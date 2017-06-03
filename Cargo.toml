@@ -3,6 +3,18 @@ name = "crucible"
 version = "0.0.0"
 authors = ["Brian Martin <brayniac@gmail.com>"]
 
+license = "MIT/Apache-2.0"
+
+description = "[WIP] performance and testing webhooks"
+
+homepage = "https://github.com/brayniac/crucible"
+documentation = "https://github.com/brayniac/crucible"
+repository = "https://github.com/brayniac/crucible"
+
+readme = "README.md"
+
+keywords = [ ]
+
 [dependencies]
 getopts = "*"
 log = "*"

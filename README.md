@@ -1,5 +1,6 @@
-# crucible - [WIP] automated performance and testing webhooks
-webhooks for performance and testing of rust code
+# crucible - [WIP] performance and testing webhooks
+
+This project is currently work-in-progress and is not ready for real use
 
 [![travis-badge][]][travis] [![downloads-badge][] ![release-badge][]][crate] [![license-badge][]](#license)
 
