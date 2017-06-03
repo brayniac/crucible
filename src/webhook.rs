@@ -128,8 +128,8 @@ fn handle_http(mut request: Request) {
 pub fn handle_payload(payload: &str) -> Response<io::Empty> {
     info!("handle payload");
     if let Ok(parsed) = json::parse(payload) {
-    	Response::empty(200)
+        Response::empty(200)
     } else {
-    	Response::empty(400)
-    } 
+        Response::empty(400)
+    }
 }
