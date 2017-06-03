@@ -16,7 +16,7 @@ readme = "README.md"
 keywords = [ ]
 
 [dependencies]
-getopts = "*"
-log = "*"
-tic = "*"
-time = "*"
+getopts = "0.2.14"
+log = "0.3.8"
+tic = "0.2.1"
+time = "0.1.37"
