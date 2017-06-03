@@ -3,13 +3,13 @@ use tic::Receiver;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Metric {
-    //Window,
+    Request,
 }
 
 impl fmt::Display for Metric {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            //Metric::Window => write!(f, "window"),
+            Metric::Request => write!(f, "request"),
         }
     }
 }
@@ -21,6 +21,7 @@ pub fn init(listen: Option<String>) -> Receiver<Metric> {
         .service(true);
 
     if let Some(addr) = listen {
+        info!("listening STATS {}", addr);
         config = config.http_listen(addr);
     }
     config.build()
