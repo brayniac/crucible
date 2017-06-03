@@ -1,0 +1,10 @@
+[package]
+name = "crucible"
+version = "0.0.0"
+authors = ["Brian Martin <brayniac@gmail.com>"]
+
+[dependencies]
+getopts = "*"
+log = "*"
+tic = "*"
+time = "*"
