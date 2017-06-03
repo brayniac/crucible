@@ -16,6 +16,7 @@ fn opts() -> Options {
 
     opts.optflag("", "version", "show version and exit");
     opts.optopt("", "metrics", "listen address for stats", "IP:PORT");
+    opts.optopt("", "http", "listen address for http", "IP:PORT");
     opts.optflagmulti("v", "verbose", "verbosity (stacking)");
     opts.optflag("h", "help", "print this help menu");
 
