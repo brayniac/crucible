@@ -14,7 +14,7 @@ use metrics::Metric;
 use options::{PROGRAM, VERSION};
 use std::{io, thread};
 use tic::Sample;
-use tiny_http::{Method, Request, Response, Server};
+use tiny_http::{Method, Request, Response};
 
 fn main() {
     let options = options::init();
@@ -55,7 +55,7 @@ fn handle_http(mut request: Request) {
                     info!("payload received");
 				    let mut content = String::new();
 				    request.as_reader().read_to_string(&mut content).unwrap();
-				    handle_payload(content)
+				    handle_payload(&content)
                 }
                 _ => Response::empty(404),
             }
@@ -67,8 +67,8 @@ fn handle_http(mut request: Request) {
 }
 
 // parse payload
-fn handle_payload(payload: String) -> Response<io::Empty> {
+fn handle_payload(payload: &str) -> Response<io::Empty> {
 	info!("handle payload");
-	let parsed = json::parse(&payload).unwrap();
+	let parsed = json::parse(payload).unwrap();
 	Response::empty(200)
 }
