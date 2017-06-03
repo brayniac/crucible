@@ -1,0 +1,45 @@
+[package]
+name = "crucible-fuzz"
+version = "0.0.1"
+authors = ["Brian Martin <brayniac@gmail.com>"]
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[profile.bench]
+opt-level = 3
+debug = true
+rpath = false
+lto = true
+debug-assertions = false
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+debug = true
+rpath = false
+lto = true
+debug-assertions = false
+codegen-units = 1
+
+[dependencies]
+getopts = "0.2.14"
+json = "0.11.6"
+log = "0.3.8"
+tic = "0.2.1"
+time = "0.1.37"
+tiny_http = "0.5.8"
+
+[dependencies.crucible]
+path = ".."
+[dependencies.libfuzzer-sys]
+git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_webhook_handler"
+path = "fuzzers/webhook_handler.rs"

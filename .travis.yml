@@ -1,11 +1,25 @@
 language: rust
-cache: cargo
 rust:
-- stable
-- beta
-- nightly
+  - stable
+  - beta
+  - nightly
 os: linux
+dist: trusty
+sudo: required
 env: TYPE=default RUST_BACKTRACE=1
+cache:
+  directories:
+  - $HOME/.cargo
+  - $TRAVIS_BUILD_DIR/target/debug
+  - $TRAVIS_BUILD_DIR/target/release
+  - $TRAVIS_BUILD_DIR/target/benchcmp/target
+  - $TRAVIS_BUILD_DIR/fuzz/target
+  - $TRAVIS_BUILD_DIR/fuzz/corpus
+script:
+- cargo build --verbose
+- cargo build --verbose --release
+- cargo test --verbose
+- cargo test --verbose --release
 matrix:
   include:
     - os: linux
@@ -20,3 +34,10 @@ matrix:
       script:
         - cargo clippy -V || cargo install -f clippy || exit 0
         - cargo clippy
+    - os: linux
+      rust: nightly
+      env: TYPE=fuzz_webhook_handler RUST_BACKTRACE=1
+      script:
+        - cargo fuzz -V || cargo install cargo-fuzz -f
+        - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_handler -- -max_total_time=300
+        - sudo chown -R travis $HOME/.cargo
