@@ -33,10 +33,10 @@ fn main() {
     // initialize http listener
     let http = options.opt_str("http").unwrap_or("0.0.0.0:4567".to_owned());
     let mut server = webhook::Server::configure()
-                        .listen(http)
-                        .clock(clock)
-                        .stats(stats)
-                        .build()
-                        .unwrap();
+        .listen(http)
+        .clock(clock)
+        .stats(stats)
+        .build()
+        .unwrap();
     server.run();
 }
