@@ -11,11 +11,8 @@ mod options;
 mod webhook;
 
 use logging::set_log_level;
-use metrics::Metric;
 use options::{PROGRAM, VERSION};
-use std::{io, thread};
-use tic::Sample;
-use tiny_http::{Method, Request, Response};
+use std::thread;
 
 fn main() {
     let options = options::init();
@@ -26,12 +23,12 @@ fn main() {
 
     // initialize metrics
     let mut metrics = metrics::init(options.opt_str("metrics"));
-    let mut stats = metrics.get_sender();
+    let stats = metrics.get_sender();
     let clock = metrics.get_clocksource();
     thread::spawn(move || { metrics.run(); });
 
     // initialize http listener
-    let http = options.opt_str("http").unwrap_or("0.0.0.0:4567".to_owned());
+    let http = options.opt_str("http").unwrap_or_else(|| "0.0.0.0:4567".to_owned());
     let mut server = webhook::Server::configure()
         .listen(http)
         .clock(clock)

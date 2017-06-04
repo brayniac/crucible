@@ -7,7 +7,7 @@ use metrics::Metric;
 use std::default::Default;
 use std::io;
 use tic::{Clocksource, Sample, Sender};
-use tiny_http::{Method, Request, Response};
+use tiny_http::{Header, Method, Request, Response};
 
 pub struct Config {
     addr: String,
@@ -80,14 +80,15 @@ impl Server {
     }
 
     // create a new webhook server listening on the given address
-    pub fn new(addr: &str) -> Result<Server, &'static str> {
+    #[allow(dead_code)]
+    pub fn new() -> Result<Server, &'static str> {
         Config::default().build()
     }
 
     // non-blocking receive
     pub fn try_recv(&mut self) {
         if let Ok(Some(request)) = self.server.try_recv() {
-            debug!("handle request");
+            trace!("handle request");
             let t0 = self.time();
             handle_http(request);
             let t1 = self.time();
@@ -104,16 +105,32 @@ impl Server {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum EventType {
+    Create,
+    PullRequest,
+    Push,
+    Status,
+    Unknown,
+}
+
 // actually handle the http request
 fn handle_http(mut request: Request) {
     let response = match *request.method() {
         Method::Post => {
             match request.url() {
                 "/payload" => {
-                    info!("payload received");
+                    trace!("payload received");
                     let mut content = String::new();
                     request.as_reader().read_to_string(&mut content).unwrap();
-                    handle_payload(&content)
+                    let event_type = event_type_from_headers(request.headers());
+                    trace!("Event type is: {:?}", event_type);
+                    match event_type {
+                        EventType::Create => handle_create(&content),
+                        EventType::PullRequest => handle_pull_request(&content),
+                        EventType::Push => handle_push(&content),
+                        _ => handle_unknown(&content),
+                    }
                 }
                 _ => Response::empty(404),
             }
@@ -124,12 +141,90 @@ fn handle_http(mut request: Request) {
     let _ = request.respond(response);
 }
 
-// parse payload
-pub fn handle_payload(payload: &str) -> Response<io::Empty> {
-    info!("handle payload");
+fn event_type_from_headers(headers: &[Header]) -> EventType {
+    let mut event_type = EventType::Unknown;
+    for header in headers {
+        let field = header.field.as_str().as_str();
+        if let "X-GitHub-Event" = field {
+            let value = header.value.as_str();
+            match value {
+                "create" => {
+                    event_type = EventType::Create;
+                }
+                "pull_request" => {
+                    event_type = EventType::PullRequest;
+                }
+                "push" => {
+                    event_type = EventType::Push;
+                }
+                "status" => {
+                    event_type = EventType::Status;
+                }
+                _ => {
+                    info!("unknown GitHub Event: {}", value);
+                }
+            }
+        }
+    }
+    event_type
+}
+
+pub struct Event {
+    git_ref: String,
+}
+
+// handle push events
+pub fn handle_push(payload: &str) -> Response<io::Empty> {
+    debug!("handle push");
     if let Ok(parsed) = json::parse(payload) {
-        Response::empty(200)
+        if let Some(git_ref) = parsed["ref"].as_str() {
+            let event = Event { git_ref: git_ref.to_owned() };
+            info!("push ref: {}", event.git_ref);
+            Response::empty(200)
+        } else {
+            info!("bad push event");
+            handle_unknown(payload)
+        }
     } else {
         Response::empty(400)
     }
+}
+
+// handle pull request events
+pub fn handle_pull_request(payload: &str) -> Response<io::Empty> {
+    debug!("handle pull request");
+    if let Ok(parsed) = json::parse(payload) {
+        if let Some(action) = parsed["action"].as_str() {
+            info!("pull request action: {}", action);
+            Response::empty(200)
+        } else {
+            info!("bad pull request event");
+            handle_unknown(payload)
+        }
+    } else {
+        Response::empty(400)
+    }
+}
+
+// handle push events
+pub fn handle_create(payload: &str) -> Response<io::Empty> {
+    info!("handle create");
+    if let Ok(parsed) = json::parse(payload) {
+        if let Some(git_ref) = parsed["ref"].as_str() {
+            let event = Event { git_ref: git_ref.to_owned() };
+            info!("create ref: {}", event.git_ref);
+            Response::empty(200)
+        } else {
+            info!("bad create event");
+            handle_unknown(payload)
+        }
+    } else {
+        Response::empty(400)
+    }
+}
+
+// handle unknown events
+pub fn handle_unknown(_: &str) -> Response<io::Empty> {
+    debug!("handle unknown");
+    Response::empty(200)
 }
