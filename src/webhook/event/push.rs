@@ -8,7 +8,7 @@ pub struct Push {
 
 impl Push {
     pub fn from_str(payload: &str) -> Result<Push, &'static str> {
-        debug!("parse push");
+        trace!("parse");
         if let Ok(parsed) = json::parse(payload) {
             let git_ref = parsed["ref"].as_str();
             let repo = parsed["repository"]["full_name"].as_str();

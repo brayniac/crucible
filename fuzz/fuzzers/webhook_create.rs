@@ -11,12 +11,12 @@ extern crate tiny_http;
 #[path = "../../src/metrics.rs"]
 mod metrics;
 
-#[path = "../../src/webhook/event/create.rs"]
-mod create;
+#[path = "../../src/webhook/event/mod.rs"]
+mod event;
 
 fuzz_target!(|data: &[u8]| {
                  // fuzzed code goes here
                  if let Ok(s) = String::from_utf8(data.to_vec()) {
-                     let _ = create::Create::from_str(&s);
+                     let _ = event::Create::from_str(&s);
                  }
              });

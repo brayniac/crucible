@@ -4,8 +4,8 @@ mod create;
 mod pull_request;
 mod push;
 
-use self::create::Create;
-use self::pull_request::PullRequest;
+pub use self::create::Create;
+pub use self::pull_request::PullRequest;
 pub use self::push::Push;
 
 #[derive(Clone, Debug)]
