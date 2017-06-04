@@ -28,7 +28,9 @@ fn main() {
     thread::spawn(move || { metrics.run(); });
 
     // initialize http listener
-    let http = options.opt_str("http").unwrap_or_else(|| "0.0.0.0:4567".to_owned());
+    let http = options
+        .opt_str("http")
+        .unwrap_or_else(|| "0.0.0.0:4567".to_owned());
     let mut server = webhook::Server::configure()
         .listen(http)
         .clock(clock)
