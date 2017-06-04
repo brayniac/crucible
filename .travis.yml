@@ -36,8 +36,22 @@ matrix:
         - cargo clippy
     - os: linux
       rust: nightly
-      env: TYPE=fuzz_webhook_handler RUST_BACKTRACE=1
+      env: TYPE=fuzz_webhook_create RUST_BACKTRACE=1
       script:
         - cargo fuzz -V || cargo install cargo-fuzz -f
-        - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_handler -- -max_total_time=300
+        - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_create -- -max_total_time=300
+        - sudo chown -R travis $HOME/.cargo
+    - os: linux
+      rust: nightly
+      env: TYPE=fuzz_webhook_pull_request RUST_BACKTRACE=1
+      script:
+        - cargo fuzz -V || cargo install cargo-fuzz -f
+        - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_pull_request -- -max_total_time=300
+        - sudo chown -R travis $HOME/.cargo
+    - os: linux
+      rust: nightly
+      env: TYPE=fuzz_webhook_push RUST_BACKTRACE=1
+      script:
+        - cargo fuzz -V || cargo install cargo-fuzz -f
+        - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_push -- -max_total_time=300
         - sudo chown -R travis $HOME/.cargo

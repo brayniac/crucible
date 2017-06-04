@@ -15,8 +15,8 @@ mod metrics;
 mod webhook;
 
 fuzz_target!(|data: &[u8]| {
-    // fuzzed code goes here
-    if let Ok(s) = String::from_utf8(data.to_vec()) {
-    	webhook::handle_payload(&s);
-    }
-});
+                 // fuzzed code goes here
+                 if let Ok(s) = String::from_utf8(data.to_vec()) {
+                     webhook::handle_pull_request(&s);
+                 }
+             });

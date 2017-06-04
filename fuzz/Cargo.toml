@@ -41,5 +41,13 @@ git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
 members = ["."]
 
 [[bin]]
-name = "fuzz_webhook_handler"
-path = "fuzzers/webhook_handler.rs"
+name = "fuzz_webhook_create"
+path = "fuzzers/webhook_create.rs"
+
+[[bin]]
+name = "fuzz_webhook_pull_request"
+path = "fuzzers/webhook_pull_request.rs"
+
+[[bin]]
+name = "fuzz_webhook_push"
+path = "fuzzers/webhook_push.rs"
