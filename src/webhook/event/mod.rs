@@ -6,7 +6,7 @@ mod push;
 
 use self::create::Create;
 use self::pull_request::PullRequest;
-use self::push::Push;
+pub use self::push::Push;
 
 #[derive(Clone, Debug)]
 pub enum Event {

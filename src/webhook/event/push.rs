@@ -31,7 +31,7 @@ impl Push {
 }
 
 mod test {
-    use webhook::event::push::Push;
+    use super::Push;
 
     #[test]
     fn test_parse() {
