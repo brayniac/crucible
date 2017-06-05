@@ -1,13 +1,14 @@
 extern crate mpmc;
 
+
 use metrics::Metric;
 use mpmc::Queue;
 use std::default::Default;
 use tic::{Clocksource, Sample, Sender};
-use webhook::event;
+use webhook::event::*;
 
 pub struct Config {
-    events: Option<Queue<event::Event>>,
+    events: Option<Queue<Event>>,
     clock: Option<Clocksource>,
     stats: Option<Sender<Metric>>,
 }
@@ -22,7 +23,7 @@ impl Config {
         self
     }
 
-    pub fn events(mut self, queue: Queue<event::Event>) -> Self {
+    pub fn events(mut self, queue: Queue<Event>) -> Self {
         self.events = Some(queue);
         self
     }
@@ -47,7 +48,7 @@ impl Default for Config {
 pub struct Consumer {
     clock: Clocksource,
     stats: Sender<Metric>,
-    events: Queue<event::Event>,
+    events: Queue<Event>,
 }
 
 impl Consumer {
@@ -83,10 +84,23 @@ impl Consumer {
     pub fn run(&mut self) {
         if let Some(event) = self.events.pop() {
             let t0 = self.time();
-            info!("consume event: {:?}", event);
+            trace!("consume event: {:?}", event);
             // do processing
+            match event {
+                Event::PullRequest(event) => self.handle_pull_request(event),
+                Event::Push(event) => self.handle_push(event),
+                _ => {},
+            }
             let t1 = self.time();
             let _ = self.stats.send(Sample::new(t0, t1, Metric::Processed));
         }
+    }
+
+    fn handle_push(&mut self, event: Push) {
+
+    }
+
+    fn handle_pull_request(&mut self, event: PullRequest) {
+
     }
 }

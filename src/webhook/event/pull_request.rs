@@ -48,6 +48,7 @@ mod test {
     #[test]
     fn test_parse() {
         use super::PullRequest;
+        use std::str::FromStr;
 
         let payload = include_str!("pull_request.json");
         let event = PullRequest::from_str(payload).unwrap();

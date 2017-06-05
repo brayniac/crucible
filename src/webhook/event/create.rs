@@ -48,6 +48,7 @@ mod test {
     #[test]
     fn test_parse() {
         use super::Create;
+        use std::str::FromStr;
 
         let payload = include_str!("create.json");
         let event = Create::from_str(payload).unwrap();

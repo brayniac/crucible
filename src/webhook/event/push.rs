@@ -54,6 +54,7 @@ mod test {
     #[test]
     fn test_parse() {
         use super::Push;
+        use std::str::FromStr;
 
         let payload = include_str!("push.json");
         let push = Push::from_str(payload).unwrap();
