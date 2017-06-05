@@ -89,18 +89,14 @@ impl Consumer {
             match event {
                 Event::PullRequest(event) => self.handle_pull_request(event),
                 Event::Push(event) => self.handle_push(event),
-                _ => {},
+                _ => {}
             }
             let t1 = self.time();
             let _ = self.stats.send(Sample::new(t0, t1, Metric::Processed));
         }
     }
 
-    fn handle_push(&mut self, event: Push) {
+    fn handle_push(&mut self, event: Push) {}
 
-    }
-
-    fn handle_pull_request(&mut self, event: PullRequest) {
-
-    }
+    fn handle_pull_request(&mut self, event: PullRequest) {}
 }

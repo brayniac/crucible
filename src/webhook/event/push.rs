@@ -1,7 +1,7 @@
 extern crate json;
 
-use std::str::FromStr;
 use std::fmt;
+use std::str::FromStr;
 
 #[derive(Clone, Debug)]
 pub struct Push {
@@ -12,7 +12,9 @@ pub struct Push {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError { _priv: () }
+pub struct ParseError {
+    _priv: (),
+}
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

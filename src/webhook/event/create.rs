@@ -10,7 +10,9 @@ pub struct Create {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError { _priv: () }
+pub struct ParseError {
+    _priv: (),
+}
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
