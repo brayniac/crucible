@@ -14,6 +14,8 @@ mod metrics;
 #[path = "../../src/webhook/event/mod.rs"]
 mod event;
 
+use std::str::FromStr;
+
 fuzz_target!(|data: &[u8]| {
                  // fuzzed code goes here
                  if let Ok(s) = String::from_utf8(data.to_vec()) {
