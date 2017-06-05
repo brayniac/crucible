@@ -2,9 +2,11 @@
 extern crate log;
 extern crate getopts;
 extern crate json;
+extern crate mpmc;
 extern crate tic;
 extern crate tiny_http;
 
+mod consumer;
 mod logging;
 mod metrics;
 mod options;
@@ -33,9 +35,21 @@ fn main() {
         .unwrap_or_else(|| "0.0.0.0:4567".to_owned());
     let mut server = webhook::Server::configure()
         .listen(http)
-        .clock(clock)
-        .stats(stats)
+        .clock(clock.clone())
+        .stats(stats.clone())
         .build()
         .unwrap();
-    server.run();
+    let events = server.get_events();
+    thread::spawn(move || { server.run(); });
+
+    // initialize the event consumer
+    let mut consumer = consumer::Consumer::configure()
+        .clock(clock)
+        .stats(stats)
+        .events(events)
+        .build()
+        .unwrap();
+    loop {
+        consumer.run();
+    }
 }

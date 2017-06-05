@@ -1,14 +1,16 @@
 extern crate getopts;
 extern crate json;
+extern crate mpmc;
 extern crate tic;
 extern crate tiny_http;
 
 use metrics::Metric;
+use mpmc::Queue;
 use std::default::Default;
 use tic::{Clocksource, Sample, Sender};
 use tiny_http::{Method, Request, Response};
 
-mod event;
+pub mod event;
 
 use self::event::Event;
 
@@ -54,6 +56,7 @@ pub struct Server {
     server: tiny_http::Server,
     clock: Clocksource,
     stats: Sender<Metric>,
+    events: Queue<Event>,
 }
 
 impl Server {
@@ -66,16 +69,22 @@ impl Server {
         let server = tiny_http::Server::http(&config.addr).unwrap();
         let stats = config.stats.clone().unwrap();
         let clock = config.clock.clone().unwrap();
+        let events = mpmc::Queue::with_capacity(1024);
         Ok(Server {
                config: config,
                clock: clock,
                stats: stats,
                server: server,
+               events: events,
            })
     }
 
     fn time(&self) -> u64 {
         self.clock.counter()
+    }
+
+    pub fn get_events(&self) -> mpmc::Queue<Event> {
+        self.events.clone()
     }
 
     fn send_stat(&mut self, t0: u64, t1: u64, metric: Metric) {
@@ -93,7 +102,7 @@ impl Server {
         if let Ok(Some(request)) = self.server.try_recv() {
             trace!("handle request");
             let t0 = self.time();
-            handle_http(request);
+            self.handle_http(request);
             let t1 = self.time();
             self.send_stat(t0, t1, Metric::Request);
         }
@@ -106,23 +115,24 @@ impl Server {
             self.try_recv();
         }
     }
-}
 
-// actually handle the http request
-fn handle_http(mut request: Request) {
-    let response = match *request.method() {
-        Method::Post => {
-            match request.url() {
-                "/payload" => {
-                    trace!("payload received");
-                    let _ = Event::from_request(&mut request);
-                    Response::empty(200)
+    // actually handle the http request
+    fn handle_http(&mut self, mut request: Request) {
+        let response = match *request.method() {
+            Method::Post => {
+                match request.url() {
+                    "/payload" => {
+                        trace!("payload received");
+                        let event = Event::from_request(&mut request);
+                        let _ = self.events.push(event);
+                        Response::empty(200)
+                    }
+                    _ => Response::empty(404),
                 }
-                _ => Response::empty(404),
             }
-        }
-        _ => Response::empty(405),
-    };
+            _ => Response::empty(405),
+        };
 
-    let _ = request.respond(response);
+        let _ = request.respond(response);
+    }
 }
