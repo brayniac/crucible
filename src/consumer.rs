@@ -1,9 +1,13 @@
-extern crate mpmc;
-
-
+use curl::easy::{Easy, List};
+use json;
 use metrics::Metric;
 use mpmc::Queue;
+use shuteye::sleep;
 use std::default::Default;
+use std::fmt;
+use std::io::Read;
+use std::process::Command;
+use std::time::Duration;
 use tic::{Clocksource, Sample, Sender};
 use webhook::event::*;
 
@@ -11,6 +15,7 @@ pub struct Config {
     events: Option<Queue<Event>>,
     clock: Option<Clocksource>,
     stats: Option<Sender<Metric>>,
+    token: Option<String>,
 }
 
 impl Config {
@@ -32,6 +37,11 @@ impl Config {
         self.stats = Some(sender);
         self
     }
+
+    pub fn token(mut self, token: String) -> Self {
+        self.token = Some(token);
+        self
+    }
 }
 
 
@@ -41,6 +51,25 @@ impl Default for Config {
             events: None,
             clock: None,
             stats: None,
+            token: None,
+        }
+    }
+}
+
+pub enum Status {
+    Pending,
+    Success,
+    Error,
+    Failure,
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Status::Pending => write!(f, "pending"),
+            Status::Success => write!(f, "success"),
+            Status::Error => write!(f, "error"),
+            Status::Failure => write!(f, "failure"),
         }
     }
 }
@@ -49,6 +78,7 @@ pub struct Consumer {
     clock: Clocksource,
     stats: Sender<Metric>,
     events: Queue<Event>,
+    token: String,
 }
 
 impl Consumer {
@@ -60,6 +90,7 @@ impl Consumer {
         let events = config.events.clone();
         let clock = config.clock.clone();
         let stats = config.stats.clone();
+        let token = config.token.clone();
 
         if events.is_none() {
             return Err("need events queue");
@@ -70,10 +101,14 @@ impl Consumer {
         if stats.is_none() {
             return Err("need stats");
         }
+        if token.is_none() {
+            return Err("need token");
+        }
         Ok(Consumer {
                events: events.unwrap(),
                clock: clock.unwrap(),
                stats: stats.unwrap(),
+               token: token.unwrap(),
            })
     }
 
@@ -94,9 +129,115 @@ impl Consumer {
             let t1 = self.time();
             let _ = self.stats.send(Sample::new(t0, t1, Metric::Processed));
         }
+        // call sleep
+        sleep(Duration::new(0, 1_000_000));
     }
 
-    fn handle_push(&mut self, event: Push) {}
+    fn send_status(&self, repo: &str, sha: &str, state: &str) {
+        info!("set: {} to: {}", sha, state);
+        let endpoint = format!("https://api.github.com/repos/{}/statuses/{}", repo, sha);
+        let auth = format!("Authorization: token {}", self.token);
+        let mut list = List::new();
+        list.append(&auth).unwrap();
+        list.append("content-type: application/json").unwrap();
+
+        let data = object!{
+            "state" => state,
+            "target_url" => "https://oxidize.io",
+            "description" => "description please",
+            "context" => "continuous-integration/crucible"
+        };
+
+        trace!("sending: {}", data);
+
+
+        let mut data_to_upload = data.dump();
+        let mut handle = Easy::new();
+        handle.useragent("crucible");
+        handle.url(&endpoint).unwrap();
+        handle.http_headers(list).unwrap();
+        handle.post(true).unwrap();
+        let mut response = Vec::new();
+
+        handle.post_fields_copy(&data_to_upload.as_bytes());
+        {
+            let mut transfer = handle.transfer();
+            transfer.write_function(|new_data| {
+                response.extend_from_slice(new_data);
+                Ok(new_data.len())
+            }).unwrap();
+            transfer.perform().unwrap();
+        }
+        let rsp_string = String::from_utf8(response).unwrap_or("invalid utf8".to_owned());
+        trace!("response: {}", rsp_string);
+    }
+
+    fn handle_push(&mut self, event: Push) {
+        // this gets scary
+        let base_path = "/mnt/scratch/";
+
+        let id = "temp";
+        let path = base_path.to_owned() + id;
+
+        // prepare
+        create_directory(&path);
+        clone_repo(&path, &event.repo(), &event.url(), &event.sha());
+
+        // inform github we're running a test
+        self.send_status(&event.repo(), &event.sha(), "pending");
+
+        // run test
+        cargo_test(&path);
+
+        // this should send a real result
+        self.send_status(&event.repo(), &event.sha(), "success");
+
+        // cleanup
+        remove_directory(&path);
+    }
 
     fn handle_pull_request(&mut self, event: PullRequest) {}
+}
+
+
+fn clone_repo(path: &str, name: &str, url: &str, sha: &str) {
+    info!("clone repo: {}", name);
+    Command::new("git")
+        .arg("clone")
+        .arg(url)
+        .arg("repo")
+        .current_dir(path)
+        .status()
+        .expect("failed to run git");
+}
+
+fn create_directory(path: &str) {
+    Command::new("mkdir")
+        .arg("-p")
+        .arg(path)
+        .status()
+        .expect("failed to run mkdir");
+}
+
+fn remove_directory(path: &str) {
+    Command::new("rm")
+        .arg("-rf")
+        .arg(path)
+        .status()
+        .expect("failed to run rm");
+}
+
+fn cargo_test(path: &str) -> Result<(), ()> {
+    let status = Command::new("cargo")
+        .arg("test")
+        .arg(path.to_owned() + "/repo")
+        .status()
+        .expect("failed to run cargo");
+    if status.success() {
+        info!("cargo test: passed");
+        Ok(())
+    } else {
+        info!("cargo test: failed");
+        Err(())
+    }
 }

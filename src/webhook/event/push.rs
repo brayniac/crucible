@@ -11,6 +11,20 @@ pub struct Push {
     sha: String,
 }
 
+impl Push {
+    pub fn repo(&self) -> String {
+        self.repo.clone()
+    }
+
+    pub fn url(&self) -> String {
+        self.clone_url.clone()
+    }
+
+    pub fn sha(&self) -> String {
+        self.sha.clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     _priv: (),
