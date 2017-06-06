@@ -1,8 +1,11 @@
 #[macro_use]
 extern crate log;
-extern crate getopts;
+#[macro_use]
 extern crate json;
+extern crate curl;
+extern crate getopts;
 extern crate mpmc;
+extern crate shuteye;
 extern crate tic;
 extern crate tiny_http;
 
@@ -43,10 +46,12 @@ fn main() {
     thread::spawn(move || { server.run(); });
 
     // initialize the event consumer
+    let token = options.opt_str("token").expect("--token required");
     let mut consumer = consumer::Consumer::configure()
         .clock(clock)
         .stats(stats)
         .events(events)
+        .token(token)
         .build()
         .unwrap();
     loop {
