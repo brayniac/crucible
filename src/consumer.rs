@@ -274,9 +274,10 @@ impl Consumer {
             // run test
             let result_test = cargo_test(&path);
             let result_fmt = cargo_fmt(&path);
+            let result_clippy = cargo_clippy(&path);
 
             // this should send a real result
-            if result_test.is_err() || result_fmt.is_err() {
+            if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() {
                 self.send_status(&event.repo(),
                                  &event.sha(),
                                  "failed",
@@ -366,12 +367,12 @@ fn remove_directory(path: &str) {
 }
 
 fn cargo_test(path: &str) -> Result<(), ()> {
-    let status = Command::new("cargo")
+    let output = Command::new("cargo")
         .arg("test")
         .current_dir(path.to_owned() + "/repo")
-        .status()
+        .output()
         .expect("failed to run cargo test");
-    if status.success() {
+    if output.status.success() {
         info!("cargo test: passed");
         Ok(())
     } else {
@@ -379,16 +380,32 @@ fn cargo_test(path: &str) -> Result<(), ()> {
         Err(())
     }
 }
-//  cargo fmt -- --write-mode=diff
+
+fn cargo_clippy(path: &str) -> Result<(), ()> {
+    let output = Command::new("cargo")
+        .arg("+nightly")
+        .arg("clippy")
+        .current_dir(path.to_owned() + "/repo")
+        .output()
+        .expect("failed to run cargo test");
+    if output.status.success() {
+        info!("cargo clippy: passed");
+        Ok(())
+    } else {
+        info!("cargo clippy: failed");
+        Err(())
+    }
+}
+
 fn cargo_fmt(path: &str) -> Result<(), ()> {
-    let status = Command::new("cargo")
+    let output = Command::new("cargo")
         .arg("fmt")
         .arg("--")
         .arg("--write-mode=diff")
         .current_dir(path.to_owned() + "/repo")
-        .status()
+        .output()
         .expect("failed to run cargo fmt");
-    if status.success() {
+    if output.status.success() {
         info!("cargo fmt: passed");
         Ok(())
     } else {
