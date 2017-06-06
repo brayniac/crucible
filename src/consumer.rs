@@ -179,12 +179,15 @@ impl Consumer {
         let id = "temp";
         let path = base_path.to_owned() + id;
 
+        // inform github we're running a test
+        self.send_status(&event.repo(), &event.sha(), "pending", "continuous-integration/crucible/push", "pending...", "https://oxidize.io");
+
         // prepare
         create_directory(&path);
-        clone_repo(&path, &event.repo(), &event.url(), &event.sha());
-
-        // inform github we're running a test
-        self.send_status(&event.repo(), &event.sha(), "pending", "continuous-integration/crucible/push", "The test is pending", "https://oxidize.io");
+        let status = clone_repo(&path, &event.repo(), &event.url(), &event.sha());
+        if status.is_err() {
+            self.send_status(&event.repo(), &event.sha(), "error", "continuous-integration/crucible/push", "whoops. error.", "https://oxidize.io");
+        }
 
         // run test
         let result_test = cargo_test(&path);
@@ -192,9 +195,9 @@ impl Consumer {
 
         // this should send a real result
         if result_test.is_err() || result_fmt.is_err() {
-            self.send_status(&event.repo(), &event.sha(), "failed", "continuous-integration/crucible/push", "The test is failed", "https://oxidize.io");
+            self.send_status(&event.repo(), &event.sha(), "failed", "continuous-integration/crucible/push", "the build failed", "https://oxidize.io");
         } else {
-            self.send_status(&event.repo(), &event.sha(), "failed", "continuous-integration/crucible/push", "The test is failed", "https://oxidize.io");
+            self.send_status(&event.repo(), &event.sha(), "success", "continuous-integration/crucible/push", "lgtm. shipit", "https://oxidize.io");
         }
         
         // cleanup
@@ -205,15 +208,28 @@ impl Consumer {
 }
 
 
-fn clone_repo(path: &str, name: &str, url: &str, sha: &str) {
+fn clone_repo(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
     info!("clone repo: {}", name);
-    Command::new("git")
+    let status = Command::new("git")
         .arg("clone")
         .arg(url)
         .arg("repo")
         .current_dir(path)
         .status()
         .expect("failed to run git");
+    if ! status.success() {
+        return Err(());
+    }
+    let status = Command::new("git")
+        .arg("checkout")
+        .arg(sha)
+        .current_dir(path.to_owned() + "/repo")
+        .status()
+        .expect("failed to run git");
+    if ! status.success() {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn create_directory(path: &str) {
