@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 use tic::Receiver;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -20,6 +21,7 @@ pub fn init(listen: Option<String>) -> Receiver<Metric> {
     let mut config = Receiver::<Metric>::configure()
         .batch_size(1)
         .capacity(4096)
+        .poll_delay(Some(Duration::new(0, 1_000_000)))
         .service(true);
 
     if let Some(addr) = listen {
