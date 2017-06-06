@@ -121,11 +121,7 @@ impl Consumer {
             let t0 = self.time();
             trace!("consume event: {:?}", event);
             // do processing
-            match event {
-                Event::PullRequest(event) => self.handle_pull_request(event),
-                Event::Push(event) => self.handle_push(event),
-                _ => {}
-            }
+            self.handle_event(event);
             let t1 = self.time();
             let _ = self.stats.send(Sample::new(t0, t1, Metric::Processed));
         }
@@ -180,77 +176,44 @@ impl Consumer {
         trace!("response: {}", rsp_string);
     }
 
-
-    fn handle_push(&mut self, event: Push) {
+    fn handle_event(&mut self, event: Event) {
         // this gets scary
         let base_path = "/mnt/scratch/";
+
+        let description = match event {
+            Event::Push(_) => "continuous-integration/crucible/push",
+            Event::PullRequest(_) => "continuous-integration/crucible/pr",
+            _ => panic!("unimplemented"),
+        };
 
         let id = "temp";
         let path = base_path.to_owned() + id;
 
         // skip events with this sha, happens when branch deleted
-        if event.sha() == "0000000000000000000000000000000000000000" {
-            return;
-        }
-
-        // inform github we're running a test
-        self.send_status(&event.repo(),
-                         &event.sha(),
-                         "pending",
-                         "continuous-integration/crucible/push",
-                         "pending...",
-                         "https://oxidize.io");
-
-        // prepare
-        create_directory(&path);
-        let status = clone_repo(&path, &event.repo(), &event.url(), &event.sha());
-        if status.is_err() {
-            self.send_status(&event.repo(),
-                             &event.sha(),
-                             "error",
-                             "continuous-integration/crucible/push",
-                             "whoops. error.",
-                             "https://oxidize.io");
-        } else {
-            // run test
-            let result_test = cargo_test(&path);
-            let result_fmt = cargo_fmt(&path);
-            let result_clippy = cargo_clippy(&path);
-
-            // this should send a real result
-            if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() {
-                self.send_status(&event.repo(),
-                                 &event.sha(),
-                                 "failed",
-                                 "continuous-integration/crucible/push",
-                                 "the build failed",
-                                 "https://oxidize.io");
-            } else {
-                self.send_status(&event.repo(),
-                                 &event.sha(),
-                                 "success",
-                                 "continuous-integration/crucible/push",
-                                 "lgtm. shipit",
-                                 "https://oxidize.io");
+        if let Event::Push(push) = event.clone() {
+            if push.sha() == "0000000000000000000000000000000000000000" {
+                return;
             }
         }
 
-        // cleanup
-        remove_directory(&path);
-    }
-
-    fn handle_pull_request(&mut self, event: PullRequest) {
-        // this gets scary
-        let base_path = "/mnt/scratch/";
-
-        let description = "continuous-integration/crucible/pull-request";
-
-        let id = "temp";
-        let path = base_path.to_owned() + id;
+        let repo = match event.clone() {
+            Event::PullRequest(pr) => pr.repo(),
+            Event::Push(push) => push.repo(),
+            _ => {
+                panic!("unsupported event");
+            }
+        };
+        let sha = match event.clone() {
+            Event::PullRequest(pr) => pr.sha(),
+            Event::Push(push) => push.sha(),
+            _ => {
+                panic!("unsupported event");
+            }
+        };
 
         // inform github we're running a test
-        self.send_status(&event.repo(),
-                         &event.sha(),
+        self.send_status(&repo,
+                         &sha,
                          "pending",
                          description,
                          "pending...",
@@ -258,15 +221,21 @@ impl Consumer {
 
         // prepare
         create_directory(&path);
-        let status = clone_pr(&path,
-                              &event.repo(),
-                              &event.url(),
-                              &event.sha(),
-                              &event.number());
+        let status = match event {
+            Event::PullRequest(pr) => {
+                clone_pr(&path, &pr.repo(), &pr.url(), &pr.sha(), &pr.number())
+            }
+            Event::Push(push) => {
+                clone_repo(&path, &push.repo(), &push.url(), &push.sha())
+            }
+            _ => {
+                panic!("unsupported event");
+            }
+        };
 
         if status.is_err() {
-            self.send_status(&event.repo(),
-                             &event.sha(),
+            self.send_status(&repo,
+                             &sha,
                              "error",
                              description,
                              "whoops. error.",
@@ -279,15 +248,15 @@ impl Consumer {
 
             // this should send a real result
             if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() {
-                self.send_status(&event.repo(),
-                                 &event.sha(),
+                self.send_status(&repo,
+                                 &sha,
                                  "failed",
                                  description,
                                  "the build failed",
                                  "https://oxidize.io");
             } else {
-                self.send_status(&event.repo(),
-                                 &event.sha(),
+                self.send_status(&repo,
+                                 &sha,
                                  "success",
                                  description,
                                  "lgtm. shipit",
