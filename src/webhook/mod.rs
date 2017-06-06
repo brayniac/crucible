@@ -1,12 +1,14 @@
 extern crate getopts;
 extern crate json;
 extern crate mpmc;
+extern crate shuteye;
 extern crate tic;
 extern crate tiny_http;
 
 use metrics::Metric;
 use mpmc::Queue;
 use std::default::Default;
+use std::time::Duration;
 use tic::{Clocksource, Sample, Sender};
 use tiny_http::{Method, Request, Response};
 
@@ -97,22 +99,19 @@ impl Server {
         Config::default().build()
     }
 
-    // non-blocking receive
-    pub fn try_recv(&mut self) {
-        if let Ok(Some(request)) = self.server.try_recv() {
-            trace!("handle request");
-            let t0 = self.time();
-            self.handle_http(request);
-            let t1 = self.time();
-            self.send_stat(t0, t1, Metric::Request);
-        }
-    }
-
     // run the server forever
     pub fn run(&mut self) {
         info!("listening HTTP {}", self.config.addr);
         loop {
-            self.try_recv();
+            if let Ok(Some(request)) = self.server.try_recv() {
+                trace!("handle request");
+                let t0 = self.time();
+                self.handle_http(request);
+                let t1 = self.time();
+                self.send_stat(t0, t1, Metric::Request);
+            } else {
+                shuteye::sleep(Duration::new(0, 1_000_000));
+            }
         }
     }
 
