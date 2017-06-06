@@ -187,6 +187,11 @@ impl Consumer {
         let id = "temp";
         let path = base_path.to_owned() + id;
 
+        // skip events with this sha, happens when branch deleted
+        if event.sha() == "0000000000000000000000000000000000000000" {
+            return;
+        }
+
         // inform github we're running a test
         self.send_status(&event.repo(),
                          &event.sha(),
