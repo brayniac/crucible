@@ -215,9 +215,10 @@ impl Consumer {
             // run test
             let result_test = cargo_test(&path);
             let result_fmt = cargo_fmt(&path);
+            let result_clippy = cargo_clippy(&path);
 
             // this should send a real result
-            if result_test.is_err() || result_fmt.is_err() {
+            if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() {
                 self.send_status(&event.repo(),
                                  &event.sha(),
                                  "failed",
