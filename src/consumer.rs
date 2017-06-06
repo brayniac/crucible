@@ -205,27 +205,27 @@ impl Consumer {
                              "continuous-integration/crucible/push",
                              "whoops. error.",
                              "https://oxidize.io");
-        }
-
-        // run test
-        let result_test = cargo_test(&path);
-        let result_fmt = cargo_fmt(&path);
-
-        // this should send a real result
-        if result_test.is_err() || result_fmt.is_err() {
-            self.send_status(&event.repo(),
-                             &event.sha(),
-                             "failed",
-                             "continuous-integration/crucible/push",
-                             "the build failed",
-                             "https://oxidize.io");
         } else {
-            self.send_status(&event.repo(),
-                             &event.sha(),
-                             "success",
-                             "continuous-integration/crucible/push",
-                             "lgtm. shipit",
-                             "https://oxidize.io");
+            // run test
+            let result_test = cargo_test(&path);
+            let result_fmt = cargo_fmt(&path);
+
+            // this should send a real result
+            if result_test.is_err() || result_fmt.is_err() {
+                self.send_status(&event.repo(),
+                                 &event.sha(),
+                                 "failed",
+                                 "continuous-integration/crucible/push",
+                                 "the build failed",
+                                 "https://oxidize.io");
+            } else {
+                self.send_status(&event.repo(),
+                                 &event.sha(),
+                                 "success",
+                                 "continuous-integration/crucible/push",
+                                 "lgtm. shipit",
+                                 "https://oxidize.io");
+            }
         }
 
         // cleanup
