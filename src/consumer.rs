@@ -196,6 +196,18 @@ impl Consumer {
             }
         }
 
+        // skip pull requests that aren't either opened or edited
+        // this avoids retesting a closed pull request
+        if let Event::PullRequest(pr) = event.clone() {
+            let action = pr.action();
+            match action.as_str() {
+                "opened" | "edited" => {},
+                _ => {
+                    return;
+                }
+            }
+        }
+
         let repo = match event.clone() {
             Event::PullRequest(pr) => pr.repo(),
             Event::Push(push) => push.repo(),
