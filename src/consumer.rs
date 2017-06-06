@@ -291,6 +291,7 @@ fn clone_repo(path: &str, name: &str, url: &str) -> Result<(), ()> {
         .expect("failed to run git");
     if !output.status.success() {
         error!("clone failed!");
+        error!("{}", String::from_utf8(output.stderr).unwrap_or("invalid utf8".to_owned()));
         Err(())
     } else {
         info!("clone completed");
