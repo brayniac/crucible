@@ -183,7 +183,9 @@ impl Consumer {
         let description = match event {
             Event::Push(_) => "continuous-integration/crucible/push",
             Event::PullRequest(_) => "continuous-integration/crucible/pr",
-            _ => panic!("unimplemented"),
+            _ => {
+                return;
+            }
         };
 
         let id = "temp";
@@ -193,6 +195,18 @@ impl Consumer {
         if let Event::Push(push) = event.clone() {
             if push.sha() == "0000000000000000000000000000000000000000" {
                 return;
+            }
+        }
+
+        // skip pull requests that aren't either opened or edited
+        // this avoids retesting a closed pull request
+        if let Event::PullRequest(pr) = event.clone() {
+            let action = pr.action();
+            match action.as_str() {
+                "opened" | "edited" => {}
+                _ => {
+                    return;
+                }
             }
         }
 
