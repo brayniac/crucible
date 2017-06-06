@@ -183,7 +183,9 @@ impl Consumer {
         let description = match event {
             Event::Push(_) => "continuous-integration/crucible/push",
             Event::PullRequest(_) => "continuous-integration/crucible/pr",
-            _ => panic!("unimplemented"),
+            _ => {
+                return;
+            },
         };
 
         let id = "temp";
