@@ -7,6 +7,31 @@ use std::str::FromStr;
 pub struct PullRequest {
     action: String,
     number: u64,
+    repository: String,
+    sha: String,
+    url: String,
+}
+
+impl PullRequest {
+    pub fn action(&self) -> String {
+        self.action.clone()
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    pub fn repo(&self) -> String {
+        self.repository.clone()
+    }
+
+    pub fn sha(&self) -> String {
+        self.sha.clone()
+    }
+
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,14 +53,20 @@ impl FromStr for PullRequest {
         if let Ok(parsed) = json::parse(payload) {
             let action = parsed["action"].as_str();
             let number = parsed["number"].as_u64();
+            let repository = parsed["repository"]["full_name"].as_str();
+            let sha = parsed["pull_request"]["head"]["sha"].as_str();
+            let url = parsed["pull_request"]["head"]["repo"]["clone_url"].as_str();
 
-            if action.is_none() || number.is_none() {
+            if action.is_none() || number.is_none() || repository.is_none() {
                 return Err(ParseError { _priv: () });
             }
 
             let event = PullRequest {
                 action: action.unwrap().to_owned(),
                 number: number.unwrap(),
+                repository: repository.unwrap().to_owned(),
+                sha: sha.unwrap().to_owned(),
+                url: url.unwrap().to_owned(),
             };
 
             debug!("{:?}", event);

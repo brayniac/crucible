@@ -180,6 +180,7 @@ impl Consumer {
         trace!("response: {}", rsp_string);
     }
 
+
     fn handle_push(&mut self, event: Push) {
         // this gets scary
         let base_path = "/mnt/scratch/";
@@ -237,9 +238,88 @@ impl Consumer {
         remove_directory(&path);
     }
 
-    fn handle_pull_request(&mut self, event: PullRequest) {}
+    fn handle_pull_request(&mut self, event: PullRequest) {
+        // this gets scary
+        let base_path = "/mnt/scratch/";
+
+        let description = "continuous-integration/crucible/pull-request";
+
+        let id = "temp";
+        let path = base_path.to_owned() + id;
+
+        // inform github we're running a test
+        self.send_status(&event.repo(),
+                         &event.sha(),
+                         "pending",
+                         description,
+                         "pending...",
+                         "https://oxidize.io");
+
+        // prepare
+        create_directory(&path);
+        let status = clone_pr(&path, &event.repo(), &event.url(), &event.sha(), &event.number());
+
+        if status.is_err() {
+            self.send_status(&event.repo(),
+                             &event.sha(),
+                             "error",
+                             description,
+                             "whoops. error.",
+                             "https://oxidize.io");
+        } else {
+            // run test
+            let result_test = cargo_test(&path);
+            let result_fmt = cargo_fmt(&path);
+
+            // this should send a real result
+            if result_test.is_err() || result_fmt.is_err() {
+                self.send_status(&event.repo(),
+                                 &event.sha(),
+                                 "failed",
+                                 description,
+                                 "the build failed",
+                                 "https://oxidize.io");
+            } else {
+                self.send_status(&event.repo(),
+                                 &event.sha(),
+                                 "success",
+                                 description,
+                                 "lgtm. shipit",
+                                 "https://oxidize.io");
+            }
+        }
+
+        // cleanup
+        remove_directory(&path);
+    }
 }
 
+//git fetch origin pull/7324/head:pr-7324
+fn clone_pr(path: &str, name: &str, url: &str, sha: &str, number: &u64) -> Result<(), ()> {
+    info!("clone repo: {}", name);
+    let status = Command::new("git")
+        .arg("clone")
+        .arg(url)
+        .arg("repo")
+        .current_dir(path)
+        .status()
+        .expect("failed to run git");
+    if !status.success() {
+        return Err(());
+    }
+    let pr_ref = format!("pull/{}/head:pr-{}", number, number);
+    let status = Command::new("git")
+        .arg("fetch")
+        .arg("origin")
+        .arg("pr_ref")
+        .current_dir(path.to_owned() + "/repo")
+        .status()
+        .expect("failed to run git");
+    if !status.success() {
+        return Err(());
+    }
+    Ok(())
+}
 
 fn clone_repo(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
     info!("clone repo: {}", name);
