@@ -133,7 +133,7 @@ impl Consumer {
         sleep(Duration::new(0, 1_000_000));
     }
 
-    fn send_status(&self, repo: &str, sha: &str, state: &str) {
+    fn send_status(&self, repo: &str, sha: &str, state: &str, context: &str, description: &str, url: &str) {
         info!("set: {} to: {}", sha, state);
         let endpoint = format!("https://api.github.com/repos/{}/statuses/{}", repo, sha);
         let auth = format!("Authorization: token {}", self.token);
@@ -143,9 +143,9 @@ impl Consumer {
 
         let data = object!{
             "state" => state,
-            "target_url" => "https://oxidize.io",
-            "description" => "description please",
-            "context" => "continuous-integration/crucible"
+            "target_url" => url,
+            "description" => description,
+            "context" => context
         };
 
         trace!("sending: {}", data);
@@ -184,14 +184,19 @@ impl Consumer {
         clone_repo(&path, &event.repo(), &event.url(), &event.sha());
 
         // inform github we're running a test
-        self.send_status(&event.repo(), &event.sha(), "pending");
+        self.send_status(&event.repo(), &event.sha(), "pending", "continuous-integration/crucible/push", "The test is pending", "https://oxidize.io");
 
         // run test
-        cargo_test(&path);
+        let result_test = cargo_test(&path);
+        let result_fmt = cargo_fmt(&path);
 
         // this should send a real result
-        self.send_status(&event.repo(), &event.sha(), "success");
-
+        if result_test.is_err() || result_fmt.is_err() {
+            self.send_status(&event.repo(), &event.sha(), "failed", "continuous-integration/crucible/push", "The test is failed", "https://oxidize.io");
+        } else {
+            self.send_status(&event.repo(), &event.sha(), "failed", "continuous-integration/crucible/push", "The test is failed", "https://oxidize.io");
+        }
+        
         // cleanup
         remove_directory(&path);
     }
@@ -230,14 +235,31 @@ fn remove_directory(path: &str) {
 fn cargo_test(path: &str) -> Result<(), ()> {
     let status = Command::new("cargo")
         .arg("test")
-        .arg(path.to_owned() + "/repo")
+        .current_dir(path.to_owned() + "/repo")
         .status()
-        .expect("failed to run cargo");
+        .expect("failed to run cargo test");
     if status.success() {
         info!("cargo test: passed");
         Ok(())
     } else {
         info!("cargo test: failed");
+        Err(())
+    }
+}
+//  cargo fmt -- --write-mode=diff
+fn cargo_fmt(path: &str) -> Result<(), ()> {
+    let status = Command::new("cargo")
+        .arg("fmt")
+        .arg("--")
+        .arg("--write-mode=diff")
+        .current_dir(path.to_owned() + "/repo")
+        .status()
+        .expect("failed to run cargo fmt");
+    if status.success() {
+        info!("cargo fmt: passed");
+        Ok(())
+    } else {
+        info!("cargo fmt: failed");
         Err(())
     }
 }
