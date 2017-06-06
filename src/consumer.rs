@@ -133,7 +133,13 @@ impl Consumer {
         sleep(Duration::new(0, 1_000_000));
     }
 
-    fn send_status(&self, repo: &str, sha: &str, state: &str, context: &str, description: &str, url: &str) {
+    fn send_status(&self,
+                   repo: &str,
+                   sha: &str,
+                   state: &str,
+                   context: &str,
+                   description: &str,
+                   url: &str) {
         info!("set: {} to: {}", sha, state);
         let endpoint = format!("https://api.github.com/repos/{}/statuses/{}", repo, sha);
         let auth = format!("Authorization: token {}", self.token);
@@ -162,10 +168,12 @@ impl Consumer {
         handle.post_fields_copy(&data_to_upload.as_bytes());
         {
             let mut transfer = handle.transfer();
-            transfer.write_function(|new_data| {
-                response.extend_from_slice(new_data);
-                Ok(new_data.len())
-            }).unwrap();
+            transfer
+                .write_function(|new_data| {
+                                    response.extend_from_slice(new_data);
+                                    Ok(new_data.len())
+                                })
+                .unwrap();
             transfer.perform().unwrap();
         }
         let rsp_string = String::from_utf8(response).unwrap_or("invalid utf8".to_owned());
@@ -180,13 +188,23 @@ impl Consumer {
         let path = base_path.to_owned() + id;
 
         // inform github we're running a test
-        self.send_status(&event.repo(), &event.sha(), "pending", "continuous-integration/crucible/push", "pending...", "https://oxidize.io");
+        self.send_status(&event.repo(),
+                         &event.sha(),
+                         "pending",
+                         "continuous-integration/crucible/push",
+                         "pending...",
+                         "https://oxidize.io");
 
         // prepare
         create_directory(&path);
         let status = clone_repo(&path, &event.repo(), &event.url(), &event.sha());
         if status.is_err() {
-            self.send_status(&event.repo(), &event.sha(), "error", "continuous-integration/crucible/push", "whoops. error.", "https://oxidize.io");
+            self.send_status(&event.repo(),
+                             &event.sha(),
+                             "error",
+                             "continuous-integration/crucible/push",
+                             "whoops. error.",
+                             "https://oxidize.io");
         }
 
         // run test
@@ -195,11 +213,21 @@ impl Consumer {
 
         // this should send a real result
         if result_test.is_err() || result_fmt.is_err() {
-            self.send_status(&event.repo(), &event.sha(), "failed", "continuous-integration/crucible/push", "the build failed", "https://oxidize.io");
+            self.send_status(&event.repo(),
+                             &event.sha(),
+                             "failed",
+                             "continuous-integration/crucible/push",
+                             "the build failed",
+                             "https://oxidize.io");
         } else {
-            self.send_status(&event.repo(), &event.sha(), "success", "continuous-integration/crucible/push", "lgtm. shipit", "https://oxidize.io");
+            self.send_status(&event.repo(),
+                             &event.sha(),
+                             "success",
+                             "continuous-integration/crucible/push",
+                             "lgtm. shipit",
+                             "https://oxidize.io");
         }
-        
+
         // cleanup
         remove_directory(&path);
     }
@@ -217,7 +245,7 @@ fn clone_repo(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
         .current_dir(path)
         .status()
         .expect("failed to run git");
-    if ! status.success() {
+    if !status.success() {
         return Err(());
     }
     let status = Command::new("git")
@@ -226,7 +254,7 @@ fn clone_repo(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
         .current_dir(path.to_owned() + "/repo")
         .status()
         .expect("failed to run git");
-    if ! status.success() {
+    if !status.success() {
         return Err(());
     }
     Ok(())
