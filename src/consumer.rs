@@ -315,7 +315,7 @@ fn clone_pr(path: &str, name: &str, url: &str, sha: &str, number: &u64) -> Resul
     let status = Command::new("git")
         .arg("fetch")
         .arg("origin")
-        .arg("pr_ref")
+        .arg(pr_ref)
         .current_dir(path.to_owned() + "/repo")
         .status()
         .expect("failed to run git");
