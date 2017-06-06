@@ -225,9 +225,7 @@ impl Consumer {
             Event::PullRequest(pr) => {
                 clone_pr(&path, &pr.repo(), &pr.url(), &pr.sha(), &pr.number())
             }
-            Event::Push(push) => {
-                clone_repo(&path, &push.repo(), &push.url(), &push.sha())
-            }
+            Event::Push(push) => clone_repo(&path, &push.repo(), &push.url(), &push.sha()),
             _ => {
                 panic!("unsupported event");
             }
