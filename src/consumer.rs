@@ -302,25 +302,25 @@ impl Consumer {
 //git fetch origin pull/7324/head:pr-7324
 fn clone_pr(path: &str, name: &str, url: &str, sha: &str, number: &u64) -> Result<(), ()> {
     info!("clone repo: {}", name);
-    let status = Command::new("git")
+    let output = Command::new("git")
         .arg("clone")
         .arg(url)
         .arg("repo")
         .current_dir(path)
-        .status()
+        .output()
         .expect("failed to run git");
-    if !status.success() {
+    if !output.status.success() {
         return Err(());
     }
     let pr_ref = format!("pull/{}/head:pr-{}", number, number);
-    let status = Command::new("git")
+    let output = Command::new("git")
         .arg("fetch")
         .arg("origin")
         .arg(pr_ref)
         .current_dir(path.to_owned() + "/repo")
-        .status()
+        .output()
         .expect("failed to run git");
-    if !status.success() {
+    if !output.status.success() {
         return Err(());
     }
     Ok(())
@@ -328,23 +328,23 @@ fn clone_pr(path: &str, name: &str, url: &str, sha: &str, number: &u64) -> Resul
 
 fn clone_repo(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
     info!("clone repo: {}", name);
-    let status = Command::new("git")
+    let output = Command::new("git")
         .arg("clone")
         .arg(url)
         .arg("repo")
         .current_dir(path)
-        .status()
+        .output()
         .expect("failed to run git");
-    if !status.success() {
+    if !output.status.success() {
         return Err(());
     }
-    let status = Command::new("git")
+    let output = Command::new("git")
         .arg("checkout")
         .arg(sha)
         .current_dir(path.to_owned() + "/repo")
-        .status()
+        .output()
         .expect("failed to run git");
-    if !status.success() {
+    if !output.status.success() {
         return Err(());
     }
     Ok(())
