@@ -257,7 +257,11 @@ impl Consumer {
 
         // prepare
         create_directory(&path);
-        let status = clone_pr(&path, &event.repo(), &event.url(), &event.sha(), &event.number());
+        let status = clone_pr(&path,
+                              &event.repo(),
+                              &event.url(),
+                              &event.sha(),
+                              &event.number());
 
         if status.is_err() {
             self.send_status(&event.repo(),
