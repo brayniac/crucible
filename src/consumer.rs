@@ -236,10 +236,8 @@ impl Consumer {
         // prepare
         create_directory(&path);
         let status = match event {
-            Event::PullRequest(pr) => {
-                clone_pr(&path, &pr.repo(), &pr.url(), &pr.sha(), &pr.number())
-            }
-            Event::Push(push) => clone_repo(&path, &push.repo(), &push.url(), &push.sha()),
+            Event::PullRequest(pr) => clone_pr(&path, &pr.repo(), &pr.url(), &pr.number()),
+            Event::Push(push) => clone_push(&path, &push.repo(), &push.url(), &push.sha()),
             _ => {
                 panic!("unsupported event");
             }
@@ -281,55 +279,62 @@ impl Consumer {
     }
 }
 
-//git fetch origin pull/7324/head:pr-7324
-fn clone_pr(path: &str, name: &str, url: &str, sha: &str, number: &u64) -> Result<(), ()> {
+// clone the repo into a build folder within the path given
+fn clone_repo(path: &str, name: &str, url: &str) -> Result<(), ()> {
     info!("clone repo: {}", name);
     let output = Command::new("git")
         .arg("clone")
         .arg(url)
-        .arg("repo")
+        .arg("build")
         .current_dir(path)
         .output()
         .expect("failed to run git");
     if !output.status.success() {
-        return Err(());
+        error!("clone failed!");
+        Err(())
+    } else {
+        info!("clone completed");
+        Ok(())
     }
-    let pr_ref = format!("pull/{}/head:pr-{}", number, number);
-    let output = Command::new("git")
-        .arg("fetch")
-        .arg("origin")
-        .arg(pr_ref)
-        .current_dir(path.to_owned() + "/repo")
-        .output()
-        .expect("failed to run git");
-    if !output.status.success() {
-        return Err(());
-    }
-    Ok(())
 }
 
-fn clone_repo(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
-    info!("clone repo: {}", name);
-    let output = Command::new("git")
-        .arg("clone")
-        .arg(url)
-        .arg("repo")
-        .current_dir(path)
-        .output()
-        .expect("failed to run git");
-    if !output.status.success() {
-        return Err(());
+//git fetch origin pull/7324/head:pr-7324
+fn clone_pr(path: &str, name: &str, url: &str, number: &u64) -> Result<(), ()> {
+    if clone_repo(path, name, url).is_ok() {
+        let pr_ref = format!("pull/{}/head:pr-{}", number, number);
+        let output = Command::new("git")
+            .arg("fetch")
+            .arg("origin")
+            .arg(pr_ref)
+            .current_dir(path.to_owned() + "/build")
+            .output()
+            .expect("failed to run git");
+        if !output.status.success() {
+            return Err(());
+        }
+        Ok(())
+    } else {
+        Err(())
     }
-    let output = Command::new("git")
-        .arg("checkout")
-        .arg(sha)
-        .current_dir(path.to_owned() + "/repo")
-        .output()
-        .expect("failed to run git");
-    if !output.status.success() {
-        return Err(());
+
+}
+
+fn clone_push(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
+    if clone_repo(path, name, url).is_ok() {
+        let output = Command::new("git")
+            .arg("checkout")
+            .arg(sha)
+            .current_dir(path.to_owned() + "/build")
+            .output()
+            .expect("failed to run git");
+        if !output.status.success() {
+            Err(())
+        } else {
+            Ok(())
+        }
+    } else {
+        Err(())
     }
-    Ok(())
 }
 
 fn create_directory(path: &str) {
@@ -351,7 +356,7 @@ fn remove_directory(path: &str) {
 fn cargo_test(path: &str) -> Result<(), ()> {
     let output = Command::new("cargo")
         .arg("test")
-        .current_dir(path.to_owned() + "/repo")
+        .current_dir(path.to_owned() + "/build")
         .output()
         .expect("failed to run cargo test");
     if output.status.success() {
@@ -367,7 +372,7 @@ fn cargo_clippy(path: &str) -> Result<(), ()> {
     let output = Command::new("cargo")
         .arg("+nightly")
         .arg("clippy")
-        .current_dir(path.to_owned() + "/repo")
+        .current_dir(path.to_owned() + "/build")
         .output()
         .expect("failed to run cargo test");
     if output.status.success() {
@@ -384,7 +389,7 @@ fn cargo_fmt(path: &str) -> Result<(), ()> {
         .arg("fmt")
         .arg("--")
         .arg("--write-mode=diff")
-        .current_dir(path.to_owned() + "/repo")
+        .current_dir(path.to_owned() + "/build")
         .output()
         .expect("failed to run cargo fmt");
     if output.status.success() {
