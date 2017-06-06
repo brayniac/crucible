@@ -185,7 +185,7 @@ impl Consumer {
             Event::PullRequest(_) => "continuous-integration/crucible/pr",
             _ => {
                 return;
-            },
+            }
         };
 
         let id = "temp";
@@ -203,7 +203,7 @@ impl Consumer {
         if let Event::PullRequest(pr) = event.clone() {
             let action = pr.action();
             match action.as_str() {
-                "opened" | "edited" => {},
+                "opened" | "edited" => {}
                 _ => {
                     return;
                 }
