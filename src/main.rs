@@ -4,6 +4,7 @@ extern crate log;
 extern crate json;
 extern crate curl;
 extern crate getopts;
+extern crate mktemp;
 extern crate mpmc;
 extern crate shuteye;
 extern crate tic;
