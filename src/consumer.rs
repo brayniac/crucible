@@ -15,6 +15,7 @@ pub struct Config {
     clock: Option<Clocksource>,
     stats: Option<Sender<Metric>>,
     token: Option<String>,
+    repo: Option<String>,
 }
 
 impl Config {
@@ -41,6 +42,11 @@ impl Config {
         self.token = Some(token);
         self
     }
+
+    pub fn repo(mut self, repo: String) -> Self {
+        self.repo = Some(repo);
+        self
+    }
 }
 
 
@@ -51,6 +57,7 @@ impl Default for Config {
             clock: None,
             stats: None,
             token: None,
+            repo: None,
         }
     }
 }
@@ -60,6 +67,7 @@ pub struct Consumer {
     stats: Sender<Metric>,
     events: Queue<Event>,
     token: String,
+    repo: Option<String>,
 }
 
 impl Consumer {
@@ -72,6 +80,7 @@ impl Consumer {
         let clock = config.clock.clone();
         let stats = config.stats.clone();
         let token = config.token.clone();
+        let repo = config.repo.clone();
 
         if events.is_none() {
             return Err("need events queue");
@@ -90,6 +99,7 @@ impl Consumer {
                clock: clock.unwrap(),
                stats: stats.unwrap(),
                token: token.unwrap(),
+               repo: repo,
            })
     }
 
@@ -156,6 +166,19 @@ impl Consumer {
     }
 
     fn handle_event(&mut self, event: Event) {
+        let repo = match event.clone() {
+            Event::PullRequest(pr) => pr.repo(),
+            Event::Push(push) => push.repo(),
+            _ => {
+                return;
+            }
+        };
+        if let Some(ref whitelist) = self.repo {
+            if repo != *whitelist {
+                return;
+            }
+        }
+
         let temp_dir = Temp::new_dir_in(Path::new("/mnt/scratch/")).unwrap();
         let path = temp_dir.to_path_buf();
 
@@ -186,13 +209,6 @@ impl Consumer {
             }
         }
 
-        let repo = match event.clone() {
-            Event::PullRequest(pr) => pr.repo(),
-            Event::Push(push) => push.repo(),
-            _ => {
-                panic!("unsupported event");
-            }
-        };
         let sha = match event.clone() {
             Event::PullRequest(pr) => pr.sha(),
             Event::Push(push) => push.sha(),
@@ -355,6 +371,8 @@ fn cargo_clippy(path: &Path) -> Result<(), ()> {
         Ok(())
     } else {
         info!("cargo clippy: failed");
+        info!("stdout:\n{}", forced_string(output.stdout));
+        info!("stderr:\n{}", forced_string(output.stderr));
         Err(())
     }
 }
