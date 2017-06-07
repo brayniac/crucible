@@ -1,11 +1,10 @@
 use curl::easy::{Easy, List};
-use json;
 use metrics::Metric;
+use mktemp::Temp;
 use mpmc::Queue;
 use shuteye::sleep;
 use std::default::Default;
-use std::fmt;
-use std::io::Read;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 use tic::{Clocksource, Sample, Sender};
@@ -52,24 +51,6 @@ impl Default for Config {
             clock: None,
             stats: None,
             token: None,
-        }
-    }
-}
-
-pub enum Status {
-    Pending,
-    Success,
-    Error,
-    Failure,
-}
-
-impl fmt::Display for Status {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Status::Pending => write!(f, "pending"),
-            Status::Success => write!(f, "success"),
-            Status::Error => write!(f, "error"),
-            Status::Failure => write!(f, "failure"),
         }
     }
 }
@@ -152,16 +133,14 @@ impl Consumer {
 
         trace!("sending: {}", data);
 
-
-        let mut data_to_upload = data.dump();
         let mut handle = Easy::new();
-        handle.useragent("crucible");
+        let _ = handle.useragent("crucible");
         handle.url(&endpoint).unwrap();
         handle.http_headers(list).unwrap();
         handle.post(true).unwrap();
         let mut response = Vec::new();
 
-        handle.post_fields_copy(&data_to_upload.as_bytes());
+        let _ = handle.post_fields_copy(data.dump().as_bytes());
         {
             let mut transfer = handle.transfer();
             transfer
@@ -172,13 +151,13 @@ impl Consumer {
                 .unwrap();
             transfer.perform().unwrap();
         }
-        let rsp_string = String::from_utf8(response).unwrap_or("invalid utf8".to_owned());
-        trace!("response: {}", rsp_string);
+
+        trace!("response: {}", forced_string(response));
     }
 
     fn handle_event(&mut self, event: Event) {
-        // this gets scary
-        let base_path = "/mnt/scratch/";
+        let temp_dir = Temp::new_dir_in(Path::new("/mnt/scratch/")).unwrap();
+        let path = temp_dir.to_path_buf();
 
         let description = match event {
             Event::Push(_) => "continuous-integration/crucible/push",
@@ -187,9 +166,6 @@ impl Consumer {
                 return;
             }
         };
-
-        let id = "temp";
-        let path = base_path.to_owned() + id;
 
         // skip events with this sha, happens when branch deleted
         if let Event::Push(push) = event.clone() {
@@ -203,7 +179,7 @@ impl Consumer {
         if let Event::PullRequest(pr) = event.clone() {
             let action = pr.action();
             match action.as_str() {
-                "opened" | "edited" => {}
+                "opened" | "edited" | "synchronize" => {}
                 _ => {
                     return;
                 }
@@ -224,6 +200,13 @@ impl Consumer {
                 panic!("unsupported event");
             }
         };
+        let url = match event.clone() {
+            Event::PullRequest(pr) => pr.url(),
+            Event::Push(push) => push.url(),
+            _ => {
+                panic!("unsupported event");
+            }
+        };
 
         // inform github we're running a test
         self.send_status(&repo,
@@ -233,13 +216,26 @@ impl Consumer {
                          "pending...",
                          "https://oxidize.io");
 
-        // prepare
-        create_directory(&path);
+        if clone_repo(path.as_path(), &repo, &url).is_err() {
+            self.send_status(&repo,
+                             &sha,
+                             "error",
+                             description,
+                             "whoops. error.",
+                             "https://oxidize.io");
+            return;
+        }
+
+        let mut build_path = path.clone();
+        info!("build path: {:?}", build_path);
+        build_path.push("build");
+        info!("build path: {:?}", build_path);
+
         let status = match event {
-            Event::PullRequest(pr) => clone_pr(&path, &pr.repo(), &pr.url(), &pr.number()),
-            Event::Push(push) => clone_push(&path, &push.repo(), &push.url(), &push.sha()),
+            Event::PullRequest(pr) => fetch_pull(build_path.as_path(), &pr.number()),
+            Event::Push(push) => checkout_sha(build_path.as_path(), &push.sha()),
             _ => {
-                panic!("unsupported event");
+                unreachable!();
             }
         };
 
@@ -252,9 +248,9 @@ impl Consumer {
                              "https://oxidize.io");
         } else {
             // run test
-            let result_test = cargo_test(&path);
-            let result_fmt = cargo_fmt(&path);
-            let result_clippy = cargo_clippy(&path);
+            let result_test = cargo_test(build_path.as_path());
+            let result_fmt = cargo_fmt(build_path.as_path());
+            let result_clippy = cargo_clippy(build_path.as_path());
 
             // this should send a real result
             if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() {
@@ -273,14 +269,15 @@ impl Consumer {
                                  "https://oxidize.io");
             }
         }
-
-        // cleanup
-        remove_directory(&path);
     }
 }
 
+fn forced_string(input: Vec<u8>) -> String {
+    String::from_utf8(input).unwrap_or_else(|_| "invalid utf8".to_owned())
+}
+
 // clone the repo into a build folder within the path given
-fn clone_repo(path: &str, name: &str, url: &str) -> Result<(), ()> {
+fn clone_repo(path: &Path, name: &str, url: &str) -> Result<(), ()> {
     info!("clone repo: {}", name);
     let output = Command::new("git")
         .arg("clone")
@@ -291,8 +288,7 @@ fn clone_repo(path: &str, name: &str, url: &str) -> Result<(), ()> {
         .expect("failed to run git");
     if !output.status.success() {
         error!("clone failed!");
-        error!("{}",
-               String::from_utf8(output.stderr).unwrap_or("invalid utf8".to_owned()));
+        error!("{}", forced_string(output.stderr));
         Err(())
     } else {
         info!("clone completed");
@@ -301,64 +297,41 @@ fn clone_repo(path: &str, name: &str, url: &str) -> Result<(), ()> {
 }
 
 //git fetch origin pull/7324/head:pr-7324
-fn clone_pr(path: &str, name: &str, url: &str, number: &u64) -> Result<(), ()> {
-    if clone_repo(path, name, url).is_ok() {
-        let pr_ref = format!("pull/{}/head:pr-{}", number, number);
-        let output = Command::new("git")
-            .arg("fetch")
-            .arg("origin")
-            .arg(pr_ref)
-            .current_dir(path.to_owned() + "/build")
-            .output()
-            .expect("failed to run git");
-        if !output.status.success() {
-            return Err(());
-        }
+fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
+    info!("fetch pr #{}", number);
+    let pr_ref = format!("pull/{}/head:pr-{}", number, number);
+    let output = Command::new("git")
+        .arg("fetch")
+        .arg("origin")
+        .arg(pr_ref)
+        .current_dir(path)
+        .output()
+        .expect("failed to run git");
+    if !output.status.success() {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn checkout_sha(path: &Path, sha: &str) -> Result<(), ()> {
+    info!("checkout sha {}", sha);
+    let output = Command::new("git")
+        .arg("checkout")
+        .arg(sha)
+        .current_dir(path)
+        .output()
+        .expect("failed to run git");
+    if !output.status.success() {
+        Err(())
+    } else {
         Ok(())
-    } else {
-        Err(())
-    }
-
-}
-
-fn clone_push(path: &str, name: &str, url: &str, sha: &str) -> Result<(), ()> {
-    if clone_repo(path, name, url).is_ok() {
-        let output = Command::new("git")
-            .arg("checkout")
-            .arg(sha)
-            .current_dir(path.to_owned() + "/build")
-            .output()
-            .expect("failed to run git");
-        if !output.status.success() {
-            Err(())
-        } else {
-            Ok(())
-        }
-    } else {
-        Err(())
     }
 }
 
-fn create_directory(path: &str) {
-    Command::new("mkdir")
-        .arg("-p")
-        .arg(path)
-        .status()
-        .expect("failed to run mkdir");
-}
-
-fn remove_directory(path: &str) {
-    Command::new("rm")
-        .arg("-rf")
-        .arg(path)
-        .status()
-        .expect("failed to run rm");
-}
-
-fn cargo_test(path: &str) -> Result<(), ()> {
+fn cargo_test(path: &Path) -> Result<(), ()> {
     let output = Command::new("cargo")
         .arg("test")
-        .current_dir(path.to_owned() + "/build")
+        .current_dir(path)
         .output()
         .expect("failed to run cargo test");
     if output.status.success() {
@@ -370,11 +343,11 @@ fn cargo_test(path: &str) -> Result<(), ()> {
     }
 }
 
-fn cargo_clippy(path: &str) -> Result<(), ()> {
+fn cargo_clippy(path: &Path) -> Result<(), ()> {
     let output = Command::new("cargo")
         .arg("+nightly")
         .arg("clippy")
-        .current_dir(path.to_owned() + "/build")
+        .current_dir(path)
         .output()
         .expect("failed to run cargo test");
     if output.status.success() {
@@ -386,12 +359,12 @@ fn cargo_clippy(path: &str) -> Result<(), ()> {
     }
 }
 
-fn cargo_fmt(path: &str) -> Result<(), ()> {
+fn cargo_fmt(path: &Path) -> Result<(), ()> {
     let output = Command::new("cargo")
         .arg("fmt")
         .arg("--")
         .arg("--write-mode=diff")
-        .current_dir(path.to_owned() + "/build")
+        .current_dir(path)
         .output()
         .expect("failed to run cargo fmt");
     if output.status.success() {
