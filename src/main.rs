@@ -33,7 +33,7 @@ fn main() {
     let clock = metrics.get_clocksource();
     thread::spawn(move || { metrics.run(); });
 
-    // initialize http listener
+    // initialize webhook listener
     let http = options
         .opt_str("http")
         .unwrap_or_else(|| "0.0.0.0:4567".to_owned());
@@ -48,13 +48,15 @@ fn main() {
 
     // initialize the event consumer
     let token = options.opt_str("token").expect("--token required");
-    let mut consumer = consumer::Consumer::configure()
+    let mut consumer_config = consumer::Consumer::configure()
         .clock(clock)
         .stats(stats)
         .events(events)
-        .token(token)
-        .build()
-        .unwrap();
+        .token(token);
+    if let Some(repo) = options.opt_str("repo") {
+        consumer_config = consumer_config.repo(repo);
+    }
+    let mut consumer = consumer_config.build().unwrap();
     loop {
         consumer.run();
     }

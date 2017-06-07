@@ -18,6 +18,7 @@ fn opts() -> Options {
     opts.optopt("", "metrics", "listen address for stats", "IP:PORT");
     opts.optopt("", "http", "listen address for http", "IP:PORT");
     opts.optopt("", "token", "github token", "STRING");
+    opts.optopt("", "repo", "github repo", "STRING");
     opts.optflagmulti("v", "verbose", "verbosity (stacking)");
     opts.optflag("h", "help", "print this help menu");
 
