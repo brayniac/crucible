@@ -6,6 +6,7 @@ extern crate curl;
 extern crate getopts;
 extern crate mktemp;
 extern crate mpmc;
+extern crate regex;
 extern crate shuteye;
 extern crate tic;
 extern crate tiny_http;

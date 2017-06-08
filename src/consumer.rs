@@ -2,6 +2,7 @@ use curl::easy::{Easy, List};
 use metrics::Metric;
 use mktemp::Temp;
 use mpmc::Queue;
+use regex::Regex;
 use shuteye::sleep;
 use std::default::Default;
 use std::path::Path;
@@ -286,9 +287,11 @@ impl Consumer {
             let result_test = cargo_test(build_path.as_path());
             let result_fmt = cargo_fmt(build_path.as_path());
             let result_clippy = cargo_clippy(build_path.as_path());
+            let result_fuzz = cargo_fuzz(build_path.as_path());
 
             // this should send a real result
-            if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() {
+            if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() ||
+               result_fuzz.is_err() {
                 self.send_status(&repo,
                                  &sha,
                                  "failed",
@@ -364,6 +367,7 @@ fn checkout_sha(path: &Path, sha: &str) -> Result<(), ()> {
 }
 
 fn cargo_test(path: &Path) -> Result<(), ()> {
+    info!("cargo test");
     let output = Command::new("cargo")
         .arg("test")
         .current_dir(path)
@@ -379,6 +383,7 @@ fn cargo_test(path: &Path) -> Result<(), ()> {
 }
 
 fn cargo_clippy(path: &Path) -> Result<(), ()> {
+    info!("cargo clippy");
     let output = Command::new("cargo")
         .arg("+nightly")
         .arg("clippy")
@@ -397,6 +402,7 @@ fn cargo_clippy(path: &Path) -> Result<(), ()> {
 }
 
 fn cargo_fmt(path: &Path) -> Result<(), ()> {
+    info!("cargo fmt");
     let output = Command::new("cargo")
         .arg("fmt")
         .arg("--")
@@ -409,6 +415,94 @@ fn cargo_fmt(path: &Path) -> Result<(), ()> {
         Ok(())
     } else {
         info!("cargo fmt: failed");
+        info!("stdout:\n{}", forced_string(output.stdout));
+        info!("stderr:\n{}", forced_string(output.stderr));
         Err(())
+    }
+}
+
+fn cargo_fuzz(path: &Path) -> Result<(), ()> {
+    info!("cargo fuzz");
+    if let Ok(targets) = cargo_fuzz_list(path) {
+        for t in targets {
+            info!("target: {}", t);
+            if cargo_fuzz_run(path, t.clone()).is_err() {
+                info!("fuzz failure target: {}", t);
+                return Err(());
+            }
+        }
+        return Ok(());
+    } else {
+        info!("no targets");
+    }
+    Err(())
+}
+
+fn cargo_fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
+    let output = Command::new("cargo")
+        .arg("fuzz")
+        .arg("list")
+        .current_dir(path)
+        .output()
+        .expect("failed to run cargo fuzz list");
+    if output.status.success() {
+        cargo_fuzz_list_parse(output.stdout)
+    } else {
+        info!("cargo fuzz: failed to list fuzz targets");
+        Err(())
+    }
+}
+
+fn cargo_fuzz_run(path: &Path, fuzzer: String) -> Result<(), ()> {
+    let output = Command::new("cargo")
+        .arg("+nightly")
+        .arg("fuzz")
+        .arg("run")
+        .arg(fuzzer)
+        .arg("--")
+        .arg("-max_total_time=60")
+        .arg("-timeout=60")
+        .arg("-jobs=8")
+        .arg("-workers=8")
+        .current_dir(path)
+        .output()
+        .expect("failed to run cargo fuzz run");
+    if output.status.success() {
+        Ok(())
+    } else {
+        info!("cargo fuzz: failed to run fuzz target");
+        info!("stdout:\n{}", forced_string(output.stdout));
+        info!("stderr:\n{}", forced_string(output.stderr));
+        Err(())
+    }
+}
+
+// this should be fuzz tested
+fn cargo_fuzz_list_parse(stdout: Vec<u8>) -> Result<Vec<String>, ()> {
+    if let Ok(stdout) = String::from_utf8(stdout) {
+        let re = Regex::new(r"(fuzz_\w+)\n").unwrap();
+        let mut result = Vec::<String>::new();
+        for cap in re.captures_iter(&stdout) {
+            result.push(cap[1].to_owned());
+        }
+        return Ok(result);
+    }
+    Err(())
+}
+
+mod tests {
+    #[test]
+    fn test_fuzz_list_parse() {
+        use super::*;
+        let data = r#"[38;5;2mfuzz_1
+[m(B[38;5;2mfuzz_2
+[m(B[38;5;2mfuzz_3
+[m(B"#;
+        let data = data.as_bytes();
+        let expected = vec!["fuzz_1".to_owned(),
+                            "fuzz_2".to_owned(),
+                            "fuzz_3".to_owned()];
+        let result = cargo_fuzz_list_parse(data.to_vec()).unwrap();
+        assert_eq!(expected, result);
     }
 }
