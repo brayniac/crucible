@@ -214,7 +214,7 @@ impl Consumer {
                 }
             }
         }
-        
+
 
         // skip pull requests that aren't either opened or edited
         // this avoids retesting a closed pull request
