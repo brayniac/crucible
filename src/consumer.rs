@@ -16,6 +16,7 @@ pub struct Config {
     stats: Option<Sender<Metric>>,
     token: Option<String>,
     repo: Option<String>,
+    author: Option<String>,
 }
 
 impl Config {
@@ -47,6 +48,11 @@ impl Config {
         self.repo = Some(repo);
         self
     }
+
+    pub fn author(mut self, author: String) -> Self {
+        self.author = Some(author);
+        self
+    }
 }
 
 
@@ -58,6 +64,7 @@ impl Default for Config {
             stats: None,
             token: None,
             repo: None,
+            author: None,
         }
     }
 }
@@ -68,6 +75,7 @@ pub struct Consumer {
     events: Queue<Event>,
     token: String,
     repo: Option<String>,
+    author: Option<String>,
 }
 
 impl Consumer {
@@ -81,6 +89,7 @@ impl Consumer {
         let stats = config.stats.clone();
         let token = config.token.clone();
         let repo = config.repo.clone();
+        let author = config.repo.clone();
 
         if events.is_none() {
             return Err("need events queue");
@@ -100,6 +109,7 @@ impl Consumer {
                stats: stats.unwrap(),
                token: token.unwrap(),
                repo: repo,
+               author: author,
            })
     }
 
@@ -196,6 +206,15 @@ impl Consumer {
                 return;
             }
         }
+        // skip events with this sha, happens when branch deleted
+        if let Some(ref author) = self.author {
+            if let Event::PullRequest(pull) = event.clone() {
+                if pull.author() != *author {
+                    return;
+                }
+            }
+        }
+        
 
         // skip pull requests that aren't either opened or edited
         // this avoids retesting a closed pull request
