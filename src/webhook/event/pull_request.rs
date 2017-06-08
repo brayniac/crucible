@@ -10,6 +10,7 @@ pub struct PullRequest {
     repository: String,
     sha: String,
     url: String,
+    author: String,
 }
 
 impl PullRequest {
@@ -31,6 +32,10 @@ impl PullRequest {
 
     pub fn url(&self) -> String {
         self.url.clone()
+    }
+
+    pub fn author(&self) -> String {
+        self.author.clone()
     }
 }
 
@@ -56,6 +61,7 @@ impl FromStr for PullRequest {
             let repository = parsed["repository"]["full_name"].as_str();
             let sha = parsed["pull_request"]["head"]["sha"].as_str();
             let url = parsed["pull_request"]["head"]["repo"]["clone_url"].as_str();
+            let author = parsed["pull_request"]["user"]["login"].as_str();
 
             if action.is_none() || number.is_none() || repository.is_none() {
                 return Err(ParseError { _priv: () });
@@ -67,6 +73,7 @@ impl FromStr for PullRequest {
                 repository: repository.unwrap().to_owned(),
                 sha: sha.unwrap().to_owned(),
                 url: url.unwrap().to_owned(),
+                author: author.unwrap().to_owned(),
             };
 
             debug!("{:?}", event);
@@ -87,5 +94,10 @@ mod test {
         let event = PullRequest::from_str(payload).unwrap();
         assert_eq!(event.action, "opened");
         assert_eq!(event.number, 1);
+        assert_eq!(event.repository, "baxterthehacker/public-repo");
+        assert_eq!(event.sha, "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c");
+        assert_eq!(event.url,
+                   "https://github.com/baxterthehacker/public-repo.git");
+        assert_eq!(event.author, "baxterthehacker");
     }
 }

@@ -56,6 +56,9 @@ fn main() {
     if let Some(repo) = options.opt_str("repo") {
         consumer_config = consumer_config.repo(repo);
     }
+    if let Some(author) = options.opt_str("author") {
+        consumer_config = consumer_config.author(author);
+    }
     let mut consumer = consumer_config.build().unwrap();
     loop {
         consumer.run();
