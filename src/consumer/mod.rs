@@ -11,64 +11,9 @@ use std::time::Duration;
 use tic::{Clocksource, Sample, Sender};
 use webhook::event::*;
 
-pub struct Config {
-    events: Option<Queue<Event>>,
-    clock: Option<Clocksource>,
-    stats: Option<Sender<Metric>>,
-    token: Option<String>,
-    repo: Option<String>,
-    author: Option<String>,
-}
+mod config;
 
-impl Config {
-    pub fn build(self) -> Result<Consumer, &'static str> {
-        Consumer::configured(self)
-    }
-
-    pub fn clock(mut self, clock: Clocksource) -> Self {
-        self.clock = Some(clock);
-        self
-    }
-
-    pub fn events(mut self, queue: Queue<Event>) -> Self {
-        self.events = Some(queue);
-        self
-    }
-
-    pub fn stats(mut self, sender: Sender<Metric>) -> Self {
-        self.stats = Some(sender);
-        self
-    }
-
-    pub fn token(mut self, token: String) -> Self {
-        self.token = Some(token);
-        self
-    }
-
-    pub fn repo(mut self, repo: String) -> Self {
-        self.repo = Some(repo);
-        self
-    }
-
-    pub fn author(mut self, author: String) -> Self {
-        self.author = Some(author);
-        self
-    }
-}
-
-
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            events: None,
-            clock: None,
-            stats: None,
-            token: None,
-            repo: None,
-            author: None,
-        }
-    }
-}
+pub use self::config::Config;
 
 pub struct Consumer {
     clock: Clocksource,
@@ -176,46 +121,35 @@ impl Consumer {
         trace!("response: {}", forced_string(response));
     }
 
-    fn handle_event(&mut self, event: Event) {
-        let repo = match event.clone() {
-            Event::PullRequest(pr) => pr.repo(),
-            Event::Push(push) => push.repo(),
-            _ => {
-                return;
-            }
-        };
+    fn should_handle(&mut self, event: &Event) -> bool {
+        // events must have a repo
+        if event.repo().is_none() {
+            return false;
+        }
+
+        // skip events with this sha, happens when branch deleted
+        if event.sha() == Some("0000000000000000000000000000000000000000".to_owned()) {
+            debug!("skip event with zero-SHA");
+            return false;
+        }
+
+        // repository whitelist
         if let Some(ref whitelist) = self.repo {
-            if repo != *whitelist {
-                return;
+            if event.repo().unwrap() != *whitelist {
+                debug!("repo: {} not in whitelist", event.repo().unwrap());
+                debug!("whitelist: {:?}", *whitelist);
+                return false;
             }
         }
 
-        let temp_dir = Temp::new_dir_in(Path::new("/mnt/scratch/")).unwrap();
-        let path = temp_dir.to_path_buf();
-
-        let description = match event {
-            Event::Push(_) => "continuous-integration/crucible/push",
-            Event::PullRequest(_) => "continuous-integration/crucible/pr",
-            _ => {
-                return;
-            }
-        };
-
-        // skip events with this sha, happens when branch deleted
-        if let Event::Push(push) = event.clone() {
-            if push.sha() == "0000000000000000000000000000000000000000" {
-                return;
+        // author whitelist
+        if let Some(ref whitelist) = self.author {
+            if event.author().unwrap() != *whitelist {
+                debug!("author: {} not in whitelist", event.author().unwrap());
+                debug!("whitelist: {:?}", *whitelist);
+                return false;
             }
         }
-        // skip events with this sha, happens when branch deleted
-        if let Some(ref author) = self.author {
-            if let Event::PullRequest(pull) = event.clone() {
-                if pull.author() != *author {
-                    return;
-                }
-            }
-        }
-
 
         // skip pull requests that aren't either opened or edited
         // this avoids retesting a closed pull request
@@ -224,25 +158,32 @@ impl Consumer {
             match action.as_str() {
                 "opened" | "edited" | "synchronize" => {}
                 _ => {
-                    return;
+                    return false;
                 }
             }
         }
 
-        let sha = match event.clone() {
-            Event::PullRequest(pr) => pr.sha(),
-            Event::Push(push) => push.sha(),
-            _ => {
-                panic!("unsupported event");
-            }
+        true
+    }
+
+    fn handle_event(&mut self, event: Event) {
+        if !self.should_handle(&event) {
+            return;
+        }
+
+        let repo = event.repo().unwrap();
+
+        let temp_dir = Temp::new_dir_in(Path::new("/mnt/scratch/")).unwrap();
+        let path = temp_dir.to_path_buf();
+
+        let description = match event {
+            Event::Push(_) => "continuous-integration/crucible/push",
+            Event::PullRequest(_) => "continuous-integration/crucible/pr",
+            _ => unreachable!(),
         };
-        let url = match event.clone() {
-            Event::PullRequest(pr) => pr.url(),
-            Event::Push(push) => push.url(),
-            _ => {
-                panic!("unsupported event");
-            }
-        };
+
+        let sha = event.sha().expect("event is missing a sha");
+        let url = event.url().expect("event is missing a url");
 
         // inform github we're running a test
         self.send_status(&repo,

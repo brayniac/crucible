@@ -73,4 +73,36 @@ impl Event {
         }
         e
     }
+
+    pub fn repo(&self) -> Option<String> {
+        match self {
+            &Event::PullRequest(ref pr) => Some(pr.repo()),
+            &Event::Push(ref push) => Some(push.repo()),
+            _ => None,
+        }
+    }
+
+    pub fn sha(&self) -> Option<String> {
+        match self {
+            &Event::PullRequest(ref pr) => Some(pr.sha()),
+            &Event::Push(ref push) => Some(push.sha()),
+            _ => None,
+        }
+    }
+
+    pub fn url(&self) -> Option<String> {
+        match self {
+            &Event::PullRequest(ref pr) => Some(pr.url()),
+            &Event::Push(ref push) => Some(push.url()),
+            _ => None,
+        }
+    }
+
+    pub fn author(&self) -> Option<String> {
+        match self {
+            &Event::PullRequest(ref pr) => Some(pr.author()),
+            &Event::Push(ref push) => Some(push.author()),
+            _ => None,
+        }
+    }
 }

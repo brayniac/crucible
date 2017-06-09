@@ -9,6 +9,7 @@ pub struct Push {
     repo: String,
     clone_url: String,
     sha: String,
+    author: String,
 }
 
 impl Push {
@@ -22,6 +23,10 @@ impl Push {
 
     pub fn sha(&self) -> String {
         self.sha.clone()
+    }
+
+    pub fn author(&self) -> String {
+        self.author.clone()
     }
 }
 
@@ -45,9 +50,11 @@ impl FromStr for Push {
             let git_ref = parsed["ref"].as_str();
             let repo = parsed["repository"]["full_name"].as_str();
             let clone_url = parsed["repository"]["clone_url"].as_str();
+            let author = parsed["pusher"]["name"].as_str();
             let sha = parsed["after"].as_str();
 
-            if git_ref.is_none() || repo.is_none() || clone_url.is_none() || sha.is_none() {
+            if git_ref.is_none() || repo.is_none() || clone_url.is_none() || sha.is_none() ||
+               author.is_none() {
                 return Err(ParseError { _priv: () });
             }
 
@@ -56,6 +63,7 @@ impl FromStr for Push {
                 repo: repo.unwrap().to_owned(),
                 clone_url: clone_url.unwrap().to_owned(),
                 sha: sha.unwrap().to_owned(),
+                author: author.unwrap().to_owned(),
             };
 
             debug!("{:?}", event);
@@ -79,5 +87,6 @@ mod test {
         assert_eq!(push.clone_url,
                    "https://github.com/baxterthehacker/public-repo.git");
         assert_eq!(push.sha, "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c");
+        assert_eq!(push.author, "baxterthehacker");
     }
 }
