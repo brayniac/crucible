@@ -1,8 +1,7 @@
-
-
 use super::Consumer;
 use metrics::Metric;
 use mpmc::Queue;
+use publisher;
 use std::default::Default;
 use tic::{Clocksource, Sender};
 use webhook::event::Event;
@@ -11,7 +10,7 @@ pub struct Config {
     pub events: Option<Queue<Event>>,
     pub clock: Option<Clocksource>,
     pub stats: Option<Sender<Metric>>,
-    pub token: Option<String>,
+    pub publisher: Option<Queue<publisher::Event>>,
     pub repo: Option<String>,
     pub author: Option<String>,
 }
@@ -36,8 +35,8 @@ impl Config {
         self
     }
 
-    pub fn token(mut self, token: String) -> Self {
-        self.token = Some(token);
+    pub fn publisher(mut self, queue: Queue<publisher::Event>) -> Self {
+        self.publisher = Some(queue);
         self
     }
 
@@ -59,9 +58,9 @@ impl Default for Config {
             events: None,
             clock: None,
             stats: None,
-            token: None,
             repo: None,
             author: None,
+            publisher: None,
         }
     }
 }

@@ -16,8 +16,10 @@ mod logging;
 mod metrics;
 mod options;
 mod webhook;
+mod publisher;
 
 use logging::set_log_level;
+use mpmc::Queue;
 use options::{PROGRAM, VERSION};
 use std::thread;
 
@@ -47,13 +49,25 @@ fn main() {
     let events = server.get_events();
     thread::spawn(move || { server.run(); });
 
-    // initialize the event consumer
+    let publish_queue = Queue::with_capacity(1024);
+
+    // initialize the publisher
     let token = options.opt_str("token").expect("--token required");
+    let mut publisher = publisher::Publisher::configure()
+        .clock(clock.clone())
+        .stats(stats.clone())
+        .queue(publish_queue.clone())
+        .token(token.clone())
+        .build()
+        .unwrap();
+    thread::spawn(move || { publisher.run(); });
+
+    // initialize the event consumer
     let mut consumer_config = consumer::Consumer::configure()
         .clock(clock)
         .stats(stats)
         .events(events)
-        .token(token);
+        .publisher(publish_queue.clone());
     if let Some(repo) = options.opt_str("repo") {
         info!("repo whitelist: {}", repo);
         consumer_config = consumer_config.repo(repo);
