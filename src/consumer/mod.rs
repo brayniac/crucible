@@ -93,6 +93,7 @@ impl Consumer {
             description: description.to_owned(),
             url: url.to_owned(),
         };
+        info!("sending publisher Event");
         let event = publisher::Event::Status(status);
 
         self.publisher.push(event).unwrap();

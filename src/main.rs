@@ -67,7 +67,7 @@ fn main() {
         .clock(clock)
         .stats(stats)
         .events(events)
-        .publisher(publish_queue);
+        .publisher(publish_queue.clone());
     if let Some(repo) = options.opt_str("repo") {
         info!("repo whitelist: {}", repo);
         consumer_config = consumer_config.repo(repo);
