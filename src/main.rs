@@ -55,9 +55,11 @@ fn main() {
         .events(events)
         .token(token);
     if let Some(repo) = options.opt_str("repo") {
+        info!("repo whitelist: {}", repo);
         consumer_config = consumer_config.repo(repo);
     }
     if let Some(author) = options.opt_str("author") {
+        info!("author whitelist: {}", author);
         consumer_config = consumer_config.author(author);
     }
     let mut consumer = consumer_config.build().unwrap();
