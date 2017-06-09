@@ -35,7 +35,7 @@ impl Consumer {
         let stats = config.stats.clone();
         let token = config.token.clone();
         let repo = config.repo.clone();
-        let author = config.repo.clone();
+        let author = config.author.clone();
 
         if events.is_none() {
             return Err("need events queue");
