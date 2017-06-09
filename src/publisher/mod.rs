@@ -73,16 +73,18 @@ impl Publisher {
     }
 
     pub fn run(&mut self) {
-        if let Some(event) = self.queue.pop() {
-            let t0 = self.time();
-            trace!("consume event: {:?}", event);
-            // do processing
-            self.handle_event(event);
-            let t1 = self.time();
-            let _ = self.stats.send(Sample::new(t0, t1, Metric::Processed));
+        loop {
+            if let Some(event) = self.queue.pop() {
+                let t0 = self.time();
+                trace!("consume event: {:?}", event);
+                // do processing
+                self.handle_event(event);
+                let t1 = self.time();
+                let _ = self.stats.send(Sample::new(t0, t1, Metric::Processed));
+            }
+            // call sleep
+            sleep(Duration::new(0, 1_000_000));
         }
-        // call sleep
-        sleep(Duration::new(0, 1_000_000));
     }
 
     fn send_status(&self, status: Status) {
