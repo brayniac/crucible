@@ -2,6 +2,8 @@ use curl::easy::{Easy, List};
 use metrics::Metric;
 use mktemp::Temp;
 use mpmc::Queue;
+use publisher;
+use publisher::Status;
 use regex::Regex;
 use shuteye::sleep;
 use std::default::Default;
@@ -19,7 +21,7 @@ pub struct Consumer {
     clock: Clocksource,
     stats: Sender<Metric>,
     events: Queue<Event>,
-    token: String,
+    publisher: Queue<publisher::Event>,
     repo: Option<String>,
     author: Option<String>,
 }
@@ -33,7 +35,7 @@ impl Consumer {
         let events = config.events.clone();
         let clock = config.clock.clone();
         let stats = config.stats.clone();
-        let token = config.token.clone();
+        let publisher = config.publisher.clone();
         let repo = config.repo.clone();
         let author = config.author.clone();
 
@@ -46,14 +48,14 @@ impl Consumer {
         if stats.is_none() {
             return Err("need stats");
         }
-        if token.is_none() {
-            return Err("need token");
+        if publisher.is_none() {
+            return Err("need publisher");
         }
         Ok(Consumer {
                events: events.unwrap(),
                clock: clock.unwrap(),
                stats: stats.unwrap(),
-               token: token.unwrap(),
+               publisher: publisher.unwrap(),
                repo: repo,
                author: author,
            })
@@ -83,42 +85,17 @@ impl Consumer {
                    context: &str,
                    description: &str,
                    url: &str) {
-        info!("set: {} to: {}", sha, state);
-        let endpoint = format!("https://api.github.com/repos/{}/statuses/{}", repo, sha);
-        let auth = format!("Authorization: token {}", self.token);
-        let mut list = List::new();
-        list.append(&auth).unwrap();
-        list.append("content-type: application/json").unwrap();
-
-        let data = object!{
-            "state" => state,
-            "target_url" => url,
-            "description" => description,
-            "context" => context
+        let status = Status {
+            repo: repo.to_owned(),
+            sha: sha.to_owned(),
+            state: state.to_owned(),
+            context: context.to_owned(),
+            description: description.to_owned(),
+            url: url.to_owned(),
         };
+        let event = publisher::Event::Status(status);
 
-        trace!("sending: {}", data);
-
-        let mut handle = Easy::new();
-        let _ = handle.useragent("crucible");
-        handle.url(&endpoint).unwrap();
-        handle.http_headers(list).unwrap();
-        handle.post(true).unwrap();
-        let mut response = Vec::new();
-
-        let _ = handle.post_fields_copy(data.dump().as_bytes());
-        {
-            let mut transfer = handle.transfer();
-            transfer
-                .write_function(|new_data| {
-                                    response.extend_from_slice(new_data);
-                                    Ok(new_data.len())
-                                })
-                .unwrap();
-            transfer.perform().unwrap();
-        }
-
-        trace!("response: {}", forced_string(response));
+        self.publisher.push(event).unwrap();
     }
 
     fn should_handle(&mut self, event: &Event) -> bool {
