@@ -14,14 +14,12 @@ fn print_usage(program: &str, opts: &Options) {
 fn opts() -> Options {
     let mut opts = Options::new();
 
-    opts.optflag("", "version", "show version and exit");
-    opts.optopt("", "metrics", "listen address for stats", "IP:PORT");
-    opts.optopt("", "http", "listen address for http", "IP:PORT");
-    opts.optopt("", "token", "github token", "STRING");
-    opts.optopt("", "repo", "github repo", "STRING");
-    opts.optopt("", "author", "github author", "STRING");
-    opts.optflagmulti("v", "verbose", "verbosity (stacking)");
     opts.optflag("h", "help", "print this help menu");
+    opts.optflag("", "version", "show version and exit");
+
+    opts.optflagmulti("v", "verbose", "verbosity (stacking)");
+
+    opts.reqopt("", "config", "config.toml", "FILE");
 
     opts
 }

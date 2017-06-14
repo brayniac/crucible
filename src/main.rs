@@ -10,7 +10,9 @@ extern crate regex;
 extern crate shuteye;
 extern crate tic;
 extern crate tiny_http;
+extern crate toml;
 
+mod config;
 mod consumer;
 mod logging;
 mod metrics;
@@ -21,7 +23,7 @@ mod publisher;
 use logging::set_log_level;
 use mpmc::Queue;
 use options::{PROGRAM, VERSION};
-use std::thread;
+use std::{process, thread};
 
 fn main() {
     let options = options::init();
@@ -30,16 +32,23 @@ fn main() {
     set_log_level(options.opt_count("verbose"));
     info!("{} {}", PROGRAM, VERSION);
 
+    // load config
+    let config = match config::load_config(&options) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("{}", e);
+            process::exit(1);
+        }
+    };
+
     // initialize metrics
-    let mut metrics = metrics::init(options.opt_str("metrics"));
+    let mut metrics = metrics::init(Some(config.stats()));
     let stats = metrics.get_sender();
     let clock = metrics.get_clocksource();
     thread::spawn(move || { metrics.run(); });
 
     // initialize webhook listener
-    let http = options
-        .opt_str("http")
-        .unwrap_or_else(|| "0.0.0.0:4567".to_owned());
+    let http = config.http();
     let mut server = webhook::Server::configure()
         .listen(http)
         .clock(clock.clone())
@@ -52,7 +61,7 @@ fn main() {
     let publish_queue = Queue::with_capacity(1024);
 
     // initialize the publisher
-    let token = options.opt_str("token").expect("--token required");
+    let token = config.token().expect("--token required");
     let mut publisher = publisher::Publisher::configure()
         .clock(clock.clone())
         .stats(stats.clone())
@@ -68,11 +77,11 @@ fn main() {
         .stats(stats)
         .events(events)
         .publisher(publish_queue.clone());
-    if let Some(repo) = options.opt_str("repo") {
+    if let Some(repo) = config.repo() {
         info!("repo whitelist: {}", repo);
         consumer_config = consumer_config.repo(repo);
     }
-    if let Some(author) = options.opt_str("author") {
+    if let Some(author) = config.author() {
         info!("author whitelist: {}", author);
         consumer_config = consumer_config.author(author);
     }

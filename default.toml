@@ -1,0 +1,4 @@
+[general]
+http = "localhost:4567"
+stats = "localhost:42024"
+#token = "YOUR GITHUB TOKEN" # Set your GitHub token here
