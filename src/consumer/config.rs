@@ -51,7 +51,6 @@ impl Config {
     }
 }
 
-
 impl Default for Config {
     fn default() -> Config {
         Config {
