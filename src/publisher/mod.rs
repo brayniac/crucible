@@ -98,7 +98,8 @@ impl Publisher {
         list.append(&auth).unwrap();
         list.append("content-type: application/json").unwrap();
 
-        let data = object!{
+        let data =
+            object!{
             "state" => status.state,
             "target_url" => status.url,
             "description" => status.description,
