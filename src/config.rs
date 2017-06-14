@@ -1,4 +1,3 @@
-
 use getopts::Matches;
 use std::collections::BTreeMap;
 use std::default::Default;
