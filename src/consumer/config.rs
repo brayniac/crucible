@@ -1,5 +1,5 @@
 use super::Consumer;
-use metrics::Metric;
+use common::metrics::Metric;
 use mpmc::Queue;
 use publisher;
 use std::default::Default;

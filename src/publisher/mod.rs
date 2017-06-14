@@ -1,5 +1,5 @@
 use curl::easy::{Easy, List};
-use metrics::Metric;
+use common::metrics::Metric;
 use mktemp::Temp;
 use mpmc::Queue;
 use regex::Regex;
@@ -89,7 +89,6 @@ impl Publisher {
 
     fn send_status(&self, status: Status) {
         debug!("set status: {:?}", status);
-        //info!("set: {} to: {}", sha, state);
         let endpoint = format!("https://api.github.com/repos/{}/statuses/{}",
                                status.repo,
                                status.sha);

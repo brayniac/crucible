@@ -12,28 +12,25 @@ extern crate tic;
 extern crate tiny_http;
 extern crate toml;
 
-mod config;
+mod common;
 mod consumer;
-mod logging;
-mod metrics;
-mod options;
 mod webhook;
 mod publisher;
 
-use logging::set_log_level;
+use common::logging::set_log_level;
+use common::options::{PROGRAM, VERSION};
 use mpmc::Queue;
-use options::{PROGRAM, VERSION};
 use std::{process, thread};
 
 fn main() {
-    let options = options::init();
+    let options = common::options::init();
 
     // initialize logging
     set_log_level(options.opt_count("verbose"));
     info!("{} {}", PROGRAM, VERSION);
 
     // load config
-    let config = match config::load_config(&options) {
+    let config = match common::config::load_config(&options) {
         Ok(c) => c,
         Err(e) => {
             error!("{}", e);
@@ -42,7 +39,7 @@ fn main() {
     };
 
     // initialize metrics
-    let mut metrics = metrics::init(Some(config.stats()));
+    let mut metrics = common::metrics::init(Some(config.stats()));
     let stats = metrics.get_sender();
     let clock = metrics.get_clocksource();
     thread::spawn(move || { metrics.run(); });

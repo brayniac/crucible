@@ -1,8 +1,6 @@
-
-
 use super::Event;
 use super::Publisher;
-use metrics::Metric;
+use common::metrics::Metric;
 use mpmc::Queue;
 use std::default::Default;
 use tic::{Clocksource, Sender};
