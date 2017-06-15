@@ -11,6 +11,9 @@ extern crate shuteye;
 extern crate tic;
 extern crate tiny_http;
 extern crate toml;
+extern crate sha_1;
+extern crate hmac;
+extern crate rustc_serialize;
 
 mod common;
 mod consumer;
@@ -48,6 +51,7 @@ fn main() {
     let http = config.http();
     let mut server = webhook::Server::configure()
         .listen(http)
+        .secret(config.secret())
         .clock(clock.clone())
         .stats(stats.clone())
         .build()

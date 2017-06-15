@@ -12,11 +12,13 @@ impl log::Log for SimpleLogger {
 
     fn log(&self, record: &LogRecord) {
         if self.enabled(record.metadata()) {
-            println!("{} {:<5} [{}] {}",
-                     time::strftime("%Y-%m-%d %H:%M:%S", &time::now()).unwrap(),
-                     record.level().to_string(),
-                     record.target().to_string(),
-                     record.args());
+            println!(
+                "{} {:<5} [{}] {}",
+                time::strftime("%Y-%m-%d %H:%M:%S", &time::now()).unwrap(),
+                record.level().to_string(),
+                record.target().to_string(),
+                record.args()
+            );
         }
     }
 }
@@ -35,7 +37,7 @@ pub fn set_log_level(level: usize) {
         }
     }
     let _ = log::set_logger(|max_log_level| {
-                                max_log_level.set(log_filter);
-                                Box::new(SimpleLogger)
-                            });
+        max_log_level.set(log_filter);
+        Box::new(SimpleLogger)
+    });
 }

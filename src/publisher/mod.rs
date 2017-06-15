@@ -61,11 +61,11 @@ impl Publisher {
             return Err("need token");
         }
         Ok(Publisher {
-               queue: queue.unwrap(),
-               clock: clock.unwrap(),
-               stats: stats.unwrap(),
-               token: token.unwrap(),
-           })
+            queue: queue.unwrap(),
+            clock: clock.unwrap(),
+            stats: stats.unwrap(),
+            token: token.unwrap(),
+        })
     }
 
     fn time(&self) -> u64 {
@@ -89,9 +89,11 @@ impl Publisher {
 
     fn send_status(&self, status: Status) {
         debug!("set status: {:?}", status);
-        let endpoint = format!("https://api.github.com/repos/{}/statuses/{}",
-                               status.repo,
-                               status.sha);
+        let endpoint = format!(
+            "https://api.github.com/repos/{}/statuses/{}",
+            status.repo,
+            status.sha
+        );
         let auth = format!("Authorization: token {}", self.token);
         let mut list = List::new();
         list.append(&auth).unwrap();
@@ -119,14 +121,14 @@ impl Publisher {
             let mut transfer = handle.transfer();
             transfer
                 .write_function(|new_data| {
-                                    response.extend_from_slice(new_data);
-                                    Ok(new_data.len())
-                                })
+                    response.extend_from_slice(new_data);
+                    Ok(new_data.len())
+                })
                 .unwrap();
             transfer.perform().unwrap();
         }
 
-        trace!("response: {}", forced_string(response));
+        debug!("response: {}", forced_string(response));
     }
 
     fn handle_event(&mut self, event: Event) {

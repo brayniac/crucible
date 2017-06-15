@@ -52,13 +52,13 @@ impl Consumer {
             return Err("need publisher");
         }
         Ok(Consumer {
-               events: events.unwrap(),
-               clock: clock.unwrap(),
-               stats: stats.unwrap(),
-               publisher: publisher.unwrap(),
-               repo: repo,
-               author: author,
-           })
+            events: events.unwrap(),
+            clock: clock.unwrap(),
+            stats: stats.unwrap(),
+            publisher: publisher.unwrap(),
+            repo: repo,
+            author: author,
+        })
     }
 
     fn time(&self) -> u64 {
@@ -78,13 +78,15 @@ impl Consumer {
         sleep(Duration::new(0, 1_000_000));
     }
 
-    fn send_status(&self,
-                   repo: &str,
-                   sha: &str,
-                   state: &str,
-                   context: &str,
-                   description: &str,
-                   url: &str) {
+    fn send_status(
+        &self,
+        repo: &str,
+        sha: &str,
+        state: &str,
+        context: &str,
+        description: &str,
+        url: &str,
+    ) {
         let status = Status {
             repo: repo.to_owned(),
             sha: sha.to_owned(),
@@ -164,20 +166,24 @@ impl Consumer {
         let url = event.url().expect("event is missing a url");
 
         // inform github we're running a test
-        self.send_status(&repo,
-                         &sha,
-                         "pending",
-                         description,
-                         "pending...",
-                         "https://oxidize.io");
+        self.send_status(
+            &repo,
+            &sha,
+            "pending",
+            description,
+            "pending...",
+            "https://oxidize.io",
+        );
 
         if clone_repo(path.as_path(), &repo, &url).is_err() {
-            self.send_status(&repo,
-                             &sha,
-                             "error",
-                             description,
-                             "whoops. error.",
-                             "https://oxidize.io");
+            self.send_status(
+                &repo,
+                &sha,
+                "error",
+                description,
+                "failed to clone repo",
+                "https://oxidize.io",
+            );
             return;
         }
 
@@ -195,12 +201,14 @@ impl Consumer {
         };
 
         if status.is_err() {
-            self.send_status(&repo,
-                             &sha,
-                             "error",
-                             description,
-                             "whoops. error.",
-                             "https://oxidize.io");
+            self.send_status(
+                &repo,
+                &sha,
+                "error",
+                description,
+                "failed to sync repo",
+                "https://oxidize.io",
+            );
         } else {
             // run test
             let result_test = cargo_test(build_path.as_path());
@@ -210,20 +218,25 @@ impl Consumer {
 
             // this should send a real result
             if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() ||
-               result_fuzz.is_err() {
-                self.send_status(&repo,
-                                 &sha,
-                                 "failed",
-                                 description,
-                                 "the build failed",
-                                 "https://oxidize.io");
+                result_fuzz.is_err()
+            {
+                self.send_status(
+                    &repo,
+                    &sha,
+                    "failed",
+                    description,
+                    "test failures found",
+                    "https://oxidize.io",
+                );
             } else {
-                self.send_status(&repo,
-                                 &sha,
-                                 "success",
-                                 description,
-                                 "lgtm. shipit",
-                                 "https://oxidize.io");
+                self.send_status(
+                    &repo,
+                    &sha,
+                    "success",
+                    description,
+                    "all tests passed",
+                    "https://oxidize.io",
+                );
             }
         }
     }
@@ -243,19 +256,21 @@ fn clone_repo(path: &Path, name: &str, url: &str) -> Result<(), ()> {
         .current_dir(path)
         .output()
         .expect("failed to run git");
-    if !output.status.success() {
-        error!("clone failed!");
-        error!("{}", forced_string(output.stderr));
-        Err(())
-    } else {
-        info!("clone completed");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
+    if output.status.success() {
+        info!("git clone: complete");
         Ok(())
+    } else {
+        error!("git clone: failed");
+        Err(())
     }
 }
 
-//git fetch origin pull/7324/head:pr-7324
 fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
-    info!("fetch pr #{}", number);
+    info!("git fetch: pr #{}", number);
     let pr_ref = format!("pull/{}/head:pr-{}", number, number);
     let output = Command::new("git")
         .arg("fetch")
@@ -264,34 +279,51 @@ fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
         .current_dir(path)
         .output()
         .expect("failed to run git");
-    if !output.status.success() {
-        return Err(());
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
+    if output.status.success() {
+        info!("git fetch: pr #{}: complete", number);
+        Ok(())
+    } else {
+        info!("git fetch: pr #{}: failed", number);
+        Err(())
     }
-    Ok(())
 }
 
 fn checkout_sha(path: &Path, sha: &str) -> Result<(), ()> {
-    info!("checkout sha {}", sha);
+    info!("git checkout: sha {}", sha);
     let output = Command::new("git")
         .arg("checkout")
         .arg(sha)
         .current_dir(path)
         .output()
         .expect("failed to run git");
-    if !output.status.success() {
-        Err(())
-    } else {
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
+    if output.status.success() {
+        info!("git checkout: sha {}: complete", sha);
         Ok(())
+    } else {
+        info!("git checkout: sha {}: failed", sha);
+        Err(())
     }
 }
 
 fn cargo_test(path: &Path) -> Result<(), ()> {
-    info!("cargo test");
+    info!("cargo test: starting");
     let output = Command::new("cargo")
         .arg("test")
         .current_dir(path)
         .output()
         .expect("failed to run cargo test");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
     if output.status.success() {
         info!("cargo test: passed");
         Ok(())
@@ -302,26 +334,28 @@ fn cargo_test(path: &Path) -> Result<(), ()> {
 }
 
 fn cargo_clippy(path: &Path) -> Result<(), ()> {
-    info!("cargo clippy");
+    info!("cargo clippy: started");
     let output = Command::new("cargo")
         .arg("+nightly")
         .arg("clippy")
         .current_dir(path)
         .output()
         .expect("failed to run cargo test");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
     if output.status.success() {
         info!("cargo clippy: passed");
         Ok(())
     } else {
         info!("cargo clippy: failed");
-        info!("stdout:\n{}", forced_string(output.stdout));
-        info!("stderr:\n{}", forced_string(output.stderr));
         Err(())
     }
 }
 
 fn cargo_fmt(path: &Path) -> Result<(), ()> {
-    info!("cargo fmt");
+    info!("cargo fmt: started");
     let output = Command::new("cargo")
         .arg("fmt")
         .arg("--")
@@ -329,27 +363,30 @@ fn cargo_fmt(path: &Path) -> Result<(), ()> {
         .current_dir(path)
         .output()
         .expect("failed to run cargo fmt");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
     if output.status.success() {
         info!("cargo fmt: passed");
         Ok(())
     } else {
         info!("cargo fmt: failed");
-        info!("stdout:\n{}", forced_string(output.stdout));
-        info!("stderr:\n{}", forced_string(output.stderr));
         Err(())
     }
 }
 
 fn cargo_fuzz(path: &Path) -> Result<(), ()> {
-    info!("cargo fuzz");
+    info!("cargo fuzz: started");
     if let Ok(targets) = cargo_fuzz_list(path) {
         for t in targets {
-            info!("target: {}", t);
             if cargo_fuzz_run(path, t.clone()).is_err() {
-                info!("fuzz failure target: {}", t);
+                debug!("stop fuzzing after failure: {}", t);
+                info!("cargo fuzz: error");
                 return Err(());
             }
         }
+        info!("cargo fuzz: passed");
         return Ok(());
     } else {
         info!("no targets");
@@ -373,11 +410,12 @@ fn cargo_fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
 }
 
 fn cargo_fuzz_run(path: &Path, fuzzer: String) -> Result<(), ()> {
+    info!("cargo fuzz {}: started", fuzzer);
     let output = Command::new("cargo")
         .arg("+nightly")
         .arg("fuzz")
         .arg("run")
-        .arg(fuzzer)
+        .arg(fuzzer.clone())
         .arg("--")
         .arg("-max_total_time=60")
         .arg("-timeout=60")
@@ -386,12 +424,15 @@ fn cargo_fuzz_run(path: &Path, fuzzer: String) -> Result<(), ()> {
         .current_dir(path)
         .output()
         .expect("failed to run cargo fuzz run");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
     if output.status.success() {
+        info!("cargo fuzz {}: passed", fuzzer);
         Ok(())
     } else {
-        info!("cargo fuzz: failed to run fuzz target");
-        info!("stdout:\n{}", forced_string(output.stdout));
-        info!("stderr:\n{}", forced_string(output.stderr));
+        info!("cargo fuzz {}: failed", fuzzer);
         Err(())
     }
 }
@@ -418,9 +459,11 @@ mod tests {
 [m(B[38;5;2mfuzz_3
 [m(B"#;
         let data = data.as_bytes();
-        let expected = vec!["fuzz_1".to_owned(),
-                            "fuzz_2".to_owned(),
-                            "fuzz_3".to_owned()];
+        let expected = vec![
+            "fuzz_1".to_owned(),
+            "fuzz_2".to_owned(),
+            "fuzz_3".to_owned(),
+        ];
         let result = cargo_fuzz_list_parse(data.to_vec()).unwrap();
         assert_eq!(expected, result);
     }

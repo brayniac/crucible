@@ -54,7 +54,8 @@ impl FromStr for Push {
             let sha = parsed["after"].as_str();
 
             if git_ref.is_none() || repo.is_none() || clone_url.is_none() || sha.is_none() ||
-               author.is_none() {
+                author.is_none()
+            {
                 return Err(ParseError { _priv: () });
             }
 
@@ -84,8 +85,10 @@ mod test {
         let push = Push::from_str(payload).unwrap();
         assert_eq!(push.git_ref, "refs/heads/changes");
         assert_eq!(push.repo, "baxterthehacker/public-repo");
-        assert_eq!(push.clone_url,
-                   "https://github.com/baxterthehacker/public-repo.git");
+        assert_eq!(
+            push.clone_url,
+            "https://github.com/baxterthehacker/public-repo.git"
+        );
         assert_eq!(push.sha, "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c");
         assert_eq!(push.author, "baxterthehacker");
     }
