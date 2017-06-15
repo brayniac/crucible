@@ -8,7 +8,7 @@ extern crate json;
 extern crate tic;
 extern crate tiny_http;
 
-#[path = "../../src/metrics.rs"]
+#[path = "../../src/common/metrics.rs"]
 mod metrics;
 
 #[path = "../../src/webhook/event/mod.rs"]

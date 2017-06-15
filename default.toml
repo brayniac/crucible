@@ -1,4 +1,6 @@
 [general]
 http = "localhost:4567"
 stats = "localhost:42024"
-#token = "YOUR GITHUB TOKEN" # Set your GitHub token here
+#token = "YOUR GITHUB TOKEN" # Bearer token for posting status # Publisher
+#repo = "owner/name" # Set a repository whitelist to secure crucible
+#author = "name" # Set an author whitelist to secure crucible

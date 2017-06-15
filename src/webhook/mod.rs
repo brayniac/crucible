@@ -5,7 +5,7 @@ extern crate shuteye;
 extern crate tic;
 extern crate tiny_http;
 
-use metrics::Metric;
+use common::metrics::Metric;
 use mpmc::Queue;
 use std::default::Default;
 use std::time::Duration;
