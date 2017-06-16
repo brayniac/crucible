@@ -193,7 +193,13 @@ impl Consumer {
         info!("build path: {:?}", build_path);
 
         let status = match event {
-            Event::PullRequest(pr) => fetch_pull(build_path.as_path(), &pr.number()),
+            Event::PullRequest(pr) => {
+                let fetch = fetch_pull(build_path.as_path(), &pr.number());
+                match fetch {
+                    Ok(_) => checkout_pr(build_path.as_path(), &pr.number()),
+                    Err(_) => Err(()),
+                }
+            }
             Event::Push(push) => checkout_sha(build_path.as_path(), &push.sha()),
             _ => {
                 unreachable!();
@@ -223,7 +229,7 @@ impl Consumer {
                 self.send_status(
                     &repo,
                     &sha,
-                    "failed",
+                    "failure",
                     description,
                     "test failures found",
                     "https://oxidize.io",
@@ -288,6 +294,28 @@ fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
         Ok(())
     } else {
         info!("git fetch: pr #{}: failed", number);
+        Err(())
+    }
+}
+
+fn checkout_pr(path: &Path, number: &u64) -> Result<(), ()> {
+    info!("git checkout: pr #{}", number);
+    let branch = format!("pr-{}", number);
+    let output = Command::new("git")
+        .arg("checkout")
+        .arg(branch)
+        .current_dir(path)
+        .output()
+        .expect("failed to run git");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
+    if output.status.success() {
+        info!("git checkout: pr #{}: complete", number);
+        Ok(())
+    } else {
+        info!("git checkout: pr #{}: failed", number);
         Err(())
     }
 }
