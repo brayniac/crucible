@@ -14,7 +14,7 @@ use tiny_http::{Method, Request, Response};
 
 pub mod event;
 
-use self::event::Event;
+use self::event::{Event, EventFactory};
 
 pub struct Config {
     addr: String,
@@ -61,11 +61,12 @@ impl Config {
 }
 
 pub struct Server {
-    config: Config,
+    addr: String,
     server: tiny_http::Server,
     clock: Clocksource,
     stats: Sender<Metric>,
     events: Queue<Event>,
+    factory: EventFactory,
 }
 
 impl Server {
@@ -75,16 +76,29 @@ impl Server {
     }
 
     fn configured(config: Config) -> Result<Server, &'static str> {
-        let server = tiny_http::Server::http(&config.addr).unwrap();
+        let addr = config.addr;
+
+        let server = tiny_http::Server::http(&addr.clone()).unwrap();
         let stats = config.stats.clone().unwrap();
         let clock = config.clock.clone().unwrap();
         let events = mpmc::Queue::with_capacity(1024);
+
+        if config.secret.is_none() {
+            return Err("no secret provided to validate webhook signatures");
+        }
+
+        let factory = EventFactory::configure()
+            .set_secret(config.secret.unwrap())
+            .build()
+            .unwrap();
+
         Ok(Server {
-            config: config,
+            addr: addr,
             clock: clock,
             stats: stats,
             server: server,
             events: events,
+            factory: factory,
         })
     }
 
@@ -108,7 +122,7 @@ impl Server {
 
     // run the server forever
     pub fn run(&mut self) {
-        info!("listening HTTP {}", self.config.addr);
+        info!("listening HTTP {}", self.addr);
         loop {
             if let Ok(Some(request)) = self.server.try_recv() {
                 trace!("handle request");
@@ -129,7 +143,7 @@ impl Server {
                 match request.url() {
                     "/payload" => {
                         trace!("payload received");
-                        let event = Event::from_request(&mut request, &self.config.secret);
+                        let event = self.factory.from_request(&mut request);
                         let _ = self.events.push(event);
                         Response::empty(200)
                     }

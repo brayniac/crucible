@@ -1,9 +1,5 @@
-use hmac;
-
 use hmac::{Hmac, Mac};
-
 use rustc_serialize::hex::ToHex;
-use sha_1;
 use sha_1::Sha1;
 use tiny_http::Request;
 
@@ -15,6 +11,7 @@ pub use self::create::Create;
 pub use self::pull_request::PullRequest;
 pub use self::push::Push;
 use std::str::FromStr;
+use std::default::Default;
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -27,8 +24,50 @@ pub enum Event {
     Invalid,
 }
 
-impl Event {
-    pub fn from_request(request: &mut Request, secret: &Option<String>) -> Event {
+pub struct Config {
+    secret: Option<String>,
+}
+
+impl Config {
+    pub fn set_secret(mut self, key: String) -> Self {
+        self.secret = Some(key);
+        self
+    }
+
+    pub fn build(self) -> Result<EventFactory, ()> {
+        EventFactory::configured(self)
+    }
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            secret: None,
+        }
+    }
+}
+
+pub struct EventFactory {
+    secret: String,
+}
+
+impl EventFactory {
+    pub fn configure() -> Config {
+        Config::default()
+    }
+
+    fn configured(config: Config) -> Result<EventFactory, ()> {
+        if config.secret.is_none() {
+            return Err(());
+        }
+
+        Ok(EventFactory {
+            secret: config.secret.unwrap(),
+        })
+    }
+
+    /// create a new Event from a Request
+    pub fn from_request(&self, request: &mut Request) -> Event {
         let mut e = Event::Unknown;
         let mut content = String::new();
         request.as_reader().read_to_string(&mut content).unwrap();
@@ -48,23 +87,11 @@ impl Event {
         }
 
         if let Some(s) = signature {
-            // valid signature or return
-
-            if let Some(ref secret) = *secret {
-                let mut mac = Hmac::<Sha1>::new(secret.as_bytes());
-                mac.input(content.as_bytes());
-                let result = mac.result();
-                let code = result.code().to_hex();
-                let code = "sha1=".to_owned() + &code;
-                info!("signature: {}", s);
-                info!("calculate: {}", code);
-
-                if code != s {
-                    debug!("bad signature received!");
-                    return Event::Invalid;
-                }
+            if !self.validate_signature(s, &content) {
+                return Event::Invalid;
             }
-
+        } else {
+            return Event::Invalid;
         }
 
         if event_type.is_none() {
@@ -117,6 +144,33 @@ impl Event {
         e
     }
 
+    /// validate the signature of the json content using HMAC SHA1 with PSK
+    pub fn validate_signature(&self, signature: &str, content: &str) -> bool {
+        let tokens: Vec<&str> = signature.split("sha1=").collect();
+        
+        if tokens.len() != 2 {
+            false
+        } else {
+            let signed = tokens[1];
+            // calculate the expected signature
+            let mut mac = Hmac::<Sha1>::new(self.secret.as_bytes());
+            mac.input(content.as_bytes());
+            let expect = mac.result().code().to_hex();
+
+            info!("signed: {}", signed);
+            info!("expect: {}", expect);
+
+            if signed != expect {
+                debug!("incorrect signature received!");
+                false
+            } else {
+                true
+            }
+        }
+    }
+}
+
+impl Event {
     pub fn repo(&self) -> Option<String> {
         match self {
             &Event::PullRequest(ref pr) => Some(pr.repo()),
