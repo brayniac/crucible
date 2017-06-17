@@ -77,6 +77,8 @@ fn main() {
         .clock(clock)
         .stats(stats)
         .events(events)
+        .fuzz_seconds(config.fuzz_seconds())
+        .fuzz_cores(config.fuzz_cores())
         .publisher(publish_queue.clone());
     if let Some(repo) = config.repo() {
         info!("repo whitelist: {}", repo);

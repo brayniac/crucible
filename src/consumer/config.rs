@@ -13,6 +13,8 @@ pub struct Config {
     pub publisher: Option<Queue<publisher::Event>>,
     pub repo: Option<String>,
     pub author: Option<String>,
+    pub fuzz_seconds: usize,
+    pub fuzz_cores: usize,
 }
 
 impl Config {
@@ -49,6 +51,16 @@ impl Config {
         self.author = Some(author);
         self
     }
+
+    pub fn fuzz_cores(mut self, cores: usize) -> Self {
+        self.fuzz_cores = cores;
+        self
+    }
+
+    pub fn fuzz_seconds(mut self, seconds: usize) -> Self {
+        self.fuzz_seconds = seconds;
+        self
+    }
 }
 
 impl Default for Config {
@@ -60,6 +72,8 @@ impl Default for Config {
             repo: None,
             author: None,
             publisher: None,
+            fuzz_seconds: 60,
+            fuzz_cores: 8,
         }
     }
 }
