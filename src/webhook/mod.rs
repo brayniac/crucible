@@ -143,7 +143,7 @@ impl Server {
                 match request.url() {
                     "/payload" => {
                         trace!("payload received");
-                        let event = self.factory.from_request(&mut request);
+                        let event = self.factory.create(&mut request);
                         let _ = self.events.push(event);
                         Response::empty(200)
                     }

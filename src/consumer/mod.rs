@@ -1,20 +1,19 @@
+mod cargo;
+mod config;
+mod git;
+
+pub use self::config::Config;
+
 use common::metrics::Metric;
 use mktemp::Temp;
 use mpmc::Queue;
-use publisher;
-use publisher::Status;
-use regex::Regex;
+use publisher::{self, Status};
 use shuteye::sleep;
 use std::default::Default;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 use tic::{Clocksource, Sample, Sender};
 use webhook::event::*;
-
-mod config;
-
-pub use self::config::Config;
 
 pub struct Consumer {
     clock: Clocksource,
@@ -174,7 +173,7 @@ impl Consumer {
             "https://oxidize.io",
         );
 
-        if clone_repo(path.as_path(), &repo, &url).is_err() {
+        if git::clone_repo(path.as_path(), &repo, &url).is_err() {
             self.send_status(
                 &repo,
                 &sha,
@@ -193,13 +192,13 @@ impl Consumer {
 
         let status = match event {
             Event::PullRequest(pr) => {
-                let fetch = fetch_pull(build_path.as_path(), &pr.number());
+                let fetch = git::fetch_pull(build_path.as_path(), &pr.number());
                 match fetch {
-                    Ok(_) => checkout_pr(build_path.as_path(), &pr.number()),
+                    Ok(_) => git::checkout_pr(build_path.as_path(), &pr.number()),
                     Err(_) => Err(()),
                 }
             }
-            Event::Push(push) => checkout_sha(build_path.as_path(), &push.sha()),
+            Event::Push(push) => git::checkout_sha(build_path.as_path(), &push.sha()),
             _ => {
                 unreachable!();
             }
@@ -216,10 +215,10 @@ impl Consumer {
             );
         } else {
             // run test
-            let result_test = cargo_test(build_path.as_path());
-            let result_fmt = cargo_fmt(build_path.as_path());
-            let result_clippy = cargo_clippy(build_path.as_path());
-            let result_fuzz = cargo_fuzz(build_path.as_path());
+            let result_test = cargo::test(build_path.as_path());
+            let result_fmt = cargo::fmt(build_path.as_path());
+            let result_clippy = cargo::clippy(build_path.as_path());
+            let result_fuzz = cargo::fuzz_all(build_path.as_path());
 
             // this should send a real result
             if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() ||
@@ -249,249 +248,4 @@ impl Consumer {
 
 fn forced_string(input: Vec<u8>) -> String {
     String::from_utf8(input).unwrap_or_else(|_| "invalid utf8".to_owned())
-}
-
-// clone the repo into a build folder within the path given
-fn clone_repo(path: &Path, name: &str, url: &str) -> Result<(), ()> {
-    info!("clone repo: {}", name);
-    let output = Command::new("git")
-        .arg("clone")
-        .arg(url)
-        .arg("build")
-        .current_dir(path)
-        .output()
-        .expect("failed to run git");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("git clone: complete");
-        Ok(())
-    } else {
-        error!("git clone: failed");
-        Err(())
-    }
-}
-
-fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
-    info!("git fetch: pr #{}", number);
-    let pr_ref = format!("pull/{}/head:pr-{}", number, number);
-    let output = Command::new("git")
-        .arg("fetch")
-        .arg("origin")
-        .arg(pr_ref)
-        .current_dir(path)
-        .output()
-        .expect("failed to run git");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("git fetch: pr #{}: complete", number);
-        Ok(())
-    } else {
-        info!("git fetch: pr #{}: failed", number);
-        Err(())
-    }
-}
-
-fn checkout_pr(path: &Path, number: &u64) -> Result<(), ()> {
-    info!("git checkout: pr #{}", number);
-    let branch = format!("pr-{}", number);
-    let output = Command::new("git")
-        .arg("checkout")
-        .arg(branch)
-        .current_dir(path)
-        .output()
-        .expect("failed to run git");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("git checkout: pr #{}: complete", number);
-        Ok(())
-    } else {
-        info!("git checkout: pr #{}: failed", number);
-        Err(())
-    }
-}
-
-fn checkout_sha(path: &Path, sha: &str) -> Result<(), ()> {
-    info!("git checkout: sha {}", sha);
-    let output = Command::new("git")
-        .arg("checkout")
-        .arg(sha)
-        .current_dir(path)
-        .output()
-        .expect("failed to run git");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("git checkout: sha {}: complete", sha);
-        Ok(())
-    } else {
-        info!("git checkout: sha {}: failed", sha);
-        Err(())
-    }
-}
-
-fn cargo_test(path: &Path) -> Result<(), ()> {
-    info!("cargo test: starting");
-    let output = Command::new("cargo")
-        .arg("test")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo test");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo test: passed");
-        Ok(())
-    } else {
-        info!("cargo test: failed");
-        Err(())
-    }
-}
-
-fn cargo_clippy(path: &Path) -> Result<(), ()> {
-    info!("cargo clippy: started");
-    let output = Command::new("cargo")
-        .arg("+nightly")
-        .arg("clippy")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo test");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo clippy: passed");
-        Ok(())
-    } else {
-        info!("cargo clippy: failed");
-        Err(())
-    }
-}
-
-fn cargo_fmt(path: &Path) -> Result<(), ()> {
-    info!("cargo fmt: started");
-    let output = Command::new("cargo")
-        .arg("fmt")
-        .arg("--")
-        .arg("--write-mode=diff")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo fmt");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo fmt: passed");
-        Ok(())
-    } else {
-        info!("cargo fmt: failed");
-        Err(())
-    }
-}
-
-fn cargo_fuzz(path: &Path) -> Result<(), ()> {
-    info!("cargo fuzz: started");
-    if let Ok(targets) = cargo_fuzz_list(path) {
-        for t in targets {
-            if cargo_fuzz_run(path, t.clone()).is_err() {
-                debug!("stop fuzzing after failure: {}", t);
-                info!("cargo fuzz: error");
-                return Err(());
-            }
-        }
-        info!("cargo fuzz: passed");
-        return Ok(());
-    } else {
-        info!("no targets");
-    }
-    Err(())
-}
-
-fn cargo_fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
-    let output = Command::new("cargo")
-        .arg("fuzz")
-        .arg("list")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo fuzz list");
-    if output.status.success() {
-        cargo_fuzz_list_parse(output.stdout)
-    } else {
-        info!("cargo fuzz: failed to list fuzz targets");
-        Err(())
-    }
-}
-
-fn cargo_fuzz_run(path: &Path, fuzzer: String) -> Result<(), ()> {
-    info!("cargo fuzz {}: started", fuzzer);
-    let output = Command::new("cargo")
-        .arg("+nightly")
-        .arg("fuzz")
-        .arg("run")
-        .arg(fuzzer.clone())
-        .arg("--")
-        .arg("-max_total_time=60")
-        .arg("-timeout=60")
-        .arg("-jobs=8")
-        .arg("-workers=8")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo fuzz run");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo fuzz {}: passed", fuzzer);
-        Ok(())
-    } else {
-        info!("cargo fuzz {}: failed", fuzzer);
-        Err(())
-    }
-}
-
-// this should be fuzz tested
-fn cargo_fuzz_list_parse(stdout: Vec<u8>) -> Result<Vec<String>, ()> {
-    if let Ok(stdout) = String::from_utf8(stdout) {
-        let re = Regex::new(r"(fuzz_\w+)\n").unwrap();
-        let mut result = Vec::<String>::new();
-        for cap in re.captures_iter(&stdout) {
-            result.push(cap[1].to_owned());
-        }
-        return Ok(result);
-    }
-    Err(())
-}
-
-mod tests {
-    #[test]
-    fn test_fuzz_list_parse() {
-        use super::*;
-        let data = r#"[38;5;2mfuzz_1
-[m(B[38;5;2mfuzz_2
-[m(B[38;5;2mfuzz_3
-[m(B"#;
-        let data = data.as_bytes();
-        let expected = vec![
-            "fuzz_1".to_owned(),
-            "fuzz_2".to_owned(),
-            "fuzz_3".to_owned(),
-        ];
-        let result = cargo_fuzz_list_parse(data.to_vec()).unwrap();
-        assert_eq!(expected, result);
-    }
 }
