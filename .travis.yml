@@ -26,32 +26,32 @@ matrix:
       rust: stable
       env: TYPE=rustfmt RUST_BACKTRACE=1
       script:
-        - cargo install rustfmt || cargo fmt -- -V || cargo install -f rustfmt || exit 0
+        - (travis_wait 20 cargo install -f rustfmt || exit 0)
         - cargo fmt -- --write-mode=diff
     - os: linux
       rust: nightly
       env: TYPE=clippy RUST_BACKTRACE=1
       script:
-        - cargo clippy -V || cargo install -f clippy || exit 0
+        - (travis_wait 20 cargo install -f clippy || exit 0)
         - cargo clippy
     - os: linux
       rust: nightly
       env: TYPE=fuzz_webhook_create RUST_BACKTRACE=1
       script:
-        - cargo fuzz -V || cargo install cargo-fuzz -f
+        - (travis_wait 20 cargo install -f cargo-fuzz || exit 0)
         - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_create -- -max_total_time=300
         - sudo chown -R travis $HOME/.cargo
     - os: linux
       rust: nightly
       env: TYPE=fuzz_webhook_pull_request RUST_BACKTRACE=1
       script:
-        - cargo fuzz -V || cargo install cargo-fuzz -f
+        - (travis_wait 20 cargo install -f cargo-fuzz || exit 0)
         - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_pull_request -- -max_total_time=300
         - sudo chown -R travis $HOME/.cargo
     - os: linux
       rust: nightly
       env: TYPE=fuzz_webhook_push RUST_BACKTRACE=1
       script:
-        - cargo fuzz -V || cargo install cargo-fuzz -f
+        - (travis_wait 20 cargo install -f cargo-fuzz || exit 0)
         - sudo -E $HOME/.cargo/bin/cargo fuzz run -s address fuzz_webhook_push -- -max_total_time=300
         - sudo chown -R travis $HOME/.cargo

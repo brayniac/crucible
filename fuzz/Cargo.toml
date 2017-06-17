@@ -25,11 +25,14 @@ codegen-units = 1
 
 [dependencies]
 getopts = "0.2.14"
+hmac = "0.3.1"
 json = "0.11.6"
 log = "0.3.8"
+sha-1 = "0.4.1"
 tic = "0.2.1"
 time = "0.1.37"
 tiny_http = "0.5.8"
+rustc-serialize = "0.3.24"
 
 [dependencies.crucible]
 path = ".."

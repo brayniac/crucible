@@ -20,6 +20,7 @@ pub struct Config {
     addr: String,
     clock: Option<Clocksource>,
     stats: Option<Sender<Metric>>,
+    secret: Option<String>,
 }
 
 impl Default for Config {
@@ -28,6 +29,7 @@ impl Default for Config {
             addr: "0.0.0.0:4567".to_owned(),
             clock: None,
             stats: None,
+            secret: None,
         }
     }
 }
@@ -49,6 +51,11 @@ impl Config {
 
     pub fn stats(mut self, sender: Sender<Metric>) -> Self {
         self.stats = Some(sender);
+        self
+    }
+
+    pub fn secret(mut self, secret: Option<String>) -> Self {
+        self.secret = secret;
         self
     }
 }
@@ -73,12 +80,12 @@ impl Server {
         let clock = config.clock.clone().unwrap();
         let events = mpmc::Queue::with_capacity(1024);
         Ok(Server {
-               config: config,
-               clock: clock,
-               stats: stats,
-               server: server,
-               events: events,
-           })
+            config: config,
+            clock: clock,
+            stats: stats,
+            server: server,
+            events: events,
+        })
     }
 
     fn time(&self) -> u64 {
@@ -122,7 +129,7 @@ impl Server {
                 match request.url() {
                     "/payload" => {
                         trace!("payload received");
-                        let event = Event::from_request(&mut request);
+                        let event = Event::from_request(&mut request, &self.config.secret);
                         let _ = self.events.push(event);
                         Response::empty(200)
                     }

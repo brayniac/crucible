@@ -96,8 +96,10 @@ mod test {
         assert_eq!(event.number, 1);
         assert_eq!(event.repository, "baxterthehacker/public-repo");
         assert_eq!(event.sha, "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c");
-        assert_eq!(event.url,
-                   "https://github.com/baxterthehacker/public-repo.git");
+        assert_eq!(
+            event.url,
+            "https://github.com/baxterthehacker/public-repo.git"
+        );
         assert_eq!(event.author, "baxterthehacker");
     }
 }

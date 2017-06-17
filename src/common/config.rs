@@ -10,6 +10,7 @@ pub struct Config {
     stats: String,
     http: String,
     token: Option<String>,
+    secret: Option<String>,
     repo: Option<String>,
     author: Option<String>,
 }
@@ -20,6 +21,7 @@ impl Default for Config {
             stats: "localhost:42024".to_owned(),
             http: "localhost:4567".to_owned(),
             token: None,
+            secret: None,
             repo: None,
             author: None,
         }
@@ -75,6 +77,15 @@ impl Config {
     pub fn author(&self) -> Option<String> {
         self.author.clone()
     }
+
+    pub fn set_secret(&mut self, secret: String) -> &mut Self {
+        self.secret = Some(secret);
+        self
+    }
+
+    pub fn secret(&self) -> Option<String> {
+        self.secret.clone()
+    }
 }
 
 pub fn load_config(matches: &Matches) -> Result<Config, String> {
@@ -100,13 +111,15 @@ pub fn load_config(matches: &Matches) -> Result<Config, String> {
                 for err in &p.errors {
                     let (loline, locol) = p.to_linecol(err.lo);
                     let (hiline, hicol) = p.to_linecol(err.hi);
-                    println!("{}:{}:{}-{}:{} error: {}",
-                             toml,
-                             loline,
-                             locol,
-                             hiline,
-                             hicol,
-                             err.desc);
+                    println!(
+                        "{}:{}:{}-{}:{} error: {}",
+                        toml,
+                        loline,
+                        locol,
+                        hiline,
+                        hicol,
+                        err.desc
+                    );
                 }
                 Err("failed to load config".to_owned())
             }
@@ -121,46 +134,55 @@ fn load_config_table(table: &BTreeMap<String, Value>, matches: &Matches) -> Resu
     let mut config = Config::default();
 
     if let Some(&Table(ref general)) = table.get("general") {
-        if let Some(v) = general
-               .get("token")
-               .and_then(|k| k.as_str())
-               .map(|k| k.to_owned()) {
+        if let Some(v) = general.get("token").and_then(|k| k.as_str()).map(|k| {
+            k.to_owned()
+        })
+        {
             config.set_token(v);
         }
     }
 
     if let Some(&Table(ref general)) = table.get("general") {
-        if let Some(v) = general
-               .get("http")
-               .and_then(|k| k.as_str())
-               .map(|k| k.to_owned()) {
+        if let Some(v) = general.get("secret").and_then(|k| k.as_str()).map(|k| {
+            k.to_owned()
+        })
+        {
+            config.set_secret(v);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("general") {
+        if let Some(v) = general.get("http").and_then(|k| k.as_str()).map(
+            |k| k.to_owned(),
+        )
+        {
             config.set_http(v);
         }
     }
 
     if let Some(&Table(ref general)) = table.get("general") {
-        if let Some(v) = general
-               .get("stats")
-               .and_then(|k| k.as_str())
-               .map(|k| k.to_owned()) {
+        if let Some(v) = general.get("stats").and_then(|k| k.as_str()).map(|k| {
+            k.to_owned()
+        })
+        {
             config.set_stats(v);
         }
     }
 
     if let Some(&Table(ref general)) = table.get("general") {
-        if let Some(v) = general
-               .get("repo")
-               .and_then(|k| k.as_str())
-               .map(|k| k.to_owned()) {
+        if let Some(v) = general.get("repo").and_then(|k| k.as_str()).map(
+            |k| k.to_owned(),
+        )
+        {
             config.set_repo(v);
         }
     }
 
     if let Some(&Table(ref general)) = table.get("general") {
-        if let Some(v) = general
-               .get("author")
-               .and_then(|k| k.as_str())
-               .map(|k| k.to_owned()) {
+        if let Some(v) = general.get("author").and_then(|k| k.as_str()).map(|k| {
+            k.to_owned()
+        })
+        {
             config.set_author(v);
         }
     }
