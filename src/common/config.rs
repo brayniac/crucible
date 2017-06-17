@@ -9,6 +9,8 @@ use toml::Value::Table;
 pub struct Config {
     stats: String,
     http: String,
+    fuzz_cores: usize,
+    fuzz_seconds: usize,
     token: Option<String>,
     secret: Option<String>,
     repo: Option<String>,
@@ -20,6 +22,8 @@ impl Default for Config {
         Config {
             stats: "localhost:42024".to_owned(),
             http: "localhost:4567".to_owned(),
+            fuzz_cores: 8,
+            fuzz_seconds: 60,
             token: None,
             secret: None,
             repo: None,
@@ -81,6 +85,24 @@ impl Config {
 
     pub fn secret(&self) -> Option<String> {
         self.secret.clone()
+    }
+
+    pub fn set_fuzz_cores(&mut self, cores: usize) -> &mut Self {
+        self.fuzz_cores = cores;
+        self
+    }
+
+    pub fn fuzz_cores(&self) -> usize {
+        self.fuzz_cores
+    }
+
+    pub fn set_fuzz_seconds(&mut self, seconds: usize) -> &mut Self {
+        self.fuzz_seconds = seconds;
+        self
+    }
+
+    pub fn fuzz_seconds(&self) -> usize {
+        self.fuzz_seconds
     }
 }
 
@@ -180,6 +202,18 @@ fn load_config_table(table: &BTreeMap<String, Value>) -> Result<Config, String> 
         })
         {
             config.set_author(v);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("general") {
+        if let Some(v) = general.get("fuzz-cores").and_then(|k| k.as_integer()) {
+            config.set_fuzz_cores(v as usize);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("general") {
+        if let Some(v) = general.get("fuzz-seconds").and_then(|k| k.as_integer()) {
+            config.set_fuzz_seconds(v as usize);
         }
     }
 

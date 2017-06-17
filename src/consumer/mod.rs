@@ -1,3 +1,4 @@
+mod caching;
 mod cargo;
 mod config;
 mod git;
@@ -22,6 +23,8 @@ pub struct Consumer {
     publisher: Queue<publisher::Event>,
     repo: Option<String>,
     author: Option<String>,
+    fuzz_seconds: usize,
+    fuzz_cores: usize,
 }
 
 impl Consumer {
@@ -56,6 +59,8 @@ impl Consumer {
             publisher: publisher.unwrap(),
             repo: repo,
             author: author,
+            fuzz_seconds: config.fuzz_seconds,
+            fuzz_cores: config.fuzz_cores,
         })
     }
 
@@ -151,7 +156,7 @@ impl Consumer {
 
         let repo = event.repo().unwrap();
 
-        let temp_dir = Temp::new_dir_in(Path::new("/mnt/scratch/")).unwrap();
+        let mut temp_dir = Temp::new_dir_in(Path::new("/mnt/scratch/")).unwrap();
         let path = temp_dir.to_path_buf();
 
         let description = match event {
@@ -186,7 +191,6 @@ impl Consumer {
         }
 
         let mut build_path = path.clone();
-        info!("build path: {:?}", build_path);
         build_path.push("build");
         info!("build path: {:?}", build_path);
 
@@ -214,16 +218,44 @@ impl Consumer {
                 "https://oxidize.io",
             );
         } else {
+            // load cache
+            let cache_dir = "/mnt/cache/".to_owned() + &repo + "/stable";
+            let _ = caching::load(build_path.as_path(), Path::new(&cache_dir));
+
             // run test
-            let result_test = cargo::test(build_path.as_path());
-            let result_fmt = cargo::fmt(build_path.as_path());
-            let result_clippy = cargo::clippy(build_path.as_path());
-            let result_fuzz = cargo::fuzz_all(build_path.as_path());
+            let mut errors = 0;
+
+            let path = build_path.as_path();
+            if cargo::build(path).is_err() {
+                errors += 1;
+            }
+            if cargo::test(path).is_err() {
+                errors += 1;
+            }
+            if cargo::fmt(path).is_err() {
+                errors += 1;
+            }
+
+            // save cache and clean buid dir
+            let _ = caching::save(path, Path::new(&cache_dir));
+            let _ = cargo::clean(path);
+
+            // setup cache for nightly
+            let cache_dir = "/mnt/cache/".to_owned() + &repo + "/nightly";
+            let _ = caching::load(path, Path::new(&cache_dir));
+
+            // run nightly tests
+            if cargo::clippy(path).is_err() {
+                errors += 1;
+            }
+            if cargo::fuzz_all(path, self.fuzz_seconds, self.fuzz_cores).is_err() {
+                errors += 1;
+            }
+
+            let _ = caching::save(path, Path::new(&cache_dir));
 
             // this should send a real result
-            if result_test.is_err() || result_fmt.is_err() || result_clippy.is_err() ||
-                result_fuzz.is_err()
-            {
+            if errors > 0 {
                 self.send_status(
                     &repo,
                     &sha,
@@ -241,7 +273,10 @@ impl Consumer {
                     "all tests passed",
                     "https://oxidize.io",
                 );
+
             }
+
+            temp_dir.release();
         }
     }
 }

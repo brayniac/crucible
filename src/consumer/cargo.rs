@@ -3,6 +3,46 @@ use regex::Regex;
 use std::path::Path;
 use std::process::Command;
 
+pub fn build(path: &Path) -> Result<(), ()> {
+    info!("cargo build: starting");
+    let output = Command::new("cargo")
+        .arg("build")
+        .current_dir(path)
+        .output()
+        .expect("failed to run cargo build");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
+    if output.status.success() {
+        info!("cargo build: passed");
+        Ok(())
+    } else {
+        info!("cargo build: failed");
+        Err(())
+    }
+}
+
+pub fn clean(path: &Path) -> Result<(), ()> {
+    info!("cargo clean: starting");
+    let output = Command::new("cargo")
+        .arg("clean")
+        .current_dir(path)
+        .output()
+        .expect("failed to run cargo clean");
+
+    debug!("stdout:\n{}", forced_string(output.stdout));
+    debug!("stderr:\n{}", forced_string(output.stderr));
+
+    if output.status.success() {
+        info!("cargo clean: ok");
+        Ok(())
+    } else {
+        info!("cargo clean: error");
+        Err(())
+    }
+}
+
 pub fn test(path: &Path) -> Result<(), ()> {
     info!("cargo test: starting");
     let output = Command::new("cargo")
@@ -66,11 +106,11 @@ pub fn fmt(path: &Path) -> Result<(), ()> {
     }
 }
 
-pub fn fuzz_all(path: &Path) -> Result<(), ()> {
+pub fn fuzz_all(path: &Path, seconds: usize, cores: usize) -> Result<(), ()> {
     info!("cargo fuzz: started");
     if let Ok(targets) = fuzz_list(path) {
         for t in targets {
-            if fuzz_run(path, &t).is_err() {
+            if fuzz_run(path, &t, seconds, cores).is_err() {
                 debug!("stop fuzzing after failure: {}", t);
                 info!("cargo fuzz: error");
                 return Err(());
@@ -99,7 +139,7 @@ pub fn fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
     }
 }
 
-pub fn fuzz_run(path: &Path, fuzzer: &str) -> Result<(), ()> {
+pub fn fuzz_run(path: &Path, fuzzer: &str, seconds: usize, cores: usize) -> Result<(), ()> {
     info!("cargo fuzz {}: started", fuzzer);
     let output = Command::new("cargo")
         .arg("+nightly")
@@ -107,10 +147,10 @@ pub fn fuzz_run(path: &Path, fuzzer: &str) -> Result<(), ()> {
         .arg("run")
         .arg(fuzzer)
         .arg("--")
-        .arg("-max_total_time=60")
-        .arg("-timeout=60")
-        .arg("-jobs=8")
-        .arg("-workers=8")
+        .arg(format!("-max_total_time={}", seconds))
+        .arg(format!("-timeout={}", seconds))
+        .arg(format!("-jobs={}", cores))
+        .arg(format!("-workers={}", cores))
         .current_dir(path)
         .output()
         .expect("failed to run cargo fuzz run");
