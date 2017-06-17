@@ -29,10 +29,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn set_token(&mut self, token: String) -> &mut Self {
         self.token = Some(token);
         self
@@ -104,7 +100,7 @@ pub fn load_config(matches: &Matches) -> Result<Config, String> {
         match p.parse() {
             Some(table) => {
                 debug!("toml parsed successfully. creating config");
-                load_config_table(&table, matches)
+                load_config_table(&table)
             }
 
             None => {
@@ -129,7 +125,7 @@ pub fn load_config(matches: &Matches) -> Result<Config, String> {
     }
 }
 
-fn load_config_table(table: &BTreeMap<String, Value>, matches: &Matches) -> Result<Config, String> {
+fn load_config_table(table: &BTreeMap<String, Value>) -> Result<Config, String> {
 
     let mut config = Config::default();
 
@@ -187,14 +183,5 @@ fn load_config_table(table: &BTreeMap<String, Value>, matches: &Matches) -> Resu
         }
     }
 
-    // get any overrides from the command line
-    try!(config_overrides(&mut config, matches));
-
     Ok(config)
-}
-
-/// Override parameters using command line arguments
-fn config_overrides(config: &mut Config, matches: &Matches) -> Result<(), String> {
-
-    Ok(())
 }

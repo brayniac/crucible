@@ -1,15 +1,10 @@
 use common::metrics::Metric;
 use curl::easy::{Easy, List};
-use mktemp::Temp;
 use mpmc::Queue;
-use regex::Regex;
 use shuteye::sleep;
 use std::default::Default;
-use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 use tic::{Clocksource, Sample, Sender};
-use webhook::event::*;
 
 mod config;
 

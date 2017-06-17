@@ -1,5 +1,4 @@
 use common::metrics::Metric;
-use curl::easy::{Easy, List};
 use mktemp::Temp;
 use mpmc::Queue;
 use publisher;
