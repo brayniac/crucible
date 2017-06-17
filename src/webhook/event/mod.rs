@@ -10,8 +10,8 @@ mod push;
 pub use self::create::Create;
 pub use self::pull_request::PullRequest;
 pub use self::push::Push;
-use std::str::FromStr;
 use std::default::Default;
+use std::str::FromStr;
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -41,9 +41,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config {
-            secret: None,
-        }
+        Config { secret: None }
     }
 }
 
@@ -61,9 +59,7 @@ impl EventFactory {
             return Err(());
         }
 
-        Ok(EventFactory {
-            secret: config.secret.unwrap(),
-        })
+        Ok(EventFactory { secret: config.secret.unwrap() })
     }
 
     /// create a new Event from a Request
@@ -147,7 +143,7 @@ impl EventFactory {
     /// validate the signature of the json content using HMAC SHA1 with PSK
     pub fn validate_signature(&self, signature: &str, content: &str) -> bool {
         let tokens: Vec<&str> = signature.split("sha1=").collect();
-        
+
         if tokens.len() != 2 {
             false
         } else {
