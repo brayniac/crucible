@@ -62,5 +62,5 @@ name = "fuzz_webhook_push"
 path = "fuzzers/webhook_push.rs"
 
 [[bin]]
-name = "cargo_fuzz_list_parse"
+name = "fuzz_cargo_fuzz_list_parse"
 path = "fuzzers/cargo_fuzz_list_parse.rs"
