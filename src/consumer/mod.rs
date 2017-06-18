@@ -25,6 +25,7 @@ pub struct Consumer {
     author: Option<String>,
     fuzz_seconds: usize,
     fuzz_cores: usize,
+    keep_temp: bool,
 }
 
 impl Consumer {
@@ -61,6 +62,7 @@ impl Consumer {
             author: author,
             fuzz_seconds: config.fuzz_seconds,
             fuzz_cores: config.fuzz_cores,
+            keep_temp: false,
         })
     }
 
@@ -226,10 +228,16 @@ impl Consumer {
             let mut errors = 0;
 
             let path = build_path.as_path();
-            if cargo::build(path).is_err() {
+            if cargo::build(path, false).is_err() {
                 errors += 1;
             }
-            if cargo::test(path).is_err() {
+            if cargo::build(path, true).is_err() {
+                errors += 1;
+            }
+            if cargo::test(path, false).is_err() {
+                errors += 1;
+            }
+            if cargo::test(path, true).is_err() {
                 errors += 1;
             }
             if cargo::fmt(path).is_err() {
@@ -245,6 +253,18 @@ impl Consumer {
             let _ = caching::load(path, Path::new(&cache_dir));
 
             // run nightly tests
+            if cargo::build(path, false).is_err() {
+                errors += 1;
+            }
+            if cargo::build(path, true).is_err() {
+                errors += 1;
+            }
+            if cargo::test(path, false).is_err() {
+                errors += 1;
+            }
+            if cargo::test(path, true).is_err() {
+                errors += 1;
+            }
             if cargo::clippy(path).is_err() {
                 errors += 1;
             }
@@ -275,8 +295,9 @@ impl Consumer {
                 );
 
             }
-
-            temp_dir.release();
+            if self.keep_temp {
+                temp_dir.release();
+            }
         }
     }
 }

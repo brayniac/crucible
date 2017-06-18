@@ -3,22 +3,30 @@ use regex::Regex;
 use std::path::Path;
 use std::process::Command;
 
-pub fn build(path: &Path) -> Result<(), ()> {
-    info!("cargo build: starting");
-    let output = Command::new("cargo")
-        .arg("build")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo build");
+pub fn build(path: &Path, release: bool) -> Result<(), ()> {
+    let label = match release {
+        true => "cargo build --release:",
+        false => "cargo build:",
+    };
 
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
+    info!("{} starting", label);
+    let mut command = Command::new("cargo");
+    command.arg("build").arg("--verbose");
+    if release {
+        command.arg("--release");
+    }
+    let output = command.current_dir(path).output().expect(
+        "failed to run cargo build",
+    );
+
+    debug!("{} stdout:\n{}", label, forced_string(output.stdout));
+    debug!("{} stderr:\n{}", label, forced_string(output.stderr));
 
     if output.status.success() {
-        info!("cargo build: passed");
+        info!("{} passed", label);
         Ok(())
     } else {
-        info!("cargo build: failed");
+        info!("{} failed", label);
         Err(())
     }
 }
@@ -43,22 +51,30 @@ pub fn clean(path: &Path) -> Result<(), ()> {
     }
 }
 
-pub fn test(path: &Path) -> Result<(), ()> {
-    info!("cargo test: starting");
-    let output = Command::new("cargo")
-        .arg("test")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo test");
+pub fn test(path: &Path, release: bool) -> Result<(), ()> {
+    let label = match release {
+        true => "cargo test --release:",
+        false => "cargo test:",
+    };
 
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
+    info!("{} starting", label);
+    let mut command = Command::new("cargo");
+    command.arg("test").arg("--verbose");
+    if release {
+        command.arg("--release");
+    }
+    let output = command.current_dir(path).output().expect(
+        "failed to run cargo test",
+    );
+
+    debug!("{} stdout:\n{}", label, forced_string(output.stdout));
+    debug!("{} stderr:\n{}", label, forced_string(output.stderr));
 
     if output.status.success() {
-        info!("cargo test: passed");
+        info!("{} passed", label);
         Ok(())
     } else {
-        info!("cargo test: failed");
+        info!("{} failed", label);
         Err(())
     }
 }
