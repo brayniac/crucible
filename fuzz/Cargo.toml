@@ -24,14 +24,20 @@ debug-assertions = false
 codegen-units = 1
 
 [dependencies]
+curl = "0.4.6"
 getopts = "0.2.14"
 hmac = "0.3.1"
 json = "0.11.6"
 log = "0.3.8"
+mktemp = "0.3.1"
+mpmc = "0.1.2"
+regex = "0.2.2"
 sha-1 = "0.4.1"
+shuteye = "0.3.2"
 tic = "0.2.1"
 time = "0.1.37"
 tiny_http = "0.5.8"
+toml = "=0.2.1"
 rustc-serialize = "0.3.24"
 
 [dependencies.crucible]
@@ -54,3 +60,7 @@ path = "fuzzers/webhook_pull_request.rs"
 [[bin]]
 name = "fuzz_webhook_push"
 path = "fuzzers/webhook_push.rs"
+
+[[bin]]
+name = "cargo_fuzz_list_parse"
+path = "fuzzers/cargo_fuzz_list_parse.rs"

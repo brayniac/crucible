@@ -302,6 +302,6 @@ impl Consumer {
     }
 }
 
-fn forced_string(input: Vec<u8>) -> String {
+pub fn forced_string(input: Vec<u8>) -> String {
     String::from_utf8(input).unwrap_or_else(|_| "invalid utf8".to_owned())
 }
