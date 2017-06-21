@@ -25,6 +25,7 @@ pub fn clone_repo(path: &Path, name: &str, url: &str) -> Result<(), ()> {
     }
 }
 
+// fetch the pull request with the given number
 pub fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
     info!("git fetch: pr #{}", number);
     let pr_ref = format!("pull/{}/head:pr-{}", number, number);
@@ -48,6 +49,7 @@ pub fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
     }
 }
 
+// checkout the given pr after fetch
 pub fn checkout_pr(path: &Path, number: &u64) -> Result<(), ()> {
     info!("git checkout: pr #{}", number);
     let branch = format!("pr-{}", number);
@@ -70,6 +72,7 @@ pub fn checkout_pr(path: &Path, number: &u64) -> Result<(), ()> {
     }
 }
 
+// checkout the given sha
 pub fn checkout_sha(path: &Path, sha: &str) -> Result<(), ()> {
     info!("git checkout: sha {}", sha);
     let output = Command::new("git")

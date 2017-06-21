@@ -3,7 +3,56 @@ use regex::Regex;
 use std::path::Path;
 use std::process::Command;
 
-pub fn build(path: &Path, release: bool) -> Result<(), ()> {
+pub struct Cargo {
+    path: String,
+    release: bool,
+    target: Option<String>,
+}
+
+impl Cargo {
+    pub fn new(path: String) -> Cargo {
+        Cargo {
+            path: path,
+            release: false,
+            target: None,
+        }
+    }
+
+    pub fn build(&self) -> Result<(), ()> {
+        build(Path::new(&self.path), self.release, self.target.clone())
+    }
+
+    pub fn clean(&self) -> Result<(), ()> {
+        clean(Path::new(&self.path))
+    }
+
+    pub fn clippy(&self) -> Result<(), ()> {
+        clippy(Path::new(&self.path))
+    }
+
+    pub fn test(&self) -> Result<(), ()> {
+        test(Path::new(&self.path), self.release, self.target.clone())
+    }
+
+    pub fn fmt(&self) -> Result<(), ()> {
+        fmt(Path::new(&self.path))
+    }
+
+    pub fn fuzz_all(&self, seconds: usize, cores: usize) -> Result<(), ()> {
+        fuzz_all(Path::new(&self.path), seconds, cores)
+    }
+
+    pub fn set_release(&mut self, enable: bool) {
+        self.release = enable;
+    }
+
+    pub fn set_target(&mut self, target: String) {
+        self.target = Some(target);
+    }
+}
+
+// run cargo build in given path in either debug or release mode
+fn build(path: &Path, release: bool, target: Option<String>) -> Result<(), ()> {
     let label = match release {
         true => "cargo build --release:",
         false => "cargo build:",
@@ -14,6 +63,10 @@ pub fn build(path: &Path, release: bool) -> Result<(), ()> {
     command.arg("build").arg("--verbose");
     if release {
         command.arg("--release");
+    }
+    if let Some(t) = target {
+        command.arg("--target");
+        command.arg(t);
     }
     let output = command.current_dir(path).output().expect(
         "failed to run cargo build",
@@ -31,7 +84,8 @@ pub fn build(path: &Path, release: bool) -> Result<(), ()> {
     }
 }
 
-pub fn clean(path: &Path) -> Result<(), ()> {
+// run cargo clean in the given path
+fn clean(path: &Path) -> Result<(), ()> {
     info!("cargo clean: starting");
     let output = Command::new("cargo")
         .arg("clean")
@@ -51,7 +105,7 @@ pub fn clean(path: &Path) -> Result<(), ()> {
     }
 }
 
-pub fn test(path: &Path, release: bool) -> Result<(), ()> {
+fn test(path: &Path, release: bool, target: Option<String>) -> Result<(), ()> {
     let label = match release {
         true => "cargo test --release:",
         false => "cargo test:",
@@ -62,6 +116,10 @@ pub fn test(path: &Path, release: bool) -> Result<(), ()> {
     command.arg("test").arg("--verbose");
     if release {
         command.arg("--release");
+    }
+    if let Some(t) = target {
+        command.arg("--target");
+        command.arg(t);
     }
     let output = command.current_dir(path).output().expect(
         "failed to run cargo test",
@@ -79,7 +137,9 @@ pub fn test(path: &Path, release: bool) -> Result<(), ()> {
     }
 }
 
-pub fn clippy(path: &Path) -> Result<(), ()> {
+// run cargo clippy
+// toolchain: nightly
+fn clippy(path: &Path) -> Result<(), ()> {
     info!("cargo clippy: started");
     let output = Command::new("cargo")
         .arg("+nightly")
@@ -100,7 +160,9 @@ pub fn clippy(path: &Path) -> Result<(), ()> {
     }
 }
 
-pub fn fmt(path: &Path) -> Result<(), ()> {
+// run cargo fmt detecting differences
+// toolchain: stable
+fn fmt(path: &Path) -> Result<(), ()> {
     info!("cargo fmt: started");
     let output = Command::new("cargo")
         .arg("fmt")
@@ -122,7 +184,9 @@ pub fn fmt(path: &Path) -> Result<(), ()> {
     }
 }
 
-pub fn fuzz_all(path: &Path, seconds: usize, cores: usize) -> Result<(), ()> {
+// run all of the fuzzers defined within the given path
+// toolchain: nightly
+fn fuzz_all(path: &Path, seconds: usize, cores: usize) -> Result<(), ()> {
     info!("cargo fuzz: started");
     if let Ok(targets) = fuzz_list(path) {
         for t in targets {
@@ -140,8 +204,11 @@ pub fn fuzz_all(path: &Path, seconds: usize, cores: usize) -> Result<(), ()> {
     Err(())
 }
 
-pub fn fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
+// lists the available fuzzers
+// toolchain: nightly
+fn fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
     let output = Command::new("cargo")
+        .arg("+nightly")
         .arg("fuzz")
         .arg("list")
         .current_dir(path)
@@ -155,8 +222,10 @@ pub fn fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
     }
 }
 
-pub fn fuzz_run(path: &Path, fuzzer: &str, seconds: usize, cores: usize) -> Result<(), ()> {
-    info!("cargo fuzz {}: started", fuzzer);
+// run the named fuzzer in the given path
+fn fuzz_run(path: &Path, fuzzer: &str, seconds: usize, cores: usize) -> Result<(), ()> {
+    let label = format!("cargo fuzz {}:", fuzzer);
+    info!("{} started", label);
     let output = Command::new("cargo")
         .arg("+nightly")
         .arg("fuzz")
@@ -183,7 +252,8 @@ pub fn fuzz_run(path: &Path, fuzzer: &str, seconds: usize, cores: usize) -> Resu
     }
 }
 
-// this should be fuzz tested
+// parse the output of "cargo fuzz list" to get list of fuzz test names
+// note: marked pub for fuzz testing
 pub fn fuzz_list_parse(stdout: Vec<u8>) -> Result<Vec<String>, ()> {
     if let Ok(stdout) = String::from_utf8(stdout) {
         let re = Regex::new(r"(fuzz_\w+)\n").unwrap();
