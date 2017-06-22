@@ -22,8 +22,16 @@ mod publisher;
 
 use common::logging::set_log_level;
 use consumer::cargo;
+use getopts::Matches;
 use getopts::Options;
 use std::{env, process};
+use std::collections::BTreeMap;
+use std::default::Default;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use toml::{Parser, Value};
+use toml::Value::Table;
 
 pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 pub const PROGRAM: &'static str = env!("CARGO_PKG_NAME");
@@ -86,6 +94,130 @@ pub fn init() -> getopts::Matches {
     options
 }
 
+pub struct Config {
+    fuzz: bool,
+    fuzz_cores: usize,
+    fuzz_seconds: usize,
+    cross: bool,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            fuzz: true,
+            fuzz_cores: 1,
+            fuzz_seconds: 10,
+            cross: true,
+        }
+    }
+}
+
+impl Config {
+    pub fn set_fuzz_cores(&mut self, cores: usize) -> &mut Self {
+        self.fuzz_cores = cores;
+        self
+    }
+
+    pub fn fuzz_cores(&self) -> usize {
+        self.fuzz_cores
+    }
+
+    pub fn set_fuzz_seconds(&mut self, seconds: usize) -> &mut Self {
+        self.fuzz_seconds = seconds;
+        self
+    }
+
+    pub fn fuzz_seconds(&self) -> usize {
+        self.fuzz_seconds
+    }
+
+    pub fn set_fuzz(&mut self, enable: bool) -> &mut Self {
+        self.fuzz = enable;
+        self
+    }
+
+    pub fn fuzz(&self) -> bool {
+        self.fuzz
+    }
+
+    pub fn set_cross(&mut self, enable: bool) -> &mut Self {
+        self.cross = enable;
+        self
+    }
+
+    pub fn cross(&self) -> bool {
+        self.cross
+    }
+}
+
+pub fn load_config(path: &Path, matches: &Matches) -> Result<Config, String> {
+    let cfg_txt = match File::open(path) {
+        Ok(mut f) => {
+            let mut cfg_txt = String::new();
+            f.read_to_string(&mut cfg_txt).unwrap();
+            cfg_txt
+        }
+        Err(e) => return Err(format!("Error opening config: {}", e)),
+    };
+
+    let mut p = Parser::new(&cfg_txt);
+
+    match p.parse() {
+        Some(table) => {
+            debug!("toml parsed successfully. creating config");
+            load_config_table(&table)
+        }
+
+        None => {
+            for err in &p.errors {
+                let (loline, locol) = p.to_linecol(err.lo);
+                let (hiline, hicol) = p.to_linecol(err.hi);
+                println!(
+                    "{:?}:{}:{}-{}:{} error: {}",
+                    path,
+                    loline,
+                    locol,
+                    hiline,
+                    hicol,
+                    err.desc
+                );
+            }
+            Err("failed to load config".to_owned())
+        }
+    }
+}
+
+fn load_config_table(table: &BTreeMap<String, Value>) -> Result<Config, String> {
+
+    let mut config = Config::default();
+
+    if let Some(&Table(ref general)) = table.get("fuzz") {
+        if let Some(v) = general.get("enable").and_then(|k| k.as_bool()) {
+            config.set_fuzz(v as bool);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("fuzz") {
+        if let Some(v) = general.get("cores").and_then(|k| k.as_integer()) {
+            config.set_fuzz_cores(v as usize);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("fuzz") {
+        if let Some(v) = general.get("seconds").and_then(|k| k.as_integer()) {
+            config.set_fuzz_seconds(v as usize);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("cross") {
+        if let Some(v) = general.get("enable").and_then(|k| k.as_bool()) {
+            config.set_cross(v as bool);
+        }
+    }
+
+    Ok(config)
+}
+
 fn main() {
     let options = init();
 
@@ -93,17 +225,7 @@ fn main() {
     set_log_level(options.opt_count("verbose"));
     info!("{} {}", PROGRAM, VERSION);
 
-    let fuzz_duration: usize = options
-        .opt_str("fuzz-duration")
-        .unwrap_or("10".to_owned())
-        .parse()
-        .expect("--fuzz-duration invalid");
-
-    let fuzz_cores: usize = options
-        .opt_str("fuzz-cores")
-        .unwrap_or("1".to_owned())
-        .parse()
-        .expect("--fuzz-duration invalid");
+    let config = load_config(Path::new(".crucible.toml"), &options).unwrap_or(Config::default());
 
     // complete set of tests - native target
     let mut cargo = cargo::Cargo::new(".".to_owned());
@@ -114,15 +236,15 @@ fn main() {
         cargo.clippy().expect("cargo clippy: failed");
     }
     if !options.opt_present("no-fuzz") {
-        cargo.fuzz_all(fuzz_duration, fuzz_cores).expect(
-            "cargo fuzz: failed",
-        );
+        cargo
+            .fuzz_all(config.fuzz_seconds(), config.fuzz_cores())
+            .expect("cargo fuzz: failed");
     }
     cargo.set_release(true);
     cargo.build().expect("cargo build --release: failed");
     cargo.test().expect("cargo test --release: failed");
 
-    if !options.opt_present("no-cross") {
+    if !options.opt_present("no-cross") && config.cross() {
         let targets = vec![
             "aarch64-unknown-linux-gnu", // Tier-2
             "arm-unknown-linux-gnueabi", // Tier-2
