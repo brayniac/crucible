@@ -15,6 +15,14 @@ readme = "README.md"
 
 keywords = [ ]
 
+[[bin]]
+name = "crucible"
+path = "./src/main.rs"
+
+[[bin]]
+name = "cargo-crucible"
+path = "./src/cargo-crucible.rs"
+
 [profile.bench]
 opt-level = 3
 debug = true

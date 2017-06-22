@@ -1,5 +1,5 @@
 mod caching;
-mod cargo;
+pub mod cargo;
 mod config;
 mod git;
 
@@ -228,47 +228,52 @@ impl Consumer {
             let mut errors = 0;
 
             let path = build_path.as_path();
-            if cargo::build(path, false).is_err() {
+            let mut cargo = cargo::Cargo::new(path.to_str().unwrap().to_owned());
+
+            if cargo.build().is_err() {
                 errors += 1;
             }
-            if cargo::build(path, true).is_err() {
+            if cargo.test().is_err() {
                 errors += 1;
             }
-            if cargo::test(path, false).is_err() {
+            if cargo.fmt().is_err() {
                 errors += 1;
             }
-            if cargo::test(path, true).is_err() {
+            cargo.set_release(true);
+            if cargo.build().is_err() {
                 errors += 1;
             }
-            if cargo::fmt(path).is_err() {
+            if cargo.test().is_err() {
                 errors += 1;
             }
 
             // save cache and clean buid dir
             let _ = caching::save(path, Path::new(&cache_dir));
-            let _ = cargo::clean(path);
+            let _ = cargo.clean();
+            cargo.set_release(false);
 
             // setup cache for nightly
             let cache_dir = "/mnt/cache/".to_owned() + &repo + "/nightly";
             let _ = caching::load(path, Path::new(&cache_dir));
 
             // run nightly tests
-            if cargo::build(path, false).is_err() {
+            if cargo.build().is_err() {
                 errors += 1;
             }
-            if cargo::build(path, true).is_err() {
+            if cargo.test().is_err() {
                 errors += 1;
             }
-            if cargo::test(path, false).is_err() {
+            if cargo.clippy().is_err() {
                 errors += 1;
             }
-            if cargo::test(path, true).is_err() {
+            if cargo.fuzz_all(self.fuzz_seconds, self.fuzz_cores).is_err() {
                 errors += 1;
             }
-            if cargo::clippy(path).is_err() {
+            cargo.set_release(true);
+            if cargo.build().is_err() {
                 errors += 1;
             }
-            if cargo::fuzz_all(path, self.fuzz_seconds, self.fuzz_cores).is_err() {
+            if cargo.test().is_err() {
                 errors += 1;
             }
 
