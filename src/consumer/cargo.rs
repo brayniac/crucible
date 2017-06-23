@@ -53,9 +53,10 @@ impl Cargo {
 
 // run cargo build in given path in either debug or release mode
 fn build(path: &Path, release: bool, target: Option<String>) -> Result<(), ()> {
-    let label = match release {
-        true => "cargo build --release:",
-        false => "cargo build:",
+    let label = if release {
+        "cargo build --release:"
+    } else {
+        "cargo build:"
     };
 
     info!("{} starting", label);
@@ -106,9 +107,10 @@ fn clean(path: &Path) -> Result<(), ()> {
 }
 
 fn test(path: &Path, release: bool, target: Option<String>) -> Result<(), ()> {
-    let label = match release {
-        true => "cargo test --release:",
-        false => "cargo test:",
+    let label = if release {
+        "cargo test --release:"
+    } else {
+        "cargo test:"
     };
 
     info!("{} starting", label);
