@@ -15,6 +15,7 @@ pub struct Config {
     pub author: Option<String>,
     pub fuzz_seconds: usize,
     pub fuzz_cores: usize,
+    pub fuzz_len: usize,
 }
 
 impl Default for Config {
@@ -27,7 +28,8 @@ impl Default for Config {
             author: None,
             publisher: None,
             fuzz_seconds: 60,
-            fuzz_cores: 8,
+            fuzz_cores: 1,
+            fuzz_len: 64,
         }
     }
 }

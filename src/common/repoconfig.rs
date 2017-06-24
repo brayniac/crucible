@@ -10,6 +10,7 @@ pub struct Config {
     fuzz: bool,
     fuzz_cores: usize,
     fuzz_seconds: usize,
+    fuzz_len: usize,
     cross: bool,
 }
 
@@ -18,7 +19,8 @@ impl Default for Config {
         Config {
             fuzz: true,
             fuzz_cores: 1,
-            fuzz_seconds: 10,
+            fuzz_seconds: 60,
+            fuzz_len: 64,
             cross: true,
         }
     }
@@ -43,6 +45,16 @@ impl Config {
     #[allow(dead_code)]
     pub fn fuzz_seconds(&self) -> usize {
         self.fuzz_seconds
+    }
+
+    pub fn set_fuzz_len(&mut self, bytes: usize) -> &mut Self {
+        self.fuzz_len = bytes;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn fuzz_len(&self) -> usize {
+        self.fuzz_len
     }
 
     pub fn set_fuzz(&mut self, enable: bool) -> &mut Self {
@@ -120,6 +132,12 @@ fn load_config_table(table: &BTreeMap<String, Value>) -> Result<Config, String> 
     if let Some(&Table(ref general)) = table.get("fuzz") {
         if let Some(v) = general.get("seconds").and_then(|k| k.as_integer()) {
             config.set_fuzz_seconds(v as usize);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("fuzz") {
+        if let Some(v) = general.get("length").and_then(|k| k.as_integer()) {
+            config.set_fuzz_len(v as usize);
         }
     }
 
