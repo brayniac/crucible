@@ -4,8 +4,9 @@ mod config;
 mod git;
 
 pub use self::config::Config;
-
 use common::metrics::Metric;
+
+use common::repoconfig;
 use mktemp::Temp;
 use mpmc::Queue;
 use publisher::{self, Status};
@@ -162,8 +163,8 @@ impl Consumer {
         let path = temp_dir.to_path_buf();
 
         let description = match event {
-            Event::Push(_) => "continuous-integration/crucible/push",
-            Event::PullRequest(_) => "continuous-integration/crucible/pr",
+            Event::Push(_) => "continuous-integration/oxidize-io/push",
+            Event::PullRequest(_) => "continuous-integration/oxidize-io/pr",
             _ => unreachable!(),
         };
 
@@ -220,6 +221,10 @@ impl Consumer {
                 "https://oxidize.io",
             );
         } else {
+            // load repo's .crucible.toml
+            let mut file = build_path.clone();
+            file.push(".crucible.toml");
+            let repo_config = repoconfig::load_config(file.as_path()).unwrap_or_default();
             // load cache
             let cache_dir = "/mnt/cache/".to_owned() + &repo + "/stable";
             let _ = caching::load(build_path.as_path(), Path::new(&cache_dir));
@@ -266,8 +271,10 @@ impl Consumer {
             if cargo.clippy().is_err() {
                 errors += 1;
             }
-            if cargo.fuzz_all(self.fuzz_seconds, self.fuzz_cores).is_err() {
-                errors += 1;
+            if repo_config.fuzz() {
+                if cargo.fuzz_all(self.fuzz_seconds, self.fuzz_cores).is_err() {
+                    errors += 1;
+                }
             }
             cargo.set_release(true);
             if cargo.build().is_err() {
@@ -278,8 +285,51 @@ impl Consumer {
             }
 
             let _ = caching::save(path, Path::new(&cache_dir));
+            let _ = cargo.clean();
+            cargo.set_release(false);
 
-            // this should send a real result
+            if repo_config.cross() {
+                let targets = vec![
+                    "aarch64-unknown-linux-gnu", // Tier-2
+                    "arm-unknown-linux-gnueabi", // Tier-2
+                    "arm-unknown-linux-gnueabihf", // Tier-2
+                    "armv7-unknown-linux-gnueabihf", // Tier-2
+                    "i686-unknown-linux-gnu", // Tier-1
+                    "i686-unknown-linux-musl", // Tier-2
+                    "x86_64-unknown-linux-gnu", // Tier-1
+                    "x86_64-unknown-linux-musl", // Tier-2
+                ];
+
+                for target in targets {
+                    // setup cache for target
+                    for channel in vec!["stable", "nightly"] {
+                        let cache_dir = "/mnt/cache/".to_owned() + &repo + "/" + channel + "-" +
+                            target;
+                        let _ = caching::load(path, Path::new(&cache_dir));
+
+                        cargo.set_target(target.to_owned());
+                        if cargo.build().is_err() {
+                            errors += 1;
+                        }
+                        if cargo.test().is_err() {
+                            errors += 1;
+                        }
+                        cargo.set_release(true);
+                        if cargo.build().is_err() {
+                            errors += 1;
+                        }
+                        if cargo.test().is_err() {
+                            errors += 1;
+                        }
+
+                        let _ = caching::save(path, Path::new(&cache_dir));
+                        let _ = cargo.clean();
+                        cargo.set_release(false);
+                    }
+                }
+            }
+
+            // report result
             if errors > 0 {
                 self.send_status(
                     &repo,
