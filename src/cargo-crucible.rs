@@ -23,10 +23,10 @@ mod publisher;
 
 use common::logging::set_log_level;
 use common::repoconfig;
-use consumer::cargo;
+use consumer::cargo::{Cargo, Channel, Profile, Triple};
 use getopts::Options;
 use std::{env, process};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 pub const PROGRAM: &'static str = env!("CARGO_PKG_NAME");
@@ -56,6 +56,7 @@ fn opts() -> Options {
         "number of cores to use during fuzzing",
         "[CORES]",
     );
+    opts.optopt("d", "fuzz-length", "max length of fuzz input", "[BYTES]");
 
     // cross targets
     opts.optflag("", "no-cross", "skip cross targets");
@@ -96,51 +97,67 @@ fn main() {
     set_log_level(options.opt_count("verbose"));
     info!("{} {}", PROGRAM, VERSION);
 
-    let config = repoconfig::load_config(Path::new(".crucible.toml")).unwrap_or_default();
+    // load config from file, override with command line
+    let mut config = repoconfig::load_config(Path::new(".crucible.toml")).unwrap_or_default();
+    if let Some(s) = options.opt_str("fuzz-duration") {
+        let v = s.parse().expect("ERROR: fuzz-duration invalid");
+        config.set_fuzz_seconds(v);
+    }
+    if let Some(s) = options.opt_str("fuzz-cores") {
+        let v = s.parse().expect("ERROR: fuzz-cores invalid");
+        config.set_fuzz_cores(v);
+    }
+    if let Some(s) = options.opt_str("fuzz-length") {
+        let v = s.parse().expect("ERROR: fuzz-length invalid");
+        config.set_fuzz_len(v);
+    }
 
     // complete set of tests - native target
-    let mut cargo = cargo::Cargo::new(".".to_owned());
-    cargo.build().expect("cargo build: failed");
-    cargo.test().expect("cargo test: failed");
+    let mut cargo = Cargo::new(PathBuf::from("."));
+    build_test(&mut cargo);
     cargo.fmt().expect("cargo fmt: failed");
     if !options.opt_present("no-clippy") {
         cargo.clippy().expect("cargo clippy: failed");
     }
     if !options.opt_present("no-fuzz") {
-        cargo
-            .fuzz_all(config.fuzz_seconds(), config.fuzz_cores())
-            .expect("cargo fuzz: failed");
+        cargo.set_fuzz_seconds(config.fuzz_seconds());
+        cargo.set_fuzz_cores(config.fuzz_cores());
+        cargo.set_fuzz_len(config.fuzz_len());
+        cargo.fuzz_all().expect("cargo fuzz: failed");
     }
-    cargo.set_release(true);
-    cargo.build().expect("cargo build --release: failed");
-    cargo.test().expect("cargo test --release: failed");
 
     if !options.opt_present("no-cross") && config.cross() {
-        let targets = vec![
-            "aarch64-unknown-linux-gnu", // Tier-2
-            "arm-unknown-linux-gnueabi", // Tier-2
-            "arm-unknown-linux-gnueabihf", // Tier-2
-            "armv7-unknown-linux-gnueabihf", // Tier-2
-            "i686-unknown-linux-gnu", // Tier-1
-            "i686-unknown-linux-musl", // Tier-2
-            "x86_64-unknown-linux-gnu", // Tier-1
-            "x86_64-unknown-linux-musl", // Tier-2
+        let channels = vec![Channel::Stable, Channel::Nightly];
+        let triples = vec![
+            Triple::Aarch64LinuxGnu,
+            Triple::ArmLinuxGnueabi,
+            Triple::ArmLinuxGnueabihf,
+            Triple::Armv7LinuxGnueabihf,
+            Triple::I686LinuxGnu,
+            Triple::I686LinuxMusl,
+            Triple::X86_64LinuxGnu,
+            Triple::X86_64LinuxMusl,
         ];
 
-        let channels = vec!["stable", "beta", "nightly"];
-
-        // cross target tests
-        for target in targets {
-            for channel in &channels {
-                info!("channel: {} target: {}", channel, target);
-                let mut cargo = cargo::Cargo::new(".".to_owned());
-                cargo.set_target(target.to_owned());
-                cargo.build().expect("cargo build: failed");
-                cargo.test().expect("cargo test: failed");
-                cargo.set_release(true);
-                cargo.build().expect("cargo build --release: failed");
-                cargo.test().expect("cargo test --release: failed");
+        if config.cross() {
+            for channel in channels {
+                cargo.set_channel(channel);
+                for triple in &triples {
+                    cargo.set_triple(*triple);
+                    build_test(&mut cargo);
+                }
             }
         }
     }
+}
+
+fn build_test(cargo: &mut Cargo) {
+    let mut errors = 0;
+
+    cargo.build().expect("cargo build failure");
+    cargo.test().expect("cargo test failure");
+    cargo.set_profile(Profile::Release);
+    cargo.build().expect("cargo release build failure");
+    cargo.test().expect("cargo release test failure");
+    cargo.set_profile(Profile::Debug);
 }

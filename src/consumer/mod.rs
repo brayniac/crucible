@@ -1,18 +1,18 @@
-mod caching;
+pub mod caching;
 pub mod cargo;
 mod config;
 mod git;
 
+use self::cargo::{Cargo, Channel, Profile, Triple};
 pub use self::config::Config;
 use common::metrics::Metric;
-
 use common::repoconfig;
 use mktemp::Temp;
 use mpmc::Queue;
 use publisher::{self, Status};
 use shuteye::sleep;
 use std::default::Default;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tic::{Clocksource, Sample, Sender};
 use webhook::event::*;
@@ -26,6 +26,7 @@ pub struct Consumer {
     author: Option<String>,
     fuzz_seconds: usize,
     fuzz_cores: usize,
+    fuzz_len: usize,
     keep_temp: bool,
 }
 
@@ -63,6 +64,7 @@ impl Consumer {
             author: author,
             fuzz_seconds: config.fuzz_seconds,
             fuzz_cores: config.fuzz_cores,
+            fuzz_len: config.fuzz_len,
             keep_temp: false,
         })
     }
@@ -225,109 +227,54 @@ impl Consumer {
             let mut file = build_path.clone();
             file.push(".crucible.toml");
             let repo_config = repoconfig::load_config(file.as_path()).unwrap_or_default();
-            // load cache
-            let cache_dir = "/mnt/cache/".to_owned() + &repo + "/stable";
-            let _ = caching::load(build_path.as_path(), Path::new(&cache_dir));
 
             // run test
             let mut errors = 0;
 
-            let path = build_path.as_path();
-            let mut cargo = cargo::Cargo::new(path.to_str().unwrap().to_owned());
+            let mut cargo = cargo::Cargo::new(build_path.clone());
+            cargo.set_cache(Some(PathBuf::from(format!("/mnt/cache/{}", repo))));
+            cargo.set_fuzz_seconds(self.fuzz_seconds);
+            cargo.set_fuzz_cores(self.fuzz_cores);
+            cargo.set_fuzz_len(self.fuzz_len);
 
-            if cargo.build().is_err() {
-                errors += 1;
-            }
-            if cargo.test().is_err() {
-                errors += 1;
-            }
-            if cargo.fmt().is_err() {
-                errors += 1;
-            }
-            cargo.set_release(true);
-            if cargo.build().is_err() {
-                errors += 1;
-            }
-            if cargo.test().is_err() {
-                errors += 1;
-            }
+            errors += build_test(&mut cargo);
+            errors += style_test(&mut cargo);
 
             // save cache and clean buid dir
-            let _ = caching::save(path, Path::new(&cache_dir));
-            let _ = cargo.clean();
-            cargo.set_release(false);
-
-            // setup cache for nightly
-            let cache_dir = "/mnt/cache/".to_owned() + &repo + "/nightly";
-            let _ = caching::load(path, Path::new(&cache_dir));
-
-            // run nightly tests
-            if cargo.build().is_err() {
-                errors += 1;
-            }
-            if cargo.test().is_err() {
-                errors += 1;
-            }
+            cargo.set_channel(Channel::Nightly);
+            errors += build_test(&mut cargo);
             if cargo.clippy().is_err() {
                 errors += 1;
             }
             if repo_config.fuzz() {
-                if cargo.fuzz_all(self.fuzz_seconds, self.fuzz_cores).is_err() {
+                if cargo.fuzz_all().is_err() {
                     errors += 1;
                 }
             }
-            cargo.set_release(true);
-            if cargo.build().is_err() {
-                errors += 1;
-            }
-            if cargo.test().is_err() {
-                errors += 1;
-            }
 
-            let _ = caching::save(path, Path::new(&cache_dir));
-            let _ = cargo.clean();
-            cargo.set_release(false);
+            let channels = vec![Channel::Stable, Channel::Nightly];
+            let triples = vec![
+                Triple::Aarch64LinuxGnu,
+                Triple::ArmLinuxGnueabi,
+                Triple::ArmLinuxGnueabihf,
+                Triple::Armv7LinuxGnueabihf,
+                Triple::I686LinuxGnu,
+                Triple::I686LinuxMusl,
+                Triple::X86_64LinuxGnu,
+                Triple::X86_64LinuxMusl,
+            ];
 
             if repo_config.cross() {
-                let targets = vec![
-                    "aarch64-unknown-linux-gnu", // Tier-2
-                    "arm-unknown-linux-gnueabi", // Tier-2
-                    "arm-unknown-linux-gnueabihf", // Tier-2
-                    "armv7-unknown-linux-gnueabihf", // Tier-2
-                    "i686-unknown-linux-gnu", // Tier-1
-                    "i686-unknown-linux-musl", // Tier-2
-                    "x86_64-unknown-linux-gnu", // Tier-1
-                    "x86_64-unknown-linux-musl", // Tier-2
-                ];
-
-                for target in targets {
-                    // setup cache for target
-                    for channel in vec!["stable", "nightly"] {
-                        let cache_dir = "/mnt/cache/".to_owned() + &repo + "/" + channel + "-" +
-                            target;
-                        let _ = caching::load(path, Path::new(&cache_dir));
-
-                        cargo.set_target(target.to_owned());
-                        if cargo.build().is_err() {
-                            errors += 1;
-                        }
-                        if cargo.test().is_err() {
-                            errors += 1;
-                        }
-                        cargo.set_release(true);
-                        if cargo.build().is_err() {
-                            errors += 1;
-                        }
-                        if cargo.test().is_err() {
-                            errors += 1;
-                        }
-
-                        let _ = caching::save(path, Path::new(&cache_dir));
-                        let _ = cargo.clean();
-                        cargo.set_release(false);
+                for channel in channels {
+                    cargo.set_channel(channel);
+                    for triple in &triples {
+                        cargo.set_triple(*triple);
+                        errors += build_test(&mut cargo);
                     }
                 }
             }
+
+            cargo.flush_cache();
 
             // report result
             if errors > 0 {
@@ -359,4 +306,28 @@ impl Consumer {
 
 pub fn forced_string(input: Vec<u8>) -> String {
     String::from_utf8(input).unwrap_or_else(|_| "invalid utf8".to_owned())
+}
+
+fn build_test(cargo: &mut Cargo) -> usize {
+    let mut errors = 0;
+
+    if cargo.build().is_err() {
+        errors += 1;
+    }
+    if cargo.test().is_err() {
+        errors += 1;
+    }
+    cargo.set_profile(Profile::Release);
+    if cargo.build().is_err() {
+        errors += 1;
+    }
+    if cargo.test().is_err() {
+        errors += 1;
+    }
+    cargo.set_profile(Profile::Debug);
+    errors
+}
+
+fn style_test(cargo: &mut Cargo) -> usize {
+    if cargo.fmt().is_err() { 1 } else { 0 }
 }
