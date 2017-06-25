@@ -67,6 +67,8 @@ fn save(build: &path::Path, cache: &path::Path, folders: Vec<String>) -> Result<
         let _ = rsync(&folder, build, cache);
     }
 
+    info!("cache save: complete");
+
     Ok(())
 }
 
@@ -77,6 +79,8 @@ fn load(build: &path::Path, cache: &path::Path, folders: Vec<String>) -> Result<
     for folder in &folders {
         let _ = rsync(&folder, cache, build);
     }
+
+    info!("cache load: complete");
 
     Ok(())
 }
@@ -99,10 +103,10 @@ fn rsync(path: &str, source: &path::Path, destination: &path::Path) -> Result<()
         trace!("stderr:\n{}", forced_string(output.stderr));
 
         if output.status.success() {
-            info!("rsync {}: ok", path);
+            debug!("rsync {}: ok", path);
             Ok(())
         } else {
-            info!("rsync {}: fail", path);
+            debug!("rsync {}: fail", path);
             Err(())
         }
     } else {
