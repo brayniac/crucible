@@ -26,7 +26,7 @@ pub struct Consumer {
     author: Option<String>,
     fuzz_seconds: usize,
     fuzz_cores: usize,
-    fuzz_len: usize,
+    fuzz_max_len: usize,
     keep_temp: bool,
 }
 
@@ -64,7 +64,7 @@ impl Consumer {
             author: author,
             fuzz_seconds: config.fuzz_seconds,
             fuzz_cores: config.fuzz_cores,
-            fuzz_len: config.fuzz_len,
+            fuzz_max_len: config.fuzz_max_len,
             keep_temp: false,
         })
     }
@@ -232,16 +232,16 @@ impl Consumer {
             let mut errors = 0;
 
             let mut cargo = cargo::Cargo::new(build_path.clone());
-            cargo.set_cache(Some(PathBuf::from(format!("/mnt/cache/{}", repo))));
-            cargo.set_fuzz_seconds(self.fuzz_seconds);
-            cargo.set_fuzz_cores(self.fuzz_cores);
-            cargo.set_fuzz_len(self.fuzz_len);
+            cargo.cache(Some(PathBuf::from(format!("/mnt/cache/{}", repo))));
+            cargo.fuzz_seconds(self.fuzz_seconds);
+            cargo.fuzz_cores(self.fuzz_cores);
+            cargo.fuzz_max_len(self.fuzz_max_len);
 
             errors += build_test(&mut cargo);
             errors += style_test(&mut cargo);
 
             // save cache and clean buid dir
-            cargo.set_channel(Channel::Nightly);
+            cargo.channel(Channel::Nightly);
             errors += build_test(&mut cargo);
             if cargo.clippy().is_err() {
                 errors += 1;
@@ -266,9 +266,9 @@ impl Consumer {
 
             if repo_config.cross() {
                 for channel in channels {
-                    cargo.set_channel(channel);
+                    cargo.channel(channel);
                     for triple in &triples {
-                        cargo.set_triple(*triple);
+                        cargo.triple(*triple);
                         errors += build_test(&mut cargo);
                     }
                 }
@@ -317,14 +317,14 @@ fn build_test(cargo: &mut Cargo) -> usize {
     if cargo.test().is_err() {
         errors += 1;
     }
-    cargo.set_profile(Profile::Release);
+    cargo.profile(Profile::Release);
     if cargo.build().is_err() {
         errors += 1;
     }
     if cargo.test().is_err() {
         errors += 1;
     }
-    cargo.set_profile(Profile::Debug);
+    cargo.profile(Profile::Debug);
     errors
 }
 

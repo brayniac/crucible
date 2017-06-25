@@ -52,6 +52,29 @@ impl fmt::Display for Triple {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubCommand {
+    Build,
+    Test,
+    Fmt,
+    Fuzz,
+    Clippy,
+    Clean,
+}
+
+impl fmt::Display for SubCommand {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SubCommand::Build => write!(f, "build"),
+            SubCommand::Clean => write!(f, "clean"),
+            SubCommand::Clippy => write!(f, "clippy"),
+            SubCommand::Fmt => write!(f, "fmt"),
+            SubCommand::Fuzz => write!(f, "fuzz"),
+            SubCommand::Test => write!(f, "test"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Debug,
     Release,
@@ -106,112 +129,147 @@ impl Cargo {
         )
     }
 
-    pub fn build(&mut self) -> Result<(), ()> {
-        self.dirty_cache = true;
-        info!("{} build: starting", self.label_maker());
+    fn command_builder(&self, sub_command: SubCommand) -> Command {
         let mut command = Command::new("cargo");
-        command.arg("build").arg("--verbose");
-        if self.profile == Profile::Release {
-            command.arg("--release");
+        command.current_dir(self.path.as_path());
+        command.arg(format!("+{}", self.channel));
+        command.arg(format!("{}", sub_command));
+        match sub_command {
+            SubCommand::Build | SubCommand::Test => {
+                command.arg("--verbose");
+                if self.profile == Profile::Release {
+                    command.arg("--release");
+                }
+                if self.triple != Triple::Native {
+                    command.arg("--target");
+                    command.arg(format!("{}", self.triple));
+                }
+            }
+            SubCommand::Fmt => {
+                command.arg("--").arg("--write-mode=diff");
+            }
+            _ => {}
         }
-        if self.triple != Triple::Native {
-            command.arg("--target");
-            command.arg(format!("{}", self.triple));
-        }
-        let output = command.current_dir(self.path.as_path()).output().expect(
-            "failed to run cargo build",
-        );
+        command
+    }
 
+    fn command_runner(&self, mut command: Command, sub_command: SubCommand) -> Result<(), ()> {
+        let output = command.output().expect("failed to run cargo");
         debug!(
-            "{} build: stdout:\n{}",
+            "{} {}: stdout:\n{}",
             self.label_maker(),
+            sub_command,
             forced_string(output.stdout)
         );
         debug!(
-            "{} build: stderr:\n{}",
+            "{} {}: stderr:\n{}",
             self.label_maker(),
+            sub_command,
             forced_string(output.stderr)
         );
-
         if output.status.success() {
-            info!("{} build: passed", self.label_maker());
+            info!("{} {}: passed", self.label_maker(), sub_command);
             Ok(())
         } else {
-            info!("{} build: failed", self.label_maker());
+            info!("{} {}: failed", self.label_maker(), sub_command);
             Err(())
         }
+    }
+
+    pub fn build(&mut self) -> Result<(), ()> {
+        self.dirty_cache = true;
+        let sub_command = SubCommand::Build;
+        info!("{} {}: starting", self.label_maker(), sub_command);
+        let mut command = self.command_builder(sub_command);
+        self.command_runner(command, sub_command)
     }
 
     pub fn clean(&mut self) -> Result<(), ()> {
         self.dirty_cache = false;
-        clean(Path::new(&self.path))
+        let sub_command = SubCommand::Clean;
+        info!("{} {}: starting", self.label_maker(), sub_command);
+        let mut command = self.command_builder(sub_command);
+        self.command_runner(command, sub_command)
     }
 
     pub fn clippy(&mut self) -> Result<(), ()> {
+        let channel = self.channel;
+        self.channel(Channel::Nightly);
         self.dirty_cache = true;
-        clippy(Path::new(&self.path))
-    }
-
-    pub fn test(&mut self) -> Result<(), ()> {
-        self.dirty_cache = true;
-        info!("{} test: starting", self.label_maker());
-        let mut command = Command::new("cargo");
-        command.arg("test").arg("--verbose");
-        if self.profile == Profile::Release {
-            command.arg("--release");
-        }
-        if self.triple != Triple::Native {
-            command.arg("--target");
-            command.arg(format!("{}", self.triple));
-        }
-        let output = command.current_dir(self.path.as_path()).output().expect(
-            "failed to run cargo test",
-        );
-
-        debug!(
-            "{} test: stdout:\n{}",
-            self.label_maker(),
-            forced_string(output.stdout)
-        );
-        debug!(
-            "{} test: stderr:\n{}",
-            self.label_maker(),
-            forced_string(output.stderr)
-        );
-
-        if output.status.success() {
-            info!("{} test: passed", self.label_maker());
-            Ok(())
-        } else {
-            info!("{} test: failed", self.label_maker());
-            Err(())
-        }
+        let sub_command = SubCommand::Clippy;
+        info!("{} {}: starting", self.label_maker(), sub_command);
+        let mut command = self.command_builder(sub_command);
+        let result = self.command_runner(command, sub_command);
+        self.channel(channel);
+        result
     }
 
     pub fn fmt(&mut self) -> Result<(), ()> {
         self.dirty_cache = true;
-        fmt(Path::new(&self.path))
+        let sub_command = SubCommand::Fmt;
+        info!("{} {}: starting", self.label_maker(), sub_command);
+        let mut command = self.command_builder(sub_command);
+        self.command_runner(command, sub_command)
     }
 
-    pub fn fuzz_all(&mut self) -> Result<(), ()> {
+    // run the named fuzzer in the given path
+    fn fuzz_run(&mut self, fuzzer: &str) -> Result<(), ()> {
+        let channel = self.channel;
+        self.channel(Channel::Nightly);
         self.dirty_cache = true;
-        fuzz_all(
-            Path::new(&self.path),
-            self.fuzz_seconds,
-            self.fuzz_cores,
-            self.fuzz_len,
-        )
+        let sub_command = SubCommand::Clippy;
+        info!("{} {}: starting", self.label_maker(), sub_command);
+        let mut command = self.command_builder(sub_command);
+        command
+            .arg("run")
+            .arg(fuzzer)
+            .arg("--")
+            .arg(format!("-max_total_time={}", self.fuzz_seconds))
+            .arg(format!("-timeout={}", self.fuzz_seconds))
+            .arg(format!("-jobs={}", self.fuzz_cores))
+            .arg(format!("-workers={}", self.fuzz_cores))
+            .arg(format!("-max_len={}", self.fuzz_len));
+        let result = self.command_runner(command, sub_command);
+        self.channel(channel);
+        result
     }
 
-    pub fn set_profile(&mut self, profile: Profile) {
+    // run the named fuzzer in the given path
+    fn fuzz_list(&mut self) -> Result<Vec<String>, ()> {
+        let channel = self.channel;
+        self.channel(Channel::Nightly);
+        let sub_command = SubCommand::Fuzz;
+        info!("{} {}: starting", self.label_maker(), sub_command);
+        let mut command = self.command_builder(sub_command);
+        command.arg("list");
+        let output = command.output().expect("Failed to run cargo fuzz list");
+        let result = if output.status.success() {
+            fuzz_list_parse(output.stdout)
+        } else {
+            info!("cargo fuzz: failed to list fuzz targets");
+            Err(())
+        };
+        self.channel(channel);
+        result
+    }
+
+    pub fn test(&mut self) -> Result<(), ()> {
+        self.dirty_cache = true;
+        let sub_command = SubCommand::Test;
+        info!("{} {}: starting", self.label_maker(), sub_command);
+        let mut command = self.command_builder(sub_command);
+        self.command_runner(command, sub_command)
+    }
+
+    pub fn profile(&mut self, profile: Profile) {
         self.profile = profile;
     }
 
-    pub fn set_triple(&mut self, triple: Triple) {
+    pub fn triple(&mut self, triple: Triple) {
         self.triple = triple;
     }
 
-    pub fn set_channel(&mut self, channel: Channel) {
+    pub fn channel(&mut self, channel: Channel) {
         self.flush_cache();
         if let Some(ref mut cache) = self.cache {
             let mut path = self.cache_base.clone().unwrap();
@@ -221,31 +279,19 @@ impl Cargo {
         self.channel = channel;
     }
 
-    pub fn set_fuzz_seconds(&mut self, seconds: usize) {
+    pub fn fuzz_seconds(&mut self, seconds: usize) {
         self.fuzz_seconds = seconds;
     }
 
-    pub fn fuzz_seconds(&self) -> usize {
-        self.fuzz_seconds
-    }
-
-    pub fn set_fuzz_cores(&mut self, cores: usize) {
+    pub fn fuzz_cores(&mut self, cores: usize) {
         self.fuzz_cores = cores;
     }
 
-    pub fn fuzz_cores(&self) -> usize {
-        self.fuzz_cores
-    }
-
-    pub fn set_fuzz_len(&mut self, bytes: usize) {
+    pub fn fuzz_max_len(&mut self, bytes: usize) {
         self.fuzz_len = bytes;
     }
 
-    pub fn fuzz_len(&self) -> usize {
-        self.fuzz_len
-    }
-
-    pub fn set_cache(&mut self, path: Option<PathBuf>) {
+    pub fn cache(&mut self, path: Option<PathBuf>) {
         self.flush_cache();
         self.clean();
         match path {
@@ -271,141 +317,23 @@ impl Cargo {
             }
         }
     }
-}
 
-// run cargo clean in the given path
-fn clean(path: &Path) -> Result<(), ()> {
-    info!("cargo clean: starting");
-    let output = Command::new("cargo")
-        .arg("clean")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo clean");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo clean: ok");
-        Ok(())
-    } else {
-        info!("cargo clean: error");
-        Err(())
-    }
-}
-
-// run cargo clippy
-// toolchain: nightly
-fn clippy(path: &Path) -> Result<(), ()> {
-    info!("cargo clippy: started");
-    let output = Command::new("cargo")
-        .arg("+nightly")
-        .arg("clippy")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo test");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo clippy: passed");
-        Ok(())
-    } else {
-        info!("cargo clippy: failed");
-        Err(())
-    }
-}
-
-// run cargo fmt detecting differences
-// toolchain: stable
-fn fmt(path: &Path) -> Result<(), ()> {
-    info!("cargo fmt: started");
-    let output = Command::new("cargo")
-        .arg("fmt")
-        .arg("--")
-        .arg("--write-mode=diff")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo fmt");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo fmt: passed");
-        Ok(())
-    } else {
-        info!("cargo fmt: failed");
-        Err(())
-    }
-}
-
-// run all of the fuzzers defined within the given path
-// toolchain: nightly
-fn fuzz_all(path: &Path, seconds: usize, cores: usize, len: usize) -> Result<(), ()> {
-    info!("cargo fuzz: started");
-    if let Ok(targets) = fuzz_list(path) {
-        for t in targets {
-            if fuzz_run(path, &t, seconds, cores, len).is_err() {
-                debug!("stop fuzzing after failure: {}", t);
-                info!("cargo fuzz: error");
-                return Err(());
+    // run all of the fuzzers defined within the given path
+    pub fn fuzz_all(&mut self) -> Result<(), ()> {
+        info!("cargo fuzz: started");
+        if let Ok(targets) = self.fuzz_list() {
+            for t in targets {
+                if self.fuzz_run(&t).is_err() {
+                    debug!("stop fuzzing after failure: {}", t);
+                    info!("cargo fuzz: error");
+                    return Err(());
+                }
             }
+            info!("cargo fuzz: passed");
+            return Ok(());
+        } else {
+            info!("no targets");
         }
-        info!("cargo fuzz: passed");
-        return Ok(());
-    } else {
-        info!("no targets");
-    }
-    Err(())
-}
-
-// lists the available fuzzers
-// toolchain: nightly
-fn fuzz_list(path: &Path) -> Result<Vec<String>, ()> {
-    let output = Command::new("cargo")
-        .arg("+nightly")
-        .arg("fuzz")
-        .arg("list")
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo fuzz list");
-    if output.status.success() {
-        fuzz_list_parse(output.stdout)
-    } else {
-        info!("cargo fuzz: failed to list fuzz targets");
-        Err(())
-    }
-}
-
-// run the named fuzzer in the given path
-fn fuzz_run(path: &Path, fuzzer: &str, seconds: usize, cores: usize, len: usize) -> Result<(), ()> {
-    let label = format!("cargo fuzz {}:", fuzzer);
-    info!("{} started", label);
-    let output = Command::new("cargo")
-        .arg("+nightly")
-        .arg("fuzz")
-        .arg("run")
-        .arg(fuzzer)
-        .arg("--")
-        .arg(format!("-max_total_time={}", seconds))
-        .arg(format!("-timeout={}", seconds))
-        .arg(format!("-jobs={}", cores))
-        .arg(format!("-workers={}", cores))
-        .arg(format!("-max_len={}", len))
-        .current_dir(path)
-        .output()
-        .expect("failed to run cargo fuzz run");
-
-    debug!("stdout:\n{}", forced_string(output.stdout));
-    debug!("stderr:\n{}", forced_string(output.stderr));
-
-    if output.status.success() {
-        info!("cargo fuzz {}: passed", fuzzer);
-        Ok(())
-    } else {
-        info!("cargo fuzz {}: failed", fuzzer);
         Err(())
     }
 }
