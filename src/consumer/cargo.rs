@@ -154,9 +154,7 @@ impl Cargo {
     }
 
     fn command_runner(&self, mut command: Command, sub_command: SubCommand) -> Result<(), ()> {
-        let output = command.output().expect(
-            "failed to run cargo",
-        );
+        let output = command.output().expect("failed to run cargo");
         debug!(
             "{} {}: stdout:\n{}",
             self.label_maker(),
@@ -222,7 +220,8 @@ impl Cargo {
         let sub_command = SubCommand::Clippy;
         info!("{} {}: starting", self.label_maker(), sub_command);
         let mut command = self.command_builder(sub_command);
-        command.arg("run")
+        command
+            .arg("run")
             .arg(fuzzer)
             .arg("--")
             .arg(format!("-max_total_time={}", self.fuzz_seconds))
