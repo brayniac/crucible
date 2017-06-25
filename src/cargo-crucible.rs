@@ -119,7 +119,7 @@ fn main() {
     if !options.opt_present("no-clippy") {
         cargo.clippy().expect("cargo clippy: failed");
     }
-    if !options.opt_present("no-fuzz") {
+    if !options.opt_present("no-fuzz") && config.fuzz() {
         cargo.set_fuzz_seconds(config.fuzz_seconds());
         cargo.set_fuzz_cores(config.fuzz_cores());
         cargo.set_fuzz_len(config.fuzz_len());
