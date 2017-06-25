@@ -15,7 +15,7 @@ pub struct Config {
     pub author: Option<String>,
     pub fuzz_seconds: usize,
     pub fuzz_cores: usize,
-    pub fuzz_len: usize,
+    pub fuzz_max_len: usize,
 }
 
 impl Default for Config {
@@ -29,7 +29,7 @@ impl Default for Config {
             publisher: None,
             fuzz_seconds: 60,
             fuzz_cores: 1,
-            fuzz_len: 64,
+            fuzz_max_len: 64,
         }
     }
 }
@@ -85,6 +85,12 @@ impl Config {
     // set the duration of each fuzz test in seconds
     pub fn fuzz_seconds(mut self, seconds: usize) -> Self {
         self.fuzz_seconds = seconds;
+        self
+    }
+
+    // set the max length in bytes of the generated data
+    pub fn fuzz_max_len(mut self, bytes: usize) -> Self {
+        self.fuzz_max_len = bytes;
         self
     }
 }
