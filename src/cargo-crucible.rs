@@ -112,20 +112,19 @@ fn main() {
         config.set_fuzz_max_len(v);
     }
 
-    // complete set of tests - native target
+    // run tests
     let mut cargo = Cargo::new(PathBuf::from("."));
     build_test(&mut cargo);
     cargo.fmt().expect("cargo fmt: failed");
     if !options.opt_present("no-clippy") {
         cargo.clippy().expect("cargo clippy: failed");
     }
-    if !options.opt_present("no-fuzz") {
+    if !options.opt_present("no-fuzz") && config.fuzz() {
         cargo.fuzz_seconds(config.fuzz_seconds());
         cargo.fuzz_cores(config.fuzz_cores());
         cargo.fuzz_max_len(config.fuzz_max_len());
         cargo.fuzz_all().expect("cargo fuzz: failed");
     }
-
     if !options.opt_present("no-cross") && config.cross() {
         let channels = vec![Channel::Stable, Channel::Nightly];
         let triples = vec![
@@ -138,7 +137,6 @@ fn main() {
             Triple::X86_64LinuxGnu,
             Triple::X86_64LinuxMusl,
         ];
-
         if config.cross() {
             for channel in channels {
                 cargo.channel(channel);
