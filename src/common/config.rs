@@ -7,10 +7,12 @@ use toml::{Parser, Value};
 use toml::Value::Table;
 
 pub struct Config {
-    stats: String,
-    http: String,
+    fuzz_max_len: usize,
     fuzz_cores: usize,
     fuzz_seconds: usize,
+    workers: usize,
+    stats: String,
+    http: String,
     token: Option<String>,
     secret: Option<String>,
     repo: Option<String>,
@@ -22,8 +24,10 @@ impl Default for Config {
         Config {
             stats: "localhost:42024".to_owned(),
             http: "localhost:4567".to_owned(),
-            fuzz_cores: 8,
+            fuzz_max_len: 64,
+            fuzz_cores: 1,
             fuzz_seconds: 60,
+            workers: 1,
             token: None,
             secret: None,
             repo: None,
@@ -103,6 +107,24 @@ impl Config {
 
     pub fn fuzz_seconds(&self) -> usize {
         self.fuzz_seconds
+    }
+
+    pub fn set_fuzz_max_len(&mut self, bytes: usize) -> &mut Self {
+        self.fuzz_max_len = bytes;
+        self
+    }
+
+    pub fn fuzz_max_len(&self) -> usize {
+        self.fuzz_max_len
+    }
+
+    pub fn set_workers(&mut self, count: usize) -> &mut Self {
+        self.workers = count;
+        self
+    }
+
+    pub fn workers(&self) -> usize {
+        self.workers
     }
 }
 
@@ -205,15 +227,27 @@ fn load_config_table(table: &BTreeMap<String, Value>) -> Result<Config, String> 
         }
     }
 
-    if let Some(&Table(ref general)) = table.get("general") {
-        if let Some(v) = general.get("fuzz-cores").and_then(|k| k.as_integer()) {
+    if let Some(&Table(ref general)) = table.get("fuzz") {
+        if let Some(v) = general.get("cores").and_then(|k| k.as_integer()) {
             config.set_fuzz_cores(v as usize);
         }
     }
 
-    if let Some(&Table(ref general)) = table.get("general") {
-        if let Some(v) = general.get("fuzz-seconds").and_then(|k| k.as_integer()) {
+    if let Some(&Table(ref general)) = table.get("fuzz") {
+        if let Some(v) = general.get("seconds").and_then(|k| k.as_integer()) {
             config.set_fuzz_seconds(v as usize);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("fuzz") {
+        if let Some(v) = general.get("max-length").and_then(|k| k.as_integer()) {
+            config.set_fuzz_max_len(v as usize);
+        }
+    }
+
+    if let Some(&Table(ref general)) = table.get("general") {
+        if let Some(v) = general.get("workers").and_then(|k| k.as_integer()) {
+            config.set_workers(v as usize);
         }
     }
 

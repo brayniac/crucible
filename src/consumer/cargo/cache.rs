@@ -1,4 +1,3 @@
-use consumer::cargo::Triple;
 use consumer::forced_string;
 use std::{fs, path, process};
 
@@ -35,36 +34,24 @@ impl Cache {
     }
 
     pub fn save(&self) -> Result<(), ()> {
-        save(
-            self.build.as_path(),
-            self.cache.as_path(),
-            self.folders.clone(),
-        )
+        save(self.build.as_path(), self.cache.as_path(), &self.folders)
     }
 
     pub fn load(&self) -> Result<(), ()> {
-        load(
-            self.build.as_path(),
-            self.cache.as_path(),
-            self.folders.clone(),
-        )
+        load(self.build.as_path(), self.cache.as_path(), &self.folders)
     }
 
     pub fn set_cache(&mut self, path: path::PathBuf) {
         self.cache = path;
     }
-
-    pub fn set_build(&mut self, path: path::PathBuf) {
-        self.build = path;
-    }
 }
 
 // save the cache directories
-fn save(build: &path::Path, cache: &path::Path, folders: Vec<String>) -> Result<(), ()> {
+fn save(build: &path::Path, cache: &path::Path, folders: &[String]) -> Result<(), ()> {
     info!("cache save: start");
 
-    for folder in &folders {
-        let _ = rsync(&folder, build, cache);
+    for folder in folders {
+        let _ = rsync(folder, build, cache);
     }
 
     info!("cache save: complete");
@@ -73,11 +60,11 @@ fn save(build: &path::Path, cache: &path::Path, folders: Vec<String>) -> Result<
 }
 
 // load the cache into the build dir
-fn load(build: &path::Path, cache: &path::Path, folders: Vec<String>) -> Result<(), ()> {
+fn load(build: &path::Path, cache: &path::Path, folders: &[String]) -> Result<(), ()> {
     info!("cache load: start");
 
-    for folder in &folders {
-        let _ = rsync(&folder, cache, build);
+    for folder in folders {
+        let _ = rsync(folder, cache, build);
     }
 
     info!("cache load: complete");

@@ -1,4 +1,5 @@
 #![no_main]
+#![allow(dead_code)]
 #[macro_use]
 extern crate libfuzzer_sys;
 #[macro_use]

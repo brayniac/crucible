@@ -23,7 +23,7 @@ mod publisher;
 
 use common::logging::set_log_level;
 use common::repoconfig;
-use consumer::cargo::{Cargo, Channel, Profile, Triple};
+use consumer::cargo::{self, Cargo, Channel, Profile};
 use getopts::Options;
 use std::{env, process};
 use std::path::{Path, PathBuf};
@@ -126,17 +126,8 @@ fn main() {
         cargo.fuzz_all().expect("cargo fuzz: failed");
     }
     if !options.opt_present("no-cross") && config.cross() {
-        let channels = vec![Channel::Stable, Channel::Nightly];
-        let triples = vec![
-            Triple::Aarch64LinuxGnu,
-            Triple::ArmLinuxGnueabi,
-            Triple::ArmLinuxGnueabihf,
-            Triple::Armv7LinuxGnueabihf,
-            Triple::I686LinuxGnu,
-            Triple::I686LinuxMusl,
-            Triple::X86_64LinuxGnu,
-            Triple::X86_64LinuxMusl,
-        ];
+        let channels = vec![Channel::Stable, Channel::Beta, Channel::Nightly];
+        let triples = cargo::triple::list();
         if config.cross() {
             for channel in channels {
                 cargo.channel(channel);
@@ -150,8 +141,6 @@ fn main() {
 }
 
 fn build_test(cargo: &mut Cargo) {
-    let mut errors = 0;
-
     cargo.build().expect("cargo build failure");
     cargo.test().expect("cargo test failure");
     cargo.profile(Profile::Release);

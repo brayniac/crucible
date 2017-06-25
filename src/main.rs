@@ -23,7 +23,7 @@ mod publisher;
 use common::logging::set_log_level;
 use common::options::{PROGRAM, VERSION};
 use mpmc::Queue;
-use std::{process, thread};
+use std::{process, thread, time};
 
 fn main() {
     let options = common::options::init();
@@ -79,6 +79,7 @@ fn main() {
         .events(events)
         .fuzz_seconds(config.fuzz_seconds())
         .fuzz_cores(config.fuzz_cores())
+        .fuzz_max_len(config.fuzz_max_len())
         .publisher(publish_queue.clone());
     if let Some(repo) = config.repo() {
         info!("repo whitelist: {}", repo);
@@ -88,8 +89,14 @@ fn main() {
         info!("author whitelist: {}", author);
         consumer_config = consumer_config.author(author);
     }
-    let mut consumer = consumer_config.build().unwrap();
+    for _ in 0..config.workers() {
+        let mut consumer = consumer_config.clone().build().unwrap();
+        thread::spawn(move || loop {
+            consumer.run_once();
+        });
+    }
+
     loop {
-        consumer.run();
+        shuteye::sleep(time::Duration::new(1, 0));
     }
 }

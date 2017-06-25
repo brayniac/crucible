@@ -1,9 +1,8 @@
-pub mod caching;
 pub mod cargo;
 mod config;
 mod git;
 
-use self::cargo::{Cargo, Channel, Profile, Triple};
+use self::cargo::{Cargo, Channel, Profile};
 pub use self::config::Config;
 use common::metrics::Metric;
 use common::repoconfig;
@@ -73,7 +72,7 @@ impl Consumer {
         self.clock.counter()
     }
 
-    pub fn run(&mut self) {
+    pub fn run_once(&mut self) {
         if let Some(event) = self.events.pop() {
             let t0 = self.time();
             trace!("consume event: {:?}", event);
@@ -246,23 +245,12 @@ impl Consumer {
             if cargo.clippy().is_err() {
                 errors += 1;
             }
-            if repo_config.fuzz() {
-                if cargo.fuzz_all().is_err() {
-                    errors += 1;
-                }
+            if repo_config.fuzz() && cargo.fuzz_all().is_err() {
+                errors += 1;
             }
 
-            let channels = vec![Channel::Stable, Channel::Nightly];
-            let triples = vec![
-                Triple::Aarch64LinuxGnu,
-                Triple::ArmLinuxGnueabi,
-                Triple::ArmLinuxGnueabihf,
-                Triple::Armv7LinuxGnueabihf,
-                Triple::I686LinuxGnu,
-                Triple::I686LinuxMusl,
-                Triple::X86_64LinuxGnu,
-                Triple::X86_64LinuxMusl,
-            ];
+            let channels = vec![Channel::Stable, Channel::Beta, Channel::Nightly];
+            let triples = cargo::triple::list();
 
             if repo_config.cross() {
                 for channel in channels {

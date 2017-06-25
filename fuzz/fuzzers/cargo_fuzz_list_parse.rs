@@ -1,4 +1,5 @@
 #![no_main]
+#![allow(dead_code)]
 #[macro_use]
 extern crate libfuzzer_sys;
 #[macro_use]
@@ -30,14 +31,11 @@ mod metrics;
 #[path = "../../src/webhook/mod.rs"]
 mod webhook;
 
-
 #[path = "../../src/consumer/mod.rs"]
 mod consumer;
 
-#[path = "../../src/consumer/cargo.rs"]
+#[path = "../../src/consumer/cargo/mod.rs"]
 mod cargo;
-
-use std::str::FromStr;
 
 fuzz_target!(|data: &[u8]| {
     // fuzzed code goes here
