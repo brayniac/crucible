@@ -1,55 +1,16 @@
-use consumer::caching::Cache;
+mod cache;
+mod channel;
+pub mod triple;
+
+pub use self::cache::Cache;
+pub use self::channel::Channel;
+pub use self::triple::Triple;
+
 use consumer::forced_string;
 use regex::Regex;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Channel {
-    Stable,
-    Beta,
-    Nightly,
-}
-
-impl fmt::Display for Channel {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Channel::Stable => write!(f, "stable"),
-            Channel::Beta => write!(f, "beta"),
-            Channel::Nightly => write!(f, "nightly"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Triple {
-    Native,
-    Aarch64LinuxGnu,
-    ArmLinuxGnueabi,
-    ArmLinuxGnueabihf,
-    Armv7LinuxGnueabihf,
-    I686LinuxGnu,
-    I686LinuxMusl,
-    X86_64LinuxGnu,
-    X86_64LinuxMusl,
-}
-
-impl fmt::Display for Triple {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Triple::Native => write!(f, "native"),
-            Triple::Aarch64LinuxGnu => write!(f, "aarch64-unknown-linux-gnu"),
-            Triple::ArmLinuxGnueabi => write!(f, "arm-unknown-linux-gnueabi"),
-            Triple::ArmLinuxGnueabihf => write!(f, "arm-unknown-linux-gnueabihf"),
-            Triple::Armv7LinuxGnueabihf => write!(f, "armv7-unknown-linux-gnueabihf"),
-            Triple::I686LinuxGnu => write!(f, "i686-unknown-linux-gnu"),
-            Triple::I686LinuxMusl => write!(f, "i686-unknown-linux-musl"),
-            Triple::X86_64LinuxGnu => write!(f, "x86_64-unknown-linux-gnu"),
-            Triple::X86_64LinuxMusl => write!(f, "x86_64-unknown-linux-musl"),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubCommand {
@@ -97,7 +58,6 @@ pub struct Cargo {
     triple: Triple,
     profile: Profile,
     path: PathBuf,
-    release: bool,
     fuzz_seconds: usize,
     fuzz_cores: usize,
     fuzz_len: usize,
@@ -113,7 +73,6 @@ impl Cargo {
             triple: Triple::Native,
             profile: Profile::Debug,
             path: path,
-            release: false,
             fuzz_seconds: 60,
             fuzz_cores: 1,
             fuzz_len: 64,
@@ -154,23 +113,36 @@ impl Cargo {
     }
 
     fn command_runner(&self, mut command: Command, sub_command: SubCommand) -> Result<(), ()> {
+        debug!("command: {:?}", command);
         let output = command.output().expect("failed to run cargo");
-        debug!(
-            "{} {}: stdout:\n{}",
-            self.label_maker(),
-            sub_command,
-            forced_string(output.stdout)
-        );
-        debug!(
-            "{} {}: stderr:\n{}",
-            self.label_maker(),
-            sub_command,
-            forced_string(output.stderr)
-        );
         if output.status.success() {
+            debug!(
+                "{} {}: stdout:\n{}",
+                self.label_maker(),
+                sub_command,
+                forced_string(output.stdout)
+            );
+            debug!(
+                "{} {}: stderr:\n{}",
+                self.label_maker(),
+                sub_command,
+                forced_string(output.stderr)
+            );
             info!("{} {}: passed", self.label_maker(), sub_command);
             Ok(())
         } else {
+            info!(
+                "{} {}: stdout:\n{}",
+                self.label_maker(),
+                sub_command,
+                forced_string(output.stdout)
+            );
+            info!(
+                "{} {}: stderr:\n{}",
+                self.label_maker(),
+                sub_command,
+                forced_string(output.stderr)
+            );
             info!("{} {}: failed", self.label_maker(), sub_command);
             Err(())
         }
@@ -180,7 +152,7 @@ impl Cargo {
         self.dirty_cache = true;
         let sub_command = SubCommand::Build;
         info!("{} {}: starting", self.label_maker(), sub_command);
-        let mut command = self.command_builder(sub_command);
+        let command = self.command_builder(sub_command);
         self.command_runner(command, sub_command)
     }
 
@@ -188,7 +160,7 @@ impl Cargo {
         self.dirty_cache = false;
         let sub_command = SubCommand::Clean;
         info!("{} {}: starting", self.label_maker(), sub_command);
-        let mut command = self.command_builder(sub_command);
+        let command = self.command_builder(sub_command);
         self.command_runner(command, sub_command)
     }
 
@@ -198,7 +170,7 @@ impl Cargo {
         self.dirty_cache = true;
         let sub_command = SubCommand::Clippy;
         info!("{} {}: starting", self.label_maker(), sub_command);
-        let mut command = self.command_builder(sub_command);
+        let command = self.command_builder(sub_command);
         let result = self.command_runner(command, sub_command);
         self.channel(channel);
         result
@@ -208,7 +180,7 @@ impl Cargo {
         self.dirty_cache = true;
         let sub_command = SubCommand::Fmt;
         info!("{} {}: starting", self.label_maker(), sub_command);
-        let mut command = self.command_builder(sub_command);
+        let command = self.command_builder(sub_command);
         self.command_runner(command, sub_command)
     }
 
@@ -217,7 +189,7 @@ impl Cargo {
         let channel = self.channel;
         self.channel(Channel::Nightly);
         self.dirty_cache = true;
-        let sub_command = SubCommand::Clippy;
+        let sub_command = SubCommand::Fuzz;
         info!("{} {}: starting", self.label_maker(), sub_command);
         let mut command = self.command_builder(sub_command);
         command
@@ -257,7 +229,7 @@ impl Cargo {
         self.dirty_cache = true;
         let sub_command = SubCommand::Test;
         info!("{} {}: starting", self.label_maker(), sub_command);
-        let mut command = self.command_builder(sub_command);
+        let command = self.command_builder(sub_command);
         self.command_runner(command, sub_command)
     }
 
@@ -293,7 +265,7 @@ impl Cargo {
 
     pub fn cache(&mut self, path: Option<PathBuf>) {
         self.flush_cache();
-        self.clean();
+        let _ = self.clean();
         match path {
             Some(path) => {
                 self.cache_base = Some(path.clone());

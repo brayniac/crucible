@@ -4,3 +4,8 @@ stats = "localhost:42024"
 #token = "YOUR GITHUB TOKEN" # Bearer token for posting status # Publisher
 #repo = "owner/name" # Set a repository whitelist to secure crucible
 #author = "name" # Set an author whitelist to secure crucible
+
+[fuzz]
+cores = 1
+max-length = 64
+seconds = 60

@@ -6,6 +6,7 @@ use std::default::Default;
 use tic::{Clocksource, Sender};
 use webhook::event::Event;
 
+#[derive(Clone)]
 pub struct Config {
     pub events: Option<Queue<Event>>,
     pub clock: Option<Clocksource>,
