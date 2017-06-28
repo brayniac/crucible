@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 // clone the repo into a build folder within the path given
-pub fn clone_repo(path: &Path, name: &str, url: &str) -> Result<(), ()> {
+pub fn clone_repo(path: &Path, name: &str, url: &str) -> Result<(), &'static str> {
     info!("clone repo: {}", name);
     let output = Command::new("git")
         .arg("clone")
@@ -21,12 +21,12 @@ pub fn clone_repo(path: &Path, name: &str, url: &str) -> Result<(), ()> {
         Ok(())
     } else {
         error!("git clone: failed");
-        Err(())
+        Err("git clone failed")
     }
 }
 
 // fetch the pull request with the given number
-pub fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
+pub fn fetch_pull(path: &Path, number: &u64) -> Result<(), &'static str> {
     info!("git fetch: pr #{}", number);
     let pr_ref = format!("pull/{}/head:pr-{}", number, number);
     let output = Command::new("git")
@@ -45,12 +45,12 @@ pub fn fetch_pull(path: &Path, number: &u64) -> Result<(), ()> {
         Ok(())
     } else {
         info!("git fetch: pr #{}: failed", number);
-        Err(())
+        Err("git fetch failed to sync the ref")
     }
 }
 
 // checkout the given pr after fetch
-pub fn checkout_pr(path: &Path, number: &u64) -> Result<(), ()> {
+pub fn checkout_pr(path: &Path, number: &u64) -> Result<(), &'static str> {
     info!("git checkout: pr #{}", number);
     let branch = format!("pr-{}", number);
     let output = Command::new("git")
@@ -68,12 +68,12 @@ pub fn checkout_pr(path: &Path, number: &u64) -> Result<(), ()> {
         Ok(())
     } else {
         info!("git checkout: pr #{}: failed", number);
-        Err(())
+        Err("git checkout failed")
     }
 }
 
 // checkout the given sha
-pub fn checkout_sha(path: &Path, sha: &str) -> Result<(), ()> {
+pub fn checkout_sha(path: &Path, sha: &str) -> Result<(), &'static str> {
     info!("git checkout: sha {}", sha);
     let output = Command::new("git")
         .arg("checkout")
@@ -90,6 +90,6 @@ pub fn checkout_sha(path: &Path, sha: &str) -> Result<(), ()> {
         Ok(())
     } else {
         info!("git checkout: sha {}: failed", sha);
-        Err(())
+        Err("git checkout failed")
     }
 }

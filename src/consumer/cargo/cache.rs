@@ -73,31 +73,26 @@ fn load(build: &path::Path, cache: &path::Path, folders: &[String]) -> Result<()
 }
 
 // call rsync for subfolder path
-fn rsync(path: &str, source: &path::Path, destination: &path::Path) -> Result<(), ()> {
+fn rsync(path: &str, source: &path::Path, destination: &path::Path) -> Result<(), &'static str> {
     let mut dst = destination.to_path_buf();
     dst.push(path);
     let _ = fs::create_dir_all(dst.as_path());
     dst.pop();
-    if let Ok(output) = process::Command::new("rsync")
+    let output = process::Command::new("rsync")
         .arg("-aPc")
         .arg("--delete")
         .arg(path)
         .arg(dst.as_path().to_str().unwrap())
         .current_dir(source)
-        .output()
-    {
-        trace!("stdout:\n{}", forced_string(output.stdout));
-        trace!("stderr:\n{}", forced_string(output.stderr));
+        .output().map_err(|_| "could not execute rsync")?;
+    trace!("stdout:\n{}", forced_string(output.stdout));
+    trace!("stderr:\n{}", forced_string(output.stderr));
 
-        if output.status.success() {
-            debug!("rsync {}: ok", path);
-            Ok(())
-        } else {
-            debug!("rsync {}: fail", path);
-            Err(())
-        }
+    if output.status.success() {
+        debug!("rsync {}: ok", path);
+        Ok(())
     } else {
-        error!("failed calling rsync");
-        Err(())
+        debug!("rsync {}: fail", path);
+        Err("rsync failed")
     }
 }
