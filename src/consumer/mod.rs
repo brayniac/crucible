@@ -200,11 +200,9 @@ impl Consumer {
 
         let status = match event {
             Event::PullRequest(pr) => {
-                let fetch = git::fetch_pull(build_path.as_path(), &pr.number());
-                match fetch {
-                    Ok(_) => git::checkout_pr(build_path.as_path(), &pr.number()),
-                    Err(_) => Err(()),
-                }
+                let path = build_path.as_path();
+                let pr_num = pr.number();
+                git::fetch_pull(path, &pr_num).and_then(move |_| git::checkout_pr(path, &pr_num))
             }
             Event::Push(push) => git::checkout_sha(build_path.as_path(), &push.sha()),
             _ => {
