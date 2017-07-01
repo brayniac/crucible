@@ -1,0 +1,44 @@
+{
+	"data": [
+      {
+        "id": "1",
+        "attributes": {
+      		"owner": "brayniac",
+      		"repo": "histogram",
+          "label": "push: initial commit",
+      		"overall": "ok"
+        },
+        "type": "builds"
+      },
+      {
+        "id": "2",
+        "attributes": {
+          "owner": "brayniac",
+          "repo": "histogram",
+          "label": "push: new feature",
+          "overall": "failed"
+        },
+        "type": "builds"
+      },
+      {
+        "id": "3",
+        "attributes": {
+          "owner": "brayniac",
+          "repo": "histogram",
+          "label": "push: fix",
+          "overall": "failed"
+        },
+        "type": "builds"
+      },
+      {
+        "id": "4",
+        "attributes": {
+          "owner": "brayniac",
+          "repo": "heatmap",
+          "label": "push: initial commit",
+          "overall": "pending"
+        },
+        "type": "builds"
+      }
+    ]
+}

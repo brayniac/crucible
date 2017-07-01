@@ -15,6 +15,7 @@ extern crate sha_1;
 extern crate hmac;
 extern crate rustc_serialize;
 
+mod api;
 mod common;
 mod consumer;
 mod webhook;
@@ -58,6 +59,14 @@ fn main() {
         .unwrap();
     let events = server.get_events();
     thread::spawn(move || { server.run(); });
+
+    // initialize api listener
+    let mut api = api::Server::configure()
+        .clock(clock.clone())
+        .stats(stats.clone())
+        .build()
+        .unwrap();
+    thread::spawn(move || { api.run(); });
 
     let publish_queue = Queue::with_capacity(1024);
 

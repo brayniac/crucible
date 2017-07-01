@@ -1,0 +1,13 @@
+{
+  "data":
+      {
+        "id": "4",
+        "attributes": {
+          "owner": "brayniac",
+          "name": "rpc-perf",
+          "overall": "ok",
+          "build": "4"
+        },
+        "type": "repos"
+      }
+}

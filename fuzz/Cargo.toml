@@ -64,3 +64,11 @@ path = "fuzzers/webhook_push.rs"
 [[bin]]
 name = "fuzz_cargo_fuzz_list_parse"
 path = "fuzzers/cargo_fuzz_list_parse.rs"
+
+[[bin]]
+name = "fuzz_api_url_params"
+path = "fuzzers/api_url_params.rs"
+
+[[bin]]
+name = "fuzz_api_repo_lookup"
+path = "fuzzers/api_repo_lookup.rs"

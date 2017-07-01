@@ -1,0 +1,13 @@
+{
+  "data":
+      {
+        "id": "3",
+        "attributes": {
+          "owner": "brayniac",
+          "name": "waterfall",
+          "overall": "ok",
+          "build": "3"
+        },
+        "type": "repos"
+      }
+}

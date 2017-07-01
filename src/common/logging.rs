@@ -12,11 +12,16 @@ impl log::Log for SimpleLogger {
 
     fn log(&self, record: &LogRecord) {
         if self.enabled(record.metadata()) {
+            let target = if record.metadata().level() >= LogLevel::Debug {
+                record.target()
+            } else {
+                "crucible"
+            };
             println!(
                 "{} {:<5} [{}] {}",
                 time::strftime("%Y-%m-%d %H:%M:%S", &time::now()).unwrap(),
                 record.level().to_string(),
-                record.target().to_string(),
+                target,
                 record.args()
             );
         }

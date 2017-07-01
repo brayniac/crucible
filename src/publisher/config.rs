@@ -12,6 +12,17 @@ pub struct Config {
     pub token: Option<String>,
 }
 
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            queue: None,
+            clock: None,
+            stats: None,
+            token: None,
+        }
+    }
+}
+
 impl Config {
     pub fn build(self) -> Result<Publisher, &'static str> {
         Publisher::configured(self)
@@ -35,17 +46,5 @@ impl Config {
     pub fn token(mut self, token: String) -> Self {
         self.token = Some(token);
         self
-    }
-}
-
-
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            queue: None,
-            clock: None,
-            stats: None,
-            token: None,
-        }
     }
 }
