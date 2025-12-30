@@ -1,0 +1,46 @@
+# Crucible Server Example Configuration
+
+# Runtime selection: "native" (io_uring/mio) or "tokio"
+runtime = "native"
+
+[workers]
+# Number of worker threads (default: number of CPUs)
+threads = 4
+
+# CPU cores to pin workers to (optional)
+# cpu_affinity = "0-3"
+
+[cache]
+# Cache backend: "segcache" or "s3fifo"
+backend = "segcache"
+
+# Total heap size
+heap_size = "64MB"
+
+# Segment size
+segment_size = "1MB"
+
+# Hashtable power (2^power buckets)
+hashtable_power = 16
+
+# RESP protocol listener (Redis-compatible)
+[[listener]]
+protocol = "resp"
+address = "127.0.0.1:6379"
+
+# Memcache protocol listener
+[[listener]]
+protocol = "memcache"
+address = "127.0.0.1:11211"
+
+[metrics]
+# Prometheus metrics endpoint
+address = "127.0.0.1:9090"
+
+# io_uring specific settings (native runtime on Linux only)
+[uring]
+sqpoll = false
+sqpoll_idle_ms = 1000
+buffer_count = 1024
+buffer_size = 4096
+sq_depth = 1024

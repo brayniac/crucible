@@ -1,0 +1,24 @@
+[package]
+name = "protocol-memcache"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bidirectional Memcache protocol implementation (ASCII and binary)"
+
+[features]
+default = ["ascii"]
+ascii = []
+binary = []
+full = ["ascii", "binary"]
+
+[dependencies]
+# For efficient line scanning
+memchr = { workspace = true }
+
+# For efficient integer formatting
+itoa = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }

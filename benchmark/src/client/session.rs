@@ -1,0 +1,501 @@
+//! Protocol session abstraction for working with IoDriver.
+//!
+//! A session handles protocol encoding/decoding and request tracking,
+//! while the IoDriver handles the actual I/O operations.
+
+use crate::buffer::BufferPair;
+use crate::config::{Config, Protocol};
+use crate::protocol::{
+    MemcacheBinaryCodec, MemcacheBinaryError, MemcacheCodec, MemcacheError, RespCodec, RespError,
+};
+
+use io_driver::ConnId;
+
+use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use super::{ConnectionState, RequestResult, RequestType};
+
+/// Timestamp for latency calculation.
+#[derive(Debug, Clone, Copy)]
+pub struct Timestamp {
+    pub instant: Instant,
+    pub kernel_ns: Option<u64>,
+}
+
+impl Timestamp {
+    pub fn now() -> Self {
+        Self {
+            instant: Instant::now(),
+            kernel_ns: None,
+        }
+    }
+
+    pub fn with_kernel_ns(kernel_ns: u64) -> Self {
+        Self {
+            instant: Instant::now(),
+            kernel_ns: Some(kernel_ns),
+        }
+    }
+}
+
+/// A request in the pipeline waiting for a response.
+#[derive(Debug)]
+struct InFlightRequest {
+    id: u64,
+    request_type: RequestType,
+    queued_at: Instant,
+    tx_timestamp: Option<Timestamp>,
+}
+
+/// Session configuration.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// Target address for reconnection
+    pub addr: SocketAddr,
+    /// Maximum pipeline depth
+    pub pipeline_depth: usize,
+    /// Reconnect delay
+    pub reconnect_delay: Duration,
+    /// Connect timeout
+    pub connect_timeout: Duration,
+    /// Use kernel timestamps
+    pub use_kernel_timestamps: bool,
+}
+
+impl SessionConfig {
+    pub fn from_config(addr: SocketAddr, config: &Config) -> Self {
+        Self {
+            addr,
+            pipeline_depth: config.connection.pipeline_depth,
+            reconnect_delay: Duration::from_millis(100),
+            connect_timeout: config.connection.connect_timeout,
+            use_kernel_timestamps: matches!(
+                config.timestamps.mode,
+                crate::config::TimestampMode::Software
+            ),
+        }
+    }
+}
+
+/// Protocol-specific codec and decoder.
+enum ProtocolCodec {
+    Resp(RespCodec),
+    Memcache(MemcacheCodec),
+    MemcacheBinary(MemcacheBinaryCodec),
+}
+
+/// A protocol session that works with IoDriver.
+///
+/// The session handles:
+/// - Protocol encoding (requests -> bytes)
+/// - Protocol decoding (bytes -> responses)
+/// - Request tracking (in-flight queue)
+/// - Latency calculation
+///
+/// The IoDriver handles:
+/// - Socket ownership and lifecycle
+/// - Actual send/recv operations
+/// - Connection state
+pub struct Session {
+    /// Connection ID (set when connected via IoDriver)
+    conn_id: Option<ConnId>,
+    /// Target address
+    addr: SocketAddr,
+    /// Protocol codec
+    codec: ProtocolCodec,
+    /// Send/recv buffers
+    buffers: BufferPair,
+    /// In-flight request queue
+    in_flight: VecDeque<InFlightRequest>,
+    /// Maximum pipeline depth
+    max_pipeline_depth: usize,
+    /// Next request ID
+    next_id: u64,
+    /// Connection state
+    state: ConnectionState,
+    /// Last reconnect attempt
+    last_reconnect_attempt: Option<Instant>,
+    /// Current reconnect delay
+    reconnect_delay: Duration,
+    /// Base reconnect delay (for reset after success)
+    base_reconnect_delay: Duration,
+    /// Connect timeout
+    connect_timeout: Duration,
+    /// Use kernel timestamps
+    use_kernel_timestamps: bool,
+    /// Most recent TX timestamp
+    last_tx_timestamp: Option<Timestamp>,
+    /// Most recent RX timestamp
+    last_rx_timestamp: Option<Timestamp>,
+}
+
+impl Session {
+    /// Create a new RESP/Redis session.
+    pub fn new_resp(config: SessionConfig) -> Self {
+        Self::new(config, ProtocolCodec::Resp(RespCodec::new()))
+    }
+
+    /// Create a new Memcache ASCII session.
+    pub fn new_memcache(config: SessionConfig) -> Self {
+        Self::new(config, ProtocolCodec::Memcache(MemcacheCodec::new()))
+    }
+
+    /// Create a new Memcache binary protocol session.
+    pub fn new_memcache_binary(config: SessionConfig) -> Self {
+        Self::new(
+            config,
+            ProtocolCodec::MemcacheBinary(MemcacheBinaryCodec::new()),
+        )
+    }
+
+    /// Create a new session from config.
+    pub fn from_config(addr: SocketAddr, config: &Config) -> Self {
+        let session_config = SessionConfig::from_config(addr, config);
+        match config.target.protocol {
+            Protocol::Resp | Protocol::Resp3 => Self::new_resp(session_config),
+            Protocol::Memcache => Self::new_memcache(session_config),
+            Protocol::MemcacheBinary => Self::new_memcache_binary(session_config),
+            Protocol::Momento => {
+                // Momento uses MomentoSession, not Session
+                panic!("Momento protocol uses MomentoSession, not Session")
+            }
+        }
+    }
+
+    fn new(config: SessionConfig, codec: ProtocolCodec) -> Self {
+        Self {
+            conn_id: None,
+            addr: config.addr,
+            codec,
+            buffers: BufferPair::new(),
+            in_flight: VecDeque::with_capacity(config.pipeline_depth),
+            max_pipeline_depth: config.pipeline_depth,
+            next_id: 0,
+            state: ConnectionState::Disconnected,
+            last_reconnect_attempt: None,
+            reconnect_delay: config.reconnect_delay,
+            base_reconnect_delay: config.reconnect_delay,
+            connect_timeout: config.connect_timeout,
+            use_kernel_timestamps: config.use_kernel_timestamps,
+            last_tx_timestamp: None,
+            last_rx_timestamp: None,
+        }
+    }
+
+    /// Get the target address.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Get the connection ID if connected.
+    pub fn conn_id(&self) -> Option<ConnId> {
+        self.conn_id
+    }
+
+    /// Set the connection ID (called after IoDriver::register).
+    pub fn set_conn_id(&mut self, id: ConnId) {
+        self.conn_id = Some(id);
+        self.state = ConnectionState::Connected;
+        self.reconnect_delay = self.base_reconnect_delay;
+        self.last_reconnect_attempt = None;
+    }
+
+    /// Mark the session as disconnected.
+    pub fn disconnect(&mut self) {
+        self.conn_id = None;
+        self.state = ConnectionState::Disconnected;
+    }
+
+    /// Check if the session is connected.
+    pub fn is_connected(&self) -> bool {
+        self.state == ConnectionState::Connected && self.conn_id.is_some()
+    }
+
+    /// Check if reconnection should be attempted.
+    pub fn should_reconnect(&self) -> bool {
+        if self.state == ConnectionState::Connected {
+            return false;
+        }
+
+        if let Some(last) = self.last_reconnect_attempt {
+            last.elapsed() >= self.reconnect_delay
+        } else {
+            true
+        }
+    }
+
+    /// Mark that a reconnection attempt was made.
+    pub fn reconnect_attempted(&mut self, success: bool) {
+        self.last_reconnect_attempt = Some(Instant::now());
+        if !success {
+            // Exponential backoff, max 5 seconds
+            self.reconnect_delay = (self.reconnect_delay * 2).min(Duration::from_secs(5));
+        }
+    }
+
+    /// Get the connect timeout.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Check if pipeline has room for more requests.
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        self.state == ConnectionState::Connected && self.in_flight.len() < self.max_pipeline_depth
+    }
+
+    /// Get the number of in-flight requests.
+    #[inline]
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Queue a GET request.
+    ///
+    /// The `now` parameter should be the current time, shared across a batch of
+    /// requests to avoid excessive clock_gettime calls.
+    #[inline]
+    pub fn get(&mut self, key: &[u8], now: Instant) -> Option<u64> {
+        if !self.can_send() {
+            return None;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        match &mut self.codec {
+            ProtocolCodec::Resp(codec) => {
+                codec.encode_get(&mut self.buffers.send, key);
+            }
+            ProtocolCodec::Memcache(codec) => {
+                codec.encode_get(&mut self.buffers.send, key);
+            }
+            ProtocolCodec::MemcacheBinary(codec) => {
+                codec.encode_get(&mut self.buffers.send, key);
+            }
+        }
+
+        self.in_flight.push_back(InFlightRequest {
+            id,
+            request_type: RequestType::Get,
+            queued_at: now,
+            tx_timestamp: None,
+        });
+
+        Some(id)
+    }
+
+    /// Queue a SET request.
+    ///
+    /// The `now` parameter should be the current time, shared across a batch of
+    /// requests to avoid excessive clock_gettime calls.
+    #[inline]
+    pub fn set(&mut self, key: &[u8], value: &[u8], now: Instant) -> Option<u64> {
+        if !self.can_send() {
+            return None;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        match &mut self.codec {
+            ProtocolCodec::Resp(codec) => {
+                codec.encode_set(&mut self.buffers.send, key, value);
+            }
+            ProtocolCodec::Memcache(codec) => {
+                codec.encode_set(&mut self.buffers.send, key, value, 0, 0);
+            }
+            ProtocolCodec::MemcacheBinary(codec) => {
+                codec.encode_set(&mut self.buffers.send, key, value, 0, 0);
+            }
+        }
+
+        self.in_flight.push_back(InFlightRequest {
+            id,
+            request_type: RequestType::Set,
+            queued_at: now,
+            tx_timestamp: None,
+        });
+
+        Some(id)
+    }
+
+    /// Get the send buffer to be written to the socket.
+    pub fn send_buffer(&self) -> &[u8] {
+        self.buffers.send.as_slice()
+    }
+
+    /// Mark bytes as sent (removes from send buffer).
+    pub fn bytes_sent(&mut self, n: usize) {
+        self.buffers.send.consume(n);
+
+        // Capture TX timestamp for in-flight requests
+        if self.use_kernel_timestamps
+            && let Some(ts) = self.last_tx_timestamp.take()
+        {
+            for req in &mut self.in_flight {
+                if req.tx_timestamp.is_none() {
+                    req.tx_timestamp = Some(ts);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Set the TX timestamp (from IoDriver if available).
+    pub fn set_tx_timestamp(&mut self, ts: Timestamp) {
+        self.last_tx_timestamp = Some(ts);
+    }
+
+    /// Set the RX timestamp (from IoDriver if available).
+    pub fn set_rx_timestamp(&mut self, ts: Timestamp) {
+        self.last_rx_timestamp = Some(ts);
+    }
+
+    /// Add received data to the receive buffer.
+    pub fn bytes_received(&mut self, data: &[u8]) {
+        // Compact if needed to make space
+        if self.buffers.recv.writable() < data.len() {
+            self.buffers.recv.compact();
+        }
+        self.buffers.recv.extend_from_slice(data);
+    }
+
+    /// Process received data and extract completed responses.
+    ///
+    /// The `now` parameter should be the current time, shared across a batch of
+    /// response processing to avoid excessive clock_gettime calls.
+    #[inline]
+    pub fn poll_responses(
+        &mut self,
+        results: &mut Vec<RequestResult>,
+        now: Instant,
+    ) -> Result<usize, SessionError> {
+        let rx_timestamp = self.last_rx_timestamp;
+        let mut count = 0;
+
+        loop {
+            let response = match &mut self.codec {
+                ProtocolCodec::Resp(codec) => match codec.decode_response(&mut self.buffers.recv) {
+                    Ok(Some(v)) => Some(ResponseInfo {
+                        is_error: v.is_error(),
+                        is_null: v.is_null(),
+                    }),
+                    Ok(None) => None,
+                    Err(e) => return Err(SessionError::Resp(e)),
+                },
+                ProtocolCodec::Memcache(codec) => {
+                    match codec.decode_response(&mut self.buffers.recv) {
+                        Ok(Some(v)) => Some(ResponseInfo {
+                            is_error: v.is_error(),
+                            is_null: v.is_miss(),
+                        }),
+                        Ok(None) => None,
+                        Err(e) => return Err(SessionError::Memcache(e)),
+                    }
+                }
+                ProtocolCodec::MemcacheBinary(codec) => {
+                    match codec.decode_response(&mut self.buffers.recv) {
+                        Ok(Some(v)) => Some(ResponseInfo {
+                            is_error: v.is_error(),
+                            is_null: v.is_miss(),
+                        }),
+                        Ok(None) => None,
+                        Err(e) => return Err(SessionError::MemcacheBinary(e)),
+                    }
+                }
+            };
+
+            match response {
+                Some(resp) => {
+                    if let Some(req) = self.in_flight.pop_front() {
+                        let latency_ns = self.calculate_latency(&req, now, rx_timestamp);
+
+                        let hit = if req.request_type == RequestType::Get {
+                            Some(!resp.is_null)
+                        } else {
+                            None
+                        };
+
+                        results.push(RequestResult {
+                            id: req.id,
+                            success: !resp.is_error,
+                            is_error_response: resp.is_error,
+                            latency_ns,
+                            request_type: req.request_type,
+                            hit,
+                        });
+                        count += 1;
+                    } else {
+                        tracing::warn!("received response without pending request");
+                    }
+                }
+                None => break,
+            }
+        }
+
+        if count > 0 {
+            self.last_rx_timestamp = None;
+        }
+
+        Ok(count)
+    }
+
+    fn calculate_latency(
+        &self,
+        req: &InFlightRequest,
+        now: Instant,
+        rx_timestamp: Option<Timestamp>,
+    ) -> u64 {
+        if self.use_kernel_timestamps
+            && let (Some(tx), Some(rx)) = (req.tx_timestamp, rx_timestamp)
+            && let (Some(tx_ns), Some(rx_ns)) = (tx.kernel_ns, rx.kernel_ns)
+        {
+            return rx_ns.saturating_sub(tx_ns);
+        }
+        now.duration_since(req.queued_at).as_nanos() as u64
+    }
+
+    /// Clear all buffers and in-flight state (for reconnection).
+    pub fn reset(&mut self) {
+        self.buffers.send.clear();
+        self.buffers.recv.clear();
+        self.in_flight.clear();
+        self.last_tx_timestamp = None;
+        self.last_rx_timestamp = None;
+
+        match &mut self.codec {
+            ProtocolCodec::Resp(codec) => codec.reset_counter(),
+            ProtocolCodec::Memcache(_) => {}
+            ProtocolCodec::MemcacheBinary(codec) => codec.reset(),
+        }
+    }
+}
+
+/// Simplified response info for latency tracking.
+struct ResponseInfo {
+    is_error: bool,
+    is_null: bool,
+}
+
+/// Session error type.
+#[derive(Debug)]
+pub enum SessionError {
+    Resp(RespError),
+    Memcache(MemcacheError),
+    MemcacheBinary(MemcacheBinaryError),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Resp(e) => write!(f, "RESP error: {}", e),
+            SessionError::Memcache(e) => write!(f, "Memcache error: {}", e),
+            SessionError::MemcacheBinary(e) => write!(f, "Memcache binary error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}

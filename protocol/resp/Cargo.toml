@@ -1,0 +1,25 @@
+[package]
+name = "protocol-resp"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bidirectional RESP2/RESP3 protocol implementation for Redis-compatible systems"
+
+[features]
+default = []
+resp3 = ["dep:ryu"]
+
+[dependencies]
+# For efficient CRLF scanning
+memchr = { workspace = true }
+
+# For efficient integer formatting
+itoa = { workspace = true }
+
+# For efficient float formatting (RESP3)
+ryu = { workspace = true, optional = true }
+
+# Error handling
+thiserror = { workspace = true }

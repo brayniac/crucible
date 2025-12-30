@@ -1,0 +1,55 @@
+[package]
+name = "server"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-performance cache server with multiple protocols and runtime backends"
+
+[features]
+default = []
+tokio-runtime = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+io_uring = ["io-driver/io_uring"]
+
+[dependencies]
+# Cache core trait
+cache-core = { workspace = true }
+
+# Cache implementations
+segcache = { workspace = true }
+s3fifo = { workspace = true }
+
+# Protocol implementations
+protocol-resp = { workspace = true, features = ["resp3"] }
+protocol-memcache = { workspace = true, features = ["full"] }
+
+# I/O driver (native runtime)
+io-driver = { workspace = true }
+
+# Core utilities
+bytes = { workspace = true }
+itoa = { workspace = true }
+slab = { workspace = true }
+libc = { workspace = true }
+
+# Configuration
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+num_cpus = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive"] }
+
+# Metrics
+metriken = { workspace = true }
+
+# Tokio runtime (optional)
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "io-util", "sync"] }
+hyper = { workspace = true, optional = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio"] }
+http-body-util = { workspace = true, optional = true }
+
+[[bin]]
+name = "crucible-server"
+path = "src/bin/server.rs"

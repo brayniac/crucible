@@ -1,0 +1,40 @@
+mod momento;
+mod session;
+
+pub use momento::MomentoSession;
+pub use session::{Session, SessionConfig, SessionError, Timestamp};
+
+/// Result of a completed request.
+#[derive(Debug, Clone)]
+pub struct RequestResult {
+    /// Unique request ID
+    pub id: u64,
+    /// Whether the request succeeded
+    pub success: bool,
+    /// Whether this was an error response (not a network error)
+    pub is_error_response: bool,
+    /// Latency in nanoseconds
+    pub latency_ns: u64,
+    /// Request type
+    pub request_type: RequestType,
+    /// For GET requests: true if cache hit, false if miss, None for non-GET
+    pub hit: Option<bool>,
+}
+
+/// Type of request for metrics categorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestType {
+    Get,
+    Set,
+    Ping,
+    Delete,
+    Other,
+}
+
+/// Connection state for reconnection handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connected,
+    Disconnected,
+    Connecting,
+}

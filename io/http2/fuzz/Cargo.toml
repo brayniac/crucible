@@ -1,0 +1,32 @@
+[package]
+name = "http2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.http2]
+path = ".."
+
+[[bin]]
+name = "fuzz_frame_decode"
+path = "fuzz_targets/fuzz_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_hpack_decode"
+path = "fuzz_targets/fuzz_hpack_decode.rs"
+test = false
+doc = false
+bench = false
+

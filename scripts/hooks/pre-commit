@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# Pre-commit hook to run rustfmt
+# Install with: cp scripts/hooks/pre-commit .git/hooks/pre-commit
+
+set -e
+
+# Check if cargo fmt is available
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "Error: cargo not found in PATH"
+    exit 1
+fi
+
+# Run cargo fmt check
+echo "Running cargo fmt --check..."
+if ! cargo fmt --all -- --check; then
+    echo ""
+    echo "Formatting errors found. Please run 'cargo fmt' to fix them."
+    exit 1
+fi
+
+echo "Format check passed."

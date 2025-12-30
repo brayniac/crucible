@@ -1,0 +1,57 @@
+[package]
+name = "benchmark"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-performance cache protocol benchmark tool"
+
+[dependencies]
+# I/O abstraction layer
+io-driver = { workspace = true, features = ["serde"] }
+
+# Protocol implementations
+protocol-resp = { workspace = true, features = ["resp3"] }
+protocol-memcache = { workspace = true, features = ["full"] }
+protocol-momento = { workspace = true }
+
+# Metrics
+metriken = { workspace = true }
+metriken-exposition = { version = "0.12", features = ["parquet"] }
+
+# Configuration
+toml = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+# CLI
+clap = { workspace = true, features = ["derive"] }
+
+# Utilities
+bytes = { workspace = true }
+libc = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
+thiserror = { workspace = true }
+itoa = { workspace = true }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# RNG for workload generation
+rand = { workspace = true }
+rand_xoshiro = "0.7"
+
+# Rate limiting
+ratelimit = "0.10"
+
+# Async runtime for admin server
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+
+[features]
+default = ["io_uring"]
+io_uring = ["io-driver/io_uring"]
+
+[[bin]]
+name = "crucible-benchmark"
+path = "src/main.rs"

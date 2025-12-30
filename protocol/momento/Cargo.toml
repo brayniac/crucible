@@ -1,0 +1,20 @@
+[package]
+name = "protocol-momento"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lightweight Momento cache protocol implementation for io-driver-based applications"
+
+[dependencies]
+bytes = { workspace = true }
+grpc = { workspace = true }
+http2 = { workspace = true }
+io-driver = { workspace = true }
+
+[[bin]]
+name = "momento-cli"
+path = "src/bin/momento-cli.rs"
+
+[dev-dependencies]

@@ -1,0 +1,38 @@
+[package]
+name = "momento-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.protocol-momento]
+path = ".."
+
+[[bin]]
+name = "fuzz_proto_decode"
+path = "fuzz_targets/fuzz_proto_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_get_response"
+path = "fuzz_targets/fuzz_get_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_set_request"
+path = "fuzz_targets/fuzz_set_request.rs"
+test = false
+doc = false
+bench = false

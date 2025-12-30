@@ -1,0 +1,29 @@
+[package]
+name = "cache-core"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Redesigned cache-core with layer-based architecture"
+
+[features]
+default = ["validation"]
+loom = ["dep:loom"]
+# Adds magic bytes and checksums to item headers for corruption detection
+validation = []
+
+[dependencies]
+ahash = { workspace = true }
+clocksource = { workspace = true }
+crossbeam-deque = { workspace = true }
+libc = { workspace = true }
+memmap2 = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+
+# Optional loom support for concurrency testing
+loom = { workspace = true, features = ["checkpoint"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"

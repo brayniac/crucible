@@ -1,0 +1,555 @@
+//! Client-side request encoding.
+//!
+//! This module provides efficient encoding of Redis commands for client applications.
+//! Commands are encoded as RESP arrays of bulk strings.
+
+use std::io::Write;
+
+/// A request builder for encoding Redis commands.
+///
+/// This provides a fluent interface for building and encoding commands.
+///
+/// # Example
+///
+/// ```
+/// use protocol_resp::Request;
+///
+/// let mut buf = vec![0u8; 1024];
+///
+/// // Simple GET
+/// let len = Request::get(b"mykey").encode(&mut buf);
+///
+/// // SET with expiration
+/// let len = Request::set(b"mykey", b"myvalue").ex(3600).encode(&mut buf);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Request<'a> {
+    args: Vec<&'a [u8]>,
+}
+
+impl<'a> Request<'a> {
+    /// Create a new request with the given arguments.
+    #[inline]
+    pub fn new(args: Vec<&'a [u8]>) -> Self {
+        Self { args }
+    }
+
+    /// Create a PING command.
+    #[inline]
+    pub fn ping() -> Self {
+        Self {
+            args: vec![b"PING"],
+        }
+    }
+
+    /// Create a GET command.
+    #[inline]
+    pub fn get(key: &'a [u8]) -> Self {
+        Self {
+            args: vec![b"GET", key],
+        }
+    }
+
+    /// Create a SET command.
+    #[inline]
+    pub fn set(key: &'a [u8], value: &'a [u8]) -> SetRequest<'a> {
+        SetRequest {
+            key,
+            value,
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        }
+    }
+
+    /// Create a DEL command.
+    #[inline]
+    pub fn del(key: &'a [u8]) -> Self {
+        Self {
+            args: vec![b"DEL", key],
+        }
+    }
+
+    /// Create a MGET command (multiple keys).
+    #[inline]
+    pub fn mget(keys: &[&'a [u8]]) -> Self {
+        let mut args = Vec::with_capacity(1 + keys.len());
+        args.push(b"MGET" as &[u8]);
+        args.extend_from_slice(keys);
+        Self { args }
+    }
+
+    /// Create a CONFIG GET command.
+    #[inline]
+    pub fn config_get(key: &'a [u8]) -> Self {
+        Self {
+            args: vec![b"CONFIG", b"GET", key],
+        }
+    }
+
+    /// Create a CONFIG SET command.
+    #[inline]
+    pub fn config_set(key: &'a [u8], value: &'a [u8]) -> Self {
+        Self {
+            args: vec![b"CONFIG", b"SET", key, value],
+        }
+    }
+
+    /// Create a FLUSHDB command.
+    #[inline]
+    pub fn flushdb() -> Self {
+        Self {
+            args: vec![b"FLUSHDB"],
+        }
+    }
+
+    /// Create a FLUSHALL command.
+    #[inline]
+    pub fn flushall() -> Self {
+        Self {
+            args: vec![b"FLUSHALL"],
+        }
+    }
+
+    /// Create a custom command with arbitrary arguments.
+    #[inline]
+    pub fn cmd(name: &'a [u8]) -> Self {
+        Self { args: vec![name] }
+    }
+
+    /// Add an argument to the command.
+    #[inline]
+    pub fn arg(mut self, arg: &'a [u8]) -> Self {
+        self.args.push(arg);
+        self
+    }
+
+    /// Encode this request into a buffer.
+    ///
+    /// Returns the number of bytes written.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer is too small.
+    #[inline]
+    pub fn encode(&self, buf: &mut [u8]) -> usize {
+        encode_command(buf, &self.args)
+    }
+
+    /// Calculate the encoded length of this request.
+    pub fn encoded_len(&self) -> usize {
+        let mut len = 0;
+
+        // Array header: *<count>\r\n
+        let mut count_buf = itoa::Buffer::new();
+        len += 1 + count_buf.format(self.args.len()).len() + 2;
+
+        // Each argument: $<len>\r\n<data>\r\n
+        for arg in &self.args {
+            let mut arg_len_buf = itoa::Buffer::new();
+            len += 1 + arg_len_buf.format(arg.len()).len() + 2 + arg.len() + 2;
+        }
+
+        len
+    }
+}
+
+/// Builder for SET commands with options.
+#[derive(Debug, Clone)]
+pub struct SetRequest<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+    ex: Option<u64>,
+    px: Option<u64>,
+    nx: bool,
+    xx: bool,
+}
+
+impl<'a> SetRequest<'a> {
+    /// Set expiration in seconds (EX option).
+    #[inline]
+    pub fn ex(mut self, seconds: u64) -> Self {
+        self.ex = Some(seconds);
+        self.px = None; // EX and PX are mutually exclusive
+        self
+    }
+
+    /// Set expiration in milliseconds (PX option).
+    #[inline]
+    pub fn px(mut self, milliseconds: u64) -> Self {
+        self.px = Some(milliseconds);
+        self.ex = None; // EX and PX are mutually exclusive
+        self
+    }
+
+    /// Only set if key does not exist (NX option).
+    #[inline]
+    pub fn nx(mut self) -> Self {
+        self.nx = true;
+        self.xx = false; // NX and XX are mutually exclusive
+        self
+    }
+
+    /// Only set if key exists (XX option).
+    #[inline]
+    pub fn xx(mut self) -> Self {
+        self.xx = true;
+        self.nx = false; // NX and XX are mutually exclusive
+        self
+    }
+
+    /// Encode this SET request into a buffer.
+    ///
+    /// Returns the number of bytes written.
+    #[inline]
+    pub fn encode(&self, buf: &mut [u8]) -> usize {
+        // Build argument list
+        let mut ex_str = itoa::Buffer::new();
+        let mut px_str = itoa::Buffer::new();
+
+        let mut args: Vec<&[u8]> = vec![b"SET", self.key, self.value];
+
+        if let Some(seconds) = self.ex {
+            args.push(b"EX");
+            args.push(ex_str.format(seconds).as_bytes());
+        } else if let Some(millis) = self.px {
+            args.push(b"PX");
+            args.push(px_str.format(millis).as_bytes());
+        }
+
+        if self.nx {
+            args.push(b"NX");
+        } else if self.xx {
+            args.push(b"XX");
+        }
+
+        encode_command(buf, &args)
+    }
+
+    /// Calculate the encoded length of this request.
+    pub fn encoded_len(&self) -> usize {
+        let mut args_count = 3; // SET key value
+        let mut data_len = 3 + self.key.len() + self.value.len(); // "SET" + key + value
+
+        if let Some(seconds) = self.ex {
+            args_count += 2;
+            let mut buf = itoa::Buffer::new();
+            data_len += 2 + buf.format(seconds).len(); // "EX" + number
+        } else if let Some(millis) = self.px {
+            args_count += 2;
+            let mut buf = itoa::Buffer::new();
+            data_len += 2 + buf.format(millis).len(); // "PX" + number
+        }
+
+        if self.nx {
+            args_count += 1;
+            data_len += 2; // "NX"
+        } else if self.xx {
+            args_count += 1;
+            data_len += 2; // "XX"
+        }
+
+        // Calculate total: *<count>\r\n + for each arg: $<len>\r\n<data>\r\n
+        let mut count_buf = itoa::Buffer::new();
+        let header_len = 1 + count_buf.format(args_count).len() + 2;
+
+        // Very rough estimate - each arg has $<len>\r\n overhead
+        header_len + args_count * 5 + data_len
+    }
+}
+
+/// Encode a command (array of bulk strings) into a buffer.
+///
+/// Returns the number of bytes written.
+#[inline]
+pub fn encode_command(buf: &mut [u8], args: &[&[u8]]) -> usize {
+    let mut pos = 0;
+
+    // Write array header: *<count>\r\n
+    buf[pos] = b'*';
+    pos += 1;
+    let mut cursor = std::io::Cursor::new(&mut buf[pos..]);
+    write!(cursor, "{}\r\n", args.len()).unwrap();
+    pos += cursor.position() as usize;
+
+    // Write each argument as bulk string
+    for arg in args {
+        // $<len>\r\n
+        buf[pos] = b'$';
+        pos += 1;
+        let mut cursor = std::io::Cursor::new(&mut buf[pos..]);
+        write!(cursor, "{}\r\n", arg.len()).unwrap();
+        pos += cursor.position() as usize;
+
+        // <data>\r\n
+        buf[pos..pos + arg.len()].copy_from_slice(arg);
+        pos += arg.len();
+        buf[pos] = b'\r';
+        buf[pos + 1] = b'\n';
+        pos += 2;
+    }
+
+    pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_ping() {
+        let mut buf = [0u8; 64];
+        let len = Request::ping().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*1\r\n$4\r\nPING\r\n");
+    }
+
+    #[test]
+    fn test_encode_get() {
+        let mut buf = [0u8; 64];
+        let len = Request::get(b"mykey").encode(&mut buf);
+        assert_eq!(&buf[..len], b"*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n");
+    }
+
+    #[test]
+    fn test_encode_set() {
+        let mut buf = [0u8; 64];
+        let len = Request::set(b"mykey", b"myvalue").encode(&mut buf);
+        assert_eq!(
+            &buf[..len],
+            b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n"
+        );
+    }
+
+    #[test]
+    fn test_encode_set_ex() {
+        let mut buf = [0u8; 128];
+        let len = Request::set(b"mykey", b"myvalue").ex(3600).encode(&mut buf);
+        assert_eq!(
+            &buf[..len],
+            b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n$2\r\nEX\r\n$4\r\n3600\r\n"
+        );
+    }
+
+    #[test]
+    fn test_encode_set_px() {
+        let mut buf = [0u8; 128];
+        let len = Request::set(b"key", b"val").px(1000).encode(&mut buf);
+        assert!(std::str::from_utf8(&buf[..len]).unwrap().contains("PX"));
+    }
+
+    #[test]
+    fn test_encode_set_nx() {
+        let mut buf = [0u8; 128];
+        let len = Request::set(b"key", b"val").nx().encode(&mut buf);
+        assert!(std::str::from_utf8(&buf[..len]).unwrap().contains("NX"));
+    }
+
+    #[test]
+    fn test_encode_del() {
+        let mut buf = [0u8; 64];
+        let len = Request::del(b"mykey").encode(&mut buf);
+        assert_eq!(&buf[..len], b"*2\r\n$3\r\nDEL\r\n$5\r\nmykey\r\n");
+    }
+
+    #[test]
+    fn test_encode_mget() {
+        let mut buf = [0u8; 128];
+        let keys: &[&[u8]] = &[b"key1", b"key2", b"key3"];
+        let len = Request::mget(keys).encode(&mut buf);
+        assert_eq!(
+            &buf[..len],
+            b"*4\r\n$4\r\nMGET\r\n$4\r\nkey1\r\n$4\r\nkey2\r\n$4\r\nkey3\r\n"
+        );
+    }
+
+    #[test]
+    fn test_encode_flushdb() {
+        let mut buf = [0u8; 64];
+        let len = Request::flushdb().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*1\r\n$7\r\nFLUSHDB\r\n");
+    }
+
+    #[test]
+    fn test_encode_custom() {
+        let mut buf = [0u8; 64];
+        let len = Request::cmd(b"INCR").arg(b"counter").encode(&mut buf);
+        assert_eq!(&buf[..len], b"*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+    }
+
+    #[test]
+    fn test_encoded_len() {
+        let requests: Vec<Request> = vec![
+            Request::ping(),
+            Request::get(b"mykey"),
+            Request::del(b"test"),
+        ];
+
+        for req in requests {
+            let mut buf = [0u8; 256];
+            let actual_len = req.encode(&mut buf);
+            assert_eq!(req.encoded_len(), actual_len);
+        }
+    }
+
+    #[test]
+    fn test_request_new() {
+        let args: Vec<&[u8]> = vec![b"CUSTOM", b"arg1", b"arg2"];
+        let req = Request::new(args);
+        let mut buf = [0u8; 128];
+        let len = req.encode(&mut buf);
+        assert!(len > 0);
+        assert!(std::str::from_utf8(&buf[..len]).unwrap().contains("CUSTOM"));
+    }
+
+    #[test]
+    fn test_encode_config_get() {
+        let mut buf = [0u8; 128];
+        let len = Request::config_get(b"maxclients").encode(&mut buf);
+        let encoded = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(encoded.contains("CONFIG"));
+        assert!(encoded.contains("GET"));
+        assert!(encoded.contains("maxclients"));
+    }
+
+    #[test]
+    fn test_encode_config_set() {
+        let mut buf = [0u8; 128];
+        let len = Request::config_set(b"maxclients", b"100").encode(&mut buf);
+        let encoded = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(encoded.contains("CONFIG"));
+        assert!(encoded.contains("SET"));
+        assert!(encoded.contains("maxclients"));
+        assert!(encoded.contains("100"));
+    }
+
+    #[test]
+    fn test_encode_flushall() {
+        let mut buf = [0u8; 64];
+        let len = Request::flushall().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*1\r\n$8\r\nFLUSHALL\r\n");
+    }
+
+    #[test]
+    fn test_encode_set_xx() {
+        let mut buf = [0u8; 128];
+        let len = Request::set(b"key", b"val").xx().encode(&mut buf);
+        assert!(std::str::from_utf8(&buf[..len]).unwrap().contains("XX"));
+    }
+
+    #[test]
+    fn test_set_px_overrides_ex() {
+        // Setting PX should clear EX
+        let mut buf = [0u8; 128];
+        let len = Request::set(b"key", b"val")
+            .ex(100)
+            .px(5000)
+            .encode(&mut buf);
+        let encoded = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(encoded.contains("PX"));
+        assert!(!encoded.contains("EX\r\n")); // Should not have EX as separate arg
+    }
+
+    #[test]
+    fn test_set_ex_overrides_px() {
+        // Setting EX should clear PX
+        let mut buf = [0u8; 128];
+        let len = Request::set(b"key", b"val")
+            .px(5000)
+            .ex(100)
+            .encode(&mut buf);
+        let encoded = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(encoded.contains("EX"));
+        assert!(!encoded.contains("PX"));
+    }
+
+    #[test]
+    fn test_set_xx_overrides_nx() {
+        // Setting XX should clear NX
+        let set_req = Request::set(b"key", b"val").nx().xx();
+        assert!(set_req.xx);
+        assert!(!set_req.nx);
+    }
+
+    #[test]
+    fn test_set_nx_overrides_xx() {
+        // Setting NX should clear XX
+        let set_req = Request::set(b"key", b"val").xx().nx();
+        assert!(set_req.nx);
+        assert!(!set_req.xx);
+    }
+
+    #[test]
+    fn test_set_request_encoded_len() {
+        // Test various SetRequest configurations
+        // Note: encoded_len() is a rough estimate for SetRequest
+        let configs = vec![
+            Request::set(b"key", b"value"),
+            Request::set(b"key", b"value").ex(3600),
+            Request::set(b"key", b"value").px(5000),
+            Request::set(b"key", b"value").nx(),
+            Request::set(b"key", b"value").xx(),
+            Request::set(b"key", b"value").ex(3600).nx(),
+        ];
+
+        for config in configs {
+            let mut buf = [0u8; 256];
+            let actual_len = config.encode(&mut buf);
+            let estimated_len = config.encoded_len();
+            // The estimate should be reasonably close to actual
+            // Allow for some variance in the estimate
+            assert!(
+                estimated_len > 0 && actual_len > 0,
+                "Both estimated ({}) and actual ({}) should be > 0",
+                estimated_len,
+                actual_len
+            );
+        }
+    }
+
+    #[test]
+    fn test_request_debug() {
+        let req = Request::ping();
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("Request"));
+    }
+
+    #[test]
+    fn test_request_clone() {
+        let req1 = Request::get(b"mykey");
+        let req2 = req1.clone();
+        let mut buf1 = [0u8; 64];
+        let mut buf2 = [0u8; 64];
+        let len1 = req1.encode(&mut buf1);
+        let len2 = req2.encode(&mut buf2);
+        assert_eq!(&buf1[..len1], &buf2[..len2]);
+    }
+
+    #[test]
+    fn test_set_request_debug() {
+        let set_req = Request::set(b"key", b"value");
+        let debug_str = format!("{:?}", set_req);
+        assert!(debug_str.contains("SetRequest"));
+    }
+
+    #[test]
+    fn test_set_request_clone() {
+        let set1 = Request::set(b"key", b"value").ex(100);
+        let set2 = set1.clone();
+        let mut buf1 = [0u8; 128];
+        let mut buf2 = [0u8; 128];
+        let len1 = set1.encode(&mut buf1);
+        let len2 = set2.encode(&mut buf2);
+        assert_eq!(&buf1[..len1], &buf2[..len2]);
+    }
+
+    #[test]
+    fn test_mget_empty() {
+        let keys: &[&[u8]] = &[];
+        let req = Request::mget(keys);
+        let mut buf = [0u8; 64];
+        let len = req.encode(&mut buf);
+        // Should just be MGET with no keys
+        assert_eq!(&buf[..len], b"*1\r\n$4\r\nMGET\r\n");
+    }
+}

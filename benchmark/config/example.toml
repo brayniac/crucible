@@ -1,0 +1,33 @@
+[general]
+duration = "60s"
+warmup = "10s"
+threads = 1
+
+[target]
+endpoints = ["127.0.0.1:6379"]
+protocol = "resp"
+
+[connection]
+pool_size = 4
+pipeline_depth = 32
+connect_timeout = "5s"
+request_timeout = "1s"
+
+[workload]
+# rate_limit = 100000  # Uncomment to limit rate
+
+[workload.keyspace]
+length = 16
+count = 1000000
+distribution = "uniform"
+
+[workload.commands]
+get = 80
+set = 20
+
+[workload.values]
+length = 64
+
+[timestamps]
+enabled = true
+mode = "userspace"  # or "software" for SO_TIMESTAMPING (Linux only)

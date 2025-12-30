@@ -1,0 +1,45 @@
+[package]
+name = "protocol-memcache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.protocol-memcache]
+path = ".."
+features = ["full"]
+
+[[bin]]
+name = "fuzz_ascii_command"
+path = "fuzz_targets/fuzz_ascii_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ascii_response"
+path = "fuzz_targets/fuzz_ascii_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_binary_command"
+path = "fuzz_targets/fuzz_binary_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_binary_response"
+path = "fuzz_targets/fuzz_binary_response.rs"
+test = false
+doc = false
+bench = false

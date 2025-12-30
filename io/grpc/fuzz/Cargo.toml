@@ -1,0 +1,32 @@
+[package]
+name = "grpc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.grpc]
+path = ".."
+
+[[bin]]
+name = "fuzz_decode_message"
+path = "fuzz_targets/fuzz_decode_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_message_decoder"
+path = "fuzz_targets/fuzz_message_decoder.rs"
+test = false
+doc = false
+bench = false
+

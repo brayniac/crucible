@@ -1,0 +1,30 @@
+[package]
+name = "cache-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.cache-core]
+path = ".."
+
+[[bin]]
+name = "fuzz_basic_header"
+path = "fuzz_targets/fuzz_basic_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ttl_header"
+path = "fuzz_targets/fuzz_ttl_header.rs"
+test = false
+doc = false
+bench = false
