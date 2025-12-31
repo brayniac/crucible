@@ -353,7 +353,8 @@ impl IoWorker {
         }
 
         // Process any received data into responses
-        self.poll_responses(now);
+        // Use a fresh timestamp to accurately measure latency (not the one used for sending)
+        self.poll_responses(std::time::Instant::now());
 
         Ok(())
     }
@@ -412,8 +413,9 @@ impl IoWorker {
             }
 
             // Poll for responses (this also drives I/O)
+            // Use a fresh timestamp to accurately measure latency (not the one used for sending)
             self.results.clear();
-            if let Err(e) = session.poll_responses(&mut self.results, now) {
+            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
                 tracing::debug!("Momento poll error: {}", e);
             }
 
