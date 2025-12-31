@@ -92,10 +92,19 @@ impl Connection {
         }
     }
 
+    /// Maximum pending write buffer size before applying backpressure.
+    /// Stop processing new requests if we have this much unsent data.
+    const MAX_PENDING_WRITE: usize = 256 * 1024; // 256KB
+
     #[inline]
     fn process_resp<C: Cache>(&mut self, cache: &C) {
         loop {
             if self.read_buf.is_empty() {
+                break;
+            }
+
+            // Backpressure: stop processing if write buffer is too large
+            if self.write_buf.len() - self.write_pos > Self::MAX_PENDING_WRITE {
                 break;
             }
 
@@ -131,6 +140,11 @@ impl Connection {
                 break;
             }
 
+            // Backpressure: stop processing if write buffer is too large
+            if self.write_buf.len() - self.write_pos > Self::MAX_PENDING_WRITE {
+                break;
+            }
+
             match MemcacheCommand::parse(&self.read_buf) {
                 Ok((cmd, consumed)) => {
                     if execute_memcache(&cmd, cache, &mut self.write_buf) {
@@ -155,6 +169,11 @@ impl Connection {
     fn process_memcache_binary<C: Cache>(&mut self, cache: &C) {
         loop {
             if self.read_buf.is_empty() {
+                break;
+            }
+
+            // Backpressure: stop processing if write buffer is too large
+            if self.write_buf.len() - self.write_pos > Self::MAX_PENDING_WRITE {
                 break;
             }
 
@@ -356,5 +375,50 @@ mod tests {
         // Second response: $-1\r\n (5 bytes)
         // Total: 8 bytes
         assert_eq!(conn.pending_write_data().len(), 8);
+    }
+
+    #[test]
+    fn test_backpressure_stops_processing() {
+        let cache = MockCache;
+        let mut conn = Connection::new(1024);
+
+        // Generate enough response data to exceed MAX_PENDING_WRITE
+        // Each GET response is "$-1\r\n" (5 bytes)
+        // MAX_PENDING_WRITE is 256KB, so we need ~52,000 requests
+        // But we can test with smaller amounts by checking that
+        // requests stop being processed when write buffer is large
+
+        // First, send many requests at once
+        let single_request = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+        let mut large_request = Vec::new();
+        for _ in 0..60000 {
+            large_request.extend_from_slice(single_request);
+        }
+        conn.append_recv_data(&large_request);
+        conn.process(&cache);
+
+        // The write buffer should be capped at around MAX_PENDING_WRITE
+        // (actually slightly more since we process one more after the check)
+        let pending = conn.pending_write_data().len();
+        assert!(
+            pending <= Connection::MAX_PENDING_WRITE + 100,
+            "pending write {} should be around MAX_PENDING_WRITE {}",
+            pending,
+            Connection::MAX_PENDING_WRITE
+        );
+
+        // There should still be unprocessed data in read buffer
+        // (backpressure stopped processing)
+        assert!(
+            !conn.read_buf.is_empty(),
+            "read buffer should still have unprocessed requests"
+        );
+
+        // Now "send" all the data and process again
+        conn.advance_write(pending);
+        conn.process(&cache);
+
+        // More data should have been processed
+        assert!(conn.has_pending_write());
     }
 }
