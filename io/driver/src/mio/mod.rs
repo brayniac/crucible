@@ -177,32 +177,17 @@ impl IoDriver for MioDriver {
     }
 
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize> {
-        let conn_len = self.connections.len();
-        let conn = self.connections.get_mut(id.as_usize()).ok_or_else(|| {
-            eprintln!(
-                "BUG(driver.recv): conn_id={} not found in slab (len={})",
-                id.as_usize(),
-                conn_len
-            );
-            io::Error::new(io::ErrorKind::NotFound, "connection not found")
-        })?;
+        let conn = self
+            .connections
+            .get_mut(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
         match conn.stream.read(buf) {
             Ok(0) => Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "connection closed",
             )),
-            Ok(n) => {
-                if n < 200 {
-                    eprintln!(
-                        "<<< RECV conn={} len={} data={:?}",
-                        id.as_usize(),
-                        n,
-                        String::from_utf8_lossy(&buf[..n.min(64)])
-                    );
-                }
-                Ok(n)
-            }
+            Ok(n) => Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 conn.readable = false;
                 Err(e)

@@ -103,18 +103,11 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
 
         for completion in driver.drain_completions() {
             match completion.kind {
-                CompletionKind::Accept { conn_id, addr, .. } => {
+                CompletionKind::Accept { conn_id, .. } => {
                     CONNECTIONS_ACCEPTED.increment();
                     CONNECTIONS_ACTIVE.increment();
 
                     let idx = conn_id.as_usize();
-                    // Check if we're overwriting an existing connection (should never happen)
-                    if idx < connections.len() && connections[idx].is_some() {
-                        eprintln!(
-                            "BUG: Accept for conn_id={} but slot already occupied! addr={:?}",
-                            idx, addr
-                        );
-                    }
                     // Grow the vec if needed
                     if idx >= connections.len() {
                         connections.resize_with(idx + 1, || None);
@@ -125,12 +118,6 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                 CompletionKind::Recv { conn_id } => {
                     let idx = conn_id.as_usize();
                     let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
-                        // Got Recv for unknown connection - this is a bug!
-                        eprintln!(
-                            "BUG: Recv for unknown conn_id={}, connections.len()={}",
-                            idx,
-                            connections.len()
-                        );
                         continue;
                     };
 
