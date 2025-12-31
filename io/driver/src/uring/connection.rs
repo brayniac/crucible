@@ -105,6 +105,22 @@ impl UringConnection {
         &self.send_bufs[buf_idx][self.send_pos[buf_idx]..]
     }
 
+    /// Get a stable pointer to the pending send data.
+    ///
+    /// # Safety
+    /// The returned pointer is valid as long as in_flight_count[buf_idx] > 0,
+    /// which prevents the buffer from being cleared or reallocated.
+    #[inline]
+    pub fn send_buf_ptr(&self, buf_idx: usize) -> *const u8 {
+        unsafe { self.send_bufs[buf_idx].as_ptr().add(self.send_pos[buf_idx]) }
+    }
+
+    /// Get the length of pending send data.
+    #[inline]
+    pub fn pending_send_len(&self, buf_idx: usize) -> usize {
+        self.send_bufs[buf_idx].len() - self.send_pos[buf_idx]
+    }
+
     /// Get the send position for a buffer.
     #[inline]
     pub fn send_pos(&self, buf_idx: usize) -> usize {

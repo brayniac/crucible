@@ -293,11 +293,14 @@ impl UringDriver {
             // If more data to send, submit another send
             if conn.has_pending_send(buf_idx) {
                 conn.increment_in_flight(buf_idx);
-                let data = conn.pending_send_data(buf_idx);
+                // Get stable pointer to the actual send buffer (not a copy!)
+                let send_ptr = conn.send_buf_ptr(buf_idx);
+                let send_len = conn.pending_send_len(buf_idx);
                 let fixed_slot = conn.fixed_slot;
-                // Need to copy data since we can't borrow conn
-                let data_copy: Vec<u8> = data.to_vec();
-                let _ = self.submit_send_zc(conn_id, fixed_slot, buf_idx as u8, &data_copy);
+
+                // Use the stable buffer pointer for zero-copy send
+                let send_data = unsafe { std::slice::from_raw_parts(send_ptr, send_len) };
+                let _ = self.submit_send_zc(conn_id, fixed_slot, buf_idx as u8, send_data);
             }
         }
 
@@ -578,11 +581,15 @@ impl IoDriver for UringDriver {
             || conn.send_pos(buf_idx) >= conn.send_buf_len(buf_idx) - data.len()
         {
             conn.increment_in_flight(buf_idx);
-            let send_data = conn.pending_send_data(buf_idx);
+            // Get stable pointer to the actual send buffer (not a copy!)
+            // This is safe because send_bufs don't reallocate while in_flight_count > 0
+            let send_ptr = conn.send_buf_ptr(buf_idx);
+            let send_len = conn.pending_send_len(buf_idx);
             let fixed_slot = conn.fixed_slot;
-            // Copy data for the submission
-            let data_copy: Vec<u8> = send_data.to_vec();
-            self.submit_send_zc(id.as_usize(), fixed_slot, buf_idx as u8, &data_copy)?;
+
+            // Use the stable buffer pointer for zero-copy send
+            let send_data = unsafe { std::slice::from_raw_parts(send_ptr, send_len) };
+            self.submit_send_zc(id.as_usize(), fixed_slot, buf_idx as u8, send_data)?;
         }
 
         Ok(data.len())
