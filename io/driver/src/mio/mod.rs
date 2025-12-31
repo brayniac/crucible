@@ -183,10 +183,6 @@ impl IoDriver for MioDriver {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
         match conn.stream.read(buf) {
-            Ok(0) => Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "connection closed",
-            )),
             Ok(n) => Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 conn.readable = false;

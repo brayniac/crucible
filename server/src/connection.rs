@@ -94,7 +94,20 @@ impl Connection {
 
     /// Maximum pending write buffer size before applying backpressure.
     /// Stop processing new requests if we have this much unsent data.
-    const MAX_PENDING_WRITE: usize = 256 * 1024; // 256KB
+    pub const MAX_PENDING_WRITE: usize = 256 * 1024; // 256KB
+
+    /// Check if we should accept more data from the socket.
+    /// Returns false when we have too much pending write data (backpressure).
+    #[inline]
+    pub fn should_read(&self) -> bool {
+        self.pending_write_len() <= Self::MAX_PENDING_WRITE
+    }
+
+    /// Get the amount of pending write data.
+    #[inline]
+    pub fn pending_write_len(&self) -> usize {
+        self.write_buf.len().saturating_sub(self.write_pos)
+    }
 
     #[inline]
     fn process_resp<C: Cache>(&mut self, cache: &C) {

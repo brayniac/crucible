@@ -780,13 +780,15 @@ fn test_connection_reset_on_recv() {
         .unwrap();
     server_driver.drain_completions();
 
-    // Try to recv - should get an error indicating connection closed
+    // Try to recv - should get EOF (Ok(0)) or an error indicating connection closed
     let mut buf = [0u8; 1024];
     let result = server_driver.recv(conn_id, &mut buf);
 
-    // Either ConnectionReset, WouldBlock (if not yet notified), or 0 bytes
+    // Ok(0) indicates EOF (peer closed connection gracefully)
+    // WouldBlock means close hasn't been detected yet
+    // ConnectionReset means peer closed ungracefully
     match result {
-        Ok(0) => panic!("Should not return 0 bytes - that should be ConnectionReset"),
+        Ok(0) => {} // EOF - connection closed gracefully
         Ok(_) => {} // Got some buffered data
         Err(e) => {
             // ConnectionReset or WouldBlock are both acceptable

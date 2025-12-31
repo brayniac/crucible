@@ -117,14 +117,28 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
 
                 CompletionKind::Recv { conn_id } => {
                     let idx = conn_id.as_usize();
-                    let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
-                        continue;
-                    };
 
-                    loop {
+                    // Check if connection exists and should read
+                    let should_process = connections
+                        .get(idx)
+                        .and_then(|c| c.as_ref())
+                        .map(|c| c.should_read())
+                        .unwrap_or(false);
+
+                    if !should_process {
+                        continue;
+                    }
+
+                    let mut need_close = false;
+
+                    'recv_loop: loop {
+                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
+                            break;
+                        };
+
                         match driver.recv(conn_id, &mut recv_buf) {
                             Ok(0) => {
-                                close_connection(&mut driver, &mut connections, conn_id);
+                                need_close = true;
                                 break;
                             }
                             Ok(n) => {
@@ -132,50 +146,124 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                                 conn.process(&*cache);
 
                                 if conn.should_close() {
-                                    close_connection(&mut driver, &mut connections, conn_id);
+                                    need_close = true;
                                     break;
                                 }
 
-                                if conn.has_pending_write() {
+                                // Drain the write buffer as much as possible
+                                while conn.has_pending_write() {
                                     let data = conn.pending_write_data();
                                     match driver.send(conn_id, data) {
                                         Ok(n) => conn.advance_write(n),
-                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                         Err(_) => {
-                                            close_connection(
-                                                &mut driver,
-                                                &mut connections,
-                                                conn_id,
-                                            );
-                                            break;
+                                            need_close = true;
+                                            break 'recv_loop;
                                         }
                                     }
+                                }
+
+                                // Check backpressure after sending - if we can't keep up,
+                                // stop reading and wait for SendReady to drain the buffer
+                                if !conn.should_read() {
+                                    break;
                                 }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
-                                close_connection(&mut driver, &mut connections, conn_id);
+                                need_close = true;
                                 break;
                             }
                         }
+                    }
+
+                    if need_close {
+                        close_connection(&mut driver, &mut connections, conn_id);
                     }
                 }
 
                 CompletionKind::SendReady { conn_id } => {
                     let idx = conn_id.as_usize();
-                    let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
-                        continue;
-                    };
+                    let mut need_close = false;
 
-                    if conn.has_pending_write() {
+                    // Loop to drain as much pending write data as possible
+                    loop {
+                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
+                            break;
+                        };
+
+                        if !conn.has_pending_write() {
+                            break;
+                        }
+
                         let data = conn.pending_write_data();
                         match driver.send(conn_id, data) {
                             Ok(n) => conn.advance_write(n),
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
-                                close_connection(&mut driver, &mut connections, conn_id);
+                                need_close = true;
+                                break;
                             }
                         }
+                    }
+
+                    if need_close {
+                        close_connection(&mut driver, &mut connections, conn_id);
+                        continue;
+                    }
+
+                    // After draining, check if we can now read and process pending data
+                    let should_process = connections
+                        .get(idx)
+                        .and_then(|c| c.as_ref())
+                        .map(|c| c.should_read())
+                        .unwrap_or(false);
+
+                    if !should_process {
+                        continue;
+                    }
+
+                    // Process any pending read data now that we have room
+                    {
+                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
+                            continue;
+                        };
+
+                        conn.process(&*cache);
+
+                        if conn.should_close() {
+                            need_close = true;
+                        }
+                    }
+
+                    if need_close {
+                        close_connection(&mut driver, &mut connections, conn_id);
+                        continue;
+                    }
+
+                    // Try to send any newly generated responses
+                    loop {
+                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
+                            break;
+                        };
+
+                        if !conn.has_pending_write() {
+                            break;
+                        }
+
+                        let data = conn.pending_write_data();
+                        match driver.send(conn_id, data) {
+                            Ok(n) => conn.advance_write(n),
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(_) => {
+                                need_close = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if need_close {
+                        close_connection(&mut driver, &mut connections, conn_id);
                     }
                 }
 
