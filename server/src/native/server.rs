@@ -3,13 +3,14 @@
 use crate::affinity::set_cpu_affinity;
 use crate::config::Config;
 use crate::connection::Connection;
-use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE};
+use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, WorkerStats, WorkerStatsSnapshot};
 use cache_core::Cache;
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Configuration for each worker thread.
 #[derive(Clone)]
@@ -35,6 +36,11 @@ pub fn run<C: Cache + 'static>(
     // Extract listener addresses
     let listeners: Vec<SocketAddr> = config.listener.iter().map(|l| l.address).collect();
 
+    // Check if diagnostics are enabled via environment variable
+    let diagnostics_enabled = std::env::var("CRUCIBLE_DIAGNOSTICS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let worker_config = WorkerConfig {
         listeners,
         backlog: 4096,
@@ -45,6 +51,29 @@ pub fn run<C: Cache + 'static>(
         sqpoll: config.uring.sqpoll,
     };
 
+    // Create per-worker stats
+    let worker_stats: Arc<Vec<WorkerStats>> =
+        Arc::new((0..num_workers).map(|_| WorkerStats::new()).collect());
+
+    // Shutdown flag for diagnostics thread
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Start diagnostics thread if enabled
+    let diagnostics_handle = if diagnostics_enabled {
+        let stats = worker_stats.clone();
+        let shutdown_flag = shutdown.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("diagnostics".to_string())
+                .spawn(move || {
+                    run_diagnostics(stats, shutdown_flag);
+                })
+                .expect("failed to spawn diagnostics thread"),
+        )
+    } else {
+        None
+    };
+
     // Spawn workers
     let mut handles = Vec::with_capacity(num_workers);
     for worker_id in 0..num_workers {
@@ -53,6 +82,7 @@ pub fn run<C: Cache + 'static>(
             .map(|cpus| cpus[worker_id % cpus.len()]);
         let cache = cache.clone();
         let worker_config = worker_config.clone();
+        let stats = worker_stats.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", worker_id))
@@ -61,7 +91,7 @@ pub fn run<C: Cache + 'static>(
                     let _ = set_cpu_affinity(cpu);
                 }
 
-                if let Err(e) = run_worker(worker_id, worker_config, cache) {
+                if let Err(e) = run_worker(worker_id, worker_config, cache, &stats[worker_id]) {
                     eprintln!("Worker {} error: {}", worker_id, e);
                 }
             })
@@ -75,10 +105,102 @@ pub fn run<C: Cache + 'static>(
         let _ = handle.join();
     }
 
+    // Shutdown diagnostics thread
+    shutdown.store(true, Ordering::SeqCst);
+    if let Some(handle) = diagnostics_handle {
+        let _ = handle.join();
+    }
+
     Ok(())
 }
 
-fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) -> io::Result<()> {
+/// Diagnostics thread that periodically reports per-worker stats.
+fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
+    let mut prev_snapshots: Vec<WorkerStatsSnapshot> = stats.iter().map(|s| s.snapshot()).collect();
+    let mut last_report = Instant::now();
+    let report_interval = Duration::from_secs(10);
+
+    eprintln!("[diagnostics] Worker diagnostics enabled, reporting every 10s");
+
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_secs(1));
+
+        if last_report.elapsed() >= report_interval {
+            let current: Vec<WorkerStatsSnapshot> = stats.iter().map(|s| s.snapshot()).collect();
+
+            eprintln!(
+                "\n[diagnostics] === Worker Stats (last {}s) ===",
+                report_interval.as_secs()
+            );
+            eprintln!(
+                "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
+                "worker",
+                "polls",
+                "empty",
+                "compls",
+                "accepts",
+                "recv",
+                "send_rdy",
+                "bytes_in",
+                "bytes_out",
+                "conns"
+            );
+
+            for (i, (curr, prev)) in current.iter().zip(prev_snapshots.iter()).enumerate() {
+                let delta = curr.delta(prev);
+                eprintln!(
+                    "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
+                    i,
+                    delta.poll_count,
+                    delta.empty_polls,
+                    delta.completions,
+                    delta.accepts,
+                    delta.recv_events,
+                    delta.send_ready_events,
+                    format_bytes(delta.bytes_received),
+                    format_bytes(delta.bytes_sent),
+                    curr.active_connections,
+                );
+
+                // Flag workers that might be stuck
+                if delta.completions == 0 && curr.active_connections > 0 {
+                    eprintln!(
+                        "  ^ WARNING: Worker {} has {} connections but processed 0 completions!",
+                        i, curr.active_connections
+                    );
+                }
+                if delta.backpressure_events > 0 {
+                    eprintln!(
+                        "  ^ INFO: Worker {} hit backpressure {} times",
+                        i, delta.backpressure_events
+                    );
+                }
+            }
+
+            prev_snapshots = current;
+            last_report = Instant::now();
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1}MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1}KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn run_worker<C: Cache>(
+    _worker_id: usize,
+    config: WorkerConfig,
+    cache: Arc<C>,
+    stats: &WorkerStats,
+) -> io::Result<()> {
     let mut driver = Driver::builder()
         .buffer_size(config.buffer_size)
         .buffer_count(config.buffer_count.next_power_of_two())
@@ -99,13 +221,19 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
     let mut recv_buf = vec![0u8; config.read_buffer_size];
 
     loop {
-        driver.poll(Some(Duration::from_millis(1)))?;
+        let completions_count = driver.poll(Some(Duration::from_millis(1)))?;
+        stats.inc_poll();
+        if completions_count == 0 {
+            stats.inc_empty_poll();
+        }
+        stats.inc_completions(completions_count as u64);
 
         for completion in driver.drain_completions() {
             match completion.kind {
                 CompletionKind::Accept { conn_id, .. } => {
                     CONNECTIONS_ACCEPTED.increment();
                     CONNECTIONS_ACTIVE.increment();
+                    stats.inc_accepts();
 
                     let idx = conn_id.as_usize();
                     // Grow the vec if needed
@@ -116,6 +244,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                 }
 
                 CompletionKind::Recv { conn_id } => {
+                    stats.inc_recv();
                     let idx = conn_id.as_usize();
 
                     // Check if connection exists and should read
@@ -126,6 +255,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                         .unwrap_or(false);
 
                     if !should_process {
+                        stats.inc_backpressure();
                         continue;
                     }
 
@@ -142,6 +272,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                                 break;
                             }
                             Ok(n) => {
+                                stats.add_bytes_received(n as u64);
                                 conn.append_recv_data(&recv_buf[..n]);
                                 conn.process(&*cache);
 
@@ -154,7 +285,10 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                                 while conn.has_pending_write() {
                                     let data = conn.pending_write_data();
                                     match driver.send(conn_id, data) {
-                                        Ok(n) => conn.advance_write(n),
+                                        Ok(n) => {
+                                            stats.add_bytes_sent(n as u64);
+                                            conn.advance_write(n);
+                                        }
                                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                         Err(_) => {
                                             need_close = true;
@@ -166,6 +300,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                                 // Check backpressure after sending - if we can't keep up,
                                 // stop reading and wait for SendReady to drain the buffer
                                 if !conn.should_read() {
+                                    stats.inc_backpressure();
                                     break;
                                 }
                             }
@@ -178,11 +313,12 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                     }
 
                     if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id);
+                        close_connection(&mut driver, &mut connections, conn_id, stats);
                     }
                 }
 
                 CompletionKind::SendReady { conn_id } => {
+                    stats.inc_send_ready();
                     let idx = conn_id.as_usize();
                     let mut need_close = false;
 
@@ -198,7 +334,10 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
 
                         let data = conn.pending_write_data();
                         match driver.send(conn_id, data) {
-                            Ok(n) => conn.advance_write(n),
+                            Ok(n) => {
+                                stats.add_bytes_sent(n as u64);
+                                conn.advance_write(n);
+                            }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
                                 need_close = true;
@@ -208,7 +347,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                     }
 
                     if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id);
+                        close_connection(&mut driver, &mut connections, conn_id, stats);
                         continue;
                     }
 
@@ -237,7 +376,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                     }
 
                     if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id);
+                        close_connection(&mut driver, &mut connections, conn_id, stats);
                         continue;
                     }
 
@@ -253,7 +392,10 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
 
                         let data = conn.pending_write_data();
                         match driver.send(conn_id, data) {
-                            Ok(n) => conn.advance_write(n),
+                            Ok(n) => {
+                                stats.add_bytes_sent(n as u64);
+                                conn.advance_write(n);
+                            }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
                                 need_close = true;
@@ -263,16 +405,16 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                     }
 
                     if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id);
+                        close_connection(&mut driver, &mut connections, conn_id, stats);
                     }
                 }
 
                 CompletionKind::Closed { conn_id } => {
-                    close_connection(&mut driver, &mut connections, conn_id);
+                    close_connection(&mut driver, &mut connections, conn_id, stats);
                 }
 
                 CompletionKind::Error { conn_id, .. } => {
-                    close_connection(&mut driver, &mut connections, conn_id);
+                    close_connection(&mut driver, &mut connections, conn_id, stats);
                 }
 
                 CompletionKind::ListenerError { error, .. } => {
@@ -288,12 +430,14 @@ fn close_connection(
     driver: &mut Box<dyn IoDriver>,
     connections: &mut [Option<Connection>],
     conn_id: ConnId,
+    stats: &WorkerStats,
 ) {
     let idx = conn_id.as_usize();
     if let Some(slot) = connections.get_mut(idx) {
         if slot.take().is_some() {
             let _ = driver.close(conn_id);
             CONNECTIONS_ACTIVE.decrement();
+            stats.inc_close();
         }
     }
 }

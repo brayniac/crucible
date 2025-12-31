@@ -101,7 +101,7 @@ function(
     value_length='64',
     get_percent='80',
     warmup_duration='30s',
-    test_duration='600s',
+    test_duration='60s',
     rate_limit=''
 )
     local args = {
@@ -266,7 +266,7 @@ function(
 
                             ulimit -n 500000
                             ulimit -a
-                            $HOME/crucible/target/release/crucible-server server.toml &
+                            CRUCIBLE_DIAGNOSTICS=1 $HOME/crucible/target/release/crucible-server server.toml &
                             echo PID=$! > pid
                         |||,
                         background=true
