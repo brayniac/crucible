@@ -76,11 +76,29 @@ impl Connection {
 
         self.detect_protocol();
 
+        let write_len_before = self.write_buf.len();
+
         match self.protocol {
             DetectedProtocol::Unknown => {}
             DetectedProtocol::Resp => self.process_resp(cache),
             DetectedProtocol::MemcacheAscii => self.process_memcache_ascii(cache),
             DetectedProtocol::MemcacheBinary => self.process_memcache_binary(cache),
+        }
+
+        // Validate that new data written starts with valid RESP type
+        if self.protocol == DetectedProtocol::Resp && self.write_buf.len() > write_len_before {
+            let new_data = &self.write_buf[write_len_before..];
+            if !new_data.is_empty() {
+                let first = new_data[0];
+                if !matches!(first, b'+' | b'-' | b':' | b'$' | b'*' | b'_' | b'%') {
+                    eprintln!(
+                        "BUG(process): Invalid RESP at write_buf[{}], first=0x{:02x}, data={:?}",
+                        write_len_before,
+                        first,
+                        &new_data[..new_data.len().min(32)]
+                    );
+                }
+            }
         }
     }
 
