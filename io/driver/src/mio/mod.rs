@@ -171,20 +171,14 @@ impl IoDriver for MioDriver {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
 
-        // Validate first byte is a valid RESP type (for debugging protocol errors)
-        if !data.is_empty() {
-            let first = data[0];
-            if !matches!(first, b'+' | b'-' | b':' | b'$' | b'*' | b'_' | b'%' |
-                         // Allow continuation bytes (mid-response)
-                         b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'\r' | b'\n' | b' ')
-            {
-                eprintln!(
-                    "TRACE(send): first=0x{:02x}, len={}, data[..32]={:?}",
-                    first,
-                    data.len(),
-                    &data[..data.len().min(32)]
-                );
-            }
+        // Log ALL sends for debugging
+        if !data.is_empty() && data.len() < 100 {
+            eprintln!(
+                ">>> SEND conn={} len={} data={:?}",
+                id.as_usize(),
+                data.len(),
+                String::from_utf8_lossy(&data[..data.len().min(64)])
+            );
         }
 
         match conn.stream.write(data) {
@@ -213,7 +207,17 @@ impl IoDriver for MioDriver {
                 io::ErrorKind::ConnectionReset,
                 "connection closed",
             )),
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                if n < 200 {
+                    eprintln!(
+                        "<<< RECV conn={} len={} data={:?}",
+                        id.as_usize(),
+                        n,
+                        String::from_utf8_lossy(&buf[..n.min(64)])
+                    );
+                }
+                Ok(n)
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 conn.readable = false;
                 Err(e)
