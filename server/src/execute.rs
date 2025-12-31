@@ -17,6 +17,42 @@ pub enum RespVersion {
     Resp3,
 }
 
+/// Write a RESP bulk string response directly to spare capacity.
+/// Returns the number of bytes written.
+///
+/// # Safety
+/// Caller must ensure `buf` has enough capacity for the response:
+/// at least 1 + 20 + 2 + value.len() + 2 bytes.
+#[inline]
+unsafe fn write_bulk_string(buf: &mut [u8], value: &[u8]) -> usize {
+    let mut pos = 0;
+    buf[pos] = b'$';
+    pos += 1;
+
+    // Write length using itoa
+    let mut len_buf = itoa::Buffer::new();
+    let len_str = len_buf.format(value.len()).as_bytes();
+    unsafe {
+        std::ptr::copy_nonoverlapping(len_str.as_ptr(), buf.as_mut_ptr().add(pos), len_str.len());
+    }
+    pos += len_str.len();
+
+    buf[pos] = b'\r';
+    buf[pos + 1] = b'\n';
+    pos += 2;
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), buf.as_mut_ptr().add(pos), value.len());
+    }
+    pos += value.len();
+
+    buf[pos] = b'\r';
+    buf[pos + 1] = b'\n';
+    pos += 2;
+
+    pos
+}
+
 /// Execute a Redis RESP command against the cache.
 #[inline]
 pub fn execute_resp<C: Cache>(
@@ -35,12 +71,16 @@ pub fn execute_resp<C: Cache>(
                 Some(guard) => {
                     HITS.increment();
                     let value = guard.as_ref();
-                    let mut len_buf = itoa::Buffer::new();
-                    write_buf.extend_from_slice(b"$");
-                    write_buf.extend_from_slice(len_buf.format(value.len()).as_bytes());
-                    write_buf.extend_from_slice(b"\r\n");
-                    write_buf.extend_from_slice(value);
-                    write_buf.extend_from_slice(b"\r\n");
+                    // Reserve: $ + max_len_digits(20) + \r\n + value + \r\n
+                    let needed = 1 + 20 + 2 + value.len() + 2;
+                    write_buf.reserve(needed);
+
+                    let spare = write_buf.spare_capacity_mut();
+                    let buf = unsafe {
+                        std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+                    };
+                    let written = unsafe { write_bulk_string(buf, value) };
+                    unsafe { write_buf.set_len(write_buf.len() + written) };
                 }
                 None => {
                     MISSES.increment();
@@ -76,15 +116,33 @@ pub fn execute_resp<C: Cache>(
         RespCommand::Del { key } => {
             DELETES.increment();
             let deleted = cache.delete(key);
-            write_buf.extend_from_slice(b":");
-            write_buf.extend_from_slice(if deleted { b"1" } else { b"0" });
-            write_buf.extend_from_slice(b"\r\n");
+            write_buf.extend_from_slice(if deleted { b":1\r\n" } else { b":0\r\n" });
         }
         RespCommand::MGet { keys } => {
+            // Reserve for array header: * + max_len_digits + \r\n
+            write_buf.reserve(1 + 20 + 2);
+            let spare = write_buf.spare_capacity_mut();
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+            };
+
+            let mut pos = 0;
+            buf[pos] = b'*';
+            pos += 1;
             let mut len_buf = itoa::Buffer::new();
-            write_buf.extend_from_slice(b"*");
-            write_buf.extend_from_slice(len_buf.format(keys.len()).as_bytes());
-            write_buf.extend_from_slice(b"\r\n");
+            let len_str = len_buf.format(keys.len()).as_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    len_str.as_ptr(),
+                    buf.as_mut_ptr().add(pos),
+                    len_str.len(),
+                );
+            }
+            pos += len_str.len();
+            buf[pos] = b'\r';
+            buf[pos + 1] = b'\n';
+            pos += 2;
+            unsafe { write_buf.set_len(write_buf.len() + pos) };
 
             for key in keys {
                 GETS.increment();
@@ -92,11 +150,18 @@ pub fn execute_resp<C: Cache>(
                     Some(guard) => {
                         HITS.increment();
                         let value = guard.as_ref();
-                        write_buf.extend_from_slice(b"$");
-                        write_buf.extend_from_slice(len_buf.format(value.len()).as_bytes());
-                        write_buf.extend_from_slice(b"\r\n");
-                        write_buf.extend_from_slice(value);
-                        write_buf.extend_from_slice(b"\r\n");
+                        let needed = 1 + 20 + 2 + value.len() + 2;
+                        write_buf.reserve(needed);
+
+                        let spare = write_buf.spare_capacity_mut();
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                spare.as_mut_ptr() as *mut u8,
+                                spare.len(),
+                            )
+                        };
+                        let written = unsafe { write_bulk_string(buf, value) };
+                        unsafe { write_buf.set_len(write_buf.len() + written) };
                     }
                     None => {
                         MISSES.increment();

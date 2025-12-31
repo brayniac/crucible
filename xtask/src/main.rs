@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +33,33 @@ enum Commands {
         #[arg(short, long, default_value = "1")]
         fork: u32,
     },
+
+    /// Generate a flamegraph of the server under load
+    Flamegraph {
+        /// Duration to record in seconds
+        #[arg(short, long, default_value = "10")]
+        duration: u64,
+
+        /// Output file for the flamegraph SVG
+        #[arg(short, long, default_value = "flamegraph.svg")]
+        output: PathBuf,
+
+        /// Server config file (uses default if not specified)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Benchmark config file (uses default if not specified)
+        #[arg(short, long)]
+        bench_config: Option<PathBuf>,
+
+        /// Skip running the benchmark (just profile idle server)
+        #[arg(long)]
+        no_load: bool,
+
+        /// Server runtime: "native" or "tokio"
+        #[arg(long, default_value = "native")]
+        runtime: String,
+    },
 }
 
 fn main() {
@@ -43,6 +71,14 @@ fn main() {
             jobs,
             fork,
         } => fuzz_all(duration, jobs, fork),
+        Commands::Flamegraph {
+            duration,
+            output,
+            config,
+            bench_config,
+            no_load,
+            runtime,
+        } => flamegraph(duration, output, config, bench_config, no_load, runtime),
     };
 
     if let Err(e) = result {
@@ -352,4 +388,291 @@ fn find_workspace_root() -> Result<PathBuf, String> {
     }
 
     Err("could not find workspace_root in cargo metadata".to_string())
+}
+
+// =============================================================================
+// Flamegraph command
+// =============================================================================
+
+fn flamegraph(
+    duration: u64,
+    output: PathBuf,
+    config: Option<PathBuf>,
+    bench_config: Option<PathBuf>,
+    no_load: bool,
+    runtime: String,
+) -> Result<(), String> {
+    let workspace_root = find_workspace_root()?;
+
+    // Check for required tools
+    check_tool("perf", "Install with: apt install linux-perf (Linux only)")?;
+    check_tool(
+        "inferno-collapse-perf",
+        "Install with: cargo install inferno",
+    )?;
+    check_tool("inferno-flamegraph", "Install with: cargo install inferno")?;
+
+    println!("Flamegraph generation");
+    println!("=====================");
+    println!("Duration: {}s", duration);
+    println!("Output: {}", output.display());
+    println!("Runtime: {}", runtime);
+    println!("Load: {}", if no_load { "none" } else { "benchmark" });
+    println!();
+
+    // Build release binaries
+    println!("Building release binaries...");
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "server", "-p", "benchmark"])
+        .current_dir(&workspace_root)
+        .status()
+        .map_err(|e| format!("failed to run cargo build: {e}"))?;
+
+    if !status.success() {
+        return Err("cargo build failed".to_string());
+    }
+
+    // Create a temporary server config if not provided
+    let server_config = match config {
+        Some(path) => path,
+        None => {
+            let config_content = format!(
+                r#"
+runtime = "{runtime}"
+
+[workers]
+threads = 4
+
+[cache]
+backend = "segcache"
+heap_size = "64MB"
+segment_size = "1MB"
+hashtable_power = 16
+
+[[listener]]
+protocol = "resp"
+address = "127.0.0.1:6379"
+
+[metrics]
+address = "127.0.0.1:9090"
+
+[uring]
+sqpoll = false
+buffer_count = 1024
+buffer_size = 4096
+sq_depth = 1024
+"#
+            );
+            let config_path = workspace_root.join("target/flamegraph-server.toml");
+            fs::write(&config_path, config_content)
+                .map_err(|e| format!("failed to write temp config: {e}"))?;
+            config_path
+        }
+    };
+
+    // Create a temporary benchmark config if not provided
+    let benchmark_config = match bench_config {
+        Some(path) => path,
+        None => {
+            let config_content = r#"
+[general]
+duration = "300s"
+warmup = "2s"
+threads = 2
+
+[target]
+endpoints = ["127.0.0.1:6379"]
+protocol = "resp"
+
+[connection]
+pool_size = 32
+pipeline_depth = 16
+connect_timeout = "5s"
+request_timeout = "1s"
+
+[workload]
+
+[workload.keyspace]
+length = 16
+count = 100000
+distribution = "uniform"
+
+[workload.commands]
+get = 80
+set = 20
+
+[workload.values]
+length = 64
+"#;
+            let config_path = workspace_root.join("target/flamegraph-bench.toml");
+            fs::write(&config_path, config_content)
+                .map_err(|e| format!("failed to write temp config: {e}"))?;
+            config_path
+        }
+    };
+
+    // Start the server
+    println!("Starting server...");
+    let server_bin = workspace_root.join("target/release/crucible-server");
+    let mut server = Command::new(&server_bin)
+        .arg(&server_config)
+        .current_dir(&workspace_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start server: {e}"))?;
+
+    let server_pid = server.id();
+    println!("Server started with PID: {}", server_pid);
+
+    // Wait for server to be ready
+    println!("Waiting for server to be ready...");
+    if !wait_for_server("127.0.0.1:6379", Duration::from_secs(10)) {
+        let _ = server.kill();
+        return Err("Server failed to start within timeout".to_string());
+    }
+    println!("Server is ready");
+
+    // Start benchmark if requested
+    let mut benchmark: Option<Child> = None;
+    if !no_load {
+        println!("Starting benchmark...");
+        let bench_bin = workspace_root.join("target/release/crucible-benchmark");
+        let child = Command::new(&bench_bin)
+            .arg(&benchmark_config)
+            .current_dir(&workspace_root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to start benchmark: {e}"))?;
+        println!("Benchmark started with PID: {}", child.id());
+        benchmark = Some(child);
+
+        // Give benchmark time to warm up
+        println!("Warming up for 3 seconds...");
+        thread::sleep(Duration::from_secs(3));
+    }
+
+    // Run perf record
+    println!("Recording perf data for {}s...", duration);
+    let perf_data = workspace_root.join("target/perf.data");
+
+    let perf_status = Command::new("sudo")
+        .args([
+            "perf",
+            "record",
+            "--call-graph",
+            "dwarf",
+            "-p",
+            &server_pid.to_string(),
+            "-o",
+            perf_data.to_str().unwrap(),
+            "--",
+            "sleep",
+            &duration.to_string(),
+        ])
+        .current_dir(&workspace_root)
+        .status()
+        .map_err(|e| format!("failed to run perf record: {e}"))?;
+
+    if !perf_status.success() {
+        let _ = server.kill();
+        if let Some(mut b) = benchmark {
+            let _ = b.kill();
+        }
+        return Err("perf record failed".to_string());
+    }
+
+    // Stop benchmark
+    if let Some(mut b) = benchmark {
+        println!("Stopping benchmark...");
+        let _ = b.kill();
+        let _ = b.wait();
+    }
+
+    // Stop server
+    println!("Stopping server...");
+    let _ = server.kill();
+    let _ = server.wait();
+
+    // Generate flamegraph
+    println!("Generating flamegraph...");
+
+    // perf script | inferno-collapse-perf | inferno-flamegraph > output.svg
+    let perf_script = Command::new("sudo")
+        .args(["perf", "script", "-i", perf_data.to_str().unwrap()])
+        .current_dir(&workspace_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to run perf script: {e}"))?;
+
+    let collapse = Command::new("inferno-collapse-perf")
+        .stdin(perf_script.stdout.unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to run inferno-collapse-perf: {e}"))?;
+
+    let flamegraph_output = Command::new("inferno-flamegraph")
+        .stdin(collapse.stdout.unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run inferno-flamegraph: {e}"))?;
+
+    if !flamegraph_output.status.success() {
+        return Err("flamegraph generation failed".to_string());
+    }
+
+    // Write output
+    let output_path = if output.is_absolute() {
+        output
+    } else {
+        workspace_root.join(output)
+    };
+
+    fs::write(&output_path, &flamegraph_output.stdout)
+        .map_err(|e| format!("failed to write flamegraph: {e}"))?;
+
+    // Clean up perf data
+    let _ = Command::new("sudo")
+        .args(["rm", "-f", perf_data.to_str().unwrap()])
+        .status();
+
+    println!();
+    println!("Flamegraph generated: {}", output_path.display());
+    println!("Open in a browser to view the interactive flamegraph.");
+
+    Ok(())
+}
+
+fn check_tool(name: &str, install_hint: &str) -> Result<(), String> {
+    let result = Command::new("which")
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(format!(
+            "Required tool '{}' not found. {}",
+            name, install_hint
+        )),
+    }
+}
+
+fn wait_for_server(addr: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(mut stream) = TcpStream::connect(addr) {
+            // Try a simple PING command
+            let _ = stream.write_all(b"*1\r\n$4\r\nPING\r\n");
+            let _ = stream.flush();
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
 }

@@ -88,12 +88,12 @@ function(
     segment_size='1MB',
     hashtable_power='20',
     server_threads='16',
-    server_cpu_affinity='',
+    server_cpu_affinity='0-15',
     runtime='native',
 
     // Benchmark parameters
-    benchmark_threads='64',
-    benchmark_cpu_affinity='',
+    benchmark_threads='32',
+    benchmark_cpu_affinity='0-31',
     connections='256',
     pipeline_depth='16',
     key_length='16',
@@ -101,7 +101,7 @@ function(
     value_length='64',
     get_percent='80',
     warmup_duration='30s',
-    test_duration='60s',
+    test_duration='600s',
     rate_limit=''
 )
     local args = {
