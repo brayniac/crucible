@@ -155,30 +155,15 @@ impl IoDriver for MioDriver {
     }
 
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {
-        let conn_len = self.connections.len();
-        let conn = self.connections.get_mut(id.as_usize()).ok_or_else(|| {
-            eprintln!(
-                "BUG(driver.send): conn_id={} not found in slab (len={})",
-                id.as_usize(),
-                conn_len
-            );
-            io::Error::new(io::ErrorKind::NotFound, "connection not found")
-        })?;
+        let conn = self
+            .connections
+            .get_mut(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
         // Don't try to send if we know the socket isn't writable yet
         // (e.g., non-blocking connect in progress)
         if !conn.writable {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-
-        // Log ALL sends for debugging
-        if !data.is_empty() && data.len() < 100 {
-            eprintln!(
-                ">>> SEND conn={} len={} data={:?}",
-                id.as_usize(),
-                data.len(),
-                String::from_utf8_lossy(&data[..data.len().min(64)])
-            );
         }
 
         match conn.stream.write(data) {
