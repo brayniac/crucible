@@ -8,7 +8,7 @@ repository.workspace = true
 description = "High-performance cache server with multiple protocols and runtime backends"
 
 [features]
-default = []
+default = ["tokio-runtime"]
 tokio-runtime = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 io_uring = ["io-driver/io_uring"]
 

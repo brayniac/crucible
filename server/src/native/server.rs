@@ -6,7 +6,6 @@ use crate::connection::Connection;
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE};
 use cache_core::Cache;
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -92,7 +91,11 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
         driver.listen(*addr, config.backlog)?;
     }
 
-    let mut connections: HashMap<usize, Connection> = HashMap::with_capacity(4096);
+    // Use Vec<Option<Connection>> indexed by ConnId for O(1) access.
+    // The io-driver's ConnId is its internal Slab index, so indices are reused
+    // when connections close. Using Vec with Option allows direct indexing while
+    // handling sparse allocation efficiently.
+    let mut connections: Vec<Option<Connection>> = Vec::with_capacity(4096);
     let mut recv_buf = vec![0u8; config.read_buffer_size];
 
     loop {
@@ -104,13 +107,17 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                     CONNECTIONS_ACCEPTED.increment();
                     CONNECTIONS_ACTIVE.increment();
 
-                    connections
-                        .insert(conn_id.as_usize(), Connection::new(config.read_buffer_size));
+                    let idx = conn_id.as_usize();
+                    // Grow the vec if needed
+                    if idx >= connections.len() {
+                        connections.resize_with(idx + 1, || None);
+                    }
+                    connections[idx] = Some(Connection::new(config.read_buffer_size));
                 }
 
                 CompletionKind::Recv { conn_id } => {
-                    let token = conn_id.as_usize();
-                    let Some(conn) = connections.get_mut(&token) else {
+                    let idx = conn_id.as_usize();
+                    let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
                         continue;
                     };
 
@@ -155,8 +162,8 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                 }
 
                 CompletionKind::SendReady { conn_id } => {
-                    let token = conn_id.as_usize();
-                    let Some(conn) = connections.get_mut(&token) else {
+                    let idx = conn_id.as_usize();
+                    let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
                         continue;
                     };
 
@@ -188,13 +195,17 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
     }
 }
 
+#[inline]
 fn close_connection(
     driver: &mut Box<dyn IoDriver>,
-    connections: &mut HashMap<usize, Connection>,
+    connections: &mut [Option<Connection>],
     conn_id: ConnId,
 ) {
-    if connections.remove(&conn_id.as_usize()).is_some() {
-        let _ = driver.close(conn_id);
-        CONNECTIONS_ACTIVE.decrement();
+    let idx = conn_id.as_usize();
+    if let Some(slot) = connections.get_mut(idx) {
+        if slot.take().is_some() {
+            let _ = driver.close(conn_id);
+            CONNECTIONS_ACTIVE.decrement();
+        }
     }
 }
