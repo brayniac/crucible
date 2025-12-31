@@ -458,8 +458,10 @@ impl IoWorker {
         let get_ratio = self.config.workload.commands.get;
         let warmup = self.warmup;
 
+        let mut total_queued = 0usize;
         for session in self.sessions.values_mut() {
             if !session.is_connected() {
+                tracing::trace!("session not connected, skipping");
                 continue;
             }
 
@@ -482,14 +484,21 @@ impl IoWorker {
                     session.set(&self.key_buf, &self.value_buf, now).is_some()
                 };
 
-                if sent && !warmup {
-                    self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
+                if sent {
+                    total_queued += 1;
+                    if !warmup {
+                        self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
 
                 if !sent {
                     break;
                 }
             }
+        }
+
+        if total_queued > 0 {
+            tracing::debug!("worker {} queued {} requests", self.id, total_queued);
         }
 
         Ok(())
@@ -514,9 +523,16 @@ impl IoWorker {
 
             match self.driver.send(conn_id, send_buf) {
                 Ok(n) => {
+                    tracing::debug!("worker {} sent {} bytes", self.id, n);
                     session.bytes_sent(n);
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tracing::debug!(
+                        "worker {} send would block ({} bytes pending)",
+                        self.id,
+                        send_buf.len()
+                    );
+                }
                 Err(e) => {
                     tracing::debug!("send error: {}", e);
                     session.disconnect();
@@ -537,9 +553,22 @@ impl IoWorker {
     fn process_completions(&mut self) -> io::Result<()> {
         let completions = self.driver.drain_completions();
 
+        if !completions.is_empty() {
+            tracing::debug!(
+                "worker {} processing {} completions",
+                self.id,
+                completions.len()
+            );
+        }
+
         for completion in completions {
             match completion.kind {
                 CompletionKind::Recv { conn_id } => {
+                    tracing::debug!(
+                        "worker {} got Recv completion for conn {}",
+                        self.id,
+                        conn_id.as_usize()
+                    );
                     // Data is available to read
                     let id = conn_id.as_usize();
                     if let Some(session) = self.sessions.get_mut(&id) {
@@ -566,18 +595,42 @@ impl IoWorker {
                     }
                 }
                 CompletionKind::SendReady { conn_id } => {
+                    tracing::debug!(
+                        "worker {} got SendReady for conn {}",
+                        self.id,
+                        conn_id.as_usize()
+                    );
                     // Socket is writable, try to flush
                     let id = conn_id.as_usize();
                     if let Some(session) = self.sessions.get_mut(&id) {
                         let send_buf = session.send_buffer();
-                        if !send_buf.is_empty()
-                            && let Ok(n) = self.driver.send(conn_id, send_buf)
-                        {
-                            session.bytes_sent(n);
+                        if !send_buf.is_empty() {
+                            match self.driver.send(conn_id, send_buf) {
+                                Ok(n) => {
+                                    tracing::debug!(
+                                        "worker {} SendReady flush sent {} bytes",
+                                        self.id,
+                                        n
+                                    );
+                                    session.bytes_sent(n);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "worker {} SendReady flush failed: {}",
+                                        self.id,
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
                 CompletionKind::Closed { conn_id } => {
+                    tracing::debug!(
+                        "worker {} got Closed for conn {}",
+                        self.id,
+                        conn_id.as_usize()
+                    );
                     let id = conn_id.as_usize();
                     if let Some(session) = self.sessions.get_mut(&id) {
                         session.disconnect();

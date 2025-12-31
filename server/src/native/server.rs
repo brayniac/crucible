@@ -6,7 +6,7 @@ use crate::connection::Connection;
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE};
 use cache_core::Cache;
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
-use slab::Slab;
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
