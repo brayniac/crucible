@@ -92,7 +92,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
         driver.listen(*addr, config.backlog)?;
     }
 
-    let mut connections: Slab<Connection> = Slab::with_capacity(4096);
+    let mut connections: HashMap<usize, Connection> = HashMap::with_capacity(4096);
     let mut recv_buf = vec![0u8; config.read_buffer_size];
 
     loop {
@@ -104,16 +104,15 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                     CONNECTIONS_ACCEPTED.increment();
                     CONNECTIONS_ACTIVE.increment();
 
-                    let entry = connections.vacant_entry();
-                    debug_assert_eq!(entry.key(), conn_id.as_usize());
-                    entry.insert(Connection::new(config.read_buffer_size));
+                    connections
+                        .insert(conn_id.as_usize(), Connection::new(config.read_buffer_size));
                 }
 
                 CompletionKind::Recv { conn_id } => {
                     let token = conn_id.as_usize();
-                    if !connections.contains(token) {
+                    let Some(conn) = connections.get_mut(&token) else {
                         continue;
-                    }
+                    };
 
                     loop {
                         match driver.recv(conn_id, &mut recv_buf) {
@@ -122,7 +121,6 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
                                 break;
                             }
                             Ok(n) => {
-                                let conn = &mut connections[token];
                                 conn.append_recv_data(&recv_buf[..n]);
                                 conn.process(&*cache);
 
@@ -158,11 +156,10 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
 
                 CompletionKind::SendReady { conn_id } => {
                     let token = conn_id.as_usize();
-                    if !connections.contains(token) {
+                    let Some(conn) = connections.get_mut(&token) else {
                         continue;
-                    }
+                    };
 
-                    let conn = &mut connections[token];
                     if conn.has_pending_write() {
                         let data = conn.pending_write_data();
                         match driver.send(conn_id, data) {
@@ -193,11 +190,10 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
 
 fn close_connection(
     driver: &mut Box<dyn IoDriver>,
-    connections: &mut Slab<Connection>,
+    connections: &mut HashMap<usize, Connection>,
     conn_id: ConnId,
 ) {
-    let token = conn_id.as_usize();
-    if connections.try_remove(token).is_some() {
+    if connections.remove(&conn_id.as_usize()).is_some() {
         let _ = driver.close(conn_id);
         CONNECTIONS_ACTIVE.decrement();
     }
