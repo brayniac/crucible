@@ -2,7 +2,7 @@ local systemslab = import 'systemslab.libsonnet';
 
 local server_config = {
     // Runtime selection: "native" (io_uring/mio) or "tokio"
-    runtime: 'native',
+    runtime: 'tokio',
 
     workers: {
         threads: error 'threads must be specified',
