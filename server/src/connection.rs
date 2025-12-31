@@ -43,6 +43,14 @@ impl Connection {
     /// Append received data to the read buffer.
     #[inline]
     pub fn append_recv_data(&mut self, data: &[u8]) {
+        // Compact the buffer periodically to prevent unbounded growth.
+        // BytesMut::reserve() triggers compaction when the unused prefix
+        // exceeds the requested amount plus remaining capacity.
+        // Check: if len * 2 < capacity (i.e., less than 50% utilized), compact.
+        let cap = self.read_buf.capacity();
+        if cap > 0 && self.read_buf.len() * 2 < cap {
+            self.read_buf.reserve(data.len());
+        }
         self.read_buf.extend_from_slice(data);
     }
 

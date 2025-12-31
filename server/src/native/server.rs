@@ -99,7 +99,7 @@ fn run_worker<C: Cache>(_worker_id: usize, config: WorkerConfig, cache: Arc<C>) 
     let mut recv_buf = vec![0u8; config.read_buffer_size];
 
     loop {
-        driver.poll(Some(Duration::from_millis(100)))?;
+        driver.poll(Some(Duration::from_millis(1)))?;
 
         for completion in driver.drain_completions() {
             match completion.kind {
