@@ -338,6 +338,9 @@ impl IoWorker {
             return self.poll_once_momento(now);
         }
 
+        // Try to reconnect disconnected sessions
+        self.try_reconnect();
+
         // Generate and queue requests
         self.drive_requests(now)?;
 
@@ -577,7 +580,22 @@ impl IoWorker {
                         // Read all available data
                         loop {
                             match self.driver.recv(conn_id, &mut self.recv_buf) {
-                                Ok(0) => break,
+                                Ok(0) => {
+                                    // Server closed connection (EOF)
+                                    tracing::debug!(
+                                        "worker {} conn {} server closed connection",
+                                        self.id,
+                                        id
+                                    );
+                                    session.disconnect();
+                                    self.shared
+                                        .connections_active
+                                        .fetch_sub(1, Ordering::Relaxed);
+                                    self.shared
+                                        .connections_failed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
                                 Ok(n) => {
                                     session.bytes_received(&self.recv_buf[..n]);
                                 }
@@ -734,6 +752,67 @@ impl IoWorker {
             .map(|s| s.in_flight_count())
             .sum();
         tcp + momento
+    }
+
+    /// Try to reconnect disconnected sessions.
+    fn try_reconnect(&mut self) {
+        // Collect sessions that need reconnection (can't modify while iterating)
+        let to_reconnect: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.should_reconnect())
+            .map(|(&id, s)| (id, s.addr()))
+            .collect();
+
+        for (old_id, addr) in to_reconnect {
+            // Remove the old session entry
+            let mut session = match self.sessions.remove(&old_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Try to connect
+            match Self::create_connection(addr, self.config.connection.connect_timeout) {
+                Ok(stream) => {
+                    match self.driver.register(stream) {
+                        Ok(conn_id) => {
+                            tracing::debug!(
+                                "worker {} reconnected to {} (new conn_id={})",
+                                self.id,
+                                addr,
+                                conn_id.as_usize()
+                            );
+                            session.set_conn_id(conn_id);
+                            session.reconnect_attempted(true);
+                            session.reset(); // Clear buffers and in-flight state
+                            self.sessions.insert(conn_id.as_usize(), session);
+                            self.shared
+                                .connections_active
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "worker {} failed to register reconnection to {}: {}",
+                                self.id,
+                                addr,
+                                e
+                            );
+                            session.reconnect_attempted(false);
+                            // Put session back with a temporary ID for future retry
+                            let temp_id = usize::MAX - self.sessions.len();
+                            self.sessions.insert(temp_id, session);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("worker {} failed to reconnect to {}: {}", self.id, addr, e);
+                    session.reconnect_attempted(false);
+                    // Put session back with a temporary ID for future retry
+                    let temp_id = usize::MAX - self.sessions.len();
+                    self.sessions.insert(temp_id, session);
+                }
+            }
+        }
     }
 }
 
