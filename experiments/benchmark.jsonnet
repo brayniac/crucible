@@ -89,7 +89,7 @@ function(
     hashtable_power='20',
     server_threads='32',
     server_cpu_affinity='',
-    runtime='native',
+    runtime='tokio',
 
     // Benchmark parameters
     benchmark_threads='64',
