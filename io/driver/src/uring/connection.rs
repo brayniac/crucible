@@ -99,12 +99,6 @@ impl UringConnection {
         self.send_pos[buf_idx] < self.send_bufs[buf_idx].len()
     }
 
-    /// Get the data that still needs to be sent from the specified buffer.
-    #[inline]
-    pub fn pending_send_data(&self, buf_idx: usize) -> &[u8] {
-        &self.send_bufs[buf_idx][self.send_pos[buf_idx]..]
-    }
-
     /// Get a stable pointer to the pending send data.
     ///
     /// # Safety
