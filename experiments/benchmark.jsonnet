@@ -87,7 +87,7 @@ function(
     heap_size='8GB',
     segment_size='1MB',
     hashtable_power='20',
-    server_threads='32',
+    server_threads='16',
     server_cpu_affinity='',
     runtime='native',
 
@@ -95,7 +95,7 @@ function(
     benchmark_threads='64',
     benchmark_cpu_affinity='',
     connections='256',
-    pipeline_depth='1',
+    pipeline_depth='16',
     key_length='16',
     key_count='1000000',
     value_length='64',
