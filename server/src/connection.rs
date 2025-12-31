@@ -196,3 +196,165 @@ impl Connection {
         self.should_close
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A simple mock cache for testing
+    struct MockCache;
+
+    impl Cache for MockCache {
+        fn get(&self, _key: &[u8]) -> Option<cache_core::OwnedGuard> {
+            None
+        }
+
+        fn set(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), cache_core::CacheError> {
+            Ok(())
+        }
+
+        fn delete(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn contains(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn test_partial_request() {
+        let cache = MockCache;
+        let mut conn = Connection::new(1024);
+
+        // Send partial RESP command: "*2\r\n$3\r\nGET\r\n$3\r\nke"
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nke");
+        conn.process(&cache);
+
+        // Should have no response yet (incomplete request)
+        assert!(!conn.has_pending_write());
+
+        // Complete the request: "y\r\n"
+        conn.append_recv_data(b"y\r\n");
+        conn.process(&cache);
+
+        // Now should have a response
+        assert!(conn.has_pending_write());
+    }
+
+    #[test]
+    fn test_pipelined_requests() {
+        let cache = MockCache;
+        let mut conn = Connection::new(1024);
+
+        // Send two complete GET requests in one batch
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n");
+        conn.process(&cache);
+
+        // Should have responses for both
+        assert!(conn.has_pending_write());
+        let response = conn.pending_write_data();
+        // Two $-1\r\n responses (null bulk string for cache miss)
+        assert_eq!(response, b"$-1\r\n$-1\r\n");
+    }
+
+    #[test]
+    fn test_complete_plus_partial() {
+        let cache = MockCache;
+        let mut conn = Connection::new(1024);
+
+        // Send one complete request and start of another
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n*2\r\n$3\r\nGET\r\n$3\r\nba");
+        conn.process(&cache);
+
+        // Should have response for first request
+        assert!(conn.has_pending_write());
+        let response = conn.pending_write_data();
+        assert_eq!(response, b"$-1\r\n");
+
+        // Complete the second request
+        conn.append_recv_data(b"r\r\n");
+        conn.process(&cache);
+
+        // Now should have both responses
+        let response = conn.pending_write_data();
+        assert_eq!(response, b"$-1\r\n$-1\r\n");
+    }
+
+    #[test]
+    fn test_partial_write_advance() {
+        let cache = MockCache;
+        let mut conn = Connection::new(1024);
+
+        // Generate a response
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        conn.process(&cache);
+
+        // Simulate partial write (only 2 bytes sent)
+        assert!(conn.has_pending_write());
+        let pending = conn.pending_write_data().len();
+        conn.advance_write(2);
+
+        // Should still have pending data
+        assert!(conn.has_pending_write());
+        assert_eq!(conn.pending_write_data().len(), pending - 2);
+
+        // Simulate rest of write
+        conn.advance_write(pending - 2);
+        assert!(!conn.has_pending_write());
+    }
+
+    #[test]
+    fn test_write_buffer_cleared_on_full_send() {
+        let cache = MockCache;
+        let mut conn = Connection::new(1024);
+
+        // First request
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        conn.process(&cache);
+
+        // "Send" all data
+        let pending = conn.pending_write_data().len();
+        conn.advance_write(pending);
+        assert!(!conn.has_pending_write());
+
+        // Second request - should work fine
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n");
+        conn.process(&cache);
+
+        // New response should be generated
+        assert!(conn.has_pending_write());
+        assert_eq!(conn.pending_write_data(), b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_write_buffer_not_cleared_on_partial_send() {
+        let cache = MockCache;
+        let mut conn = Connection::new(1024);
+
+        // First request
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        conn.process(&cache);
+
+        // Partial send (only 2 bytes)
+        conn.advance_write(2);
+
+        // Second request arrives - write_buf should NOT be cleared
+        conn.append_recv_data(b"*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n");
+        conn.process(&cache);
+
+        // Should have remaining from first response + second response
+        assert!(conn.has_pending_write());
+        // First response: $-1\r\n (5 bytes), sent 2, remaining 3
+        // Second response: $-1\r\n (5 bytes)
+        // Total: 8 bytes
+        assert_eq!(conn.pending_write_data().len(), 8);
+    }
+}
