@@ -1,4 +1,4 @@
-name: Test Self-Hosted Runner
+name: Self-Hosted Runner Test
 
 on:
   workflow_dispatch:
@@ -9,16 +9,24 @@ jobs:
     steps:
       - name: System info
         run: |
-          echo "Hello from self-hosted runner!"
+          echo "Runner: $(hostname)"
           uname -a
           nproc
           free -h
-      - name: Check Rust
+
+      - name: Check Rust toolchain
         run: |
           source ~/.cargo/env
           rustc --version
           cargo --version
+          rustup show
+
       - name: Check cargo-fuzz
         run: |
           source ~/.cargo/env
           cargo fuzz --version
+
+      - name: Check nightly
+        run: |
+          source ~/.cargo/env
+          rustup run nightly rustc --version
