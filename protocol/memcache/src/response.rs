@@ -445,12 +445,21 @@ fn parse_u32(data: &[u8]) -> Result<u32, ParseError> {
         .map_err(|_| ParseError::InvalidNumber)
 }
 
-/// Parse a usize from ASCII decimal.
+/// Maximum value data size (1MB, matching DEFAULT_MAX_VALUE_LEN).
+const MAX_VALUE_DATA_LEN: usize = 1024 * 1024;
+
+/// Parse a usize from ASCII decimal, with a maximum limit.
 fn parse_usize(data: &[u8]) -> Result<usize, ParseError> {
-    std::str::from_utf8(data)
+    let value: usize = std::str::from_utf8(data)
         .map_err(|_| ParseError::InvalidNumber)?
         .parse()
-        .map_err(|_| ParseError::InvalidNumber)
+        .map_err(|_| ParseError::InvalidNumber)?;
+
+    if value > MAX_VALUE_DATA_LEN {
+        return Err(ParseError::Protocol("value data too large"));
+    }
+
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -947,5 +956,16 @@ mod tests {
     fn test_find_crlf_edge_cases() {
         // \r at end without \n
         assert!(Response::parse(b"STORED\r").is_err());
+    }
+
+    #[test]
+    fn test_parse_value_data_too_large() {
+        // Value data size exceeding MAX_VALUE_DATA_LEN should be rejected
+        let data = b"VALUE k 0 18446744073709551615\r\n";
+        let result = Response::parse(data);
+        assert!(matches!(
+            result,
+            Err(ParseError::Protocol("value data too large"))
+        ));
     }
 }
