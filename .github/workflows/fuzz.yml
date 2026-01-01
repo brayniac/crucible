@@ -88,23 +88,62 @@ jobs:
             --duration "$DURATION" \
             --jobs "$JOBS"
 
-      - name: Collect crash artifacts
+      - name: Minimize and collect crash artifacts
         if: failure()
         run: |
-          echo "Collecting crash artifacts..."
+          source ~/.cargo/env
+
+          echo "Collecting and minimizing crash artifacts..."
           mkdir -p crash-artifacts
 
-          # Find all crash/oom/timeout files
-          find . -path '*/fuzz/artifacts/*' -type f \( \
-            -name 'crash-*' -o \
-            -name 'oom-*' -o \
-            -name 'timeout-*' -o \
-            -name 'leak-*' \
-          \) -exec cp {} crash-artifacts/ \;
+          # Find all fuzz directories with crash artifacts
+          for fuzz_dir in $(find . -type d -path '*/fuzz' -exec test -d {}/artifacts \; -print); do
+            echo "Processing $fuzz_dir..."
 
-          # List what we found
-          echo "Crash artifacts:"
-          ls -la crash-artifacts/ || echo "No crash artifacts found"
+            for artifact_dir in "$fuzz_dir"/artifacts/*/; do
+              target_name=$(basename "$artifact_dir")
+
+              for crash_file in "$artifact_dir"crash-* "$artifact_dir"oom-* "$artifact_dir"timeout-*; do
+                [ -f "$crash_file" ] || continue
+
+                crash_name=$(basename "$crash_file")
+                echo "  Found: $target_name/$crash_name"
+
+                # Copy original
+                mkdir -p "crash-artifacts/$target_name"
+                cp "$crash_file" "crash-artifacts/$target_name/$crash_name"
+
+                # Try to minimize (with timeout)
+                echo "  Minimizing $crash_name..."
+                cd "$fuzz_dir"
+                timeout 60 cargo +nightly fuzz tmin "$target_name" "artifacts/$target_name/$crash_name" \
+                  -- -max_total_time=30 2>/dev/null || true
+
+                # Check if minimized version exists
+                if [ -f "artifacts/$target_name/${crash_name}-minimized" ]; then
+                  cp "artifacts/$target_name/${crash_name}-minimized" \
+                     "$GITHUB_WORKSPACE/crash-artifacts/$target_name/${crash_name}-minimized"
+                  echo "  Minimized to: ${crash_name}-minimized"
+                fi
+                cd "$GITHUB_WORKSPACE"
+              done
+            done
+          done
+
+          # Show hex dump of crash inputs for quick analysis
+          echo ""
+          echo "=== Crash Input Analysis ==="
+          for f in crash-artifacts/*/*; do
+            [ -f "$f" ] || continue
+            echo ""
+            echo "--- $f ---"
+            xxd "$f" | head -20
+            echo "Size: $(wc -c < "$f") bytes"
+          done
+
+          echo ""
+          echo "Total crash artifacts:"
+          find crash-artifacts -type f | wc -l
 
       - name: Upload crash artifacts
         if: failure()
