@@ -433,11 +433,11 @@ fn close_connection(
     stats: &WorkerStats,
 ) {
     let idx = conn_id.as_usize();
-    if let Some(slot) = connections.get_mut(idx) {
-        if slot.take().is_some() {
-            let _ = driver.close(conn_id);
-            CONNECTIONS_ACTIVE.decrement();
-            stats.inc_close();
-        }
+    if let Some(slot) = connections.get_mut(idx)
+        && slot.take().is_some()
+    {
+        let _ = driver.close(conn_id);
+        CONNECTIONS_ACTIVE.decrement();
+        stats.inc_close();
     }
 }
