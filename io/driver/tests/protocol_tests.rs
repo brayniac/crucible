@@ -992,11 +992,8 @@ fn test_concurrent_clients_stress() {
     while total_responses < total_expected {
         // Each client tries to send
         for (i, client) in clients.iter_mut().enumerate() {
-            if requests_sent[i] < requests_per_client {
-                match client.write(b"PING\n") {
-                    Ok(_) => requests_sent[i] += 1,
-                    Err(_) => {}
-                }
+            if requests_sent[i] < requests_per_client && client.write_all(b"PING\n").is_ok() {
+                requests_sent[i] += 1;
             }
         }
 
@@ -1022,11 +1019,11 @@ fn test_concurrent_clients_stress() {
     }
 
     // Verify each client got expected responses
-    for i in 0..clients.len() {
+    for (i, &received) in responses_received.iter().enumerate() {
         assert_eq!(
-            responses_received[i], requests_per_client,
+            received, requests_per_client,
             "Client {} got {} responses, expected {}",
-            i, responses_received[i], requests_per_client
+            i, received, requests_per_client
         );
     }
 }

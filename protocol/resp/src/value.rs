@@ -23,6 +23,11 @@
 use crate::error::ParseError;
 use std::io::Write;
 
+/// Default maximum key length in bytes.
+///
+/// This matches the memcache protocol default of 250 bytes.
+pub const DEFAULT_MAX_KEY_LEN: usize = 250;
+
 /// Default maximum number of elements in a collection (array, map, set, etc.).
 ///
 /// This limit prevents denial-of-service attacks where a malicious client sends
@@ -66,6 +71,8 @@ pub const DEFAULT_MAX_TOTAL_ITEMS: usize = 1024;
 /// against resource exhaustion attacks.
 #[derive(Debug, Clone, Copy)]
 pub struct ParseOptions {
+    /// Maximum key length in bytes.
+    pub max_key_len: usize,
     /// Maximum number of elements in a single collection.
     pub max_collection_elements: usize,
     /// Maximum size of a bulk string in bytes.
@@ -83,6 +90,7 @@ pub struct ParseOptions {
 impl Default for ParseOptions {
     fn default() -> Self {
         Self {
+            max_key_len: DEFAULT_MAX_KEY_LEN,
             max_collection_elements: DEFAULT_MAX_COLLECTION_ELEMENTS,
             max_bulk_string_len: DEFAULT_MAX_BULK_STRING_LEN,
             max_depth: DEFAULT_MAX_DEPTH,
@@ -95,11 +103,18 @@ impl ParseOptions {
     /// Create new parse options with default values.
     pub const fn new() -> Self {
         Self {
+            max_key_len: DEFAULT_MAX_KEY_LEN,
             max_collection_elements: DEFAULT_MAX_COLLECTION_ELEMENTS,
             max_bulk_string_len: DEFAULT_MAX_BULK_STRING_LEN,
             max_depth: DEFAULT_MAX_DEPTH,
             max_total_items: DEFAULT_MAX_TOTAL_ITEMS,
         }
+    }
+
+    /// Set the maximum key length.
+    pub const fn max_key_len(mut self, len: usize) -> Self {
+        self.max_key_len = len;
+        self
     }
 
     /// Set the maximum collection element count.

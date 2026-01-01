@@ -206,7 +206,7 @@ fn test_rapid_connection_cycles() {
                 // Server might be slow, retry
                 thread::sleep(Duration::from_millis(10));
                 TcpStream::connect(addr)
-                    .expect(&format!("Failed to connect on iteration {}: {}", i, e))
+                    .unwrap_or_else(|_| panic!("Failed to connect on iteration {}: {}", i, e))
             }
         };
 

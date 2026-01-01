@@ -636,7 +636,7 @@ mod tests {
 
         // Create a buffer that exceeds max_line_len without CRLF
         let mut data = vec![b'g', b'e', b't', b' '];
-        data.extend(std::iter::repeat(b'a').take(max_line_len + 1));
+        data.extend(std::iter::repeat_n(b'a', max_line_len + 1));
         // No CRLF - should error, not return Incomplete
         assert!(matches!(
             Command::parse(&data),
@@ -648,7 +648,7 @@ mod tests {
     fn test_parse_key_too_large() {
         // Key exceeds DEFAULT_MAX_KEY_LEN
         let mut data = b"set ".to_vec();
-        data.extend(std::iter::repeat(b'a').take(DEFAULT_MAX_KEY_LEN + 1));
+        data.extend(std::iter::repeat_n(b'a', DEFAULT_MAX_KEY_LEN + 1));
         data.extend(b" 0 0 5\r\nhello\r\n");
         assert!(matches!(
             Command::parse(&data),
@@ -662,7 +662,7 @@ mod tests {
         let cmd = format!("set k 0 0 {}\r\n", DEFAULT_MAX_VALUE_LEN + 1);
         let mut data = cmd.as_bytes().to_vec();
         // Don't actually append the value data, just the header
-        data.extend(std::iter::repeat(b'x').take(DEFAULT_MAX_VALUE_LEN + 1));
+        data.extend(std::iter::repeat_n(b'x', DEFAULT_MAX_VALUE_LEN + 1));
         data.extend(b"\r\n");
         assert!(matches!(
             Command::parse(&data),
@@ -681,7 +681,7 @@ mod tests {
         let mut data = b"get ".to_vec();
         // Fill to exactly max_line_len bytes (no CRLF)
         let remaining = max_line_len - data.len();
-        data.extend(std::iter::repeat(b'a').take(remaining));
+        data.extend(std::iter::repeat_n(b'a', remaining));
         assert_eq!(data.len(), max_line_len);
         assert!(matches!(Command::parse(&data), Err(ParseError::Incomplete)));
     }
@@ -692,7 +692,7 @@ mod tests {
         // Line at max_line_len + 1 should error (not Incomplete)
         let mut data = b"get ".to_vec();
         let remaining = max_line_len + 1 - data.len();
-        data.extend(std::iter::repeat(b'a').take(remaining));
+        data.extend(std::iter::repeat_n(b'a', remaining));
         assert_eq!(data.len(), max_line_len + 1);
         assert!(matches!(
             Command::parse(&data),
@@ -718,7 +718,7 @@ mod tests {
     fn test_key_length_at_exact_limit() {
         // Key exactly at DEFAULT_MAX_KEY_LEN should succeed
         let mut data = b"set ".to_vec();
-        data.extend(std::iter::repeat(b'k').take(DEFAULT_MAX_KEY_LEN));
+        data.extend(std::iter::repeat_n(b'k', DEFAULT_MAX_KEY_LEN));
         data.extend(b" 0 0 1\r\nv\r\n");
         let result = Command::parse(&data);
         assert!(result.is_ok());
@@ -731,7 +731,7 @@ mod tests {
     fn test_key_length_one_over_limit() {
         // Key at DEFAULT_MAX_KEY_LEN + 1 should fail
         let mut data = b"set ".to_vec();
-        data.extend(std::iter::repeat(b'k').take(DEFAULT_MAX_KEY_LEN + 1));
+        data.extend(std::iter::repeat_n(b'k', DEFAULT_MAX_KEY_LEN + 1));
         data.extend(b" 0 0 1\r\nv\r\n");
         assert!(matches!(
             Command::parse(&data),
@@ -744,7 +744,7 @@ mod tests {
         // Value exactly at DEFAULT_MAX_VALUE_LEN should succeed
         let cmd = format!("set k 0 0 {}\r\n", DEFAULT_MAX_VALUE_LEN);
         let mut data = cmd.as_bytes().to_vec();
-        data.extend(std::iter::repeat(b'v').take(DEFAULT_MAX_VALUE_LEN));
+        data.extend(std::iter::repeat_n(b'v', DEFAULT_MAX_VALUE_LEN));
         data.extend(b"\r\n");
         let result = Command::parse(&data);
         assert!(result.is_ok());
@@ -758,7 +758,7 @@ mod tests {
         // Value at DEFAULT_MAX_VALUE_LEN + 1 should fail
         let cmd = format!("set k 0 0 {}\r\n", DEFAULT_MAX_VALUE_LEN + 1);
         let mut data = cmd.as_bytes().to_vec();
-        data.extend(std::iter::repeat(b'v').take(DEFAULT_MAX_VALUE_LEN + 1));
+        data.extend(std::iter::repeat_n(b'v', DEFAULT_MAX_VALUE_LEN + 1));
         data.extend(b"\r\n");
         assert!(matches!(
             Command::parse(&data),
@@ -819,7 +819,7 @@ mod tests {
         let max_line_len = ParseOptions::default().max_line_len();
         // \r found but no \n, and buffer exceeds limit
         let mut data = b"get ".to_vec();
-        data.extend(std::iter::repeat(b'a').take(max_line_len));
+        data.extend(std::iter::repeat_n(b'a', max_line_len));
         data.push(b'\r');
         assert!(matches!(
             Command::parse(&data),
@@ -831,7 +831,7 @@ mod tests {
     fn test_get_with_key_at_limit() {
         // GET doesn't check key length, but make sure it parses
         let mut data = b"get ".to_vec();
-        data.extend(std::iter::repeat(b'k').take(DEFAULT_MAX_KEY_LEN));
+        data.extend(std::iter::repeat_n(b'k', DEFAULT_MAX_KEY_LEN));
         data.extend(b"\r\n");
         let result = Command::parse(&data);
         assert!(result.is_ok());
@@ -842,7 +842,7 @@ mod tests {
         // DELETE doesn't currently check key length in the same way SET does
         // It only checks for empty key
         let mut data = b"delete ".to_vec();
-        data.extend(std::iter::repeat(b'k').take(DEFAULT_MAX_KEY_LEN + 100));
+        data.extend(std::iter::repeat_n(b'k', DEFAULT_MAX_KEY_LEN + 100));
         data.extend(b"\r\n");
         // DELETE doesn't have key length validation like SET does
         // This test documents current behavior - may want to add validation
@@ -885,7 +885,7 @@ mod tests {
         // Value over custom limit should fail
         let cmd = b"set k 0 0 101\r\n";
         let mut value_data = cmd.to_vec();
-        value_data.extend(std::iter::repeat(b'v').take(101));
+        value_data.extend(std::iter::repeat_n(b'v', 101));
         value_data.extend(b"\r\n");
         let result = Command::parse_with_options(&value_data, &options);
         assert!(matches!(
