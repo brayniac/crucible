@@ -38,14 +38,13 @@ local server_config = {
 local benchmark_config = {
     general: {
         duration: error 'duration must be specified',
-        warmup: error 'warmup must be specified',
+        warmup: '0s',
         threads: error 'threads must be specified',
-        io_engine: 'auto',
+        io_engine: 'mio',
     },
 
     target: {
-        // Server address will be replaced by sed
-        endpoints: ['SERVER_ADDR:6379'],
+        endpoints: ['127.0.0.1:6379'],
         protocol: 'resp',
     },
 
@@ -87,22 +86,23 @@ function(
     heap_size='8GB',
     segment_size='1MB',
     hashtable_power='20',
-    server_threads='8',
-    server_cpu_affinity='4-7,20-23',
+    server_threads='16',
+    server_cpu_affinity='0-15',
     runtime='native',
 
     // Benchmark parameters
-    benchmark_threads='20',
-    benchmark_cpu_affinity='10-15,20-23,42-47,52-55',
+    benchmark_threads='16',
     connections='256',
-    pipeline_depth='64',
+    pipeline_depth='16',
     key_length='16',
     key_count='1000000',
     value_length='64',
     get_percent='80',
+
+    // Flamegraph parameters
     warmup_duration='30s',
-    test_duration='300s',
-    rate_limit=''
+    record_duration='30',
+    perf_frequency='99'
 )
     local args = {
         server_threads: server_threads,
@@ -114,6 +114,8 @@ function(
         value_length: value_length,
         get_percent: get_percent,
         hashtable_power: hashtable_power,
+        record_duration: record_duration,
+        perf_frequency: perf_frequency,
     };
 
     local
@@ -147,25 +149,22 @@ function(
             },
         },
 
+        // Warmup config - write-heavy to populate cache
         warmup_benchmark_config = benchmark_config {
             general+: {
                 duration: warmup_duration,
-                warmup: '0s',
                 threads: benchmark_threads_int,
-                [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
             },
             connection+: {
                 connections: connections_int,
                 pipeline_depth: pipeline_depth_int,
             },
             workload+: {
-                [if rate_limit != '' then 'rate_limit']: std.parseInt(rate_limit),
                 keyspace+: {
                     length: key_length_int,
                     count: key_count_int,
                 },
                 commands: {
-                    // Warmup is write-heavy to populate the cache
                     get: 10,
                     set: 90,
                 },
@@ -175,19 +174,18 @@ function(
             },
         },
 
-        test_benchmark_config = benchmark_config {
+        // Load config for profiling - normal read-heavy workload
+        load_benchmark_config = benchmark_config {
             general+: {
-                duration: test_duration,
-                warmup: '0s',
+                // Run longer than record duration to ensure we capture full profile
+                duration: std.toString(std.parseInt(args.record_duration) + 60) + 's',
                 threads: benchmark_threads_int,
-                [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
             },
             connection+: {
                 connections: connections_int,
                 pipeline_depth: pipeline_depth_int,
             },
             workload+: {
-                [if rate_limit != '' then 'rate_limit']: std.parseInt(rate_limit),
                 keyspace+: {
                     length: key_length_int,
                     count: key_count_int,
@@ -203,10 +201,12 @@ function(
         };
 
     {
-        name: 'crucible_' + cache_backend + '_c' + connections + '_k' + key_length + '_v' + value_length + '_r' + get_percent,
+        name: 'flamegraph_' + cache_backend + '_' + runtime + '_t' + server_threads,
         jobs: {
-            server: {
+            profiler: {
                 local config = std.manifestTomlEx(cache_config, ''),
+                local warmup = std.manifestTomlEx(warmup_benchmark_config, ''),
+                local loadgen = std.manifestTomlEx(load_benchmark_config, ''),
 
                 host: {
                     tags: ['baremetal', 'server'],
@@ -222,6 +222,12 @@ function(
                             if [ ! -f $HOME/.cargo/bin/cargo ]; then
                                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                             fi
+
+                            # Install inferno for flamegraph generation
+                            source $HOME/.cargo/env
+                            if ! command -v inferno-flamegraph &> /dev/null; then
+                                cargo install inferno
+                            fi
                         |||
                     ),
 
@@ -245,19 +251,21 @@ function(
                         ||| % { repo: repo, git_ref: git_ref }
                     ),
 
-                    // Build the server binary
+                    // Build the server and benchmark binaries
                     systemslab.bash(
                         |||
                             export HOME=/tmp/crucible-build
                             source $HOME/.cargo/env
 
                             cd $HOME/crucible
-                            cargo build --release -p server
+                            cargo build --release -p server -p benchmark
                         |||
                     ),
 
-                    // Write out the server config
+                    // Write out configs
                     systemslab.write_file('server.toml', config),
+                    systemslab.write_file('warmup.toml', warmup),
+                    systemslab.write_file('loadgen.toml', loadgen),
 
                     // Start the cache server in the background
                     systemslab.bash(
@@ -266,14 +274,15 @@ function(
 
                             ulimit -n 500000
                             ulimit -a
-                            CRUCIBLE_DIAGNOSTICS=1 $HOME/crucible/target/release/crucible-server server.toml &
-                            echo PID=$! > pid
+                            $HOME/crucible/target/release/crucible-server server.toml &
+                            SERVER_PID=$!
+                            echo "SERVER_PID=$SERVER_PID" > pids.env
                         |||,
                         background=true
                     ),
 
                     // Give the server a moment to start up
-                    systemslab.bash('sleep 10'),
+                    systemslab.bash('sleep 5'),
 
                     // Verify the server is listening
                     systemslab.bash(
@@ -282,134 +291,87 @@ function(
                         |||
                     ),
 
-                    // Signal that the cache is ready
-                    systemslab.barrier('cache-start'),
-
-                    // Wait for warmup to complete
-                    systemslab.barrier('warmup-complete'),
-
-                    // Verify the server is still running after warmup
-                    systemslab.bash(
-                        |||
-                            nc -z localhost 6379 || { echo "Cache server died during warmup"; exit 1; }
-                        |||
-                    ),
-
-                    // Wait for the benchmark to finish
-                    systemslab.barrier('test-finish'),
-
-                    // Shutdown the server
-                    systemslab.bash(
-                        |||
-                            source ./pid
-                            kill $PID
-                        |||
-                    ),
-                ],
-            },
-
-            client: {
-                local warmup = std.manifestTomlEx(warmup_benchmark_config, ''),
-                local loadgen = std.manifestTomlEx(test_benchmark_config, ''),
-
-                host: {
-                    tags: ['baremetal', 'client'],
-                },
-
-                steps: [
-                    // Set up persistent build environment with Rust toolchain
+                    // Run warmup workload to populate cache
                     systemslab.bash(
                         |||
                             export HOME=/tmp/crucible-build
-                            mkdir -p $HOME
 
-                            if [ ! -f $HOME/.cargo/bin/cargo ]; then
-                                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-                            fi
+                            echo "Running warmup workload..."
+                            ulimit -n 500000
+                            $HOME/crucible/target/release/crucible-benchmark warmup.toml
+                            echo "Warmup complete"
+
+                            # Brief pause to let connections settle
+                            sleep 5
                         |||
                     ),
 
-                    // Clone or update the repository
+                    // Start load generation in background and record with perf
+                    systemslab.bash(
+                        |||
+                            export HOME=/tmp/crucible-build
+                            source pids.env
+
+                            echo "Starting load generation..."
+                            ulimit -n 500000
+                            $HOME/crucible/target/release/crucible-benchmark loadgen.toml &
+                            BENCHMARK_PID=$!
+                            echo "BENCHMARK_PID=$BENCHMARK_PID" >> pids.env
+
+                            # Wait for benchmark to ramp up
+                            sleep 10
+
+                            echo "Recording with perf for %(record_duration)s seconds..."
+                            sudo perf record \
+                                --call-graph dwarf \
+                                --freq %(perf_frequency)s \
+                                -p $SERVER_PID \
+                                -o perf.data \
+                                -- sleep %(record_duration)s
+
+                            echo "Perf recording complete"
+                        ||| % { record_duration: args.record_duration, perf_frequency: args.perf_frequency }
+                    ),
+
+                    // Generate flamegraph
                     systemslab.bash(
                         |||
                             export HOME=/tmp/crucible-build
                             source $HOME/.cargo/env
 
-                            cd $HOME
-                            if [ -d crucible ]; then
-                                cd crucible
-                                git fetch origin
-                                git checkout %(git_ref)s
-                                git pull origin %(git_ref)s || true
-                            else
-                                git clone %(repo)s crucible
-                                cd crucible
-                                git checkout %(git_ref)s
+                            echo "Generating flamegraph..."
+                            sudo perf script -i perf.data | \
+                                $HOME/.cargo/bin/inferno-collapse-perf | \
+                                $HOME/.cargo/bin/inferno-flamegraph > flamegraph.svg
+
+                            echo "Flamegraph generated: flamegraph.svg"
+                            ls -la flamegraph.svg
+                        |||
+                    ),
+
+                    // Shutdown processes
+                    systemslab.bash(
+                        |||
+                            source pids.env
+
+                            # Stop benchmark if still running
+                            if [ -n "$BENCHMARK_PID" ]; then
+                                kill $BENCHMARK_PID 2>/dev/null || true
                             fi
-                        ||| % { repo: repo, git_ref: git_ref }
-                    ),
 
-                    // Build the benchmark binary
-                    systemslab.bash(
-                        |||
-                            export HOME=/tmp/crucible-build
-                            source $HOME/.cargo/env
+                            # Stop server
+                            if [ -n "$SERVER_PID" ]; then
+                                kill $SERVER_PID 2>/dev/null || true
+                            fi
 
-                            cd $HOME/crucible
-                            cargo build --release -p benchmark
+                            echo "Cleanup complete"
                         |||
                     ),
 
-                    // Write out the toml configs
-                    systemslab.write_file('warmup.toml', warmup),
-                    systemslab.write_file('loadgen.toml', loadgen),
-
-                    // Replace SERVER_ADDR placeholder with actual server address
-                    systemslab.bash(
-                        |||
-                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" warmup.toml
-                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" loadgen.toml
-                        |||
-                    ),
-
-                    // Wait for the cache to start
-                    systemslab.barrier('cache-start'),
-
-                    // Run the warmup workload
-                    systemslab.bash(
-                        |||
-                            export HOME=/tmp/crucible-build
-
-                            ulimit -n 500000
-                            ulimit -a
-
-                            RUST_LOG=debug $HOME/crucible/target/release/crucible-benchmark warmup.toml
-                        |||
-                    ),
-
-                    // Wait for connections to clean up
-                    systemslab.bash('sleep 10'),
-
-                    // Signal warmup is complete
-                    systemslab.barrier('warmup-complete'),
-
-                    // Run the benchmark
-                    systemslab.bash(
-                        |||
-                            export HOME=/tmp/crucible-build
-
-                            ulimit -n 500000
-                            ulimit -a
-
-                            RUST_LOG=debug $HOME/crucible/target/release/crucible-benchmark loadgen.toml
-                        |||
-                    ),
-
-                    // Signal that the test is complete
-                    systemslab.barrier('test-finish'),
-
-                    // Upload the artifacts
-                    systemslab.upload_artifact('loadgen.toml', tags=['benchmark-config']),
+                    // Upload artifacts
+                    systemslab.upload_artifact('flamegraph.svg', tags=['flamegraph', runtime, cache_backend]),
+                    systemslab.upload_artifact('server.toml', tags=['config']),
+                    systemslab.upload_artifact('loadgen.toml', tags=['config']),
                 ],
             },
         },
