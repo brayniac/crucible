@@ -28,17 +28,17 @@ use std::io::Write;
 /// This limit prevents denial-of-service attacks where a malicious client sends
 /// a message claiming to have billions of elements, causing the server to attempt
 /// a massive allocation.
-pub const DEFAULT_MAX_COLLECTION_ELEMENTS: usize = 1_000_000;
+pub const DEFAULT_MAX_COLLECTION_ELEMENTS: usize = 1024;
 
-/// Default maximum size of a bulk string in bytes (512MB).
+/// Default maximum size of a bulk string in bytes (1MB).
 ///
 /// This limit prevents denial-of-service attacks where a malicious client sends
 /// a message claiming to have a huge bulk string, causing the server to attempt
-/// a massive allocation. This matches Redis's default `proto-max-bulk-len`.
+/// a massive allocation.
 ///
 /// For cache implementations, you may want to set this to match your segment size
 /// minus header overhead using `ParseOptions::max_bulk_string_len()`.
-pub const DEFAULT_MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_BULK_STRING_LEN: usize = 1024 * 1024;
 
 /// Default maximum nesting depth for recursive structures (arrays, maps, sets, etc.).
 ///
@@ -54,11 +54,10 @@ pub const DEFAULT_MAX_DEPTH: usize = 8;
 ///
 /// This is the critical DoS protection limit. Without this, nested collections
 /// could cause exponential memory allocation: MAX_ITEMS^MAX_DEPTH elements.
-/// With MAX_ITEMS=1M and MAX_DEPTH=8, that would be 10^48 possible items.
 ///
 /// This limit caps the total number of collection elements across ALL levels
 /// of nesting in a single parse operation to prevent such attacks.
-pub const DEFAULT_MAX_TOTAL_ITEMS: usize = 1_000_000;
+pub const DEFAULT_MAX_TOTAL_ITEMS: usize = 1024;
 
 /// Configuration options for RESP value parsing.
 ///
