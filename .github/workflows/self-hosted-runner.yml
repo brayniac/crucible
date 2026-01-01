@@ -1,26 +1,24 @@
 name: Test Self-Hosted Runner
 
-  on:
-    workflow_dispatch:
+on:
+  workflow_dispatch:
 
-  jobs:
-    test:
-      runs-on: self-hosted
-      steps:
-        - name: System info
-          run: |
-            echo "Hello from self-hosted runner!"
-            uname -a
-            nproc
-            free -h
-
-        - name: Check Rust
-          run: |
-            source ~/.cargo/env
-            rustc --version
-            cargo --version
-
-        - name: Check cargo-fuzz
-          run: |
-            source ~/.cargo/env
-            cargo fuzz --version
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - name: System info
+        run: |
+          echo "Hello from self-hosted runner!"
+          uname -a
+          nproc
+          free -h
+      - name: Check Rust
+        run: |
+          source ~/.cargo/env
+          rustc --version
+          cargo --version
+      - name: Check cargo-fuzz
+        run: |
+          source ~/.cargo/env
+          cargo fuzz --version
