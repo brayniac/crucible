@@ -1348,8 +1348,8 @@ mod loom_tests {
 
             // At least one should succeed, and if both succeed they should get different slots
             assert!(r1.is_some() || r2.is_some());
-            if r1.is_some() && r2.is_some() {
-                assert_ne!(r1.unwrap(), r2.unwrap());
+            if let (Some(v1), Some(v2)) = (r1, r2) {
+                assert_ne!(v1, v2);
             }
         });
     }
