@@ -24,9 +24,9 @@ impl MemcacheCodec {
 
     /// Encodes a GET command.
     ///
-    /// Format: get <key>\r\n
-    /// Response: VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n
-    ///       or: END\r\n (miss)
+    /// Format: `get <key>\r\n`
+    /// Response: `VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n`
+    ///       or: `END\r\n` (miss)
     pub fn encode_get(&mut self, buf: &mut Buffer, key: &[u8]) -> usize {
         let spare = buf.spare_mut();
         let len = Request::get(key).encode(spare);
@@ -37,8 +37,8 @@ impl MemcacheCodec {
 
     /// Encodes a multi-GET command (more efficient than multiple single GETs).
     ///
-    /// Format: get <key1> <key2> ... <keyN>\r\n
-    /// Response: VALUE <key> <flags> <bytes>\r\n<data>\r\n... END\r\n
+    /// Format: `get <key1> <key2> ... <keyN>\r\n`
+    /// Response: `VALUE <key> <flags> <bytes>\r\n<data>\r\n... END\r\n`
     pub fn encode_multi_get(&mut self, buf: &mut Buffer, keys: &[&[u8]]) -> usize {
         if keys.is_empty() {
             return 0;
@@ -54,8 +54,8 @@ impl MemcacheCodec {
 
     /// Encodes a SET command.
     ///
-    /// Format: set <key> <flags> <exptime> <bytes>\r\n<data>\r\n
-    /// Response: STORED\r\n or NOT_STORED\r\n or ERROR\r\n
+    /// Format: `set <key> <flags> <exptime> <bytes>\r\n<data>\r\n`
+    /// Response: `STORED\r\n` or `NOT_STORED\r\n` or `ERROR\r\n`
     pub fn encode_set(
         &mut self,
         buf: &mut Buffer,
@@ -76,8 +76,8 @@ impl MemcacheCodec {
 
     /// Encodes a DELETE command.
     ///
-    /// Format: delete <key>\r\n
-    /// Response: DELETED\r\n or NOT_FOUND\r\n
+    /// Format: `delete <key>\r\n`
+    /// Response: `DELETED\r\n` or `NOT_FOUND\r\n`
     pub fn encode_delete(&mut self, buf: &mut Buffer, key: &[u8]) -> usize {
         let spare = buf.spare_mut();
         let len = Request::delete(key).encode(spare);

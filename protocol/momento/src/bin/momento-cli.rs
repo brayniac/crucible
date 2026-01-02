@@ -1,9 +1,11 @@
 //! Simple CLI tool to test Momento cache operations.
 //!
 //! Usage:
+//! ```text
 //!   momento-cli get <cache> <key>
 //!   momento-cli set <cache> <key> <value> [--ttl <seconds>]
 //!   momento-cli delete <cache> <key>
+//! ```
 //!
 //! Requires MOMENTO_API_KEY environment variable to be set.
 

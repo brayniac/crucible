@@ -135,9 +135,6 @@ pub struct IoWorker {
     /// Maps conn_id -> session index (for completion lookup)
     conn_id_to_idx: HashMap<usize, usize>,
 
-    /// Next session index for round-robin distribution
-    next_session_idx: usize,
-
     /// Momento sessions (handle their own I/O)
     momento_sessions: Vec<MomentoSession>,
 
@@ -185,7 +182,6 @@ impl IoWorker {
             shared: cfg.shared,
             sessions: Vec::new(),
             conn_id_to_idx: HashMap::new(),
-            next_session_idx: 0,
             momento_sessions: Vec::new(),
             rng,
             key_buf,
@@ -479,50 +475,55 @@ impl IoWorker {
 
         let mut total_queued = 0usize;
 
-        // Round-robin: start from next_session_idx and wrap around
-        for i in 0..num_sessions {
-            let idx = (self.next_session_idx + i) % num_sessions;
-            let session = &mut self.sessions[idx];
+        // Fairness-based selection: always pick the session with the fewest
+        // requests sent that can currently accept a request. This ensures
+        // even distribution regardless of response latency differences.
+        loop {
+            // Find the session with minimum requests_sent that can accept
+            let mut best_idx = None;
+            let mut best_count = u64::MAX;
 
-            if !session.is_connected() {
-                tracing::trace!("session not connected, skipping");
-                continue;
-            }
-
-            while session.can_send() {
-                // Check rate limiter
-                if let Some(ref rl) = self.ratelimiter
-                    && rl.try_wait().is_err()
-                {
-                    break;
-                }
-
-                let key_id = self.rng.random_range(0..key_count);
-                write_key(&mut self.key_buf, key_id);
-
-                let is_get = self.rng.random_range(0..100) < get_ratio;
-                let sent = if is_get {
-                    session.get(&self.key_buf, now).is_some()
-                } else {
-                    self.rng.fill_bytes(&mut self.value_buf);
-                    session.set(&self.key_buf, &self.value_buf, now).is_some()
-                };
-
-                if sent {
-                    total_queued += 1;
-                    if !warmup {
-                        self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
+            for (idx, session) in self.sessions.iter().enumerate() {
+                if session.is_connected() && session.can_send() {
+                    let count = session.requests_sent();
+                    if count < best_count {
+                        best_count = count;
+                        best_idx = Some(idx);
                     }
                 }
+            }
 
-                if !sent {
-                    break;
+            let idx = match best_idx {
+                Some(i) => i,
+                None => break, // No session can accept
+            };
+
+            // Check rate limiter
+            if let Some(ref rl) = self.ratelimiter
+                && rl.try_wait().is_err()
+            {
+                break;
+            }
+
+            let key_id = self.rng.random_range(0..key_count);
+            write_key(&mut self.key_buf, key_id);
+
+            let session = &mut self.sessions[idx];
+            let is_get = self.rng.random_range(0..100) < get_ratio;
+            let sent = if is_get {
+                session.get(&self.key_buf, now).is_some()
+            } else {
+                self.rng.fill_bytes(&mut self.value_buf);
+                session.set(&self.key_buf, &self.value_buf, now).is_some()
+            };
+
+            if sent {
+                total_queued += 1;
+                if !warmup {
+                    self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-
-        // Advance starting point for next iteration
-        self.next_session_idx = (self.next_session_idx + 1) % num_sessions;
 
         if total_queued > 0 {
             tracing::debug!("worker {} queued {} requests", self.id, total_queued);

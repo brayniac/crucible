@@ -347,7 +347,7 @@ impl<H: Hashtable> TieredCache<H> {
 
     /// Get an item from the cache.
     ///
-    /// Returns the value as a Vec<u8>, or None if not found.
+    /// Returns the value as a `Vec<u8>`, or None if not found.
     /// This increments the item's frequency counter.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let verifier = self.create_key_verifier();

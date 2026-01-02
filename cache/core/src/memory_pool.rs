@@ -135,8 +135,8 @@ impl MemoryPoolBuilder {
 
     /// Configure segments to use per-item TTL headers.
     ///
-    /// - `false` (default): Segment-level TTL using [`BasicHeader`]
-    /// - `true`: Per-item TTL using [`TtlHeader`]
+    /// - `false` (default): Segment-level TTL using `BasicHeader`
+    /// - `true`: Per-item TTL using `TtlHeader`
     pub fn per_item_ttl(mut self, enabled: bool) -> Self {
         self.is_per_item_ttl = enabled;
         self

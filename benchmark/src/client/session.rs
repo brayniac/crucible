@@ -113,6 +113,8 @@ pub struct Session {
     max_pipeline_depth: usize,
     /// Next request ID
     next_id: u64,
+    /// Total requests sent on this session (for fairness tracking)
+    requests_sent: u64,
     /// Connection state
     state: ConnectionState,
     /// Last reconnect attempt
@@ -173,6 +175,7 @@ impl Session {
             in_flight: VecDeque::with_capacity(config.pipeline_depth),
             max_pipeline_depth: config.pipeline_depth,
             next_id: 0,
+            requests_sent: 0,
             state: ConnectionState::Disconnected,
             last_reconnect_attempt: None,
             reconnect_delay: config.reconnect_delay,
@@ -252,6 +255,12 @@ impl Session {
         self.in_flight.len()
     }
 
+    /// Get the total number of requests sent on this session.
+    #[inline]
+    pub fn requests_sent(&self) -> u64 {
+        self.requests_sent
+    }
+
     /// Queue a GET request.
     ///
     /// The `now` parameter should be the current time, shared across a batch of
@@ -283,6 +292,7 @@ impl Session {
             queued_at: now,
             tx_timestamp: None,
         });
+        self.requests_sent += 1;
 
         Some(id)
     }
@@ -318,6 +328,7 @@ impl Session {
             queued_at: now,
             tx_timestamp: None,
         });
+        self.requests_sent += 1;
 
         Some(id)
     }

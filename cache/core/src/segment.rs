@@ -378,7 +378,7 @@ pub trait SegmentPrune: Segment {
     /// - `get_frequency`: Returns the frequency for a key
     ///
     /// # Returns
-    /// See [`PruneCollectingResult`] for the return type structure.
+    /// A `PruneCollectingResult` containing the pruned items and statistics.
     fn prune_collecting<F>(&self, threshold: u8, get_frequency: F) -> PruneCollectingResult
     where
         F: Fn(&[u8]) -> Option<u8>;

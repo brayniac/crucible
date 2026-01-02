@@ -107,7 +107,7 @@ pub enum BinaryCommand<'a> {
         expiration: u32,
         opaque: u32,
     },
-    /// FLUSH [expiration]
+    /// FLUSH \[expiration\]
     Flush { expiration: u32, opaque: u32 },
     /// NOOP (used for pipelining)
     Noop { opaque: u32 },
@@ -115,7 +115,7 @@ pub enum BinaryCommand<'a> {
     Version { opaque: u32 },
     /// QUIT
     Quit { opaque: u32 },
-    /// STAT [key]
+    /// STAT \[key\]
     Stat { key: Option<&'a [u8]>, opaque: u32 },
 }
 
