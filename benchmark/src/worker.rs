@@ -14,7 +14,7 @@ use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use ratelimit::Ratelimiter;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -129,11 +129,18 @@ pub struct IoWorker {
     config: Config,
     shared: Arc<SharedState>,
 
-    /// Sessions stored in a Vec for cache-friendly iteration
+    /// Sessions (stable storage)
     sessions: Vec<Session>,
 
     /// Maps conn_id -> session index (for completion lookup)
     conn_id_to_idx: HashMap<usize, usize>,
+
+    /// Round-robin queue of session indices that are ready to send.
+    /// Only sessions with pipeline capacity are in this queue.
+    send_queue: VecDeque<usize>,
+
+    /// Tracks which session indices are currently in send_queue.
+    in_send_queue: HashSet<usize>,
 
     /// Momento sessions (handle their own I/O)
     momento_sessions: Vec<MomentoSession>,
@@ -182,6 +189,8 @@ impl IoWorker {
             shared: cfg.shared,
             sessions: Vec::new(),
             conn_id_to_idx: HashMap::new(),
+            send_queue: VecDeque::new(),
+            in_send_queue: HashSet::new(),
             momento_sessions: Vec::new(),
             rng,
             key_buf,
@@ -246,8 +255,8 @@ impl IoWorker {
                         .fetch_add(1, Ordering::Relaxed);
                     // Create disconnected session for reconnection attempts
                     let session = Session::from_config(endpoint, &self.config);
-                    // Push to Vec - no conn_id mapping since not connected
                     self.sessions.push(session);
+                    // Not added to send_queue - will be added on successful reconnect
                 }
             }
         }
@@ -303,6 +312,9 @@ impl IoWorker {
         let idx = self.sessions.len();
         self.sessions.push(session);
         self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
+        // Connected session can send - add to queue
+        self.send_queue.push_back(idx);
+        self.in_send_queue.insert(idx);
         Ok(())
     }
 
@@ -467,62 +479,45 @@ impl IoWorker {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let warmup = self.warmup;
-        let num_sessions = self.sessions.len();
+        let queue_len = self.send_queue.len();
 
-        if num_sessions == 0 {
+        if queue_len == 0 {
             return Ok(());
         }
 
         let mut total_queued = 0usize;
 
-        // Strict fairness: find the minimum requests_sent across ALL connected
-        // sessions (not just those that can send), then only send to sessions
-        // within a small threshold of that minimum. This ensures even distribution
-        // even when some connections have higher latency.
-        loop {
-            // Find minimum requests_sent across all connected sessions
-            let mut min_sent = u64::MAX;
-            for session in self.sessions.iter() {
-                if session.is_connected() {
-                    min_sent = min_sent.min(session.requests_sent());
-                }
-            }
-
-            if min_sent == u64::MAX {
-                break; // No connected sessions
-            }
-
-            // Find a session that can send AND is within threshold of minimum
-            // Threshold of 1 means a session can be at most 1 request ahead
-            const FAIRNESS_THRESHOLD: u64 = 1;
-            let mut best_idx = None;
-
-            for (idx, session) in self.sessions.iter().enumerate() {
-                if session.is_connected()
-                    && session.can_send()
-                    && session.requests_sent() <= min_sent + FAIRNESS_THRESHOLD
-                {
-                    best_idx = Some(idx);
-                    break;
-                }
-            }
-
-            let idx = match best_idx {
+        // Round-robin fairness: pop index from front, send one request,
+        // only push back if session can still accept more requests.
+        for _ in 0..queue_len {
+            // Pop session index from front
+            let idx = match self.send_queue.pop_front() {
                 Some(i) => i,
-                None => break, // No eligible session can accept
+                None => break,
             };
+
+            let session = &mut self.sessions[idx];
+
+            // Check if session can send (connected and has pipeline room)
+            if !session.is_connected() || !session.can_send() {
+                // Can't send - remove from queue, will be re-added when ready
+                self.in_send_queue.remove(&idx);
+                continue;
+            }
 
             // Check rate limiter
             if let Some(ref rl) = self.ratelimiter
                 && rl.try_wait().is_err()
             {
+                // Rate limited - keep in queue for next poll
+                self.send_queue.push_back(idx);
                 break;
             }
 
+            // Generate and send one request
             let key_id = self.rng.random_range(0..key_count);
             write_key(&mut self.key_buf, key_id);
 
-            let session = &mut self.sessions[idx];
             let is_get = self.rng.random_range(0..100) < get_ratio;
             let sent = if is_get {
                 session.get(&self.key_buf, now).is_some()
@@ -536,6 +531,14 @@ impl IoWorker {
                 if !warmup {
                     self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+
+            // Only keep in queue if session can still send
+            if session.can_send() {
+                self.send_queue.push_back(idx);
+            } else {
+                // Pipeline full - remove from queue, will be re-added when response received
+                self.in_send_queue.remove(&idx);
             }
         }
 
@@ -826,6 +829,12 @@ impl IoWorker {
                                 self.conn_id_to_idx.remove(&old_id);
                             }
                             self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
+
+                            // Add to send queue if not already present
+                            if !self.in_send_queue.contains(&idx) {
+                                self.send_queue.push_back(idx);
+                                self.in_send_queue.insert(idx);
+                            }
 
                             self.shared
                                 .connections_active
