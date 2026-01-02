@@ -8,11 +8,13 @@
 
 use crate::config::LayerConfig;
 use crate::error::{CacheError, CacheResult};
-use crate::hashtable::{Hashtable, SegmentProvider};
+use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::item::ItemGuard;
+use crate::item_location::ItemLocation;
 use crate::layer::{FifoLayer, Layer, TtlLayer};
-use crate::location::ItemLocation;
+use crate::location::Location;
 use crate::pool::RamPool;
+use crate::segment::SegmentKeyVerify;
 use crate::slice_segment::SliceSegment;
 use std::sync::Arc;
 use std::time::Duration;
@@ -247,11 +249,14 @@ impl<H: Hashtable> TieredCache<H> {
         let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
         let location = layer.write_item(key, value, optional, ttl)?;
 
-        // Create segment provider for hashtable operations
-        let provider = self.create_segment_provider();
+        // Create key verifier for hashtable operations
+        let verifier = self.create_key_verifier();
 
         // Insert into hashtable (preserves ghost frequency if present)
-        match self.hashtable.insert(key, location, &provider) {
+        match self
+            .hashtable
+            .insert(key, location.to_location(), &verifier)
+        {
             Ok(Some(old_location)) => {
                 // Key existed, mark old location as deleted
                 self.mark_deleted_at(old_location);
@@ -274,8 +279,8 @@ impl<H: Hashtable> TieredCache<H> {
     /// Returns error if key already exists.
     pub fn add(&self, key: &[u8], value: &[u8], optional: &[u8], ttl: Duration) -> CacheResult<()> {
         // Check if key exists first
-        let provider = self.create_segment_provider();
-        if self.hashtable.contains(key, &provider) {
+        let verifier = self.create_key_verifier();
+        if self.hashtable.contains(key, &verifier) {
             return Err(CacheError::KeyExists);
         }
 
@@ -287,7 +292,10 @@ impl<H: Hashtable> TieredCache<H> {
         let location = layer.write_item(key, value, optional, ttl)?;
 
         // Insert into hashtable (ADD semantics)
-        match self.hashtable.insert_if_absent(key, location, &provider) {
+        match self
+            .hashtable
+            .insert_if_absent(key, location.to_location(), &verifier)
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Failed to insert, mark item as deleted
@@ -307,10 +315,10 @@ impl<H: Hashtable> TieredCache<H> {
         optional: &[u8],
         ttl: Duration,
     ) -> CacheResult<()> {
-        let provider = self.create_segment_provider();
+        let verifier = self.create_key_verifier();
 
         // Check if key exists
-        if !self.hashtable.contains(key, &provider) {
+        if !self.hashtable.contains(key, &verifier) {
             return Err(CacheError::KeyNotFound);
         }
 
@@ -322,7 +330,10 @@ impl<H: Hashtable> TieredCache<H> {
         let location = layer.write_item(key, value, optional, ttl)?;
 
         // Update in hashtable
-        match self.hashtable.update_if_present(key, location, &provider) {
+        match self
+            .hashtable
+            .update_if_present(key, location.to_location(), &verifier)
+        {
             Ok(old_location) => {
                 self.mark_deleted_at(old_location);
                 Ok(())
@@ -339,17 +350,18 @@ impl<H: Hashtable> TieredCache<H> {
     /// Returns the value as a Vec<u8>, or None if not found.
     /// This increments the item's frequency counter.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let provider = self.create_segment_provider();
+        let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
-        let (location, _freq) = self.hashtable.lookup(key, &provider)?;
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let item_loc = ItemLocation::from_location(location);
 
         // Find the layer containing this item
-        let layer_idx = self.layer_for_pool(location.pool_id())?;
+        let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
         let layer = self.layers.get(layer_idx)?;
 
         // Get value from layer
-        layer.get_value(location, key)
+        layer.get_value(item_loc, key)
     }
 
     /// Get an item with full details via callback.
@@ -360,27 +372,28 @@ impl<H: Hashtable> TieredCache<H> {
     where
         F: FnOnce(&dyn ItemGuard<'_>) -> R,
     {
-        let provider = self.create_segment_provider();
+        let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
-        let (location, _freq) = self.hashtable.lookup(key, &provider)?;
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let item_loc = ItemLocation::from_location(location);
 
         // Find the layer containing this item
-        let layer_idx = self.layer_for_pool(location.pool_id())?;
+        let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
         let layer = self.layers.get(layer_idx)?;
 
         // Call function with item
-        layer.with_item(location, key, f)
+        layer.with_item(item_loc, key, f)
     }
 
     /// Delete an item from the cache.
     ///
     /// Returns true if the item was found and deleted.
     pub fn delete(&self, key: &[u8]) -> bool {
-        let provider = self.create_segment_provider();
+        let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
-        let Some((location, _freq)) = self.hashtable.lookup(key, &provider) else {
+        let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) else {
             return false;
         };
 
@@ -399,25 +412,26 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// Does not increment frequency counter.
     pub fn contains(&self, key: &[u8]) -> bool {
-        let provider = self.create_segment_provider();
-        self.hashtable.contains(key, &provider)
+        let verifier = self.create_key_verifier();
+        self.hashtable.contains(key, &verifier)
     }
 
     /// Get the remaining TTL for an item.
     pub fn ttl(&self, key: &[u8]) -> Option<Duration> {
-        let provider = self.create_segment_provider();
+        let verifier = self.create_key_verifier();
 
-        let (location, _freq) = self.hashtable.lookup(key, &provider)?;
-        let layer_idx = self.layer_for_pool(location.pool_id())?;
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let item_loc = ItemLocation::from_location(location);
+        let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
         let layer = self.layers.get(layer_idx)?;
 
-        layer.item_ttl(location)
+        layer.item_ttl(item_loc)
     }
 
     /// Get the frequency counter for an item.
     pub fn frequency(&self, key: &[u8]) -> Option<u8> {
-        let provider = self.create_segment_provider();
-        self.hashtable.get_frequency(key, &provider)
+        let verifier = self.create_key_verifier();
+        self.hashtable.get_frequency(key, &verifier)
     }
 
     /// Run expiration on all layers.
@@ -470,11 +484,12 @@ impl<H: Hashtable> TieredCache<H> {
     }
 
     /// Mark an item as deleted at the given location.
-    fn mark_deleted_at(&self, location: ItemLocation) {
-        if let Some(layer_idx) = self.layer_for_pool(location.pool_id())
+    fn mark_deleted_at(&self, location: Location) {
+        let item_loc = ItemLocation::from_location(location);
+        if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
             && let Some(layer) = self.layers.get(layer_idx)
         {
-            layer.mark_deleted(location);
+            layer.mark_deleted(item_loc);
         }
     }
 
@@ -485,25 +500,38 @@ impl<H: Hashtable> TieredCache<H> {
             .position(|layer| layer.pool_id() == pool_id)
     }
 
-    /// Create a segment provider for hashtable operations.
-    fn create_segment_provider(&self) -> CacheSegmentProvider<'_, H> {
-        CacheSegmentProvider { cache: self }
+    /// Create a key verifier for hashtable operations.
+    fn create_key_verifier(&self) -> CacheKeyVerifier<'_, H> {
+        CacheKeyVerifier { cache: self }
     }
 }
 
-/// Segment provider for TieredCache.
-struct CacheSegmentProvider<'a, H: Hashtable> {
+/// Key verifier for TieredCache.
+struct CacheKeyVerifier<'a, H: Hashtable> {
     cache: &'a TieredCache<H>,
 }
 
-impl<H: Hashtable> SegmentProvider<SliceSegment<'static>> for CacheSegmentProvider<'_, H> {
-    fn get_segment(&self, pool_id: u8, segment_id: u32) -> Option<&SliceSegment<'static>> {
-        // Find layer by pool_id
-        let layer_idx = self.cache.layer_for_pool(pool_id)?;
-        let layer = self.cache.layers.get(layer_idx)?;
+impl<H: Hashtable> KeyVerifier for CacheKeyVerifier<'_, H> {
+    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+        let item_loc = ItemLocation::from_location(location);
+        let pool_id = item_loc.pool_id();
+        let segment_id = item_loc.segment_id();
+        let offset = item_loc.offset();
 
-        // Get segment from layer's pool
-        layer.get_segment(segment_id)
+        // Find layer by pool_id
+        let Some(layer_idx) = self.cache.layer_for_pool(pool_id) else {
+            return false;
+        };
+        let Some(layer) = self.cache.layers.get(layer_idx) else {
+            return false;
+        };
+
+        // Get segment and verify key
+        if let Some(segment) = layer.get_segment(segment_id) {
+            segment.verify_key_at_offset(offset, key, allow_deleted)
+        } else {
+            false
+        }
     }
 }
 

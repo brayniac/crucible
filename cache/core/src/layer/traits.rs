@@ -4,7 +4,7 @@ use crate::config::LayerConfig;
 use crate::error::CacheResult;
 use crate::hashtable::Hashtable;
 use crate::item::ItemGuard;
-use crate::location::ItemLocation;
+use crate::item_location::ItemLocation;
 use std::time::Duration;
 
 /// A layer in the cache hierarchy.

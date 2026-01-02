@@ -2,7 +2,7 @@
 //!
 //! This crate provides the core building blocks for segment-based caches:
 //!
-//! - **Location**: `ItemLocation` for identifying items across pools/segments
+//! - **Location**: Opaque `Location` for hashtable storage, `ItemLocation` for segment interpretation
 //! - **Configuration**: `LayerConfig`, `FrequencyDecay`, `MergeConfig`
 //! - **Segments**: Fixed-size storage units with item append/read
 //! - **Pools**: Segment allocation and lifecycle management
@@ -68,6 +68,9 @@ mod error;
 mod location;
 mod sync;
 
+// Segment-specific location interpretation
+mod item_location;
+
 // Phase 2 - Item and Segment types
 mod item;
 mod segment;
@@ -76,7 +79,10 @@ mod state;
 // Re-exports
 pub use config::{EvictionStrategy, FrequencyDecay, LayerConfig, LayerId, MergeConfig};
 pub use error::{CacheError, CacheResult};
-pub use location::ItemLocation;
+
+// Location re-exports
+pub use item_location::{FnVerifier, ItemLocation, MultiPoolVerifier, SinglePoolVerifier};
+pub use location::Location;
 
 // Phase 2 re-exports
 pub use item::{BasicHeader, BasicItemGuard, ItemGuard, TtlHeader};
@@ -90,7 +96,7 @@ mod hashtable;
 mod hashtable_impl;
 
 // Phase 3 re-exports
-pub use hashtable::{FnProvider, Hashtable, MultiPool, SegmentProvider, SinglePool};
+pub use hashtable::{Hashtable, KeyVerifier};
 pub use hashtable_impl::{CuckooHashtable, Hashbucket};
 
 // Phase 4 - Pools
@@ -144,3 +150,5 @@ pub use metrics::{
 // Cache trait for server compatibility
 mod cache_trait;
 pub use cache_trait::{Cache, DEFAULT_TTL, OwnedGuard};
+mod arc_cache;
+pub use arc_cache::{ArcCache, Entry};

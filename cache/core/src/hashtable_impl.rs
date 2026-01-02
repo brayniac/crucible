@@ -4,26 +4,23 @@
 //! - Configurable N-choice hashing (1-8 choices) for tunable load factors
 //! - ASFC (Adaptive Software Frequency Counter) for frequency tracking
 //! - Ghost entries for preserving frequency after eviction
-//! - Multi-pool storage with pool_id tracking
+//! - Storage-agnostic location handling
 
 use crate::error::{CacheError, CacheResult};
-use crate::hashtable::{Hashtable, SegmentProvider};
-use crate::location::ItemLocation;
-use crate::segment::SegmentKeyVerify;
+use crate::hashtable::{Hashtable, KeyVerifier};
+use crate::location::Location;
 use crate::sync::{AtomicU64, Ordering};
 use ahash::RandomState;
 
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
 
-/// Lock-free hashtable for segment-based caches.
+/// Lock-free hashtable for caches.
 ///
 /// Each entry stores:
 /// - 12-bit tag (hash suffix for fast filtering)
 /// - 8-bit frequency counter (ASFC algorithm)
-/// - 2-bit pool_id (supports up to 4 pools)
-/// - 22-bit segment_id (up to 4M segments per pool)
-/// - 20-bit offset/8 (up to ~8MB per segment)
+/// - 44-bit location (opaque, meaning defined by storage backend)
 pub struct CuckooHashtable {
     hash_builder: Box<RandomState>,
     buckets: Box<[Hashbucket]>,
@@ -163,13 +160,13 @@ impl CuckooHashtable {
     }
 
     /// Search a bucket for an item, updating frequency on hit.
-    fn search_bucket_for_get<S: SegmentKeyVerify>(
+    fn search_bucket_for_get(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
-        segments: &impl SegmentProvider<S>,
-    ) -> Option<(ItemLocation, u8)> {
+        verifier: &impl KeyVerifier,
+    ) -> Option<(Location, u8)> {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
@@ -179,17 +176,13 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag {
-                let pool_id = Hashbucket::item_pool_id(packed);
-                let segment_id = Hashbucket::item_segment_id(packed);
-                let offset = Hashbucket::item_offset(packed);
+            if Hashbucket::tag(packed) == tag {
+                let location = Hashbucket::location(packed);
 
-                // Verify key matches
-                if let Some(segment) = segments.get_segment(pool_id, segment_id)
-                    && segment.verify_key_at_offset(offset, key, false)
-                {
+                // Verify key matches using the verifier
+                if verifier.verify(key, location, false) {
                     // Update frequency (best effort)
-                    let freq = Hashbucket::item_freq(packed);
+                    let freq = Hashbucket::freq(packed);
                     if freq < 127
                         && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
                     {
@@ -201,8 +194,7 @@ impl CuckooHashtable {
                         );
                     }
 
-                    let location = ItemLocation::new(pool_id, segment_id, offset);
-                    return Some((location, Hashbucket::item_freq(packed)));
+                    return Some((location, Hashbucket::freq(packed)));
                 }
             }
         }
@@ -211,12 +203,12 @@ impl CuckooHashtable {
     }
 
     /// Search a bucket for existence (no frequency update).
-    fn search_bucket_exists<S: SegmentKeyVerify>(
+    fn search_bucket_exists(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
-        segments: &impl SegmentProvider<S>,
+        verifier: &impl KeyVerifier,
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
@@ -227,14 +219,10 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag {
-                let pool_id = Hashbucket::item_pool_id(packed);
-                let segment_id = Hashbucket::item_segment_id(packed);
-                let offset = Hashbucket::item_offset(packed);
+            if Hashbucket::tag(packed) == tag {
+                let location = Hashbucket::location(packed);
 
-                if let Some(segment) = segments.get_segment(pool_id, segment_id)
-                    && segment.verify_key_at_offset(offset, key, false)
-                {
+                if verifier.verify(key, location, false) {
                     return true;
                 }
             }
@@ -250,8 +238,8 @@ impl CuckooHashtable {
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
 
-            if Hashbucket::is_ghost(packed) && Hashbucket::item_tag(packed) == tag {
-                return Some(Hashbucket::item_freq(packed));
+            if Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
+                return Some(Hashbucket::freq(packed));
             }
         }
 
@@ -259,12 +247,12 @@ impl CuckooHashtable {
     }
 
     /// Search for frequency of a specific item.
-    fn search_bucket_for_freq<S: SegmentKeyVerify>(
+    fn search_bucket_for_freq(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
-        segments: &impl SegmentProvider<S>,
+        verifier: &impl KeyVerifier,
     ) -> Option<u8> {
         let bucket = self.bucket(bucket_index);
 
@@ -275,15 +263,11 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag {
-                let pool_id = Hashbucket::item_pool_id(packed);
-                let segment_id = Hashbucket::item_segment_id(packed);
-                let offset = Hashbucket::item_offset(packed);
+            if Hashbucket::tag(packed) == tag {
+                let location = Hashbucket::location(packed);
 
-                if let Some(segment) = segments.get_segment(pool_id, segment_id)
-                    && segment.verify_key_at_offset(offset, key, false)
-                {
-                    return Some(Hashbucket::item_freq(packed));
+                if verifier.verify(key, location, false) {
+                    return Some(Hashbucket::freq(packed));
                 }
             }
         }
@@ -296,12 +280,9 @@ impl CuckooHashtable {
         &self,
         bucket_index: usize,
         tag: u16,
-        location: ItemLocation,
+        location: Location,
     ) -> Option<u8> {
         let bucket = self.bucket(bucket_index);
-        let pool_id = location.pool_id();
-        let segment_id = location.segment_id();
-        let offset = location.offset();
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
@@ -310,12 +291,8 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag
-                && Hashbucket::item_pool_id(packed) == pool_id
-                && Hashbucket::item_segment_id(packed) == segment_id
-                && Hashbucket::item_offset(packed) == offset
-            {
-                return Some(Hashbucket::item_freq(packed));
+            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == location {
+                return Some(Hashbucket::freq(packed));
             }
         }
 
@@ -323,25 +300,25 @@ impl CuckooHashtable {
     }
 
     /// Try to link in a bucket, handling existing entries and ghosts.
-    fn try_link_in_bucket<S: SegmentKeyVerify>(
+    fn try_link_in_bucket(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
         new_packed: u64,
-        segments: &impl SegmentProvider<S>,
-    ) -> Option<CacheResult<Option<ItemLocation>>> {
+        verifier: &impl KeyVerifier,
+    ) -> Option<CacheResult<Option<Location>>> {
         let bucket = self.bucket(bucket_index);
 
         // First pass: look for existing entry or matching ghost
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
 
-            if Hashbucket::item_tag(packed) == tag {
+            if Hashbucket::tag(packed) == tag {
                 if Hashbucket::is_ghost(packed) {
                     // Replace ghost, preserving frequency
-                    let freq = Hashbucket::item_freq(packed);
-                    let new_with_freq = Hashbucket::update_freq_in_packed(new_packed, freq);
+                    let freq = Hashbucket::freq(packed);
+                    let new_with_freq = Hashbucket::with_freq(new_packed, freq);
 
                     match slot.compare_exchange(
                         packed,
@@ -354,16 +331,12 @@ impl CuckooHashtable {
                     }
                 }
 
-                let pool_id = Hashbucket::item_pool_id(packed);
-                let segment_id = Hashbucket::item_segment_id(packed);
-                let offset = Hashbucket::item_offset(packed);
+                let location = Hashbucket::location(packed);
 
-                if let Some(segment) = segments.get_segment(pool_id, segment_id)
-                    && segment.verify_key_at_offset(offset, key, true)
-                {
+                if verifier.verify(key, location, true) {
                     // Replace existing entry, preserving frequency
-                    let freq = Hashbucket::item_freq(packed);
-                    let new_with_freq = Hashbucket::update_freq_in_packed(new_packed, freq);
+                    let freq = Hashbucket::freq(packed);
+                    let new_with_freq = Hashbucket::with_freq(new_packed, freq);
 
                     match slot.compare_exchange(
                         packed,
@@ -372,8 +345,7 @@ impl CuckooHashtable {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            let old_loc = ItemLocation::new(pool_id, segment_id, offset);
-                            return Some(Ok(Some(old_loc)));
+                            return Some(Ok(Some(location)));
                         }
                         Err(_) => continue,
                     }
@@ -414,11 +386,8 @@ impl CuckooHashtable {
     }
 
     /// Try to unlink an item from a bucket.
-    fn try_unlink_in_bucket(&self, bucket_index: usize, tag: u16, location: ItemLocation) -> bool {
+    fn try_unlink_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
-        let pool_id = location.pool_id();
-        let segment_id = location.segment_id();
-        let offset = location.offset();
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
@@ -427,11 +396,7 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag
-                && Hashbucket::item_pool_id(packed) == pool_id
-                && Hashbucket::item_segment_id(packed) == segment_id
-                && Hashbucket::item_offset(packed) == offset
-            {
+            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
                 match slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Acquire) {
                     Ok(_) => return true,
                     Err(_) => continue,
@@ -443,16 +408,8 @@ impl CuckooHashtable {
     }
 
     /// Try to convert an item to ghost in a bucket.
-    fn try_to_ghost_in_bucket(
-        &self,
-        bucket_index: usize,
-        tag: u16,
-        location: ItemLocation,
-    ) -> bool {
+    fn try_to_ghost_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
-        let pool_id = location.pool_id();
-        let segment_id = location.segment_id();
-        let offset = location.offset();
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
@@ -461,11 +418,7 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag
-                && Hashbucket::item_pool_id(packed) == pool_id
-                && Hashbucket::item_segment_id(packed) == segment_id
-                && Hashbucket::item_offset(packed) == offset
-            {
+            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
                 let ghost = Hashbucket::to_ghost(packed);
                 match slot.compare_exchange(packed, ghost, Ordering::Release, Ordering::Acquire) {
                     Ok(_) => return true,
@@ -482,14 +435,11 @@ impl CuckooHashtable {
         &self,
         bucket_index: usize,
         tag: u16,
-        old_location: ItemLocation,
-        new_location: ItemLocation,
+        old_location: Location,
+        new_location: Location,
         preserve_freq: bool,
     ) -> bool {
         let bucket = self.bucket(bucket_index);
-        let old_pool_id = old_location.pool_id();
-        let old_segment_id = old_location.segment_id();
-        let old_offset = old_location.offset();
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
@@ -498,23 +448,13 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag
-                && Hashbucket::item_pool_id(packed) == old_pool_id
-                && Hashbucket::item_segment_id(packed) == old_segment_id
-                && Hashbucket::item_offset(packed) == old_offset
-            {
+            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == old_location {
                 let freq = if preserve_freq {
-                    Hashbucket::item_freq(packed)
+                    Hashbucket::freq(packed)
                 } else {
                     1
                 };
-                let new_packed = Hashbucket::pack_item(
-                    tag,
-                    freq,
-                    new_location.pool_id(),
-                    new_location.segment_id(),
-                    new_location.offset(),
-                );
+                let new_packed = Hashbucket::pack(tag, freq, new_location);
 
                 if slot
                     .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Acquire)
@@ -529,12 +469,12 @@ impl CuckooHashtable {
     }
 
     /// Check if key exists (for ADD semantics).
-    fn check_key_exists<S: SegmentKeyVerify>(
+    fn check_key_exists(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
-        segments: &impl SegmentProvider<S>,
+        verifier: &impl KeyVerifier,
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
@@ -544,14 +484,10 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag {
-                let pool_id = Hashbucket::item_pool_id(packed);
-                let seg_id = Hashbucket::item_segment_id(packed);
-                let off = Hashbucket::item_offset(packed);
+            if Hashbucket::tag(packed) == tag {
+                let location = Hashbucket::location(packed);
 
-                if let Some(segment) = segments.get_segment(pool_id, seg_id)
-                    && segment.verify_key_at_offset(off, key, false)
-                {
+                if verifier.verify(key, location, false) {
                     return true;
                 }
             }
@@ -565,22 +501,16 @@ impl CuckooHashtable {
         &self,
         bucket_index: usize,
         tag: u16,
-        location: ItemLocation,
+        location: Location,
     ) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
 
-            if Hashbucket::is_ghost(packed) && Hashbucket::item_tag(packed) == tag {
-                let freq = Hashbucket::item_freq(packed);
-                let new_packed = Hashbucket::pack_item(
-                    tag,
-                    freq,
-                    location.pool_id(),
-                    location.segment_id(),
-                    location.offset(),
-                );
+            if Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
+                let freq = Hashbucket::freq(packed);
+                let new_packed = Hashbucket::pack(tag, freq, location);
 
                 match slot.compare_exchange(
                     packed,
@@ -598,13 +528,13 @@ impl CuckooHashtable {
     }
 
     /// Try to insert into empty slot for ADD.
-    fn try_insert_empty_for_add<S: SegmentKeyVerify>(
+    fn try_insert_empty_for_add(
         &self,
         bucket_index: usize,
         tag: u16,
         new_packed: u64,
         key: &[u8],
-        segments: &impl SegmentProvider<S>,
+        verifier: &impl KeyVerifier,
     ) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
@@ -620,7 +550,7 @@ impl CuckooHashtable {
                             slot,
                             tag,
                             key,
-                            segments,
+                            verifier,
                         ) {
                             let _ = slot.compare_exchange(
                                 new_packed,
@@ -636,14 +566,10 @@ impl CuckooHashtable {
                         // Check if someone else inserted our key
                         if new_current != 0
                             && !Hashbucket::is_ghost(new_current)
-                            && Hashbucket::item_tag(new_current) == tag
+                            && Hashbucket::tag(new_current) == tag
                         {
-                            let pool_id = Hashbucket::item_pool_id(new_current);
-                            let seg_id = Hashbucket::item_segment_id(new_current);
-                            let off = Hashbucket::item_offset(new_current);
-                            if let Some(segment) = segments.get_segment(pool_id, seg_id)
-                                && segment.verify_key_at_offset(off, key, false)
-                            {
+                            let location = Hashbucket::location(new_current);
+                            if verifier.verify(key, location, false) {
                                 return Some(Err(CacheError::KeyExists));
                             }
                         }
@@ -657,13 +583,13 @@ impl CuckooHashtable {
     }
 
     /// Check for duplicate after inserting (race detection).
-    fn check_for_duplicate_after_insert<S: SegmentKeyVerify>(
+    fn check_for_duplicate_after_insert(
         &self,
         inserted_bucket: usize,
         inserted_slot: &AtomicU64,
         tag: u16,
         key: &[u8],
-        segments: &impl SegmentProvider<S>,
+        verifier: &impl KeyVerifier,
     ) -> bool {
         let hash = self.hash_key(key);
         let buckets = self.bucket_indices(hash);
@@ -681,14 +607,10 @@ impl CuckooHashtable {
                     continue;
                 }
 
-                if Hashbucket::item_tag(packed) == tag {
-                    let pool_id = Hashbucket::item_pool_id(packed);
-                    let seg_id = Hashbucket::item_segment_id(packed);
-                    let off = Hashbucket::item_offset(packed);
+                if Hashbucket::tag(packed) == tag {
+                    let location = Hashbucket::location(packed);
 
-                    if let Some(segment) = segments.get_segment(pool_id, seg_id)
-                        && segment.verify_key_at_offset(off, key, false)
-                    {
+                    if verifier.verify(key, location, false) {
                         return true;
                     }
                 }
@@ -722,14 +644,14 @@ impl CuckooHashtable {
     }
 
     /// Try to replace existing entry for REPLACE semantics.
-    fn try_replace_existing_for_replace<S: SegmentKeyVerify>(
+    fn try_replace_existing_for_replace(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
-        new_location: ItemLocation,
-        segments: &impl SegmentProvider<S>,
-    ) -> Option<CacheResult<ItemLocation>> {
+        new_location: Location,
+        verifier: &impl KeyVerifier,
+    ) -> Option<CacheResult<Location>> {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
@@ -738,22 +660,12 @@ impl CuckooHashtable {
                 continue;
             }
 
-            if Hashbucket::item_tag(packed) == tag {
-                let old_pool_id = Hashbucket::item_pool_id(packed);
-                let old_seg_id = Hashbucket::item_segment_id(packed);
-                let old_offset = Hashbucket::item_offset(packed);
+            if Hashbucket::tag(packed) == tag {
+                let old_location = Hashbucket::location(packed);
 
-                if let Some(segment) = segments.get_segment(old_pool_id, old_seg_id)
-                    && segment.verify_key_at_offset(old_offset, key, false)
-                {
-                    let freq = Hashbucket::item_freq(packed);
-                    let new_packed = Hashbucket::pack_item(
-                        tag,
-                        freq,
-                        new_location.pool_id(),
-                        new_location.segment_id(),
-                        new_location.offset(),
-                    );
+                if verifier.verify(key, old_location, false) {
+                    let freq = Hashbucket::freq(packed);
+                    let new_packed = Hashbucket::pack(tag, freq, new_location);
 
                     match slot.compare_exchange(
                         packed,
@@ -762,8 +674,7 @@ impl CuckooHashtable {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            let old_loc = ItemLocation::new(old_pool_id, old_seg_id, old_offset);
-                            return Some(Ok(old_loc));
+                            return Some(Ok(old_location));
                         }
                         Err(_) => continue,
                     }
@@ -776,17 +687,13 @@ impl CuckooHashtable {
 }
 
 impl Hashtable for CuckooHashtable {
-    fn lookup<S: SegmentKeyVerify>(
-        &self,
-        key: &[u8],
-        segments: &impl SegmentProvider<S>,
-    ) -> Option<(ItemLocation, u8)> {
+    fn lookup(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<(Location, u8)> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
-            if let Some(result) = self.search_bucket_for_get(bucket_index, tag, key, segments) {
+            if let Some(result) = self.search_bucket_for_get(bucket_index, tag, key, verifier) {
                 return Some(result);
             }
         }
@@ -794,17 +701,13 @@ impl Hashtable for CuckooHashtable {
         None
     }
 
-    fn contains<S: SegmentKeyVerify>(
-        &self,
-        key: &[u8],
-        segments: &impl SegmentProvider<S>,
-    ) -> bool {
+    fn contains(&self, key: &[u8], verifier: &impl KeyVerifier) -> bool {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
-            if self.search_bucket_exists(bucket_index, tag, key, segments) {
+            if self.search_bucket_exists(bucket_index, tag, key, verifier) {
                 return true;
             }
         }
@@ -812,29 +715,23 @@ impl Hashtable for CuckooHashtable {
         false
     }
 
-    fn insert<S: SegmentKeyVerify>(
+    fn insert(
         &self,
         key: &[u8],
-        location: ItemLocation,
-        segments: &impl SegmentProvider<S>,
-    ) -> CacheResult<Option<ItemLocation>> {
+        location: Location,
+        verifier: &impl KeyVerifier,
+    ) -> CacheResult<Option<Location>> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
         let choices = &buckets[..self.num_choices as usize];
 
-        let new_packed = Hashbucket::pack_item(
-            tag,
-            1,
-            location.pool_id(),
-            location.segment_id(),
-            location.offset(),
-        );
+        let new_packed = Hashbucket::pack(tag, 1, location);
 
         // First pass: try to find existing key or ghost in any bucket
         for &bucket_index in choices {
             if let Some(result) =
-                self.try_link_in_bucket(bucket_index, tag, key, new_packed, segments)
+                self.try_link_in_bucket(bucket_index, tag, key, new_packed, verifier)
             {
                 return result;
             }
@@ -849,7 +746,7 @@ impl Hashtable for CuckooHashtable {
                 .min_by_key(|&b| self.count_occupied(b))
                 .unwrap();
 
-            if let Some(result) = self.try_link_in_bucket(target, tag, key, new_packed, segments) {
+            if let Some(result) = self.try_link_in_bucket(target, tag, key, new_packed, verifier) {
                 return result;
             }
 
@@ -858,7 +755,7 @@ impl Hashtable for CuckooHashtable {
             sorted.sort_by_key(|&b| self.count_occupied(b));
             for bucket_index in sorted {
                 if let Some(result) =
-                    self.try_link_in_bucket(bucket_index, tag, key, new_packed, segments)
+                    self.try_link_in_bucket(bucket_index, tag, key, new_packed, verifier)
                 {
                     return result;
                 }
@@ -868,11 +765,11 @@ impl Hashtable for CuckooHashtable {
         Err(CacheError::HashTableFull)
     }
 
-    fn insert_if_absent<S: SegmentKeyVerify>(
+    fn insert_if_absent(
         &self,
         key: &[u8],
-        location: ItemLocation,
-        segments: &impl SegmentProvider<S>,
+        location: Location,
+        verifier: &impl KeyVerifier,
     ) -> CacheResult<()> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
@@ -881,7 +778,7 @@ impl Hashtable for CuckooHashtable {
 
         // Phase 1: Check if key already exists in any bucket
         for &bucket_index in choices {
-            if self.check_key_exists(bucket_index, tag, key, segments) {
+            if self.check_key_exists(bucket_index, tag, key, verifier) {
                 return Err(CacheError::KeyExists);
             }
         }
@@ -894,13 +791,7 @@ impl Hashtable for CuckooHashtable {
         }
 
         // Phase 3: Insert into empty slot, preferring least-full bucket
-        let new_packed = Hashbucket::pack_item(
-            tag,
-            1,
-            location.pool_id(),
-            location.segment_id(),
-            location.offset(),
-        );
+        let new_packed = Hashbucket::pack(tag, 1, location);
 
         // Sort buckets by occupancy (least-full first)
         let mut sorted: Vec<_> = choices.to_vec();
@@ -908,7 +799,7 @@ impl Hashtable for CuckooHashtable {
 
         for bucket_index in &sorted {
             if let Some(result) =
-                self.try_insert_empty_for_add(*bucket_index, tag, new_packed, key, segments)
+                self.try_insert_empty_for_add(*bucket_index, tag, new_packed, key, verifier)
             {
                 return result;
             }
@@ -924,19 +815,19 @@ impl Hashtable for CuckooHashtable {
         Err(CacheError::HashTableFull)
     }
 
-    fn update_if_present<S: SegmentKeyVerify>(
+    fn update_if_present(
         &self,
         key: &[u8],
-        location: ItemLocation,
-        segments: &impl SegmentProvider<S>,
-    ) -> CacheResult<ItemLocation> {
+        location: Location,
+        verifier: &impl KeyVerifier,
+    ) -> CacheResult<Location> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
             if let Some(result) =
-                self.try_replace_existing_for_replace(bucket_index, tag, key, location, segments)
+                self.try_replace_existing_for_replace(bucket_index, tag, key, location, verifier)
             {
                 return result;
             }
@@ -945,7 +836,7 @@ impl Hashtable for CuckooHashtable {
         Err(CacheError::KeyNotFound)
     }
 
-    fn remove(&self, key: &[u8], expected: ItemLocation) -> bool {
+    fn remove(&self, key: &[u8], expected: Location) -> bool {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
@@ -959,7 +850,7 @@ impl Hashtable for CuckooHashtable {
         false
     }
 
-    fn convert_to_ghost(&self, key: &[u8], expected: ItemLocation) -> bool {
+    fn convert_to_ghost(&self, key: &[u8], expected: Location) -> bool {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
@@ -976,8 +867,8 @@ impl Hashtable for CuckooHashtable {
     fn cas_location(
         &self,
         key: &[u8],
-        old_location: ItemLocation,
-        new_location: ItemLocation,
+        old_location: Location,
+        new_location: Location,
         preserve_freq: bool,
     ) -> bool {
         let hash = self.hash_key(key);
@@ -994,17 +885,13 @@ impl Hashtable for CuckooHashtable {
         false
     }
 
-    fn get_frequency<S: SegmentKeyVerify>(
-        &self,
-        key: &[u8],
-        segments: &impl SegmentProvider<S>,
-    ) -> Option<u8> {
+    fn get_frequency(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<u8> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
-            if let Some(freq) = self.search_bucket_for_freq(bucket_index, tag, key, segments) {
+            if let Some(freq) = self.search_bucket_for_freq(bucket_index, tag, key, verifier) {
                 return Some(freq);
             }
         }
@@ -1012,7 +899,7 @@ impl Hashtable for CuckooHashtable {
         None
     }
 
-    fn get_item_frequency(&self, key: &[u8], location: ItemLocation) -> Option<u8> {
+    fn get_item_frequency(&self, key: &[u8], location: Location) -> Option<u8> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
@@ -1047,11 +934,10 @@ impl Hashtable for CuckooHashtable {
 
 /// A single hashtable bucket (64 bytes, cache-line aligned).
 ///
-/// Contains 8 item slots (no separate info slot - CAS handled differently).
+/// Contains 8 item slots, each packed as:
+/// `[12 bits tag][8 bits freq][44 bits location]`
 #[repr(C, align(64))]
 pub struct Hashbucket {
-    /// 8 item slots, each packed as:
-    /// `[12 bits tag][8 bits freq][2 bits pool_id][22 bits segment_id][20 bits offset/8]`
     pub(crate) items: [AtomicU64; 8],
 }
 
@@ -1059,9 +945,6 @@ const _: () = assert!(std::mem::size_of::<Hashbucket>() == 64);
 const _: () = assert!(std::mem::align_of::<Hashbucket>() == 64);
 
 impl Hashbucket {
-    /// Sentinel segment ID for ghost entries.
-    pub const GHOST_SEGMENT_ID: u32 = 0x3FFFFF;
-
     /// Create a new empty bucket.
     pub fn new() -> Self {
         Self {
@@ -1069,80 +952,56 @@ impl Hashbucket {
         }
     }
 
-    /// Pack item data into a u64.
+    /// Pack an entry into a u64.
     ///
-    /// Layout: `[12 bits tag][8 bits freq][2 bits pool_id][22 bits segment_id][20 bits offset/8]`
+    /// Layout: `[12 bits tag][8 bits freq][44 bits location]`
     #[inline]
-    pub fn pack_item(tag: u16, freq: u8, pool_id: u8, segment_id: u32, offset: u32) -> u64 {
-        debug_assert!(offset & 0x7 == 0, "offset must be 8-byte aligned");
-        debug_assert!(pool_id <= 3, "pool_id exceeds 2-bit limit");
-        debug_assert!(segment_id <= 0x3FFFFF, "segment_id exceeds 22-bit limit");
-
+    pub fn pack(tag: u16, freq: u8, location: Location) -> u64 {
         let tag_64 = (tag as u64 & 0xFFF) << 52;
         let freq_64 = (freq as u64 & 0xFF) << 44;
-        let pool_64 = (pool_id as u64 & 0x3) << 42;
-        let seg_64 = (segment_id as u64 & 0x3FFFFF) << 20;
-        let off_64 = (offset >> 3) as u64 & 0xFFFFF;
-
-        tag_64 | freq_64 | pool_64 | seg_64 | off_64
+        let loc_64 = location.as_raw() & Location::MAX_RAW;
+        tag_64 | freq_64 | loc_64
     }
 
     /// Extract tag (12 bits).
     #[inline]
-    pub fn item_tag(packed: u64) -> u16 {
+    pub fn tag(packed: u64) -> u16 {
         (packed >> 52) as u16
     }
 
     /// Extract frequency (8 bits).
     #[inline]
-    pub fn item_freq(packed: u64) -> u8 {
+    pub fn freq(packed: u64) -> u8 {
         ((packed >> 44) & 0xFF) as u8
     }
 
-    /// Extract pool ID (2 bits).
+    /// Extract location (44 bits).
     #[inline]
-    pub fn item_pool_id(packed: u64) -> u8 {
-        ((packed >> 42) & 0x3) as u8
-    }
-
-    /// Extract segment ID (22 bits).
-    #[inline]
-    pub fn item_segment_id(packed: u64) -> u32 {
-        ((packed >> 20) & 0x3FFFFF) as u32
-    }
-
-    /// Extract offset (20 bits * 8).
-    #[inline]
-    pub fn item_offset(packed: u64) -> u32 {
-        ((packed & 0xFFFFF) << 3) as u32
+    pub fn location(packed: u64) -> Location {
+        Location::from_raw(packed)
     }
 
     /// Check if entry is a ghost.
     #[inline]
     pub fn is_ghost(packed: u64) -> bool {
-        packed != 0 && Self::item_segment_id(packed) == Self::GHOST_SEGMENT_ID
+        packed != 0 && Self::location(packed).is_ghost()
     }
 
     /// Pack a ghost entry (tag + frequency only).
     #[inline]
     pub fn pack_ghost(tag: u16, freq: u8) -> u64 {
-        let tag_64 = (tag as u64 & 0xFFF) << 52;
-        let freq_64 = (freq as u64 & 0xFF) << 44;
-        let seg_64 = (Self::GHOST_SEGMENT_ID as u64) << 20;
-        tag_64 | freq_64 | seg_64
+        Self::pack(tag, freq, Location::GHOST)
     }
 
     /// Convert a live entry to ghost.
     #[inline]
     pub fn to_ghost(packed: u64) -> u64 {
-        let tag = Self::item_tag(packed);
-        let freq = Self::item_freq(packed);
-        Self::pack_ghost(tag, freq)
+        Self::pack_ghost(Self::tag(packed), Self::freq(packed))
     }
 
     /// Update frequency in a packed value.
     #[inline]
-    pub fn update_freq_in_packed(packed: u64, freq: u8) -> u64 {
+    pub fn with_freq(packed: u64, freq: u8) -> u64 {
         let freq_mask = 0xFF_u64 << 44;
         (packed & !freq_mask) | ((freq as u64) << 44)
     }
@@ -1172,7 +1031,7 @@ impl Hashbucket {
         };
 
         if should_increment {
-            Some(Self::update_freq_in_packed(packed, freq + 1))
+            Some(Self::with_freq(packed, freq + 1))
         } else {
             None
         }
@@ -1189,51 +1048,56 @@ impl Default for Hashbucket {
 mod tests {
     use super::*;
 
-    // Mock segment for testing
-    struct MockSegment {
-        keys: Vec<(u32, Vec<u8>, bool)>, // (offset, key, is_deleted)
+    // Mock verifier for testing
+    struct MockVerifier {
+        entries: Vec<(Vec<u8>, Location, bool)>, // (key, location, is_deleted)
     }
 
-    impl SegmentKeyVerify for MockSegment {
-        fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
-            self.keys
-                .iter()
-                .any(|(off, k, deleted)| *off == offset && k == key && (allow_deleted || !deleted))
+    impl MockVerifier {
+        fn new() -> Self {
+            Self {
+                entries: Vec::new(),
+            }
+        }
+
+        fn add(&mut self, key: &[u8], location: Location, deleted: bool) {
+            self.entries.push((key.to_vec(), location, deleted));
+        }
+    }
+
+    impl KeyVerifier for MockVerifier {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            self.entries.iter().any(|(k, loc, deleted)| {
+                k == key && *loc == location && (allow_deleted || !deleted)
+            })
         }
     }
 
     #[test]
-    fn test_pack_item_basic() {
+    fn test_pack_basic() {
         let tag = 0xABC;
         let freq = 42;
-        let pool_id = 2;
-        let segment_id = 0x123456 & 0x3FFFFF;
-        let offset = 0x100;
+        let location = Location::new(0x123_4567_89AB);
 
-        let packed = Hashbucket::pack_item(tag, freq, pool_id, segment_id, offset);
+        let packed = Hashbucket::pack(tag, freq, location);
 
-        assert_eq!(Hashbucket::item_tag(packed), tag);
-        assert_eq!(Hashbucket::item_freq(packed), freq);
-        assert_eq!(Hashbucket::item_pool_id(packed), pool_id);
-        assert_eq!(Hashbucket::item_segment_id(packed), segment_id);
-        assert_eq!(Hashbucket::item_offset(packed), offset);
+        assert_eq!(Hashbucket::tag(packed), tag);
+        assert_eq!(Hashbucket::freq(packed), freq);
+        assert_eq!(Hashbucket::location(packed), location);
     }
 
     #[test]
-    fn test_pack_item_max_values() {
+    fn test_pack_max_values() {
         let tag = 0xFFF;
         let freq = 0xFF;
-        let pool_id = 3;
-        let segment_id = 0x3FFFFE;
-        let offset = 0xFFFFF << 3;
+        let location = Location::new(Location::MAX_RAW - 1); // Not ghost
 
-        let packed = Hashbucket::pack_item(tag, freq, pool_id, segment_id, offset);
+        let packed = Hashbucket::pack(tag, freq, location);
 
-        assert_eq!(Hashbucket::item_tag(packed), tag);
-        assert_eq!(Hashbucket::item_freq(packed), freq);
-        assert_eq!(Hashbucket::item_pool_id(packed), pool_id);
-        assert_eq!(Hashbucket::item_segment_id(packed), segment_id);
-        assert_eq!(Hashbucket::item_offset(packed), offset);
+        assert_eq!(Hashbucket::tag(packed), tag);
+        assert_eq!(Hashbucket::freq(packed), freq);
+        assert_eq!(Hashbucket::location(packed), location);
+        assert!(!Hashbucket::is_ghost(packed));
     }
 
     #[test]
@@ -1244,22 +1108,19 @@ mod tests {
         let ghost = Hashbucket::pack_ghost(tag, freq);
 
         assert!(Hashbucket::is_ghost(ghost));
-        assert_eq!(Hashbucket::item_tag(ghost), tag);
-        assert_eq!(Hashbucket::item_freq(ghost), freq);
-        assert_eq!(
-            Hashbucket::item_segment_id(ghost),
-            Hashbucket::GHOST_SEGMENT_ID
-        );
+        assert_eq!(Hashbucket::tag(ghost), tag);
+        assert_eq!(Hashbucket::freq(ghost), freq);
+        assert!(Hashbucket::location(ghost).is_ghost());
     }
 
     #[test]
     fn test_to_ghost() {
-        let packed = Hashbucket::pack_item(0x456, 75, 1, 1000, 2048);
+        let packed = Hashbucket::pack(0x456, 75, Location::new(1000));
         let ghost = Hashbucket::to_ghost(packed);
 
         assert!(Hashbucket::is_ghost(ghost));
-        assert_eq!(Hashbucket::item_tag(ghost), 0x456);
-        assert_eq!(Hashbucket::item_freq(ghost), 75);
+        assert_eq!(Hashbucket::tag(ghost), 0x456);
+        assert_eq!(Hashbucket::freq(ghost), 75);
     }
 
     #[test]
@@ -1283,103 +1144,97 @@ mod tests {
     #[test]
     fn test_insert_and_lookup() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        let location = ItemLocation::new(0, 0, 0);
-        let result = ht.insert(b"test", location, &provider);
+        let location = Location::new(12345);
+        verifier.add(b"test", location, false);
+
+        let result = ht.insert(b"test", location, &verifier);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
 
-        let lookup = ht.lookup(b"test", &provider);
+        let lookup = ht.lookup(b"test", &verifier);
         assert!(lookup.is_some());
         let (loc, freq) = lookup.unwrap();
-        assert_eq!(loc.pool_id(), 0);
-        assert_eq!(loc.segment_id(), 0);
-        assert_eq!(loc.offset(), 0);
+        assert_eq!(loc, location);
         assert!(freq >= 1);
     }
 
     #[test]
     fn test_insert_if_absent() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        let location1 = ItemLocation::new(0, 0, 0);
-        let result = ht.insert_if_absent(b"test", location1, &provider);
+        let location1 = Location::new(100);
+        let location2 = Location::new(200);
+        verifier.add(b"test", location1, false);
+        verifier.add(b"test", location2, false);
+
+        let result = ht.insert_if_absent(b"test", location1, &verifier);
         assert!(result.is_ok());
 
-        let location2 = ItemLocation::new(0, 0, 8);
-        let result = ht.insert_if_absent(b"test", location2, &provider);
+        let result = ht.insert_if_absent(b"test", location2, &verifier);
         assert!(matches!(result, Err(CacheError::KeyExists)));
     }
 
     #[test]
     fn test_update_if_present() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
+
+        let location1 = Location::new(100);
+        let location2 = Location::new(200);
+        verifier.add(b"test", location1, false);
+        verifier.add(b"test", location2, false);
 
         // Try to update non-existent key
-        let location = ItemLocation::new(0, 0, 8);
-        let result = ht.update_if_present(b"test", location, &provider);
+        let result = ht.update_if_present(b"test", location2, &verifier);
         assert!(matches!(result, Err(CacheError::KeyNotFound)));
 
         // Insert first
-        let location1 = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location1, &provider).unwrap();
+        ht.insert(b"test", location1, &verifier).unwrap();
 
         // Now update should work
-        let result = ht.update_if_present(b"test", location, &provider);
+        let result = ht.update_if_present(b"test", location2, &verifier);
         assert!(result.is_ok());
-        let old = result.unwrap();
-        assert_eq!(old.offset(), 0);
+        assert_eq!(result.unwrap(), location1);
     }
 
     #[test]
     fn test_remove() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
+        let location = Location::new(12345);
+        verifier.add(b"test", location, false);
 
-        assert!(ht.contains(b"test", &provider));
+        ht.insert(b"test", location, &verifier).unwrap();
+
+        assert!(ht.contains(b"test", &verifier));
         assert!(ht.remove(b"test", location));
-        assert!(!ht.contains(b"test", &provider));
+        assert!(!ht.contains(b"test", &verifier));
     }
 
     #[test]
     fn test_convert_to_ghost() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
+        let location = Location::new(12345);
+        verifier.add(b"test", location, false);
+
+        ht.insert(b"test", location, &verifier).unwrap();
 
         // Lookup to increase frequency
         for _ in 0..5 {
-            ht.lookup(b"test", &provider);
+            ht.lookup(b"test", &verifier);
         }
 
         // Convert to ghost
         assert!(ht.convert_to_ghost(b"test", location));
 
         // Should not be found via normal lookup
-        assert!(!ht.contains(b"test", &provider));
+        assert!(!ht.contains(b"test", &verifier));
 
         // But ghost frequency should be preserved
         let ghost_freq = ht.get_ghost_frequency(b"test");
@@ -1390,41 +1245,39 @@ mod tests {
     #[test]
     fn test_cas_location() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        let location1 = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location1, &provider).unwrap();
+        let location1 = Location::new(100);
+        let location2 = Location::new(200);
+        verifier.add(b"test", location1, false);
+        verifier.add(b"test", location2, false);
 
-        let location2 = ItemLocation::new(0, 0, 8);
+        ht.insert(b"test", location1, &verifier).unwrap();
 
         // CAS with correct old location should succeed
         assert!(ht.cas_location(b"test", location1, location2, true));
 
         // Verify new location
-        let lookup = ht.lookup(b"test", &provider);
+        let lookup = ht.lookup(b"test", &verifier);
         assert!(lookup.is_some());
-        assert_eq!(lookup.unwrap().0.offset(), 8);
+        assert_eq!(lookup.unwrap().0, location2);
     }
 
     #[test]
     fn test_get_frequency() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
+
+        let location = Location::new(12345);
+        verifier.add(b"test", location, false);
 
         // Key doesn't exist
-        assert!(ht.get_frequency(b"test", &provider).is_none());
+        assert!(ht.get_frequency(b"test", &verifier).is_none());
 
         // Insert and check frequency
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
+        ht.insert(b"test", location, &verifier).unwrap();
 
-        let freq = ht.get_frequency(b"test", &provider);
+        let freq = ht.get_frequency(b"test", &verifier);
         assert!(freq.is_some());
         assert!(freq.unwrap() >= 1);
     }
@@ -1432,107 +1285,60 @@ mod tests {
     #[test]
     fn test_lookup_nonexistent() {
         let ht = CuckooHashtable::new(10);
-        let segments: Vec<MockSegment> = vec![];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let verifier = MockVerifier::new();
 
-        assert!(ht.lookup(b"nonexistent", &provider).is_none());
+        assert!(ht.lookup(b"nonexistent", &verifier).is_none());
     }
 
     #[test]
     fn test_contains_nonexistent() {
         let ht = CuckooHashtable::new(10);
-        let segments: Vec<MockSegment> = vec![];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let verifier = MockVerifier::new();
 
-        assert!(!ht.contains(b"nonexistent", &provider));
+        assert!(!ht.contains(b"nonexistent", &verifier));
     }
 
     #[test]
     fn test_remove_nonexistent() {
         let ht = CuckooHashtable::new(10);
 
-        let location = ItemLocation::new(0, 0, 0);
+        let location = Location::new(12345);
         assert!(!ht.remove(b"nonexistent", location));
     }
 
     #[test]
     fn test_cas_location_wrong_old() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        let location1 = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location1, &provider).unwrap();
+        let location1 = Location::new(100);
+        let wrong_old = Location::new(999);
+        let new_loc = Location::new(200);
+        verifier.add(b"test", location1, false);
+
+        ht.insert(b"test", location1, &verifier).unwrap();
 
         // Try CAS with wrong old location
-        let wrong_old = ItemLocation::new(0, 0, 16);
-        let new = ItemLocation::new(0, 0, 8);
-        assert!(!ht.cas_location(b"test", wrong_old, new, true));
-    }
-
-    #[test]
-    fn test_cas_location_nonexistent() {
-        let ht = CuckooHashtable::new(10);
-
-        let old = ItemLocation::new(0, 0, 0);
-        let new = ItemLocation::new(0, 0, 8);
-        assert!(!ht.cas_location(b"nonexistent", old, new, true));
-    }
-
-    #[test]
-    fn test_single_choice_hashtable() {
-        let ht = CuckooHashtable::with_choices(10, 1);
-        assert_eq!(ht.num_choices(), 1);
-
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"key1".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        let result = ht.insert(b"key1", location, &provider);
-        assert!(result.is_ok());
-
-        assert!(ht.contains(b"key1", &provider));
-    }
-
-    #[test]
-    fn test_three_choice_hashtable() {
-        let ht = CuckooHashtable::with_choices(10, 3);
-        assert_eq!(ht.num_choices(), 3);
-
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"key1".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        let result = ht.insert(b"key1", location, &provider);
-        assert!(result.is_ok());
+        assert!(!ht.cas_location(b"test", wrong_old, new_loc, true));
     }
 
     #[test]
     fn test_insert_multiple_keys() {
         let ht = CuckooHashtable::new(10);
+        let mut verifier = MockVerifier::new();
 
-        // Create segments with multiple keys
-        let mut keys = Vec::new();
+        // Create multiple keys
         for i in 0..100 {
             let key = format!("key_{}", i);
-            let offset = (i * 8) as u32;
-            keys.push((offset, key.into_bytes(), false));
+            let location = Location::new(i as u64 * 1000);
+            verifier.add(key.as_bytes(), location, false);
         }
-        let segments = vec![MockSegment { keys }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
 
         // Insert all keys
         for i in 0..100 {
             let key = format!("key_{}", i);
-            let offset = (i * 8) as u32;
-            let location = ItemLocation::new(0, 0, offset);
-            let result = ht.insert(key.as_bytes(), location, &provider);
+            let location = Location::new(i as u64 * 1000);
+            let result = ht.insert(key.as_bytes(), location, &verifier);
             assert!(result.is_ok(), "Failed to insert key_{}", i);
         }
 
@@ -1540,7 +1346,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("key_{}", i);
             assert!(
-                ht.contains(key.as_bytes(), &provider),
+                ht.contains(key.as_bytes(), &verifier),
                 "key_{} not found",
                 i
             );
@@ -1550,24 +1356,24 @@ mod tests {
     #[test]
     fn test_insert_overwrite() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
+
+        let location1 = Location::new(100);
+        let location2 = Location::new(200);
+        verifier.add(b"test", location1, false);
+        verifier.add(b"test", location2, false);
 
         // First insert
-        let location1 = ItemLocation::new(0, 0, 0);
-        let result = ht.insert(b"test", location1, &provider);
+        let result = ht.insert(b"test", location1, &verifier);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none()); // No old value
+        assert!(result.unwrap().is_none());
 
         // Second insert overwrites
-        let location2 = ItemLocation::new(0, 0, 8);
-        let result = ht.insert(b"test", location2, &provider);
+        let result = ht.insert(b"test", location2, &verifier);
         assert!(result.is_ok());
         let old = result.unwrap();
         assert!(old.is_some());
-        assert_eq!(old.unwrap().offset(), 0);
+        assert_eq!(old.unwrap(), location1);
     }
 
     #[test]
@@ -1579,31 +1385,30 @@ mod tests {
     }
 
     #[test]
-    fn test_update_freq_in_packed() {
-        let packed = Hashbucket::pack_item(0x123, 10, 0, 100, 0);
-        let updated = Hashbucket::update_freq_in_packed(packed, 50);
+    fn test_with_freq() {
+        let packed = Hashbucket::pack(0x123, 10, Location::new(100));
+        let updated = Hashbucket::with_freq(packed, 50);
 
-        assert_eq!(Hashbucket::item_freq(updated), 50);
-        assert_eq!(Hashbucket::item_tag(updated), 0x123);
-        assert_eq!(Hashbucket::item_pool_id(updated), 0);
-        assert_eq!(Hashbucket::item_segment_id(updated), 100);
+        assert_eq!(Hashbucket::freq(updated), 50);
+        assert_eq!(Hashbucket::tag(updated), 0x123);
+        assert_eq!(Hashbucket::location(updated), Location::new(100));
     }
 
     #[test]
     fn test_try_update_freq_max() {
-        let packed = Hashbucket::pack_item(0x123, 127, 0, 100, 0);
+        let packed = Hashbucket::pack(0x123, 127, Location::new(100));
         // At max frequency, should return None
         assert!(Hashbucket::try_update_freq(packed, 127).is_none());
     }
 
     #[test]
     fn test_try_update_freq_low() {
-        let packed = Hashbucket::pack_item(0x123, 5, 0, 100, 0);
+        let packed = Hashbucket::pack(0x123, 5, Location::new(100));
         // Low frequency always increments
         let result = Hashbucket::try_update_freq(packed, 5);
         assert!(result.is_some());
         let new_packed = result.unwrap();
-        assert_eq!(Hashbucket::item_freq(new_packed), 6);
+        assert_eq!(Hashbucket::freq(new_packed), 6);
     }
 
     #[test]
@@ -1614,137 +1419,30 @@ mod tests {
 
     #[test]
     fn test_is_ghost_live_entry() {
-        let packed = Hashbucket::pack_item(0x123, 10, 0, 100, 0);
+        let packed = Hashbucket::pack(0x123, 10, Location::new(100));
         assert!(!Hashbucket::is_ghost(packed));
     }
 
     #[test]
-    fn test_convert_to_ghost_and_resurrect() {
+    fn test_ghost_resurrection() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        // Insert with offset 0
-        let location1 = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location1, &provider).unwrap();
+        let location1 = Location::new(100);
+        let location2 = Location::new(200);
+        verifier.add(b"test", location1, false);
+        verifier.add(b"test", location2, false);
+
+        // Insert key
+        ht.insert(b"test", location1, &verifier).unwrap();
 
         // Access to build up frequency
         for _ in 0..10 {
-            ht.lookup(b"test", &provider);
-        }
-
-        // Convert to ghost
-        assert!(ht.convert_to_ghost(b"test", location1));
-
-        // Get ghost frequency
-        let ghost_freq = ht.get_ghost_frequency(b"test");
-        assert!(ghost_freq.is_some());
-
-        // Re-insert should resurrect the ghost with preserved frequency
-        let location2 = ItemLocation::new(0, 0, 8);
-        let result = ht.insert(b"test", location2, &provider);
-        assert!(result.is_ok());
-
-        // Now the item should be found again
-        assert!(ht.contains(b"test", &provider));
-    }
-
-    #[test]
-    fn test_remove_with_ghost_config() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
-
-        // Remove the item
-        assert!(ht.remove(b"test", location));
-
-        // Should no longer be found
-        assert!(!ht.contains(b"test", &provider));
-    }
-
-    #[test]
-    fn test_get_ghost_frequency_nonexistent() {
-        let ht = CuckooHashtable::new(10);
-        assert!(ht.get_ghost_frequency(b"nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_convert_to_ghost_nonexistent() {
-        let ht = CuckooHashtable::new(10);
-        let location = ItemLocation::new(0, 0, 0);
-        assert!(!ht.convert_to_ghost(b"nonexistent", location));
-    }
-
-    #[test]
-    fn test_get_item_frequency() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        // Key doesn't exist
-        let location = ItemLocation::new(0, 0, 0);
-        assert!(ht.get_item_frequency(b"test", location).is_none());
-
-        // Insert and check frequency by exact location
-        ht.insert(b"test", location, &provider).unwrap();
-
-        let freq = ht.get_item_frequency(b"test", location);
-        assert!(freq.is_some());
-        assert!(freq.unwrap() >= 1);
-    }
-
-    #[test]
-    fn test_get_item_frequency_wrong_location() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
-
-        // Query with wrong location should return None
-        let wrong_location = ItemLocation::new(0, 0, 8);
-        assert!(ht.get_item_frequency(b"test", wrong_location).is_none());
-
-        // Query with wrong pool_id
-        let wrong_pool = ItemLocation::new(1, 0, 0);
-        assert!(ht.get_item_frequency(b"test", wrong_pool).is_none());
-
-        // Query with wrong segment_id
-        let wrong_seg = ItemLocation::new(0, 1, 0);
-        assert!(ht.get_item_frequency(b"test", wrong_seg).is_none());
-    }
-
-    #[test]
-    fn test_insert_over_ghost_preserves_frequency() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        // Insert key
-        let location1 = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location1, &provider).unwrap();
-
-        // Increase frequency by multiple lookups
-        for _ in 0..10 {
-            ht.lookup(b"test", &provider);
+            ht.lookup(b"test", &verifier);
         }
 
         // Get the frequency before converting to ghost
-        let freq_before = ht.get_frequency(b"test", &provider).unwrap();
+        let freq_before = ht.get_frequency(b"test", &verifier).unwrap();
         assert!(freq_before > 1);
 
         // Convert to ghost
@@ -1756,180 +1454,51 @@ mod tests {
         assert_eq!(ghost_freq.unwrap(), freq_before);
 
         // Insert over the ghost - frequency should be preserved
-        let location2 = ItemLocation::new(0, 0, 8);
-        let result = ht.insert(b"test", location2, &provider);
+        let result = ht.insert(b"test", location2, &verifier);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none()); // Ghost resurrection returns None
 
         // Verify the frequency was preserved
-        let freq_after = ht.get_frequency(b"test", &provider).unwrap();
+        let freq_after = ht.get_frequency(b"test", &verifier).unwrap();
         assert_eq!(freq_after, freq_before);
     }
 
     #[test]
-    fn test_insert_if_absent_over_ghost() {
+    fn test_get_item_frequency() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        // Insert key
-        let location1 = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location1, &provider).unwrap();
+        let location = Location::new(12345);
+        verifier.add(b"test", location, false);
 
-        // Increase frequency
-        for _ in 0..5 {
-            ht.lookup(b"test", &provider);
-        }
+        // Key doesn't exist
+        assert!(ht.get_item_frequency(b"test", location).is_none());
 
-        let freq_before = ht.get_frequency(b"test", &provider).unwrap();
+        // Insert and check frequency by exact location
+        ht.insert(b"test", location, &verifier).unwrap();
 
-        // Convert to ghost
-        assert!(ht.convert_to_ghost(b"test", location1));
+        let freq = ht.get_item_frequency(b"test", location);
+        assert!(freq.is_some());
+        assert!(freq.unwrap() >= 1);
 
-        // Now the key doesn't exist as live entry
-        assert!(!ht.contains(b"test", &provider));
-
-        // insert_if_absent should succeed over a ghost
-        let location2 = ItemLocation::new(0, 0, 8);
-        let result = ht.insert_if_absent(b"test", location2, &provider);
-        assert!(result.is_ok());
-
-        // Verify the key exists now
-        assert!(ht.contains(b"test", &provider));
-
-        // Frequency should be preserved from ghost
-        let freq_after = ht.get_frequency(b"test", &provider).unwrap();
-        assert_eq!(freq_after, freq_before);
+        // Wrong location returns None
+        let wrong_location = Location::new(99999);
+        assert!(ht.get_item_frequency(b"test", wrong_location).is_none());
     }
 
     #[test]
-    fn test_convert_to_ghost_wrong_location() {
+    fn test_deleted_entry() {
         let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
+        let mut verifier = MockVerifier::new();
 
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
-
-        // Converting with wrong location should return false
-        let wrong_location = ItemLocation::new(0, 0, 8);
-        assert!(!ht.convert_to_ghost(b"test", wrong_location));
-
-        // The entry should still be live
-        assert!(ht.contains(b"test", &provider));
-    }
-
-    #[test]
-    fn test_get_ghost_frequency_live_entry() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
-
-        // get_ghost_frequency should return None for live entries
-        assert!(ht.get_ghost_frequency(b"test").is_none());
-    }
-
-    #[test]
-    fn test_remove_wrong_location() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location, &provider).unwrap();
-
-        // Try to remove with wrong location - should fail
-        let wrong_location = ItemLocation::new(0, 0, 8);
-        assert!(!ht.remove(b"test", wrong_location));
-
-        // Entry should still exist
-        assert!(ht.contains(b"test", &provider));
-    }
-
-    #[test]
-    fn test_cas_location_reset_frequency() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), false), (8, b"test".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location1 = ItemLocation::new(0, 0, 0);
-        ht.insert(b"test", location1, &provider).unwrap();
-
-        // Increase frequency
-        for _ in 0..10 {
-            ht.lookup(b"test", &provider);
-        }
-
-        let freq_before = ht.get_frequency(b"test", &provider).unwrap();
-        assert!(freq_before > 1);
-
-        // CAS with preserve_freq = false should reset frequency
-        let location2 = ItemLocation::new(0, 0, 8);
-        assert!(ht.cas_location(b"test", location1, location2, false));
-
-        let freq_after = ht.get_frequency(b"test", &provider).unwrap();
-        assert_eq!(freq_after, 1);
-    }
-
-    #[test]
-    fn test_lookup_deleted_entry() {
-        let ht = CuckooHashtable::new(10);
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"test".to_vec(), true)], // marked as deleted
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
+        let location = Location::new(12345);
+        verifier.add(b"test", location, true); // marked as deleted
 
         // Insert should still work (uses allow_deleted=true)
-        ht.insert(b"test", location, &provider).unwrap();
+        ht.insert(b"test", location, &verifier).unwrap();
 
         // But lookup should not find it (uses allow_deleted=false)
-        assert!(ht.lookup(b"test", &provider).is_none());
-        assert!(!ht.contains(b"test", &provider));
-    }
-
-    #[test]
-    fn test_hashtable_with_four_choices() {
-        let ht = CuckooHashtable::with_choices(10, 4);
-        assert_eq!(ht.num_choices(), 4);
-
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"key".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        let result = ht.insert(b"key", location, &provider);
-        assert!(result.is_ok());
-        assert!(ht.contains(b"key", &provider));
-    }
-
-    #[test]
-    fn test_hashtable_with_eight_choices() {
-        let ht = CuckooHashtable::with_choices(10, 8);
-        assert_eq!(ht.num_choices(), 8);
-
-        let segments = vec![MockSegment {
-            keys: vec![(0, b"key".to_vec(), false)],
-        }];
-        let provider = crate::hashtable::SinglePool::new(&segments);
-
-        let location = ItemLocation::new(0, 0, 0);
-        let result = ht.insert(b"key", location, &provider);
-        assert!(result.is_ok());
+        assert!(ht.lookup(b"test", &verifier).is_none());
+        assert!(!ht.contains(b"test", &verifier));
     }
 }

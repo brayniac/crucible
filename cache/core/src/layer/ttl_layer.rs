@@ -13,15 +13,15 @@
 use crate::config::LayerConfig;
 use crate::error::{CacheError, CacheResult};
 use crate::eviction::{ItemFate, determine_item_fate};
-use crate::hashtable::{Hashtable, SegmentProvider};
+use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::item::{BasicHeader, BasicItemGuard};
+use crate::item_location::ItemLocation;
 use crate::layer::Layer;
-use crate::location::ItemLocation;
+use crate::location::Location;
 use crate::memory_pool::{MemoryPool, MemoryPoolBuilder};
 use crate::organization::TtlBuckets;
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentGuard, SegmentKeyVerify};
-use crate::slice_segment::SliceSegment;
 use crate::state::State;
 use std::time::Duration;
 
@@ -179,8 +179,8 @@ impl TtlLayer {
                         let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
 
                         // Get frequency from hashtable
-                        let provider = SinglePoolProvider { pool: &self.pool };
-                        let freq = hashtable.get_frequency(key, &provider).unwrap_or(0);
+                        let verifier = SinglePoolVerifier { pool: &self.pool };
+                        let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
 
                         // Determine item fate
                         let fate = determine_item_fate(freq, &self.config);
@@ -188,16 +188,16 @@ impl TtlLayer {
                         match fate {
                             ItemFate::Ghost => {
                                 // Convert to ghost in hashtable
-                                hashtable.convert_to_ghost(key, location);
+                                hashtable.convert_to_ghost(key, location.to_location());
                             }
                             ItemFate::Demote => {
                                 // Demotion to next layer is handled by caller (TieredCache)
                                 // For now, just unlink from hashtable
-                                hashtable.remove(key, location);
+                                hashtable.remove(key, location.to_location());
                             }
                             ItemFate::Discard => {
                                 // Simply remove from hashtable
-                                hashtable.remove(key, location);
+                                hashtable.remove(key, location.to_location());
                             }
                         }
                     }
@@ -248,14 +248,19 @@ impl TtlLayer {
     }
 }
 
-/// Helper struct for providing segments to hashtable
-struct SinglePoolProvider<'a> {
+/// Helper struct for verifying keys in segments
+struct SinglePoolVerifier<'a> {
     pool: &'a MemoryPool,
 }
 
-impl<'a> SegmentProvider<SliceSegment<'static>> for SinglePoolProvider<'a> {
-    fn get_segment(&self, _pool_id: u8, segment_id: u32) -> Option<&SliceSegment<'static>> {
-        self.pool.get(segment_id)
+impl KeyVerifier for SinglePoolVerifier<'_> {
+    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+        let item_loc = ItemLocation::from_location(location);
+        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
+            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        } else {
+            false
+        }
     }
 }
 
