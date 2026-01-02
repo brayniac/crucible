@@ -1502,3 +1502,255 @@ mod tests {
         assert!(!ht.contains(b"test", &verifier));
     }
 }
+
+// -----------------------------------------------------------------------------
+// Loom concurrency tests
+// -----------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use crate::hashtable::Hashtable;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Simple verifier that always returns true for testing hashtable mechanics.
+    struct AlwaysVerifier;
+
+    impl KeyVerifier for AlwaysVerifier {
+        fn verify(&self, _key: &[u8], _location: Location, _allow_deleted: bool) -> bool {
+            true
+        }
+    }
+
+    /// Helper to call insert_if_absent on CuckooHashtable
+    fn ht_insert(
+        ht: &CuckooHashtable,
+        key: &[u8],
+        location: Location,
+        verifier: &impl KeyVerifier,
+    ) -> CacheResult<()> {
+        <CuckooHashtable as Hashtable>::insert_if_absent(ht, key, location, verifier)
+    }
+
+    /// Helper to call lookup on CuckooHashtable
+    fn ht_lookup(
+        ht: &CuckooHashtable,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+    ) -> Option<(Location, u8)> {
+        <CuckooHashtable as Hashtable>::lookup(ht, key, verifier)
+    }
+
+    /// Helper to call remove on CuckooHashtable
+    fn ht_remove(ht: &CuckooHashtable, key: &[u8], location: Location) -> bool {
+        <CuckooHashtable as Hashtable>::remove(ht, key, location)
+    }
+
+    /// Helper to call cas_location on CuckooHashtable
+    fn ht_cas(
+        ht: &CuckooHashtable,
+        key: &[u8],
+        old_loc: Location,
+        new_loc: Location,
+        preserve_freq: bool,
+    ) -> bool {
+        <CuckooHashtable as Hashtable>::cas_location(ht, key, old_loc, new_loc, preserve_freq)
+    }
+
+    /// Helper to call get_ghost_frequency on CuckooHashtable
+    fn ht_ghost_freq(ht: &CuckooHashtable, key: &[u8]) -> Option<u8> {
+        <CuckooHashtable as Hashtable>::get_ghost_frequency(ht, key)
+    }
+
+    #[test]
+    fn test_concurrent_insert_different_keys() {
+        loom::model(|| {
+            let ht = Arc::new(CuckooHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || {
+                let loc = Location::new(1);
+                let _ = ht_insert(&ht1, b"key1", loc, &*v1);
+            });
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || {
+                let loc = Location::new(2);
+                let _ = ht_insert(&ht2, b"key2", loc, &*v2);
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Both keys should be present (or one may fail due to full bucket)
+            let found1 = ht_lookup(&ht, b"key1", &*verifier).is_some();
+            let found2 = ht_lookup(&ht, b"key2", &*verifier).is_some();
+
+            // At least one should succeed
+            assert!(found1 || found2);
+        });
+    }
+
+    #[test]
+    fn test_concurrent_insert_same_key() {
+        loom::model(|| {
+            let ht = Arc::new(CuckooHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || {
+                let loc = Location::new(1);
+                ht_insert(&ht1, b"key", loc, &*v1)
+            });
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || {
+                let loc = Location::new(2);
+                ht_insert(&ht2, b"key", loc, &*v2)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one should succeed, one should fail with KeyExists
+            let successes = [r1.is_ok(), r2.is_ok()].iter().filter(|&&x| x).count();
+            assert_eq!(successes, 1, "Exactly one insert should succeed");
+        });
+    }
+
+    #[test]
+    fn test_concurrent_lookup_frequency_update() {
+        loom::model(|| {
+            let ht = Arc::new(CuckooHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            // Insert a key first
+            let loc = Location::new(42);
+            ht_insert(&ht, b"key", loc, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || ht_lookup(&ht1, b"key", &*v1));
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || ht_lookup(&ht2, b"key", &*v2));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both lookups should find the key
+            assert!(r1.is_some());
+            assert!(r2.is_some());
+
+            // Both should return the same location
+            assert_eq!(r1.unwrap().0, loc);
+            assert_eq!(r2.unwrap().0, loc);
+        });
+    }
+
+    #[test]
+    fn test_concurrent_insert_and_remove() {
+        loom::model(|| {
+            let ht = Arc::new(CuckooHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            // Insert a key first
+            let loc = Location::new(42);
+            ht_insert(&ht, b"key", loc, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let t1 = thread::spawn(move || ht_remove(&ht1, b"key", loc));
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || {
+                let new_loc = Location::new(99);
+                ht_insert(&ht2, b"key2", new_loc, &*v2)
+            });
+
+            let removed = t1.join().unwrap();
+            let _ = t2.join().unwrap();
+
+            // Remove should have succeeded
+            assert!(removed);
+
+            // Original key should be gone (or converted to ghost)
+            let lookup = ht_lookup(&ht, b"key", &*verifier);
+            assert!(lookup.is_none() || ht_ghost_freq(&ht, b"key").is_some());
+        });
+    }
+
+    #[test]
+    fn test_concurrent_cas_operations() {
+        loom::model(|| {
+            let ht = Arc::new(CuckooHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            // Insert a key first
+            let loc1 = Location::new(1);
+            ht_insert(&ht, b"key", loc1, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let t1 = thread::spawn(move || {
+                let loc2 = Location::new(2);
+                ht_cas(&ht1, b"key", loc1, loc2, true)
+            });
+
+            let ht2 = ht.clone();
+            let t2 = thread::spawn(move || {
+                let loc3 = Location::new(3);
+                ht_cas(&ht2, b"key", loc1, loc3, true)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one CAS should succeed
+            let successes = [r1, r2].iter().filter(|&&x| x).count();
+            assert_eq!(successes, 1, "Exactly one CAS should succeed");
+
+            // The key should now point to either loc2 or loc3
+            let lookup = ht_lookup(&ht, b"key", &*verifier);
+            assert!(lookup.is_some());
+            let final_loc = lookup.unwrap().0;
+            assert!(final_loc == Location::new(2) || final_loc == Location::new(3));
+        });
+    }
+
+    #[test]
+    fn test_bucket_slot_cas_contention() {
+        loom::model(|| {
+            // Test direct slot CAS operations
+            let bucket = Hashbucket::new();
+            let slot = &bucket.items[0];
+
+            let slot_ptr = slot as *const AtomicU64 as usize;
+
+            let t1 = thread::spawn(move || {
+                let slot = unsafe { &*(slot_ptr as *const AtomicU64) };
+                let packed = Hashbucket::pack(0x123, 1, Location::new(1));
+                slot.compare_exchange(0, packed, Ordering::Release, Ordering::Acquire)
+            });
+
+            let t2 = thread::spawn(move || {
+                let slot = unsafe { &*(slot_ptr as *const AtomicU64) };
+                let packed = Hashbucket::pack(0x456, 1, Location::new(2));
+                slot.compare_exchange(0, packed, Ordering::Release, Ordering::Acquire)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one should succeed (starting from 0)
+            let successes = [r1.is_ok(), r2.is_ok()].iter().filter(|&&x| x).count();
+            assert_eq!(successes, 1, "Exactly one CAS from 0 should succeed");
+        });
+    }
+}

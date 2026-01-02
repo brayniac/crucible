@@ -1595,3 +1595,268 @@ mod tests {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Loom concurrency tests
+// -----------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use crate::state::{Metadata, State};
+    use crate::sync::{AtomicU32, AtomicU64, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Test concurrent state transitions using CAS on packed metadata.
+    #[test]
+    fn test_concurrent_state_transition() {
+        loom::model(|| {
+            // Simulate segment metadata atomic
+            let metadata = Arc::new(AtomicU64::new(Metadata::new(State::Sealed).pack()));
+
+            let m1 = metadata.clone();
+            let t1 = thread::spawn(move || {
+                // Try to transition from Sealed -> Draining
+                let current = Metadata::new(State::Sealed).pack();
+                let new = Metadata::new(State::Draining).pack();
+                m1.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            });
+
+            let m2 = metadata.clone();
+            let t2 = thread::spawn(move || {
+                // Try same transition concurrently
+                let current = Metadata::new(State::Sealed).pack();
+                let new = Metadata::new(State::Draining).pack();
+                m2.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one should succeed
+            assert_eq!(
+                [r1, r2].iter().filter(|&&x| x).count(),
+                1,
+                "Exactly one state transition should succeed"
+            );
+
+            // Final state should be Draining
+            let final_meta = Metadata::unpack(metadata.load(Ordering::Acquire));
+            assert_eq!(final_meta.state, State::Draining);
+        });
+    }
+
+    /// Test concurrent ref_count increment/decrement.
+    #[test]
+    fn test_concurrent_ref_count() {
+        loom::model(|| {
+            let ref_count = Arc::new(AtomicU32::new(0));
+
+            let rc1 = ref_count.clone();
+            let t1 = thread::spawn(move || {
+                rc1.fetch_add(1, Ordering::AcqRel);
+            });
+
+            let rc2 = ref_count.clone();
+            let t2 = thread::spawn(move || {
+                rc2.fetch_add(1, Ordering::AcqRel);
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Both increments should have happened
+            assert_eq!(ref_count.load(Ordering::Acquire), 2);
+
+            // Now decrement
+            let rc3 = ref_count.clone();
+            let t3 = thread::spawn(move || {
+                rc3.fetch_sub(1, Ordering::AcqRel);
+            });
+
+            let rc4 = ref_count.clone();
+            let t4 = thread::spawn(move || {
+                rc4.fetch_sub(1, Ordering::AcqRel);
+            });
+
+            t3.join().unwrap();
+            t4.join().unwrap();
+
+            // Should be back to 0
+            assert_eq!(ref_count.load(Ordering::Acquire), 0);
+        });
+    }
+
+    /// Test concurrent write_offset CAS (simulating reserve_space).
+    #[test]
+    fn test_concurrent_write_offset_cas() {
+        loom::model(|| {
+            let write_offset = Arc::new(AtomicU32::new(0));
+            let capacity: u32 = 1000;
+
+            let wo1 = write_offset.clone();
+            let t1 = thread::spawn(move || {
+                let size = 100u32;
+                loop {
+                    let current = wo1.load(Ordering::Acquire);
+                    let new_offset = current + size;
+                    if new_offset > capacity {
+                        return None;
+                    }
+                    match wo1.compare_exchange(
+                        current,
+                        new_offset,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Some(current),
+                        Err(_) => continue,
+                    }
+                }
+            });
+
+            let wo2 = write_offset.clone();
+            let t2 = thread::spawn(move || {
+                let size = 100u32;
+                loop {
+                    let current = wo2.load(Ordering::Acquire);
+                    let new_offset = current + size;
+                    if new_offset > capacity {
+                        return None;
+                    }
+                    match wo2.compare_exchange(
+                        current,
+                        new_offset,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Some(current),
+                        Err(_) => continue,
+                    }
+                }
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both should succeed with different offsets
+            assert!(r1.is_some());
+            assert!(r2.is_some());
+            assert_ne!(r1, r2);
+
+            // Final offset should be 200
+            assert_eq!(write_offset.load(Ordering::Acquire), 200);
+        });
+    }
+
+    /// Test reader-writer pattern (ref_count check before state transition).
+    #[test]
+    fn test_reader_writer_pattern() {
+        loom::model(|| {
+            let ref_count = Arc::new(AtomicU32::new(0));
+            let metadata = Arc::new(AtomicU64::new(Metadata::new(State::Live).pack()));
+
+            // Reader: increment ref_count if state is readable
+            let rc1 = ref_count.clone();
+            let m1 = metadata.clone();
+            let t1 = thread::spawn(move || {
+                let meta = Metadata::unpack(m1.load(Ordering::Acquire));
+                if meta.state.is_readable() {
+                    rc1.fetch_add(1, Ordering::AcqRel);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            // Writer: transition state if ref_count is 0
+            let rc2 = ref_count.clone();
+            let m2 = metadata.clone();
+            let t2 = thread::spawn(move || {
+                // Check ref_count first
+                if rc2.load(Ordering::Acquire) == 0 {
+                    let current = Metadata::new(State::Live).pack();
+                    let new = Metadata::new(State::Sealed).pack();
+                    m2.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                } else {
+                    false
+                }
+            });
+
+            let reader_acquired = t1.join().unwrap();
+            let _writer_transitioned = t2.join().unwrap();
+
+            // Due to race, we can have various outcomes:
+            // 1. Reader acquired ref, writer failed (ref_count > 0)
+            // 2. Writer transitioned first, reader failed (state not readable)
+            // 3. Writer transitioned while reader was checking (data race, but safe)
+            // The key is that we don't have undefined behavior
+            let final_ref = ref_count.load(Ordering::Acquire);
+            let final_meta = Metadata::unpack(metadata.load(Ordering::Acquire));
+
+            // If reader acquired, ref_count should be 1
+            if reader_acquired {
+                assert_eq!(final_ref, 1);
+            }
+
+            // State should be either Live or Sealed
+            assert!(final_meta.state == State::Live || final_meta.state == State::Sealed);
+        });
+    }
+
+    /// Test metadata pack/unpack atomicity.
+    #[test]
+    fn test_metadata_atomic_update() {
+        loom::model(|| {
+            let metadata = Arc::new(AtomicU64::new(
+                Metadata::with_chain(State::Live, Some(10), Some(20)).pack(),
+            ));
+
+            // Thread 1: Update next pointer
+            let m1 = metadata.clone();
+            let t1 = thread::spawn(move || {
+                loop {
+                    let current = m1.load(Ordering::Acquire);
+                    let mut meta = Metadata::unpack(current);
+                    meta.next = 30;
+                    let new = meta.pack();
+                    if m1
+                        .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            // Thread 2: Update prev pointer
+            let m2 = metadata.clone();
+            let t2 = thread::spawn(move || {
+                loop {
+                    let current = m2.load(Ordering::Acquire);
+                    let mut meta = Metadata::unpack(current);
+                    meta.prev = 40;
+                    let new = meta.pack();
+                    if m2
+                        .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Both updates should have been applied (possibly with retries)
+            let final_meta = Metadata::unpack(metadata.load(Ordering::Acquire));
+            assert_eq!(final_meta.next, 30);
+            assert_eq!(final_meta.prev, 40);
+            assert_eq!(final_meta.state, State::Live);
+        });
+    }
+}

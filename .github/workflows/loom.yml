@@ -41,7 +41,6 @@ jobs:
       - name: Run loom tests
         env:
           LOOM_MAX_PREEMPTIONS: ${{ github.event.inputs.max_preemptions || env.DEFAULT_MAX_PREEMPTIONS }}
-          RUSTFLAGS: "--cfg loom"
         run: |
           source ~/.cargo/env
 
@@ -49,7 +48,10 @@ jobs:
           echo "  Max preemptions: $LOOM_MAX_PREEMPTIONS"
           echo ""
 
-          # Run loom tests for cache-core
+          # Run loom tests for cache-core (17 tests across 3 modules)
+          # - arc_cache: 6 tests (slot storage, free list, reader counting)
+          # - hashtable_impl: 6 tests (concurrent insert, lookup, CAS)
+          # - slice_segment: 5 tests (state transitions, ref counting, write offset)
           cargo test -p cache-core --features loom --release -- --nocapture
 
       - name: Summary
