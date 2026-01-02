@@ -63,7 +63,7 @@ impl ItemLocation {
             "segment_id must fit in 22 bits"
         );
         debug_assert!(
-            offset % Self::OFFSET_ALIGN == 0,
+            offset.is_multiple_of(Self::OFFSET_ALIGN),
             "offset must be 8-byte aligned"
         );
         debug_assert!(offset <= Self::MAX_OFFSET, "offset/8 must fit in 20 bits");
@@ -230,10 +230,10 @@ impl<S: SegmentKeyVerify + Send + Sync> KeyVerifier for MultiPoolVerifier<'_, S>
             return false;
         }
 
-        if let Some(segments) = self.pools[pool_id] {
-            if let Some(segment) = segments.get(segment_id) {
-                return segment.verify_key_at_offset(offset, key, allow_deleted);
-            }
+        if let Some(segments) = self.pools[pool_id]
+            && let Some(segment) = segments.get(segment_id)
+        {
+            return segment.verify_key_at_offset(offset, key, allow_deleted);
         }
 
         false

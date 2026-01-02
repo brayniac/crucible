@@ -1,0 +1,69 @@
+name: Loom Concurrency Testing
+
+on:
+  # Run nightly at 3 AM UTC (after fuzz tests)
+  schedule:
+    - cron: '0 3 * * *'
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      max_preemptions:
+        description: 'Maximum preemptions per test (higher = more thorough)'
+        required: false
+        default: '3'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Default max preemptions for scheduled runs
+  DEFAULT_MAX_PREEMPTIONS: 3
+
+jobs:
+  loom:
+    runs-on: self-hosted
+    timeout-minutes: 120  # 2 hours max
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          source ~/.cargo/env
+
+          # Use stable for loom tests
+          rustup default stable
+          rustup update stable
+
+          # Show versions
+          rustc --version
+          cargo --version
+
+      - name: Run loom tests
+        env:
+          LOOM_MAX_PREEMPTIONS: ${{ github.event.inputs.max_preemptions || env.DEFAULT_MAX_PREEMPTIONS }}
+          RUSTFLAGS: "--cfg loom"
+        run: |
+          source ~/.cargo/env
+
+          echo "Running loom concurrency tests:"
+          echo "  Max preemptions: $LOOM_MAX_PREEMPTIONS"
+          echo ""
+
+          # Run loom tests for cache-core
+          cargo test -p cache-core --features loom --release -- --nocapture
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Loom Concurrency Testing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "All loom tests passed." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Some loom tests failed. Check logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Max preemptions: ${{ github.event.inputs.max_preemptions || env.DEFAULT_MAX_PREEMPTIONS }}" >> $GITHUB_STEP_SUMMARY

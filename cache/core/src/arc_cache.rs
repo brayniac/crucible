@@ -792,7 +792,10 @@ where
         // Get a pseudo-random starting point using the counter
         let start = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
 
-        let mut best_victim: Option<(u32, Arc<Entry<K, V>>, u8)> = None; // (slot_idx, entry, freq)
+        // Track the best victim using separate variables
+        let mut victim_slot_idx: Option<u32> = None;
+        let mut victim_entry: Option<Arc<Entry<K, V>>> = None;
+        let mut victim_freq: u8 = u8::MAX;
         let mut samples_tried = 0;
 
         // Sample slots looking for eviction candidates
@@ -817,21 +820,17 @@ where
             };
 
             // Look up frequency in hashtable
-            let location = SlotLocation::new(idx, generation as u16).to_location();
+            let location = SlotLocation::new(idx, generation).to_location();
             let freq = self
                 .hashtable
                 .get_item_frequency(entry.key.as_ref(), location)
                 .unwrap_or(0);
 
             // Track the lowest frequency candidate
-            match &best_victim {
-                None => {
-                    best_victim = Some((idx, entry, freq));
-                }
-                Some((_, _, best_freq)) if freq < *best_freq => {
-                    best_victim = Some((idx, entry, freq));
-                }
-                _ => {}
+            if victim_slot_idx.is_none() || freq < victim_freq {
+                victim_slot_idx = Some(idx);
+                victim_entry = Some(entry);
+                victim_freq = freq;
             }
 
             samples_tried += 1;
@@ -841,7 +840,7 @@ where
         }
 
         // Evict the best victim if we found one
-        if let Some((slot_idx, entry, _freq)) = best_victim {
+        if let (Some(slot_idx), Some(entry)) = (victim_slot_idx, victim_entry) {
             let key_bytes = entry.key.as_ref();
             let verifier = ArcCacheVerifier {
                 storage: &self.storage,
