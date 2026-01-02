@@ -475,27 +475,41 @@ impl IoWorker {
 
         let mut total_queued = 0usize;
 
-        // Fairness-based selection: always pick the session with the fewest
-        // requests sent that can currently accept a request. This ensures
-        // even distribution regardless of response latency differences.
+        // Strict fairness: find the minimum requests_sent across ALL connected
+        // sessions (not just those that can send), then only send to sessions
+        // within a small threshold of that minimum. This ensures even distribution
+        // even when some connections have higher latency.
         loop {
-            // Find the session with minimum requests_sent that can accept
+            // Find minimum requests_sent across all connected sessions
+            let mut min_sent = u64::MAX;
+            for session in self.sessions.iter() {
+                if session.is_connected() {
+                    min_sent = min_sent.min(session.requests_sent());
+                }
+            }
+
+            if min_sent == u64::MAX {
+                break; // No connected sessions
+            }
+
+            // Find a session that can send AND is within threshold of minimum
+            // Threshold of 1 means a session can be at most 1 request ahead
+            const FAIRNESS_THRESHOLD: u64 = 1;
             let mut best_idx = None;
-            let mut best_count = u64::MAX;
 
             for (idx, session) in self.sessions.iter().enumerate() {
-                if session.is_connected() && session.can_send() {
-                    let count = session.requests_sent();
-                    if count < best_count {
-                        best_count = count;
-                        best_idx = Some(idx);
-                    }
+                if session.is_connected()
+                    && session.can_send()
+                    && session.requests_sent() <= min_sent + FAIRNESS_THRESHOLD
+                {
+                    best_idx = Some(idx);
+                    break;
                 }
             }
 
             let idx = match best_idx {
                 Some(i) => i,
-                None => break, // No session can accept
+                None => break, // No eligible session can accept
             };
 
             // Check rate limiter
