@@ -1603,8 +1603,8 @@ mod tests {
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
     use crate::state::{Metadata, State};
-    use crate::sync::{AtomicU32, AtomicU64, Ordering};
     use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use loom::thread;
 
     /// Test concurrent state transitions using CAS on packed metadata.
