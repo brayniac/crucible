@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use server::banner::{BannerConfig, print_banner};
-use server::config::{CacheBackend, Config, Runtime};
+use server::config::{CacheBackend, Config, HugepageConfig, Runtime};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -103,24 +103,38 @@ fn run_with_cache<C: cache_core::Cache + 'static>(
 }
 
 fn create_segcache(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use segcache::SegCache;
+    use segcache::{HugepageSize, SegCache};
+
+    let hugepage_size = match config.cache.hugepage {
+        HugepageConfig::None => HugepageSize::None,
+        HugepageConfig::TwoMegabyte => HugepageSize::TwoMegabyte,
+        HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
+    };
 
     let cache = SegCache::builder()
         .heap_size(config.cache.heap_size)
         .segment_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power)
+        .hugepage_size(hugepage_size)
         .build()?;
 
     Ok(cache)
 }
 
 fn create_s3fifo(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use s3fifo::S3FifoCache;
+    use s3fifo::{HugepageSize, S3FifoCache};
+
+    let hugepage_size = match config.cache.hugepage {
+        HugepageConfig::None => HugepageSize::None,
+        HugepageConfig::TwoMegabyte => HugepageSize::TwoMegabyte,
+        HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
+    };
 
     let cache = S3FifoCache::builder()
         .ram_size(config.cache.heap_size)
         .segment_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power)
+        .hugepage_size(hugepage_size)
         .build()?;
 
     Ok(cache)
@@ -151,6 +165,10 @@ segment_size = "1MB"
 
 # Hashtable power (2^power buckets)
 hashtable_power = 26
+
+# Hugepage size: "none", "2mb", or "1gb" (Linux only)
+# Falls back to regular pages if hugepages are unavailable
+hugepage = "none"
 
 # Protocol listeners - configure one or more
 [[listener]]

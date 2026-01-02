@@ -81,6 +81,10 @@ pub struct CacheConfig {
     /// Hashtable power (2^power buckets)
     #[serde(default = "default_hashtable_power")]
     pub hashtable_power: u8,
+
+    /// Hugepage size preference: "none", "2mb", or "1gb"
+    #[serde(default)]
+    pub hugepage: HugepageConfig,
 }
 
 impl Default for CacheConfig {
@@ -90,6 +94,7 @@ impl Default for CacheConfig {
             heap_size: default_heap_size(),
             segment_size: default_segment_size(),
             hashtable_power: default_hashtable_power(),
+            hugepage: HugepageConfig::default(),
         }
     }
 }
@@ -103,6 +108,25 @@ pub enum CacheBackend {
     Segcache,
     /// S3-FIFO - Simple, Scalable eviction with three FIFO queues
     S3fifo,
+}
+
+/// Hugepage size configuration.
+///
+/// Controls whether to use explicit hugepages for cache memory allocation.
+/// Falls back to regular pages (with THP hint) if hugepages are unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HugepageConfig {
+    /// No explicit hugepages, use regular 4KB pages.
+    /// The OS may still use THP if configured system-wide.
+    #[default]
+    None,
+    /// 2MB hugepages (Linux only).
+    #[serde(rename = "2mb")]
+    TwoMegabyte,
+    /// 1GB hugepages (Linux only).
+    #[serde(rename = "1gb")]
+    OneGigabyte,
 }
 
 /// Protocol listener configuration.

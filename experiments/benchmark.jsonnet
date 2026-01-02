@@ -92,8 +92,8 @@ function(
     runtime='native',
 
     // Benchmark parameters
-    benchmark_threads='20',
-    benchmark_cpu_affinity='10-15,20-23,42-47,52-55',
+    benchmark_threads='8',
+    benchmark_cpu_affinity='20-23,52-55',
     connections='256',
     pipeline_depth='64',
     key_length='16',

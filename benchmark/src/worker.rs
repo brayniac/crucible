@@ -129,8 +129,14 @@ pub struct IoWorker {
     config: Config,
     shared: Arc<SharedState>,
 
-    /// Sessions indexed by ConnId (for RESP/Memcache)
-    sessions: HashMap<usize, Session>,
+    /// Sessions stored in a Vec for cache-friendly iteration
+    sessions: Vec<Session>,
+
+    /// Maps conn_id -> session index (for completion lookup)
+    conn_id_to_idx: HashMap<usize, usize>,
+
+    /// Next session index for round-robin distribution
+    next_session_idx: usize,
 
     /// Momento sessions (handle their own I/O)
     momento_sessions: Vec<MomentoSession>,
@@ -177,7 +183,9 @@ impl IoWorker {
             driver,
             config: cfg.config,
             shared: cfg.shared,
-            sessions: HashMap::new(),
+            sessions: Vec::new(),
+            conn_id_to_idx: HashMap::new(),
+            next_session_idx: 0,
             momento_sessions: Vec::new(),
             rng,
             key_buf,
@@ -242,9 +250,8 @@ impl IoWorker {
                         .fetch_add(1, Ordering::Relaxed);
                     // Create disconnected session for reconnection attempts
                     let session = Session::from_config(endpoint, &self.config);
-                    // Store with a fake ID - will be updated on reconnect
-                    let fake_id = usize::MAX - i;
-                    self.sessions.insert(fake_id, session);
+                    // Push to Vec - no conn_id mapping since not connected
+                    self.sessions.push(session);
                 }
             }
         }
@@ -297,7 +304,9 @@ impl IoWorker {
         let mut session = Session::from_config(addr, &self.config);
         session.set_conn_id(conn_id);
 
-        self.sessions.insert(conn_id.as_usize(), session);
+        let idx = self.sessions.len();
+        self.sessions.push(session);
+        self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
         Ok(())
     }
 
@@ -462,9 +471,19 @@ impl IoWorker {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let warmup = self.warmup;
+        let num_sessions = self.sessions.len();
+
+        if num_sessions == 0 {
+            return Ok(());
+        }
 
         let mut total_queued = 0usize;
-        for session in self.sessions.values_mut() {
+
+        // Round-robin: start from next_session_idx and wrap around
+        for i in 0..num_sessions {
+            let idx = (self.next_session_idx + i) % num_sessions;
+            let session = &mut self.sessions[idx];
+
             if !session.is_connected() {
                 tracing::trace!("session not connected, skipping");
                 continue;
@@ -502,6 +521,9 @@ impl IoWorker {
             }
         }
 
+        // Advance starting point for next iteration
+        self.next_session_idx = (self.next_session_idx + 1) % num_sessions;
+
         if total_queued > 0 {
             tracing::debug!("worker {} queued {} requests", self.id, total_queued);
         }
@@ -511,7 +533,7 @@ impl IoWorker {
 
     #[inline]
     fn flush_sends(&mut self) -> io::Result<()> {
-        for session in self.sessions.values_mut() {
+        for session in &mut self.sessions {
             if !session.is_connected() {
                 continue;
             }
@@ -576,7 +598,8 @@ impl IoWorker {
                     );
                     // Data is available to read
                     let id = conn_id.as_usize();
-                    if let Some(session) = self.sessions.get_mut(&id) {
+                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        let session = &mut self.sessions[idx];
                         // Read all available data
                         loop {
                             match self.driver.recv(conn_id, &mut self.recv_buf) {
@@ -622,7 +645,8 @@ impl IoWorker {
                     );
                     // Socket is writable, try to flush
                     let id = conn_id.as_usize();
-                    if let Some(session) = self.sessions.get_mut(&id) {
+                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        let session = &mut self.sessions[idx];
                         let send_buf = session.send_buffer();
                         if !send_buf.is_empty() {
                             match self.driver.send(conn_id, send_buf) {
@@ -652,8 +676,8 @@ impl IoWorker {
                         conn_id.as_usize()
                     );
                     let id = conn_id.as_usize();
-                    if let Some(session) = self.sessions.get_mut(&id) {
-                        session.disconnect();
+                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        self.sessions[idx].disconnect();
                         self.shared
                             .connections_active
                             .fetch_sub(1, Ordering::Relaxed);
@@ -665,8 +689,8 @@ impl IoWorker {
                 CompletionKind::Error { conn_id, error } => {
                     let id = conn_id.as_usize();
                     tracing::debug!("connection {} error: {}", id, error);
-                    if let Some(session) = self.sessions.get_mut(&id) {
-                        session.disconnect();
+                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        self.sessions[idx].disconnect();
                         self.shared
                             .connections_active
                             .fetch_sub(1, Ordering::Relaxed);
@@ -687,14 +711,14 @@ impl IoWorker {
     fn poll_responses(&mut self, now: std::time::Instant) {
         if self.warmup {
             // Still need to parse responses but don't record metrics
-            for session in self.sessions.values_mut() {
+            for session in &mut self.sessions {
                 self.results.clear();
                 let _ = session.poll_responses(&mut self.results, now);
             }
             return;
         }
 
-        for session in self.sessions.values_mut() {
+        for session in &mut self.sessions {
             self.results.clear();
             if let Err(e) = session.poll_responses(&mut self.results, now) {
                 tracing::debug!("protocol error: {}", e);
@@ -733,7 +757,7 @@ impl IoWorker {
 
     /// Get the number of active connections.
     pub fn active_connections(&self) -> usize {
-        let tcp_sessions = self.sessions.values().filter(|s| s.is_connected()).count();
+        let tcp_sessions = self.sessions.iter().filter(|s| s.is_connected()).count();
         let momento_sessions = self
             .momento_sessions
             .iter()
@@ -745,7 +769,7 @@ impl IoWorker {
     /// Get the total in-flight count.
     #[allow(dead_code)]
     pub fn in_flight_count(&self) -> usize {
-        let tcp: usize = self.sessions.values().map(|s| s.in_flight_count()).sum();
+        let tcp: usize = self.sessions.iter().map(|s| s.in_flight_count()).sum();
         let momento: usize = self
             .momento_sessions
             .iter()
@@ -756,21 +780,16 @@ impl IoWorker {
 
     /// Try to reconnect disconnected sessions.
     fn try_reconnect(&mut self) {
-        // Collect sessions that need reconnection (can't modify while iterating)
+        // Collect indices of sessions that need reconnection
         let to_reconnect: Vec<_> = self
             .sessions
             .iter()
+            .enumerate()
             .filter(|(_, s)| s.should_reconnect())
-            .map(|(&id, s)| (id, s.addr()))
+            .map(|(idx, s)| (idx, s.addr(), s.conn_id().map(|c| c.as_usize())))
             .collect();
 
-        for (old_id, addr) in to_reconnect {
-            // Remove the old session entry
-            let mut session = match self.sessions.remove(&old_id) {
-                Some(s) => s,
-                None => continue,
-            };
-
+        for (idx, addr, old_conn_id) in to_reconnect {
             // Try to connect
             match Self::create_connection(addr, self.config.connection.connect_timeout) {
                 Ok(stream) => {
@@ -782,10 +801,17 @@ impl IoWorker {
                                 addr,
                                 conn_id.as_usize()
                             );
+                            let session = &mut self.sessions[idx];
                             session.set_conn_id(conn_id);
                             session.reconnect_attempted(true);
                             session.reset(); // Clear buffers and in-flight state
-                            self.sessions.insert(conn_id.as_usize(), session);
+
+                            // Update conn_id mapping
+                            if let Some(old_id) = old_conn_id {
+                                self.conn_id_to_idx.remove(&old_id);
+                            }
+                            self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
+
                             self.shared
                                 .connections_active
                                 .fetch_add(1, Ordering::Relaxed);
@@ -797,19 +823,13 @@ impl IoWorker {
                                 addr,
                                 e
                             );
-                            session.reconnect_attempted(false);
-                            // Put session back with a temporary ID for future retry
-                            let temp_id = usize::MAX - self.sessions.len();
-                            self.sessions.insert(temp_id, session);
+                            self.sessions[idx].reconnect_attempted(false);
                         }
                     }
                 }
                 Err(e) => {
                     tracing::debug!("worker {} failed to reconnect to {}: {}", self.id, addr, e);
-                    session.reconnect_attempted(false);
-                    // Put session back with a temporary ID for future retry
-                    let temp_id = usize::MAX - self.sessions.len();
-                    self.sessions.insert(temp_id, session);
+                    self.sessions[idx].reconnect_attempted(false);
                 }
             }
         }

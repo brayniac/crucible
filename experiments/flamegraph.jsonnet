@@ -86,12 +86,13 @@ function(
     heap_size='8GB',
     segment_size='1MB',
     hashtable_power='20',
-    server_threads='16',
-    server_cpu_affinity='0-15',
+    server_threads='8',
+    server_cpu_affinity='4-7,20-23',
     runtime='native',
 
     // Benchmark parameters
     benchmark_threads='16',
+    benchmark_cpu_affinity='8-15,24-31',
     connections='256',
     pipeline_depth='16',
     key_length='16',
@@ -154,6 +155,7 @@ function(
             general+: {
                 duration: warmup_duration,
                 threads: benchmark_threads_int,
+                [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
             },
             connection+: {
                 connections: connections_int,
