@@ -3,7 +3,9 @@
 use crate::affinity::set_cpu_affinity;
 use crate::config::Config;
 use crate::connection::Connection;
-use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, WorkerStats, WorkerStatsSnapshot};
+use crate::metrics::{
+    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats, WorkerStatsSnapshot,
+};
 use cache_core::Cache;
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
 use std::io;
@@ -235,6 +237,19 @@ fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
                         i, delta.backpressure_events
                     );
                 }
+                // Show close reason breakdown when there are closes
+                if delta.close_events > 0 {
+                    eprintln!(
+                        "  ^ closes: {} (eof={} proto={} recv_err={} send_err={} closed={} error={})",
+                        delta.close_events,
+                        delta.closes_client_eof,
+                        delta.closes_protocol,
+                        delta.closes_recv_error,
+                        delta.closes_send_error,
+                        delta.closes_closed_event,
+                        delta.closes_error_event,
+                    );
+                }
             }
 
             prev_snapshots = current;
@@ -392,7 +407,7 @@ fn run_worker<C: Cache>(
                         continue;
                     }
 
-                    let mut need_close = false;
+                    let mut close_reason: Option<CloseReason> = None;
 
                     'recv_loop: loop {
                         let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
@@ -401,7 +416,7 @@ fn run_worker<C: Cache>(
 
                         match driver.recv(conn_id, &mut recv_buf) {
                             Ok(0) => {
-                                need_close = true;
+                                close_reason = Some(CloseReason::ClientEof);
                                 break;
                             }
                             Ok(n) => {
@@ -410,7 +425,7 @@ fn run_worker<C: Cache>(
                                 conn.process(&*cache);
 
                                 if conn.should_close() {
-                                    need_close = true;
+                                    close_reason = Some(CloseReason::ProtocolClose);
                                     break;
                                 }
 
@@ -424,7 +439,7 @@ fn run_worker<C: Cache>(
                                         }
                                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                         Err(_) => {
-                                            need_close = true;
+                                            close_reason = Some(CloseReason::SendError);
                                             break 'recv_loop;
                                         }
                                     }
@@ -439,21 +454,21 @@ fn run_worker<C: Cache>(
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
-                                need_close = true;
+                                close_reason = Some(CloseReason::RecvError);
                                 break;
                             }
                         }
                     }
 
-                    if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id, stats);
+                    if let Some(reason) = close_reason {
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                     }
                 }
 
                 CompletionKind::SendReady { conn_id } => {
                     stats.inc_send_ready();
                     let idx = conn_id.as_usize();
-                    let mut need_close = false;
+                    let mut close_reason: Option<CloseReason> = None;
 
                     // Loop to drain as much pending write data as possible
                     loop {
@@ -473,14 +488,14 @@ fn run_worker<C: Cache>(
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
-                                need_close = true;
+                                close_reason = Some(CloseReason::SendError);
                                 break;
                             }
                         }
                     }
 
-                    if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id, stats);
+                    if let Some(reason) = close_reason {
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                         continue;
                     }
 
@@ -504,12 +519,12 @@ fn run_worker<C: Cache>(
                         conn.process(&*cache);
 
                         if conn.should_close() {
-                            need_close = true;
+                            close_reason = Some(CloseReason::ProtocolClose);
                         }
                     }
 
-                    if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id, stats);
+                    if let Some(reason) = close_reason {
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                         continue;
                     }
 
@@ -531,23 +546,35 @@ fn run_worker<C: Cache>(
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
-                                need_close = true;
+                                close_reason = Some(CloseReason::SendError);
                                 break;
                             }
                         }
                     }
 
-                    if need_close {
-                        close_connection(&mut driver, &mut connections, conn_id, stats);
+                    if let Some(reason) = close_reason {
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                     }
                 }
 
                 CompletionKind::Closed { conn_id } => {
-                    close_connection(&mut driver, &mut connections, conn_id, stats);
+                    close_connection(
+                        &mut driver,
+                        &mut connections,
+                        conn_id,
+                        stats,
+                        CloseReason::ClosedEvent,
+                    );
                 }
 
                 CompletionKind::Error { conn_id, .. } => {
-                    close_connection(&mut driver, &mut connections, conn_id, stats);
+                    close_connection(
+                        &mut driver,
+                        &mut connections,
+                        conn_id,
+                        stats,
+                        CloseReason::ErrorEvent,
+                    );
                 }
 
                 CompletionKind::ListenerError { error, .. } => {
@@ -570,6 +597,7 @@ fn close_connection(
     connections: &mut [Option<Connection>],
     conn_id: ConnId,
     stats: &WorkerStats,
+    reason: CloseReason,
 ) {
     let idx = conn_id.as_usize();
     if let Some(slot) = connections.get_mut(idx)
@@ -577,6 +605,6 @@ fn close_connection(
     {
         let _ = driver.close(conn_id);
         CONNECTIONS_ACTIVE.decrement();
-        stats.inc_close();
+        stats.inc_close(reason);
     }
 }

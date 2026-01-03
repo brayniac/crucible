@@ -46,6 +46,23 @@ pub static SET_ERRORS: Counter = Counter::new();
 #[metric(name = "protocol_errors", description = "Total protocol parse errors")]
 pub static PROTOCOL_ERRORS: Counter = Counter::new();
 
+/// Reason for closing a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// Client closed connection (recv returned 0)
+    ClientEof,
+    /// Protocol requested close (e.g., Connection: close)
+    ProtocolClose,
+    /// Error during recv
+    RecvError,
+    /// Error during send
+    SendError,
+    /// Closed completion event from driver
+    ClosedEvent,
+    /// Error completion event from driver
+    ErrorEvent,
+}
+
 /// Per-worker statistics for diagnosing performance issues.
 #[derive(Default)]
 pub struct WorkerStats {
@@ -61,6 +78,13 @@ pub struct WorkerStats {
     pub bytes_sent: AtomicU64,
     pub active_connections: AtomicU64,
     pub backpressure_events: AtomicU64,
+    // Close reason breakdown
+    pub closes_client_eof: AtomicU64,
+    pub closes_protocol: AtomicU64,
+    pub closes_recv_error: AtomicU64,
+    pub closes_send_error: AtomicU64,
+    pub closes_closed_event: AtomicU64,
+    pub closes_error_event: AtomicU64,
 }
 
 impl WorkerStats {
@@ -78,6 +102,12 @@ impl WorkerStats {
             bytes_sent: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
             backpressure_events: AtomicU64::new(0),
+            closes_client_eof: AtomicU64::new(0),
+            closes_protocol: AtomicU64::new(0),
+            closes_recv_error: AtomicU64::new(0),
+            closes_send_error: AtomicU64::new(0),
+            closes_closed_event: AtomicU64::new(0),
+            closes_error_event: AtomicU64::new(0),
         }
     }
 
@@ -119,9 +149,30 @@ impl WorkerStats {
     }
 
     #[inline]
-    pub fn inc_close(&self) {
+    pub fn inc_close(&self, reason: CloseReason) {
         self.close_events.fetch_add(1, Ordering::Relaxed);
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
+
+        match reason {
+            CloseReason::ClientEof => {
+                self.closes_client_eof.fetch_add(1, Ordering::Relaxed);
+            }
+            CloseReason::ProtocolClose => {
+                self.closes_protocol.fetch_add(1, Ordering::Relaxed);
+            }
+            CloseReason::RecvError => {
+                self.closes_recv_error.fetch_add(1, Ordering::Relaxed);
+            }
+            CloseReason::SendError => {
+                self.closes_send_error.fetch_add(1, Ordering::Relaxed);
+            }
+            CloseReason::ClosedEvent => {
+                self.closes_closed_event.fetch_add(1, Ordering::Relaxed);
+            }
+            CloseReason::ErrorEvent => {
+                self.closes_error_event.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     #[inline]
@@ -154,6 +205,12 @@ impl WorkerStats {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
             backpressure_events: self.backpressure_events.load(Ordering::Relaxed),
+            closes_client_eof: self.closes_client_eof.load(Ordering::Relaxed),
+            closes_protocol: self.closes_protocol.load(Ordering::Relaxed),
+            closes_recv_error: self.closes_recv_error.load(Ordering::Relaxed),
+            closes_send_error: self.closes_send_error.load(Ordering::Relaxed),
+            closes_closed_event: self.closes_closed_event.load(Ordering::Relaxed),
+            closes_error_event: self.closes_error_event.load(Ordering::Relaxed),
         }
     }
 }
@@ -173,6 +230,13 @@ pub struct WorkerStatsSnapshot {
     pub bytes_sent: u64,
     pub active_connections: u64,
     pub backpressure_events: u64,
+    // Close reason breakdown
+    pub closes_client_eof: u64,
+    pub closes_protocol: u64,
+    pub closes_recv_error: u64,
+    pub closes_send_error: u64,
+    pub closes_closed_event: u64,
+    pub closes_error_event: u64,
 }
 
 impl WorkerStatsSnapshot {
@@ -195,6 +259,22 @@ impl WorkerStatsSnapshot {
             backpressure_events: self
                 .backpressure_events
                 .saturating_sub(prev.backpressure_events),
+            closes_client_eof: self
+                .closes_client_eof
+                .saturating_sub(prev.closes_client_eof),
+            closes_protocol: self.closes_protocol.saturating_sub(prev.closes_protocol),
+            closes_recv_error: self
+                .closes_recv_error
+                .saturating_sub(prev.closes_recv_error),
+            closes_send_error: self
+                .closes_send_error
+                .saturating_sub(prev.closes_send_error),
+            closes_closed_event: self
+                .closes_closed_event
+                .saturating_sub(prev.closes_closed_event),
+            closes_error_event: self
+                .closes_error_event
+                .saturating_sub(prev.closes_error_event),
         }
     }
 }
