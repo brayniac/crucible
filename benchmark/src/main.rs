@@ -167,7 +167,7 @@ fn run_benchmark(
     let duration = config.general.duration;
 
     // Shared state
-    let shared = Arc::new(SharedState::new());
+    let shared = Arc::new(SharedState::new(num_threads));
 
     // Create shared rate limiter if configured
     let ratelimiter = config.workload.rate_limit.map(|rate| {
@@ -337,6 +337,19 @@ fn run_benchmark(
                 p99 / 1000.0,
                 p999 / 1000.0,
             );
+
+            // Print per-worker stats for diagnostics
+            if std::env::var("CRUCIBLE_DIAGNOSTICS")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                let worker_rates: Vec<u64> = shared
+                    .worker_stats
+                    .iter()
+                    .map(|s| s.requests_sent.load(Ordering::Relaxed))
+                    .collect();
+                tracing::info!("per-worker requests: {:?}", worker_rates);
+            }
 
             last_report = Instant::now();
         }

@@ -13,7 +13,7 @@ local server_config = {
         heap_size: error 'heap_size must be specified',
         segment_size: '1MB',
         hashtable_power: 20,
-        hugepage: '2mb',
+        hugepage: '2MB',
     },
 
     listener: [
@@ -385,6 +385,7 @@ function(
                             ulimit -n 500000
                             ulimit -a
 
+                            export CRUCIBLE_DIAGNOSTICS=1
                             /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-benchmark warmup.toml
                         |||
                     ),
@@ -403,6 +404,7 @@ function(
                             ulimit -n 500000
                             ulimit -a
 
+                            export CRUCIBLE_DIAGNOSTICS=1
                             /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-benchmark loadgen.toml
                         |||
                     ),

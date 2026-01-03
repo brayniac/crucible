@@ -57,6 +57,27 @@ impl Phase {
     }
 }
 
+/// Per-worker statistics for diagnostics.
+pub struct WorkerStats {
+    pub requests_sent: AtomicU64,
+    pub responses_received: AtomicU64,
+}
+
+impl WorkerStats {
+    pub fn new() -> Self {
+        Self {
+            requests_sent: AtomicU64::new(0),
+            responses_received: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for WorkerStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared state between workers and main thread.
 pub struct SharedState {
     /// Current test phase (controlled by main thread)
@@ -75,10 +96,12 @@ pub struct SharedState {
     pub connections_active: AtomicU64,
     /// Connections that have disconnected
     pub connections_failed: AtomicU64,
+    /// Per-worker statistics (for diagnosing imbalance)
+    pub worker_stats: Vec<WorkerStats>,
 }
 
 impl SharedState {
-    pub fn new() -> Self {
+    pub fn new(num_workers: usize) -> Self {
         Self {
             phase: AtomicU8::new(Phase::Connect as u8),
             requests_sent: AtomicU64::new(0),
@@ -88,6 +111,7 @@ impl SharedState {
             misses: AtomicU64::new(0),
             connections_active: AtomicU64::new(0),
             connections_failed: AtomicU64::new(0),
+            worker_stats: (0..num_workers).map(|_| WorkerStats::new()).collect(),
         }
     }
 
@@ -106,7 +130,7 @@ impl SharedState {
 
 impl Default for SharedState {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -498,6 +522,9 @@ impl IoWorker {
 
             if sent && !warmup {
                 self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
+                if let Some(stats) = self.shared.worker_stats.get(self.id) {
+                    stats.requests_sent.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
