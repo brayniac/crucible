@@ -218,14 +218,27 @@ impl UringDriver {
             return;
         }
 
-        if result <= 0 {
-            // Connection closed or error
+        if result == 0 {
+            // Clean EOF - client closed connection gracefully
             if let Some(buf_id) = cqueue::buffer_select(flags) {
                 self.buf_ring.return_buffer(buf_id);
             }
             self.pending_completions
                 .push(Completion::new(CompletionKind::Closed {
                     conn_id: ConnId::new(conn_id),
+                }));
+            return;
+        }
+
+        if result < 0 {
+            // Recv error
+            if let Some(buf_id) = cqueue::buffer_select(flags) {
+                self.buf_ring.return_buffer(buf_id);
+            }
+            self.pending_completions
+                .push(Completion::new(CompletionKind::Error {
+                    conn_id: ConnId::new(conn_id),
+                    error: io::Error::from_raw_os_error(-result),
                 }));
             return;
         }
@@ -290,9 +303,16 @@ impl UringDriver {
         }
 
         if result <= 0 {
+            // Send error (result == 0 means connection closed, result < 0 is error)
+            let error = if result == 0 {
+                io::Error::new(io::ErrorKind::WriteZero, "send returned 0")
+            } else {
+                io::Error::from_raw_os_error(-result)
+            };
             self.pending_completions
-                .push(Completion::new(CompletionKind::Closed {
+                .push(Completion::new(CompletionKind::Error {
                     conn_id: ConnId::new(conn_id),
+                    error,
                 }));
             return;
         }
