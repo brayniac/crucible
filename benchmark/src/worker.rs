@@ -7,7 +7,7 @@
 use crate::client::{MomentoSession, RequestResult, RequestType, Session};
 use crate::config::{Config, Protocol as CacheProtocol};
 
-use io_driver::{CompletionKind, Driver, IoDriver};
+use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
 
 use metriken::AtomicHistogram;
 use rand::prelude::*;
@@ -794,6 +794,13 @@ impl IoWorker {
             .collect();
 
         for (idx, addr, old_conn_id) in to_reconnect {
+            // Close the old connection if it exists (it may have been marked
+            // disconnected but the socket never closed)
+            if let Some(old_id) = old_conn_id {
+                let _ = self.driver.close(ConnId::new(old_id));
+                self.conn_id_to_idx.remove(&old_id);
+            }
+
             // Try to connect
             match Self::create_connection(addr, self.config.connection.connect_timeout) {
                 Ok(stream) => {
@@ -810,10 +817,6 @@ impl IoWorker {
                             session.reconnect_attempted(true);
                             session.reset(); // Clear buffers and in-flight state
 
-                            // Update conn_id mapping
-                            if let Some(old_id) = old_conn_id {
-                                self.conn_id_to_idx.remove(&old_id);
-                            }
                             self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
 
                             self.shared
