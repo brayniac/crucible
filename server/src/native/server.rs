@@ -189,12 +189,14 @@ fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
                 report_interval.as_secs()
             );
             eprintln!(
-                "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
+                "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
                 "worker",
                 "polls",
                 "empty",
                 "compls",
                 "accepts",
+                "ch_recv",
+                "closes",
                 "recv",
                 "send_rdy",
                 "bytes_in",
@@ -205,12 +207,14 @@ fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
             for (i, (curr, prev)) in current.iter().zip(prev_snapshots.iter()).enumerate() {
                 let delta = curr.delta(prev);
                 eprintln!(
-                    "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
+                    "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
                     i,
                     delta.poll_count,
                     delta.empty_polls,
                     delta.completions,
                     delta.accepts,
+                    delta.channel_receives,
+                    delta.close_events,
                     delta.recv_events,
                     delta.send_ready_events,
                     format_bytes(delta.bytes_received),
@@ -349,7 +353,7 @@ fn run_worker<C: Cache>(
                 Ok(conn_id) => {
                     CONNECTIONS_ACCEPTED.increment();
                     CONNECTIONS_ACTIVE.increment();
-                    // Don't count as "accept" - these came via channel from acceptor
+                    stats.inc_channel_receive();
 
                     let idx = conn_id.as_usize();
                     if idx >= connections.len() {

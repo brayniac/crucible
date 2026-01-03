@@ -53,6 +53,7 @@ pub struct WorkerStats {
     pub empty_polls: AtomicU64,
     pub completions: AtomicU64,
     pub accepts: AtomicU64,
+    pub channel_receives: AtomicU64,
     pub recv_events: AtomicU64,
     pub send_ready_events: AtomicU64,
     pub close_events: AtomicU64,
@@ -69,6 +70,7 @@ impl WorkerStats {
             empty_polls: AtomicU64::new(0),
             completions: AtomicU64::new(0),
             accepts: AtomicU64::new(0),
+            channel_receives: AtomicU64::new(0),
             recv_events: AtomicU64::new(0),
             send_ready_events: AtomicU64::new(0),
             close_events: AtomicU64::new(0),
@@ -97,6 +99,12 @@ impl WorkerStats {
     #[inline]
     pub fn inc_accepts(&self) {
         self.accepts.fetch_add(1, Ordering::Relaxed);
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_channel_receive(&self) {
+        self.channel_receives.fetch_add(1, Ordering::Relaxed);
         self.active_connections.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -138,6 +146,7 @@ impl WorkerStats {
             empty_polls: self.empty_polls.load(Ordering::Relaxed),
             completions: self.completions.load(Ordering::Relaxed),
             accepts: self.accepts.load(Ordering::Relaxed),
+            channel_receives: self.channel_receives.load(Ordering::Relaxed),
             recv_events: self.recv_events.load(Ordering::Relaxed),
             send_ready_events: self.send_ready_events.load(Ordering::Relaxed),
             close_events: self.close_events.load(Ordering::Relaxed),
@@ -156,6 +165,7 @@ pub struct WorkerStatsSnapshot {
     pub empty_polls: u64,
     pub completions: u64,
     pub accepts: u64,
+    pub channel_receives: u64,
     pub recv_events: u64,
     pub send_ready_events: u64,
     pub close_events: u64,
@@ -173,6 +183,7 @@ impl WorkerStatsSnapshot {
             empty_polls: self.empty_polls.saturating_sub(prev.empty_polls),
             completions: self.completions.saturating_sub(prev.completions),
             accepts: self.accepts.saturating_sub(prev.accepts),
+            channel_receives: self.channel_receives.saturating_sub(prev.channel_receives),
             recv_events: self.recv_events.saturating_sub(prev.recv_events),
             send_ready_events: self
                 .send_ready_events
