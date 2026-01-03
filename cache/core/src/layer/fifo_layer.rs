@@ -343,6 +343,7 @@ pub struct FifoLayerBuilder {
     pool_id: u8,
     segment_size: usize,
     heap_size: usize,
+    numa_node: Option<u32>,
 }
 
 impl FifoLayerBuilder {
@@ -354,6 +355,7 @@ impl FifoLayerBuilder {
             pool_id: 0,
             segment_size: 1024 * 1024,   // 1MB
             heap_size: 64 * 1024 * 1024, // 64MB
+            numa_node: None,
         }
     }
 
@@ -387,13 +389,24 @@ impl FifoLayerBuilder {
         self
     }
 
+    /// Set the NUMA node to bind memory to (Linux only).
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.numa_node = Some(node);
+        self
+    }
+
     /// Build the FIFO layer.
     pub fn build(self) -> Result<FifoLayer, std::io::Error> {
-        let pool = MemoryPoolBuilder::new(self.pool_id)
+        let mut builder = MemoryPoolBuilder::new(self.pool_id)
             .per_item_ttl(true) // FIFO layer uses per-item TTL
             .segment_size(self.segment_size)
-            .heap_size(self.heap_size)
-            .build()?;
+            .heap_size(self.heap_size);
+
+        if let Some(node) = self.numa_node {
+            builder = builder.numa_node(node);
+        }
+
+        let pool = builder.build()?;
 
         Ok(FifoLayer {
             layer_id: self.layer_id,

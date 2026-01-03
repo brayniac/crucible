@@ -4,7 +4,7 @@
 //! contiguous memory region, optionally using hugepages for better TLB
 //! performance.
 
-use crate::hugepage::{HugepageAllocation, HugepageSize, allocate};
+use crate::hugepage::{HugepageAllocation, HugepageSize, allocate_on_node};
 use crate::pool::RamPool;
 use crate::segment::Segment;
 use crate::slice_segment::SliceSegment;
@@ -20,8 +20,7 @@ use crate::slice_segment::SliceSegment;
 /// MemoryPool is `Send + Sync`. All operations use lock-free atomics.
 pub struct MemoryPool {
     /// Backing memory allocation (handles deallocation on drop).
-    /// This field is intentionally "unused" - it keeps the allocation alive.
-    _heap: HugepageAllocation,
+    heap: HugepageAllocation,
 
     /// Segment metadata.
     segments: Vec<SliceSegment<'static>>,
@@ -42,6 +41,13 @@ pub struct MemoryPool {
 // 3. free_queue (Injector) is already Send + Sync
 unsafe impl Send for MemoryPool {}
 unsafe impl Sync for MemoryPool {}
+
+impl MemoryPool {
+    /// Get the page size that was actually used for the allocation.
+    pub fn page_size(&self) -> crate::hugepage::AllocatedPageSize {
+        self.heap.page_size()
+    }
+}
 
 impl Drop for MemoryPool {
     fn drop(&mut self) {
@@ -116,6 +122,7 @@ pub struct MemoryPoolBuilder {
     segment_size: usize,
     heap_size: usize,
     hugepage_size: HugepageSize,
+    numa_node: Option<u32>,
 }
 
 impl MemoryPoolBuilder {
@@ -130,6 +137,7 @@ impl MemoryPoolBuilder {
             segment_size: 1024 * 1024,   // 1MB default
             heap_size: 64 * 1024 * 1024, // 64MB default
             hugepage_size: HugepageSize::None,
+            numa_node: None,
         }
     }
 
@@ -168,6 +176,23 @@ impl MemoryPoolBuilder {
         self
     }
 
+    /// Set the NUMA node to bind memory to (Linux only).
+    ///
+    /// When set, the allocated memory will be bound to the specified NUMA node
+    /// using `mbind()`. This ensures memory locality for CPUs on that node.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let pool = MemoryPoolBuilder::new(0)
+    ///     .heap_size(1024 * 1024 * 1024)  // 1GB
+    ///     .numa_node(0)  // Bind to NUMA node 0
+    ///     .build()?;
+    /// ```
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.numa_node = Some(node);
+        self
+    }
+
     /// Build the memory pool.
     pub fn build(self) -> Result<MemoryPool, std::io::Error> {
         let num_segments = self.heap_size / self.segment_size;
@@ -180,8 +205,8 @@ impl MemoryPoolBuilder {
 
         let actual_size = num_segments * self.segment_size;
 
-        // Allocate backing memory
-        let heap = allocate(actual_size, self.hugepage_size)?;
+        // Allocate backing memory (optionally bound to NUMA node)
+        let heap = allocate_on_node(actual_size, self.hugepage_size, self.numa_node)?;
 
         // Initialize segments
         let mut segments = Vec::with_capacity(num_segments);
@@ -206,7 +231,7 @@ impl MemoryPoolBuilder {
         }
 
         Ok(MemoryPool {
-            _heap: heap,
+            heap,
             segments,
             free_queue,
             pool_id: self.pool_id,

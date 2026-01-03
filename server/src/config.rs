@@ -85,6 +85,11 @@ pub struct CacheConfig {
     /// Hugepage size preference: "none", "2mb", or "1gb"
     #[serde(default)]
     pub hugepage: HugepageConfig,
+
+    /// NUMA node to bind cache memory to (Linux only).
+    /// If not specified, memory is allocated according to the default policy.
+    #[serde(default)]
+    pub numa_node: Option<u32>,
 }
 
 impl Default for CacheConfig {
@@ -95,6 +100,7 @@ impl Default for CacheConfig {
             segment_size: default_segment_size(),
             hashtable_power: default_hashtable_power(),
             hugepage: HugepageConfig::default(),
+            numa_node: None,
         }
     }
 }
@@ -446,6 +452,89 @@ impl Config {
             .as_ref()
             .and_then(|s| parse_cpu_list(s).ok())
     }
+
+    /// Get the NUMA node for cache allocation.
+    ///
+    /// Returns the explicitly configured numa_node, or auto-detects from
+    /// cpu_affinity if all CPUs are on the same NUMA node.
+    pub fn numa_node(&self) -> Option<u32> {
+        // Explicit configuration takes precedence
+        if self.cache.numa_node.is_some() {
+            return self.cache.numa_node;
+        }
+
+        // Try to auto-detect from CPU affinity
+        #[cfg(target_os = "linux")]
+        if let Some(cpus) = self.cpu_affinity() {
+            return detect_numa_node_from_cpus(&cpus);
+        }
+
+        None
+    }
+}
+
+/// Detect which NUMA node a set of CPUs belongs to.
+///
+/// Returns `Some(node)` if all CPUs are on the same NUMA node,
+/// or `None` if CPUs span multiple nodes or detection fails.
+#[cfg(target_os = "linux")]
+fn detect_numa_node_from_cpus(cpus: &[usize]) -> Option<u32> {
+    use std::collections::HashSet;
+    use std::fs;
+
+    if cpus.is_empty() {
+        return None;
+    }
+
+    let cpu_set: HashSet<usize> = cpus.iter().copied().collect();
+
+    // Read /sys/devices/system/node/ to find NUMA nodes
+    let node_dir = std::path::Path::new("/sys/devices/system/node");
+    if !node_dir.exists() {
+        return None;
+    }
+
+    let entries = match fs::read_dir(node_dir) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Look for directories like "node0", "node1", etc.
+        if !name_str.starts_with("node") {
+            continue;
+        }
+
+        let node_id: u32 = match name_str[4..].parse() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        // Read the cpulist for this node
+        let cpulist_path = entry.path().join("cpulist");
+        let cpulist = match fs::read_to_string(&cpulist_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Parse the CPU list for this node
+        let node_cpus = match parse_cpu_list(cpulist.trim()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let node_cpu_set: HashSet<usize> = node_cpus.into_iter().collect();
+
+        // Check if all requested CPUs are on this node
+        if cpu_set.is_subset(&node_cpu_set) {
+            return Some(node_id);
+        }
+    }
+
+    None
 }
 
 /// Format a size in bytes as a human-readable string.

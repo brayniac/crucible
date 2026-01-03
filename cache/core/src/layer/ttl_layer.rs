@@ -420,6 +420,7 @@ pub struct TtlLayerBuilder {
     pool_id: u8,
     segment_size: usize,
     heap_size: usize,
+    numa_node: Option<u32>,
 }
 
 impl TtlLayerBuilder {
@@ -431,6 +432,7 @@ impl TtlLayerBuilder {
             pool_id: 1,
             segment_size: 1024 * 1024,    // 1MB
             heap_size: 256 * 1024 * 1024, // 256MB
+            numa_node: None,
         }
     }
 
@@ -464,13 +466,24 @@ impl TtlLayerBuilder {
         self
     }
 
+    /// Set the NUMA node to bind memory to (Linux only).
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.numa_node = Some(node);
+        self
+    }
+
     /// Build the TTL layer.
     pub fn build(self) -> Result<TtlLayer, std::io::Error> {
-        let pool = MemoryPoolBuilder::new(self.pool_id)
+        let mut builder = MemoryPoolBuilder::new(self.pool_id)
             .per_item_ttl(false) // TTL layer uses segment-level TTL
             .segment_size(self.segment_size)
-            .heap_size(self.heap_size)
-            .build()?;
+            .heap_size(self.heap_size);
+
+        if let Some(node) = self.numa_node {
+            builder = builder.numa_node(node);
+        }
+
+        let pool = builder.build()?;
 
         // Initialize cached write segments (one per bucket)
         let bucket_count = crate::organization::MAX_TTL_BUCKETS;

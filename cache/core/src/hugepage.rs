@@ -2,6 +2,8 @@
 //!
 //! This module provides mmap-based allocation with hugepage support for Linux.
 //! On non-Linux platforms, falls back to regular mmap.
+//!
+//! Optionally supports NUMA memory binding via `mbind()`.
 
 use std::ptr::NonNull;
 
@@ -48,6 +50,16 @@ pub enum AllocatedPageSize {
     Regular,
 }
 
+impl std::fmt::Display for AllocatedPageSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AllocatedPageSize::OneGigabyte => write!(f, "1GB hugepages"),
+            AllocatedPageSize::TwoMegabyte => write!(f, "2MB hugepages"),
+            AllocatedPageSize::Regular => write!(f, "4KB pages"),
+        }
+    }
+}
+
 impl HugepageAllocation {
     /// Get a pointer to the allocated memory.
     pub fn as_ptr(&self) -> *mut u8 {
@@ -89,6 +101,19 @@ fn round_up(size: usize, align: usize) -> usize {
     (size + align - 1) & !(align - 1)
 }
 
+/// Format bytes as human-readable string.
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= GB && bytes % GB == 0 {
+        format!("{} GB", bytes / GB)
+    } else if bytes >= MB && bytes % MB == 0 {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB && bytes % KB == 0 {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
 /// Allocate memory with the specified hugepage preference.
 ///
 /// # Arguments
@@ -107,6 +132,24 @@ pub fn allocate(
     size: usize,
     hugepage_size: HugepageSize,
 ) -> Result<HugepageAllocation, std::io::Error> {
+    allocate_on_node(size, hugepage_size, None)
+}
+
+/// Allocate memory with the specified hugepage preference, optionally bound to a NUMA node.
+///
+/// # Arguments
+/// * `size` - Minimum size to allocate (will be rounded up for alignment).
+/// * `hugepage_size` - Preferred hugepage size.
+/// * `numa_node` - Optional NUMA node to bind memory to (Linux only).
+///
+/// # Returns
+/// * `Ok(HugepageAllocation)` - Successfully allocated memory.
+/// * `Err(std::io::Error)` - All allocation attempts failed.
+pub fn allocate_on_node(
+    size: usize,
+    hugepage_size: HugepageSize,
+    numa_node: Option<u32>,
+) -> Result<HugepageAllocation, std::io::Error> {
     if size == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -114,11 +157,59 @@ pub fn allocate(
         ));
     }
 
-    match hugepage_size {
+    let alloc = match hugepage_size {
         HugepageSize::OneGigabyte => allocate_prefer_1gb(size),
         HugepageSize::TwoMegabyte => allocate_prefer_2mb(size),
         HugepageSize::None => allocate_regular(size),
+    }?;
+
+    // Bind to NUMA node if specified
+    if let Some(node) = numa_node {
+        bind_to_numa_node(alloc.as_ptr(), alloc.allocated_size(), node)?;
     }
+
+    Ok(alloc)
+}
+
+/// Bind a memory region to a specific NUMA node.
+///
+/// Uses `mbind()` with `MPOL_BIND` policy to ensure memory is allocated
+/// on the specified node.
+#[cfg(target_os = "linux")]
+fn bind_to_numa_node(ptr: *mut u8, size: usize, node: u32) -> Result<(), std::io::Error> {
+    // MPOL_BIND = 2: Allocate on specific nodes only
+    const MPOL_BIND: libc::c_int = 2;
+    // MPOL_MF_MOVE = 2: Move existing pages to comply with policy
+    const MPOL_MF_MOVE: libc::c_uint = 1 << 1;
+
+    // Create a nodemask with just the specified node
+    // nodemask is a bitmask where bit N means node N
+    let mut nodemask: libc::c_ulong = 1 << node;
+
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            ptr as *mut libc::c_void,
+            size,
+            MPOL_BIND,
+            &mut nodemask as *mut libc::c_ulong,
+            // maxnode: number of bits in nodemask (must be > highest node + 1)
+            (node + 2) as libc::c_ulong,
+            MPOL_MF_MOVE,
+        )
+    };
+
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_to_numa_node(_ptr: *mut u8, _size: usize, _node: u32) -> Result<(), std::io::Error> {
+    // NUMA binding not supported on non-Linux platforms
+    Ok(())
 }
 
 /// Try to allocate with 1GB pages, falling back directly to regular pages.
@@ -129,13 +220,26 @@ fn allocate_prefer_1gb(size: usize) -> Result<HugepageAllocation, std::io::Error
 
     if size >= GB && waste_1gb * 2 <= rounded_1gb {
         // Waste is acceptable, try 1GB pages
-        if let Ok(alloc) = try_mmap_hugepage(rounded_1gb, GB) {
-            return Ok(HugepageAllocation {
-                ptr: alloc,
-                requested_size: size,
-                allocated_size: rounded_1gb,
-                page_size: AllocatedPageSize::OneGigabyte,
-            });
+        match try_mmap_hugepage(rounded_1gb, GB) {
+            Ok(alloc) => {
+                eprintln!(
+                    "Allocated {} using 1GB hugepages ({} pages)",
+                    format_bytes(rounded_1gb),
+                    rounded_1gb / GB
+                );
+                return Ok(HugepageAllocation {
+                    ptr: alloc,
+                    requested_size: size,
+                    allocated_size: rounded_1gb,
+                    page_size: AllocatedPageSize::OneGigabyte,
+                });
+            }
+            Err(e) => {
+                eprintln!(
+                    "1GB hugepage allocation failed ({}), falling back to regular pages",
+                    e
+                );
+            }
         }
     }
 
@@ -148,13 +252,26 @@ fn allocate_prefer_1gb(size: usize) -> Result<HugepageAllocation, std::io::Error
 fn allocate_prefer_2mb(size: usize) -> Result<HugepageAllocation, std::io::Error> {
     let rounded_2mb = round_up(size, 2 * MB);
 
-    if let Ok(alloc) = try_mmap_hugepage(rounded_2mb, 2 * MB) {
-        return Ok(HugepageAllocation {
-            ptr: alloc,
-            requested_size: size,
-            allocated_size: rounded_2mb,
-            page_size: AllocatedPageSize::TwoMegabyte,
-        });
+    match try_mmap_hugepage(rounded_2mb, 2 * MB) {
+        Ok(alloc) => {
+            eprintln!(
+                "Allocated {} using 2MB hugepages ({} pages)",
+                format_bytes(rounded_2mb),
+                rounded_2mb / (2 * MB)
+            );
+            return Ok(HugepageAllocation {
+                ptr: alloc,
+                requested_size: size,
+                allocated_size: rounded_2mb,
+                page_size: AllocatedPageSize::TwoMegabyte,
+            });
+        }
+        Err(e) => {
+            eprintln!(
+                "2MB hugepage allocation failed ({}), falling back to regular pages",
+                e
+            );
+        }
     }
 
     // Fall back to regular pages (still use 2MB size for THP friendliness)
@@ -194,6 +311,11 @@ fn allocate_regular_internal(
         // MADV_HUGEPAGE = 14
         let _ = libc::madvise(ptr, alloc_size, 14);
     }
+
+    eprintln!(
+        "Allocated {} using regular pages (with THP hint)",
+        format_bytes(alloc_size)
+    );
 
     // Pre-fault pages
     prefault(ptr as *mut u8, alloc_size, 4096);

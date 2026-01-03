@@ -106,7 +106,9 @@ mod pool;
 mod slice_segment;
 
 // Phase 4 re-exports
-pub use hugepage::{AllocatedPageSize, HugepageAllocation, HugepageSize};
+pub use hugepage::{
+    AllocatedPageSize, HugepageAllocation, HugepageSize, allocate, allocate_on_node,
+};
 pub use memory_pool::{MemoryPool, MemoryPoolBuilder};
 pub use pool::RamPool;
 pub use slice_segment::SliceSegment;

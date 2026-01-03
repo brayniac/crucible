@@ -26,6 +26,8 @@ pub struct BannerConfig<'a> {
     pub segment_size: usize,
     /// Optional CPU affinity list
     pub cpu_affinity: Option<&'a [usize]>,
+    /// Optional NUMA node for cache memory
+    pub numa_node: Option<u32>,
 }
 
 /// Print a startup banner to stdout.
@@ -87,6 +89,9 @@ pub fn print_banner(config: &BannerConfig) {
         config.heap_size / config.segment_size
     )
     .unwrap();
+    if let Some(node) = config.numa_node {
+        writeln!(output, "  NUMA Node: {}", node).unwrap();
+    }
 
     writeln!(output).unwrap();
 

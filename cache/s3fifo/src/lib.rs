@@ -259,6 +259,9 @@ pub struct S3FifoCacheBuilder {
 
     /// Demotion threshold for small queue items.
     demotion_threshold: u8,
+
+    /// NUMA node to bind memory to (Linux only).
+    numa_node: Option<u32>,
 }
 
 impl Default for S3FifoCacheBuilder {
@@ -283,6 +286,7 @@ impl S3FifoCacheBuilder {
             hashtable_power: 16,        // 64K buckets
             hugepage_size: HugepageSize::None,
             demotion_threshold: 1, // freq > 1 to promote
+            numa_node: None,
         }
     }
 
@@ -342,6 +346,14 @@ impl S3FifoCacheBuilder {
         self
     }
 
+    /// Set the NUMA node to bind cache memory to (Linux only).
+    ///
+    /// When set, the allocated memory will be bound to the specified NUMA node.
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.numa_node = Some(node);
+        self
+    }
+
     /// Build the S3-FIFO cache.
     ///
     /// # Errors
@@ -370,24 +382,34 @@ impl S3FifoCacheBuilder {
             .with_next_layer(1)
             .with_demotion_threshold(self.demotion_threshold);
 
-        let layer0 = FifoLayerBuilder::new()
+        let mut layer0_builder = FifoLayerBuilder::new()
             .layer_id(0)
             .pool_id(0)
             .config(layer0_config)
             .segment_size(self.segment_size)
-            .heap_size(small_queue_size)
-            .build()?;
+            .heap_size(small_queue_size);
+
+        if let Some(node) = self.numa_node {
+            layer0_builder = layer0_builder.numa_node(node);
+        }
+
+        let layer0 = layer0_builder.build()?;
 
         // Create Layer 1: TTL-organized main cache
         let layer1_config = LayerConfig::new().with_ghosts(true);
 
-        let layer1 = TtlLayerBuilder::new()
+        let mut layer1_builder = TtlLayerBuilder::new()
             .layer_id(1)
             .pool_id(1)
             .config(layer1_config)
             .segment_size(self.segment_size)
-            .heap_size(main_cache_size)
-            .build()?;
+            .heap_size(main_cache_size);
+
+        if let Some(node) = self.numa_node {
+            layer1_builder = layer1_builder.numa_node(node);
+        }
+
+        let layer1 = layer1_builder.build()?;
 
         // Create hashtable
         let hashtable = Arc::new(CuckooHashtable::new(self.hashtable_power));

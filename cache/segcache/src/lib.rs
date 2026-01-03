@@ -226,6 +226,9 @@ pub struct SegCacheBuilder {
 
     /// Enable ghost entries for evicted items.
     enable_ghosts: bool,
+
+    /// NUMA node to bind memory to (Linux only).
+    numa_node: Option<u32>,
 }
 
 impl Default for SegCacheBuilder {
@@ -248,6 +251,7 @@ impl SegCacheBuilder {
             hashtable_power: 16,         // 64K buckets
             hugepage_size: HugepageSize::None,
             enable_ghosts: false,
+            numa_node: None,
         }
     }
 
@@ -297,6 +301,14 @@ impl SegCacheBuilder {
         self
     }
 
+    /// Set the NUMA node to bind cache memory to (Linux only).
+    ///
+    /// When set, the allocated memory will be bound to the specified NUMA node.
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.numa_node = Some(node);
+        self
+    }
+
     /// Build the SegCache.
     ///
     /// # Errors
@@ -306,13 +318,18 @@ impl SegCacheBuilder {
         // Create TtlLayer
         let layer_config = LayerConfig::new().with_ghosts(self.enable_ghosts);
 
-        let layer = TtlLayerBuilder::new()
+        let mut layer_builder = TtlLayerBuilder::new()
             .layer_id(0)
             .pool_id(0)
             .config(layer_config)
             .segment_size(self.segment_size)
-            .heap_size(self.heap_size)
-            .build()?;
+            .heap_size(self.heap_size);
+
+        if let Some(node) = self.numa_node {
+            layer_builder = layer_builder.numa_node(node);
+        }
+
+        let layer = layer_builder.build()?;
 
         // Create hashtable
         let hashtable = Arc::new(CuckooHashtable::new(self.hashtable_power));

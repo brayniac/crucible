@@ -63,6 +63,8 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Runtime::Tokio => "tokio (not compiled)",
     };
 
+    let numa_node = config.numa_node();
+
     print_banner(&BannerConfig {
         version: env!("CARGO_PKG_VERSION"),
         runtime: config.runtime,
@@ -74,6 +76,7 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         heap_size: config.cache.heap_size,
         segment_size: config.cache.segment_size,
         cpu_affinity: cpu_affinity_slice,
+        numa_node,
     });
 
     // Create cache based on backend selection
@@ -111,12 +114,18 @@ fn create_segcache(config: &Config) -> Result<impl cache_core::Cache, Box<dyn st
         HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
     };
 
-    let cache = SegCache::builder()
+    let mut builder = SegCache::builder()
         .heap_size(config.cache.heap_size)
         .segment_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power)
-        .hugepage_size(hugepage_size)
-        .build()?;
+        .hugepage_size(hugepage_size);
+
+    // Use auto-detected or explicit NUMA node
+    if let Some(node) = config.numa_node() {
+        builder = builder.numa_node(node);
+    }
+
+    let cache = builder.build()?;
 
     Ok(cache)
 }
@@ -130,12 +139,18 @@ fn create_s3fifo(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std:
         HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
     };
 
-    let cache = S3FifoCache::builder()
+    let mut builder = S3FifoCache::builder()
         .ram_size(config.cache.heap_size)
         .segment_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power)
-        .hugepage_size(hugepage_size)
-        .build()?;
+        .hugepage_size(hugepage_size);
+
+    // Use auto-detected or explicit NUMA node
+    if let Some(node) = config.numa_node() {
+        builder = builder.numa_node(node);
+    }
+
+    let cache = builder.build()?;
 
     Ok(cache)
 }
@@ -169,6 +184,10 @@ hashtable_power = 26
 # Hugepage size: "none", "2mb", or "1gb" (Linux only)
 # Falls back to regular pages if hugepages are unavailable
 hugepage = "none"
+
+# NUMA node to bind cache memory to (Linux only)
+# If not set, auto-detected from cpu_affinity when all CPUs are on the same node
+# numa_node = 0
 
 # Protocol listeners - configure one or more
 [[listener]]
