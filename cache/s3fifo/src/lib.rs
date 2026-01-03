@@ -387,7 +387,8 @@ impl S3FifoCacheBuilder {
             .pool_id(0)
             .config(layer0_config)
             .segment_size(self.segment_size)
-            .heap_size(small_queue_size);
+            .heap_size(small_queue_size)
+            .hugepage_size(self.hugepage_size);
 
         if let Some(node) = self.numa_node {
             layer0_builder = layer0_builder.numa_node(node);
@@ -403,7 +404,8 @@ impl S3FifoCacheBuilder {
             .pool_id(1)
             .config(layer1_config)
             .segment_size(self.segment_size)
-            .heap_size(main_cache_size);
+            .heap_size(main_cache_size)
+            .hugepage_size(self.hugepage_size);
 
         if let Some(node) = self.numa_node {
             layer1_builder = layer1_builder.numa_node(node);

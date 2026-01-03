@@ -120,19 +120,34 @@ pub enum CacheBackend {
 ///
 /// Controls whether to use explicit hugepages for cache memory allocation.
 /// Falls back to regular pages (with THP hint) if hugepages are unavailable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HugepageConfig {
     /// No explicit hugepages, use regular 4KB pages.
     /// The OS may still use THP if configured system-wide.
     #[default]
     None,
     /// 2MB hugepages (Linux only).
-    #[serde(rename = "2mb")]
     TwoMegabyte,
     /// 1GB hugepages (Linux only).
-    #[serde(rename = "1gb")]
     OneGigabyte,
+}
+
+impl<'de> Deserialize<'de> for HugepageConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "none" => Ok(HugepageConfig::None),
+            "2mb" => Ok(HugepageConfig::TwoMegabyte),
+            "1gb" => Ok(HugepageConfig::OneGigabyte),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid hugepage size: '{}' (expected 'none', '2mb', or '1gb')",
+                s
+            ))),
+        }
+    }
 }
 
 /// Protocol listener configuration.

@@ -344,6 +344,7 @@ pub struct FifoLayerBuilder {
     segment_size: usize,
     heap_size: usize,
     numa_node: Option<u32>,
+    hugepage_size: crate::hugepage::HugepageSize,
 }
 
 impl FifoLayerBuilder {
@@ -356,6 +357,7 @@ impl FifoLayerBuilder {
             segment_size: 1024 * 1024,   // 1MB
             heap_size: 64 * 1024 * 1024, // 64MB
             numa_node: None,
+            hugepage_size: crate::hugepage::HugepageSize::None,
         }
     }
 
@@ -395,12 +397,19 @@ impl FifoLayerBuilder {
         self
     }
 
+    /// Set the hugepage size preference.
+    pub fn hugepage_size(mut self, size: crate::hugepage::HugepageSize) -> Self {
+        self.hugepage_size = size;
+        self
+    }
+
     /// Build the FIFO layer.
     pub fn build(self) -> Result<FifoLayer, std::io::Error> {
         let mut builder = MemoryPoolBuilder::new(self.pool_id)
             .per_item_ttl(true) // FIFO layer uses per-item TTL
             .segment_size(self.segment_size)
-            .heap_size(self.heap_size);
+            .heap_size(self.heap_size)
+            .hugepage_size(self.hugepage_size);
 
         if let Some(node) = self.numa_node {
             builder = builder.numa_node(node);

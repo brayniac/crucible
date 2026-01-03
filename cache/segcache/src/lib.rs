@@ -323,7 +323,8 @@ impl SegCacheBuilder {
             .pool_id(0)
             .config(layer_config)
             .segment_size(self.segment_size)
-            .heap_size(self.heap_size);
+            .heap_size(self.heap_size)
+            .hugepage_size(self.hugepage_size);
 
         if let Some(node) = self.numa_node {
             layer_builder = layer_builder.numa_node(node);

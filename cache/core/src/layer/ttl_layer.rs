@@ -421,6 +421,7 @@ pub struct TtlLayerBuilder {
     segment_size: usize,
     heap_size: usize,
     numa_node: Option<u32>,
+    hugepage_size: crate::hugepage::HugepageSize,
 }
 
 impl TtlLayerBuilder {
@@ -433,6 +434,7 @@ impl TtlLayerBuilder {
             segment_size: 1024 * 1024,    // 1MB
             heap_size: 256 * 1024 * 1024, // 256MB
             numa_node: None,
+            hugepage_size: crate::hugepage::HugepageSize::None,
         }
     }
 
@@ -472,12 +474,19 @@ impl TtlLayerBuilder {
         self
     }
 
+    /// Set the hugepage size preference.
+    pub fn hugepage_size(mut self, size: crate::hugepage::HugepageSize) -> Self {
+        self.hugepage_size = size;
+        self
+    }
+
     /// Build the TTL layer.
     pub fn build(self) -> Result<TtlLayer, std::io::Error> {
         let mut builder = MemoryPoolBuilder::new(self.pool_id)
             .per_item_ttl(false) // TTL layer uses segment-level TTL
             .segment_size(self.segment_size)
-            .heap_size(self.heap_size);
+            .heap_size(self.heap_size)
+            .hugepage_size(self.hugepage_size);
 
         if let Some(node) = self.numa_node {
             builder = builder.numa_node(node);
