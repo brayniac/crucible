@@ -567,7 +567,7 @@ fn run_worker<C: Cache>(
                     );
                 }
 
-                CompletionKind::Error { conn_id, .. } => {
+                CompletionKind::Error { conn_id, error: _ } => {
                     close_connection(
                         &mut driver,
                         &mut connections,

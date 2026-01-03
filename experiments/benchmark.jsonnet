@@ -385,7 +385,7 @@ function(
                             ulimit -n 500000
                             ulimit -a
 
-                            export CRUCIBLE_DIAGNOSTICS=1
+                            export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
                             /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-benchmark warmup.toml
                         |||
                     ),
@@ -404,7 +404,7 @@ function(
                             ulimit -n 500000
                             ulimit -a
 
-                            export CRUCIBLE_DIAGNOSTICS=1
+                            export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
                             /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-benchmark loadgen.toml
                         |||
                     ),
