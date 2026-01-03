@@ -224,19 +224,21 @@ impl IoWorker {
         let pipeline_depth = cfg.config.connection.pipeline_depth;
 
         // Buffer count needs to handle peak load where all connections might have
-        // responses arriving simultaneously. With pipelining, each connection can have
-        // up to pipeline_depth responses in flight. Size for worst case scenario.
-        // Use connections * (pipeline_depth / 2) to handle burst responses.
+        // responses arriving simultaneously. Each connection needs at least 2 buffers
+        // (one being processed, one for next recv). With pipelining, scale further.
+        // Minimum is 4x connections to handle burst responses at any pipeline depth.
+        let pipeline_factor = pipeline_depth.max(4);
         let buffer_count = conns_per_worker
-            .saturating_mul(pipeline_depth / 2)
-            .max(512)
+            .saturating_mul(pipeline_factor)
+            .max(conns_per_worker.saturating_mul(4))
+            .max(1024)
             .min(16384) as u16;
 
         // Increase sq_depth to handle high throughput - needs to accommodate
         // both recv completions and send submissions
         let sq_depth = conns_per_worker
-            .saturating_mul(pipeline_depth / 4)
-            .max(512)
+            .saturating_mul(pipeline_factor)
+            .max(1024)
             .min(8192) as u32;
 
         let driver = Driver::builder()
