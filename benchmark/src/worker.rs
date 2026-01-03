@@ -583,18 +583,18 @@ impl IoWorker {
 
             match self.driver.send(conn_id, send_buf) {
                 Ok(n) => {
-                    tracing::debug!("worker {} sent {} bytes", self.id, n);
+                    tracing::trace!("worker {} sent {} bytes", self.id, n);
                     session.bytes_sent(n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    tracing::debug!(
+                    tracing::trace!(
                         "worker {} send would block ({} bytes pending)",
                         self.id,
                         send_buf.len()
                     );
                 }
                 Err(e) => {
-                    tracing::debug!("send error: {}", e);
+                    tracing::debug!("worker {} send error: {}", self.id, e);
                     to_close.push(idx);
                 }
             }
@@ -618,25 +618,12 @@ impl IoWorker {
     fn process_completions(&mut self) -> io::Result<()> {
         let completions = self.driver.drain_completions();
 
-        if !completions.is_empty() {
-            tracing::debug!(
-                "worker {} processing {} completions",
-                self.id,
-                completions.len()
-            );
-        }
-
         // Collect indices and reasons for sessions to close (to avoid borrow conflicts)
         let mut to_close: Vec<(usize, DisconnectReason)> = Vec::new();
 
         for completion in completions {
             match completion.kind {
                 CompletionKind::Recv { conn_id } => {
-                    tracing::debug!(
-                        "worker {} got Recv completion for conn {}",
-                        self.id,
-                        conn_id.as_usize()
-                    );
                     // Data is available to read
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
