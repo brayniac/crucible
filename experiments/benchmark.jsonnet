@@ -266,7 +266,7 @@ function(
                             export HOME=/tmp/crucible-build
 
                             ulimit -n 500000
-                            ulimit -l unlimited
+                            sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
                             export CRUCIBLE_DIAGNOSTICS=1
                             /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-server server.toml &
@@ -384,7 +384,7 @@ function(
                             export HOME=/tmp/crucible-build
 
                             ulimit -n 500000
-                            ulimit -l unlimited
+                            sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
 
                             export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
@@ -404,7 +404,7 @@ function(
                             export HOME=/tmp/crucible-build
 
                             ulimit -n 500000
-                            ulimit -l unlimited
+                            sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
 
                             export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug

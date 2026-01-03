@@ -275,7 +275,7 @@ function(
                             export HOME=/tmp/crucible-build
 
                             ulimit -n 500000
-                            ulimit -l unlimited
+                            sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
                             $HOME/crucible/target/release/crucible-server server.toml &
                             SERVER_PID=$!
@@ -301,7 +301,7 @@ function(
 
                             echo "Running warmup workload..."
                             ulimit -n 500000
-                            ulimit -l unlimited
+                            sudo prlimit --memlock=unlimited --pid $$
                             $HOME/crucible/target/release/crucible-benchmark warmup.toml
                             echo "Warmup complete"
 
@@ -318,7 +318,7 @@ function(
 
                             echo "Starting load generation..."
                             ulimit -n 500000
-                            ulimit -l unlimited
+                            sudo prlimit --memlock=unlimited --pid $$
                             $HOME/crucible/target/release/crucible-benchmark loadgen.toml &
                             BENCHMARK_PID=$!
                             echo "BENCHMARK_PID=$BENCHMARK_PID" >> pids.env
