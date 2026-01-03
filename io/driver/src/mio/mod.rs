@@ -26,6 +26,9 @@ struct MioConnection {
 /// Listener state for mio driver.
 struct MioListener {
     listener: MioTcpListener,
+    /// When true, accepted connections are not registered with poll.
+    /// Instead, AcceptRaw completions are emitted with the raw fd.
+    raw_mode: bool,
 }
 
 /// Mio-based I/O driver.
@@ -111,17 +114,49 @@ impl IoDriver for MioDriver {
 
         entry.insert(MioListener {
             listener: mio_listener,
+            raw_mode: false,
         });
 
         Ok(ListenerId::new(id))
     }
 
     fn listen_raw(&mut self, addr: SocketAddr, backlog: u32) -> io::Result<ListenerId> {
-        // For mio, listen_raw behaves the same as listen since we don't have
-        // the same multishot accept optimization. The single-acceptor pattern
-        // can still be used but without the raw fd optimization.
-        // This will still emit regular Accept events, not AcceptRaw.
-        self.listen(addr, backlog)
+        // Create socket with socket2 for more control
+        let socket = socket2::Socket::new(
+            match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            },
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+
+        socket.set_reuse_address(true)?;
+        // Note: NO SO_REUSEPORT for raw mode - single acceptor pattern
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(backlog as i32)?;
+
+        // Convert to mio TcpListener
+        let std_listener: std::net::TcpListener = socket.into();
+        let mut mio_listener = MioTcpListener::from_std(std_listener);
+
+        let entry = self.listeners.vacant_entry();
+        let id = entry.key();
+
+        // Register with poll
+        self.poll.registry().register(
+            &mut mio_listener,
+            Token(id + LISTENER_TOKEN_OFFSET),
+            Interest::READABLE,
+        )?;
+
+        entry.insert(MioListener {
+            listener: mio_listener,
+            raw_mode: true,
+        });
+
+        Ok(ListenerId::new(id))
     }
 
     fn close_listener(&mut self, id: ListenerId) -> io::Result<()> {
@@ -334,39 +369,67 @@ impl MioDriver {
             None => return,
         };
 
+        let raw_mode = listener.raw_mode;
+
         loop {
             match listener.listener.accept() {
-                Ok((mut stream, addr)) => {
-                    // Register the new connection
-                    let entry = self.connections.vacant_entry();
-                    let conn_id = entry.key();
+                Ok((stream, addr)) => {
+                    if raw_mode {
+                        // Raw mode: don't register, emit AcceptRaw with raw fd
+                        // Set TCP_NODELAY before handing off
+                        let raw_fd = stream.into_raw_fd();
+                        unsafe {
+                            let optval: libc::c_int = 1;
+                            libc::setsockopt(
+                                raw_fd,
+                                libc::IPPROTO_TCP,
+                                libc::TCP_NODELAY,
+                                &optval as *const _ as *const libc::c_void,
+                                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                            );
+                        }
 
-                    if let Err(e) = self.poll.registry().register(
-                        &mut stream,
-                        Token(conn_id),
-                        Interest::READABLE | Interest::WRITABLE,
-                    ) {
-                        self.pending_completions.push(Completion::new(
-                            CompletionKind::ListenerError {
+                        self.pending_completions
+                            .push(Completion::new(CompletionKind::AcceptRaw {
                                 listener_id: ListenerId::new(listener_id),
-                                error: e,
-                            },
-                        ));
-                        continue;
+                                raw_fd,
+                                addr,
+                            }));
+                    } else {
+                        // Normal mode: register the new connection
+                        let mut mio_stream =
+                            unsafe { MioTcpStream::from_raw_fd(stream.into_raw_fd()) };
+
+                        let entry = self.connections.vacant_entry();
+                        let conn_id = entry.key();
+
+                        if let Err(e) = self.poll.registry().register(
+                            &mut mio_stream,
+                            Token(conn_id),
+                            Interest::READABLE | Interest::WRITABLE,
+                        ) {
+                            self.pending_completions.push(Completion::new(
+                                CompletionKind::ListenerError {
+                                    listener_id: ListenerId::new(listener_id),
+                                    error: e,
+                                },
+                            ));
+                            continue;
+                        }
+
+                        entry.insert(MioConnection {
+                            stream: mio_stream,
+                            readable: false,
+                            writable: true,
+                        });
+
+                        self.pending_completions
+                            .push(Completion::new(CompletionKind::Accept {
+                                listener_id: ListenerId::new(listener_id),
+                                conn_id: ConnId::new(conn_id),
+                                addr,
+                            }));
                     }
-
-                    entry.insert(MioConnection {
-                        stream,
-                        readable: false,
-                        writable: true,
-                    });
-
-                    self.pending_completions
-                        .push(Completion::new(CompletionKind::Accept {
-                            listener_id: ListenerId::new(listener_id),
-                            conn_id: ConnId::new(conn_id),
-                            addr,
-                        }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // No more pending connections

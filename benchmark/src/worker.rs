@@ -533,7 +533,10 @@ impl IoWorker {
 
     #[inline]
     fn flush_sends(&mut self) -> io::Result<()> {
-        for session in &mut self.sessions {
+        // Collect indices of sessions that fail during send
+        let mut to_close = Vec::new();
+
+        for (idx, session) in self.sessions.iter_mut().enumerate() {
             if !session.is_connected() {
                 continue;
             }
@@ -562,15 +565,20 @@ impl IoWorker {
                 }
                 Err(e) => {
                     tracing::debug!("send error: {}", e);
-                    session.disconnect();
-                    self.shared
-                        .connections_active
-                        .fetch_sub(1, Ordering::Relaxed);
-                    self.shared
-                        .connections_failed
-                        .fetch_add(1, Ordering::Relaxed);
+                    to_close.push(idx);
                 }
             }
+        }
+
+        // Close failed sessions after iteration
+        for idx in to_close {
+            self.close_session(idx);
+            self.shared
+                .connections_active
+                .fetch_sub(1, Ordering::Relaxed);
+            self.shared
+                .connections_failed
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -588,6 +596,9 @@ impl IoWorker {
             );
         }
 
+        // Collect indices of sessions to close (to avoid borrow conflicts)
+        let mut to_close = Vec::new();
+
         for completion in completions {
             match completion.kind {
                 CompletionKind::Recv { conn_id } => {
@@ -601,6 +612,7 @@ impl IoWorker {
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
                         let session = &mut self.sessions[idx];
                         // Read all available data
+                        let mut should_close = false;
                         loop {
                             match self.driver.recv(conn_id, &mut self.recv_buf) {
                                 Ok(0) => {
@@ -610,13 +622,7 @@ impl IoWorker {
                                         self.id,
                                         id
                                     );
-                                    session.disconnect();
-                                    self.shared
-                                        .connections_active
-                                        .fetch_sub(1, Ordering::Relaxed);
-                                    self.shared
-                                        .connections_failed
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    should_close = true;
                                     break;
                                 }
                                 Ok(n) => {
@@ -624,16 +630,13 @@ impl IoWorker {
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                 Err(_) => {
-                                    session.disconnect();
-                                    self.shared
-                                        .connections_active
-                                        .fetch_sub(1, Ordering::Relaxed);
-                                    self.shared
-                                        .connections_failed
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    should_close = true;
                                     break;
                                 }
                             }
+                        }
+                        if should_close {
+                            to_close.push(idx);
                         }
                     }
                 }
@@ -677,26 +680,14 @@ impl IoWorker {
                     );
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        self.sessions[idx].disconnect();
-                        self.shared
-                            .connections_active
-                            .fetch_sub(1, Ordering::Relaxed);
-                        self.shared
-                            .connections_failed
-                            .fetch_add(1, Ordering::Relaxed);
+                        to_close.push(idx);
                     }
                 }
                 CompletionKind::Error { conn_id, error } => {
                     let id = conn_id.as_usize();
                     tracing::debug!("connection {} error: {}", id, error);
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        self.sessions[idx].disconnect();
-                        self.shared
-                            .connections_active
-                            .fetch_sub(1, Ordering::Relaxed);
-                        self.shared
-                            .connections_failed
-                            .fetch_add(1, Ordering::Relaxed);
+                        to_close.push(idx);
                     }
                 }
                 // Accept, AcceptRaw, and ListenerError are for server-side, not used here
@@ -704,6 +695,17 @@ impl IoWorker {
                 | CompletionKind::AcceptRaw { .. }
                 | CompletionKind::ListenerError { .. } => {}
             }
+        }
+
+        // Close failed sessions after processing all completions
+        for idx in to_close {
+            self.close_session(idx);
+            self.shared
+                .connections_active
+                .fetch_sub(1, Ordering::Relaxed);
+            self.shared
+                .connections_failed
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -835,6 +837,17 @@ impl IoWorker {
                 }
             }
         }
+    }
+
+    /// Close a session's connection in the driver and mark it as disconnected.
+    /// This ensures the socket is properly closed so the server receives FIN/RST.
+    fn close_session(&mut self, idx: usize) {
+        let session = &mut self.sessions[idx];
+        if let Some(conn_id) = session.conn_id() {
+            let _ = self.driver.close(conn_id);
+            self.conn_id_to_idx.remove(&conn_id.as_usize());
+        }
+        session.disconnect();
     }
 }
 

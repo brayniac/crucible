@@ -283,7 +283,8 @@ fn run_acceptor(
         for completion in driver.drain_completions() {
             match completion.kind {
                 CompletionKind::AcceptRaw { raw_fd, addr, .. } => {
-                    // Round-robin distribution to workers (io_uring path)
+                    // Round-robin distribution to workers
+                    // Both io_uring and mio emit AcceptRaw when using listen_raw()
                     let sender = &senders[next_worker];
                     next_worker = (next_worker + 1) % num_workers;
 
@@ -293,24 +294,9 @@ fn run_acceptor(
                         unsafe { libc::close(raw_fd) };
                     }
                 }
-                CompletionKind::Accept { conn_id, addr, .. } => {
-                    // Mio fallback path: take the fd and distribute it
-                    // For mio, listen_raw delegates to listen, so we get Accept events
-                    match driver.take_fd(conn_id) {
-                        Ok(raw_fd) => {
-                            let sender = &senders[next_worker];
-                            next_worker = (next_worker + 1) % num_workers;
-
-                            // Try to send the fd to the worker
-                            if sender.try_send((raw_fd, addr)).is_err() {
-                                // Channel full or disconnected, close the fd
-                                unsafe { libc::close(raw_fd) };
-                            }
-                        }
-                        Err(_) => {
-                            // Connection not found, already closed
-                        }
-                    }
+                CompletionKind::Accept { .. } => {
+                    // Should not happen with listen_raw(), but handle gracefully
+                    // by ignoring (connection will be closed when dropped)
                 }
                 CompletionKind::ListenerError { error, .. } => {
                     eprintln!("Acceptor listener error: {}", error);
