@@ -217,7 +217,15 @@ impl IoWorker {
     /// Create a new worker.
     pub fn new(cfg: IoWorkerConfig) -> io::Result<Self> {
         let engine = cfg.config.general.io_engine;
-        let driver = Driver::builder().engine(engine).build()?;
+        // Calculate connections per worker and use 4x for buffer count to avoid ENOMEM
+        let total_connections = cfg.config.connection.total_connections();
+        let num_threads = cfg.config.general.threads.max(1);
+        let conns_per_worker = (total_connections + num_threads - 1) / num_threads;
+        let buffer_count = conns_per_worker.saturating_mul(4).max(256) as u16;
+        let driver = Driver::builder()
+            .engine(engine)
+            .buffer_count(buffer_count)
+            .build()?;
 
         let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);
         let key_buf = vec![0u8; cfg.config.workload.keyspace.length];
