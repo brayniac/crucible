@@ -634,11 +634,6 @@ impl IoWorker {
                             match self.driver.recv(conn_id, &mut self.recv_buf) {
                                 Ok(0) => {
                                     // Server closed connection (EOF)
-                                    tracing::debug!(
-                                        "worker {} conn {} server closed connection",
-                                        self.id,
-                                        id
-                                    );
                                     close_reason = Some(DisconnectReason::Eof);
                                     break;
                                 }
@@ -658,11 +653,6 @@ impl IoWorker {
                     }
                 }
                 CompletionKind::SendReady { conn_id } => {
-                    tracing::debug!(
-                        "worker {} got SendReady for conn {}",
-                        self.id,
-                        conn_id.as_usize()
-                    );
                     // Socket is writable, try to flush
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
@@ -671,30 +661,16 @@ impl IoWorker {
                         if !send_buf.is_empty() {
                             match self.driver.send(conn_id, send_buf) {
                                 Ok(n) => {
-                                    tracing::debug!(
-                                        "worker {} SendReady flush sent {} bytes",
-                                        self.id,
-                                        n
-                                    );
                                     session.bytes_sent(n);
                                 }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "worker {} SendReady flush failed: {}",
-                                        self.id,
-                                        e
-                                    );
+                                Err(_) => {
+                                    // WouldBlock is expected, other errors handled elsewhere
                                 }
                             }
                         }
                     }
                 }
                 CompletionKind::Closed { conn_id } => {
-                    tracing::debug!(
-                        "worker {} got Closed for conn {}",
-                        self.id,
-                        conn_id.as_usize()
-                    );
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
                         to_close.push((idx, DisconnectReason::ClosedEvent));
@@ -823,12 +799,6 @@ impl IoWorker {
                 Ok(stream) => {
                     match self.driver.register(stream) {
                         Ok(conn_id) => {
-                            tracing::debug!(
-                                "worker {} reconnected to {} (new conn_id={})",
-                                self.id,
-                                addr,
-                                conn_id.as_usize()
-                            );
                             let session = &mut self.sessions[idx];
                             session.set_conn_id(conn_id);
                             session.reconnect_attempted(true);
@@ -840,19 +810,12 @@ impl IoWorker {
                                 .connections_active
                                 .fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(e) => {
-                            tracing::debug!(
-                                "worker {} failed to register reconnection to {}: {}",
-                                self.id,
-                                addr,
-                                e
-                            );
+                        Err(_) => {
                             self.sessions[idx].reconnect_attempted(false);
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("worker {} failed to reconnect to {}: {}", self.id, addr, e);
+                Err(_) => {
                     self.sessions[idx].reconnect_attempted(false);
                 }
             }
