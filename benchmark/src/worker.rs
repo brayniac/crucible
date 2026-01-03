@@ -217,15 +217,33 @@ impl IoWorker {
     /// Create a new worker.
     pub fn new(cfg: IoWorkerConfig) -> io::Result<Self> {
         let engine = cfg.config.general.io_engine;
-        // Calculate connections per worker and use 16x for buffer count to avoid ENOMEM
-        // Multishot recv can have multiple completions in-flight per connection
+        // Calculate connections per worker for buffer/queue sizing
         let total_connections = cfg.config.connection.total_connections();
         let num_threads = cfg.config.general.threads.max(1);
         let conns_per_worker = (total_connections + num_threads - 1) / num_threads;
-        let buffer_count = conns_per_worker.saturating_mul(16).max(1024).min(65535) as u16;
+        let pipeline_depth = cfg.config.connection.pipeline_depth;
+
+        // Buffer count needs to handle peak load where all connections might have
+        // responses arriving simultaneously. With pipelining, each connection can have
+        // up to pipeline_depth responses in flight. Size for worst case scenario.
+        // Use connections * (pipeline_depth / 2) to handle burst responses.
+        let buffer_count = conns_per_worker
+            .saturating_mul(pipeline_depth / 2)
+            .max(512)
+            .min(16384) as u16;
+
+        // Increase sq_depth to handle high throughput - needs to accommodate
+        // both recv completions and send submissions
+        let sq_depth = conns_per_worker
+            .saturating_mul(pipeline_depth / 4)
+            .max(512)
+            .min(8192) as u32;
+
         let driver = Driver::builder()
             .engine(engine)
-            .buffer_count(buffer_count)
+            .buffer_count(buffer_count.next_power_of_two())
+            .buffer_size(4096)
+            .sq_depth(sq_depth.next_power_of_two())
             .build()?;
 
         let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);
@@ -235,8 +253,6 @@ impl IoWorker {
         // Fill value buffer with random data
         let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);
         init_rng.fill_bytes(&mut value_buf);
-
-        let pipeline_depth = cfg.config.connection.pipeline_depth;
 
         Ok(Self {
             id: cfg.id,
