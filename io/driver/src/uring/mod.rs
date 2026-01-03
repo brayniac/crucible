@@ -263,6 +263,14 @@ impl UringDriver {
                     && let Some(conn) = self.connections.get_mut(conn_id)
                 {
                     conn.multishot_active = true;
+                } else {
+                    // Failed to re-arm multishot recv - connection would be orphaned.
+                    // Emit an error so the server can clean up.
+                    self.pending_completions
+                        .push(Completion::new(CompletionKind::Error {
+                            conn_id: ConnId::new(conn_id),
+                            error: io::Error::other("failed to re-arm multishot recv"),
+                        }));
                 }
             }
         }
@@ -398,10 +406,20 @@ impl UringDriver {
             let conn = UringConnection::new(new_fd, fixed_slot, self.buffer_size);
             entry.insert(conn);
 
-            // Submit multishot recv
-            if self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
-                && let Some(conn) = self.connections.get_mut(conn_id)
-            {
+            // Submit multishot recv - if this fails, clean up and skip this connection
+            if self.submit_multishot_recv(conn_id, fixed_slot).is_err() {
+                self.connections.try_remove(conn_id);
+                let fds = [-1i32];
+                let _ = self
+                    .ring
+                    .submitter()
+                    .register_files_update(fixed_slot, &fds);
+                self.registered_files.free(fixed_slot);
+                unsafe { libc::close(new_fd) };
+                return;
+            }
+
+            if let Some(conn) = self.connections.get_mut(conn_id) {
                 conn.multishot_active = true;
             }
 
@@ -506,10 +524,20 @@ impl IoDriver for UringDriver {
         };
         entry.insert(listener);
 
-        // Submit multishot accept
-        if self.submit_multishot_accept(id, fixed_slot).is_ok()
-            && let Some(listener) = self.listeners.get_mut(id)
-        {
+        // Submit multishot accept - if this fails, clean up and return error
+        if let Err(e) = self.submit_multishot_accept(id, fixed_slot) {
+            self.listeners.try_remove(id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
+
+        if let Some(listener) = self.listeners.get_mut(id) {
             listener.multishot_active = true;
         }
 
@@ -566,10 +594,20 @@ impl IoDriver for UringDriver {
         };
         entry.insert(listener);
 
-        // Submit multishot accept
-        if self.submit_multishot_accept(id, fixed_slot).is_ok()
-            && let Some(listener) = self.listeners.get_mut(id)
-        {
+        // Submit multishot accept - if this fails, clean up and return error
+        if let Err(e) = self.submit_multishot_accept(id, fixed_slot) {
+            self.listeners.try_remove(id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
+
+        if let Some(listener) = self.listeners.get_mut(id) {
             listener.multishot_active = true;
         }
 
@@ -632,10 +670,20 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Submit multishot recv
-        if self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
-            && let Some(conn) = self.connections.get_mut(conn_id)
-        {
+        // Submit multishot recv - if this fails, clean up and return error
+        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
+            self.connections.try_remove(conn_id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
+
+        if let Some(conn) = self.connections.get_mut(conn_id) {
             conn.multishot_active = true;
         }
 
@@ -677,10 +725,20 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Submit multishot recv
-        if self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
-            && let Some(conn) = self.connections.get_mut(conn_id)
-        {
+        // Submit multishot recv - if this fails, clean up and return error
+        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
+            self.connections.try_remove(conn_id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
+
+        if let Some(conn) = self.connections.get_mut(conn_id) {
             conn.multishot_active = true;
         }
 
