@@ -13,6 +13,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Set the current thread's name (visible in ps, htop, etc).
+/// Name is truncated to 15 chars (Linux limit).
+#[cfg(target_os = "linux")]
+fn set_thread_name(name: &str) {
+    use std::ffi::CString;
+    if let Ok(cname) = CString::new(name) {
+        unsafe {
+            libc::prctl(libc::PR_SET_NAME, cname.as_ptr());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_thread_name(_name: &str) {
+    // No-op on non-Linux
+}
+
 /// Configuration for each worker thread.
 #[derive(Clone)]
 struct WorkerConfig {
@@ -102,6 +119,7 @@ pub fn run<C: Cache + 'static>(
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", worker_id))
             .spawn(move || {
+                set_thread_name(&format!("crucible-w{}", worker_id));
                 if let Some(cpu) = cpu_id {
                     let _ = set_cpu_affinity(cpu);
                 }
@@ -125,6 +143,7 @@ pub fn run<C: Cache + 'static>(
         let handle = std::thread::Builder::new()
             .name("acceptor".to_string())
             .spawn(move || {
+                set_thread_name("crucible-accept");
                 if let Some(cpu) = acceptor_cpu {
                     let _ = set_cpu_affinity(cpu);
                 }
@@ -330,7 +349,7 @@ fn run_worker<C: Cache>(
                 Ok(conn_id) => {
                     CONNECTIONS_ACCEPTED.increment();
                     CONNECTIONS_ACTIVE.increment();
-                    stats.inc_accepts();
+                    // Don't count as "accept" - these came via channel from acceptor
 
                     let idx = conn_id.as_usize();
                     if idx >= connections.len() {
