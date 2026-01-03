@@ -57,6 +57,23 @@ impl Phase {
     }
 }
 
+/// Reason for a connection disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// Server closed connection (recv returned 0)
+    Eof,
+    /// Error during recv
+    RecvError,
+    /// Error during send
+    SendError,
+    /// Closed completion event from driver
+    ClosedEvent,
+    /// Error completion event from driver
+    ErrorEvent,
+    /// Failed to establish connection
+    ConnectFailed,
+}
+
 /// Per-worker statistics for diagnostics.
 pub struct WorkerStats {
     pub requests_sent: AtomicU64,
@@ -96,6 +113,13 @@ pub struct SharedState {
     pub connections_active: AtomicU64,
     /// Connections that have disconnected
     pub connections_failed: AtomicU64,
+    /// Disconnect reasons
+    pub disconnects_eof: AtomicU64,
+    pub disconnects_recv_error: AtomicU64,
+    pub disconnects_send_error: AtomicU64,
+    pub disconnects_closed_event: AtomicU64,
+    pub disconnects_error_event: AtomicU64,
+    pub disconnects_connect_failed: AtomicU64,
     /// Per-worker statistics (for diagnosing imbalance)
     pub worker_stats: Vec<WorkerStats>,
 }
@@ -111,6 +135,12 @@ impl SharedState {
             misses: AtomicU64::new(0),
             connections_active: AtomicU64::new(0),
             connections_failed: AtomicU64::new(0),
+            disconnects_eof: AtomicU64::new(0),
+            disconnects_recv_error: AtomicU64::new(0),
+            disconnects_send_error: AtomicU64::new(0),
+            disconnects_closed_event: AtomicU64::new(0),
+            disconnects_error_event: AtomicU64::new(0),
+            disconnects_connect_failed: AtomicU64::new(0),
             worker_stats: (0..num_workers).map(|_| WorkerStats::new()).collect(),
         }
     }
@@ -572,7 +602,7 @@ impl IoWorker {
 
         // Close failed sessions after iteration
         for idx in to_close {
-            self.close_session(idx);
+            self.close_session(idx, DisconnectReason::SendError);
             self.shared
                 .connections_active
                 .fetch_sub(1, Ordering::Relaxed);
@@ -596,8 +626,8 @@ impl IoWorker {
             );
         }
 
-        // Collect indices of sessions to close (to avoid borrow conflicts)
-        let mut to_close = Vec::new();
+        // Collect indices and reasons for sessions to close (to avoid borrow conflicts)
+        let mut to_close: Vec<(usize, DisconnectReason)> = Vec::new();
 
         for completion in completions {
             match completion.kind {
@@ -612,7 +642,7 @@ impl IoWorker {
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
                         let session = &mut self.sessions[idx];
                         // Read all available data
-                        let mut should_close = false;
+                        let mut close_reason: Option<DisconnectReason> = None;
                         loop {
                             match self.driver.recv(conn_id, &mut self.recv_buf) {
                                 Ok(0) => {
@@ -622,7 +652,7 @@ impl IoWorker {
                                         self.id,
                                         id
                                     );
-                                    should_close = true;
+                                    close_reason = Some(DisconnectReason::Eof);
                                     break;
                                 }
                                 Ok(n) => {
@@ -630,13 +660,13 @@ impl IoWorker {
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                 Err(_) => {
-                                    should_close = true;
+                                    close_reason = Some(DisconnectReason::RecvError);
                                     break;
                                 }
                             }
                         }
-                        if should_close {
-                            to_close.push(idx);
+                        if let Some(reason) = close_reason {
+                            to_close.push((idx, reason));
                         }
                     }
                 }
@@ -680,14 +710,14 @@ impl IoWorker {
                     );
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        to_close.push(idx);
+                        to_close.push((idx, DisconnectReason::ClosedEvent));
                     }
                 }
                 CompletionKind::Error { conn_id, error } => {
                     let id = conn_id.as_usize();
                     tracing::debug!("connection {} error: {}", id, error);
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        to_close.push(idx);
+                        to_close.push((idx, DisconnectReason::ErrorEvent));
                     }
                 }
                 // Accept, AcceptRaw, and ListenerError are for server-side, not used here
@@ -698,8 +728,8 @@ impl IoWorker {
         }
 
         // Close failed sessions after processing all completions
-        for idx in to_close {
-            self.close_session(idx);
+        for (idx, reason) in to_close {
+            self.close_session(idx, reason);
             self.shared
                 .connections_active
                 .fetch_sub(1, Ordering::Relaxed);
@@ -844,13 +874,45 @@ impl IoWorker {
 
     /// Close a session's connection in the driver and mark it as disconnected.
     /// This ensures the socket is properly closed so the server receives FIN/RST.
-    fn close_session(&mut self, idx: usize) {
+    fn close_session(&mut self, idx: usize, reason: DisconnectReason) {
         let session = &mut self.sessions[idx];
         if let Some(conn_id) = session.conn_id() {
             let _ = self.driver.close(conn_id);
             self.conn_id_to_idx.remove(&conn_id.as_usize());
         }
         session.disconnect();
+
+        // Track disconnect reason
+        match reason {
+            DisconnectReason::Eof => {
+                self.shared.disconnects_eof.fetch_add(1, Ordering::Relaxed);
+            }
+            DisconnectReason::RecvError => {
+                self.shared
+                    .disconnects_recv_error
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DisconnectReason::SendError => {
+                self.shared
+                    .disconnects_send_error
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DisconnectReason::ClosedEvent => {
+                self.shared
+                    .disconnects_closed_event
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DisconnectReason::ErrorEvent => {
+                self.shared
+                    .disconnects_error_event
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DisconnectReason::ConnectFailed => {
+                self.shared
+                    .disconnects_connect_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 

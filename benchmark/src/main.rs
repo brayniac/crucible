@@ -239,6 +239,13 @@ fn run_benchmark(
     let mut last_hits = 0u64;
     let mut last_misses = 0u64;
     let mut last_histogram: Option<Histogram> = None;
+    let mut last_failed = 0u64;
+    let mut last_eof = 0u64;
+    let mut last_recv_err = 0u64;
+    let mut last_send_err = 0u64;
+    let mut last_closed = 0u64;
+    let mut last_error_evt = 0u64;
+    let mut last_connect_failed = 0u64;
     let mut current_phase = Phase::Warmup;
 
     loop {
@@ -338,6 +345,43 @@ fn run_benchmark(
                 p999 / 1000.0,
             );
 
+            // Report disconnect reasons when connections have failed
+            let delta_failed = failed - last_failed;
+            if delta_failed > 0 {
+                let eof = shared.disconnects_eof.load(Ordering::Relaxed);
+                let recv_err = shared.disconnects_recv_error.load(Ordering::Relaxed);
+                let send_err = shared.disconnects_send_error.load(Ordering::Relaxed);
+                let closed = shared.disconnects_closed_event.load(Ordering::Relaxed);
+                let error_evt = shared.disconnects_error_event.load(Ordering::Relaxed);
+                let connect_failed = shared.disconnects_connect_failed.load(Ordering::Relaxed);
+
+                let d_eof = eof - last_eof;
+                let d_recv = recv_err - last_recv_err;
+                let d_send = send_err - last_send_err;
+                let d_closed = closed - last_closed;
+                let d_error = error_evt - last_error_evt;
+                let d_conn = connect_failed - last_connect_failed;
+
+                tracing::info!(
+                    "disconnects: {} (eof={} recv_err={} send_err={} closed={} error={} connect_failed={})",
+                    delta_failed,
+                    d_eof,
+                    d_recv,
+                    d_send,
+                    d_closed,
+                    d_error,
+                    d_conn,
+                );
+
+                last_eof = eof;
+                last_recv_err = recv_err;
+                last_send_err = send_err;
+                last_closed = closed;
+                last_error_evt = error_evt;
+                last_connect_failed = connect_failed;
+            }
+            last_failed = failed;
+
             // Print per-worker stats for diagnostics
             if std::env::var("CRUCIBLE_DIAGNOSTICS")
                 .map(|v| v == "1")
@@ -395,6 +439,21 @@ fn run_benchmark(
     tracing::info!("latency p99: {:.2} us", p99 / 1000.0);
     tracing::info!("latency p99.9: {:.2} us", p999 / 1000.0);
     tracing::info!("latency p99.99: {:.2} us", p9999 / 1000.0);
+
+    // Report final disconnect reason breakdown
+    let total_failed = shared.connections_failed.load(Ordering::Relaxed);
+    if total_failed > 0 {
+        tracing::info!(
+            "disconnects: {} (eof={} recv_err={} send_err={} closed={} error={} connect_failed={})",
+            total_failed,
+            shared.disconnects_eof.load(Ordering::Relaxed),
+            shared.disconnects_recv_error.load(Ordering::Relaxed),
+            shared.disconnects_send_error.load(Ordering::Relaxed),
+            shared.disconnects_closed_event.load(Ordering::Relaxed),
+            shared.disconnects_error_event.load(Ordering::Relaxed),
+            shared.disconnects_connect_failed.load(Ordering::Relaxed),
+        );
+    }
 
     drop(_admin_handle);
 
