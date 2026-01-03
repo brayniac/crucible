@@ -8,6 +8,7 @@ use cache_core::Cache;
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,13 +16,18 @@ use std::time::{Duration, Instant};
 /// Configuration for each worker thread.
 #[derive(Clone)]
 struct WorkerConfig {
-    listeners: Vec<SocketAddr>,
-    backlog: u32,
     read_buffer_size: usize,
     buffer_size: usize,
     buffer_count: u16,
     sq_depth: u32,
     sqpoll: bool,
+}
+
+/// Configuration for the acceptor thread.
+#[derive(Clone)]
+struct AcceptorConfig {
+    listeners: Vec<SocketAddr>,
+    backlog: u32,
 }
 
 /// Run the native runtime server.
@@ -42,8 +48,6 @@ pub fn run<C: Cache + 'static>(
         .unwrap_or(false);
 
     let worker_config = WorkerConfig {
-        listeners,
-        backlog: 4096,
         read_buffer_size: 64 * 1024,
         buffer_size: config.uring.buffer_size,
         buffer_count: config.uring.buffer_count,
@@ -51,12 +55,23 @@ pub fn run<C: Cache + 'static>(
         sqpoll: config.uring.sqpoll,
     };
 
+    let acceptor_config = AcceptorConfig {
+        listeners,
+        backlog: 4096,
+    };
+
     // Create per-worker stats
     let worker_stats: Arc<Vec<WorkerStats>> =
         Arc::new((0..num_workers).map(|_| WorkerStats::new()).collect());
 
-    // Shutdown flag for diagnostics thread
+    // Shutdown flag for diagnostics and acceptor threads
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Create channels for fd distribution (one per worker)
+    // Using crossbeam for bounded channels with good performance
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_workers)
+        .map(|_| crossbeam_channel::bounded::<(RawFd, SocketAddr)>(1024))
+        .unzip();
 
     // Start diagnostics thread if enabled
     let diagnostics_handle = if diagnostics_enabled {
@@ -75,8 +90,8 @@ pub fn run<C: Cache + 'static>(
     };
 
     // Spawn workers
-    let mut handles = Vec::with_capacity(num_workers);
-    for worker_id in 0..num_workers {
+    let mut handles = Vec::with_capacity(num_workers + 1);
+    for (worker_id, receiver) in receivers.into_iter().enumerate() {
         let cpu_id = cpu_affinity
             .as_ref()
             .map(|cpus| cpus[worker_id % cpus.len()]);
@@ -91,7 +106,9 @@ pub fn run<C: Cache + 'static>(
                     let _ = set_cpu_affinity(cpu);
                 }
 
-                if let Err(e) = run_worker(worker_id, worker_config, cache, &stats[worker_id]) {
+                if let Err(e) =
+                    run_worker(worker_id, worker_config, cache, &stats[worker_id], receiver)
+                {
                     eprintln!("Worker {} error: {}", worker_id, e);
                 }
             })
@@ -100,7 +117,27 @@ pub fn run<C: Cache + 'static>(
         handles.push(handle);
     }
 
-    // Wait for all workers
+    // Spawn acceptor thread
+    // Pin to first CPU in affinity list (shares with worker-0, but acceptor is lightweight)
+    {
+        let acceptor_cpu = cpu_affinity.as_ref().map(|cpus| cpus[0]);
+        let shutdown_flag = shutdown.clone();
+        let handle = std::thread::Builder::new()
+            .name("acceptor".to_string())
+            .spawn(move || {
+                if let Some(cpu) = acceptor_cpu {
+                    let _ = set_cpu_affinity(cpu);
+                }
+                if let Err(e) = run_acceptor(acceptor_config, senders, shutdown_flag) {
+                    eprintln!("Acceptor error: {}", e);
+                }
+            })
+            .expect("failed to spawn acceptor thread");
+
+        handles.push(handle);
+    }
+
+    // Wait for all threads
     for handle in handles {
         let _ = handle.join();
     }
@@ -195,11 +232,80 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Acceptor thread that accepts connections and distributes them to workers.
+fn run_acceptor(
+    config: AcceptorConfig,
+    senders: Vec<crossbeam_channel::Sender<(RawFd, SocketAddr)>>,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
+    // Use a small driver just for accepting connections
+    let mut driver = Driver::builder()
+        .buffer_size(4096) // minimal, not used for data
+        .buffer_count(16) // minimal
+        .sq_depth(64) // smaller ring for accept-only
+        .sqpoll(false) // no need for sqpoll on acceptor
+        .build()?;
+
+    // Start listening on all configured addresses using raw mode
+    for addr in &config.listeners {
+        driver.listen_raw(*addr, config.backlog)?;
+    }
+
+    let num_workers = senders.len();
+    let mut next_worker = 0usize;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        let _ = driver.poll(Some(Duration::from_millis(10)))?;
+
+        for completion in driver.drain_completions() {
+            match completion.kind {
+                CompletionKind::AcceptRaw { raw_fd, addr, .. } => {
+                    // Round-robin distribution to workers (io_uring path)
+                    let sender = &senders[next_worker];
+                    next_worker = (next_worker + 1) % num_workers;
+
+                    // Try to send the fd to the worker
+                    if sender.try_send((raw_fd, addr)).is_err() {
+                        // Channel full or disconnected, close the fd
+                        unsafe { libc::close(raw_fd) };
+                    }
+                }
+                CompletionKind::Accept { conn_id, addr, .. } => {
+                    // Mio fallback path: take the fd and distribute it
+                    // For mio, listen_raw delegates to listen, so we get Accept events
+                    match driver.take_fd(conn_id) {
+                        Ok(raw_fd) => {
+                            let sender = &senders[next_worker];
+                            next_worker = (next_worker + 1) % num_workers;
+
+                            // Try to send the fd to the worker
+                            if sender.try_send((raw_fd, addr)).is_err() {
+                                // Channel full or disconnected, close the fd
+                                unsafe { libc::close(raw_fd) };
+                            }
+                        }
+                        Err(_) => {
+                            // Connection not found, already closed
+                        }
+                    }
+                }
+                CompletionKind::ListenerError { error, .. } => {
+                    eprintln!("Acceptor listener error: {}", error);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_worker<C: Cache>(
     _worker_id: usize,
     config: WorkerConfig,
     cache: Arc<C>,
     stats: &WorkerStats,
+    fd_receiver: crossbeam_channel::Receiver<(RawFd, SocketAddr)>,
 ) -> io::Result<()> {
     let mut driver = Driver::builder()
         .buffer_size(config.buffer_size)
@@ -208,10 +314,7 @@ fn run_worker<C: Cache>(
         .sqpoll(config.sqpoll)
         .build()?;
 
-    // Start listening on all configured addresses
-    for addr in &config.listeners {
-        driver.listen(*addr, config.backlog)?;
-    }
+    // No listeners - connections come from the acceptor via channel
 
     // Use Vec<Option<Connection>> indexed by ConnId for O(1) access.
     // The io-driver's ConnId is its internal Slab index, so indices are reused
@@ -221,6 +324,26 @@ fn run_worker<C: Cache>(
     let mut recv_buf = vec![0u8; config.read_buffer_size];
 
     loop {
+        // Check for new connections from the acceptor (non-blocking)
+        while let Ok((raw_fd, _addr)) = fd_receiver.try_recv() {
+            match driver.register_fd(raw_fd) {
+                Ok(conn_id) => {
+                    CONNECTIONS_ACCEPTED.increment();
+                    CONNECTIONS_ACTIVE.increment();
+                    stats.inc_accepts();
+
+                    let idx = conn_id.as_usize();
+                    if idx >= connections.len() {
+                        connections.resize_with(idx + 1, || None);
+                    }
+                    connections[idx] = Some(Connection::new(config.read_buffer_size));
+                }
+                Err(_) => {
+                    // Failed to register, fd is already closed by driver
+                }
+            }
+        }
+
         let completions_count = driver.poll(Some(Duration::from_millis(1)))?;
         stats.inc_poll();
         if completions_count == 0 {
@@ -230,6 +353,7 @@ fn run_worker<C: Cache>(
 
         for completion in driver.drain_completions() {
             match completion.kind {
+                // Accept events can still come from mio fallback
                 CompletionKind::Accept { conn_id, .. } => {
                     CONNECTIONS_ACCEPTED.increment();
                     CONNECTIONS_ACTIVE.increment();
@@ -419,6 +543,12 @@ fn run_worker<C: Cache>(
 
                 CompletionKind::ListenerError { error, .. } => {
                     eprintln!("Listener error: {}", error);
+                }
+
+                // AcceptRaw is only used by the acceptor thread, not workers
+                CompletionKind::AcceptRaw { raw_fd, .. } => {
+                    // This shouldn't happen in workers, close the fd
+                    unsafe { libc::close(raw_fd) };
                 }
             }
         }

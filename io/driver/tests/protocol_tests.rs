@@ -234,6 +234,9 @@ fn run_test_server(
                 }
 
                 CompletionKind::ListenerError { .. } => {}
+
+                // AcceptRaw only used by listen_raw, not tested here
+                CompletionKind::AcceptRaw { .. } => {}
             }
         }
     }

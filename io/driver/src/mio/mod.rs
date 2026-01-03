@@ -116,6 +116,14 @@ impl IoDriver for MioDriver {
         Ok(ListenerId::new(id))
     }
 
+    fn listen_raw(&mut self, addr: SocketAddr, backlog: u32) -> io::Result<ListenerId> {
+        // For mio, listen_raw behaves the same as listen since we don't have
+        // the same multishot accept optimization. The single-acceptor pattern
+        // can still be used but without the raw fd optimization.
+        // This will still emit regular Accept events, not AcceptRaw.
+        self.listen(addr, backlog)
+    }
+
     fn close_listener(&mut self, id: ListenerId) -> io::Result<()> {
         if let Some(mut listener) = self.listeners.try_remove(id.as_usize()) {
             self.poll.registry().deregister(&mut listener.listener)?;
@@ -147,11 +155,52 @@ impl IoDriver for MioDriver {
         Ok(ConnId::new(id))
     }
 
+    fn register_fd(&mut self, raw_fd: RawFd) -> io::Result<ConnId> {
+        // Set non-blocking
+        unsafe {
+            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+            libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        let mut mio_stream = unsafe { MioTcpStream::from_raw_fd(raw_fd) };
+
+        let entry = self.connections.vacant_entry();
+        let id = entry.key();
+
+        // Register with poll
+        self.poll.registry().register(
+            &mut mio_stream,
+            Token(id),
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
+
+        entry.insert(MioConnection {
+            stream: mio_stream,
+            readable: false,
+            writable: true,
+        });
+
+        Ok(ConnId::new(id))
+    }
+
     fn close(&mut self, id: ConnId) -> io::Result<()> {
         if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
             self.poll.registry().deregister(&mut conn.stream)?;
         }
         Ok(())
+    }
+
+    fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
+        if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
+            self.poll.registry().deregister(&mut conn.stream)?;
+            // Extract the raw fd without closing it
+            Ok(conn.stream.into_raw_fd())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "connection not found",
+            ))
+        }
     }
 
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {

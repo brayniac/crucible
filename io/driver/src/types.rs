@@ -3,6 +3,9 @@
 use std::io;
 use std::net::SocketAddr;
 
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
+
 /// Opaque connection identifier.
 ///
 /// Returned when registering a connection or accepting a new one.
@@ -123,6 +126,20 @@ pub enum CompletionKind {
         listener_id: ListenerId,
         /// The error that occurred.
         error: io::Error,
+    },
+
+    /// A new connection was accepted in raw mode.
+    ///
+    /// Unlike `Accept`, the connection is NOT automatically registered.
+    /// The raw fd must be explicitly registered with a worker using `register_fd()`.
+    /// This is used for single-acceptor patterns with round-robin distribution.
+    AcceptRaw {
+        /// The listener that accepted the connection.
+        listener_id: ListenerId,
+        /// The raw file descriptor of the accepted connection.
+        raw_fd: RawFd,
+        /// The address of the remote peer.
+        addr: SocketAddr,
     },
 }
 

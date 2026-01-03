@@ -672,8 +672,10 @@ impl IoWorker {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                // Accept and ListenerError are for server-side, not used here
-                CompletionKind::Accept { .. } | CompletionKind::ListenerError { .. } => {}
+                // Accept, AcceptRaw, and ListenerError are for server-side, not used here
+                CompletionKind::Accept { .. }
+                | CompletionKind::AcceptRaw { .. }
+                | CompletionKind::ListenerError { .. } => {}
             }
         }
 

@@ -57,13 +57,28 @@ pub trait IoDriver: Send {
     /// Bind and start listening on an address.
     ///
     /// Returns a listener ID that can be used to identify accepted connections.
-    /// New connections will be reported via `Accept` completions.
+    /// New connections will be reported via `Accept` completions (auto-registered).
     ///
     /// # Arguments
     ///
     /// * `addr` - The address to bind to
     /// * `backlog` - The maximum number of pending connections
     fn listen(&mut self, addr: SocketAddr, backlog: u32) -> io::Result<ListenerId>;
+
+    /// Bind and start listening on an address in raw mode.
+    ///
+    /// Unlike `listen()`, connections accepted in raw mode are NOT automatically
+    /// registered with the driver. Instead, `AcceptRaw` completions are emitted
+    /// with the raw file descriptor. This is designed for single-acceptor patterns
+    /// where connections are distributed to workers via channels.
+    ///
+    /// Workers must call `register_fd()` to register received file descriptors.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - The address to bind to
+    /// * `backlog` - The maximum number of pending connections
+    fn listen_raw(&mut self, addr: SocketAddr, backlog: u32) -> io::Result<ListenerId>;
 
     /// Close a listener and stop accepting new connections.
     fn close_listener(&mut self, id: ListenerId) -> io::Result<()>;
@@ -76,10 +91,32 @@ pub trait IoDriver: Send {
     /// in non-blocking mode.
     fn register(&mut self, stream: TcpStream) -> io::Result<ConnId>;
 
+    /// Register a raw file descriptor with the driver.
+    ///
+    /// Used to register connections received from an acceptor thread via
+    /// `AcceptRaw` completions. The fd should be a valid TCP socket.
+    /// The driver takes ownership of the fd and will close it on connection close.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the fd is a valid, open TCP socket.
+    #[cfg(unix)]
+    fn register_fd(&mut self, fd: RawFd) -> io::Result<ConnId>;
+
     /// Close a connection.
     ///
     /// This deregisters the connection from the driver and closes the socket.
     fn close(&mut self, id: ConnId) -> io::Result<()>;
+
+    /// Take ownership of a connection's file descriptor.
+    ///
+    /// This removes the connection from the driver and returns its raw fd
+    /// WITHOUT closing it. Used to transfer connections between drivers
+    /// (e.g., from acceptor to worker).
+    ///
+    /// The caller takes ownership of the fd and is responsible for closing it.
+    #[cfg(unix)]
+    fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd>;
 
     /// Send data on a connection.
     ///

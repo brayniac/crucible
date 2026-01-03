@@ -57,6 +57,9 @@ struct UringListener {
     raw_fd: RawFd,
     fixed_slot: u32,
     multishot_active: bool,
+    /// When true, accepted connections are not auto-registered.
+    /// Instead, AcceptRaw completions are emitted with the raw fd.
+    raw_mode: bool,
 }
 
 /// io_uring-based I/O driver.
@@ -338,60 +341,89 @@ impl UringDriver {
             );
         }
 
-        // Allocate a registered fd slot
-        let fixed_slot = match self.registered_files.alloc() {
-            Some(slot) => slot,
-            None => {
+        // Check if this listener is in raw mode
+        let raw_mode = self
+            .listeners
+            .get(listener_id)
+            .map(|l| l.raw_mode)
+            .unwrap_or(false);
+
+        if raw_mode {
+            // Raw mode: don't register, just emit AcceptRaw with the fd
+            let addr = unsafe {
+                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                libc::getpeername(
+                    new_fd,
+                    &mut storage as *mut _ as *mut libc::sockaddr,
+                    &mut len,
+                );
+                sockaddr_to_socketaddr(&storage)
+            };
+
+            self.pending_completions
+                .push(Completion::new(CompletionKind::AcceptRaw {
+                    listener_id: ListenerId::new(listener_id),
+                    raw_fd: new_fd,
+                    addr,
+                }));
+        } else {
+            // Normal mode: register the connection automatically
+            // Allocate a registered fd slot
+            let fixed_slot = match self.registered_files.alloc() {
+                Some(slot) => slot,
+                None => {
+                    unsafe { libc::close(new_fd) };
+                    return;
+                }
+            };
+
+            // Register the fd
+            let fds = [new_fd];
+            if self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds)
+                .is_err()
+            {
+                self.registered_files.free(fixed_slot);
                 unsafe { libc::close(new_fd) };
                 return;
             }
-        };
 
-        // Register the fd
-        let fds = [new_fd];
-        if self
-            .ring
-            .submitter()
-            .register_files_update(fixed_slot, &fds)
-            .is_err()
-        {
-            self.registered_files.free(fixed_slot);
-            unsafe { libc::close(new_fd) };
-            return;
+            // Create connection
+            let entry = self.connections.vacant_entry();
+            let conn_id = entry.key();
+
+            let conn = UringConnection::new(new_fd, fixed_slot, self.buffer_size);
+            entry.insert(conn);
+
+            // Submit multishot recv
+            if self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
+                && let Some(conn) = self.connections.get_mut(conn_id)
+            {
+                conn.multishot_active = true;
+            }
+
+            // Get peer address
+            let addr = unsafe {
+                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                libc::getpeername(
+                    new_fd,
+                    &mut storage as *mut _ as *mut libc::sockaddr,
+                    &mut len,
+                );
+                sockaddr_to_socketaddr(&storage)
+            };
+
+            self.pending_completions
+                .push(Completion::new(CompletionKind::Accept {
+                    listener_id: ListenerId::new(listener_id),
+                    conn_id: ConnId::new(conn_id),
+                    addr,
+                }));
         }
-
-        // Create connection
-        let entry = self.connections.vacant_entry();
-        let conn_id = entry.key();
-
-        let conn = UringConnection::new(new_fd, fixed_slot, self.buffer_size);
-        entry.insert(conn);
-
-        // Submit multishot recv
-        if self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
-            && let Some(conn) = self.connections.get_mut(conn_id)
-        {
-            conn.multishot_active = true;
-        }
-
-        // Get peer address
-        let addr = unsafe {
-            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            libc::getpeername(
-                new_fd,
-                &mut storage as *mut _ as *mut libc::sockaddr,
-                &mut len,
-            );
-            sockaddr_to_socketaddr(&storage)
-        };
-
-        self.pending_completions
-            .push(Completion::new(CompletionKind::Accept {
-                listener_id: ListenerId::new(listener_id),
-                conn_id: ConnId::new(conn_id),
-                addr,
-            }));
 
         // Re-arm multishot accept if needed
         if !cqueue::more(flags) {
@@ -470,6 +502,67 @@ impl IoDriver for UringDriver {
             raw_fd,
             fixed_slot,
             multishot_active: false,
+            raw_mode: false,
+        };
+        entry.insert(listener);
+
+        // Submit multishot accept
+        if self.submit_multishot_accept(id, fixed_slot).is_ok()
+            && let Some(listener) = self.listeners.get_mut(id)
+        {
+            listener.multishot_active = true;
+        }
+
+        self.ring.submit()?;
+
+        Ok(ListenerId::new(id))
+    }
+
+    fn listen_raw(&mut self, addr: SocketAddr, backlog: u32) -> io::Result<ListenerId> {
+        // Create socket
+        let socket = socket2::Socket::new(
+            match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            },
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+
+        socket.set_reuse_address(true)?;
+        // Note: NO SO_REUSEPORT for raw mode - single acceptor pattern
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(backlog as i32)?;
+
+        let raw_fd = socket.into_raw_fd();
+
+        // Allocate registered fd slot
+        let fixed_slot = self
+            .registered_files
+            .alloc()
+            .ok_or_else(|| io::Error::other("no free fd slots"))?;
+
+        // Register the fd
+        let fds = [raw_fd];
+        if let Err(e) = self
+            .ring
+            .submitter()
+            .register_files_update(fixed_slot, &fds)
+        {
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
+
+        let entry = self.listeners.vacant_entry();
+        let id = entry.key();
+
+        let listener = UringListener {
+            raw_fd,
+            fixed_slot,
+            multishot_active: false,
+            raw_mode: true,
         };
         entry.insert(listener);
 
@@ -551,6 +644,51 @@ impl IoDriver for UringDriver {
         Ok(ConnId::new(conn_id))
     }
 
+    fn register_fd(&mut self, raw_fd: RawFd) -> io::Result<ConnId> {
+        // Set non-blocking
+        unsafe {
+            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+            libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // TCP_NODELAY is already set by handle_accept in raw mode
+
+        // Allocate registered fd slot
+        let fixed_slot = self
+            .registered_files
+            .alloc()
+            .ok_or_else(|| io::Error::other("no free fd slots"))?;
+
+        // Register the fd
+        let fds = [raw_fd];
+        if let Err(e) = self
+            .ring
+            .submitter()
+            .register_files_update(fixed_slot, &fds)
+        {
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
+
+        let entry = self.connections.vacant_entry();
+        let conn_id = entry.key();
+
+        let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
+        entry.insert(conn);
+
+        // Submit multishot recv
+        if self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
+            && let Some(conn) = self.connections.get_mut(conn_id)
+        {
+            conn.multishot_active = true;
+        }
+
+        self.ring.submit()?;
+
+        Ok(ConnId::new(conn_id))
+    }
+
     fn close(&mut self, id: ConnId) -> io::Result<()> {
         if let Some(conn) = self.connections.try_remove(id.as_usize()) {
             // Update registered fd to -1
@@ -563,6 +701,25 @@ impl IoDriver for UringDriver {
             unsafe { libc::close(conn.raw_fd) };
         }
         Ok(())
+    }
+
+    fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
+        if let Some(conn) = self.connections.try_remove(id.as_usize()) {
+            // Update registered fd to -1 (deregister)
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(conn.fixed_slot, &fds);
+            self.registered_files.free(conn.fixed_slot);
+            // Return the fd WITHOUT closing it
+            Ok(conn.raw_fd)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "connection not found",
+            ))
+        }
     }
 
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {

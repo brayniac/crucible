@@ -29,6 +29,7 @@ io-driver = { workspace = true }
 
 # Core utilities
 bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
 itoa = { workspace = true }
 slab = { workspace = true }
 libc = { workspace = true }
