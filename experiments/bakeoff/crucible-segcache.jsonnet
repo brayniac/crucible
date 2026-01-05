@@ -1,5 +1,41 @@
 local systemslab = import 'systemslab.libsonnet';
 
+local server_config = {
+    // Runtime selection: "native" (io_uring/mio) or "tokio"
+    runtime: 'native',
+
+    workers: {
+        threads: error 'threads must be specified',
+    },
+
+    cache: {
+        backend: error 'backend must be specified',
+        heap_size: error 'heap_size must be specified',
+        segment_size: '1MB',
+        hashtable_power: 20,
+        hugepage: '2MB',
+    },
+
+    listener: [
+        {
+            protocol: 'resp',
+            address: '0.0.0.0:6379',
+        },
+    ],
+
+    metrics: {
+        address: '0.0.0.0:9090',
+    },
+
+    uring: {
+        sqpoll: false,
+        sqpoll_idle_ms: 1000,
+        buffer_count: 1024,
+        buffer_size: 4096,
+        sq_depth: 1024,
+    },
+};
+
 local benchmark_config = {
     general: {
         duration: error 'duration must be specified',
@@ -9,7 +45,8 @@ local benchmark_config = {
     },
 
     target: {
-        endpoints: ['SERVER_ADDR:6379'],
+        // Server address will be replaced by sed
+        endpoints: ['172.31.31.218:6379'],
         protocol: 'resp',
     },
 
@@ -42,19 +79,22 @@ local benchmark_config = {
 };
 
 function(
-    // Git parameters for benchmark client
+    // Git parameters
     repo='https://github.com/brayniac/crucible.git',
     git_ref='main',
 
-    // Valkey parameters
-    valkey_version='9.0.1',
+    // Server parameters
+    cache_backend='segcache',
+    heap_size='8GB',
+    segment_size='1MB',
+    hashtable_power='20',
     server_threads='8',
     server_cpu_affinity='0-7',
-    maxmemory='8gb',
+    runtime='native',
 
     // Benchmark parameters
     benchmark_threads='24',
-    benchmark_cpu_affinity='8-31',
+    benchmark_cpu_affinity='8-32',
     connections='256',
     pipeline_depth='64',
     key_length='16',
@@ -74,6 +114,7 @@ function(
         key_count: key_count,
         value_length: value_length,
         get_percent: get_percent,
+        hashtable_power: hashtable_power,
     };
 
     local
@@ -85,25 +126,27 @@ function(
         key_count_int = std.parseInt(args.key_count),
         value_length_int = std.parseInt(args.value_length),
         get_percent_int = std.parseInt(args.get_percent),
+        hashtable_power_int = std.parseInt(args.hashtable_power),
         set_percent_int = 100 - get_percent_int;
 
     assert get_percent_int >= 0 && get_percent_int <= 100 : 'get_percent must be between 0 and 100';
+    assert cache_backend == 'segcache' || cache_backend == 's3fifo' : 'cache_backend must be segcache or s3fifo';
+    assert runtime == 'native' || runtime == 'tokio' : 'runtime must be native or tokio';
 
     local
-        // Valkey config as command line arguments
-        valkey_args = [
-            '--port 6379',
-            '--bind 0.0.0.0',
-            '--protected-mode no',
-            '--maxclients 65000',
-            '--tcp-backlog 65535',
-            '--maxmemory ' + maxmemory,
-            '--maxmemory-policy allkeys-lru',
-            '--io-threads ' + server_threads,
-            '--io-threads-do-reads yes',
-            '--appendonly no',
-            '--save ""',
-        ],
+        cache_config = server_config {
+            runtime: runtime,
+            workers+: {
+                threads: server_threads_int,
+                [if server_cpu_affinity != '' then 'cpu_affinity']: server_cpu_affinity,
+            },
+            cache+: {
+                backend: cache_backend,
+                heap_size: heap_size,
+                segment_size: segment_size,
+                hashtable_power: hashtable_power_int,
+            },
+        },
 
         warmup_benchmark_config = benchmark_config {
             general+: {
@@ -151,8 +194,9 @@ function(
                     count: key_count_int,
                 },
                 commands: {
-                    get: get_percent_int,
-                    set: set_percent_int,
+                    // GET only to match valkey-benchmark -t get
+                    get: 100,
+                    set: 0,
                 },
                 values+: {
                     length: value_length_int,
@@ -161,78 +205,94 @@ function(
         };
 
     {
-        name: 'valkey_' + valkey_version + '_c' + connections + '_k' + key_length + '_v' + value_length + '_r' + get_percent,
+        name: 'crucible_' + cache_backend + '_c' + connections + '_k' + key_length + '_v' + value_length + '_r' + get_percent,
         jobs: {
             server: {
+                local config = std.manifestTomlEx(cache_config, ''),
+
                 host: {
                     tags: ['c8g.2xl'],
                 },
 
                 steps: [
-                    // Install valkey from source
+                    // Set up persistent build environment with Rust toolchain
                     systemslab.bash(
                         |||
-                            export HOME=/tmp/valkey-build
+                            export HOME=/tmp/crucible-build
                             mkdir -p $HOME
-                            cd $HOME
 
-                            if [ ! -f valkey-server ]; then
-                                echo "Downloading and building Valkey %(version)s..."
-                                curl -LO https://github.com/valkey-io/valkey/archive/refs/tags/%(version)s.tar.gz
-                                tar xzf %(version)s.tar.gz
-                                cd valkey-%(version)s
-                                make -j$(nproc) BUILD_TLS=no
-                                cp src/valkey-server $HOME/
-                                cd $HOME
+                            if [ ! -f $HOME/.cargo/bin/cargo ]; then
+                                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                             fi
-
-                            echo "Valkey server ready"
-                            $HOME/valkey-server --version
-                        ||| % { version: valkey_version }
+                        |||
                     ),
+
+                    // Clone or update the repository
+                    systemslab.bash(
+                        |||
+                            export HOME=/tmp/crucible-build
+                            source $HOME/.cargo/env
+
+                            cd $HOME
+                            if [ -d crucible ]; then
+                                cd crucible
+                                git fetch origin
+                                git checkout %(git_ref)s
+                                git pull origin %(git_ref)s || true
+                            else
+                                git clone %(repo)s crucible
+                                cd crucible
+                                git checkout %(git_ref)s
+                            fi
+                        ||| % { repo: repo, git_ref: git_ref }
+                    ),
+
+                    // Build the server binary
+                    systemslab.bash(
+                        |||
+                            export HOME=/tmp/crucible-build
+                            source $HOME/.cargo/env
+
+                            cd $HOME/crucible
+                            cargo build --release -p server
+                        |||
+                    ),
+
+                    // Write out the server config
+                    systemslab.write_file('server.toml', config),
 
                     // Server tuning
                     systemslab.bash(
                         |||
-                            # Increase TCP backlog
-                            sudo sysctl -w net.core.somaxconn=65535
-                            sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+                            export HOME=/tmp/crucible-build
+                            mkdir -p $HOME
 
-                            # Disable THP (recommended by Redis/Valkey)
-                            echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled || true
-
-                            # Network tuning
-                            sudo ethtool -L ens34 combined 8 || true
+                            sudo ethtool -L ens34 combined 8
                         |||
                     ),
 
-                    // Start valkey server in the background
+                    // Start the cache server in the background
                     systemslab.bash(
                         |||
-                            export HOME=/tmp/valkey-build
+                            export HOME=/tmp/crucible-build
 
                             ulimit -n 500000
+                            sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
-
-                            %(cpu_affinity_cmd)s $HOME/valkey-server %(valkey_args)s &
+                            export CRUCIBLE_DIAGNOSTICS=1
+                            $HOME/crucible/target/release/crucible-server server.toml &
                             echo PID=$! > pid
-
-                            echo "Valkey server started with PID $(cat pid)"
-                        ||| % {
-                            valkey_args: std.join(' ', valkey_args),
-                            cpu_affinity_cmd: if server_cpu_affinity != '' then 'taskset -c ' + server_cpu_affinity else '',
-                        },
+                        |||,
                         background=true
                     ),
 
                     // Give the server a moment to start up
-                    systemslab.bash('sleep 5'),
+                    systemslab.bash('sleep 10'),
 
                     // Verify the server is listening
                     systemslab.bash(
                         |||
-                            nc -z localhost 6379 || { echo "Valkey server failed to start"; exit 1; }
-                            echo "Valkey server is ready"
+                            nc -z localhost 6379 || { echo "Cache server failed to start"; exit 1; }
                         |||
                     ),
 
@@ -245,20 +305,12 @@ function(
                     // Verify the server is still running after warmup
                     systemslab.bash(
                         |||
-                            nc -z localhost 6379 || { echo "Valkey server died during warmup"; exit 1; }
+                            nc -z localhost 6379 || { echo "Cache server died during warmup"; exit 1; }
                         |||
                     ),
 
                     // Wait for the benchmark to finish
                     systemslab.barrier('test-finish'),
-
-                    // Get valkey stats before shutdown
-                    systemslab.bash(
-                        |||
-                            echo "=== Valkey INFO stats ==="
-                            echo "INFO" | nc localhost 6379 | head -100
-                        |||
-                    ),
 
                     // Shutdown the server
                     systemslab.bash(
@@ -346,7 +398,7 @@ function(
                             sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
 
-                            export RUST_LOG=benchmark=info
+                            export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
                             $HOME/crucible/target/release/crucible-benchmark warmup.toml
                         |||
                     ),
@@ -366,7 +418,7 @@ function(
                             sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
 
-                            export RUST_LOG=benchmark=info
+                            export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
                             $HOME/crucible/target/release/crucible-benchmark loadgen.toml
                         |||
                     ),
