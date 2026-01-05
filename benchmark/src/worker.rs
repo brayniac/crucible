@@ -549,38 +549,43 @@ impl IoWorker {
         let get_ratio = self.config.workload.commands.get;
         let warmup = self.warmup;
 
-        // Simple approach: iterate through all sessions, send one request each
-        // if they can accept it. This ensures fairness - each session gets
-        // at most one request per poll cycle.
+        // Pack each connection's pipeline to maximize throughput.
+        // Fill each session's pipeline completely before moving to the next.
         for session in &mut self.sessions {
-            // Skip if can't send
-            if !session.is_connected() || !session.can_send() {
+            if !session.is_connected() {
                 continue;
             }
 
-            // Check rate limiter
-            if let Some(ref rl) = self.ratelimiter
-                && rl.try_wait().is_err()
-            {
-                break;
-            }
+            // Fill this session's pipeline
+            while session.can_send() {
+                // Check rate limiter
+                if let Some(ref rl) = self.ratelimiter
+                    && rl.try_wait().is_err()
+                {
+                    return Ok(());
+                }
 
-            // Generate and send one request
-            let key_id = self.rng.random_range(0..key_count);
-            write_key(&mut self.key_buf, key_id);
+                // Generate and send request
+                let key_id = self.rng.random_range(0..key_count);
+                write_key(&mut self.key_buf, key_id);
 
-            let is_get = self.rng.random_range(0..100) < get_ratio;
-            let sent = if is_get {
-                session.get(&self.key_buf, now).is_some()
-            } else {
-                self.rng.fill_bytes(&mut self.value_buf);
-                session.set(&self.key_buf, &self.value_buf, now).is_some()
-            };
+                let is_get = self.rng.random_range(0..100) < get_ratio;
+                let sent = if is_get {
+                    session.get(&self.key_buf, now).is_some()
+                } else {
+                    self.rng.fill_bytes(&mut self.value_buf);
+                    session.set(&self.key_buf, &self.value_buf, now).is_some()
+                };
 
-            if sent && !warmup {
-                self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
-                if let Some(stats) = self.shared.worker_stats.get(self.id) {
-                    stats.requests_sent.fetch_add(1, Ordering::Relaxed);
+                if sent && !warmup {
+                    self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
+                    if let Some(stats) = self.shared.worker_stats.get(self.id) {
+                        stats.requests_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                if !sent {
+                    break;
                 }
             }
         }
