@@ -9,7 +9,7 @@ local benchmark_config = {
     },
 
     target: {
-        endpoints: ['SERVER_ADDR:6379'],
+        endpoints: ['172.31.31.218:6379'],
         protocol: 'resp',
     },
 
@@ -57,12 +57,12 @@ function(
     benchmark_cpu_affinity='8-31',
     connections='256',
     pipeline_depth='64',
-    key_length='16',
+    key_length='20',
     key_count='1000000',
     value_length='64',
     get_percent='80',
     warmup_duration='30s',
-    test_duration='300s',
+    test_duration='60s',
     rate_limit=''
 )
     local args = {
@@ -98,7 +98,7 @@ function(
             '--maxclients 65000',
             '--tcp-backlog 65535',
             '--maxmemory ' + maxmemory,
-            '--maxmemory-policy allkeys-lru',
+            '--maxmemory-policy allkeys-random',
             '--io-threads ' + server_threads,
             '--io-threads-do-reads yes',
             '--appendonly no',
@@ -326,14 +326,6 @@ function(
                     // Write out the toml configs
                     systemslab.write_file('warmup.toml', warmup),
                     systemslab.write_file('loadgen.toml', loadgen),
-
-                    // Replace SERVER_ADDR placeholder with actual server address
-                    systemslab.bash(
-                        |||
-                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" warmup.toml
-                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" loadgen.toml
-                        |||
-                    ),
 
                     // Wait for the cache to start
                     systemslab.barrier('cache-start'),

@@ -15,7 +15,7 @@ local server_config = {
         heap_size: error 'heap_size must be specified',
         segment_size: '1MB',
         hashtable_power: 20,
-        hugepage: '2MB',
+        hugepage: 'disabled',
     },
 
     listener: [
@@ -158,6 +158,9 @@ function(
                             sudo sysctl -w net.core.somaxconn=65535
                             sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
 
+                            # Disable THP (for fair comparison with Valkey)
+                            echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled || true
+
                             # Network tuning
                             sudo ethtool -L ens34 combined 8 || true
                         |||
@@ -260,7 +263,7 @@ function(
 
                             echo "=== Running warmup (SET-heavy to populate cache) ==="
                             %(cpu_affinity_cmd)s $HOME/valkey-benchmark \
-                                -h $SERVER_ADDR \
+                                -h 172.31.31.218 \
                                 -p 6379 \
                                 -c %(connections)s \
                                 -n %(warmup_requests)s \
@@ -300,7 +303,7 @@ function(
 
                             echo "=== Running GET benchmark ==="
                             %(cpu_affinity_cmd)s $HOME/valkey-benchmark \
-                                -h $SERVER_ADDR \
+                                -h 172.31.31.218 \
                                 -p 6379 \
                                 -c %(connections)s \
                                 -n %(test_requests)s \

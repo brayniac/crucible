@@ -13,7 +13,7 @@ local server_config = {
         heap_size: error 'heap_size must be specified',
         segment_size: '1MB',
         hashtable_power: 20,
-        hugepage: '2MB',
+        hugepage: 'disabled',
     },
 
     listener: [
@@ -97,12 +97,12 @@ function(
     benchmark_cpu_affinity='8-32',
     connections='256',
     pipeline_depth='64',
-    key_length='16',
+    key_length='20',
     key_count='1000000',
     value_length='64',
     get_percent='80',
     warmup_duration='30s',
-    test_duration='300s',
+    test_duration='60s',
     rate_limit=''
 )
     local args = {
@@ -264,10 +264,15 @@ function(
                     // Server tuning
                     systemslab.bash(
                         |||
-                            export HOME=/tmp/crucible-build
-                            mkdir -p $HOME
+                            # Increase TCP backlog
+                            sudo sysctl -w net.core.somaxconn=65535
+                            sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
 
-                            sudo ethtool -L ens34 combined 8
+                            # Disable THP (for fair comparison with Valkey)
+                            echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled || true
+
+                            # Network tuning
+                            sudo ethtool -L ens34 combined 8 || true
                         |||
                     ),
 
@@ -377,14 +382,6 @@ function(
                     // Write out the toml configs
                     systemslab.write_file('warmup.toml', warmup),
                     systemslab.write_file('loadgen.toml', loadgen),
-
-                    // Replace SERVER_ADDR placeholder with actual server address
-                    systemslab.bash(
-                        |||
-                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" warmup.toml
-                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" loadgen.toml
-                        |||
-                    ),
 
                     // Wait for the cache to start
                     systemslab.barrier('cache-start'),

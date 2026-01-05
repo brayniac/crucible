@@ -42,7 +42,7 @@ function(
             '--maxclients 65000',
             '--tcp-backlog 65535',
             '--maxmemory ' + maxmemory,
-            '--maxmemory-policy allkeys-lru',
+            '--maxmemory-policy allkeys-random',
             '--io-threads ' + server_threads,
             '--io-threads-do-reads yes',
             '--appendonly no',
