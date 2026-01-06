@@ -7,7 +7,7 @@ use crate::metrics::{
     CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats, WorkerStatsSnapshot,
 };
 use cache_core::Cache;
-use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
+use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -35,6 +35,7 @@ fn set_thread_name(_name: &str) {
 /// Configuration for each worker thread.
 #[derive(Clone)]
 struct WorkerConfig {
+    io_engine: IoEngine,
     read_buffer_size: usize,
     buffer_size: usize,
     buffer_count: u16,
@@ -45,6 +46,7 @@ struct WorkerConfig {
 /// Configuration for the acceptor thread.
 #[derive(Clone)]
 struct AcceptorConfig {
+    io_engine: IoEngine,
     listeners: Vec<SocketAddr>,
     backlog: u32,
 }
@@ -67,6 +69,7 @@ pub fn run<C: Cache + 'static>(
         .unwrap_or(false);
 
     let worker_config = WorkerConfig {
+        io_engine: config.io_engine,
         read_buffer_size: 64 * 1024,
         buffer_size: config.uring.buffer_size,
         buffer_count: config.uring.buffer_count,
@@ -75,6 +78,7 @@ pub fn run<C: Cache + 'static>(
     };
 
     let acceptor_config = AcceptorConfig {
+        io_engine: config.io_engine,
         listeners,
         backlog: 4096,
     };
@@ -278,6 +282,7 @@ fn run_acceptor(
 ) -> io::Result<()> {
     // Use a small driver just for accepting connections
     let mut driver = Driver::builder()
+        .engine(config.io_engine)
         .buffer_size(4096) // minimal, not used for data
         .buffer_count(16) // minimal
         .sq_depth(64) // smaller ring for accept-only
@@ -332,6 +337,7 @@ fn run_worker<C: Cache>(
     fd_receiver: crossbeam_channel::Receiver<(RawFd, SocketAddr)>,
 ) -> io::Result<()> {
     let mut driver = Driver::builder()
+        .engine(config.io_engine)
         .buffer_size(config.buffer_size)
         .buffer_count(config.buffer_count.next_power_of_two())
         .sq_depth(config.sq_depth)

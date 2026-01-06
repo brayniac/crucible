@@ -3,6 +3,7 @@
 //! Supports runtime selection (native vs tokio), cache backend selection,
 //! and multiple protocol listeners.
 
+use io_driver::IoEngine;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -31,7 +32,11 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
-    /// io_uring specific configuration (only used when runtime = "native" on Linux 6.0+)
+    /// I/O engine selection for native runtime: "auto", "mio", or "uring"
+    #[serde(default)]
+    pub io_engine: IoEngine,
+
+    /// io_uring specific configuration (only used when io_engine = "uring" or "auto" on Linux 6.0+)
     #[serde(default)]
     pub uring: UringConfig,
 }

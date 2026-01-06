@@ -25,6 +25,9 @@ members = [
 
 	# Development Tasks
 	"xtask",
+
+	# Experiment Driver
+	"crates/bakeoff",
 ]
 
 [workspace.package]

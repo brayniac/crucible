@@ -25,7 +25,7 @@ protocol-resp = { workspace = true, features = ["resp3"] }
 protocol-memcache = { workspace = true, features = ["full"] }
 
 # I/O driver (native runtime)
-io-driver = { workspace = true }
+io-driver = { workspace = true, features = ["serde"] }
 
 # Core utilities
 bytes = { workspace = true }

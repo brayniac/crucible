@@ -13,7 +13,7 @@ local server_config = {
         heap_size: error 'heap_size must be specified',
         segment_size: '1MB',
         hashtable_power: 20,
-        hugepage: 'disabled',
+        hugepage: 'none',
     },
 
     listener: [
