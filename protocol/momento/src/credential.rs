@@ -191,6 +191,7 @@ impl Credential {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_credential_with_endpoint() {
@@ -461,6 +462,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_from_env_with_explicit_endpoint() {
         // Save original values
         let orig_key = std::env::var("MOMENTO_API_KEY").ok();
@@ -498,6 +500,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_from_env_with_region() {
         // Save original values
         let orig_key = std::env::var("MOMENTO_API_KEY").ok();
@@ -537,6 +540,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_from_env_missing_token() {
         // Save original values
         let orig_key = std::env::var("MOMENTO_API_KEY").ok();

@@ -18,3 +18,4 @@ name = "momento-cli"
 path = "src/bin/momento-cli.rs"
 
 [dev-dependencies]
+serial_test = "3"

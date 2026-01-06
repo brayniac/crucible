@@ -276,6 +276,14 @@ impl IoDriver for MioDriver {
         }
     }
 
+    fn submit_recv(&mut self, _id: ConnId, _buf: &mut [u8]) -> io::Result<()> {
+        // mio doesn't support async recv submission - use recv() after Recv completion
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "submit_recv not supported on mio backend, use recv() instead",
+        ))
+    }
+
     fn poll(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
         self.pending_completions.clear();
 

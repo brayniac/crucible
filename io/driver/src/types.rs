@@ -78,9 +78,22 @@ pub enum CompletionKind {
     /// Data is available to read.
     ///
     /// Call `recv()` on the driver to get the data.
+    /// Used by mio backend and io_uring multishot recv.
     Recv {
         /// The connection that has data available.
         conn_id: ConnId,
+    },
+
+    /// A submitted recv operation completed (io_uring single-shot mode).
+    ///
+    /// Data has been written directly to the buffer provided in `submit_recv()`.
+    /// The `bytes` field indicates how many bytes were received.
+    /// A value of 0 indicates EOF (peer closed connection).
+    RecvComplete {
+        /// The connection that received data.
+        conn_id: ConnId,
+        /// Number of bytes received (0 = EOF).
+        bytes: usize,
     },
 
     /// The connection is ready to send more data.

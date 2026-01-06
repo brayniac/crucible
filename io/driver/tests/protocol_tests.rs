@@ -237,6 +237,9 @@ fn run_test_server(
 
                 // AcceptRaw only used by listen_raw, not tested here
                 CompletionKind::AcceptRaw { .. } => {}
+
+                // RecvComplete is for io_uring zero-copy mode, not tested here
+                CompletionKind::RecvComplete { .. } => {}
             }
         }
     }

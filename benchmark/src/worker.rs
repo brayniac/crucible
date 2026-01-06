@@ -377,6 +377,9 @@ impl IoWorker {
         let mut session = Session::from_config(addr, &self.config);
         session.set_conn_id(conn_id);
 
+        // Try to start zero-copy recv (io_uring path)
+        let _ = self.driver.submit_recv(conn_id, session.recv_spare());
+
         let idx = self.sessions.len();
         self.sessions.push(session);
         self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
@@ -712,6 +715,24 @@ impl IoWorker {
                         to_close.push((idx, DisconnectReason::ErrorEvent));
                     }
                 }
+                // RecvComplete is for io_uring zero-copy recv mode
+                // Data is already in the session's buffer - just commit
+                CompletionKind::RecvComplete { conn_id, bytes } => {
+                    let id = conn_id.as_usize();
+                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        if bytes == 0 {
+                            // EOF - server closed connection
+                            to_close.push((idx, DisconnectReason::Eof));
+                        } else {
+                            let session = &mut self.sessions[idx];
+                            session.recv_commit(bytes);
+
+                            // Re-submit recv for next data
+                            let _ = self.driver.submit_recv(conn_id, session.recv_spare());
+                        }
+                    }
+                }
+
                 // Accept, AcceptRaw, and ListenerError are for server-side, not used here
                 CompletionKind::Accept { .. }
                 | CompletionKind::AcceptRaw { .. }
@@ -832,6 +853,9 @@ impl IoWorker {
                             session.set_conn_id(conn_id);
                             session.reconnect_attempted(true);
                             session.reset(); // Clear buffers and in-flight state
+
+                            // Try to start zero-copy recv (io_uring path)
+                            let _ = self.driver.submit_recv(conn_id, session.recv_spare());
 
                             self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
 

@@ -15,7 +15,7 @@ pub struct UringConnection {
     pub raw_fd: RawFd,
     /// Registered fd slot index for io_uring fixed files.
     pub fixed_slot: u32,
-    /// Accumulated received data.
+    /// Accumulated received data (used with multishot recv).
     pub recv_data: Vec<u8>,
     /// Double send buffers for async send safety.
     send_bufs: [Vec<u8>; 2],
@@ -31,6 +31,10 @@ pub struct UringConnection {
     current_buf: usize,
     /// Whether multishot recv is currently active.
     pub multishot_active: bool,
+    /// Whether a single-shot recv is pending (for zero-copy mode).
+    pub single_recv_pending: bool,
+    /// Whether to use single-shot recv mode (disables multishot).
+    pub use_single_recv: bool,
 }
 
 impl UringConnection {
@@ -46,6 +50,8 @@ impl UringConnection {
             in_flight_count: [0, 0],
             current_buf: 0,
             multishot_active: false,
+            single_recv_pending: false,
+            use_single_recv: false,
         }
     }
 

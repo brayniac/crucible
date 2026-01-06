@@ -366,6 +366,12 @@ fn run_worker<C: Cache>(
                         connections.resize_with(idx + 1, || None);
                     }
                     connections[idx] = Some(Connection::new(config.read_buffer_size));
+
+                    // Try to start zero-copy recv (io_uring path)
+                    // If this fails (mio), we'll use the Recv completion path
+                    if let Some(conn) = connections[idx].as_mut() {
+                        let _ = driver.submit_recv(conn_id, conn.recv_spare());
+                    }
                 }
                 Err(_) => {
                     // Failed to register, fd is already closed by driver
@@ -394,6 +400,11 @@ fn run_worker<C: Cache>(
                         connections.resize_with(idx + 1, || None);
                     }
                     connections[idx] = Some(Connection::new(config.read_buffer_size));
+
+                    // Try to start zero-copy recv (io_uring path)
+                    if let Some(conn) = connections[idx].as_mut() {
+                        let _ = driver.submit_recv(conn_id, conn.recv_spare());
+                    }
                 }
 
                 CompletionKind::Recv { conn_id } => {
@@ -593,6 +604,66 @@ fn run_worker<C: Cache>(
                 CompletionKind::AcceptRaw { raw_fd, .. } => {
                     // This shouldn't happen in workers, close the fd
                     unsafe { libc::close(raw_fd) };
+                }
+
+                // RecvComplete is for io_uring zero-copy recv mode
+                // Data is already in the connection's buffer - just commit and process
+                CompletionKind::RecvComplete { conn_id, bytes } => {
+                    stats.inc_recv();
+                    let idx = conn_id.as_usize();
+
+                    if bytes == 0 {
+                        // EOF - peer closed connection
+                        close_connection(
+                            &mut driver,
+                            &mut connections,
+                            conn_id,
+                            stats,
+                            CloseReason::ClientEof,
+                        );
+                        continue;
+                    }
+
+                    let mut close_reason: Option<CloseReason> = None;
+
+                    // Process the received data
+                    if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                        stats.add_bytes_received(bytes as u64);
+                        conn.recv_commit(bytes);
+                        conn.process(&*cache);
+
+                        if conn.should_close() {
+                            close_reason = Some(CloseReason::ProtocolClose);
+                        } else {
+                            // Drain write buffer
+                            while conn.has_pending_write() {
+                                let data = conn.pending_write_data();
+                                match driver.send(conn_id, data) {
+                                    Ok(n) => {
+                                        stats.add_bytes_sent(n as u64);
+                                        conn.advance_write(n);
+                                    }
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(_) => {
+                                        close_reason = Some(CloseReason::SendError);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(reason) = close_reason {
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
+                        continue;
+                    }
+
+                    // Re-submit recv for next data
+                    if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                        if conn.should_read() {
+                            let _ = driver.submit_recv(conn_id, conn.recv_spare());
+                        }
+                    }
                 }
             }
         }

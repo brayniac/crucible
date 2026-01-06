@@ -34,6 +34,7 @@ use std::time::Duration;
 const OP_SEND: u64 = 1;
 const OP_MULTISHOT_RECV: u64 = 2;
 const OP_ACCEPT: u64 = 3;
+const OP_SINGLE_RECV: u64 = 4;
 
 /// Buffer group ID for recv operations.
 const RECV_BGID: u16 = 0;
@@ -205,6 +206,9 @@ impl UringDriver {
             OP_ACCEPT => {
                 self.handle_accept(id, result, flags);
             }
+            OP_SINGLE_RECV => {
+                self.handle_single_recv(id, result);
+            }
             _ => {}
         }
     }
@@ -287,6 +291,44 @@ impl UringDriver {
                 }
             }
         }
+    }
+
+    fn handle_single_recv(&mut self, conn_id: usize, result: i32) {
+        // Clear pending flag
+        if let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.single_recv_pending = false;
+        }
+
+        if !self.connections.contains(conn_id) {
+            return;
+        }
+
+        if result == 0 {
+            // EOF - peer closed connection
+            self.pending_completions
+                .push(Completion::new(CompletionKind::RecvComplete {
+                    conn_id: ConnId::new(conn_id),
+                    bytes: 0,
+                }));
+            return;
+        }
+
+        if result < 0 {
+            // Recv error
+            self.pending_completions
+                .push(Completion::new(CompletionKind::Error {
+                    conn_id: ConnId::new(conn_id),
+                    error: io::Error::from_raw_os_error(-result),
+                }));
+            return;
+        }
+
+        // Success - data is already in the user's buffer
+        self.pending_completions
+            .push(Completion::new(CompletionKind::RecvComplete {
+                conn_id: ConnId::new(conn_id),
+                bytes: result as usize,
+            }));
     }
 
     fn handle_send(&mut self, conn_id: usize, buf_idx: usize, result: i32, flags: u32) {
@@ -426,22 +468,8 @@ impl UringDriver {
             let conn = UringConnection::new(new_fd, fixed_slot, self.buffer_size);
             entry.insert(conn);
 
-            // Submit multishot recv - if this fails, clean up and skip this connection
-            if self.submit_multishot_recv(conn_id, fixed_slot).is_err() {
-                self.connections.try_remove(conn_id);
-                let fds = [-1i32];
-                let _ = self
-                    .ring
-                    .submitter()
-                    .register_files_update(fixed_slot, &fds);
-                self.registered_files.free(fixed_slot);
-                unsafe { libc::close(new_fd) };
-                return;
-            }
-
-            if let Some(conn) = self.connections.get_mut(conn_id) {
-                conn.multishot_active = true;
-            }
+            // Don't auto-submit multishot recv - let caller decide via submit_recv()
+            // This enables zero-copy recv when caller uses submit_recv()
 
             // Get peer address
             let addr = unsafe {
@@ -690,24 +718,8 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Submit multishot recv - if this fails, clean up and return error
-        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
-            self.connections.try_remove(conn_id);
-            let fds = [-1i32];
-            let _ = self
-                .ring
-                .submitter()
-                .register_files_update(fixed_slot, &fds);
-            self.registered_files.free(fixed_slot);
-            unsafe { libc::close(raw_fd) };
-            return Err(e);
-        }
-
-        if let Some(conn) = self.connections.get_mut(conn_id) {
-            conn.multishot_active = true;
-        }
-
-        self.ring.submit()?;
+        // Don't auto-submit multishot recv - let caller decide via submit_recv()
+        // This enables zero-copy recv when caller uses submit_recv()
 
         Ok(ConnId::new(conn_id))
     }
@@ -745,24 +757,8 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Submit multishot recv - if this fails, clean up and return error
-        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
-            self.connections.try_remove(conn_id);
-            let fds = [-1i32];
-            let _ = self
-                .ring
-                .submitter()
-                .register_files_update(fixed_slot, &fds);
-            self.registered_files.free(fixed_slot);
-            unsafe { libc::close(raw_fd) };
-            return Err(e);
-        }
-
-        if let Some(conn) = self.connections.get_mut(conn_id) {
-            conn.multishot_active = true;
-        }
-
-        self.ring.submit()?;
+        // Don't auto-submit multishot recv - let caller decide via submit_recv()
+        // This enables zero-copy recv when caller uses submit_recv()
 
         Ok(ConnId::new(conn_id))
     }
@@ -845,6 +841,43 @@ impl IoDriver for UringDriver {
         conn.recv_data.drain(..n);
 
         Ok(n)
+    }
+
+    fn submit_recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<()> {
+        let conn_id = id.as_usize();
+        let conn = self
+            .connections
+            .get_mut(conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Only one recv can be pending at a time
+        if conn.single_recv_pending {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Mark this connection as using single-shot mode (disables multishot)
+        conn.use_single_recv = true;
+
+        let fixed_slot = conn.fixed_slot;
+
+        // Submit single-shot recv with user's buffer
+        let recv_op = opcode::Recv::new(Fixed(fixed_slot), buf.as_mut_ptr(), buf.len() as u32)
+            .build()
+            .user_data(encode_user_data(conn_id, 0, OP_SINGLE_RECV));
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&recv_op)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+
+        // Mark recv as pending
+        if let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.single_recv_pending = true;
+        }
+
+        Ok(())
     }
 
     fn poll(&mut self, timeout: Option<Duration>) -> io::Result<usize> {

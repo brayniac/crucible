@@ -141,6 +141,34 @@ pub trait IoDriver: Send {
     /// - `Err(other)` - An error occurred
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize>;
 
+    /// Submit an async recv operation with a caller-provided buffer.
+    ///
+    /// This is an alternative to the `Recv` + `recv()` pattern that enables
+    /// zero-copy receives on io_uring. The kernel writes directly to the
+    /// provided buffer, eliminating intermediate copies.
+    ///
+    /// # Buffer Lifetime
+    ///
+    /// The buffer must remain valid until the corresponding `RecvComplete`
+    /// completion is received. The caller is responsible for ensuring this.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - The recv was submitted successfully
+    /// - `Err(WouldBlock)` - A recv is already pending for this connection
+    /// - `Err(other)` - An error occurred
+    ///
+    /// # Completion
+    ///
+    /// When data is received, a `RecvComplete { conn_id, bytes }` completion
+    /// is emitted. If `bytes` is 0, the peer closed the connection.
+    ///
+    /// # Backend Support
+    ///
+    /// - **io_uring**: Submits a single-shot recv with the provided buffer
+    /// - **mio**: Falls back to returning `Err(Unsupported)` - use `recv()` instead
+    fn submit_recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<()>;
+
     // === Event loop ===
 
     /// Poll for I/O events with optional timeout.
