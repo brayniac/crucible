@@ -388,6 +388,25 @@ impl Session {
         self.buffers.recv.extend_from_slice(data);
     }
 
+    /// Get spare capacity in the recv buffer for direct recv.
+    ///
+    /// Returns a mutable slice that can be passed directly to recv()
+    /// to avoid an intermediate copy. After receiving, call `recv_commit(n)`.
+    #[inline]
+    pub fn recv_spare(&mut self) -> &mut [u8] {
+        // Compact if running low on writable space
+        if self.buffers.recv.writable() < self.buffers.recv.capacity() / 4 {
+            self.buffers.recv.compact();
+        }
+        self.buffers.recv.spare_mut()
+    }
+
+    /// Commit bytes received directly into the recv buffer.
+    #[inline]
+    pub fn recv_commit(&mut self, n: usize) {
+        self.buffers.recv.advance(n);
+    }
+
     /// Process received data and extract completed responses.
     ///
     /// The `now` parameter should be the current time, shared across a batch of

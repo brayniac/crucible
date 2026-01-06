@@ -200,9 +200,6 @@ pub struct IoWorker {
     /// Results buffer (reused)
     results: Vec<RequestResult>,
 
-    /// Receive buffer (reused to avoid allocation per recv)
-    recv_buf: Vec<u8>,
-
     /// Rate limiting
     ratelimiter: Option<Arc<Ratelimiter>>,
 
@@ -268,7 +265,6 @@ impl IoWorker {
             key_buf,
             value_buf,
             results: Vec::with_capacity(pipeline_depth),
-            recv_buf: vec![0u8; 16384],
             ratelimiter: cfg.ratelimiter,
             response_latency: cfg.response_latency,
             get_latency: cfg.get_latency,
@@ -660,17 +656,18 @@ impl IoWorker {
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
                         let session = &mut self.sessions[idx];
-                        // Read all available data
+                        // Read all available data directly into session's buffer
                         let mut close_reason: Option<DisconnectReason> = None;
                         loop {
-                            match self.driver.recv(conn_id, &mut self.recv_buf) {
+                            let recv_buf = session.recv_spare();
+                            match self.driver.recv(conn_id, recv_buf) {
                                 Ok(0) => {
                                     // Server closed connection (EOF)
                                     close_reason = Some(DisconnectReason::Eof);
                                     break;
                                 }
                                 Ok(n) => {
-                                    session.bytes_received(&self.recv_buf[..n]);
+                                    session.recv_commit(n);
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                 Err(_) => {
