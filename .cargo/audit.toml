@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+    # paste is unmaintained but stable; upstream (arrow-rs) declined to migrate
+    # https://github.com/apache/arrow-rs/pull/8590
+    "RUSTSEC-2024-0436",
+]
