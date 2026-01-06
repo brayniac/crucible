@@ -7,6 +7,8 @@ use clap::Parser;
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine};
 use protocol_ping::Response;
 use serde::Deserialize;
+use server::affinity::set_cpu_affinity;
+use server::config::parse_cpu_list;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -202,10 +204,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Starting ping server on {}", listen);
 
+    // Parse CPU affinity
+    let cpu_affinity = config
+        .workers
+        .cpu_affinity
+        .as_ref()
+        .map(|s| parse_cpu_list(s))
+        .transpose()
+        .map_err(|e| format!("invalid cpu_affinity: {}", e))?;
+
     if threads == 0 {
         run_single_threaded(listen, engine, &config.uring)?;
     } else {
-        run_multi_threaded(listen, engine, threads, &config.uring)?;
+        run_multi_threaded(
+            listen,
+            engine,
+            threads,
+            cpu_affinity.as_deref(),
+            &config.uring,
+        )?;
     }
 
     Ok(())
@@ -335,6 +352,7 @@ fn run_multi_threaded(
     addr: SocketAddr,
     engine: IoEngine,
     num_workers: usize,
+    cpu_affinity: Option<&[usize]>,
     uring: &UringConfig,
 ) -> io::Result<()> {
     use std::os::unix::io::RawFd;
@@ -354,9 +372,18 @@ fn run_multi_threaded(
     let mut handles = Vec::with_capacity(num_workers + 1);
     for (worker_id, receiver) in receivers.into_iter().enumerate() {
         let uring = uring_config.clone();
+        let cpu_id = cpu_affinity.map(|cpus| cpus[worker_id % cpus.len()]);
         let handle = std::thread::Builder::new()
             .name(format!("ping-worker-{}", worker_id))
             .spawn(move || {
+                if let Some(cpu) = cpu_id {
+                    if let Err(e) = set_cpu_affinity(cpu) {
+                        eprintln!(
+                            "Worker {} failed to set CPU affinity to {}: {}",
+                            worker_id, cpu, e
+                        );
+                    }
+                }
                 if let Err(e) = run_worker(engine, receiver, &uring) {
                     eprintln!("Worker {} error: {}", worker_id, e);
                 }

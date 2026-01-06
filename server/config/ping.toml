@@ -17,7 +17,7 @@ io_engine = "auto"
 # N = multi-threaded with N workers + 1 acceptor thread
 threads = 0
 
-# CPU cores to pin workers to (optional, not yet implemented)
+# CPU cores to pin workers to (Linux-style, e.g., "0-3,6-8")
 # cpu_affinity = "0-3"
 
 # io_uring specific settings (Linux only)

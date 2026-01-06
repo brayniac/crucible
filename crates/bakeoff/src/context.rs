@@ -62,6 +62,12 @@ impl ContextManager {
         let prefix = format!("{}_", name);
         self.contexts.submitted.retain(|n| !n.starts_with(&prefix));
     }
+
+    /// Remove a specific experiment from the submitted set.
+    /// Returns true if it was present and removed.
+    pub fn clear_submitted(&mut self, name: &str) -> bool {
+        self.contexts.submitted.remove(name)
+    }
 }
 
 /// Create a new context via systemslab CLI and return the UUID.

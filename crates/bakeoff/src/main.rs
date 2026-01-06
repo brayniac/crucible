@@ -69,6 +69,17 @@ enum Commands {
         #[arg(long, short)]
         output: Option<std::path::PathBuf>,
     },
+
+    /// Retry failed experiments
+    Retry {
+        /// Only show what would be retried, don't actually retry
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Only clear failed experiments from tracking, don't resubmit
+        #[arg(long)]
+        clear_only: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -497,6 +508,220 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        }
+
+        Commands::Retry {
+            dry_run,
+            clear_only,
+        } => {
+            ctx_manager.load()?;
+
+            println!(
+                "Checking for failed experiments in {} suite{}...\n",
+                match cli.suite {
+                    Suite::Server => "server",
+                    Suite::IoEngine => "io-engine",
+                },
+                if dry_run { " (DRY RUN)" } else { "" }
+            );
+
+            let mut total_failed = 0;
+            let mut total_cleared = 0;
+            let mut failed_experiments: Vec<(String, String, usize, usize)> = Vec::new(); // (exp_name, label, conns, pipe)
+
+            // Collect all failed experiments
+            match cli.suite {
+                Suite::Server => {
+                    for exp in Experiment::all() {
+                        let context_id = match ctx_manager.get_by_name(exp.name()) {
+                            Some(id) => id,
+                            None => {
+                                println!("  {}: no context initialized, skipping", exp.name());
+                                continue;
+                            }
+                        };
+
+                        match results::fetch_failed_experiments(context_id, exp.name()) {
+                            Ok(failed) => {
+                                if !failed.is_empty() {
+                                    println!(
+                                        "  {}: {} failed experiments",
+                                        exp.name(),
+                                        failed.len()
+                                    );
+                                    for f in &failed {
+                                        println!("    - c{}/p{}", f.connections, f.pipeline_depth);
+                                        failed_experiments.push((
+                                            exp.name().to_string(),
+                                            f.label.clone(),
+                                            f.connections,
+                                            f.pipeline_depth,
+                                        ));
+                                    }
+                                    total_failed += failed.len();
+                                } else {
+                                    println!("  {}: no failures", exp.name());
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  {}: error fetching results: {}", exp.name(), e);
+                            }
+                        }
+                    }
+                }
+                Suite::IoEngine => {
+                    for exp in IoExperiment::all() {
+                        let exp_name = exp.name();
+                        let context_id = match ctx_manager.get_by_name(&exp_name) {
+                            Some(id) => id,
+                            None => {
+                                println!("  {}: no context initialized, skipping", exp_name);
+                                continue;
+                            }
+                        };
+
+                        match results::fetch_failed_experiments(context_id, &exp_name) {
+                            Ok(failed) => {
+                                if !failed.is_empty() {
+                                    println!("  {}: {} failed experiments", exp_name, failed.len());
+                                    for f in &failed {
+                                        println!("    - c{}/p{}", f.connections, f.pipeline_depth);
+                                        failed_experiments.push((
+                                            exp_name.clone(),
+                                            f.label.clone(),
+                                            f.connections,
+                                            f.pipeline_depth,
+                                        ));
+                                    }
+                                    total_failed += failed.len();
+                                } else {
+                                    println!("  {}: no failures", exp_name);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  {}: error fetching results: {}", exp_name, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if total_failed == 0 {
+                println!("\nNo failed experiments found.");
+                return Ok(());
+            }
+
+            println!("\nTotal failed: {}", total_failed);
+
+            if dry_run {
+                println!("\nDry run - no changes made.");
+                return Ok(());
+            }
+
+            // Clear failed experiments from submitted tracking
+            println!("\nClearing failed experiments from tracking...");
+            for (_, label, _, _) in &failed_experiments {
+                if ctx_manager.clear_submitted(label) {
+                    total_cleared += 1;
+                }
+            }
+            ctx_manager.save()?;
+            println!(
+                "  Cleared {} experiments from submitted tracking",
+                total_cleared
+            );
+
+            if clear_only {
+                println!("\nCleared tracking only. Run 'bakeoff run' to resubmit.");
+                return Ok(());
+            }
+
+            // Resubmit failed experiments
+            println!("\nResubmitting failed experiments...");
+
+            let runner = Runner::new(&cli.experiments_dir, false, true);
+            let mut submitted_count = 0;
+
+            match cli.suite {
+                Suite::Server => {
+                    for (exp_name, _, connections, pipeline_depth) in &failed_experiments {
+                        let exp = Experiment::all()
+                            .into_iter()
+                            .find(|e| e.name() == exp_name)
+                            .unwrap();
+
+                        let context_id = ctx_manager.get_by_name(exp.name()).unwrap().clone();
+                        let params = sweep::SweepParams {
+                            connections: *connections,
+                            pipeline_depth: *pipeline_depth,
+                        };
+
+                        let (name, result) = runner.run(
+                            exp.name(),
+                            exp.jsonnet_file(),
+                            &context_id,
+                            &params,
+                            &[],
+                            false, // not already submitted (we just cleared it)
+                        )?;
+
+                        match result {
+                            RunResult::Submitted => {
+                                println!("  [OK] {}", name);
+                                ctx_manager.mark_submitted(name);
+                                ctx_manager.save()?;
+                                submitted_count += 1;
+                            }
+                            RunResult::Skipped => {
+                                println!("  [SKIP] {}", name);
+                            }
+                            RunResult::DryRun => {}
+                        }
+                    }
+                }
+                Suite::IoEngine => {
+                    for (exp_name, _, connections, pipeline_depth) in &failed_experiments {
+                        let exp = IoExperiment::all()
+                            .into_iter()
+                            .find(|e| e.name() == *exp_name)
+                            .unwrap();
+
+                        let context_id = ctx_manager.get_by_name(&exp.name()).unwrap().clone();
+                        let params = sweep::SweepParams {
+                            connections: *connections,
+                            pipeline_depth: *pipeline_depth,
+                        };
+                        let extra_args = exp.extra_args();
+
+                        let (name, result) = runner.run(
+                            &exp.name(),
+                            exp.jsonnet_file(),
+                            &context_id,
+                            &params,
+                            &extra_args,
+                            false,
+                        )?;
+
+                        match result {
+                            RunResult::Submitted => {
+                                println!("  [OK] {}", name);
+                                ctx_manager.mark_submitted(name);
+                                ctx_manager.save()?;
+                                submitted_count += 1;
+                            }
+                            RunResult::Skipped => {
+                                println!("  [SKIP] {}", name);
+                            }
+                            RunResult::DryRun => {}
+                        }
+                    }
+                }
+            }
+
+            println!(
+                "\nRetry complete: {} experiments resubmitted",
+                submitted_count
+            );
         }
     }
 

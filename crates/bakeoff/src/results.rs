@@ -124,6 +124,33 @@ struct ExperimentInfo {
     jobs: Vec<JobData>,
 }
 
+/// Information about a failed experiment for retry purposes.
+#[derive(Debug)]
+pub struct FailedExperiment {
+    pub label: String,
+    pub connections: usize,
+    pub pipeline_depth: usize,
+}
+
+/// Fetch the list of failed experiments from a context.
+/// Returns experiment labels in the format "{exp_name}_c{connections}_p{pipeline_depth}".
+pub fn fetch_failed_experiments(
+    context_id: &str,
+    exp_name: &str,
+) -> Result<Vec<FailedExperiment>, Box<dyn std::error::Error>> {
+    let results = fetch_context_results(context_id)?;
+
+    Ok(results
+        .into_iter()
+        .filter(|r| r.state == "failure")
+        .map(|r| FailedExperiment {
+            label: format!("{}_c{}_p{}", exp_name, r.connections, r.pipeline_depth),
+            connections: r.connections,
+            pipeline_depth: r.pipeline_depth,
+        })
+        .collect())
+}
+
 /// Fetch results for a context using GraphQL (fast path).
 pub fn fetch_context_results(
     context_id: &str,
