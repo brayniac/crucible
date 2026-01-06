@@ -1,0 +1,23 @@
+[package]
+name = "protocol-ping-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.protocol-ping]
+path = ".."
+
+[[bin]]
+name = "fuzz_response"
+path = "fuzz_targets/fuzz_response.rs"
+test = false
+doc = false
+bench = false

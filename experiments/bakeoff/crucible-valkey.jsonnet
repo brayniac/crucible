@@ -9,7 +9,7 @@ local benchmark_config = {
     },
 
     target: {
-        endpoints: ['172.31.31.218:6379'],
+        endpoints: ['SERVER_ADDR:6379'],
         protocol: 'resp',
     },
 
@@ -166,7 +166,7 @@ function(
         jobs: {
             server: {
                 host: {
-                    tags: ['c8g.2xl'],
+                    tags: ['c8g-2xlarge'],
                 },
 
                 steps: [
@@ -276,7 +276,7 @@ function(
                 local loadgen = std.manifestTomlEx(test_benchmark_config, ''),
 
                 host: {
-                    tags: ['c8g.8xl'],
+                    tags: ['c8g-8xlarge'],
                 },
 
                 steps: [
@@ -326,6 +326,14 @@ function(
                     // Write out the toml configs
                     systemslab.write_file('warmup.toml', warmup),
                     systemslab.write_file('loadgen.toml', loadgen),
+
+                    // Replace SERVER_ADDR placeholder with actual server address
+                    systemslab.bash(
+                        |||
+                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" warmup.toml
+                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" loadgen.toml
+                        |||
+                    ),
 
                     // Wait for the cache to start
                     systemslab.barrier('cache-start'),

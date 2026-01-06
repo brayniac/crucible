@@ -12,6 +12,7 @@ description = "High-performance cache protocol benchmark tool"
 io-driver = { workspace = true, features = ["serde"] }
 
 # Protocol implementations
+protocol-ping = { workspace = true }
 protocol-resp = { workspace = true, features = ["resp3"] }
 protocol-memcache = { workspace = true, features = ["full"] }
 protocol-momento = { workspace = true }

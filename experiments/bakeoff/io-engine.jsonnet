@@ -47,7 +47,7 @@ local benchmark_config = {
     },
 
     target: {
-        endpoints: ['172.31.31.218:6379'],
+        endpoints: ['SERVER_ADDR:6379'],
         protocol: 'resp',
     },
 
@@ -88,7 +88,8 @@ function(
     heap_size='8GB',
     server_threads='8',
     server_cpu_affinity='0-7',
-    server_io_engine='auto',  // auto, mio, or uring
+    server_runtime='native',  // native or tokio
+    server_io_engine='auto',  // auto, mio, or uring (only used for native runtime)
 
     // Benchmark parameters
     benchmark_threads='24',
@@ -115,12 +116,14 @@ function(
         set_percent_int = 100 - get_percent_int;
 
     assert get_percent_int >= 0 && get_percent_int <= 100 : 'get_percent must be between 0 and 100';
+    assert server_runtime == 'native' || server_runtime == 'tokio' : 'server_runtime must be native or tokio';
     assert server_io_engine == 'auto' || server_io_engine == 'mio' || server_io_engine == 'uring' : 'server_io_engine must be auto, mio, or uring';
     assert client_io_engine == 'auto' || client_io_engine == 'mio' || client_io_engine == 'uring' : 'client_io_engine must be auto, mio, or uring';
 
     local
         cache_config = server_config {
-            io_engine: server_io_engine,
+            runtime: server_runtime,
+            [if server_runtime == 'native' then 'io_engine']: server_io_engine,
             workers+: {
                 threads: server_threads_int,
                 [if server_cpu_affinity != '' then 'cpu_affinity']: server_cpu_affinity,
@@ -184,14 +187,16 @@ function(
             },
         };
 
+    local server_label = if server_runtime == 'tokio' then 'tokio' else server_io_engine;
+
     {
-        name: 'io_engine_s' + server_io_engine + '_c' + client_io_engine + '_c' + connections + '_p' + pipeline_depth,
+        name: 'io_engine_s' + server_label + '_c' + client_io_engine + '_c' + connections + '_p' + pipeline_depth,
         jobs: {
             server: {
                 local config = std.manifestTomlEx(cache_config, ''),
 
                 host: {
-                    tags: ['c8g.2xl'],
+                    tags: ['c8g-2xlarge'],
                 },
 
                 steps: [
@@ -293,7 +298,7 @@ function(
                 local loadgen = std.manifestTomlEx(test_benchmark_config, ''),
 
                 host: {
-                    tags: ['c8g.8xl'],
+                    tags: ['c8g-8xlarge'],
                 },
 
                 steps: [
@@ -339,6 +344,14 @@ function(
 
                     systemslab.write_file('warmup.toml', warmup),
                     systemslab.write_file('loadgen.toml', loadgen),
+
+                    // Replace SERVER_ADDR placeholder with actual server address
+                    systemslab.bash(
+                        |||
+                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" warmup.toml
+                            sed -i "s/SERVER_ADDR/$SERVER_ADDR/g" loadgen.toml
+                        |||
+                    ),
 
                     systemslab.barrier('cache-start'),
 

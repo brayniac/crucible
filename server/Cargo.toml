@@ -21,6 +21,7 @@ segcache = { workspace = true }
 s3fifo = { workspace = true }
 
 # Protocol implementations
+protocol-ping = { workspace = true }
 protocol-resp = { workspace = true, features = ["resp3"] }
 protocol-memcache = { workspace = true, features = ["full"] }
 
@@ -54,3 +55,7 @@ http-body-util = { workspace = true, optional = true }
 [[bin]]
 name = "crucible-server"
 path = "src/bin/server.rs"
+
+[[bin]]
+name = "ping-server"
+path = "src/bin/ping.rs"

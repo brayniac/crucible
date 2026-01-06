@@ -88,6 +88,8 @@ pub enum Protocol {
     #[serde(alias = "memcache-binary")]
     MemcacheBinary,
     Momento,
+    /// Simple ASCII PING/PONG protocol
+    Ping,
 }
 
 #[derive(Debug, Clone, Deserialize)]

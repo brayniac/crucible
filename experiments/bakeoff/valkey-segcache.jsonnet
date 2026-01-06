@@ -62,7 +62,7 @@ function(
     value_length='64',
     get_percent='80',
     warmup_requests='10000000',
-    test_requests='50000000',
+    test_duration='60',  // Target test duration in seconds (calibrated automatically)
 )
     local
         server_threads_int = std.parseInt(server_threads),
@@ -101,7 +101,7 @@ function(
                 local config = std.manifestTomlEx(cache_config, ''),
 
                 host: {
-                    tags: ['c8g.2xl'],
+                    tags: ['c8g-2xlarge'],
                 },
 
                 steps: [
@@ -223,7 +223,7 @@ function(
 
             client: {
                 host: {
-                    tags: ['c8g.8xl'],
+                    tags: ['c8g-8xlarge'],
                 },
 
                 steps: [
@@ -263,7 +263,7 @@ function(
 
                             echo "=== Running warmup (SET-heavy to populate cache) ==="
                             %(cpu_affinity_cmd)s $HOME/valkey-benchmark \
-                                -h 172.31.31.218 \
+                                -h $SERVER_ADDR \
                                 -p 6379 \
                                 -c %(connections)s \
                                 -n %(warmup_requests)s \
@@ -292,7 +292,63 @@ function(
                     // Signal warmup is complete
                     systemslab.barrier('warmup-complete'),
 
-                    // Run the GET benchmark
+                    // Calibration run: estimate throughput to calculate request count for target duration
+                    systemslab.bash(
+                        |||
+                            export HOME=/tmp/valkey-build
+
+                            ulimit -n 500000
+                            sudo prlimit --memlock=unlimited --pid $$
+
+                            echo "=== Running calibration (10K requests) ==="
+                            CALIBRATION_OUTPUT=$(%(cpu_affinity_cmd)s $HOME/valkey-benchmark \
+                                -h $SERVER_ADDR \
+                                -p 6379 \
+                                -c %(connections)s \
+                                -n 10000 \
+                                -d %(value_length)s \
+                                -r %(key_count)s \
+                                -P %(pipeline_depth)s \
+                                --threads %(threads)s \
+                                -t get \
+                                -q 2>&1)
+
+                            echo "$CALIBRATION_OUTPUT"
+
+                            # Extract throughput (requests per second) from output
+                            # Format: "GET: 867313.00 requests per second, ..."
+                            THROUGHPUT=$(echo "$CALIBRATION_OUTPUT" | grep -oP 'GET: \K[0-9.]+' | head -1)
+
+                            if [ -z "$THROUGHPUT" ]; then
+                                echo "ERROR: Could not extract throughput from calibration"
+                                THROUGHPUT=100000  # fallback to 100K/s
+                            fi
+
+                            # Calculate requests needed for %(target_duration)s seconds
+                            # Add 10%% buffer to ensure we hit the duration
+                            TARGET_REQUESTS=$(python3 -c "print(int(float('$THROUGHPUT') * %(target_duration)s * 1.1))")
+
+                            # Clamp to reasonable bounds (1M to 500M)
+                            if [ "$TARGET_REQUESTS" -lt 1000000 ]; then
+                                TARGET_REQUESTS=1000000
+                            elif [ "$TARGET_REQUESTS" -gt 500000000 ]; then
+                                TARGET_REQUESTS=500000000
+                            fi
+
+                            echo "Calibration: ${THROUGHPUT} req/s -> targeting ${TARGET_REQUESTS} requests for ~%(target_duration)s seconds"
+                            echo "$TARGET_REQUESTS" > /tmp/target_requests
+                        ||| % {
+                            connections: connections,
+                            value_length: value_length,
+                            key_count: key_count,
+                            pipeline_depth: pipeline_depth,
+                            threads: benchmark_threads,
+                            target_duration: test_duration,
+                            cpu_affinity_cmd: if benchmark_cpu_affinity != '' then 'taskset -c ' + benchmark_cpu_affinity else '',
+                        }
+                    ),
+
+                    // Run the actual GET benchmark with calculated request count
                     systemslab.bash(
                         |||
                             export HOME=/tmp/valkey-build
@@ -301,12 +357,14 @@ function(
                             sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
 
-                            echo "=== Running GET benchmark ==="
+                            TARGET_REQUESTS=$(cat /tmp/target_requests)
+                            echo "=== Running GET benchmark ($TARGET_REQUESTS requests) ==="
+
                             %(cpu_affinity_cmd)s $HOME/valkey-benchmark \
-                                -h 172.31.31.218 \
+                                -h $SERVER_ADDR \
                                 -p 6379 \
                                 -c %(connections)s \
-                                -n %(test_requests)s \
+                                -n $TARGET_REQUESTS \
                                 -d %(value_length)s \
                                 -r %(key_count)s \
                                 -P %(pipeline_depth)s \
@@ -314,7 +372,6 @@ function(
                                 -t get
                         ||| % {
                             connections: connections,
-                            test_requests: test_requests,
                             value_length: value_length,
                             key_count: key_count,
                             pipeline_depth: pipeline_depth,

@@ -6,7 +6,8 @@
 use crate::buffer::BufferPair;
 use crate::config::{Config, Protocol};
 use crate::protocol::{
-    MemcacheBinaryCodec, MemcacheBinaryError, MemcacheCodec, MemcacheError, RespCodec, RespError,
+    MemcacheBinaryCodec, MemcacheBinaryError, MemcacheCodec, MemcacheError, PingCodec, PingError,
+    RespCodec, RespError,
 };
 
 use io_driver::ConnId;
@@ -84,6 +85,7 @@ enum ProtocolCodec {
     Resp(RespCodec),
     Memcache(MemcacheCodec),
     MemcacheBinary(MemcacheBinaryCodec),
+    Ping(PingCodec),
 }
 
 /// A protocol session that works with IoDriver.
@@ -152,6 +154,11 @@ impl Session {
         )
     }
 
+    /// Create a new PING protocol session.
+    pub fn new_ping(config: SessionConfig) -> Self {
+        Self::new(config, ProtocolCodec::Ping(PingCodec::new()))
+    }
+
     /// Create a new session from config.
     pub fn from_config(addr: SocketAddr, config: &Config) -> Self {
         let session_config = SessionConfig::from_config(addr, config);
@@ -159,6 +166,7 @@ impl Session {
             Protocol::Resp | Protocol::Resp3 => Self::new_resp(session_config),
             Protocol::Memcache => Self::new_memcache(session_config),
             Protocol::MemcacheBinary => Self::new_memcache_binary(session_config),
+            Protocol::Ping => Self::new_ping(session_config),
             Protocol::Momento => {
                 // Momento uses MomentoSession, not Session
                 panic!("Momento protocol uses MomentoSession, not Session")
@@ -284,6 +292,9 @@ impl Session {
             ProtocolCodec::MemcacheBinary(codec) => {
                 codec.encode_get(&mut self.buffers.send, key);
             }
+            ProtocolCodec::Ping(codec) => {
+                codec.encode_ping(&mut self.buffers.send);
+            }
         }
 
         self.in_flight.push_back(InFlightRequest {
@@ -319,6 +330,9 @@ impl Session {
             }
             ProtocolCodec::MemcacheBinary(codec) => {
                 codec.encode_set(&mut self.buffers.send, key, value, 0, 0);
+            }
+            ProtocolCodec::Ping(codec) => {
+                codec.encode_ping(&mut self.buffers.send);
             }
         }
 
@@ -417,6 +431,14 @@ impl Session {
                         Err(e) => return Err(SessionError::MemcacheBinary(e)),
                     }
                 }
+                ProtocolCodec::Ping(codec) => match codec.decode_response(&mut self.buffers.recv) {
+                    Ok(Some(v)) => Some(ResponseInfo {
+                        is_error: v.is_error(),
+                        is_null: false,
+                    }),
+                    Ok(None) => None,
+                    Err(e) => return Err(SessionError::Ping(e)),
+                },
             };
 
             match response {
@@ -481,6 +503,7 @@ impl Session {
             ProtocolCodec::Resp(codec) => codec.reset_counter(),
             ProtocolCodec::Memcache(_) => {}
             ProtocolCodec::MemcacheBinary(codec) => codec.reset(),
+            ProtocolCodec::Ping(codec) => codec.reset(),
         }
     }
 }
@@ -497,6 +520,7 @@ pub enum SessionError {
     Resp(RespError),
     Memcache(MemcacheError),
     MemcacheBinary(MemcacheBinaryError),
+    Ping(PingError),
 }
 
 impl std::fmt::Display for SessionError {
@@ -505,6 +529,7 @@ impl std::fmt::Display for SessionError {
             SessionError::Resp(e) => write!(f, "RESP error: {}", e),
             SessionError::Memcache(e) => write!(f, "Memcache error: {}", e),
             SessionError::MemcacheBinary(e) => write!(f, "Memcache binary error: {}", e),
+            SessionError::Ping(e) => write!(f, "Ping error: {}", e),
         }
     }
 }

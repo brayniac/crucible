@@ -1,51 +1,76 @@
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
+
+const SYSTEMSLAB_URL: &str = "http://systemslab";
+
+// ============================================================================
+// GraphQL types
+// ============================================================================
 
 #[derive(Debug, Deserialize)]
-pub struct ContextExport {
+struct GraphQLResponse<T> {
+    data: Option<T>,
     #[allow(dead_code)]
-    pub id: String,
-    #[allow(dead_code)]
-    pub name: String,
-    #[allow(dead_code)]
-    pub state: String,
-    pub experiments: Vec<ExperimentRef>,
+    errors: Option<Vec<GraphQLError>>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ExperimentRef {
-    pub experiment_id: String,
-    #[serde(default)]
-    pub params: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExperimentExport {
+struct GraphQLError {
     #[allow(dead_code)]
-    pub id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextByIdData {
+    #[serde(rename = "contextById")]
+    context_by_id: Option<ContextData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextData {
     #[allow(dead_code)]
-    pub name: String,
-    pub state: String,
-    #[serde(default)]
-    pub artifacts: Vec<ArtifactRef>,
-    #[serde(default)]
-    pub jobs: Vec<JobRef>,
+    id: String,
+    #[allow(dead_code)]
+    name: String,
+    experiments: Vec<ContextExperimentData>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ArtifactRef {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub job_id: Option<String>,
+struct ContextExperimentData {
+    #[serde(rename = "experimentId")]
+    #[allow(dead_code)]
+    experiment_id: String,
+    params: HashMap<String, String>,
+    experiment: ExperimentData,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct JobRef {
-    pub id: String,
-    pub name: String,
+struct ExperimentData {
+    id: String,
+    #[allow(dead_code)]
+    name: String,
+    state: String,
+    job: Vec<JobData>,
 }
+
+#[derive(Debug, Deserialize)]
+struct JobData {
+    #[allow(dead_code)]
+    id: String,
+    name: String,
+    artifact: Vec<ArtifactData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactData {
+    id: String,
+    name: String,
+}
+
+// ============================================================================
+// Export types (for legacy fallback)
+// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct LogsFile {
@@ -59,6 +84,10 @@ pub struct LogEvent {
     #[serde(default)]
     pub text: Option<String>,
 }
+
+// ============================================================================
+// Result types
+// ============================================================================
 
 #[derive(Debug, Default, Serialize)]
 pub struct BenchmarkMetrics {
@@ -82,69 +111,107 @@ pub struct BakeoffResults {
     pub experiments: HashMap<String, Vec<ExperimentResult>>,
 }
 
-/// Fetch results for a context by exporting and parsing the data.
+// ============================================================================
+// GraphQL-based fast fetching
+// ============================================================================
+
+/// Intermediate struct for parallel processing
+struct ExperimentInfo {
+    connections: usize,
+    pipeline_depth: usize,
+    state: String,
+    experiment_id: String,
+    jobs: Vec<JobData>,
+}
+
+/// Fetch results for a context using GraphQL (fast path).
 pub fn fetch_context_results(
     context_id: &str,
 ) -> Result<Vec<ExperimentResult>, Box<dyn std::error::Error>> {
-    // Export context and extract context.json using tar
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "systemslab export context {} -o - 2>/dev/null | tar -xOf - context.json",
-            context_id
-        ))
-        .output()?;
+    // Query experiments and their states via GraphQL
+    let query = format!(
+        r#"{{
+            contextById(id: "{}") {{
+                id
+                name
+                experiments {{
+                    experimentId
+                    params
+                    experiment {{
+                        id
+                        name
+                        state
+                        job {{
+                            id
+                            name
+                            artifact {{
+                                id
+                                name
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}"#,
+        context_id
+    );
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to export context: {}", stderr).into());
-    }
+    let response: GraphQLResponse<ContextByIdData> =
+        ureq::post(&format!("{}/api/graphql", SYSTEMSLAB_URL))
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!({ "query": query }))?
+            .into_json()?;
 
-    let context: ContextExport = serde_json::from_slice(&output.stdout)?;
+    let context = response
+        .data
+        .and_then(|d| d.context_by_id)
+        .ok_or("Context not found")?;
 
-    let mut results = Vec::new();
+    // Collect experiment info for parallel processing
+    let experiment_infos: Vec<ExperimentInfo> = context
+        .experiments
+        .into_iter()
+        .map(|ctx_exp| {
+            let connections = ctx_exp
+                .params
+                .get("connections")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
 
-    for exp_ref in &context.experiments {
-        // Extract experiment.json for each experiment
-        let exp_output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "systemslab export context {} -o - 2>/dev/null | tar -xOf - {}/experiment.json",
-                context_id, exp_ref.experiment_id
-            ))
-            .output()?;
+            let pipeline_depth = ctx_exp
+                .params
+                .get("pipeline_depth")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
 
-        let (state, metrics) = if exp_output.status.success() {
-            let exp: ExperimentExport = serde_json::from_slice(&exp_output.stdout)?;
-            let metrics = if exp.state == "success" {
-                extract_metrics(context_id, &exp)
+            ExperimentInfo {
+                connections,
+                pipeline_depth,
+                state: ctx_exp.experiment.state,
+                experiment_id: ctx_exp.experiment.id,
+                jobs: ctx_exp.experiment.job,
+            }
+        })
+        .collect();
+
+    // Fetch metrics in parallel for successful experiments
+    let mut results: Vec<ExperimentResult> = experiment_infos
+        .into_par_iter()
+        .map(|info| {
+            let metrics = if info.state == "success" {
+                fetch_experiment_metrics(&info.experiment_id, &info.jobs)
             } else {
                 BenchmarkMetrics::default()
             };
-            (exp.state, metrics)
-        } else {
-            ("unknown".to_string(), BenchmarkMetrics::default())
-        };
 
-        let connections = exp_ref
-            .params
-            .get("connections")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        let pipeline_depth = exp_ref
-            .params
-            .get("pipeline_depth")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        results.push(ExperimentResult {
-            connections,
-            pipeline_depth,
-            state,
-            metrics,
-        });
-    }
+            ExperimentResult {
+                connections: info.connections,
+                pipeline_depth: info.pipeline_depth,
+                state: info.state,
+                metrics,
+            }
+        })
+        .collect();
 
     // Sort by connections, then pipeline_depth
     results.sort_by(|a, b| {
@@ -156,47 +223,37 @@ pub fn fetch_context_results(
     Ok(results)
 }
 
-/// Extract benchmark metrics from experiment logs.
-fn extract_metrics(context_id: &str, exp: &ExperimentExport) -> BenchmarkMetrics {
+/// Fetch metrics for a successful experiment by downloading the logs artifact.
+fn fetch_experiment_metrics(_experiment_id: &str, jobs: &[JobData]) -> BenchmarkMetrics {
     // Find the client job
-    let client_job = exp.jobs.iter().find(|j| j.name == "client");
-    let client_job_id = match client_job {
-        Some(j) => &j.id,
+    let client_job = match jobs.iter().find(|j| j.name == "client") {
+        Some(j) => j,
         None => return BenchmarkMetrics::default(),
     };
 
-    // Find the logs.json artifact for the client job
-    let logs_artifact = exp
-        .artifacts
-        .iter()
-        .find(|a| a.name == "logs.json" && a.job_id.as_ref() == Some(client_job_id));
-
-    let artifact_id = match logs_artifact {
-        Some(a) => &a.id,
+    // Find the logs.json artifact
+    let logs_artifact = match client_job.artifact.iter().find(|a| a.name == "logs.json") {
+        Some(a) => a,
         None => return BenchmarkMetrics::default(),
     };
 
-    // Extract the logs file
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "systemslab export context {} -o - 2>/dev/null | tar -xOf - {}/artifact/{}",
-            context_id, exp.id, artifact_id
-        ))
-        .output();
+    // Download artifact directly via HTTP (UUID without hyphens)
+    let artifact_id_no_hyphens = logs_artifact.id.replace('-', "");
+    let url = format!(
+        "{}/api/v1/artifact/{}",
+        SYSTEMSLAB_URL, artifact_id_no_hyphens
+    );
 
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return BenchmarkMetrics::default(),
-    };
-
-    // Parse logs and extract metrics
-    let logs: LogsFile = match serde_json::from_slice(&output.stdout) {
-        Ok(l) => l,
+    let response = match ureq::get(&url).call() {
+        Ok(r) => r,
         Err(_) => return BenchmarkMetrics::default(),
     };
 
-    parse_benchmark_metrics(&logs)
+    // Parse logs and extract metrics
+    match response.into_json::<LogsFile>() {
+        Ok(logs) => parse_benchmark_metrics(&logs),
+        Err(_) => BenchmarkMetrics::default(),
+    }
 }
 
 /// Parse benchmark summary metrics from log events.
@@ -248,10 +305,6 @@ fn parse_benchmark_metrics(logs: &LogsFile) -> BenchmarkMetrics {
                 }
             }
             // valkey-benchmark latency summary table header (verbose mode)
-            // Format:
-            //   latency summary (msec):
-            //           avg       min       p50       p95       p99       max
-            //         0.167     0.016     0.159     0.287     0.343     2.527
             else if text.contains("latency summary (msec):") {
                 saw_latency_header = true;
             } else if saw_latency_header && text.trim().starts_with("avg") {
@@ -283,6 +336,10 @@ fn extract_float_before(text: &str, suffix: &str) -> Option<f64> {
     let parts: Vec<&str> = before.split_whitespace().collect();
     parts.last()?.parse().ok()
 }
+
+// ============================================================================
+// Output formatting
+// ============================================================================
 
 /// Print results as a table.
 pub fn print_results_table(experiment_name: &str, results: &[ExperimentResult]) {
@@ -551,12 +608,26 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
 
     <script>
         const data = {json_data};
-        const colors = {{
-            'crucible-segcache': '#3498db',
-            'crucible-valkey': '#e74c3c',
-            'valkey-segcache': '#2ecc71',
-            'valkey-valkey': '#9b59b6'
-        }};
+        const defaultColors = [
+            '#3498db', '#e74c3c', '#2ecc71', '#9b59b6',
+            '#f39c12', '#1abc9c', '#34495e', '#e67e22'
+        ];
+
+        function getColor(name, index) {{
+            const colorMap = {{
+                'crucible-segcache': '#3498db',
+                'crucible-valkey': '#e74c3c',
+                'valkey-segcache': '#2ecc71',
+                'valkey-valkey': '#9b59b6',
+                'uring-uring': '#3498db',
+                'uring-mio': '#e74c3c',
+                'mio-uring': '#2ecc71',
+                'mio-mio': '#9b59b6',
+                'tokio-uring': '#f39c12',
+                'tokio-mio': '#1abc9c'
+            }};
+            return colorMap[name] || defaultColors[index % defaultColors.length];
+        }}
 
         function formatThroughput(val) {{
             if (!val) return '-';
@@ -617,7 +688,9 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 return ca - cb || pa - pb;
             }});
 
+            let idx = 0;
             for (const [name, results] of Object.entries(data.experiments)) {{
+                const color = getColor(name, idx++);
                 const throughputData = sortedLabels.map(label => {{
                     const [c, p] = label.match(/\d+/g).map(Number);
                     const r = results.find(r => r.connections === c && r.pipeline_depth === p);
@@ -627,8 +700,8 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 datasets.push({{
                     label: name,
                     data: throughputData,
-                    backgroundColor: colors[name] + '80',
-                    borderColor: colors[name],
+                    backgroundColor: color + '80',
+                    borderColor: color,
                     borderWidth: 2
                 }});
             }}
@@ -658,7 +731,9 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
             const connections = [64, 256, 512, 1024];
             const datasets = [];
 
+            let idx = 0;
             for (const [name, results] of Object.entries(data.experiments)) {{
+                const color = getColor(name, idx++);
                 const throughputData = connections.map(c => {{
                     const r = results.find(r => r.connections === c && r.pipeline_depth === 1);
                     return r?.metrics?.throughput ? r.metrics.throughput / 1000000 : null;
@@ -667,8 +742,8 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 datasets.push({{
                     label: name,
                     data: throughputData,
-                    borderColor: colors[name],
-                    backgroundColor: colors[name] + '20',
+                    borderColor: color,
+                    backgroundColor: color + '20',
                     tension: 0.3,
                     fill: false
                 }});
@@ -694,7 +769,9 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
             const pipelines = [1, 8, 32, 64, 128];
             const datasets = [];
 
+            let idx = 0;
             for (const [name, results] of Object.entries(data.experiments)) {{
+                const color = getColor(name, idx++);
                 const throughputData = pipelines.map(p => {{
                     const r = results.find(r => r.connections === 256 && r.pipeline_depth === p);
                     return r?.metrics?.throughput ? r.metrics.throughput / 1000000 : null;
@@ -703,8 +780,8 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 datasets.push({{
                     label: name,
                     data: throughputData,
-                    borderColor: colors[name],
-                    backgroundColor: colors[name] + '20',
+                    borderColor: color,
+                    backgroundColor: color + '20',
                     tension: 0.3,
                     fill: false
                 }});
@@ -740,7 +817,9 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 return ca - cb || pa - pb;
             }});
 
+            let idx = 0;
             for (const [name, results] of Object.entries(data.experiments)) {{
+                const color = getColor(name, idx++);
                 const latencyData = sortedLabels.map(label => {{
                     const [c, p] = label.match(/\d+/g).map(Number);
                     const r = results.find(r => r.connections === c && r.pipeline_depth === p);
@@ -750,8 +829,8 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 datasets.push({{
                     label: name,
                     data: latencyData,
-                    backgroundColor: colors[name] + '80',
-                    borderColor: colors[name],
+                    backgroundColor: color + '80',
+                    borderColor: color,
                     borderWidth: 2
                 }});
             }}
@@ -777,7 +856,9 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
             const ctx = document.getElementById('throughputVsLatency').getContext('2d');
             const datasets = [];
 
+            let idx = 0;
             for (const [name, results] of Object.entries(data.experiments)) {{
+                const color = getColor(name, idx++);
                 const points = results
                     .filter(r => r.metrics.throughput && r.metrics.p99_us)
                     .map(r => ({{
@@ -788,8 +869,8 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 datasets.push({{
                     label: name,
                     data: points,
-                    backgroundColor: colors[name],
-                    borderColor: colors[name],
+                    backgroundColor: color,
+                    borderColor: color,
                     pointRadius: 6
                 }});
             }}
@@ -814,7 +895,9 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
             const configs = ['c64/p1', 'c256/p1', 'c256/p32', 'c1024/p64'];
             const datasets = [];
 
+            let idx = 0;
             for (const [name, results] of Object.entries(data.experiments)) {{
+                const color = getColor(name, idx++);
                 const latencyData = configs.map(cfg => {{
                     const [c, p] = cfg.match(/\d+/g).map(Number);
                     const r = results.find(r => r.connections === c && r.pipeline_depth === p);
@@ -824,8 +907,8 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 datasets.push({{
                     label: name,
                     data: latencyData,
-                    borderColor: colors[name],
-                    backgroundColor: colors[name] + '20',
+                    borderColor: color,
+                    backgroundColor: color + '20',
                     tension: 0.3,
                     fill: false
                 }});

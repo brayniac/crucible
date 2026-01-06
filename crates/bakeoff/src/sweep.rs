@@ -71,48 +71,95 @@ impl Experiment {
 // I/O Engine comparison suite
 // ============================================================================
 
-/// I/O engine configuration for experiments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum, Serialize, Deserialize)]
+/// Server engine configuration (runtime + io_engine combination).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum IoEngine {
+pub enum ServerEngine {
+    /// Native runtime with io_uring
     Uring,
+    /// Native runtime with mio (epoll)
     Mio,
+    /// Tokio async runtime
+    Tokio,
 }
 
-impl IoEngine {
+impl ServerEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
-            IoEngine::Uring => "uring",
-            IoEngine::Mio => "mio",
+            ServerEngine::Uring => "uring",
+            ServerEngine::Mio => "mio",
+            ServerEngine::Tokio => "tokio",
+        }
+    }
+
+    /// Returns the runtime config value
+    pub fn runtime(&self) -> &'static str {
+        match self {
+            ServerEngine::Uring | ServerEngine::Mio => "native",
+            ServerEngine::Tokio => "tokio",
+        }
+    }
+
+    /// Returns the io_engine config value (only relevant for native runtime)
+    pub fn io_engine(&self) -> &'static str {
+        match self {
+            ServerEngine::Uring => "uring",
+            ServerEngine::Mio => "mio",
+            ServerEngine::Tokio => "auto", // not used for tokio runtime
         }
     }
 }
 
-/// I/O engine experiment: server_io x client_io combinations.
+/// Client I/O engine configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientEngine {
+    Uring,
+    Mio,
+}
+
+impl ClientEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClientEngine::Uring => "uring",
+            ClientEngine::Mio => "mio",
+        }
+    }
+}
+
+/// I/O engine experiment: server_engine x client_engine combinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IoExperiment {
-    pub server: IoEngine,
-    pub client: IoEngine,
+    pub server: ServerEngine,
+    pub client: ClientEngine,
 }
 
 impl IoExperiment {
     pub fn all() -> Vec<IoExperiment> {
         vec![
             IoExperiment {
-                server: IoEngine::Uring,
-                client: IoEngine::Uring,
+                server: ServerEngine::Uring,
+                client: ClientEngine::Uring,
             },
             IoExperiment {
-                server: IoEngine::Uring,
-                client: IoEngine::Mio,
+                server: ServerEngine::Uring,
+                client: ClientEngine::Mio,
             },
             IoExperiment {
-                server: IoEngine::Mio,
-                client: IoEngine::Uring,
+                server: ServerEngine::Mio,
+                client: ClientEngine::Uring,
             },
             IoExperiment {
-                server: IoEngine::Mio,
-                client: IoEngine::Mio,
+                server: ServerEngine::Mio,
+                client: ClientEngine::Mio,
+            },
+            IoExperiment {
+                server: ServerEngine::Tokio,
+                client: ClientEngine::Uring,
+            },
+            IoExperiment {
+                server: ServerEngine::Tokio,
+                client: ClientEngine::Mio,
             },
         ]
     }
@@ -128,7 +175,9 @@ impl IoExperiment {
     pub fn extra_args(&self) -> Vec<String> {
         vec![
             "-p".to_string(),
-            format!("server_io_engine={}", self.server.as_str()),
+            format!("server_runtime={}", self.server.runtime()),
+            "-p".to_string(),
+            format!("server_io_engine={}", self.server.io_engine()),
             "-p".to_string(),
             format!("client_io_engine={}", self.client.as_str()),
         ]

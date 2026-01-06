@@ -14,6 +14,7 @@ members = [
 
 	# Protocol Implementations
 	"protocol/momento",
+	"protocol/ping",
 	"protocol/resp",
 	"protocol/memcache",
 
@@ -73,6 +74,7 @@ io-driver = { path = "io/driver" }
 http2 = { path = "io/http2" }
 grpc = { path = "io/grpc" }
 protocol-momento = { path = "protocol/momento" }
+protocol-ping = { path = "protocol/ping" }
 protocol-resp = { path = "protocol/resp" }
 protocol-memcache = { path = "protocol/memcache" }
 cache-core = { path = "cache/core" }
