@@ -247,6 +247,9 @@ pub fn fetch_context_results(
             .then(a.pipeline_depth.cmp(&b.pipeline_depth))
     });
 
+    // Filter out experiments with fewer than 8 connections
+    results.retain(|r| r.connections >= 8);
+
     Ok(results)
 }
 
@@ -648,10 +651,10 @@ pub fn generate_html_report(results: &BakeoffResults) -> String {
                 'valkey-valkey': '#9b59b6',
                 'uring-uring': '#3498db',
                 'uring-mio': '#e74c3c',
-                'mio-uring': '#2ecc71',
-                'mio-mio': '#9b59b6',
-                'tokio-uring': '#f39c12',
-                'tokio-mio': '#1abc9c'
+                'uring-tokio': '#2ecc71',
+                'mio-uring': '#9b59b6',
+                'mio-mio': '#f39c12',
+                'mio-tokio': '#1abc9c'
             }};
             return colorMap[name] || defaultColors[index % defaultColors.length];
         }}

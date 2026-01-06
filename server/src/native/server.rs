@@ -351,7 +351,6 @@ fn run_worker<C: Cache>(
     // when connections close. Using Vec with Option allows direct indexing while
     // handling sparse allocation efficiently.
     let mut connections: Vec<Option<Connection>> = Vec::with_capacity(4096);
-    let mut recv_buf = vec![0u8; config.read_buffer_size];
 
     loop {
         // Check for new connections from the acceptor (non-blocking)
@@ -420,14 +419,17 @@ fn run_worker<C: Cache>(
                             break;
                         };
 
-                        match driver.recv(conn_id, &mut recv_buf) {
+                        // Get spare capacity from connection's buffer for zero-copy recv
+                        let recv_buf = conn.recv_spare();
+
+                        match driver.recv(conn_id, recv_buf) {
                             Ok(0) => {
                                 close_reason = Some(CloseReason::ClientEof);
                                 break;
                             }
                             Ok(n) => {
                                 stats.add_bytes_received(n as u64);
-                                conn.append_recv_data(&recv_buf[..n]);
+                                conn.recv_commit(n);
                                 conn.process(&*cache);
 
                                 if conn.should_close() {

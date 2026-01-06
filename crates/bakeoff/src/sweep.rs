@@ -165,7 +165,7 @@ impl IoExperiment {
     }
 
     pub fn name(&self) -> String {
-        format!("{}-{}", self.server.as_str(), self.client.as_str())
+        format!("{}-{}", self.client.as_str(), self.server.as_str())
     }
 
     pub fn jsonnet_file(&self) -> &'static str {
@@ -223,10 +223,12 @@ impl SweepConfig {
     }
 
     /// Full sweep configuration for io-engine suite.
+    /// Focuses on shallow pipelines and varied connection counts
+    /// to isolate I/O engine overhead from cache performance.
     pub fn io_engine() -> Self {
         Self {
-            connections: vec![64, 256, 512, 1024],
-            pipeline_depths: vec![1, 8, 16, 32, 64, 128],
+            connections: vec![8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+            pipeline_depths: vec![1, 2, 4, 8, 16, 32, 64, 128, 256],
         }
     }
 

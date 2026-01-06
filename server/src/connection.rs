@@ -54,6 +54,47 @@ impl Connection {
         self.read_buf.extend_from_slice(data);
     }
 
+    /// Get a mutable slice of spare capacity for direct recv.
+    ///
+    /// Returns a slice that the caller can pass directly to read()/recv()
+    /// to avoid an intermediate copy. After reading, call `recv_commit(n)`
+    /// to update the buffer length.
+    #[inline]
+    pub fn recv_spare(&mut self) -> &mut [u8] {
+        // Ensure we have reasonable space available
+        const MIN_RECV_SPACE: usize = 8192;
+
+        // Compact if utilization is low
+        let cap = self.read_buf.capacity();
+        let len = self.read_buf.len();
+        if cap > 0 && len * 2 < cap {
+            self.read_buf.reserve(MIN_RECV_SPACE);
+        } else if cap - len < MIN_RECV_SPACE {
+            self.read_buf.reserve(MIN_RECV_SPACE);
+        }
+
+        // Return spare capacity as mutable slice
+        let spare_cap = self.read_buf.capacity() - self.read_buf.len();
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.read_buf.as_mut_ptr().add(self.read_buf.len()),
+                spare_cap,
+            )
+        }
+    }
+
+    /// Commit bytes that were written directly to the spare capacity.
+    ///
+    /// # Safety
+    /// Caller must ensure `n` bytes were actually written to the slice
+    /// returned by `recv_spare()`.
+    #[inline]
+    pub fn recv_commit(&mut self, n: usize) {
+        unsafe {
+            self.read_buf.set_len(self.read_buf.len() + n);
+        }
+    }
+
     /// Detect protocol from the first byte of data.
     #[inline]
     fn detect_protocol(&mut self) {
