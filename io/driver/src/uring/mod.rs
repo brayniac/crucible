@@ -845,8 +845,18 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Don't auto-submit multishot recv - let caller decide via submit_recv()
-        // This enables zero-copy recv when caller uses submit_recv()
+        // Submit multishot recv - if this fails, clean up and return error
+        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
+            self.connections.try_remove(conn_id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
 
         Ok(ConnId::new(conn_id))
     }
@@ -884,8 +894,18 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Don't auto-submit multishot recv - let caller decide via submit_recv()
-        // This enables zero-copy recv when caller uses submit_recv()
+        // Submit multishot recv - if this fails, clean up and return error
+        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
+            self.connections.try_remove(conn_id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
 
         Ok(ConnId::new(conn_id))
     }
