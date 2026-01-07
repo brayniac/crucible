@@ -94,14 +94,14 @@ function(
     // Benchmark parameters
     benchmark_threads='24',
     benchmark_cpu_affinity='8-31',
-    connections='1',
-    pipeline_depth='16',
+    connections='256',
+    pipeline_depth='64',
     key_length='16',
     key_count='1000000',
     value_length='64',
     get_percent='80',
-    warmup_duration='1s',
-    test_duration='1s',
+    warmup_duration='60s',
+    test_duration='300s',
     rate_limit='',
 
     // IO parameters
