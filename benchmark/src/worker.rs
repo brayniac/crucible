@@ -737,10 +737,15 @@ impl IoWorker {
                     }
                 }
 
-                // Accept, AcceptRaw, and ListenerError are for server-side, not used here
+                // Accept, AcceptRaw, ListenerError, and UDP variants are not used in this TCP benchmark
                 CompletionKind::Accept { .. }
                 | CompletionKind::AcceptRaw { .. }
-                | CompletionKind::ListenerError { .. } => {}
+                | CompletionKind::ListenerError { .. }
+                | CompletionKind::UdpReadable { .. }
+                | CompletionKind::RecvMsgComplete { .. }
+                | CompletionKind::UdpWritable { .. }
+                | CompletionKind::SendMsgComplete { .. }
+                | CompletionKind::UdpError { .. } => {}
             }
         }
 
