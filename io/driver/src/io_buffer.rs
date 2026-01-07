@@ -307,4 +307,67 @@ mod tests {
         buf.ensure_spare(100);
         assert!(buf.spare_capacity() >= 100);
     }
+
+    /// Test the full receive cycle: loan -> write -> unloan -> consume -> loan again
+    /// This simulates the actual usage pattern in single-shot recv mode.
+    #[test]
+    fn test_recv_cycle_with_consume() {
+        let mut buf = IoBuffer::with_capacity(1024);
+
+        // First recv: loan spare, write 100 bytes, unloan
+        {
+            let spare = buf.loan_spare();
+            spare[..100].copy_from_slice(&[b'A'; 100]);
+        }
+        buf.unloan(100);
+        assert_eq!(buf.len(), 100);
+        assert_eq!(&buf.as_slice()[..100], &[b'A'; 100]);
+
+        // Consume 60 bytes (simulate processing a request)
+        buf.consume(60);
+        assert_eq!(buf.len(), 40);
+        assert_eq!(&buf.as_slice()[..40], &[b'A'; 40]);
+
+        // Second recv: loan spare, write 50 more bytes, unloan
+        {
+            let spare = buf.loan_spare();
+            // Spare should start after the 40 remaining bytes
+            spare[..50].copy_from_slice(&[b'B'; 50]);
+        }
+        buf.unloan(50);
+        assert_eq!(buf.len(), 90);
+        // First 40 bytes are still 'A', next 50 are 'B'
+        assert_eq!(&buf.as_slice()[..40], &[b'A'; 40]);
+        assert_eq!(&buf.as_slice()[40..90], &[b'B'; 50]);
+    }
+
+    /// Test that loan_spare returns correct pointer after consume
+    #[test]
+    fn test_loan_spare_pointer_after_consume() {
+        let mut buf = IoBuffer::with_capacity(1024);
+
+        // Write some data
+        buf.extend_from_slice(&[b'X'; 100]);
+
+        // Consume 50 bytes
+        buf.consume(50);
+
+        // Now loan spare and check pointer
+        let spare = buf.loan_spare();
+        let spare_ptr = spare.as_ptr();
+
+        // Write to spare
+        spare[..10].copy_from_slice(&[b'Y'; 10]);
+        buf.unloan(10);
+
+        // Verify the data is in the right place
+        assert_eq!(buf.len(), 60); // 50 remaining + 10 new
+        assert_eq!(&buf.as_slice()[..50], &[b'X'; 50]);
+        assert_eq!(&buf.as_slice()[50..60], &[b'Y'; 10]);
+
+        // The Y bytes should be at spare_ptr
+        unsafe {
+            assert_eq!(*spare_ptr, b'Y');
+        }
+    }
 }

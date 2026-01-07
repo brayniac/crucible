@@ -15,6 +15,13 @@ pub struct UringConnection {
     pub raw_fd: RawFd,
     /// Registered fd slot index for io_uring fixed files.
     pub fixed_slot: u32,
+    /// Generation counter for detecting stale recv completions.
+    ///
+    /// When a connection is created, it gets a unique generation number.
+    /// This is encoded in the user_data of single-shot recv operations.
+    /// On completion, we check if the generation matches to detect stale
+    /// completions from a previous connection that reused the same slab slot.
+    pub generation: u32,
     /// Accumulated received data (used with multishot recv).
     pub recv_data: Vec<u8>,
     /// Double send buffers for async send safety.
@@ -38,11 +45,12 @@ pub struct UringConnection {
 }
 
 impl UringConnection {
-    /// Create a new connection with the given buffer size.
-    pub fn new(raw_fd: RawFd, fixed_slot: u32, buffer_size: usize) -> Self {
+    /// Create a new connection with the given buffer size and generation.
+    pub fn new(raw_fd: RawFd, fixed_slot: u32, buffer_size: usize, generation: u32) -> Self {
         Self {
             raw_fd,
             fixed_slot,
+            generation,
             recv_data: Vec::with_capacity(buffer_size),
             // 64KB per buffer to handle large response backlogs
             send_bufs: [Vec::with_capacity(65536), Vec::with_capacity(65536)],
