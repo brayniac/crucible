@@ -549,10 +549,11 @@ impl UringDriver {
             }));
 
         // Also submit next recv to keep the recv loop going
-        if let Some(conn) = self.connections.get(conn_id) {
-            let generation = conn.generation;
-            let fixed_slot = conn.fixed_slot;
-            drop(conn);
+        let next_recv_info = self
+            .connections
+            .get(conn_id)
+            .map(|c| (c.generation, c.fixed_slot));
+        if let Some((generation, fixed_slot)) = next_recv_info {
             let _ = self.submit_single_recv_internal(conn_id, generation, fixed_slot);
         }
     }
