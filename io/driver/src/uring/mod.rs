@@ -264,6 +264,52 @@ impl UringDriver {
         Ok(())
     }
 
+    /// Submit a single-shot recv for a connection (internal helper).
+    /// Data will be appended to recv_state on completion.
+    fn submit_single_recv_internal(
+        &mut self,
+        conn_id: usize,
+        generation: u32,
+        fixed_slot: u32,
+    ) -> io::Result<()> {
+        // Check if recv is already pending
+        if let Some(conn) = self.connections.get(conn_id) {
+            if conn.single_recv_pending {
+                return Ok(()); // Already have a recv pending
+            }
+        }
+
+        // Allocate a buffer from the pool
+        let (buf_id, pool_ptr, pool_len) = self
+            .recv_pool
+            .alloc(conn_id, generation)
+            .ok_or_else(|| io::Error::other("recv buffer pool exhausted"))?;
+
+        // Submit single-shot recv with pool buffer
+        let recv_op = opcode::Recv::new(Fixed(fixed_slot), pool_ptr, pool_len as u32)
+            .build()
+            .user_data(encode_pooled_recv(
+                conn_id,
+                generation,
+                buf_id,
+                OP_SINGLE_RECV,
+            ));
+
+        unsafe {
+            if let Err(_) = self.ring.submission().push(&recv_op) {
+                self.recv_pool.free(buf_id);
+                return Err(io::Error::other("SQ full"));
+            }
+        }
+
+        // Mark recv as pending
+        if let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.single_recv_pending = true;
+        }
+
+        Ok(())
+    }
+
     /// Submit a multishot accept for a listener.
     fn submit_multishot_accept(&mut self, listener_id: usize, fixed_slot: u32) -> io::Result<()> {
         let accept_op = AcceptMulti::new(Fixed(fixed_slot))
@@ -507,7 +553,7 @@ impl UringDriver {
             let generation = conn.generation;
             let fixed_slot = conn.fixed_slot;
             drop(conn);
-            let _ = self.submit_single_recv(conn_id, generation, fixed_slot);
+            let _ = self.submit_single_recv_internal(conn_id, generation, fixed_slot);
         }
     }
 
@@ -974,7 +1020,7 @@ impl IoDriver for UringDriver {
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
             self.submit_multishot_recv(conn_id, fixed_slot)
         } else {
-            self.submit_single_recv(conn_id, generation, fixed_slot)
+            self.submit_single_recv_internal(conn_id, generation, fixed_slot)
         };
 
         if let Err(e) = recv_result {
@@ -1031,7 +1077,7 @@ impl IoDriver for UringDriver {
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
             self.submit_multishot_recv(conn_id, fixed_slot)
         } else {
-            self.submit_single_recv(conn_id, generation, fixed_slot)
+            self.submit_single_recv_internal(conn_id, generation, fixed_slot)
         };
 
         if let Err(e) = recv_result {

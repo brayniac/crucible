@@ -150,7 +150,7 @@ function(
                 hashtable_power: hashtable_power_int,
             },
             uring+: {
-                recv_mode: 'multishot',
+                recv_mode: recv_mode,
             },
         },
 
