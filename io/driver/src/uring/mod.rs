@@ -61,27 +61,11 @@ fn encode_user_data(id: usize, buf_idx: u8, op: u64) -> u64 {
     ((id as u64) << 8) | ((buf_idx as u64) << 4) | op
 }
 
-/// Encode user_data with generation for single-shot recv.
-#[inline]
-fn encode_user_data_with_gen(id: usize, generation: u32, op: u64) -> u64 {
-    ((generation as u64) << 40) | ((id as u64) << 8) | op
-}
-
 #[inline]
 fn decode_user_data(user_data: u64) -> (usize, u8, u64) {
     (
         ((user_data >> 8) & 0xFFFF_FFFF) as usize,
         ((user_data >> 4) & 0xF) as u8,
-        user_data & 0xF,
-    )
-}
-
-/// Decode user_data including generation (for single-shot recv - legacy).
-#[inline]
-fn decode_user_data_with_gen(user_data: u64) -> (usize, u32, u64) {
-    (
-        ((user_data >> 8) & 0xFFFF_FFFF) as usize,
-        (user_data >> 40) as u32,
         user_data & 0xF,
     )
 }
@@ -447,7 +431,7 @@ impl UringDriver {
         // to a pool buffer (still valid), not a freed connection buffer.
         let conn = match self.connections.get_mut(conn_id) {
             Some(c) if c.generation == generation => c,
-            Some(c) => {
+            Some(_) => {
                 // Generation mismatch - stale completion from old connection.
                 // Data was safely written to pool buffer, just discard it.
                 self.recv_pool.free(buf_id);
@@ -469,9 +453,8 @@ impl UringDriver {
             // EOF - peer closed connection
             self.recv_pool.free(buf_id);
             self.pending_completions
-                .push(Completion::new(CompletionKind::RecvComplete {
+                .push(Completion::new(CompletionKind::Closed {
                     conn_id: ConnId::new(conn_id),
-                    bytes: 0,
                 }));
             return;
         }
@@ -513,11 +496,19 @@ impl UringDriver {
         // Return pool buffer for reuse
         self.recv_pool.free(buf_id);
 
+        // Generate Recv completion (same as multishot) since data is in recv_state
         self.pending_completions
-            .push(Completion::new(CompletionKind::RecvComplete {
+            .push(Completion::new(CompletionKind::Recv {
                 conn_id: ConnId::new(conn_id),
-                bytes,
             }));
+
+        // Also submit next recv to keep the recv loop going
+        if let Some(conn) = self.connections.get(conn_id) {
+            let generation = conn.generation;
+            let fixed_slot = conn.fixed_slot;
+            drop(conn);
+            let _ = self.submit_single_recv(conn_id, generation, fixed_slot);
+        }
     }
 
     fn handle_send(&mut self, conn_id: usize, buf_idx: usize, result: i32, flags: u32) {
@@ -979,19 +970,23 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
         entry.insert(conn);
 
-        // In multishot mode, automatically start receiving data
-        if self.recv_mode == crate::types::RecvMode::Multishot {
-            if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
-                self.connections.try_remove(conn_id);
-                let fds = [-1i32];
-                let _ = self
-                    .ring
-                    .submitter()
-                    .register_files_update(fixed_slot, &fds);
-                self.registered_files.free(fixed_slot);
-                unsafe { libc::close(raw_fd) };
-                return Err(e);
-            }
+        // Automatically start receiving data
+        let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
+            self.submit_multishot_recv(conn_id, fixed_slot)
+        } else {
+            self.submit_single_recv(conn_id, generation, fixed_slot)
+        };
+
+        if let Err(e) = recv_result {
+            self.connections.try_remove(conn_id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
         }
 
         Ok(ConnId::new(conn_id))
@@ -1032,19 +1027,23 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
         entry.insert(conn);
 
-        // In multishot mode, automatically start receiving data
-        if self.recv_mode == crate::types::RecvMode::Multishot {
-            if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
-                self.connections.try_remove(conn_id);
-                let fds = [-1i32];
-                let _ = self
-                    .ring
-                    .submitter()
-                    .register_files_update(fixed_slot, &fds);
-                self.registered_files.free(fixed_slot);
-                unsafe { libc::close(raw_fd) };
-                return Err(e);
-            }
+        // Automatically start receiving data
+        let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
+            self.submit_multishot_recv(conn_id, fixed_slot)
+        } else {
+            self.submit_single_recv(conn_id, generation, fixed_slot)
+        };
+
+        if let Err(e) = recv_result {
+            self.connections.try_remove(conn_id);
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(fixed_slot, &fds);
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
         }
 
         Ok(ConnId::new(conn_id))
@@ -1177,7 +1176,7 @@ impl IoDriver for UringDriver {
             ));
 
         unsafe {
-            if let Err(e) = self.ring.submission().push(&recv_op) {
+            if let Err(_) = self.ring.submission().push(&recv_op) {
                 // Failed to submit - free the pool buffer
                 self.recv_pool.free(buf_id);
                 if let Some(conn) = self.connections.get_mut(conn_id) {
