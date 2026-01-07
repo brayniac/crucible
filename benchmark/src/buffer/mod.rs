@@ -12,7 +12,7 @@ const MAX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// - Starts with initial capacity, grows as needed up to MAX_BUFFER_SIZE
 /// - Tracks read/write positions separately
 /// - Supports compact operation to reclaim consumed space
-/// - Shrinks back to initial capacity when empty and oversized
+/// - Optionally shrinks back to initial capacity when empty and oversized
 #[derive(Debug)]
 pub struct Buffer {
     data: Vec<u8>,
@@ -22,6 +22,8 @@ pub struct Buffer {
     read_pos: usize,
     /// Write position: data has been written up to here
     write_pos: usize,
+    /// Whether to allow shrinking (must be false when buffer is loaned to kernel)
+    allow_shrink: bool,
 }
 
 impl Buffer {
@@ -37,7 +39,24 @@ impl Buffer {
             initial_capacity: capacity,
             read_pos: 0,
             write_pos: 0,
+            allow_shrink: true,
         }
+    }
+
+    /// Disable shrinking on this buffer.
+    ///
+    /// IMPORTANT: Must be called before loaning the buffer to the kernel via
+    /// io_uring submit_recv. Shrinking while the kernel has a pointer to the
+    /// buffer would cause use-after-free.
+    #[inline]
+    pub fn disable_shrink(&mut self) {
+        self.allow_shrink = false;
+    }
+
+    /// Enable shrinking on this buffer.
+    #[inline]
+    pub fn enable_shrink(&mut self) {
+        self.allow_shrink = true;
     }
 
     /// Returns the total capacity of the buffer.
@@ -114,8 +133,9 @@ impl Buffer {
             self.read_pos = 0;
             self.write_pos = 0;
 
-            // Shrink if we've grown beyond initial capacity
-            if self.data.len() > self.initial_capacity * 2 {
+            // Shrink if we've grown beyond initial capacity AND shrinking is allowed.
+            // Shrinking must be disabled when buffer is loaned to kernel (io_uring).
+            if self.allow_shrink && self.data.len() > self.initial_capacity * 2 {
                 self.data.truncate(self.initial_capacity);
                 self.data.shrink_to_fit();
                 self.data.resize(self.initial_capacity, 0);
@@ -150,14 +170,15 @@ impl Buffer {
     }
 
     /// Clears the buffer, resetting both positions.
-    /// Shrinks the buffer if it has grown beyond initial capacity.
+    /// Shrinks the buffer if it has grown beyond initial capacity and shrinking is allowed.
     #[inline]
     pub fn clear(&mut self) {
         self.read_pos = 0;
         self.write_pos = 0;
 
-        // Shrink if we've grown beyond initial capacity
-        if self.data.len() > self.initial_capacity * 2 {
+        // Shrink if we've grown beyond initial capacity AND shrinking is allowed.
+        // Shrinking must be disabled when buffer is loaned to kernel (io_uring).
+        if self.allow_shrink && self.data.len() > self.initial_capacity * 2 {
             self.data.truncate(self.initial_capacity);
             self.data.shrink_to_fit();
             self.data.resize(self.initial_capacity, 0);
@@ -225,16 +246,23 @@ pub struct BufferPair {
 
 impl BufferPair {
     pub fn new() -> Self {
+        // Disable shrinking on recv buffer by default.
+        // With io_uring submit_recv, the buffer is loaned to the kernel and
+        // shrinking would cause use-after-free.
+        let mut recv = Buffer::new();
+        recv.disable_shrink();
         Self {
             send: Buffer::new(),
-            recv: Buffer::new(),
+            recv,
         }
     }
 
     pub fn with_capacity(send_cap: usize, recv_cap: usize) -> Self {
+        let mut recv = Buffer::with_capacity(recv_cap);
+        recv.disable_shrink();
         Self {
             send: Buffer::with_capacity(send_cap),
-            recv: Buffer::with_capacity(recv_cap),
+            recv,
         }
     }
 }
