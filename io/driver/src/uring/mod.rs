@@ -305,7 +305,12 @@ impl UringDriver {
             }
             OP_SINGLE_RECV => {
                 // Single-shot recv encodes generation to detect stale completions
-                let (id, generation, _) = decode_user_data_with_gen(user_data);
+                let (id, generation, decoded_op) = decode_user_data_with_gen(user_data);
+                // Debug: log ALL recv completions
+                eprintln!(
+                    "[uring] RECV CQE: user_data={:#x} -> id={}, gen={}, op={}, result={}",
+                    user_data, id, generation, decoded_op, result
+                );
                 self.handle_single_recv(id, generation, result);
             }
             OP_UDP_RECVMSG => {
@@ -410,8 +415,20 @@ impl UringDriver {
         // By checking generation, we detect this race and discard stale completions.
         let conn = match self.connections.get_mut(conn_id) {
             Some(c) if c.generation == generation => c,
-            _ => {
-                // Connection doesn't exist or generation mismatch - stale completion
+            Some(c) => {
+                // Generation mismatch - stale completion from old connection
+                eprintln!(
+                    "[uring] STALE recv completion: conn_id={}, expected_gen={}, got_gen={}",
+                    conn_id, c.generation, generation
+                );
+                return;
+            }
+            None => {
+                // Connection doesn't exist
+                eprintln!(
+                    "[uring] recv completion for non-existent conn_id={}, gen={}",
+                    conn_id, generation
+                );
                 return;
             }
         };
@@ -903,6 +920,10 @@ impl IoDriver for UringDriver {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
+        eprintln!(
+            "[uring] register: conn_id={}, generation={}",
+            conn_id, generation
+        );
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
         entry.insert(conn);
 
@@ -956,6 +977,10 @@ impl IoDriver for UringDriver {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
+        eprintln!(
+            "[uring] register_fd: conn_id={}, generation={}",
+            conn_id, generation
+        );
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
         entry.insert(conn);
 
@@ -1075,16 +1100,22 @@ impl IoDriver for UringDriver {
         let fixed_slot = conn.fixed_slot;
         let generation = conn.generation;
 
+        // Debug: verify encoding/decoding round-trips correctly
+        let encoded = encode_user_data_with_gen(conn_id, generation, OP_SINGLE_RECV);
+        let (decoded_id, decoded_gen, decoded_op) = decode_user_data_with_gen(encoded);
+        if decoded_id != conn_id || decoded_gen != generation || decoded_op != OP_SINGLE_RECV {
+            eprintln!(
+                "[uring] ENCODE BUG: conn_id={} gen={} -> encoded={:#x} -> decoded=({}, {}, {})",
+                conn_id, generation, encoded, decoded_id, decoded_gen, decoded_op
+            );
+        }
+
         // Submit single-shot recv with user's buffer.
         // Encode generation in user_data to detect stale completions if the
         // connection is closed and the ID is reused before the recv completes.
         let recv_op = opcode::Recv::new(Fixed(fixed_slot), buf.as_mut_ptr(), buf.len() as u32)
             .build()
-            .user_data(encode_user_data_with_gen(
-                conn_id,
-                generation,
-                OP_SINGLE_RECV,
-            ));
+            .user_data(encoded);
 
         unsafe {
             self.ring
