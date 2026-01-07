@@ -7,7 +7,7 @@ use crate::metrics::{
     CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats, WorkerStatsSnapshot,
 };
 use cache_core::Cache;
-use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine};
+use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine, RecvMode as DriverRecvMode};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -338,12 +338,19 @@ fn run_worker<C: Cache>(
     stats: &WorkerStats,
     fd_receiver: crossbeam_channel::Receiver<(RawFd, SocketAddr)>,
 ) -> io::Result<()> {
+    // Convert server RecvMode to driver RecvMode
+    let driver_recv_mode = match config.recv_mode {
+        RecvMode::Multishot => DriverRecvMode::Multishot,
+        RecvMode::SingleShot => DriverRecvMode::SingleShot,
+    };
+
     let mut driver = Driver::builder()
         .engine(config.io_engine)
         .buffer_size(config.buffer_size)
         .buffer_count(config.buffer_count.next_power_of_two())
         .sq_depth(config.sq_depth)
         .sqpoll(config.sqpoll)
+        .recv_mode(driver_recv_mode)
         .build()?;
 
     // No listeners - connections come from the acceptor via channel
@@ -441,6 +448,12 @@ fn run_worker<C: Cache>(
                 }
 
                 CompletionKind::Recv { conn_id } => {
+                    // In single-shot mode, we use RecvComplete events instead.
+                    // The Recv event should not occur, but skip it just in case.
+                    if single_shot {
+                        continue;
+                    }
+
                     stats.inc_recv();
                     let idx = conn_id.as_usize();
 

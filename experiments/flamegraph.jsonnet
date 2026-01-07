@@ -252,14 +252,14 @@ function(
                         ||| % { repo: repo, git_ref: git_ref }
                     ),
 
-                    // Build the server binary
+                    // Build the server binary with frame pointers for profiling
                     systemslab.bash(
                         |||
                             export HOME=/tmp/crucible-build
                             source $HOME/.cargo/env
 
                             cd $HOME/crucible
-                            cargo build --release -p server
+                            RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release -p server
                         |||
                     ),
 
@@ -336,7 +336,7 @@ function(
 
                             echo "Recording with perf for %(record_duration)s seconds..."
                             sudo perf record \
-                                --call-graph dwarf \
+                                --call-graph fp \
                                 --freq %(perf_frequency)s \
                                 -p $SERVER_PID \
                                 -o perf.data \

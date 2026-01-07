@@ -88,7 +88,8 @@ pub use builder::DriverBuilder;
 pub use driver::IoDriver;
 pub use io_buffer::IoBuffer;
 pub use types::{
-    Completion, CompletionKind, ConnId, Ecn, IoEngine, ListenerId, RecvMeta, SendMeta, UdpSocketId,
+    Completion, CompletionKind, ConnId, Ecn, IoEngine, ListenerId, RecvMeta, RecvMode, SendMeta,
+    UdpSocketId,
 };
 
 // Transport re-exports

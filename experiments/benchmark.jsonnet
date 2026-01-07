@@ -89,21 +89,25 @@ function(
     segment_size='1MB',
     hashtable_power='20',
     server_threads='8',
-    server_cpu_affinity='4-7,20-23',
+    server_cpu_affinity='0-8',
     runtime='native',
 
     // Benchmark parameters
-    benchmark_threads='8',
-    benchmark_cpu_affinity='20-23,52-55',
+    benchmark_threads='24',
+    benchmark_cpu_affinity='8-31',
     connections='256',
-    pipeline_depth='64',
+    pipeline_depth='16',
     key_length='16',
     key_count='1000000',
     value_length='64',
     get_percent='80',
     warmup_duration='30s',
     test_duration='300s',
-    rate_limit=''
+    rate_limit='',
+
+    // IO parameters
+    io_engine='auto',
+    recv_mode='multishot'
 )
     local args = {
         server_threads: server_threads,
@@ -146,6 +150,9 @@ function(
                 segment_size: segment_size,
                 hashtable_power: hashtable_power_int,
             },
+            uring+: {
+                recv_mode: recv_mode,
+            },
         },
 
         warmup_benchmark_config = benchmark_config {
@@ -154,6 +161,8 @@ function(
                 warmup: '0s',
                 threads: benchmark_threads_int,
                 [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
+                io_engine: io_engine,
+                recv_mode: recv_mode,
             },
             connection+: {
                 connections: connections_int,
@@ -182,6 +191,8 @@ function(
                 warmup: '0s',
                 threads: benchmark_threads_int,
                 [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
+                io_engine: io_engine,
+                recv_mode: recv_mode,
             },
             connection+: {
                 connections: connections_int,
@@ -210,7 +221,7 @@ function(
                 local config = std.manifestTomlEx(cache_config, ''),
 
                 host: {
-                    tags: ['baremetal', 'server'],
+                    tags: ['c8g-2xlarge'],
                 },
 
                 steps: [
@@ -269,7 +280,7 @@ function(
                             sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
                             export CRUCIBLE_DIAGNOSTICS=1
-                            /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-server server.toml &
+                            $HOME/crucible/target/release/crucible-server server.toml &
                             echo PID=$! > pid
                         |||,
                         background=true
@@ -316,7 +327,7 @@ function(
                 local loadgen = std.manifestTomlEx(test_benchmark_config, ''),
 
                 host: {
-                    tags: ['baremetal', 'client'],
+                    tags: ['c8g-8xlarge'],
                 },
 
                 steps: [
@@ -388,7 +399,7 @@ function(
                             ulimit -a
 
                             export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
-                            /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-benchmark warmup.toml
+                            $HOME/crucible/target/release/crucible-benchmark warmup.toml
                         |||
                     ),
 
@@ -408,7 +419,7 @@ function(
                             ulimit -a
 
                             export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
-                            /usr/bin/numactl --localalloc $HOME/crucible/target/release/crucible-benchmark loadgen.toml
+                            $HOME/crucible/target/release/crucible-benchmark loadgen.toml
                         |||
                     ),
 

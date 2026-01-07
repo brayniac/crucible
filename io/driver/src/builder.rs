@@ -25,6 +25,7 @@ pub struct DriverBuilder {
     sq_depth: u32,
     max_connections: u32,
     sqpoll: bool,
+    recv_mode: crate::types::RecvMode,
 }
 
 impl Default for DriverBuilder {
@@ -43,6 +44,7 @@ impl DriverBuilder {
             sq_depth: 256,         // io_uring submission queue depth
             max_connections: 8192, // Maximum registered connections
             sqpoll: false,         // SQPOLL disabled by default
+            recv_mode: crate::types::RecvMode::default(),
         }
     }
 
@@ -102,6 +104,23 @@ impl DriverBuilder {
         self
     }
 
+    /// Set the recv mode for io_uring.
+    ///
+    /// - `Multishot` (default): The driver automatically submits multishot recv
+    ///   operations using ring-provided buffers, producing `CompletionKind::Recv`
+    ///   events with data copied to an internal buffer.
+    ///
+    /// - `SingleShot`: The driver does not automatically start recv operations.
+    ///   The caller must manually submit recv operations using `submit_recv()`,
+    ///   which produces `CompletionKind::RecvComplete` events.
+    ///
+    /// Only applies to the io_uring backend.
+    /// Default: Multishot
+    pub fn recv_mode(mut self, mode: crate::types::RecvMode) -> Self {
+        self.recv_mode = mode;
+        self
+    }
+
     /// Build the driver with the configured settings.
     pub fn build(self) -> io::Result<Box<dyn IoDriver>> {
         match self.engine {
@@ -152,6 +171,7 @@ impl DriverBuilder {
             self.buffer_count,
             self.max_connections,
             self.sqpoll,
+            self.recv_mode,
         )?))
     }
 }
@@ -170,6 +190,7 @@ mod tests {
         assert_eq!(builder.sq_depth, 256);
         assert_eq!(builder.max_connections, 8192);
         assert!(!builder.sqpoll);
+        assert_eq!(builder.recv_mode, crate::types::RecvMode::Multishot);
     }
 
     #[test]
@@ -218,6 +239,12 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_recv_mode() {
+        let builder = DriverBuilder::new().recv_mode(crate::types::RecvMode::SingleShot);
+        assert_eq!(builder.recv_mode, crate::types::RecvMode::SingleShot);
+    }
+
+    #[test]
     fn test_builder_chaining() {
         let builder = DriverBuilder::new()
             .engine(IoEngine::Mio)
@@ -225,7 +252,8 @@ mod tests {
             .buffer_count(128)
             .sq_depth(128)
             .max_connections(4096)
-            .sqpoll(true);
+            .sqpoll(true)
+            .recv_mode(crate::types::RecvMode::SingleShot);
 
         assert_eq!(builder.engine, IoEngine::Mio);
         assert_eq!(builder.buffer_size, 8192);
@@ -233,6 +261,7 @@ mod tests {
         assert_eq!(builder.sq_depth, 128);
         assert_eq!(builder.max_connections, 4096);
         assert!(builder.sqpoll);
+        assert_eq!(builder.recv_mode, crate::types::RecvMode::SingleShot);
     }
 
     #[test]

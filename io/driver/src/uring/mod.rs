@@ -120,6 +120,7 @@ pub struct UringDriver {
     buf_ring: BufRing,
     pending_completions: Vec<Completion>,
     buffer_size: usize,
+    recv_mode: crate::types::RecvMode,
 }
 
 // SAFETY: UringDriver can be safely sent between threads.
@@ -132,7 +133,14 @@ unsafe impl Send for UringDriver {}
 impl UringDriver {
     /// Create a new io_uring driver with default settings.
     pub fn new() -> io::Result<Self> {
-        Self::with_config(256, 16384, 256, 8192, false)
+        Self::with_config(
+            256,
+            16384,
+            256,
+            8192,
+            false,
+            crate::types::RecvMode::default(),
+        )
     }
 
     /// Create a new io_uring driver with custom configuration.
@@ -145,6 +153,7 @@ impl UringDriver {
         buffer_count: u16,
         max_connections: u32,
         sqpoll: bool,
+        recv_mode: crate::types::RecvMode,
     ) -> io::Result<Self> {
         // Verify kernel supports required features
         if !is_supported() {
@@ -165,7 +174,7 @@ impl UringDriver {
         let registered_files = RegisteredFiles::new(max_connections);
         ring.submitter().register_files_sparse(max_connections)?;
 
-        // Create buffer ring for multishot recv
+        // Create buffer ring for multishot recv (needed even in single-shot mode for UDP)
         let ring_entries = buffer_count.next_power_of_two();
         let buf_ring = BufRing::new(ring_entries, buffer_size)?;
 
@@ -188,6 +197,7 @@ impl UringDriver {
             buf_ring,
             pending_completions: Vec::with_capacity(256),
             buffer_size,
+            recv_mode,
         })
     }
 
@@ -845,17 +855,19 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Submit multishot recv - if this fails, clean up and return error
-        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
-            self.connections.try_remove(conn_id);
-            let fds = [-1i32];
-            let _ = self
-                .ring
-                .submitter()
-                .register_files_update(fixed_slot, &fds);
-            self.registered_files.free(fixed_slot);
-            unsafe { libc::close(raw_fd) };
-            return Err(e);
+        // In multishot mode, automatically start receiving data
+        if self.recv_mode == crate::types::RecvMode::Multishot {
+            if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
+                self.connections.try_remove(conn_id);
+                let fds = [-1i32];
+                let _ = self
+                    .ring
+                    .submitter()
+                    .register_files_update(fixed_slot, &fds);
+                self.registered_files.free(fixed_slot);
+                unsafe { libc::close(raw_fd) };
+                return Err(e);
+            }
         }
 
         Ok(ConnId::new(conn_id))
@@ -894,17 +906,19 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size);
         entry.insert(conn);
 
-        // Submit multishot recv - if this fails, clean up and return error
-        if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
-            self.connections.try_remove(conn_id);
-            let fds = [-1i32];
-            let _ = self
-                .ring
-                .submitter()
-                .register_files_update(fixed_slot, &fds);
-            self.registered_files.free(fixed_slot);
-            unsafe { libc::close(raw_fd) };
-            return Err(e);
+        // In multishot mode, automatically start receiving data
+        if self.recv_mode == crate::types::RecvMode::Multishot {
+            if let Err(e) = self.submit_multishot_recv(conn_id, fixed_slot) {
+                self.connections.try_remove(conn_id);
+                let fds = [-1i32];
+                let _ = self
+                    .ring
+                    .submitter()
+                    .register_files_update(fixed_slot, &fds);
+                self.registered_files.free(fixed_slot);
+                unsafe { libc::close(raw_fd) };
+                return Err(e);
+            }
         }
 
         Ok(ConnId::new(conn_id))
