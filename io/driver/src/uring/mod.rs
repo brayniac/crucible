@@ -122,6 +122,13 @@ pub struct UringDriver {
     buffer_size: usize,
 }
 
+// SAFETY: UringDriver can be safely sent between threads.
+// The raw pointers in msghdr within UringUdpSocket point to data owned by the same
+// UringUdpSocket struct (addr_storage, cmsg_buf, iovec). When the driver is moved,
+// all owned data moves together. The driver is designed for single-threaded use
+// but can be transferred between threads safely.
+unsafe impl Send for UringDriver {}
+
 impl UringDriver {
     /// Create a new io_uring driver with default settings.
     pub fn new() -> io::Result<Self> {
