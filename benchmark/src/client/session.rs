@@ -407,6 +407,40 @@ impl Session {
         self.buffers.recv.advance(n);
     }
 
+    // --- Single-shot recv mode methods ---
+
+    /// Loan the recv buffer's spare capacity to the kernel for single-shot recv.
+    ///
+    /// Returns a mutable slice that can be passed to `submit_recv()`.
+    /// The buffer is marked as loaned and cannot be compacted until
+    /// `recv_unloan()` or `recv_unloan_cancel()` is called.
+    #[inline]
+    pub fn recv_loan_spare(&mut self) -> &mut [u8] {
+        // Compact before loaning if running low on writable space
+        if self.buffers.recv.writable() < self.buffers.recv.capacity() / 4 {
+            self.buffers.recv.compact();
+        }
+        self.buffers.recv.loan_spare()
+    }
+
+    /// Return the recv buffer from the kernel and commit bytes received.
+    #[inline]
+    pub fn recv_unloan(&mut self, bytes: usize) {
+        self.buffers.recv.unloan(bytes);
+    }
+
+    /// Cancel a recv loan without committing any bytes.
+    #[inline]
+    pub fn recv_unloan_cancel(&mut self) {
+        self.buffers.recv.unloan_cancel();
+    }
+
+    /// Returns true if the recv buffer is currently loaned to the kernel.
+    #[inline]
+    pub fn is_recv_loaned(&self) -> bool {
+        self.buffers.recv.is_loaned()
+    }
+
     /// Process received data and extract completed responses.
     ///
     /// The `now` parameter should be the current time, shared across a batch of

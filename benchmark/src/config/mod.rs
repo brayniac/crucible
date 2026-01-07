@@ -5,6 +5,17 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Recv mode for io_uring connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecvMode {
+    /// Multishot recv with kernel-managed buffer ring (default).
+    #[default]
+    Multishot,
+    /// Single-shot recv directly into connection buffer.
+    SingleShot,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -36,6 +47,9 @@ pub struct General {
     /// I/O engine selection (auto, mio, uring)
     #[serde(default)]
     pub io_engine: IoEngine,
+    /// Recv mode: "multishot" (default) or "single-shot"
+    #[serde(default)]
+    pub recv_mode: RecvMode,
 }
 
 impl Default for General {
@@ -46,6 +60,7 @@ impl Default for General {
             threads: default_threads(),
             cpu_list: None,
             io_engine: IoEngine::default(),
+            recv_mode: RecvMode::default(),
         }
     }
 }

@@ -2,6 +2,7 @@
 
 use bytes::{Buf, BytesMut};
 use cache_core::Cache;
+use io_driver::IoBuffer;
 use protocol_memcache::binary::{BinaryCommand, REQUEST_MAGIC};
 use protocol_memcache::{Command as MemcacheCommand, ParseError as MemcacheParseError};
 use protocol_resp::{Command as RespCommand, ParseError as RespParseError};
@@ -18,9 +19,17 @@ enum DetectedProtocol {
     MemcacheBinary,
 }
 
+/// Read buffer implementation - either BytesMut (multishot) or IoBuffer (single-shot).
+enum ReadBuffer {
+    /// Standard BytesMut for multishot recv mode.
+    BytesMut(BytesMut),
+    /// IoBuffer for single-shot recv mode - prevents reallocation while loaned to kernel.
+    IoBuffer(IoBuffer),
+}
+
 /// Per-connection state for the cache server.
 pub struct Connection {
-    read_buf: BytesMut,
+    read_buf: ReadBuffer,
     write_buf: BytesMut,
     write_pos: usize,
     protocol: DetectedProtocol,
@@ -29,9 +38,10 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Create a new connection for multishot recv mode (default).
     pub fn new(read_buffer_size: usize) -> Self {
         Self {
-            read_buf: BytesMut::with_capacity(read_buffer_size),
+            read_buf: ReadBuffer::BytesMut(BytesMut::with_capacity(read_buffer_size)),
             write_buf: BytesMut::with_capacity(65536),
             write_pos: 0,
             protocol: DetectedProtocol::Unknown,
@@ -40,73 +50,213 @@ impl Connection {
         }
     }
 
-    /// Append received data to the read buffer.
-    #[inline]
-    pub fn append_recv_data(&mut self, data: &[u8]) {
-        // Compact the buffer periodically to prevent unbounded growth.
-        // BytesMut::reserve() triggers compaction when the unused prefix
-        // exceeds the requested amount plus remaining capacity.
-        // Check: if len * 2 < capacity (i.e., less than 50% utilized), compact.
-        let cap = self.read_buf.capacity();
-        if cap > 0 && self.read_buf.len() * 2 < cap {
-            self.read_buf.reserve(data.len());
+    /// Create a new connection for single-shot recv mode.
+    ///
+    /// Uses IoBuffer which prevents reallocation while the buffer is loaned to the kernel.
+    pub fn new_single_shot(read_buffer_size: usize) -> Self {
+        Self {
+            read_buf: ReadBuffer::IoBuffer(IoBuffer::with_capacity(read_buffer_size)),
+            write_buf: BytesMut::with_capacity(65536),
+            write_pos: 0,
+            protocol: DetectedProtocol::Unknown,
+            should_close: false,
+            resp_version: RespVersion::default(),
         }
-        self.read_buf.extend_from_slice(data);
     }
 
-    /// Get a mutable slice of spare capacity for direct recv.
+    /// Returns true if this connection uses single-shot recv mode.
+    #[inline]
+    pub fn is_single_shot(&self) -> bool {
+        matches!(self.read_buf, ReadBuffer::IoBuffer(_))
+    }
+
+    /// Append received data to the read buffer (multishot mode).
+    #[inline]
+    pub fn append_recv_data(&mut self, data: &[u8]) {
+        match &mut self.read_buf {
+            ReadBuffer::BytesMut(buf) => {
+                // Compact the buffer periodically to prevent unbounded growth.
+                let cap = buf.capacity();
+                if cap > 0 && buf.len() * 2 < cap {
+                    buf.reserve(data.len());
+                }
+                buf.extend_from_slice(data);
+            }
+            ReadBuffer::IoBuffer(buf) => {
+                buf.extend_from_slice(data);
+            }
+        }
+    }
+
+    /// Get a mutable slice of spare capacity for direct recv (multishot mode).
     ///
     /// Returns a slice that the caller can pass directly to read()/recv()
     /// to avoid an intermediate copy. After reading, call `recv_commit(n)`
     /// to update the buffer length.
     #[inline]
     pub fn recv_spare(&mut self) -> &mut [u8] {
-        // Ensure we have reasonable space available
         const MIN_RECV_SPACE: usize = 8192;
 
-        // Compact if utilization is low
-        let cap = self.read_buf.capacity();
-        let len = self.read_buf.len();
-        if cap > 0 && len * 2 < cap {
-            self.read_buf.reserve(MIN_RECV_SPACE);
-        } else if cap - len < MIN_RECV_SPACE {
-            self.read_buf.reserve(MIN_RECV_SPACE);
-        }
+        match &mut self.read_buf {
+            ReadBuffer::BytesMut(buf) => {
+                // Compact if utilization is low
+                let cap = buf.capacity();
+                let len = buf.len();
+                if cap > 0 && len * 2 < cap {
+                    buf.reserve(MIN_RECV_SPACE);
+                } else if cap - len < MIN_RECV_SPACE {
+                    buf.reserve(MIN_RECV_SPACE);
+                }
 
-        // Return spare capacity as mutable slice
-        let spare_cap = self.read_buf.capacity() - self.read_buf.len();
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.read_buf.as_mut_ptr().add(self.read_buf.len()),
-                spare_cap,
-            )
+                // Return spare capacity as mutable slice
+                let spare_cap = buf.capacity() - buf.len();
+                unsafe {
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr().add(buf.len()), spare_cap)
+                }
+            }
+            ReadBuffer::IoBuffer(buf) => {
+                buf.ensure_spare(MIN_RECV_SPACE);
+                let len = buf.len();
+                let spare_cap = buf.spare_capacity();
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (buf.as_slice().as_ptr() as *mut u8).add(len),
+                        spare_cap,
+                    )
+                }
+            }
         }
     }
 
-    /// Commit bytes that were written directly to the spare capacity.
+    /// Commit bytes that were written directly to the spare capacity (multishot mode).
     ///
     /// # Safety
     /// Caller must ensure `n` bytes were actually written to the slice
     /// returned by `recv_spare()`.
     #[inline]
     pub fn recv_commit(&mut self, n: usize) {
-        unsafe {
-            self.read_buf.set_len(self.read_buf.len() + n);
+        match &mut self.read_buf {
+            ReadBuffer::BytesMut(buf) => unsafe {
+                buf.set_len(buf.len() + n);
+            },
+            ReadBuffer::IoBuffer(_) => {
+                panic!("recv_commit called on IoBuffer - use unloan_recv instead");
+            }
+        }
+    }
+
+    // --- Single-shot recv mode methods ---
+
+    /// Loan the spare capacity to the kernel for single-shot recv.
+    ///
+    /// Returns a mutable slice that can be passed to `submit_recv()`.
+    /// The buffer is marked as loaned and cannot be reallocated until
+    /// `unloan_recv()` or `unloan_cancel()` is called.
+    ///
+    /// # Panics
+    /// Panics if the buffer is already loaned or if not in single-shot mode.
+    #[inline]
+    pub fn loan_recv_spare(&mut self) -> &mut [u8] {
+        const MIN_RECV_SPACE: usize = 8192;
+
+        match &mut self.read_buf {
+            ReadBuffer::IoBuffer(buf) => {
+                buf.ensure_spare(MIN_RECV_SPACE);
+                buf.loan_spare()
+            }
+            ReadBuffer::BytesMut(_) => {
+                panic!("loan_recv_spare called on BytesMut - use recv_spare instead");
+            }
+        }
+    }
+
+    /// Return the buffer from the kernel and commit bytes received.
+    ///
+    /// # Panics
+    /// Panics if the buffer is not loaned or if not in single-shot mode.
+    #[inline]
+    pub fn unloan_recv(&mut self, bytes: usize) {
+        match &mut self.read_buf {
+            ReadBuffer::IoBuffer(buf) => {
+                buf.unloan(bytes);
+            }
+            ReadBuffer::BytesMut(_) => {
+                panic!("unloan_recv called on BytesMut");
+            }
+        }
+    }
+
+    /// Cancel a loan without committing any bytes (e.g., on error).
+    ///
+    /// # Panics
+    /// Panics if the buffer is not loaned or if not in single-shot mode.
+    #[inline]
+    pub fn unloan_cancel(&mut self) {
+        match &mut self.read_buf {
+            ReadBuffer::IoBuffer(buf) => {
+                buf.unloan_cancel();
+            }
+            ReadBuffer::BytesMut(_) => {
+                panic!("unloan_cancel called on BytesMut");
+            }
+        }
+    }
+
+    /// Returns true if the buffer is currently loaned to the kernel.
+    #[inline]
+    pub fn is_recv_loaned(&self) -> bool {
+        match &self.read_buf {
+            ReadBuffer::IoBuffer(buf) => buf.is_loaned(),
+            ReadBuffer::BytesMut(_) => false,
+        }
+    }
+
+    // --- Read buffer access helpers ---
+
+    #[inline]
+    fn read_buf_is_empty(&self) -> bool {
+        match &self.read_buf {
+            ReadBuffer::BytesMut(buf) => buf.is_empty(),
+            ReadBuffer::IoBuffer(buf) => buf.is_empty(),
+        }
+    }
+
+    #[inline]
+    fn read_buf_first_byte(&self) -> Option<u8> {
+        match &self.read_buf {
+            ReadBuffer::BytesMut(buf) => buf.first().copied(),
+            ReadBuffer::IoBuffer(buf) => buf.as_slice().first().copied(),
+        }
+    }
+
+    #[inline]
+    fn read_buf_advance(&mut self, n: usize) {
+        match &mut self.read_buf {
+            ReadBuffer::BytesMut(buf) => buf.advance(n),
+            ReadBuffer::IoBuffer(buf) => buf.consume(n),
+        }
+    }
+
+    #[inline]
+    fn read_buf_clear(&mut self) {
+        match &mut self.read_buf {
+            ReadBuffer::BytesMut(buf) => buf.clear(),
+            ReadBuffer::IoBuffer(buf) => buf.clear(),
         }
     }
 
     /// Detect protocol from the first byte of data.
     #[inline]
     fn detect_protocol(&mut self) {
-        if self.protocol != DetectedProtocol::Unknown || self.read_buf.is_empty() {
+        if self.protocol != DetectedProtocol::Unknown || self.read_buf_is_empty() {
             return;
         }
 
-        match self.read_buf[0] {
-            REQUEST_MAGIC => {
+        match self.read_buf_first_byte() {
+            Some(REQUEST_MAGIC) => {
                 self.protocol = DetectedProtocol::MemcacheBinary;
             }
-            b'*' => {
+            Some(b'*') => {
                 self.protocol = DetectedProtocol::Resp;
             }
             _ => {
@@ -153,7 +303,7 @@ impl Connection {
     #[inline]
     fn process_resp<C: Cache>(&mut self, cache: &C) {
         loop {
-            if self.read_buf.is_empty() {
+            if self.read_buf_is_empty() {
                 break;
             }
 
@@ -162,10 +312,16 @@ impl Connection {
                 break;
             }
 
-            match RespCommand::parse(&self.read_buf) {
+            // Access buffer directly to allow separate borrows for cmd and write_buf
+            let parse_result = match &self.read_buf {
+                ReadBuffer::BytesMut(buf) => RespCommand::parse(buf),
+                ReadBuffer::IoBuffer(buf) => RespCommand::parse(buf.as_slice()),
+            };
+
+            match parse_result {
                 Ok((cmd, consumed)) => {
                     execute_resp(&cmd, cache, &mut self.write_buf, &mut self.resp_version);
-                    self.read_buf.advance(consumed);
+                    self.read_buf_advance(consumed);
                 }
                 Err(RespParseError::Incomplete) => break,
                 Err(e) => {
@@ -180,7 +336,7 @@ impl Connection {
                         self.write_buf.extend_from_slice(msg.as_bytes());
                         self.write_buf.extend_from_slice(b"\r\n");
                     }
-                    self.read_buf.clear();
+                    self.read_buf_clear();
                     break;
                 }
             }
@@ -190,7 +346,7 @@ impl Connection {
     #[inline]
     fn process_memcache_ascii<C: Cache>(&mut self, cache: &C) {
         loop {
-            if self.read_buf.is_empty() {
+            if self.read_buf_is_empty() {
                 break;
             }
 
@@ -199,12 +355,18 @@ impl Connection {
                 break;
             }
 
-            match MemcacheCommand::parse(&self.read_buf) {
+            // Access buffer directly to allow separate borrows for cmd and write_buf
+            let parse_result = match &self.read_buf {
+                ReadBuffer::BytesMut(buf) => MemcacheCommand::parse(buf),
+                ReadBuffer::IoBuffer(buf) => MemcacheCommand::parse(buf.as_slice()),
+            };
+
+            match parse_result {
                 Ok((cmd, consumed)) => {
                     if execute_memcache(&cmd, cache, &mut self.write_buf) {
                         self.should_close = true;
                     }
-                    self.read_buf.advance(consumed);
+                    self.read_buf_advance(consumed);
                 }
                 Err(MemcacheParseError::Incomplete) => break,
                 Err(e) => {
@@ -212,7 +374,7 @@ impl Connection {
                     self.write_buf.extend_from_slice(b"ERROR ");
                     self.write_buf.extend_from_slice(e.to_string().as_bytes());
                     self.write_buf.extend_from_slice(b"\r\n");
-                    self.read_buf.clear();
+                    self.read_buf_clear();
                     break;
                 }
             }
@@ -222,7 +384,7 @@ impl Connection {
     #[inline]
     fn process_memcache_binary<C: Cache>(&mut self, cache: &C) {
         loop {
-            if self.read_buf.is_empty() {
+            if self.read_buf_is_empty() {
                 break;
             }
 
@@ -231,18 +393,24 @@ impl Connection {
                 break;
             }
 
-            match BinaryCommand::parse(&self.read_buf) {
+            // Access buffer directly to allow separate borrows for cmd and write_buf
+            let parse_result = match &self.read_buf {
+                ReadBuffer::BytesMut(buf) => BinaryCommand::parse(buf),
+                ReadBuffer::IoBuffer(buf) => BinaryCommand::parse(buf.as_slice()),
+            };
+
+            match parse_result {
                 Ok((cmd, consumed)) => {
                     if execute_memcache_binary(&cmd, cache, &mut self.write_buf) {
                         self.should_close = true;
                     }
-                    self.read_buf.advance(consumed);
+                    self.read_buf_advance(consumed);
                 }
                 Err(MemcacheParseError::Incomplete) => break,
                 Err(_) => {
                     PROTOCOL_ERRORS.increment();
                     self.should_close = true;
-                    self.read_buf.clear();
+                    self.read_buf_clear();
                     break;
                 }
             }
@@ -267,6 +435,12 @@ impl Connection {
     #[inline]
     pub fn should_close(&self) -> bool {
         self.should_close
+    }
+
+    /// Returns true if the read buffer has no data.
+    #[inline]
+    pub fn is_read_buf_empty(&self) -> bool {
+        self.read_buf_is_empty()
     }
 }
 
@@ -464,7 +638,7 @@ mod tests {
         // There should still be unprocessed data in read buffer
         // (backpressure stopped processing)
         assert!(
-            !conn.read_buf.is_empty(),
+            !conn.is_read_buf_empty(),
             "read buffer should still have unprocessed requests"
         );
 

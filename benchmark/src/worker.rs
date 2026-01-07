@@ -5,7 +5,7 @@
 //! registered file descriptors for lower latency.
 
 use crate::client::{MomentoSession, RequestResult, RequestType, Session};
-use crate::config::{Config, Protocol as CacheProtocol};
+use crate::config::{Config, Protocol as CacheProtocol, RecvMode};
 
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver};
 
@@ -208,6 +208,9 @@ pub struct IoWorker {
     get_latency: &'static AtomicHistogram,
     set_latency: &'static AtomicHistogram,
     warmup: bool,
+
+    /// Single-shot recv mode (vs multishot)
+    single_shot: bool,
 }
 
 impl IoWorker {
@@ -253,6 +256,8 @@ impl IoWorker {
         let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);
         init_rng.fill_bytes(&mut value_buf);
 
+        let single_shot = cfg.config.general.recv_mode == RecvMode::SingleShot;
+
         Ok(Self {
             id: cfg.id,
             driver,
@@ -270,6 +275,7 @@ impl IoWorker {
             get_latency: cfg.get_latency,
             set_latency: cfg.set_latency,
             warmup: cfg.warmup,
+            single_shot,
         })
     }
 
@@ -380,6 +386,19 @@ impl IoWorker {
         let idx = self.sessions.len();
         self.sessions.push(session);
         self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
+
+        // For single-shot mode, submit the first recv
+        if self.single_shot {
+            let session = &mut self.sessions[idx];
+            let buf = session.recv_loan_spare();
+            if let Err(e) = self.driver.submit_recv(conn_id, buf) {
+                session.recv_unloan_cancel();
+                self.conn_id_to_idx.remove(&conn_id.as_usize());
+                self.sessions.pop();
+                let _ = self.driver.close(conn_id);
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -702,6 +721,11 @@ impl IoWorker {
                 CompletionKind::Closed { conn_id } => {
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        // Cancel any pending loan before closing
+                        let session = &mut self.sessions[idx];
+                        if session.is_recv_loaned() {
+                            session.recv_unloan_cancel();
+                        }
                         to_close.push((idx, DisconnectReason::ClosedEvent));
                     }
                 }
@@ -709,6 +733,11 @@ impl IoWorker {
                     let id = conn_id.as_usize();
                     tracing::debug!("connection {} error: {}", id, error);
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        // Cancel any pending loan before closing
+                        let session = &mut self.sessions[idx];
+                        if session.is_recv_loaned() {
+                            session.recv_unloan_cancel();
+                        }
                         to_close.push((idx, DisconnectReason::ErrorEvent));
                     }
                 }
@@ -717,8 +746,39 @@ impl IoWorker {
                 | CompletionKind::AcceptRaw { .. }
                 | CompletionKind::ListenerError { .. } => {}
 
-                // RecvComplete is for single-shot recv mode, not used with multishot
-                CompletionKind::RecvComplete { .. } => {}
+                // RecvComplete is for single-shot recv mode
+                CompletionKind::RecvComplete { conn_id, bytes } => {
+                    if !self.single_shot {
+                        // Shouldn't happen in multishot mode
+                        continue;
+                    }
+
+                    let id = conn_id.as_usize();
+                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        let session = &mut self.sessions[idx];
+                        let mut close_reason: Option<DisconnectReason> = None;
+
+                        if bytes == 0 {
+                            // EOF - server closed connection
+                            session.recv_unloan_cancel();
+                            close_reason = Some(DisconnectReason::Eof);
+                        } else {
+                            // Commit received bytes
+                            session.recv_unloan(bytes);
+                        }
+
+                        if let Some(reason) = close_reason {
+                            to_close.push((idx, reason));
+                        } else {
+                            // Submit next recv if session still valid
+                            let buf = session.recv_loan_spare();
+                            if let Err(_) = self.driver.submit_recv(conn_id, buf) {
+                                session.recv_unloan_cancel();
+                                to_close.push((idx, DisconnectReason::RecvError));
+                            }
+                        }
+                    }
+                }
 
                 // UDP events not used in TCP client
                 CompletionKind::UdpReadable { .. }

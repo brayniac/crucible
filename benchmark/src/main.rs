@@ -1,4 +1,4 @@
-use benchmark::config::Config;
+use benchmark::config::{Config, RecvMode};
 use benchmark::worker::Phase;
 use benchmark::{AdminServer, IoWorker, IoWorkerConfig, SharedState, parse_cpu_list};
 
@@ -140,6 +140,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         effective_engine,
         config.general.io_engine
     );
+    // Show recv_mode when using io_uring
+    if effective_engine == IoEngine::Uring {
+        let mode_str = match config.general.recv_mode {
+            RecvMode::Multishot => "multishot",
+            RecvMode::SingleShot => "single-shot",
+        };
+        tracing::info!("recv_mode: {}", mode_str);
+    }
     tracing::info!("timestamp_mode: {:?}", config.timestamps.mode);
     if let Some(ref cpu_list) = config.general.cpu_list {
         tracing::info!("cpu_list: {}", cpu_list);

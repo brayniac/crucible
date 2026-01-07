@@ -208,6 +208,21 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Recv mode for io_uring connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecvMode {
+    /// Multishot recv with kernel-managed buffer ring (default).
+    /// Uses 2 copies (kernel buffer -> connection buffer -> parse).
+    /// More efficient for many small receives.
+    #[default]
+    Multishot,
+    /// Single-shot recv directly into connection buffer.
+    /// Uses 1 copy (kernel writes directly to user buffer).
+    /// May be more efficient for larger messages.
+    SingleShot,
+}
+
 /// io_uring specific configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +246,10 @@ pub struct UringConfig {
     /// Submission queue depth
     #[serde(default = "default_sq_depth")]
     pub sq_depth: u32,
+
+    /// Recv mode: "multishot" (default) or "single-shot"
+    #[serde(default)]
+    pub recv_mode: RecvMode,
 }
 
 impl Default for UringConfig {
@@ -241,6 +260,7 @@ impl Default for UringConfig {
             buffer_count: default_buffer_count(),
             buffer_size: default_buffer_size(),
             sq_depth: default_sq_depth(),
+            recv_mode: RecvMode::default(),
         }
     }
 }

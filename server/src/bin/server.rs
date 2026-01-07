@@ -55,12 +55,24 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let cpu_affinity = config.cpu_affinity();
     let cpu_affinity_slice = cpu_affinity.as_deref();
 
-    let backend_detail = match config.runtime {
-        Runtime::Native => server::native::backend_detail(),
+    let backend_detail: String = match config.runtime {
+        Runtime::Native => {
+            let base = server::native::backend_detail();
+            // Show recv_mode when using io_uring
+            if base == "io_uring" {
+                let mode = match config.uring.recv_mode {
+                    server::config::RecvMode::Multishot => "multishot",
+                    server::config::RecvMode::SingleShot => "single-shot",
+                };
+                format!("{}, {}", base, mode)
+            } else {
+                base.to_string()
+            }
+        }
         #[cfg(feature = "tokio-runtime")]
-        Runtime::Tokio => server::tokio::backend_detail(),
+        Runtime::Tokio => server::tokio::backend_detail().to_string(),
         #[cfg(not(feature = "tokio-runtime"))]
-        Runtime::Tokio => "tokio (not compiled)",
+        Runtime::Tokio => "tokio (not compiled)".to_string(),
     };
 
     let numa_node = config.numa_node();
@@ -68,7 +80,7 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     print_banner(&BannerConfig {
         version: env!("CARGO_PKG_VERSION"),
         runtime: config.runtime,
-        backend_detail,
+        backend_detail: &backend_detail,
         cache_backend: config.cache.backend,
         workers: config.threads(),
         listeners: &listeners,

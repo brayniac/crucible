@@ -2,6 +2,8 @@
 duration = "60s"
 warmup = "10s"
 threads = 1
+# Recv mode: "multishot" (default, 2 copies) or "single-shot" (1 copy)
+# recv_mode = "multishot"
 
 [target]
 endpoints = ["127.0.0.1:6379"]
