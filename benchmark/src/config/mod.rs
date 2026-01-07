@@ -307,6 +307,17 @@ fn default_parquet_interval() -> Duration {
     Duration::from_secs(1)
 }
 
+/// Momento wire format selection.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MomentoWireFormat {
+    /// Standard gRPC over HTTP/2 (default).
+    #[default]
+    Grpc,
+    /// Higher-performance protosocket format.
+    Protosocket,
+}
+
 /// Momento-specific configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Momento {
@@ -319,6 +330,9 @@ pub struct Momento {
     /// Default TTL for SET operations in seconds.
     #[serde(default = "default_momento_ttl")]
     pub ttl_seconds: u64,
+    /// Wire format (grpc or protosocket).
+    #[serde(default)]
+    pub wire_format: MomentoWireFormat,
 }
 
 impl Default for Momento {
@@ -327,6 +341,7 @@ impl Default for Momento {
             cache_name: default_cache_name(),
             endpoint: None,
             ttl_seconds: default_momento_ttl(),
+            wire_format: MomentoWireFormat::default(),
         }
     }
 }

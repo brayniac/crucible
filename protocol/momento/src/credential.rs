@@ -2,15 +2,18 @@
 //!
 //! Momento API tokens contain encoded endpoint information.
 
+use crate::WireFormat;
 use crate::error::{Error, Result};
 
-/// Momento credential containing API token and endpoint.
+/// Momento credential containing API token, endpoint, and wire format configuration.
 #[derive(Debug, Clone)]
 pub struct Credential {
     /// The API token for authentication.
     token: String,
     /// The cache endpoint (host:port or just host).
     endpoint: String,
+    /// The wire format to use for communication.
+    wire_format: WireFormat,
 }
 
 impl Credential {
@@ -18,6 +21,7 @@ impl Credential {
     ///
     /// The token is expected to be a Momento API key. The endpoint
     /// can be extracted from the token or provided separately.
+    /// Uses gRPC wire format by default.
     pub fn from_token(token: impl Into<String>) -> Result<Self> {
         let token = token.into();
 
@@ -27,14 +31,20 @@ impl Credential {
         let endpoint = Self::extract_endpoint(&token)
             .unwrap_or_else(|| "cache.cell-us-east-1-1.prod.a.momentohq.com".to_string());
 
-        Ok(Self { token, endpoint })
+        Ok(Self {
+            token,
+            endpoint,
+            wire_format: WireFormat::default(),
+        })
     }
 
     /// Create a credential with explicit endpoint.
+    /// Uses gRPC wire format by default.
     pub fn with_endpoint(token: impl Into<String>, endpoint: impl Into<String>) -> Self {
         Self {
             token: token.into(),
             endpoint: endpoint.into(),
+            wire_format: WireFormat::default(),
         }
     }
 
@@ -44,25 +54,57 @@ impl Credential {
     /// - `MOMENTO_API_KEY` or `MOMENTO_AUTH_TOKEN` for the token
     /// - `MOMENTO_ENDPOINT` for explicit endpoint (e.g., "cache.us-west-2.momentohq.com")
     /// - `MOMENTO_REGION` for region-based endpoint (e.g., "us-west-2")
+    /// - `MOMENTO_WIRE_FORMAT` for wire format ("grpc" or "protosocket")
     pub fn from_env() -> Result<Self> {
         let token = std::env::var("MOMENTO_API_KEY")
             .or_else(|_| std::env::var("MOMENTO_AUTH_TOKEN"))
             .map_err(|_| Error::Config("MOMENTO_API_KEY environment variable not set".into()))?;
 
+        // Check for wire format
+        let wire_format = match std::env::var("MOMENTO_WIRE_FORMAT").as_deref() {
+            Ok("protosocket") => WireFormat::Protosocket,
+            _ => WireFormat::Grpc,
+        };
+
         // Check for explicit endpoint
         if let Ok(endpoint) = std::env::var("MOMENTO_ENDPOINT") {
-            return Ok(Self::with_endpoint(token, endpoint));
+            return Ok(Self {
+                token,
+                endpoint,
+                wire_format,
+            });
         }
 
         // Check for region-based endpoint
         if let Ok(region) = std::env::var("MOMENTO_REGION") {
             // Momento endpoint format: cache.cell-<region>-1.prod.a.momentohq.com
             let endpoint = format!("cache.cell-{}-1.prod.a.momentohq.com", region);
-            return Ok(Self::with_endpoint(token, endpoint));
+            return Ok(Self {
+                token,
+                endpoint,
+                wire_format,
+            });
         }
 
         // Try to extract from token (legacy tokens)
-        Self::from_token(token)
+        let mut cred = Self::from_token(token)?;
+        cred.wire_format = wire_format;
+        Ok(cred)
+    }
+
+    /// Set the wire format for this credential.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use protocol_momento::{Credential, WireFormat};
+    ///
+    /// let cred = Credential::from_token("token")?
+    ///     .with_wire_format(WireFormat::Protosocket);
+    /// ```
+    pub fn with_wire_format(mut self, format: WireFormat) -> Self {
+        self.wire_format = format;
+        self
     }
 
     /// Get the API token.
@@ -73,6 +115,11 @@ impl Credential {
     /// Get the cache endpoint.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Get the wire format.
+    pub fn wire_format(&self) -> WireFormat {
+        self.wire_format
     }
 
     /// Get the host portion of the endpoint.
@@ -200,6 +247,28 @@ mod tests {
         assert_eq!(cred.endpoint(), "cache.example.com:443");
         assert_eq!(cred.host(), "cache.example.com");
         assert_eq!(cred.port(), 443);
+        assert_eq!(cred.wire_format(), WireFormat::Grpc); // Default
+    }
+
+    #[test]
+    fn test_credential_default_wire_format() {
+        let cred = Credential::with_endpoint("token", "endpoint.com");
+        assert_eq!(cred.wire_format(), WireFormat::Grpc);
+    }
+
+    #[test]
+    fn test_credential_with_wire_format() {
+        let cred = Credential::with_endpoint("token", "endpoint.com")
+            .with_wire_format(WireFormat::Protosocket);
+        assert_eq!(cred.wire_format(), WireFormat::Protosocket);
+    }
+
+    #[test]
+    fn test_credential_wire_format_chain() {
+        let cred = Credential::from_token("token")
+            .unwrap()
+            .with_wire_format(WireFormat::Protosocket);
+        assert_eq!(cred.wire_format(), WireFormat::Protosocket);
     }
 
     #[test]
@@ -256,10 +325,12 @@ mod tests {
 
     #[test]
     fn test_credential_clone() {
-        let cred = Credential::with_endpoint("token", "endpoint.com");
+        let cred = Credential::with_endpoint("token", "endpoint.com")
+            .with_wire_format(WireFormat::Protosocket);
         let cloned = cred.clone();
         assert_eq!(cloned.token(), cred.token());
         assert_eq!(cloned.endpoint(), cred.endpoint());
+        assert_eq!(cloned.wire_format(), WireFormat::Protosocket);
     }
 
     #[test]

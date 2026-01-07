@@ -6,6 +6,10 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
+// ============================================================================
+// TCP Types
+// ============================================================================
+
 /// Opaque connection identifier.
 ///
 /// Returned when registering a connection or accepting a new one.
@@ -51,6 +55,123 @@ impl ListenerId {
         self.0
     }
 }
+
+// ============================================================================
+// UDP Types
+// ============================================================================
+
+/// Opaque UDP socket identifier.
+///
+/// Returned when binding a UDP socket.
+/// Used to identify the socket in subsequent operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UdpSocketId(pub(crate) usize);
+
+impl UdpSocketId {
+    /// Create a new UDP socket ID from a raw value.
+    #[inline]
+    pub fn new(id: usize) -> Self {
+        Self(id)
+    }
+
+    /// Get the raw value of the socket ID.
+    #[inline]
+    pub fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
+/// ECN (Explicit Congestion Notification) codepoint.
+///
+/// These are the two ECN bits from the IP header's Traffic Class (IPv6)
+/// or TOS (IPv4) field. QUIC uses ECN for congestion control feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Ecn {
+    /// Not ECN-Capable Transport (no ECN support)
+    #[default]
+    NotEct = 0b00,
+    /// ECN Capable Transport (1)
+    Ect1 = 0b01,
+    /// ECN Capable Transport (0)
+    Ect0 = 0b10,
+    /// Congestion Experienced
+    Ce = 0b11,
+}
+
+impl Ecn {
+    /// Create an ECN value from the raw TOS/Traffic Class byte.
+    #[inline]
+    pub fn from_tos(tos: u8) -> Self {
+        match tos & 0b11 {
+            0b00 => Ecn::NotEct,
+            0b01 => Ecn::Ect1,
+            0b10 => Ecn::Ect0,
+            0b11 => Ecn::Ce,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Get the raw ECN bits for setting in TOS/Traffic Class.
+    #[inline]
+    pub fn to_tos(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Metadata for a received UDP datagram.
+#[derive(Debug, Clone)]
+pub struct RecvMeta {
+    /// Source address of the datagram.
+    pub source: SocketAddr,
+    /// Local destination address (if available via IP_PKTINFO/IPV6_PKTINFO).
+    pub local: Option<SocketAddr>,
+    /// ECN codepoint from the IP header.
+    pub ecn: Ecn,
+    /// Number of bytes received.
+    pub len: usize,
+}
+
+/// Metadata for sending a UDP datagram.
+#[derive(Debug, Clone)]
+pub struct SendMeta {
+    /// Destination address for the datagram.
+    pub dest: SocketAddr,
+    /// Source address to use (optional, requires IP_PKTINFO).
+    pub source: Option<SocketAddr>,
+    /// ECN codepoint to set in the IP header.
+    pub ecn: Ecn,
+}
+
+impl SendMeta {
+    /// Create send metadata with just a destination address.
+    #[inline]
+    pub fn new(dest: SocketAddr) -> Self {
+        Self {
+            dest,
+            source: None,
+            ecn: Ecn::NotEct,
+        }
+    }
+
+    /// Set the ECN codepoint.
+    #[inline]
+    pub fn with_ecn(mut self, ecn: Ecn) -> Self {
+        self.ecn = ecn;
+        self
+    }
+
+    /// Set the source address.
+    #[inline]
+    pub fn with_source(mut self, source: SocketAddr) -> Self {
+        self.source = Some(source);
+        self
+    }
+}
+
+// ============================================================================
+// Completion Types
+// ============================================================================
 
 /// Result of a completed I/O operation.
 #[derive(Debug)]
@@ -153,6 +274,49 @@ pub enum CompletionKind {
         raw_fd: RawFd,
         /// The address of the remote peer.
         addr: SocketAddr,
+    },
+
+    // === UDP events ===
+    /// A UDP socket is readable (mio backend).
+    ///
+    /// Call `recvmsg()` on the driver to receive the datagram.
+    UdpReadable {
+        /// The socket that has data available.
+        socket_id: UdpSocketId,
+    },
+
+    /// A submitted recvmsg operation completed (io_uring backend).
+    ///
+    /// The datagram data has been written to the buffer provided in `submit_recvmsg()`.
+    RecvMsgComplete {
+        /// The socket that received data.
+        socket_id: UdpSocketId,
+        /// Metadata about the received datagram.
+        meta: RecvMeta,
+    },
+
+    /// A UDP socket is writable (mio backend).
+    ///
+    /// The socket is ready to send more datagrams.
+    UdpWritable {
+        /// The socket that is ready to send.
+        socket_id: UdpSocketId,
+    },
+
+    /// A submitted sendmsg operation completed (io_uring backend).
+    SendMsgComplete {
+        /// The socket that sent data.
+        socket_id: UdpSocketId,
+        /// Number of bytes sent.
+        bytes: usize,
+    },
+
+    /// An error occurred on a UDP socket.
+    UdpError {
+        /// The socket that had an error.
+        socket_id: UdpSocketId,
+        /// The error that occurred.
+        error: io::Error,
     },
 }
 

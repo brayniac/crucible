@@ -229,33 +229,40 @@ impl<'a> SetRequest<'a> {
 
     /// Calculate the encoded length of this request.
     pub fn encoded_len(&self) -> usize {
-        let mut args_count = 3; // SET key value
-        let mut data_len = 3 + self.key.len() + self.value.len(); // "SET" + key + value
+        // Build the argument list to compute exact length
+        let mut ex_str = itoa::Buffer::new();
+        let mut px_str = itoa::Buffer::new();
+
+        let mut args: Vec<&[u8]> = vec![b"SET", self.key, self.value];
 
         if let Some(seconds) = self.ex {
-            args_count += 2;
-            let mut buf = itoa::Buffer::new();
-            data_len += 2 + buf.format(seconds).len(); // "EX" + number
+            args.push(b"EX");
+            args.push(ex_str.format(seconds).as_bytes());
         } else if let Some(millis) = self.px {
-            args_count += 2;
-            let mut buf = itoa::Buffer::new();
-            data_len += 2 + buf.format(millis).len(); // "PX" + number
+            args.push(b"PX");
+            args.push(px_str.format(millis).as_bytes());
         }
 
         if self.nx {
-            args_count += 1;
-            data_len += 2; // "NX"
+            args.push(b"NX");
         } else if self.xx {
-            args_count += 1;
-            data_len += 2; // "XX"
+            args.push(b"XX");
         }
 
-        // Calculate total: *<count>\r\n + for each arg: $<len>\r\n<data>\r\n
-        let mut count_buf = itoa::Buffer::new();
-        let header_len = 1 + count_buf.format(args_count).len() + 2;
+        // Calculate exact length using same logic as Request::encoded_len()
+        let mut len = 0;
 
-        // Very rough estimate - each arg has $<len>\r\n overhead
-        header_len + args_count * 5 + data_len
+        // Array header: *<count>\r\n
+        let mut count_buf = itoa::Buffer::new();
+        len += 1 + count_buf.format(args.len()).len() + 2;
+
+        // Each argument: $<len>\r\n<data>\r\n
+        for arg in &args {
+            let mut arg_len_buf = itoa::Buffer::new();
+            len += 1 + arg_len_buf.format(arg.len()).len() + 2 + arg.len() + 2;
+        }
+
+        len
     }
 }
 
@@ -482,7 +489,6 @@ mod tests {
     #[test]
     fn test_set_request_encoded_len() {
         // Test various SetRequest configurations
-        // Note: encoded_len() is a rough estimate for SetRequest
         let configs = vec![
             Request::set(b"key", b"value"),
             Request::set(b"key", b"value").ex(3600),
@@ -496,15 +502,28 @@ mod tests {
             let mut buf = [0u8; 256];
             let actual_len = config.encode(&mut buf);
             let estimated_len = config.encoded_len();
-            // The estimate should be reasonably close to actual
-            // Allow for some variance in the estimate
-            assert!(
-                estimated_len > 0 && actual_len > 0,
-                "Both estimated ({}) and actual ({}) should be > 0",
-                estimated_len,
-                actual_len
+            assert_eq!(
+                estimated_len, actual_len,
+                "encoded_len() should match actual encoded length"
             );
         }
+    }
+
+    #[test]
+    fn test_set_request_encoded_len_large_values() {
+        // Test with larger keys and values to ensure length calculation handles
+        // multi-digit lengths correctly
+        let large_key = vec![b'k'; 1000];
+        let large_value = vec![b'v'; 10000];
+
+        let config = Request::set(&large_key, &large_value).ex(86400);
+        let mut buf = vec![0u8; 20000];
+        let actual_len = config.encode(&mut buf);
+        let estimated_len = config.encoded_len();
+        assert_eq!(
+            estimated_len, actual_len,
+            "encoded_len() should match for large values"
+        );
     }
 
     #[test]

@@ -5,11 +5,19 @@ use crate::config::Config;
 use crate::connection::Connection;
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE};
 use cache_core::Cache;
+use io_driver::BufferPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+
+/// Per-connection buffer pool settings.
+/// For tokio, we use a small pool per connection since we don't have
+/// io_uring's ring-provided buffers.
+const CONN_CHUNK_SIZE: usize = 32 * 1024; // 32KB chunks
+const CONN_CHUNK_COUNT: usize = 8; // 8 chunks = 256KB per connection
+const ASSEMBLY_SIZE: usize = 256 * 1024; // 256KB assembly buffer
 
 /// Run the tokio runtime server.
 pub fn run<C: Cache + 'static>(
@@ -102,27 +110,62 @@ async fn accept_loop<C: Cache + 'static>(listener: TcpListener, cache: Arc<C>) {
 }
 
 async fn handle_connection<C: Cache>(mut stream: TcpStream, cache: Arc<C>) -> std::io::Result<()> {
-    let mut conn = Connection::new(64 * 1024);
-    let mut recv_buf = vec![0u8; 64 * 1024];
+    let mut conn = Connection::new();
+    let mut pool = BufferPool::new(CONN_CHUNK_SIZE, CONN_CHUNK_COUNT);
+    let mut assembly = vec![0u8; ASSEMBLY_SIZE];
 
     loop {
         // Wait for the socket to be readable
         stream.readable().await?;
 
-        // Try to read data
-        match stream.try_read(&mut recv_buf) {
+        // Check out a buffer for receiving
+        let buf_id = match pool.checkout() {
+            Some(id) => id,
+            None => {
+                // Pool exhausted - process pending data to free buffers
+                conn.process(&*cache, &pool, &mut assembly);
+                for id in conn.drain_consumed_buffers() {
+                    pool.checkin(id);
+                }
+                // Try again
+                match pool.checkout() {
+                    Some(id) => id,
+                    None => {
+                        // Still no buffers - connection has too much pending data
+                        return Err(std::io::Error::other("buffer pool exhausted"));
+                    }
+                }
+            }
+        };
+
+        // Try to read data into the checked-out buffer
+        let recv_buf = pool.get_mut(buf_id);
+        match stream.try_read(recv_buf) {
             Ok(0) => {
-                // Connection closed
+                // Connection closed - return buffer and cleanup
+                pool.checkin(buf_id);
+                for id in conn.clear_recv_buffers() {
+                    pool.checkin(id);
+                }
                 return Ok(());
             }
             Ok(n) => {
-                conn.append_recv_data(&recv_buf[..n]);
-                conn.process(&*cache);
+                // Push buffer to connection's recv chain
+                conn.push_recv_buffer(buf_id, n);
+                conn.process(&*cache, &pool, &mut assembly);
+
+                // Return consumed buffers to pool
+                for id in conn.drain_consumed_buffers() {
+                    pool.checkin(id);
+                }
 
                 if conn.should_close() {
                     // Flush any pending writes before closing
                     if conn.has_pending_write() {
                         let _ = stream.write_all(conn.pending_write_data()).await;
+                    }
+                    for id in conn.clear_recv_buffers() {
+                        pool.checkin(id);
                     }
                     return Ok(());
                 }
@@ -134,10 +177,16 @@ async fn handle_connection<C: Cache>(mut stream: TcpStream, cache: Arc<C>) -> st
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available, continue waiting
+                // No data available - return buffer to pool and continue waiting
+                pool.checkin(buf_id);
                 continue;
             }
             Err(e) => {
+                // Error - cleanup and return
+                pool.checkin(buf_id);
+                for id in conn.clear_recv_buffers() {
+                    pool.checkin(id);
+                }
                 return Err(e);
             }
         }

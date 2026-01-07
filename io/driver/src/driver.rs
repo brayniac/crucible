@@ -1,6 +1,6 @@
 //! I/O driver trait definition.
 
-use crate::types::{Completion, ConnId, ListenerId};
+use crate::types::{Completion, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId};
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -199,4 +199,85 @@ pub trait IoDriver: Send {
     /// Useful for setting socket options like `SO_TIMESTAMPING`.
     #[cfg(unix)]
     fn raw_fd(&self, id: ConnId) -> Option<RawFd>;
+
+    // === UDP socket operations ===
+
+    /// Bind a UDP socket to an address.
+    ///
+    /// Returns a socket ID for subsequent operations.
+    /// The socket is automatically configured for:
+    /// - Non-blocking mode
+    /// - `IP_RECVTOS` / `IPV6_RECVTCLASS` (ECN reception)
+    /// - `IP_PKTINFO` / `IPV6_RECVPKTINFO` (destination address)
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - The address to bind to
+    fn bind_udp(&mut self, addr: SocketAddr) -> io::Result<UdpSocketId>;
+
+    /// Close a UDP socket.
+    fn close_udp(&mut self, id: UdpSocketId) -> io::Result<()>;
+
+    /// Submit an async recvmsg operation (io_uring backend).
+    ///
+    /// When a datagram arrives, a `RecvMsgComplete` completion is emitted.
+    /// The datagram data is written to `buf`, metadata in the completion.
+    ///
+    /// # Buffer Lifetime
+    ///
+    /// The buffer must remain valid until the completion is received.
+    ///
+    /// # Backend Support
+    ///
+    /// - **io_uring**: Submits a recvmsg operation
+    /// - **mio**: Returns `Err(Unsupported)` - use `recvmsg()` instead
+    fn submit_recvmsg(&mut self, id: UdpSocketId, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Submit an async sendmsg operation (io_uring backend).
+    ///
+    /// Sends a datagram with the specified metadata.
+    /// A `SendMsgComplete` completion is emitted when done.
+    ///
+    /// # Buffer Lifetime
+    ///
+    /// The data buffer must remain valid until the completion is received.
+    ///
+    /// # Backend Support
+    ///
+    /// - **io_uring**: Submits a sendmsg operation
+    /// - **mio**: Returns `Err(Unsupported)` - use `sendmsg()` instead
+    fn submit_sendmsg(&mut self, id: UdpSocketId, data: &[u8], meta: &SendMeta) -> io::Result<()>;
+
+    /// Receive a datagram synchronously.
+    ///
+    /// Reads a single datagram into `buf` and returns metadata.
+    /// Call this after receiving a `UdpReadable` completion (mio) or
+    /// use `submit_recvmsg()` for async operation (io_uring).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(meta)` - A datagram was received, `meta.len` bytes written to `buf`
+    /// - `Err(WouldBlock)` - No datagram available
+    /// - `Err(other)` - An error occurred
+    fn recvmsg(&mut self, id: UdpSocketId, buf: &mut [u8]) -> io::Result<RecvMeta>;
+
+    /// Send a datagram synchronously.
+    ///
+    /// Sends data to the address specified in `meta`.
+    /// Call this after receiving a `UdpWritable` completion (mio) or
+    /// use `submit_sendmsg()` for async operation (io_uring).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(n)` - `n` bytes were sent
+    /// - `Err(WouldBlock)` - Cannot send right now
+    /// - `Err(other)` - An error occurred
+    fn sendmsg(&mut self, id: UdpSocketId, data: &[u8], meta: &SendMeta) -> io::Result<usize>;
+
+    /// Get the number of UDP sockets.
+    fn udp_socket_count(&self) -> usize;
+
+    /// Get the raw file descriptor for a UDP socket.
+    #[cfg(unix)]
+    fn udp_raw_fd(&self, id: UdpSocketId) -> Option<RawFd>;
 }

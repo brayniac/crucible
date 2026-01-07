@@ -240,6 +240,13 @@ fn run_test_server(
 
                 // RecvComplete is for io_uring zero-copy mode, not tested here
                 CompletionKind::RecvComplete { .. } => {}
+
+                // UDP completions not tested here
+                CompletionKind::UdpReadable { .. }
+                | CompletionKind::RecvMsgComplete { .. }
+                | CompletionKind::UdpWritable { .. }
+                | CompletionKind::SendMsgComplete { .. }
+                | CompletionKind::UdpError { .. } => {}
             }
         }
     }

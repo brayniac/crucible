@@ -103,11 +103,11 @@ fn round_up(size: usize, align: usize) -> usize {
 
 /// Format bytes as human-readable string.
 fn format_bytes(bytes: usize) -> String {
-    if bytes >= GB && bytes % GB == 0 {
+    if bytes >= GB && bytes.is_multiple_of(GB) {
         format!("{} GB", bytes / GB)
-    } else if bytes >= MB && bytes % MB == 0 {
+    } else if bytes >= MB && bytes.is_multiple_of(MB) {
         format!("{} MB", bytes / MB)
-    } else if bytes >= KB && bytes % KB == 0 {
+    } else if bytes >= KB && bytes.is_multiple_of(KB) {
         format!("{} KB", bytes / KB)
     } else {
         format!("{} bytes", bytes)

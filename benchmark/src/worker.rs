@@ -72,6 +72,8 @@ pub enum DisconnectReason {
     ErrorEvent,
     /// Failed to establish connection
     ConnectFailed,
+    /// Protocol parsing error (corrupted data stream)
+    ProtocolError,
 }
 
 /// Per-worker statistics for diagnostics.
@@ -120,6 +122,7 @@ pub struct SharedState {
     pub disconnects_closed_event: AtomicU64,
     pub disconnects_error_event: AtomicU64,
     pub disconnects_connect_failed: AtomicU64,
+    pub disconnects_protocol_error: AtomicU64,
     /// Per-worker statistics (for diagnosing imbalance)
     pub worker_stats: Vec<WorkerStats>,
 }
@@ -141,6 +144,7 @@ impl SharedState {
             disconnects_closed_event: AtomicU64::new(0),
             disconnects_error_event: AtomicU64::new(0),
             disconnects_connect_failed: AtomicU64::new(0),
+            disconnects_protocol_error: AtomicU64::new(0),
             worker_stats: (0..num_workers).map(|_| WorkerStats::new()).collect(),
         }
     }
@@ -756,49 +760,68 @@ impl IoWorker {
 
     #[inline]
     fn poll_responses(&mut self, now: std::time::Instant) {
+        // Track sessions with protocol errors to close after iteration
+        let mut protocol_errors: Vec<usize> = Vec::new();
+
         if self.warmup {
             // Still need to parse responses but don't record metrics
-            for session in &mut self.sessions {
+            for idx in 0..self.sessions.len() {
                 self.results.clear();
-                let _ = session.poll_responses(&mut self.results, now);
+                if self.sessions[idx]
+                    .poll_responses(&mut self.results, now)
+                    .is_err()
+                {
+                    protocol_errors.push(idx);
+                }
             }
-            return;
+        } else {
+            for idx in 0..self.sessions.len() {
+                self.results.clear();
+                if let Err(e) = self.sessions[idx].poll_responses(&mut self.results, now) {
+                    tracing::debug!("protocol error: {}", e);
+                    protocol_errors.push(idx);
+                }
+
+                for result in &self.results {
+                    self.shared
+                        .responses_received
+                        .fetch_add(1, Ordering::Relaxed);
+                    if result.is_error_response {
+                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    if let Some(hit) = result.hit {
+                        if hit {
+                            self.shared.hits.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.shared.misses.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    let _ = self.response_latency.increment(result.latency_ns);
+
+                    match result.request_type {
+                        RequestType::Get => {
+                            let _ = self.get_latency.increment(result.latency_ns);
+                        }
+                        RequestType::Set => {
+                            let _ = self.set_latency.increment(result.latency_ns);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
-        for session in &mut self.sessions {
-            self.results.clear();
-            if let Err(e) = session.poll_responses(&mut self.results, now) {
-                tracing::debug!("protocol error: {}", e);
-            }
-
-            for result in &self.results {
-                self.shared
-                    .responses_received
-                    .fetch_add(1, Ordering::Relaxed);
-                if result.is_error_response {
-                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if let Some(hit) = result.hit {
-                    if hit {
-                        self.shared.hits.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        self.shared.misses.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                let _ = self.response_latency.increment(result.latency_ns);
-
-                match result.request_type {
-                    RequestType::Get => {
-                        let _ = self.get_latency.increment(result.latency_ns);
-                    }
-                    RequestType::Set => {
-                        let _ = self.set_latency.increment(result.latency_ns);
-                    }
-                    _ => {}
-                }
-            }
+        // Close sessions with protocol errors (data stream corrupted, must reconnect)
+        for idx in protocol_errors {
+            self.close_session(idx, DisconnectReason::ProtocolError);
+            self.shared
+                .connections_active
+                .fetch_sub(1, Ordering::Relaxed);
+            self.shared
+                .connections_failed
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -913,6 +936,11 @@ impl IoWorker {
             DisconnectReason::ConnectFailed => {
                 self.shared
                     .disconnects_connect_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DisconnectReason::ProtocolError => {
+                self.shared
+                    .disconnects_protocol_error
                     .fetch_add(1, Ordering::Relaxed);
             }
         }

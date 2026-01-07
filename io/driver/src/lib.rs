@@ -67,9 +67,12 @@
 //!     .build()?;
 //! ```
 
+mod buffer;
+mod buffer_pool;
 mod builder;
 mod driver;
 mod types;
+mod udp;
 
 pub mod mio;
 pub mod transport;
@@ -78,9 +81,13 @@ pub mod transport;
 pub mod uring;
 
 // Re-exports
+pub use buffer::RecvBuffer;
+pub use buffer_pool::{BufferChain, BufferPool, DEFAULT_CHUNK_SIZE, DEFAULT_POOL_SIZE};
 pub use builder::DriverBuilder;
 pub use driver::IoDriver;
-pub use types::{Completion, CompletionKind, ConnId, IoEngine, ListenerId};
+pub use types::{
+    Completion, CompletionKind, ConnId, Ecn, IoEngine, ListenerId, RecvMeta, SendMeta, UdpSocketId,
+};
 
 // Transport re-exports
 pub use transport::{PlainTransport, ProcessResult, Transport, TransportState};

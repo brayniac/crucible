@@ -4,10 +4,10 @@
 //! MomentoSession handles its own TLS+HTTP/2+gRPC stack internally.
 
 use super::{ConnectionState, RequestResult, RequestType};
-use crate::config::Config;
+use crate::config::{Config, MomentoWireFormat};
 
 use io_driver::{TlsConfig, TlsTransport, Transport, TransportState};
-use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential};
+use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential, WireFormat};
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -44,6 +44,8 @@ pub struct MomentoSession {
     max_pipeline_depth: usize,
     /// Credential for authentication.
     credential: Credential,
+    /// Wire format (gRPC or protosocket).
+    wire_format: WireFormat,
     /// Receive buffer for TLS handshake.
     recv_buf: Vec<u8>,
     /// Error message if connection failed.
@@ -53,6 +55,12 @@ pub struct MomentoSession {
 impl MomentoSession {
     /// Create a new Momento session.
     pub fn new(config: &Config) -> io::Result<Self> {
+        // Convert config wire format to protocol wire format
+        let wire_format = match config.momento.wire_format {
+            MomentoWireFormat::Grpc => WireFormat::Grpc,
+            MomentoWireFormat::Protosocket => WireFormat::Protosocket,
+        };
+
         // Get credential from environment
         let credential = Credential::from_env()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -63,6 +71,9 @@ impl MomentoSession {
         } else {
             credential
         };
+
+        // Apply wire format to credential
+        let credential = credential.with_wire_format(wire_format);
 
         Ok(Self {
             stream: None,
@@ -75,6 +86,7 @@ impl MomentoSession {
             next_id: 0,
             max_pipeline_depth: config.connection.pipeline_depth,
             credential,
+            wire_format,
             recv_buf: vec![0u8; 16384],
             error: None,
         })
@@ -102,8 +114,12 @@ impl MomentoSession {
         stream.set_nodelay(true)?;
         self.stream = Some(stream);
 
-        // Create TLS transport
-        let tls_config = TlsConfig::http2()?;
+        // Create TLS transport with appropriate config for wire format
+        // gRPC requires ALPN for HTTP/2, protosocket uses plain TLS
+        let tls_config = match self.wire_format {
+            WireFormat::Grpc => TlsConfig::http2()?,
+            WireFormat::Protosocket => TlsConfig::new()?,
+        };
         let transport = TlsTransport::new(&tls_config, host)?;
         self.tls_transport = Some(transport);
 
@@ -118,18 +134,24 @@ impl MomentoSession {
             ConnectionState::Connecting => {
                 // Drive TLS handshake
                 if self.drive_tls_handshake()? {
-                    // TLS ready, create CacheClient and start HTTP/2
+                    // TLS ready, create CacheClient with appropriate transport
                     let transport = self.tls_transport.take().unwrap();
-                    let mut client =
-                        CacheClient::with_transport(transport, self.credential.clone());
+                    let mut client = match self.wire_format {
+                        WireFormat::Grpc => {
+                            CacheClient::with_transport(transport, self.credential.clone())
+                        }
+                        WireFormat::Protosocket => CacheClient::with_protosocket_transport(
+                            transport,
+                            self.credential.clone(),
+                        ),
+                    };
                     client.on_transport_ready()?;
                     self.client = Some(client);
-                    // Still need to complete HTTP/2 setup
                 }
 
-                // Drive HTTP/2 setup if client exists
+                // Drive I/O (HTTP/2 or protosocket) if client exists
                 if self.client.is_some() {
-                    self.drive_http2_io()?;
+                    self.drive_client_io()?;
                     if self.client.as_ref().map(|c| c.is_ready()).unwrap_or(false) {
                         self.state = ConnectionState::Connected;
                         return Ok(true);
@@ -139,7 +161,7 @@ impl MomentoSession {
             }
             ConnectionState::Connected => {
                 // Drive any pending I/O
-                self.drive_http2_io()?;
+                self.drive_client_io()?;
                 Ok(true)
             }
             ConnectionState::Disconnected => Ok(false),
@@ -192,8 +214,8 @@ impl MomentoSession {
         Ok(false)
     }
 
-    /// Drive HTTP/2+gRPC I/O.
-    fn drive_http2_io(&mut self) -> io::Result<()> {
+    /// Drive client I/O (HTTP/2+gRPC or protosocket).
+    fn drive_client_io(&mut self) -> io::Result<()> {
         let client = match self.client.as_mut() {
             Some(c) => c,
             None => return Ok(()),
@@ -337,7 +359,7 @@ impl MomentoSession {
         now: Instant,
     ) -> io::Result<usize> {
         // First drive I/O
-        self.drive_http2_io()?;
+        self.drive_client_io()?;
 
         let client = match self.client.as_mut() {
             Some(c) => c,

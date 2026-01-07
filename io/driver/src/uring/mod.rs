@@ -8,13 +8,17 @@
 //! - Ring-provided buffers (kernel-managed buffer pool)
 //! - Registered file descriptors (reduced syscall overhead)
 //! - Multishot accept (efficient connection acceptance)
+//! - UDP recvmsg/sendmsg with ECN support
 
 mod buf_ring;
 mod connection;
 mod registered_files;
 
 use crate::driver::IoDriver;
-use crate::types::{Completion, CompletionKind, ConnId, ListenerId};
+use crate::types::{
+    Completion, CompletionKind, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId,
+};
+use crate::udp::{self, CMSG_BUFFER_SIZE};
 use buf_ring::BufRing;
 use connection::UringConnection;
 use io_uring::cqueue;
@@ -25,7 +29,9 @@ use io_uring::{IoUring, Probe};
 use registered_files::RegisteredFiles;
 use slab::Slab;
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::mem;
+use std::net::SocketAddr;
+use std::net::TcpStream;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::time::Duration;
 
@@ -35,6 +41,8 @@ const OP_SEND: u64 = 1;
 const OP_MULTISHOT_RECV: u64 = 2;
 const OP_ACCEPT: u64 = 3;
 const OP_SINGLE_RECV: u64 = 4;
+const OP_UDP_RECVMSG: u64 = 5;
+const OP_UDP_SENDMSG: u64 = 6;
 
 /// Buffer group ID for recv operations.
 const RECV_BGID: u16 = 0;
@@ -63,6 +71,42 @@ struct UringListener {
     raw_mode: bool,
 }
 
+/// UDP socket state for io_uring.
+struct UringUdpSocket {
+    raw_fd: RawFd,
+    fixed_slot: u32,
+    /// Bound address (used to determine IPv4 vs IPv6 for cmsg parsing).
+    bound_addr: SocketAddr,
+    /// Whether a recvmsg operation is pending.
+    recv_pending: bool,
+    /// Whether a sendmsg operation is pending.
+    send_pending: bool,
+    /// Control message buffer for recvmsg (reused across operations).
+    cmsg_buf: Vec<u8>,
+    /// sockaddr storage for recvmsg.
+    addr_storage: libc::sockaddr_storage,
+    /// msghdr for recvmsg (must be kept alive during async operation).
+    msghdr: libc::msghdr,
+    /// iovec for recvmsg (must be kept alive during async operation).
+    iovec: libc::iovec,
+}
+
+impl UringUdpSocket {
+    fn new(raw_fd: RawFd, fixed_slot: u32, bound_addr: SocketAddr) -> Self {
+        Self {
+            raw_fd,
+            fixed_slot,
+            bound_addr,
+            recv_pending: false,
+            send_pending: false,
+            cmsg_buf: vec![0u8; CMSG_BUFFER_SIZE],
+            addr_storage: unsafe { mem::zeroed() },
+            msghdr: unsafe { mem::zeroed() },
+            iovec: unsafe { mem::zeroed() },
+        }
+    }
+}
+
 /// io_uring-based I/O driver.
 ///
 /// Requires Linux 6.0+ for full feature support (multishot recv/accept,
@@ -71,6 +115,7 @@ pub struct UringDriver {
     ring: IoUring,
     connections: Slab<UringConnection>,
     listeners: Slab<UringListener>,
+    udp_sockets: Slab<UringUdpSocket>,
     registered_files: RegisteredFiles,
     buf_ring: BufRing,
     pending_completions: Vec<Completion>,
@@ -131,6 +176,7 @@ impl UringDriver {
             ring,
             connections: Slab::with_capacity(max_connections as usize),
             listeners: Slab::with_capacity(16),
+            udp_sockets: Slab::with_capacity(64),
             registered_files,
             buf_ring,
             pending_completions: Vec::with_capacity(256),
@@ -208,6 +254,12 @@ impl UringDriver {
             }
             OP_SINGLE_RECV => {
                 self.handle_single_recv(id, result);
+            }
+            OP_UDP_RECVMSG => {
+                self.handle_udp_recvmsg(id, result);
+            }
+            OP_UDP_SENDMSG => {
+                self.handle_udp_sendmsg(id, result);
             }
             _ => {}
         }
@@ -507,6 +559,74 @@ impl UringDriver {
                 }
             }
         }
+    }
+
+    fn handle_udp_recvmsg(&mut self, socket_id: usize, result: i32) {
+        // Clear pending flag
+        if let Some(sock) = self.udp_sockets.get_mut(socket_id) {
+            sock.recv_pending = false;
+        }
+
+        if !self.udp_sockets.contains(socket_id) {
+            return;
+        }
+
+        if result < 0 {
+            // recvmsg error
+            self.pending_completions
+                .push(Completion::new(CompletionKind::UdpError {
+                    socket_id: UdpSocketId::new(socket_id),
+                    error: io::Error::from_raw_os_error(-result),
+                }));
+            return;
+        }
+
+        let len = result as usize;
+
+        // Parse control messages to extract ECN and local address
+        let meta = if let Some(sock) = self.udp_sockets.get(socket_id) {
+            // Parse source address from msghdr
+            let source = udp::sockaddr_to_std(&sock.addr_storage, sock.msghdr.msg_namelen)
+                .unwrap_or(sock.bound_addr);
+
+            // Parse control messages
+            udp::parse_control_messages(&sock.msghdr, source, len)
+        } else {
+            return;
+        };
+
+        self.pending_completions
+            .push(Completion::new(CompletionKind::RecvMsgComplete {
+                socket_id: UdpSocketId::new(socket_id),
+                meta,
+            }));
+    }
+
+    fn handle_udp_sendmsg(&mut self, socket_id: usize, result: i32) {
+        // Clear pending flag
+        if let Some(sock) = self.udp_sockets.get_mut(socket_id) {
+            sock.send_pending = false;
+        }
+
+        if !self.udp_sockets.contains(socket_id) {
+            return;
+        }
+
+        if result < 0 {
+            // sendmsg error
+            self.pending_completions
+                .push(Completion::new(CompletionKind::UdpError {
+                    socket_id: UdpSocketId::new(socket_id),
+                    error: io::Error::from_raw_os_error(-result),
+                }));
+            return;
+        }
+
+        self.pending_completions
+            .push(Completion::new(CompletionKind::SendMsgComplete {
+                socket_id: UdpSocketId::new(socket_id),
+                bytes: result as usize,
+            }));
     }
 }
 
@@ -922,6 +1042,252 @@ impl IoDriver for UringDriver {
 
     fn raw_fd(&self, id: ConnId) -> Option<RawFd> {
         self.connections.get(id.as_usize()).map(|c| c.raw_fd)
+    }
+
+    // === UDP socket operations ===
+
+    fn bind_udp(&mut self, addr: SocketAddr) -> io::Result<UdpSocketId> {
+        // Create UDP socket
+        let socket = socket2::Socket::new(
+            match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            },
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+
+        let raw_fd = socket.into_raw_fd();
+
+        // Configure socket for ECN and pktinfo
+        udp::configure_socket(raw_fd, &addr)?;
+
+        // Allocate registered fd slot
+        let fixed_slot = self
+            .registered_files
+            .alloc()
+            .ok_or_else(|| io::Error::other("no free fd slots"))?;
+
+        // Register the fd
+        let fds = [raw_fd];
+        if let Err(e) = self
+            .ring
+            .submitter()
+            .register_files_update(fixed_slot, &fds)
+        {
+            self.registered_files.free(fixed_slot);
+            unsafe { libc::close(raw_fd) };
+            return Err(e);
+        }
+
+        let entry = self.udp_sockets.vacant_entry();
+        let id = entry.key();
+
+        entry.insert(UringUdpSocket::new(raw_fd, fixed_slot, addr));
+
+        Ok(UdpSocketId::new(id))
+    }
+
+    fn close_udp(&mut self, id: UdpSocketId) -> io::Result<()> {
+        if let Some(sock) = self.udp_sockets.try_remove(id.as_usize()) {
+            // Update registered fd to -1
+            let fds = [-1i32];
+            let _ = self
+                .ring
+                .submitter()
+                .register_files_update(sock.fixed_slot, &fds);
+            self.registered_files.free(sock.fixed_slot);
+            unsafe { libc::close(sock.raw_fd) };
+        }
+        Ok(())
+    }
+
+    fn submit_recvmsg(&mut self, id: UdpSocketId, buf: &mut [u8]) -> io::Result<()> {
+        let socket_id = id.as_usize();
+        let sock = self
+            .udp_sockets
+            .get_mut(socket_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP socket not found"))?;
+
+        if sock.recv_pending {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Set up iovec
+        sock.iovec.iov_base = buf.as_mut_ptr() as *mut libc::c_void;
+        sock.iovec.iov_len = buf.len();
+
+        // Set up msghdr
+        sock.msghdr.msg_name = &mut sock.addr_storage as *mut _ as *mut libc::c_void;
+        sock.msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        sock.msghdr.msg_iov = &mut sock.iovec;
+        sock.msghdr.msg_iovlen = 1;
+        sock.msghdr.msg_control = sock.cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        sock.msghdr.msg_controllen = sock.cmsg_buf.len();
+        sock.msghdr.msg_flags = 0;
+
+        let fixed_slot = sock.fixed_slot;
+        let msghdr_ptr = &sock.msghdr as *const libc::msghdr;
+
+        // Submit recvmsg operation
+        let recvmsg_op = opcode::RecvMsg::new(Fixed(fixed_slot), msghdr_ptr as *mut _)
+            .build()
+            .user_data(encode_user_data(socket_id, 0, OP_UDP_RECVMSG));
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&recvmsg_op)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+
+        // Mark recv as pending
+        if let Some(sock) = self.udp_sockets.get_mut(socket_id) {
+            sock.recv_pending = true;
+        }
+
+        Ok(())
+    }
+
+    fn submit_sendmsg(&mut self, id: UdpSocketId, data: &[u8], meta: &SendMeta) -> io::Result<()> {
+        let socket_id = id.as_usize();
+        let sock = self
+            .udp_sockets
+            .get_mut(socket_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP socket not found"))?;
+
+        if sock.send_pending {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Set ECN on the socket
+        udp::set_ecn(sock.raw_fd, &meta.dest, meta.ecn)?;
+
+        // Convert destination address
+        let (dest_storage, dest_len) = udp::std_to_sockaddr(&meta.dest);
+        sock.addr_storage = dest_storage;
+
+        // Set up iovec
+        sock.iovec.iov_base = data.as_ptr() as *mut libc::c_void;
+        sock.iovec.iov_len = data.len();
+
+        // Set up msghdr
+        sock.msghdr.msg_name = &mut sock.addr_storage as *mut _ as *mut libc::c_void;
+        sock.msghdr.msg_namelen = dest_len;
+        sock.msghdr.msg_iov = &mut sock.iovec;
+        sock.msghdr.msg_iovlen = 1;
+        sock.msghdr.msg_control = std::ptr::null_mut();
+        sock.msghdr.msg_controllen = 0;
+        sock.msghdr.msg_flags = 0;
+
+        let fixed_slot = sock.fixed_slot;
+        let msghdr_ptr = &sock.msghdr as *const libc::msghdr;
+
+        // Submit sendmsg operation
+        let sendmsg_op = opcode::SendMsg::new(Fixed(fixed_slot), msghdr_ptr as *const _)
+            .build()
+            .user_data(encode_user_data(socket_id, 0, OP_UDP_SENDMSG));
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&sendmsg_op)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+
+        // Mark send as pending
+        if let Some(sock) = self.udp_sockets.get_mut(socket_id) {
+            sock.send_pending = true;
+        }
+
+        Ok(())
+    }
+
+    fn recvmsg(&mut self, id: UdpSocketId, buf: &mut [u8]) -> io::Result<RecvMeta> {
+        let sock = self
+            .udp_sockets
+            .get_mut(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP socket not found"))?;
+
+        // Set up for synchronous recvmsg
+        let mut iovec = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+
+        let mut addr_storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
+
+        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+        msghdr.msg_name = &mut addr_storage as *mut _ as *mut libc::c_void;
+        msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msghdr.msg_iov = &mut iovec;
+        msghdr.msg_iovlen = 1;
+        msghdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msghdr.msg_controllen = cmsg_buf.len();
+        msghdr.msg_flags = 0;
+
+        let result = unsafe { libc::recvmsg(sock.raw_fd, &mut msghdr, 0) };
+
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let len = result as usize;
+
+        // Parse source address
+        let source =
+            udp::sockaddr_to_std(&addr_storage, msghdr.msg_namelen).unwrap_or(sock.bound_addr);
+
+        // Parse control messages
+        Ok(udp::parse_control_messages(&msghdr, source, len))
+    }
+
+    fn sendmsg(&mut self, id: UdpSocketId, data: &[u8], meta: &SendMeta) -> io::Result<usize> {
+        let sock = self
+            .udp_sockets
+            .get(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP socket not found"))?;
+
+        // Set ECN on the socket
+        udp::set_ecn(sock.raw_fd, &meta.dest, meta.ecn)?;
+
+        // Convert destination address
+        let (dest_storage, dest_len) = udp::std_to_sockaddr(&meta.dest);
+
+        let mut iovec = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        };
+
+        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+        msghdr.msg_name = &dest_storage as *const _ as *mut libc::c_void;
+        msghdr.msg_namelen = dest_len;
+        msghdr.msg_iov = &mut iovec;
+        msghdr.msg_iovlen = 1;
+        msghdr.msg_control = std::ptr::null_mut();
+        msghdr.msg_controllen = 0;
+        msghdr.msg_flags = 0;
+
+        let result = unsafe { libc::sendmsg(sock.raw_fd, &msghdr, 0) };
+
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(result as usize)
+    }
+
+    fn udp_socket_count(&self) -> usize {
+        self.udp_sockets.len()
+    }
+
+    fn udp_raw_fd(&self, id: UdpSocketId) -> Option<RawFd> {
+        self.udp_sockets.get(id.as_usize()).map(|s| s.raw_fd)
     }
 }
 

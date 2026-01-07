@@ -3,15 +3,21 @@ use std::io::{self, Read, Write};
 /// Default buffer size: 64KB
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 
-/// A pre-allocated, reusable buffer for network I/O.
+/// Maximum buffer size: 4MB (prevents unbounded growth)
+const MAX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// A growable, reusable buffer for network I/O.
 ///
-/// This buffer is designed for zero-allocation in the hot path:
-/// - Fixed capacity, never reallocates
+/// This buffer is designed for efficient network I/O:
+/// - Starts with initial capacity, grows as needed up to MAX_BUFFER_SIZE
 /// - Tracks read/write positions separately
 /// - Supports compact operation to reclaim consumed space
+/// - Shrinks back to initial capacity when empty and oversized
 #[derive(Debug)]
 pub struct Buffer {
-    data: Box<[u8]>,
+    data: Vec<u8>,
+    /// Initial capacity (used for shrinking)
+    initial_capacity: usize,
     /// Read position: data before this has been consumed
     read_pos: usize,
     /// Write position: data has been written up to here
@@ -27,7 +33,8 @@ impl Buffer {
     /// Create a new buffer with the specified capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            data: vec![0u8; capacity].into_boxed_slice(),
+            data: vec![0u8; capacity],
+            initial_capacity: capacity,
             read_pos: 0,
             write_pos: 0,
         }
@@ -37,6 +44,30 @@ impl Buffer {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.data.len()
+    }
+
+    /// Ensures the buffer has at least `additional` bytes of writable space.
+    /// Grows the buffer if necessary, up to MAX_BUFFER_SIZE.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        let needed = self.write_pos + additional;
+        if needed <= self.data.len() {
+            return;
+        }
+
+        // First try compacting
+        if self.read_pos > 0 {
+            self.compact();
+            if self.writable() >= additional {
+                return;
+            }
+        }
+
+        // Need to grow
+        let new_size = (needed.next_power_of_two()).min(MAX_BUFFER_SIZE);
+        if new_size > self.data.len() {
+            self.data.resize(new_size, 0);
+        }
     }
 
     /// Returns the number of bytes available to read.
@@ -78,10 +109,17 @@ impl Buffer {
         assert!(n <= self.readable(), "consume exceeds readable bytes");
         self.read_pos += n;
 
-        // If we've consumed everything, reset to start
+        // If we've consumed everything, reset to start and maybe shrink
         if self.read_pos == self.write_pos {
             self.read_pos = 0;
             self.write_pos = 0;
+
+            // Shrink if we've grown beyond initial capacity
+            if self.data.len() > self.initial_capacity * 2 {
+                self.data.truncate(self.initial_capacity);
+                self.data.shrink_to_fit();
+                self.data.resize(self.initial_capacity, 0);
+            }
         }
     }
 
@@ -112,10 +150,18 @@ impl Buffer {
     }
 
     /// Clears the buffer, resetting both positions.
+    /// Shrinks the buffer if it has grown beyond initial capacity.
     #[inline]
     pub fn clear(&mut self) {
         self.read_pos = 0;
         self.write_pos = 0;
+
+        // Shrink if we've grown beyond initial capacity
+        if self.data.len() > self.initial_capacity * 2 {
+            self.data.truncate(self.initial_capacity);
+            self.data.shrink_to_fit();
+            self.data.resize(self.initial_capacity, 0);
+        }
     }
 
     /// Reads from the given reader into the buffer.
@@ -245,5 +291,58 @@ mod tests {
 
         // Should auto-reset when all data consumed
         assert_eq!(buf.writable(), 1024);
+    }
+
+    #[test]
+    fn test_buffer_grow() {
+        let mut buf = Buffer::with_capacity(64);
+
+        // Fill the buffer
+        let data = vec![b'x'; 64];
+        buf.extend_from_slice(&data);
+        assert_eq!(buf.writable(), 0);
+
+        // Reserve more space - should grow
+        buf.reserve(128);
+        assert!(buf.capacity() >= 64 + 128);
+        assert!(buf.writable() >= 128);
+    }
+
+    #[test]
+    fn test_buffer_shrink_on_consume() {
+        let mut buf = Buffer::with_capacity(64);
+
+        // Grow the buffer significantly
+        buf.reserve(1024);
+        let large_data = vec![b'x'; 1024];
+        buf.extend_from_slice(&large_data);
+
+        // Buffer should be large now
+        assert!(buf.capacity() >= 1024);
+
+        // Consume all data - should shrink back
+        buf.consume(1024);
+        assert_eq!(buf.capacity(), 64);
+    }
+
+    #[test]
+    fn test_buffer_reserve_compacts_first() {
+        let mut buf = Buffer::with_capacity(128);
+
+        // Write some data
+        buf.extend_from_slice(&[b'a'; 100]);
+        // Consume most of it
+        buf.consume(90);
+
+        // Now we have 10 bytes of data and 28 bytes writable
+        assert_eq!(buf.readable(), 10);
+        assert_eq!(buf.writable(), 28);
+
+        // Reserve 50 bytes - should compact (moving 10 bytes to front)
+        // giving us 118 bytes writable without growing
+        buf.reserve(50);
+        assert_eq!(buf.capacity(), 128); // Didn't grow
+        assert_eq!(buf.readable(), 10);
+        assert!(buf.writable() >= 50);
     }
 }

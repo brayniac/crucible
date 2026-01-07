@@ -8,7 +8,7 @@ mod sweep;
 
 use context::ContextManager;
 use runner::{RunResult, Runner};
-use sweep::{Experiment, IoExperiment, Suite, SweepConfig};
+use sweep::{Experiment, IoExperiment, NativeExperiment, NativeSweepConfig, Suite, SweepConfig};
 
 #[derive(Parser)]
 #[command(name = "bakeoff")]
@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match cli.suite {
                     Suite::Server => "server comparison",
                     Suite::IoEngine => "io-engine comparison",
+                    Suite::IoNative => "native io-engine comparison",
                 }
             );
 
@@ -159,6 +160,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                Suite::IoNative => {
+                    for exp in NativeExperiment::all() {
+                        let exp_name = exp.name();
+                        if !force && ctx_manager.get_by_name(&exp_name).is_some() {
+                            println!("  {} already has context, skipping", exp_name);
+                            continue;
+                        }
+
+                        // Clear submitted tracking for this experiment when re-initializing
+                        if force {
+                            ctx_manager.clear_submitted_for_name(&exp_name);
+                        }
+
+                        let name = format!("bakeoff-native-{}-{}", exp_name, timestamp);
+                        println!("  Creating context: {}", name);
+
+                        match context::create_context(&name) {
+                            Ok(uuid) => {
+                                println!("    -> {}", uuid);
+                                ctx_manager.set_by_name(&exp_name, uuid);
+                            }
+                            Err(e) => {
+                                eprintln!("    -> ERROR: {}", e);
+                            }
+                        }
+                    }
+                }
             }
 
             ctx_manager.save()?;
@@ -173,12 +201,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match cli.suite {
                     Suite::Server => "Server Suite",
                     Suite::IoEngine => "IO Engine Suite",
+                    Suite::IoNative => "Native IO Engine Suite",
                 }
             );
+
+            // Handle IoNative separately since it uses different sweep config
+            if cli.suite == Suite::IoNative {
+                let sweep = NativeSweepConfig::full();
+
+                for exp in NativeExperiment::all() {
+                    let name = exp.name();
+                    match ctx_manager.get_by_name(&name) {
+                        Some(uuid) => println!("  {:<20} {}", name, uuid),
+                        None => println!("  {:<20} (not initialized)", name),
+                    }
+                }
+
+                println!("\nSubmitted Experiments:\n");
+                let mut total_submitted = 0;
+                for exp in NativeExperiment::all() {
+                    let mut count = 0;
+                    for params in sweep.iter() {
+                        let name = format!("{}_{}", exp.name(), params.label());
+                        if ctx_manager.is_submitted(&name) {
+                            count += 1;
+                        }
+                    }
+                    total_submitted += count;
+                    println!(
+                        "  {:<20} {}/{}",
+                        exp.name(),
+                        count,
+                        sweep.total_combinations()
+                    );
+                }
+                println!(
+                    "\n  Total: {}/{}",
+                    total_submitted,
+                    NativeExperiment::all().len() * sweep.total_combinations()
+                );
+                return Ok(());
+            }
 
             let sweep = match cli.suite {
                 Suite::Server => SweepConfig::full(),
                 Suite::IoEngine => SweepConfig::io_engine(),
+                Suite::IoNative => unreachable!(), // handled above
             };
 
             match cli.suite {
@@ -248,6 +316,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         IoExperiment::all().len() * sweep.total_combinations()
                     );
                 }
+                Suite::IoNative => {
+                    // Already handled and returned early above
+                    unreachable!()
+                }
             }
         }
 
@@ -258,14 +330,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             ctx_manager.load()?;
 
+            let runner = Runner::new(&cli.experiments_dir, dry_run, force);
+
+            // Handle IoNative separately since it uses NativeSweepConfig
+            if cli.suite == Suite::IoNative {
+                let sweep = if limited {
+                    NativeSweepConfig::limited()
+                } else {
+                    NativeSweepConfig::full()
+                };
+
+                let experiments = NativeExperiment::all();
+
+                println!(
+                    "Running {} native io experiments with {} parameter combinations{}",
+                    experiments.len(),
+                    sweep.total_combinations(),
+                    if dry_run { " (DRY RUN)" } else { "" }
+                );
+                println!();
+
+                let mut submitted_count = 0;
+                let mut skipped_count = 0;
+
+                for exp in experiments {
+                    let exp_name = exp.name();
+                    let context_id = match ctx_manager.get_by_name(&exp_name) {
+                        Some(id) => id.clone(),
+                        None if dry_run => "<CONTEXT_ID>".to_string(),
+                        None => {
+                            return Err(format!(
+                                "No context for {}. Run 'bakeoff -s io-native init' first.",
+                                exp_name
+                            )
+                            .into());
+                        }
+                    };
+
+                    let display_id = if context_id.len() >= 8 {
+                        &context_id[..8]
+                    } else {
+                        &context_id
+                    };
+                    println!("=== {} (context: {}) ===", exp_name, display_id);
+
+                    let extra_args = exp.extra_args();
+
+                    for params in sweep.iter() {
+                        let name = format!("{}_{}", exp_name, params.label());
+                        let already_submitted = ctx_manager.is_submitted(&name);
+
+                        let (name, result) = runner.run_native(
+                            &exp_name,
+                            exp.jsonnet_file(),
+                            &context_id,
+                            &params,
+                            &extra_args,
+                            already_submitted,
+                        )?;
+
+                        match result {
+                            RunResult::Submitted => {
+                                ctx_manager.mark_submitted(name);
+                                ctx_manager.save()?;
+                                submitted_count += 1;
+                            }
+                            RunResult::Skipped => {
+                                skipped_count += 1;
+                            }
+                            RunResult::DryRun => {}
+                        }
+                    }
+
+                    println!();
+                }
+
+                if !dry_run {
+                    println!(
+                        "Summary: {} submitted, {} skipped",
+                        submitted_count, skipped_count
+                    );
+                }
+
+                return Ok(());
+            }
+
             let sweep = match cli.suite {
                 Suite::Server if limited => SweepConfig::limited(),
                 Suite::Server => SweepConfig::full(),
                 Suite::IoEngine if limited => SweepConfig::limited(),
                 Suite::IoEngine => SweepConfig::io_engine(),
+                Suite::IoNative => unreachable!(), // handled above
             };
-
-            let runner = Runner::new(&cli.experiments_dir, dry_run, force);
 
             match cli.suite {
                 Suite::Server => {
@@ -411,6 +567,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
+                Suite::IoNative => {
+                    // Already handled and returned early above
+                    unreachable!()
+                }
             }
         }
 
@@ -474,6 +634,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                Suite::IoNative => {
+                    for exp in NativeExperiment::all() {
+                        let exp_name = exp.name();
+                        let context_id = match ctx_manager.get_by_name(&exp_name) {
+                            Some(id) => id,
+                            None => {
+                                if format == "table" {
+                                    println!("{}: no context initialized\n", exp_name);
+                                }
+                                continue;
+                            }
+                        };
+
+                        match results::fetch_native_context_results(context_id) {
+                            Ok(exp_results) => {
+                                all_results.insert(exp_name, exp_results);
+                            }
+                            Err(e) => {
+                                if format == "table" {
+                                    println!("{}: error fetching results: {}\n", exp_name, e);
+                                } else {
+                                    eprintln!("{}: error fetching results: {}", exp_name, e);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             let bakeoff_results = results::BakeoffResults {
@@ -500,6 +687,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .map(|e| e.name().to_string())
                             .collect(),
                         Suite::IoEngine => IoExperiment::all().iter().map(|e| e.name()).collect(),
+                        Suite::IoNative => {
+                            NativeExperiment::all().iter().map(|e| e.name()).collect()
+                        }
                     };
                     for exp_name in &experiments {
                         if let Some(exp_results) = bakeoff_results.experiments.get(exp_name) {
@@ -521,6 +711,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match cli.suite {
                     Suite::Server => "server",
                     Suite::IoEngine => "io-engine",
+                    Suite::IoNative => "native io-engine",
                 },
                 if dry_run { " (DRY RUN)" } else { "" }
             );
@@ -603,6 +794,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                }
+                Suite::IoNative => {
+                    // IoNative retry not yet implemented - requires value_size tracking
+                    println!("  Retry not yet implemented for io-native suite.");
+                    println!(
+                        "  Use 'bakeoff -s io-native run --force' to resubmit all experiments."
+                    );
+                    return Ok(());
                 }
             }
 
@@ -715,6 +914,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             RunResult::DryRun => {}
                         }
                     }
+                }
+                Suite::IoNative => {
+                    // Already returned early above
+                    unreachable!()
                 }
             }
 

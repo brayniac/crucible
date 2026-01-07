@@ -2,6 +2,10 @@
 //!
 //! This implements just enough protobuf wire format to encode/decode
 //! the cache API messages without requiring prost or other heavy deps.
+//!
+//! Supports both wire formats:
+//! - gRPC: Direct Get/Set/Delete request/response messages
+//! - Protosocket: CacheCommand/CacheResponse wrapper messages with message IDs
 
 use bytes::Bytes;
 
@@ -469,6 +473,669 @@ impl DeleteResponse {
         // _DeleteResponse has no fields
         Vec::new()
     }
+}
+
+// ============================================================================
+// Protosocket Wire Format Messages
+// ============================================================================
+//
+// Protosocket uses a different wire format than gRPC:
+// - Messages are length-delimited (varint prefix) over raw TCP
+// - CacheCommand wraps requests with message_id for correlation
+// - CacheResponse wraps responses with message_id
+// - Authentication is done via AuthenticateCommand (first message on connection)
+
+/// Control codes for protosocket messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum ControlCode {
+    /// Normal message.
+    #[default]
+    Normal = 0,
+    /// Cancel the RPC.
+    Cancel = 1,
+    /// End of stream (for streaming RPCs).
+    End = 2,
+}
+
+impl ControlCode {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => ControlCode::Normal,
+            1 => ControlCode::Cancel,
+            2 => ControlCode::End,
+            _ => ControlCode::Normal,
+        }
+    }
+}
+
+/// Status codes for protosocket responses (matches gRPC codes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum StatusCode {
+    #[default]
+    Ok = 0,
+    Cancelled = 1,
+    Unknown = 2,
+    InvalidArgument = 3,
+    DeadlineExceeded = 4,
+    NotFound = 5,
+    AlreadyExists = 6,
+    PermissionDenied = 7,
+    ResourceExhausted = 8,
+    FailedPrecondition = 9,
+    Aborted = 10,
+    OutOfRange = 11,
+    Unimplemented = 12,
+    Internal = 13,
+    Unavailable = 14,
+    DataLoss = 15,
+    Unauthenticated = 16,
+}
+
+impl StatusCode {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => StatusCode::Ok,
+            1 => StatusCode::Cancelled,
+            2 => StatusCode::Unknown,
+            3 => StatusCode::InvalidArgument,
+            4 => StatusCode::DeadlineExceeded,
+            5 => StatusCode::NotFound,
+            6 => StatusCode::AlreadyExists,
+            7 => StatusCode::PermissionDenied,
+            8 => StatusCode::ResourceExhausted,
+            9 => StatusCode::FailedPrecondition,
+            10 => StatusCode::Aborted,
+            11 => StatusCode::OutOfRange,
+            12 => StatusCode::Unimplemented,
+            13 => StatusCode::Internal,
+            14 => StatusCode::Unavailable,
+            15 => StatusCode::DataLoss,
+            16 => StatusCode::Unauthenticated,
+            _ => StatusCode::Unknown,
+        }
+    }
+}
+
+/// Error from a protosocket command.
+#[derive(Debug, Clone)]
+pub struct CommandError {
+    pub code: StatusCode,
+    pub message: String,
+}
+
+impl CommandError {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
+        encode_uint64(1, self.code as u64, &mut buf);
+        if !self.message.is_empty() {
+            encode_string(2, &self.message, &mut buf);
+        }
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+        let mut code = StatusCode::Unknown;
+        let mut message = String::new();
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            match field_number {
+                1 => code = StatusCode::from_u32(decode_varint(&mut buf)? as u32),
+                2 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    message = String::from_utf8_lossy(bytes).into_owned();
+                }
+                _ => skip_field(wire_type, &mut buf)?,
+            }
+        }
+
+        Some(Self { code, message })
+    }
+}
+
+/// Unary command types for protosocket.
+#[derive(Debug, Clone)]
+pub enum UnaryCommand {
+    Authenticate {
+        auth_token: String,
+    },
+    Get {
+        namespace: String,
+        key: Bytes,
+    },
+    Set {
+        namespace: String,
+        key: Bytes,
+        value: Bytes,
+        ttl_millis: u64,
+    },
+    Delete {
+        namespace: String,
+        key: Bytes,
+    },
+}
+
+impl UnaryCommand {
+    /// Encode the inner command (without the Unary wrapper).
+    fn encode_inner(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        match self {
+            UnaryCommand::Authenticate { auth_token } => {
+                encode_string(1, auth_token, &mut buf);
+            }
+            UnaryCommand::Get { namespace, key } => {
+                encode_string(1, namespace, &mut buf);
+                encode_bytes(2, key, &mut buf);
+            }
+            UnaryCommand::Set {
+                namespace,
+                key,
+                value,
+                ttl_millis,
+            } => {
+                encode_string(1, namespace, &mut buf);
+                encode_bytes(2, key, &mut buf);
+                encode_bytes(3, value, &mut buf);
+                encode_uint64(4, *ttl_millis, &mut buf);
+            }
+            UnaryCommand::Delete { namespace, key } => {
+                encode_string(1, namespace, &mut buf);
+                encode_bytes(2, key, &mut buf);
+            }
+        }
+        buf
+    }
+
+    /// Encode as a Unary message with the command in the appropriate field.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        let inner = self.encode_inner();
+        let field_number = match self {
+            UnaryCommand::Authenticate { .. } => 1,
+            UnaryCommand::Get { .. } => 2,
+            UnaryCommand::Set { .. } => 3,
+            UnaryCommand::Delete { .. } => 4,
+        };
+        encode_message(field_number, &inner, &mut buf);
+        buf
+    }
+
+    /// Decode a Unary message.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            if wire_type != WIRE_TYPE_LEN {
+                skip_field(wire_type, &mut buf)?;
+                continue;
+            }
+
+            let inner = decode_length_delimited(&mut buf)?;
+            return match field_number {
+                1 => Self::decode_authenticate(inner),
+                2 => Self::decode_get(inner),
+                3 => Self::decode_set(inner),
+                4 => Self::decode_delete(inner),
+                _ => None,
+            };
+        }
+
+        None
+    }
+
+    fn decode_authenticate(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+        let mut auth_token = String::new();
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            match field_number {
+                1 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    auth_token = String::from_utf8_lossy(bytes).into_owned();
+                }
+                _ => skip_field(wire_type, &mut buf)?,
+            }
+        }
+
+        Some(UnaryCommand::Authenticate { auth_token })
+    }
+
+    fn decode_get(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+        let mut namespace = String::new();
+        let mut key = Bytes::new();
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            match field_number {
+                1 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    namespace = String::from_utf8_lossy(bytes).into_owned();
+                }
+                2 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    key = Bytes::copy_from_slice(bytes);
+                }
+                _ => skip_field(wire_type, &mut buf)?,
+            }
+        }
+
+        Some(UnaryCommand::Get { namespace, key })
+    }
+
+    fn decode_set(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+        let mut namespace = String::new();
+        let mut key = Bytes::new();
+        let mut value = Bytes::new();
+        let mut ttl_millis = 0u64;
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            match field_number {
+                1 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    namespace = String::from_utf8_lossy(bytes).into_owned();
+                }
+                2 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    key = Bytes::copy_from_slice(bytes);
+                }
+                3 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    value = Bytes::copy_from_slice(bytes);
+                }
+                4 => {
+                    ttl_millis = decode_varint(&mut buf)?;
+                }
+                _ => skip_field(wire_type, &mut buf)?,
+            }
+        }
+
+        Some(UnaryCommand::Set {
+            namespace,
+            key,
+            value,
+            ttl_millis,
+        })
+    }
+
+    fn decode_delete(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+        let mut namespace = String::new();
+        let mut key = Bytes::new();
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            match field_number {
+                1 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    namespace = String::from_utf8_lossy(bytes).into_owned();
+                }
+                2 => {
+                    let bytes = decode_length_delimited(&mut buf)?;
+                    key = Bytes::copy_from_slice(bytes);
+                }
+                _ => skip_field(wire_type, &mut buf)?,
+            }
+        }
+
+        Some(UnaryCommand::Delete { namespace, key })
+    }
+}
+
+/// A command sent from client to server over protosocket.
+#[derive(Debug, Clone)]
+pub struct CacheCommand {
+    pub message_id: u64,
+    pub control_code: ControlCode,
+    pub command: Option<UnaryCommand>,
+}
+
+impl CacheCommand {
+    /// Create a new command with the given message ID.
+    pub fn new(message_id: u64, command: UnaryCommand) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Normal,
+            command: Some(command),
+        }
+    }
+
+    /// Create a cancel command.
+    pub fn cancel(message_id: u64) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Cancel,
+            command: None,
+        }
+    }
+
+    /// Encode the command to bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+
+        // Field 1: message_id
+        encode_uint64(1, self.message_id, &mut buf);
+
+        // Field 2: control_code
+        encode_uint64(2, self.control_code as u64, &mut buf);
+
+        // Field 3: unary command (wrapped in Unary message)
+        if let Some(ref cmd) = self.command {
+            let unary = cmd.encode();
+            encode_message(3, &unary, &mut buf);
+        }
+
+        buf
+    }
+
+    /// Encode with length prefix for protosocket wire format.
+    pub fn encode_length_delimited(&self) -> Vec<u8> {
+        let inner = self.encode();
+        let mut buf = Vec::with_capacity(inner.len() + 5);
+        encode_varint(inner.len() as u64, &mut buf);
+        buf.extend_from_slice(&inner);
+        buf
+    }
+
+    /// Decode a command from bytes.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+        let mut message_id = 0u64;
+        let mut control_code = ControlCode::Normal;
+        let mut command = None;
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            match field_number {
+                1 => message_id = decode_varint(&mut buf)?,
+                2 => control_code = ControlCode::from_u32(decode_varint(&mut buf)? as u32),
+                3 => {
+                    let unary_data = decode_length_delimited(&mut buf)?;
+                    command = UnaryCommand::decode(unary_data);
+                }
+                _ => skip_field(wire_type, &mut buf)?,
+            }
+        }
+
+        Some(Self {
+            message_id,
+            control_code,
+            command,
+        })
+    }
+}
+
+/// Response types for protosocket.
+#[derive(Debug, Clone)]
+pub enum UnaryResponse {
+    Authenticate,
+    Get { value: Option<Bytes> },
+    Set,
+    Delete,
+}
+
+impl UnaryResponse {
+    /// Encode the inner response.
+    fn encode_inner(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        match self {
+            UnaryResponse::Authenticate => {
+                // Empty message
+            }
+            UnaryResponse::Get { value } => {
+                if let Some(v) = value {
+                    encode_bytes(1, v, &mut buf);
+                }
+            }
+            UnaryResponse::Set => {
+                // Empty message
+            }
+            UnaryResponse::Delete => {
+                // Empty message
+            }
+        }
+        buf
+    }
+
+    /// Encode as a response with the appropriate field number.
+    pub fn encode(&self, field_number: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        let inner = self.encode_inner();
+        encode_message(field_number, &inner, &mut buf);
+        buf
+    }
+}
+
+/// A response sent from server to client over protosocket.
+#[derive(Debug, Clone)]
+pub struct CacheResponse {
+    pub message_id: u64,
+    pub control_code: ControlCode,
+    pub result: CacheResponseResult,
+}
+
+/// The result portion of a CacheResponse.
+#[derive(Debug, Clone)]
+pub enum CacheResponseResult {
+    Authenticate,
+    Get { value: Option<Bytes> },
+    Set,
+    Delete,
+    Error(CommandError),
+}
+
+impl CacheResponse {
+    /// Create a successful authenticate response.
+    pub fn authenticate(message_id: u64) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Normal,
+            result: CacheResponseResult::Authenticate,
+        }
+    }
+
+    /// Create a successful get response (hit).
+    pub fn get_hit(message_id: u64, value: Bytes) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Normal,
+            result: CacheResponseResult::Get { value: Some(value) },
+        }
+    }
+
+    /// Create a get miss response.
+    pub fn get_miss(message_id: u64) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Normal,
+            result: CacheResponseResult::Get { value: None },
+        }
+    }
+
+    /// Create a successful set response.
+    pub fn set_ok(message_id: u64) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Normal,
+            result: CacheResponseResult::Set,
+        }
+    }
+
+    /// Create a successful delete response.
+    pub fn delete_ok(message_id: u64) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Normal,
+            result: CacheResponseResult::Delete,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(message_id: u64, code: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            message_id,
+            control_code: ControlCode::Normal,
+            result: CacheResponseResult::Error(CommandError {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+
+    /// Encode the response to bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+
+        // Field 1: message_id
+        encode_uint64(1, self.message_id, &mut buf);
+
+        // Field 2: control_code
+        encode_uint64(2, self.control_code as u64, &mut buf);
+
+        // Field 3-7: response kind
+        match &self.result {
+            CacheResponseResult::Authenticate => {
+                // Field 1: authenticate response (empty)
+                encode_message(1, &[], &mut buf);
+            }
+            CacheResponseResult::Get { value } => {
+                // Field 2: get response
+                let mut inner = Vec::new();
+                if let Some(v) = value {
+                    encode_bytes(1, v, &mut inner);
+                }
+                encode_message(2, &inner, &mut buf);
+            }
+            CacheResponseResult::Set => {
+                // Field 3: set response (empty)
+                encode_message(3, &[], &mut buf);
+            }
+            CacheResponseResult::Delete => {
+                // Field 4: delete response (empty)
+                encode_message(4, &[], &mut buf);
+            }
+            CacheResponseResult::Error(err) => {
+                // Field 5: error
+                let inner = err.encode();
+                encode_message(5, &inner, &mut buf);
+            }
+        }
+
+        buf
+    }
+
+    /// Encode with length prefix for protosocket wire format.
+    pub fn encode_length_delimited(&self) -> Vec<u8> {
+        let inner = self.encode();
+        let mut buf = Vec::with_capacity(inner.len() + 5);
+        encode_varint(inner.len() as u64, &mut buf);
+        buf.extend_from_slice(&inner);
+        buf
+    }
+
+    /// Decode a response from bytes.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut buf = data;
+        let mut message_id = 0u64;
+        let mut control_code = ControlCode::Normal;
+        let mut result = None;
+
+        while !buf.is_empty() {
+            let (field_number, wire_type) = decode_tag(&mut buf)?;
+            match field_number {
+                1 if wire_type == WIRE_TYPE_VARINT => {
+                    message_id = decode_varint(&mut buf)?;
+                }
+                2 if wire_type == WIRE_TYPE_VARINT => {
+                    control_code = ControlCode::from_u32(decode_varint(&mut buf)? as u32);
+                }
+                // Response kinds (field 1 is also authenticate response when LEN type)
+                1 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited(&mut buf)?;
+                    result = Some(CacheResponseResult::Authenticate);
+                }
+                2 if wire_type == WIRE_TYPE_LEN => {
+                    let inner = decode_length_delimited(&mut buf)?;
+                    result = Some(Self::decode_get_response(inner));
+                }
+                3 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited(&mut buf)?;
+                    result = Some(CacheResponseResult::Set);
+                }
+                4 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited(&mut buf)?;
+                    result = Some(CacheResponseResult::Delete);
+                }
+                5 if wire_type == WIRE_TYPE_LEN => {
+                    let inner = decode_length_delimited(&mut buf)?;
+                    let err = CommandError::decode(inner)?;
+                    result = Some(CacheResponseResult::Error(err));
+                }
+                _ => skip_field(wire_type, &mut buf)?,
+            }
+        }
+
+        Some(Self {
+            message_id,
+            control_code,
+            result: result.unwrap_or(CacheResponseResult::Error(CommandError {
+                code: StatusCode::Internal,
+                message: "missing response".to_string(),
+            })),
+        })
+    }
+
+    fn decode_get_response(data: &[u8]) -> CacheResponseResult {
+        let mut buf = data;
+        let mut value = None;
+
+        while !buf.is_empty() {
+            if let Some((field_number, wire_type)) = decode_tag(&mut buf) {
+                match field_number {
+                    1 => {
+                        if let Some(bytes) = decode_length_delimited(&mut buf) {
+                            value = Some(Bytes::copy_from_slice(bytes));
+                        }
+                    }
+                    _ => {
+                        if skip_field(wire_type, &mut buf).is_none() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        CacheResponseResult::Get { value }
+    }
+}
+
+/// Decode a length-delimited message from a buffer.
+/// Returns (bytes_consumed, message) or None if incomplete.
+pub fn decode_length_delimited_message(buf: &[u8]) -> Option<(usize, &[u8])> {
+    let mut cursor = buf;
+    let original_len = buf.len();
+
+    // Decode varint length
+    let len = decode_varint(&mut cursor)? as usize;
+    let header_len = original_len - cursor.len();
+
+    // Check if we have enough data
+    if cursor.len() < len {
+        return None;
+    }
+
+    let message = &cursor[..len];
+    Some((header_len + len, message))
 }
 
 #[cfg(test)]
@@ -1152,5 +1819,299 @@ mod tests {
         };
         let cloned = req.clone();
         assert_eq!(cloned.cache_key, req.cache_key);
+    }
+
+    // =========================================================================
+    // Protosocket message tests
+    // =========================================================================
+
+    // ControlCode tests
+
+    #[test]
+    fn test_control_code_from_u32() {
+        assert_eq!(ControlCode::from_u32(0), ControlCode::Normal);
+        assert_eq!(ControlCode::from_u32(1), ControlCode::Cancel);
+        assert_eq!(ControlCode::from_u32(2), ControlCode::End);
+        assert_eq!(ControlCode::from_u32(99), ControlCode::Normal);
+    }
+
+    #[test]
+    fn test_control_code_default() {
+        assert_eq!(ControlCode::default(), ControlCode::Normal);
+    }
+
+    // StatusCode tests
+
+    #[test]
+    fn test_status_code_from_u32() {
+        assert_eq!(StatusCode::from_u32(0), StatusCode::Ok);
+        assert_eq!(StatusCode::from_u32(5), StatusCode::NotFound);
+        assert_eq!(StatusCode::from_u32(14), StatusCode::Unavailable);
+        assert_eq!(StatusCode::from_u32(16), StatusCode::Unauthenticated);
+        assert_eq!(StatusCode::from_u32(99), StatusCode::Unknown);
+    }
+
+    #[test]
+    fn test_status_code_default() {
+        assert_eq!(StatusCode::default(), StatusCode::Ok);
+    }
+
+    // CommandError tests
+
+    #[test]
+    fn test_command_error_roundtrip() {
+        let err = CommandError {
+            code: StatusCode::NotFound,
+            message: "key not found".to_string(),
+        };
+        let encoded = err.encode();
+        let decoded = CommandError::decode(&encoded).unwrap();
+        assert_eq!(decoded.code, StatusCode::NotFound);
+        assert_eq!(decoded.message, "key not found");
+    }
+
+    #[test]
+    fn test_command_error_empty_message() {
+        let err = CommandError {
+            code: StatusCode::Internal,
+            message: String::new(),
+        };
+        let encoded = err.encode();
+        let decoded = CommandError::decode(&encoded).unwrap();
+        assert_eq!(decoded.code, StatusCode::Internal);
+        assert!(decoded.message.is_empty());
+    }
+
+    // UnaryCommand tests
+
+    #[test]
+    fn test_unary_command_authenticate_roundtrip() {
+        let cmd = UnaryCommand::Authenticate {
+            auth_token: "test-token-123".to_string(),
+        };
+        let encoded = cmd.encode();
+        let decoded = UnaryCommand::decode(&encoded).unwrap();
+        match decoded {
+            UnaryCommand::Authenticate { auth_token } => {
+                assert_eq!(auth_token, "test-token-123");
+            }
+            _ => panic!("expected Authenticate"),
+        }
+    }
+
+    #[test]
+    fn test_unary_command_get_roundtrip() {
+        let cmd = UnaryCommand::Get {
+            namespace: "my-cache".to_string(),
+            key: Bytes::from_static(b"my-key"),
+        };
+        let encoded = cmd.encode();
+        let decoded = UnaryCommand::decode(&encoded).unwrap();
+        match decoded {
+            UnaryCommand::Get { namespace, key } => {
+                assert_eq!(namespace, "my-cache");
+                assert_eq!(key.as_ref(), b"my-key");
+            }
+            _ => panic!("expected Get"),
+        }
+    }
+
+    #[test]
+    fn test_unary_command_set_roundtrip() {
+        let cmd = UnaryCommand::Set {
+            namespace: "cache".to_string(),
+            key: Bytes::from_static(b"key"),
+            value: Bytes::from_static(b"value"),
+            ttl_millis: 60000,
+        };
+        let encoded = cmd.encode();
+        let decoded = UnaryCommand::decode(&encoded).unwrap();
+        match decoded {
+            UnaryCommand::Set {
+                namespace,
+                key,
+                value,
+                ttl_millis,
+            } => {
+                assert_eq!(namespace, "cache");
+                assert_eq!(key.as_ref(), b"key");
+                assert_eq!(value.as_ref(), b"value");
+                assert_eq!(ttl_millis, 60000);
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn test_unary_command_delete_roundtrip() {
+        let cmd = UnaryCommand::Delete {
+            namespace: "cache".to_string(),
+            key: Bytes::from_static(b"delete-me"),
+        };
+        let encoded = cmd.encode();
+        let decoded = UnaryCommand::decode(&encoded).unwrap();
+        match decoded {
+            UnaryCommand::Delete { namespace, key } => {
+                assert_eq!(namespace, "cache");
+                assert_eq!(key.as_ref(), b"delete-me");
+            }
+            _ => panic!("expected Delete"),
+        }
+    }
+
+    // CacheCommand tests
+
+    #[test]
+    fn test_cache_command_roundtrip() {
+        let cmd = CacheCommand::new(
+            42,
+            UnaryCommand::Get {
+                namespace: "test".to_string(),
+                key: Bytes::from_static(b"key"),
+            },
+        );
+        let encoded = cmd.encode();
+        let decoded = CacheCommand::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 42);
+        assert_eq!(decoded.control_code, ControlCode::Normal);
+        assert!(decoded.command.is_some());
+    }
+
+    #[test]
+    fn test_cache_command_cancel() {
+        let cmd = CacheCommand::cancel(99);
+        let encoded = cmd.encode();
+        let decoded = CacheCommand::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 99);
+        assert_eq!(decoded.control_code, ControlCode::Cancel);
+        assert!(decoded.command.is_none());
+    }
+
+    #[test]
+    fn test_cache_command_length_delimited() {
+        let cmd = CacheCommand::new(
+            1,
+            UnaryCommand::Authenticate {
+                auth_token: "token".to_string(),
+            },
+        );
+        let encoded = cmd.encode_length_delimited();
+        // First bytes should be varint length
+        let (consumed, message) = decode_length_delimited_message(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        let decoded = CacheCommand::decode(message).unwrap();
+        assert_eq!(decoded.message_id, 1);
+    }
+
+    // CacheResponse tests
+
+    #[test]
+    fn test_cache_response_authenticate() {
+        let resp = CacheResponse::authenticate(1);
+        let encoded = resp.encode();
+        let decoded = CacheResponse::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 1);
+        assert!(matches!(decoded.result, CacheResponseResult::Authenticate));
+    }
+
+    #[test]
+    fn test_cache_response_get_hit() {
+        let resp = CacheResponse::get_hit(2, Bytes::from_static(b"value"));
+        let encoded = resp.encode();
+        let decoded = CacheResponse::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 2);
+        match decoded.result {
+            CacheResponseResult::Get { value } => {
+                assert_eq!(value, Some(Bytes::from_static(b"value")));
+            }
+            _ => panic!("expected Get"),
+        }
+    }
+
+    #[test]
+    fn test_cache_response_get_miss() {
+        let resp = CacheResponse::get_miss(3);
+        let encoded = resp.encode();
+        let decoded = CacheResponse::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 3);
+        match decoded.result {
+            CacheResponseResult::Get { value } => {
+                assert!(value.is_none());
+            }
+            _ => panic!("expected Get"),
+        }
+    }
+
+    #[test]
+    fn test_cache_response_set_ok() {
+        let resp = CacheResponse::set_ok(4);
+        let encoded = resp.encode();
+        let decoded = CacheResponse::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 4);
+        assert!(matches!(decoded.result, CacheResponseResult::Set));
+    }
+
+    #[test]
+    fn test_cache_response_delete_ok() {
+        let resp = CacheResponse::delete_ok(5);
+        let encoded = resp.encode();
+        let decoded = CacheResponse::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 5);
+        assert!(matches!(decoded.result, CacheResponseResult::Delete));
+    }
+
+    #[test]
+    fn test_cache_response_error() {
+        let resp = CacheResponse::error(6, StatusCode::NotFound, "not found");
+        let encoded = resp.encode();
+        let decoded = CacheResponse::decode(&encoded).unwrap();
+        assert_eq!(decoded.message_id, 6);
+        match decoded.result {
+            CacheResponseResult::Error(err) => {
+                assert_eq!(err.code, StatusCode::NotFound);
+                assert_eq!(err.message, "not found");
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_cache_response_length_delimited() {
+        let resp = CacheResponse::set_ok(7);
+        let encoded = resp.encode_length_delimited();
+        let (consumed, message) = decode_length_delimited_message(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        let decoded = CacheResponse::decode(message).unwrap();
+        assert_eq!(decoded.message_id, 7);
+    }
+
+    // decode_length_delimited_message tests
+
+    #[test]
+    fn test_decode_length_delimited_message_complete() {
+        let data = b"hello";
+        let mut buf = Vec::new();
+        encode_varint(data.len() as u64, &mut buf);
+        buf.extend_from_slice(data);
+
+        let (consumed, message) = decode_length_delimited_message(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(message, data);
+    }
+
+    #[test]
+    fn test_decode_length_delimited_message_incomplete() {
+        let mut buf = Vec::new();
+        encode_varint(100, &mut buf); // Says 100 bytes
+        buf.extend_from_slice(b"short"); // Only 5 bytes
+
+        let result = decode_length_delimited_message(&buf);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_decode_length_delimited_message_empty() {
+        let result = decode_length_delimited_message(&[]);
+        assert!(result.is_none());
     }
 }

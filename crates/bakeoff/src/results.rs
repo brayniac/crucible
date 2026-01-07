@@ -101,6 +101,8 @@ pub struct BenchmarkMetrics {
 pub struct ExperimentResult {
     pub connections: usize,
     pub pipeline_depth: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_size: Option<usize>,
     pub state: String,
     pub metrics: BenchmarkMetrics,
 }
@@ -234,6 +236,7 @@ pub fn fetch_context_results(
             ExperimentResult {
                 connections: info.connections,
                 pipeline_depth: info.pipeline_depth,
+                value_size: None,
                 state: info.state,
                 metrics,
             }
@@ -245,6 +248,126 @@ pub fn fetch_context_results(
         a.connections
             .cmp(&b.connections)
             .then(a.pipeline_depth.cmp(&b.pipeline_depth))
+    });
+
+    // Filter out experiments with fewer than 8 connections
+    results.retain(|r| r.connections >= 8);
+
+    Ok(results)
+}
+
+/// Fetch results for a native IO context (includes value_size).
+pub fn fetch_native_context_results(
+    context_id: &str,
+) -> Result<Vec<ExperimentResult>, Box<dyn std::error::Error>> {
+    // Query experiments and their states via GraphQL
+    let query = format!(
+        r#"{{
+            contextById(id: "{}") {{
+                id
+                name
+                experiments {{
+                    experimentId
+                    params
+                    experiment {{
+                        id
+                        name
+                        state
+                        job {{
+                            id
+                            name
+                            artifact {{
+                                id
+                                name
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}"#,
+        context_id
+    );
+
+    let response: GraphQLResponse<ContextByIdData> =
+        ureq::post(&format!("{}/api/graphql", SYSTEMSLAB_URL))
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!({ "query": query }))?
+            .into_json()?;
+
+    let context = response
+        .data
+        .and_then(|d| d.context_by_id)
+        .ok_or("Context not found")?;
+
+    // Collect experiment info with value_size
+    struct NativeExperimentInfo {
+        connections: usize,
+        pipeline_depth: usize,
+        value_size: usize,
+        state: String,
+        experiment_id: String,
+        jobs: Vec<JobData>,
+    }
+
+    let experiment_infos: Vec<NativeExperimentInfo> = context
+        .experiments
+        .into_iter()
+        .map(|ctx_exp| {
+            let connections = ctx_exp
+                .params
+                .get("connections")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let pipeline_depth = ctx_exp
+                .params
+                .get("pipeline_depth")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let value_size = ctx_exp
+                .params
+                .get("value_length")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64); // default to 64 if not specified
+
+            NativeExperimentInfo {
+                connections,
+                pipeline_depth,
+                value_size,
+                state: ctx_exp.experiment.state,
+                experiment_id: ctx_exp.experiment.id,
+                jobs: ctx_exp.experiment.job,
+            }
+        })
+        .collect();
+
+    // Fetch metrics in parallel for successful experiments
+    let mut results: Vec<ExperimentResult> = experiment_infos
+        .into_par_iter()
+        .map(|info| {
+            let metrics = if info.state == "success" {
+                fetch_experiment_metrics(&info.experiment_id, &info.jobs)
+            } else {
+                BenchmarkMetrics::default()
+            };
+
+            ExperimentResult {
+                connections: info.connections,
+                pipeline_depth: info.pipeline_depth,
+                value_size: Some(info.value_size),
+                state: info.state,
+                metrics,
+            }
+        })
+        .collect();
+
+    // Sort by connections, then pipeline_depth, then value_size
+    results.sort_by(|a, b| {
+        a.connections
+            .cmp(&b.connections)
+            .then(a.pipeline_depth.cmp(&b.pipeline_depth))
+            .then(a.value_size.cmp(&b.value_size))
     });
 
     // Filter out experiments with fewer than 8 connections
@@ -373,15 +496,29 @@ fn extract_float_before(text: &str, suffix: &str) -> Option<f64> {
 
 /// Print results as a table.
 pub fn print_results_table(experiment_name: &str, results: &[ExperimentResult]) {
+    // Check if any results have value_size to determine table format
+    let has_value_size = results.iter().any(|r| r.value_size.is_some());
+
     println!("{}:", experiment_name);
-    println!(
-        "  {:>6} {:>6} {:>10} {:>12} {:>10} {:>10} {:>10}",
-        "conns", "pipe", "state", "throughput", "p50", "p99", "p99.9"
-    );
-    println!(
-        "  {:->6} {:->6} {:->10} {:->12} {:->10} {:->10} {:->10}",
-        "", "", "", "", "", "", ""
-    );
+    if has_value_size {
+        println!(
+            "  {:>6} {:>6} {:>8} {:>10} {:>12} {:>10} {:>10} {:>10}",
+            "conns", "pipe", "vsize", "state", "throughput", "p50", "p99", "p99.9"
+        );
+        println!(
+            "  {:->6} {:->6} {:->8} {:->10} {:->12} {:->10} {:->10} {:->10}",
+            "", "", "", "", "", "", "", ""
+        );
+    } else {
+        println!(
+            "  {:>6} {:>6} {:>10} {:>12} {:>10} {:>10} {:>10}",
+            "conns", "pipe", "state", "throughput", "p50", "p99", "p99.9"
+        );
+        println!(
+            "  {:->6} {:->6} {:->10} {:->12} {:->10} {:->10} {:->10}",
+            "", "", "", "", "", "", ""
+        );
+    }
 
     for r in results {
         let state_display = match r.state.as_str() {
@@ -416,10 +553,21 @@ pub fn print_results_table(experiment_name: &str, results: &[ExperimentResult]) 
             .map(format_latency)
             .unwrap_or_else(|| "-".to_string());
 
-        println!(
-            "  {:>6} {:>6} {:>10} {:>12} {:>10} {:>10} {:>10}",
-            r.connections, r.pipeline_depth, state_display, throughput, p50, p99, p999
-        );
+        if has_value_size {
+            let vsize = r
+                .value_size
+                .map(format_value_size)
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:>6} {:>6} {:>8} {:>10} {:>12} {:>10} {:>10} {:>10}",
+                r.connections, r.pipeline_depth, vsize, state_display, throughput, p50, p99, p999
+            );
+        } else {
+            println!(
+                "  {:>6} {:>6} {:>10} {:>12} {:>10} {:>10} {:>10}",
+                r.connections, r.pipeline_depth, state_display, throughput, p50, p99, p999
+            );
+        }
     }
     println!();
 }
@@ -439,6 +587,16 @@ fn format_latency(us: f64) -> String {
         format!("{:.2}ms", us / 1000.0)
     } else {
         format!("{:.0}us", us)
+    }
+}
+
+fn format_value_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{}MB", bytes / (1024 * 1024))
+    } else if bytes >= 1024 {
+        format!("{}KB", bytes / 1024)
+    } else {
+        format!("{}B", bytes)
     }
 }
 

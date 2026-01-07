@@ -9,6 +9,8 @@ pub enum Suite {
     Server,
     /// I/O engine comparison: uring vs mio vs tokio
     IoEngine,
+    /// Native I/O engine comparison: uring vs mio with value size sweep
+    IoNative,
 }
 
 impl Suite {
@@ -16,6 +18,7 @@ impl Suite {
         match self {
             Suite::Server => "contexts.json",
             Suite::IoEngine => "contexts-io.json",
+            Suite::IoNative => "contexts-native.json",
         }
     }
 }
@@ -251,6 +254,153 @@ impl SweepConfig {
                 .map(move |&pipeline_depth| SweepParams {
                     connections,
                     pipeline_depth,
+                })
+        })
+    }
+}
+
+// ============================================================================
+// Native I/O engine comparison suite (mio vs uring with value sizes)
+// ============================================================================
+
+/// Native engine experiment: mio and uring only (no tokio).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NativeExperiment {
+    pub server: NativeEngine,
+    pub client: NativeEngine,
+}
+
+/// Native I/O engine (mio or uring only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeEngine {
+    Uring,
+    Mio,
+}
+
+impl NativeEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NativeEngine::Uring => "uring",
+            NativeEngine::Mio => "mio",
+        }
+    }
+}
+
+impl NativeExperiment {
+    pub fn all() -> Vec<NativeExperiment> {
+        vec![
+            NativeExperiment {
+                server: NativeEngine::Uring,
+                client: NativeEngine::Uring,
+            },
+            NativeExperiment {
+                server: NativeEngine::Uring,
+                client: NativeEngine::Mio,
+            },
+            NativeExperiment {
+                server: NativeEngine::Mio,
+                client: NativeEngine::Uring,
+            },
+            NativeExperiment {
+                server: NativeEngine::Mio,
+                client: NativeEngine::Mio,
+            },
+        ]
+    }
+
+    pub fn name(&self) -> String {
+        format!("{}-{}", self.client.as_str(), self.server.as_str())
+    }
+
+    pub fn jsonnet_file(&self) -> &'static str {
+        "io-engine.jsonnet"
+    }
+
+    pub fn extra_args(&self) -> Vec<String> {
+        vec![
+            "-p".to_string(),
+            "server_runtime=native".to_string(),
+            "-p".to_string(),
+            format!("server_io_engine={}", self.server.as_str()),
+            "-p".to_string(),
+            format!("client_io_engine={}", self.client.as_str()),
+        ]
+    }
+}
+
+/// Parameters for a native sweep run (includes value_size).
+#[derive(Debug, Clone)]
+pub struct NativeSweepParams {
+    pub connections: usize,
+    pub pipeline_depth: usize,
+    pub value_size: usize,
+}
+
+impl NativeSweepParams {
+    /// Generate CLI parameters for systemslab submit.
+    pub fn to_args(&self) -> Vec<String> {
+        vec![
+            "-p".to_string(),
+            format!("connections={}", self.connections),
+            "-p".to_string(),
+            format!("pipeline_depth={}", self.pipeline_depth),
+            "-p".to_string(),
+            format!("value_length={}", self.value_size),
+        ]
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "c{}_p{}_v{}",
+            self.connections, self.pipeline_depth, self.value_size
+        )
+    }
+}
+
+/// Configuration for native parameter sweep (3D: connections x pipeline x value_size).
+pub struct NativeSweepConfig {
+    pub connections: Vec<usize>,
+    pub pipeline_depths: Vec<usize>,
+    pub value_sizes: Vec<usize>,
+}
+
+impl NativeSweepConfig {
+    /// Full sweep configuration for native io suite.
+    /// Focuses on comparing mio vs uring across different workload characteristics.
+    pub fn full() -> Self {
+        Self {
+            connections: vec![8, 64, 256, 1024],
+            pipeline_depths: vec![1, 8, 64],
+            value_sizes: vec![64, 1024, 16384],
+        }
+    }
+
+    /// Limited sweep for testing.
+    pub fn limited() -> Self {
+        Self {
+            connections: vec![64, 256],
+            pipeline_depths: vec![1, 8],
+            value_sizes: vec![64, 1024],
+        }
+    }
+
+    pub fn total_combinations(&self) -> usize {
+        self.connections.len() * self.pipeline_depths.len() * self.value_sizes.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = NativeSweepParams> + '_ {
+        self.connections.iter().flat_map(move |&connections| {
+            self.pipeline_depths
+                .iter()
+                .flat_map(move |&pipeline_depth| {
+                    self.value_sizes
+                        .iter()
+                        .map(move |&value_size| NativeSweepParams {
+                            connections,
+                            pipeline_depth,
+                            value_size,
+                        })
                 })
         })
     }

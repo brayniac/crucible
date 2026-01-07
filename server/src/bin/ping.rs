@@ -376,13 +376,13 @@ fn run_multi_threaded(
         let handle = std::thread::Builder::new()
             .name(format!("ping-worker-{}", worker_id))
             .spawn(move || {
-                if let Some(cpu) = cpu_id {
-                    if let Err(e) = set_cpu_affinity(cpu) {
-                        eprintln!(
-                            "Worker {} failed to set CPU affinity to {}: {}",
-                            worker_id, cpu, e
-                        );
-                    }
+                if let Some(cpu) = cpu_id
+                    && let Err(e) = set_cpu_affinity(cpu)
+                {
+                    eprintln!(
+                        "Worker {} failed to set CPU affinity to {}: {}",
+                        worker_id, cpu, e
+                    );
                 }
                 if let Err(e) = run_worker(engine, receiver, &uring) {
                     eprintln!("Worker {} error: {}", worker_id, e);

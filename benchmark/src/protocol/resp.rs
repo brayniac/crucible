@@ -25,8 +25,10 @@ impl RespCodec {
     /// Encodes a GET command.
     #[inline]
     pub fn encode_get(&self, buf: &mut Buffer, key: &[u8]) -> usize {
-        let spare = buf.spare_mut();
-        let len = Request::get(key).encode(spare);
+        let req = Request::get(key);
+        let needed = req.encoded_len();
+        Self::ensure_space(buf, needed);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         len
     }
@@ -34,8 +36,10 @@ impl RespCodec {
     /// Encodes a SET command.
     #[inline]
     pub fn encode_set(&self, buf: &mut Buffer, key: &[u8], value: &[u8]) -> usize {
-        let spare = buf.spare_mut();
-        let len = Request::set(key, value).encode(spare);
+        let req = Request::set(key, value);
+        let needed = req.encoded_len();
+        Self::ensure_space(buf, needed);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         len
     }
@@ -43,8 +47,10 @@ impl RespCodec {
     /// Encodes a SET command with expiration (EX seconds).
     #[inline]
     pub fn encode_set_ex(&self, buf: &mut Buffer, key: &[u8], value: &[u8], ex: u64) -> usize {
-        let spare = buf.spare_mut();
-        let len = Request::set(key, value).ex(ex).encode(spare);
+        let req = Request::set(key, value).ex(ex);
+        let needed = req.encoded_len();
+        Self::ensure_space(buf, needed);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         len
     }
@@ -52,10 +58,27 @@ impl RespCodec {
     /// Encodes a PING command.
     #[inline]
     pub fn encode_ping(&self, buf: &mut Buffer) -> usize {
-        let spare = buf.spare_mut();
-        let len = Request::ping().encode(spare);
+        let req = Request::ping();
+        let needed = req.encoded_len();
+        Self::ensure_space(buf, needed);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         len
+    }
+
+    /// Ensures the buffer has at least `needed` bytes of writable space.
+    /// Compacts the buffer if necessary.
+    #[inline]
+    fn ensure_space(buf: &mut Buffer, needed: usize) {
+        if buf.writable() < needed {
+            buf.compact();
+        }
+        assert!(
+            buf.writable() >= needed,
+            "buffer too small: need {} bytes but only {} available after compact",
+            needed,
+            buf.writable()
+        );
     }
 
     /// Attempts to decode a response from the buffer.

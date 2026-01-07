@@ -4,17 +4,26 @@
 //! Linux, macOS, and other Unix systems.
 
 use crate::driver::IoDriver;
-use crate::types::{Completion, CompletionKind, ConnId, ListenerId};
-use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
+use crate::types::{
+    Completion, CompletionKind, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId,
+};
+use crate::udp::{self, CMSG_BUFFER_SIZE};
+use mio::net::{
+    TcpListener as MioTcpListener, TcpStream as MioTcpStream, UdpSocket as MioUdpSocket,
+};
 use mio::{Events, Interest, Poll, Token};
 use slab::Slab;
 use std::io::{self, Read, Write};
+use std::mem;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::time::Duration;
 
 /// Token offset for listeners to avoid collision with connections.
 const LISTENER_TOKEN_OFFSET: usize = 1 << 30;
+
+/// Token offset for UDP sockets to avoid collision with connections and listeners.
+const UDP_TOKEN_OFFSET: usize = 1 << 29;
 
 /// Connection state for mio driver.
 struct MioConnection {
@@ -31,6 +40,15 @@ struct MioListener {
     raw_mode: bool,
 }
 
+/// UDP socket state for mio driver.
+struct MioUdpSocketState {
+    socket: MioUdpSocket,
+    /// Bound address (used to determine IPv4 vs IPv6).
+    bound_addr: SocketAddr,
+    readable: bool,
+    writable: bool,
+}
+
 /// Mio-based I/O driver.
 ///
 /// This driver uses mio (epoll on Linux, kqueue on macOS) for I/O multiplexing.
@@ -40,6 +58,7 @@ pub struct MioDriver {
     events: Events,
     connections: Slab<MioConnection>,
     listeners: Slab<MioListener>,
+    udp_sockets: Slab<MioUdpSocketState>,
     pending_completions: Vec<Completion>,
     #[allow(dead_code)]
     buffer_size: usize,
@@ -58,6 +77,7 @@ impl MioDriver {
             events: Events::with_capacity(1024),
             connections: Slab::with_capacity(max_connections.min(4096)),
             listeners: Slab::with_capacity(16),
+            udp_sockets: Slab::with_capacity(64),
             pending_completions: Vec::with_capacity(256),
             buffer_size,
         })
@@ -315,6 +335,37 @@ impl IoDriver for MioDriver {
                 continue;
             }
 
+            // Check if this is a UDP socket event
+            if token >= UDP_TOKEN_OFFSET {
+                let socket_id = token - UDP_TOKEN_OFFSET;
+                if let Some(sock) = self.udp_sockets.get_mut(socket_id) {
+                    if readable {
+                        sock.readable = true;
+                        self.pending_completions.push(Completion::new(
+                            CompletionKind::UdpReadable {
+                                socket_id: UdpSocketId::new(socket_id),
+                            },
+                        ));
+                    }
+                    if writable {
+                        sock.writable = true;
+                        self.pending_completions.push(Completion::new(
+                            CompletionKind::UdpWritable {
+                                socket_id: UdpSocketId::new(socket_id),
+                            },
+                        ));
+                    }
+                    if error {
+                        self.pending_completions
+                            .push(Completion::new(CompletionKind::UdpError {
+                                socket_id: UdpSocketId::new(socket_id),
+                                error: io::Error::other("UDP socket error"),
+                            }));
+                    }
+                }
+                continue;
+            }
+
             // Connection event
             if let Some(conn) = self.connections.get_mut(token) {
                 if readable {
@@ -366,6 +417,176 @@ impl IoDriver for MioDriver {
         self.connections
             .get(id.as_usize())
             .map(|c| c.stream.as_raw_fd())
+    }
+
+    // === UDP socket operations ===
+
+    fn bind_udp(&mut self, addr: SocketAddr) -> io::Result<UdpSocketId> {
+        // Create UDP socket
+        let socket = socket2::Socket::new(
+            match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            },
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+
+        let raw_fd = socket.into_raw_fd();
+
+        // Configure socket for ECN and pktinfo
+        udp::configure_socket(raw_fd, &addr)?;
+
+        // Convert to mio UdpSocket
+        let mut mio_socket = unsafe { MioUdpSocket::from_raw_fd(raw_fd) };
+
+        let entry = self.udp_sockets.vacant_entry();
+        let id = entry.key();
+
+        // Register with poll
+        self.poll.registry().register(
+            &mut mio_socket,
+            Token(id + UDP_TOKEN_OFFSET),
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
+
+        entry.insert(MioUdpSocketState {
+            socket: mio_socket,
+            bound_addr: addr,
+            readable: false,
+            writable: true,
+        });
+
+        Ok(UdpSocketId::new(id))
+    }
+
+    fn close_udp(&mut self, id: UdpSocketId) -> io::Result<()> {
+        if let Some(mut sock) = self.udp_sockets.try_remove(id.as_usize()) {
+            self.poll.registry().deregister(&mut sock.socket)?;
+        }
+        Ok(())
+    }
+
+    fn submit_recvmsg(&mut self, _id: UdpSocketId, _buf: &mut [u8]) -> io::Result<()> {
+        // mio doesn't support async recvmsg submission - use recvmsg() after UdpReadable
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "submit_recvmsg not supported on mio backend, use recvmsg() instead",
+        ))
+    }
+
+    fn submit_sendmsg(
+        &mut self,
+        _id: UdpSocketId,
+        _data: &[u8],
+        _meta: &SendMeta,
+    ) -> io::Result<()> {
+        // mio doesn't support async sendmsg submission - use sendmsg() after UdpWritable
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "submit_sendmsg not supported on mio backend, use sendmsg() instead",
+        ))
+    }
+
+    fn recvmsg(&mut self, id: UdpSocketId, buf: &mut [u8]) -> io::Result<RecvMeta> {
+        let sock = self
+            .udp_sockets
+            .get_mut(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP socket not found"))?;
+
+        let raw_fd = sock.socket.as_raw_fd();
+        let bound_addr = sock.bound_addr;
+
+        // Set up for recvmsg
+        let mut iovec = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+
+        let mut addr_storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
+
+        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+        msghdr.msg_name = &mut addr_storage as *mut _ as *mut libc::c_void;
+        msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msghdr.msg_iov = &mut iovec;
+        msghdr.msg_iovlen = 1;
+        msghdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msghdr.msg_controllen = cmsg_buf.len() as _;
+        msghdr.msg_flags = 0;
+
+        let result = unsafe { libc::recvmsg(raw_fd, &mut msghdr, 0) };
+
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                sock.readable = false;
+            }
+            return Err(err);
+        }
+
+        let len = result as usize;
+
+        // Parse source address
+        let source = udp::sockaddr_to_std(&addr_storage, msghdr.msg_namelen).unwrap_or(bound_addr);
+
+        // Parse control messages
+        Ok(udp::parse_control_messages(&msghdr, source, len))
+    }
+
+    fn sendmsg(&mut self, id: UdpSocketId, data: &[u8], meta: &SendMeta) -> io::Result<usize> {
+        let sock = self
+            .udp_sockets
+            .get_mut(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP socket not found"))?;
+
+        let raw_fd = sock.socket.as_raw_fd();
+
+        // Set ECN on the socket
+        udp::set_ecn(raw_fd, &meta.dest, meta.ecn)?;
+
+        // Convert destination address
+        let (dest_storage, dest_len) = udp::std_to_sockaddr(&meta.dest);
+
+        let mut iovec = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        };
+
+        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+        msghdr.msg_name = &dest_storage as *const _ as *mut libc::c_void;
+        msghdr.msg_namelen = dest_len;
+        msghdr.msg_iov = &mut iovec;
+        msghdr.msg_iovlen = 1;
+        msghdr.msg_control = std::ptr::null_mut();
+        msghdr.msg_controllen = 0;
+        msghdr.msg_flags = 0;
+
+        let result = unsafe { libc::sendmsg(raw_fd, &msghdr, 0) };
+
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                sock.writable = false;
+            }
+            return Err(err);
+        }
+
+        Ok(result as usize)
+    }
+
+    fn udp_socket_count(&self) -> usize {
+        self.udp_sockets.len()
+    }
+
+    fn udp_raw_fd(&self, id: UdpSocketId) -> Option<RawFd> {
+        self.udp_sockets
+            .get(id.as_usize())
+            .map(|s| s.socket.as_raw_fd())
     }
 }
 
