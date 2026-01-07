@@ -388,20 +388,15 @@ impl Session {
         self.buffers.recv.extend_from_slice(data);
     }
 
-    /// Minimum recv buffer space to ensure for each recv operation.
-    /// With deep pipelines and large objects, we need reasonable space.
-    const MIN_RECV_SPACE: usize = 16 * 1024; // 16KB
-
     /// Get spare capacity in the recv buffer for direct recv.
     ///
     /// Returns a mutable slice that can be passed directly to recv()
     /// to avoid an intermediate copy. After receiving, call `recv_commit(n)`.
     #[inline]
     pub fn recv_spare(&mut self) -> &mut [u8] {
-        // Ensure we have at least MIN_RECV_SPACE available
-        // This will compact first, then grow if needed
-        if self.buffers.recv.writable() < Self::MIN_RECV_SPACE {
-            self.buffers.recv.reserve(Self::MIN_RECV_SPACE);
+        // Compact if running low on writable space
+        if self.buffers.recv.writable() < self.buffers.recv.capacity() / 4 {
+            self.buffers.recv.compact();
         }
         self.buffers.recv.spare_mut()
     }

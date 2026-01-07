@@ -72,8 +72,6 @@ pub enum DisconnectReason {
     ErrorEvent,
     /// Failed to establish connection
     ConnectFailed,
-    /// Protocol parsing error (corrupted data stream)
-    ProtocolError,
 }
 
 /// Per-worker statistics for diagnostics.
@@ -122,7 +120,6 @@ pub struct SharedState {
     pub disconnects_closed_event: AtomicU64,
     pub disconnects_error_event: AtomicU64,
     pub disconnects_connect_failed: AtomicU64,
-    pub disconnects_protocol_error: AtomicU64,
     /// Per-worker statistics (for diagnosing imbalance)
     pub worker_stats: Vec<WorkerStats>,
 }
@@ -144,7 +141,6 @@ impl SharedState {
             disconnects_closed_event: AtomicU64::new(0),
             disconnects_error_event: AtomicU64::new(0),
             disconnects_connect_failed: AtomicU64::new(0),
-            disconnects_protocol_error: AtomicU64::new(0),
             worker_stats: (0..num_workers).map(|_| WorkerStats::new()).collect(),
         }
     }
@@ -380,9 +376,6 @@ impl IoWorker {
 
         let mut session = Session::from_config(addr, &self.config);
         session.set_conn_id(conn_id);
-
-        // Try to start zero-copy recv (io_uring path)
-        let _ = self.driver.submit_recv(conn_id, session.recv_spare());
 
         let idx = self.sessions.len();
         self.sessions.push(session);
@@ -719,29 +712,16 @@ impl IoWorker {
                         to_close.push((idx, DisconnectReason::ErrorEvent));
                     }
                 }
-                // RecvComplete is for io_uring zero-copy recv mode
-                // Data is already in the session's buffer - just commit
-                CompletionKind::RecvComplete { conn_id, bytes } => {
-                    let id = conn_id.as_usize();
-                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        if bytes == 0 {
-                            // EOF - server closed connection
-                            to_close.push((idx, DisconnectReason::Eof));
-                        } else {
-                            let session = &mut self.sessions[idx];
-                            session.recv_commit(bytes);
-
-                            // Re-submit recv for next data
-                            let _ = self.driver.submit_recv(conn_id, session.recv_spare());
-                        }
-                    }
-                }
-
-                // Accept, AcceptRaw, ListenerError, and UDP variants are not used in this TCP benchmark
+                // Accept, AcceptRaw, and ListenerError are for server-side, not used here
                 CompletionKind::Accept { .. }
                 | CompletionKind::AcceptRaw { .. }
-                | CompletionKind::ListenerError { .. }
-                | CompletionKind::UdpReadable { .. }
+                | CompletionKind::ListenerError { .. } => {}
+
+                // RecvComplete is for single-shot recv mode, not used with multishot
+                CompletionKind::RecvComplete { .. } => {}
+
+                // UDP events not used in TCP client
+                CompletionKind::UdpReadable { .. }
                 | CompletionKind::RecvMsgComplete { .. }
                 | CompletionKind::UdpWritable { .. }
                 | CompletionKind::SendMsgComplete { .. }
@@ -765,68 +745,49 @@ impl IoWorker {
 
     #[inline]
     fn poll_responses(&mut self, now: std::time::Instant) {
-        // Track sessions with protocol errors to close after iteration
-        let mut protocol_errors: Vec<usize> = Vec::new();
-
         if self.warmup {
             // Still need to parse responses but don't record metrics
-            for idx in 0..self.sessions.len() {
+            for session in &mut self.sessions {
                 self.results.clear();
-                if self.sessions[idx]
-                    .poll_responses(&mut self.results, now)
-                    .is_err()
-                {
-                    protocol_errors.push(idx);
-                }
+                let _ = session.poll_responses(&mut self.results, now);
             }
-        } else {
-            for idx in 0..self.sessions.len() {
-                self.results.clear();
-                if let Err(e) = self.sessions[idx].poll_responses(&mut self.results, now) {
-                    tracing::debug!("protocol error: {}", e);
-                    protocol_errors.push(idx);
-                }
-
-                for result in &self.results {
-                    self.shared
-                        .responses_received
-                        .fetch_add(1, Ordering::Relaxed);
-                    if result.is_error_response {
-                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    if let Some(hit) = result.hit {
-                        if hit {
-                            self.shared.hits.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            self.shared.misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-
-                    let _ = self.response_latency.increment(result.latency_ns);
-
-                    match result.request_type {
-                        RequestType::Get => {
-                            let _ = self.get_latency.increment(result.latency_ns);
-                        }
-                        RequestType::Set => {
-                            let _ = self.set_latency.increment(result.latency_ns);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            return;
         }
 
-        // Close sessions with protocol errors (data stream corrupted, must reconnect)
-        for idx in protocol_errors {
-            self.close_session(idx, DisconnectReason::ProtocolError);
-            self.shared
-                .connections_active
-                .fetch_sub(1, Ordering::Relaxed);
-            self.shared
-                .connections_failed
-                .fetch_add(1, Ordering::Relaxed);
+        for session in &mut self.sessions {
+            self.results.clear();
+            if let Err(e) = session.poll_responses(&mut self.results, now) {
+                tracing::debug!("protocol error: {}", e);
+            }
+
+            for result in &self.results {
+                self.shared
+                    .responses_received
+                    .fetch_add(1, Ordering::Relaxed);
+                if result.is_error_response {
+                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if let Some(hit) = result.hit {
+                    if hit {
+                        self.shared.hits.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.shared.misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                let _ = self.response_latency.increment(result.latency_ns);
+
+                match result.request_type {
+                    RequestType::Get => {
+                        let _ = self.get_latency.increment(result.latency_ns);
+                    }
+                    RequestType::Set => {
+                        let _ = self.set_latency.increment(result.latency_ns);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -881,9 +842,6 @@ impl IoWorker {
                             session.set_conn_id(conn_id);
                             session.reconnect_attempted(true);
                             session.reset(); // Clear buffers and in-flight state
-
-                            // Try to start zero-copy recv (io_uring path)
-                            let _ = self.driver.submit_recv(conn_id, session.recv_spare());
 
                             self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
 
@@ -941,11 +899,6 @@ impl IoWorker {
             DisconnectReason::ConnectFailed => {
                 self.shared
                     .disconnects_connect_failed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            DisconnectReason::ProtocolError => {
-                self.shared
-                    .disconnects_protocol_error
                     .fetch_add(1, Ordering::Relaxed);
             }
         }

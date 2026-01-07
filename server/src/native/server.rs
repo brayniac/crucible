@@ -7,7 +7,7 @@ use crate::metrics::{
     CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats, WorkerStatsSnapshot,
 };
 use cache_core::Cache;
-use io_driver::{BufferPool, CompletionKind, ConnId, Driver, IoDriver, IoEngine};
+use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -36,12 +36,7 @@ fn set_thread_name(_name: &str) {
 #[derive(Clone)]
 struct WorkerConfig {
     io_engine: IoEngine,
-    /// Size of each buffer chunk in the pool
-    pool_chunk_size: usize,
-    /// Total pool size in bytes
-    pool_total_size: usize,
-    /// Assembly buffer size for fragmented messages
-    assembly_size: usize,
+    read_buffer_size: usize,
     buffer_size: usize,
     buffer_count: u16,
     sq_depth: u32,
@@ -75,9 +70,7 @@ pub fn run<C: Cache + 'static>(
 
     let worker_config = WorkerConfig {
         io_engine: config.io_engine,
-        pool_chunk_size: 32 * 1024,         // 32KB chunks
-        pool_total_size: 128 * 1024 * 1024, // 128MB pool per worker
-        assembly_size: 4 * 1024 * 1024,     // 4MB assembly buffer
+        read_buffer_size: 64 * 1024,
         buffer_size: config.uring.buffer_size,
         buffer_count: config.uring.buffer_count,
         sq_depth: config.uring.sq_depth,
@@ -336,13 +329,6 @@ fn run_acceptor(
     Ok(())
 }
 
-/// Tracks pending recv buffer for io_uring submit_recv.
-/// When we submit a recv, we "loan" a buffer to the kernel.
-/// On RecvComplete, we get it back.
-struct PendingRecv {
-    buf_id: u16,
-}
-
 fn run_worker<C: Cache>(
     _worker_id: usize,
     config: WorkerConfig,
@@ -358,18 +344,13 @@ fn run_worker<C: Cache>(
         .sqpoll(config.sqpoll)
         .build()?;
 
-    // Create buffer pool for this worker
-    let chunk_count = config.pool_total_size / config.pool_chunk_size;
-    let mut pool = BufferPool::new(config.pool_chunk_size, chunk_count);
+    // No listeners - connections come from the acceptor via channel
 
-    // Assembly buffer for fragmented messages
-    let mut assembly = vec![0u8; config.assembly_size];
-
-    // Connections indexed by ConnId
+    // Use Vec<Option<Connection>> indexed by ConnId for O(1) access.
+    // The io-driver's ConnId is its internal Slab index, so indices are reused
+    // when connections close. Using Vec with Option allows direct indexing while
+    // handling sparse allocation efficiently.
     let mut connections: Vec<Option<Connection>> = Vec::with_capacity(4096);
-
-    // Track pending recv buffers for io_uring (buffer loaned to kernel)
-    let mut pending_recvs: Vec<Option<PendingRecv>> = Vec::with_capacity(4096);
 
     loop {
         // Check for new connections from the acceptor (non-blocking)
@@ -383,19 +364,8 @@ fn run_worker<C: Cache>(
                     let idx = conn_id.as_usize();
                     if idx >= connections.len() {
                         connections.resize_with(idx + 1, || None);
-                        pending_recvs.resize_with(idx + 1, || None);
                     }
-                    connections[idx] = Some(Connection::new());
-
-                    // Try to start recv with a pooled buffer
-                    if let Some(buf_id) = pool.checkout() {
-                        let buf = pool.get_mut(buf_id);
-                        if driver.submit_recv(conn_id, buf).is_ok() {
-                            pending_recvs[idx] = Some(PendingRecv { buf_id });
-                        } else {
-                            pool.checkin(buf_id);
-                        }
-                    }
+                    connections[idx] = Some(Connection::new(config.read_buffer_size));
                 }
                 Err(_) => {
                     // Failed to register, fd is already closed by driver
@@ -419,24 +389,13 @@ fn run_worker<C: Cache>(
                     stats.inc_accepts();
 
                     let idx = conn_id.as_usize();
+                    // Grow the vec if needed
                     if idx >= connections.len() {
                         connections.resize_with(idx + 1, || None);
-                        pending_recvs.resize_with(idx + 1, || None);
                     }
-                    connections[idx] = Some(Connection::new());
-
-                    // Try to start recv with a pooled buffer
-                    if let Some(buf_id) = pool.checkout() {
-                        let buf = pool.get_mut(buf_id);
-                        if driver.submit_recv(conn_id, buf).is_ok() {
-                            pending_recvs[idx] = Some(PendingRecv { buf_id });
-                        } else {
-                            pool.checkin(buf_id);
-                        }
-                    }
+                    connections[idx] = Some(Connection::new(config.read_buffer_size));
                 }
 
-                // Mio path: socket is readable, recv into pooled buffer
                 CompletionKind::Recv { conn_id } => {
                     stats.inc_recv();
                     let idx = conn_id.as_usize();
@@ -456,37 +415,22 @@ fn run_worker<C: Cache>(
                     let mut close_reason: Option<CloseReason> = None;
 
                     'recv_loop: loop {
-                        // Checkout a buffer from pool
-                        let Some(buf_id) = pool.checkout() else {
-                            // Pool exhausted, stop reading
+                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
                             break;
                         };
 
-                        let buf = pool.get_mut(buf_id);
+                        // Get spare capacity from connection's buffer for zero-copy recv
+                        let recv_buf = conn.recv_spare();
 
-                        match driver.recv(conn_id, buf) {
+                        match driver.recv(conn_id, recv_buf) {
                             Ok(0) => {
-                                pool.checkin(buf_id);
                                 close_reason = Some(CloseReason::ClientEof);
                                 break;
                             }
                             Ok(n) => {
                                 stats.add_bytes_received(n as u64);
-
-                                // Push buffer to connection's chain
-                                let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
-                                else {
-                                    pool.checkin(buf_id);
-                                    break;
-                                };
-
-                                conn.push_recv_buffer(buf_id, n);
-                                conn.process(&*cache, &pool, &mut assembly);
-
-                                // Return consumed buffers to pool
-                                for id in conn.drain_consumed_buffers() {
-                                    pool.checkin(id);
-                                }
+                                conn.recv_commit(n);
+                                conn.process(&*cache);
 
                                 if conn.should_close() {
                                     close_reason = Some(CloseReason::ProtocolClose);
@@ -509,18 +453,15 @@ fn run_worker<C: Cache>(
                                     }
                                 }
 
-                                // Check backpressure after sending
+                                // Check backpressure after sending - if we can't keep up,
+                                // stop reading and wait for SendReady to drain the buffer
                                 if !conn.should_read() {
                                     stats.inc_backpressure();
                                     break;
                                 }
                             }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                pool.checkin(buf_id);
-                                break;
-                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => {
-                                pool.checkin(buf_id);
                                 close_reason = Some(CloseReason::RecvError);
                                 break;
                             }
@@ -528,15 +469,7 @@ fn run_worker<C: Cache>(
                     }
 
                     if let Some(reason) = close_reason {
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            &mut pending_recvs,
-                            &mut pool,
-                            conn_id,
-                            stats,
-                            reason,
-                        );
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                     }
                 }
 
@@ -545,7 +478,7 @@ fn run_worker<C: Cache>(
                     let idx = conn_id.as_usize();
                     let mut close_reason: Option<CloseReason> = None;
 
-                    // Drain pending write data
+                    // Loop to drain as much pending write data as possible
                     loop {
                         let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
                             break;
@@ -570,34 +503,28 @@ fn run_worker<C: Cache>(
                     }
 
                     if let Some(reason) = close_reason {
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            &mut pending_recvs,
-                            &mut pool,
-                            conn_id,
-                            stats,
-                            reason,
-                        );
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
+                        continue;
+                    }
+
+                    // After draining, check if we can now read and process pending data
+                    let should_process = connections
+                        .get(idx)
+                        .and_then(|c| c.as_ref())
+                        .map(|c| c.should_read())
+                        .unwrap_or(false);
+
+                    if !should_process {
                         continue;
                     }
 
                     // Process any pending read data now that we have room
-                    let should_process = connections
-                        .get(idx)
-                        .and_then(|c| c.as_ref())
-                        .map(|c| c.should_read() && !c.recv_is_empty())
-                        .unwrap_or(false);
-
-                    if should_process
-                        && let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
                     {
-                        conn.process(&*cache, &pool, &mut assembly);
+                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
+                            continue;
+                        };
 
-                        // Return consumed buffers
-                        for id in conn.drain_consumed_buffers() {
-                            pool.checkin(id);
-                        }
+                        conn.process(&*cache);
 
                         if conn.should_close() {
                             close_reason = Some(CloseReason::ProtocolClose);
@@ -605,19 +532,11 @@ fn run_worker<C: Cache>(
                     }
 
                     if let Some(reason) = close_reason {
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            &mut pending_recvs,
-                            &mut pool,
-                            conn_id,
-                            stats,
-                            reason,
-                        );
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                         continue;
                     }
 
-                    // Send any newly generated responses
+                    // Try to send any newly generated responses
                     loop {
                         let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
                             break;
@@ -642,15 +561,7 @@ fn run_worker<C: Cache>(
                     }
 
                     if let Some(reason) = close_reason {
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            &mut pending_recvs,
-                            &mut pool,
-                            conn_id,
-                            stats,
-                            reason,
-                        );
+                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                     }
                 }
 
@@ -658,8 +569,6 @@ fn run_worker<C: Cache>(
                     close_connection(
                         &mut driver,
                         &mut connections,
-                        &mut pending_recvs,
-                        &mut pool,
                         conn_id,
                         stats,
                         CloseReason::ClosedEvent,
@@ -670,8 +579,6 @@ fn run_worker<C: Cache>(
                     close_connection(
                         &mut driver,
                         &mut connections,
-                        &mut pending_recvs,
-                        &mut pool,
                         conn_id,
                         stats,
                         CloseReason::ErrorEvent,
@@ -688,102 +595,10 @@ fn run_worker<C: Cache>(
                     unsafe { libc::close(raw_fd) };
                 }
 
-                // io_uring zero-copy recv completion
-                // The buffer we submitted is now filled with data
-                CompletionKind::RecvComplete { conn_id, bytes } => {
-                    stats.inc_recv();
-                    let idx = conn_id.as_usize();
+                // RecvComplete is for single-shot recv mode, not used with multishot
+                CompletionKind::RecvComplete { .. } => {}
 
-                    // Get the pending recv buffer
-                    let pending = pending_recvs.get_mut(idx).and_then(|p| p.take());
-
-                    if bytes == 0 {
-                        // EOF - return buffer to pool and close
-                        if let Some(p) = pending {
-                            pool.checkin(p.buf_id);
-                        }
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            &mut pending_recvs,
-                            &mut pool,
-                            conn_id,
-                            stats,
-                            CloseReason::ClientEof,
-                        );
-                        continue;
-                    }
-
-                    let Some(p) = pending else {
-                        // No pending buffer - shouldn't happen
-                        continue;
-                    };
-
-                    let mut close_reason: Option<CloseReason> = None;
-
-                    // Push the received buffer to connection's chain
-                    if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                        stats.add_bytes_received(bytes as u64);
-                        conn.push_recv_buffer(p.buf_id, bytes);
-                        conn.process(&*cache, &pool, &mut assembly);
-
-                        // Return consumed buffers to pool
-                        for id in conn.drain_consumed_buffers() {
-                            pool.checkin(id);
-                        }
-
-                        if conn.should_close() {
-                            close_reason = Some(CloseReason::ProtocolClose);
-                        } else {
-                            // Drain write buffer
-                            while conn.has_pending_write() {
-                                let data = conn.pending_write_data();
-                                match driver.send(conn_id, data) {
-                                    Ok(n) => {
-                                        stats.add_bytes_sent(n as u64);
-                                        conn.advance_write(n);
-                                    }
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => {
-                                        close_reason = Some(CloseReason::SendError);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        // Connection gone, return buffer
-                        pool.checkin(p.buf_id);
-                    }
-
-                    if let Some(reason) = close_reason {
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            &mut pending_recvs,
-                            &mut pool,
-                            conn_id,
-                            stats,
-                            reason,
-                        );
-                        continue;
-                    }
-
-                    // Re-submit recv for next data
-                    if let Some(conn) = connections.get(idx).and_then(|c| c.as_ref())
-                        && conn.should_read()
-                        && let Some(buf_id) = pool.checkout()
-                    {
-                        let buf = pool.get_mut(buf_id);
-                        if driver.submit_recv(conn_id, buf).is_ok() {
-                            pending_recvs[idx] = Some(PendingRecv { buf_id });
-                        } else {
-                            pool.checkin(buf_id);
-                        }
-                    }
-                }
-
-                // UDP events - not used by this TCP server
+                // UDP events not used in TCP server
                 CompletionKind::UdpReadable { .. }
                 | CompletionKind::RecvMsgComplete { .. }
                 | CompletionKind::UdpWritable { .. }
@@ -798,26 +613,11 @@ fn run_worker<C: Cache>(
 fn close_connection(
     driver: &mut Box<dyn IoDriver>,
     connections: &mut [Option<Connection>],
-    pending_recvs: &mut [Option<PendingRecv>],
-    pool: &mut BufferPool,
     conn_id: ConnId,
     stats: &WorkerStats,
     reason: CloseReason,
 ) {
     let idx = conn_id.as_usize();
-
-    // Return pending recv buffer if any
-    if let Some(pending) = pending_recvs.get_mut(idx).and_then(|p| p.take()) {
-        pool.checkin(pending.buf_id);
-    }
-
-    // Return connection's buffers to pool
-    if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-        for id in conn.clear_recv_buffers() {
-            pool.checkin(id);
-        }
-    }
-
     if let Some(slot) = connections.get_mut(idx)
         && slot.take().is_some()
     {
