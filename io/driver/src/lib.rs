@@ -72,6 +72,7 @@ mod buffer_pool;
 mod builder;
 mod driver;
 mod io_buffer;
+mod recv_state;
 mod types;
 mod udp;
 
@@ -85,8 +86,9 @@ pub mod uring;
 pub use buffer::RecvBuffer;
 pub use buffer_pool::{BufferChain, BufferPool, DEFAULT_CHUNK_SIZE, DEFAULT_POOL_SIZE};
 pub use builder::DriverBuilder;
-pub use driver::IoDriver;
+pub use driver::{IoDriver, RecvBuf};
 pub use io_buffer::IoBuffer;
+pub use recv_state::{BufferSlice, BufferSource, ConnectionRecvState, PendingReturn, ReadGuard};
 pub use types::{
     Completion, CompletionKind, ConnId, Ecn, IoEngine, ListenerId, RecvMeta, RecvMode, SendMeta,
     UdpSocketId,

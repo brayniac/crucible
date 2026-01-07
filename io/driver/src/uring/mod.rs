@@ -12,9 +12,10 @@
 
 mod buf_ring;
 mod connection;
+mod recv_pool;
 mod registered_files;
 
-use crate::driver::IoDriver;
+use crate::driver::{IoDriver, RecvBuf};
 use crate::types::{
     Completion, CompletionKind, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId,
 };
@@ -26,6 +27,7 @@ use io_uring::opcode::{self, AcceptMulti, RecvMulti, SendZc};
 use io_uring::squeue;
 use io_uring::types::Fixed;
 use io_uring::{IoUring, Probe};
+use recv_pool::RecvBufferPool;
 use registered_files::RegisteredFiles;
 use slab::Slab;
 use std::io;
@@ -74,13 +76,36 @@ fn decode_user_data(user_data: u64) -> (usize, u8, u64) {
     )
 }
 
-/// Decode user_data including generation (for single-shot recv).
+/// Decode user_data including generation (for single-shot recv - legacy).
 #[inline]
 fn decode_user_data_with_gen(user_data: u64) -> (usize, u32, u64) {
     (
         ((user_data >> 8) & 0xFFFF_FFFF) as usize,
         (user_data >> 40) as u32,
         user_data & 0xF,
+    )
+}
+
+/// Encode user_data for pooled single-shot recv.
+///
+/// Layout (64 bits):
+/// - bits 0-3: op (4 bits)
+/// - bits 4-19: buffer_id (16 bits) - pool buffer slot
+/// - bits 20-39: conn_id (20 bits) - up to ~1M connections
+/// - bits 40-63: generation (24 bits)
+#[inline]
+fn encode_pooled_recv(conn_id: usize, generation: u32, buf_id: u16, op: u64) -> u64 {
+    ((generation as u64) << 40) | ((conn_id as u64 & 0xFFFFF) << 20) | ((buf_id as u64) << 4) | op
+}
+
+/// Decode user_data for pooled single-shot recv.
+#[inline]
+fn decode_pooled_recv(user_data: u64) -> (usize, u32, u16, u64) {
+    (
+        ((user_data >> 20) & 0xFFFFF) as usize, // conn_id (20 bits)
+        (user_data >> 40) as u32,               // generation (24 bits)
+        ((user_data >> 4) & 0xFFFF) as u16,     // buf_id (16 bits)
+        user_data & 0xF,                        // op (4 bits)
     )
 }
 
@@ -141,6 +166,11 @@ pub struct UringDriver {
     udp_sockets: Slab<UringUdpSocket>,
     registered_files: RegisteredFiles,
     buf_ring: BufRing,
+    /// Buffer pool for single-shot recv operations.
+    ///
+    /// Buffers in this pool outlive individual connections, preventing
+    /// use-after-free when a connection closes with a pending recv.
+    recv_pool: RecvBufferPool,
     pending_completions: Vec<Completion>,
     buffer_size: usize,
     recv_mode: crate::types::RecvMode,
@@ -216,6 +246,10 @@ impl UringDriver {
             )?;
         }
 
+        // Create recv buffer pool for single-shot mode.
+        // Pool buffers outlive connections to prevent use-after-free.
+        let recv_pool = RecvBufferPool::new(ring_entries, buffer_size);
+
         Ok(Self {
             ring,
             connections: Slab::with_capacity(max_connections as usize),
@@ -223,6 +257,7 @@ impl UringDriver {
             udp_sockets: Slab::with_capacity(64),
             registered_files,
             buf_ring,
+            recv_pool,
             pending_completions: Vec::with_capacity(256),
             buffer_size,
             recv_mode,
@@ -304,14 +339,9 @@ impl UringDriver {
                 self.handle_accept(id, result, flags);
             }
             OP_SINGLE_RECV => {
-                // Single-shot recv encodes generation to detect stale completions
-                let (id, generation, decoded_op) = decode_user_data_with_gen(user_data);
-                // Debug: log ALL recv completions
-                eprintln!(
-                    "[uring] RECV CQE: user_data={:#x} -> id={}, gen={}, op={}, result={}",
-                    user_data, id, generation, decoded_op, result
-                );
-                self.handle_single_recv(id, generation, result);
+                // Single-shot recv uses pooled buffers - decode all fields
+                let (conn_id, generation, buf_id, _) = decode_pooled_recv(user_data);
+                self.handle_single_recv(conn_id, generation, buf_id, result);
             }
             OP_UDP_RECVMSG => {
                 let (id, _, _) = decode_user_data(user_data);
@@ -370,7 +400,9 @@ impl UringDriver {
         // Copy data from provided buffer to connection buffer
         let buf_data = &self.buf_ring.get(buf_id)[..n];
         if let Some(conn) = self.connections.get_mut(conn_id) {
+            // Append to both legacy recv_data and new recv_state for API compatibility
             conn.append_recv_data(buf_data);
+            conn.recv_state.append_owned(buf_data);
         }
 
         // Return buffer to ring
@@ -405,39 +437,37 @@ impl UringDriver {
         }
     }
 
-    fn handle_single_recv(&mut self, conn_id: usize, generation: u32, result: i32) {
+    fn handle_single_recv(&mut self, conn_id: usize, generation: u32, buf_id: u16, result: i32) {
+        // IMPORTANT: Always free the pool buffer, even for stale/error completions.
+        // The pool buffer is safe to access because it outlives connections.
+        // This is the key safety property that prevents use-after-free.
+
         // Check if this is a stale completion from a closed connection.
-        // When a connection closes while a recv is pending:
-        // 1. The connection is removed from the slab
-        // 2. The slab slot may be reused for a new connection with a new generation
-        // 3. The old recv completes with data written to a freed/reused buffer
-        //
-        // By checking generation, we detect this race and discard stale completions.
+        // With pooled buffers, stale completions are safe - the data was written
+        // to a pool buffer (still valid), not a freed connection buffer.
         let conn = match self.connections.get_mut(conn_id) {
             Some(c) if c.generation == generation => c,
             Some(c) => {
-                // Generation mismatch - stale completion from old connection
-                eprintln!(
-                    "[uring] STALE recv completion: conn_id={}, expected_gen={}, got_gen={}",
-                    conn_id, c.generation, generation
-                );
+                // Generation mismatch - stale completion from old connection.
+                // Data was safely written to pool buffer, just discard it.
+                self.recv_pool.free(buf_id);
                 return;
             }
             None => {
-                // Connection doesn't exist
-                eprintln!(
-                    "[uring] recv completion for non-existent conn_id={}, gen={}",
-                    conn_id, generation
-                );
+                // Connection doesn't exist - stale completion.
+                // Data was safely written to pool buffer, just discard it.
+                self.recv_pool.free(buf_id);
                 return;
             }
         };
 
-        // Clear pending flag
+        // Clear pending flag and get user buffer info
         conn.single_recv_pending = false;
+        let user_buf = conn.user_recv_buf.take();
 
         if result == 0 {
             // EOF - peer closed connection
+            self.recv_pool.free(buf_id);
             self.pending_completions
                 .push(Completion::new(CompletionKind::RecvComplete {
                     conn_id: ConnId::new(conn_id),
@@ -448,6 +478,7 @@ impl UringDriver {
 
         if result < 0 {
             // Recv error
+            self.recv_pool.free(buf_id);
             self.pending_completions
                 .push(Completion::new(CompletionKind::Error {
                     conn_id: ConnId::new(conn_id),
@@ -456,11 +487,36 @@ impl UringDriver {
             return;
         }
 
-        // Success - data is already in the user's buffer
+        // Success - copy data from pool buffer to user's buffer and recv_state
+        let bytes = result as usize;
+
+        // Get data from pool buffer (validated by conn_id/generation)
+        if let Some(pool_data) = self.recv_pool.get(buf_id, conn_id, generation) {
+            let data = &pool_data[..bytes];
+
+            // Copy to user's buffer if provided (legacy API)
+            if let Some((user_ptr, user_len)) = user_buf {
+                let copy_len = std::cmp::min(bytes, user_len);
+                // Safety: user_ptr is valid because connection still exists,
+                // and the IoBuffer it points to cannot reallocate while loaned.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), user_ptr, copy_len);
+                }
+            }
+
+            // Also append to recv_state for the new with_recv_buf API
+            if let Some(conn) = self.connections.get_mut(conn_id) {
+                conn.recv_state.append_owned(data);
+            }
+        }
+
+        // Return pool buffer for reuse
+        self.recv_pool.free(buf_id);
+
         self.pending_completions
             .push(Completion::new(CompletionKind::RecvComplete {
                 conn_id: ConnId::new(conn_id),
-                bytes: result as usize,
+                bytes,
             }));
     }
 
@@ -920,10 +976,6 @@ impl IoDriver for UringDriver {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
-        eprintln!(
-            "[uring] register: conn_id={}, generation={}",
-            conn_id, generation
-        );
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
         entry.insert(conn);
 
@@ -977,10 +1029,6 @@ impl IoDriver for UringDriver {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
-        eprintln!(
-            "[uring] register_fd: conn_id={}, generation={}",
-            conn_id, generation
-        );
         let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
         entry.insert(conn);
 
@@ -1100,34 +1148,82 @@ impl IoDriver for UringDriver {
         let fixed_slot = conn.fixed_slot;
         let generation = conn.generation;
 
-        // Debug: verify encoding/decoding round-trips correctly
-        let encoded = encode_user_data_with_gen(conn_id, generation, OP_SINGLE_RECV);
-        let (decoded_id, decoded_gen, decoded_op) = decode_user_data_with_gen(encoded);
-        if decoded_id != conn_id || decoded_gen != generation || decoded_op != OP_SINGLE_RECV {
-            eprintln!(
-                "[uring] ENCODE BUG: conn_id={} gen={} -> encoded={:#x} -> decoded=({}, {}, {})",
-                conn_id, generation, encoded, decoded_id, decoded_gen, decoded_op
-            );
-        }
+        // Store user's buffer pointer for copying data on completion.
+        // Safety: The pointer remains valid as long as the connection exists
+        // because it points into the connection's IoBuffer which cannot
+        // reallocate while loaned to the kernel.
+        conn.user_recv_buf = Some((buf.as_mut_ptr(), buf.len()));
 
-        // Submit single-shot recv with user's buffer.
-        // Encode generation in user_data to detect stale completions if the
-        // connection is closed and the ID is reused before the recv completes.
-        let recv_op = opcode::Recv::new(Fixed(fixed_slot), buf.as_mut_ptr(), buf.len() as u32)
+        // Allocate a buffer from the pool instead of using the user's buffer.
+        // Pool buffers outlive connections, preventing use-after-free if the
+        // connection closes while recv is pending.
+        let (buf_id, pool_ptr, pool_len) = self
+            .recv_pool
+            .alloc(conn_id, generation)
+            .ok_or_else(|| io::Error::other("recv buffer pool exhausted"))?;
+
+        // Use the smaller of pool buffer size and user buffer size
+        let recv_len = std::cmp::min(pool_len, buf.len()) as u32;
+
+        // Submit single-shot recv with pool buffer.
+        // Encode pool buffer ID in user_data for completion handling.
+        let recv_op = opcode::Recv::new(Fixed(fixed_slot), pool_ptr, recv_len)
             .build()
-            .user_data(encoded);
+            .user_data(encode_pooled_recv(
+                conn_id,
+                generation,
+                buf_id,
+                OP_SINGLE_RECV,
+            ));
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&recv_op)
-                .map_err(|_| io::Error::other("SQ full"))?;
+            if let Err(e) = self.ring.submission().push(&recv_op) {
+                // Failed to submit - free the pool buffer
+                self.recv_pool.free(buf_id);
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.user_recv_buf = None;
+                }
+                return Err(io::Error::other("SQ full"));
+            }
         }
 
         // Mark recv as pending
         if let Some(conn) = self.connections.get_mut(conn_id) {
             conn.single_recv_pending = true;
         }
+
+        Ok(())
+    }
+
+    fn with_recv_buf(&mut self, id: ConnId, f: &mut dyn FnMut(&mut dyn RecvBuf)) -> io::Result<()> {
+        let conn = self
+            .connections
+            .get_mut(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Create a wrapper that implements RecvBuf using the connection's recv_state
+        struct UringRecvBuf<'a> {
+            state: &'a mut crate::recv_state::ConnectionRecvState,
+        }
+
+        impl RecvBuf for UringRecvBuf<'_> {
+            fn as_slice(&self) -> &[u8] {
+                self.state.as_slice()
+            }
+
+            fn len(&self) -> usize {
+                self.state.available()
+            }
+
+            fn consume(&mut self, n: usize) {
+                self.state.consume(n);
+            }
+        }
+
+        let mut buf = UringRecvBuf {
+            state: &mut conn.recv_state,
+        };
+        f(&mut buf);
 
         Ok(())
     }

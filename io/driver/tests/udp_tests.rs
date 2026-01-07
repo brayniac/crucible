@@ -1,8 +1,17 @@
 //! UDP socket tests for io-driver.
+//!
+//! These tests use the mio backend explicitly because they rely on
+//! `UdpReadable` events which the uring backend doesn't emit (it uses
+//! async `submit_recvmsg()` / `RecvMsgComplete` instead).
 
-use io_driver::{CompletionKind, Driver, Ecn, SendMeta, UdpSocketId};
+use io_driver::{CompletionKind, Driver, Ecn, IoEngine, SendMeta, UdpSocketId};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+/// Create a driver using the mio backend (for consistent UdpReadable behavior).
+fn create_mio_driver() -> Box<dyn io_driver::IoDriver> {
+    Driver::builder().engine(IoEngine::Mio).build().unwrap()
+}
 
 /// Poll until we see a UdpReadable event for the given socket, or timeout.
 fn poll_until_readable(
@@ -27,7 +36,7 @@ fn poll_until_readable(
 /// Simple UDP echo test using mio backend.
 #[test]
 fn test_udp_echo() {
-    let mut driver = Driver::new().unwrap();
+    let mut driver = create_mio_driver();
 
     // Bind server socket
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -96,7 +105,7 @@ fn test_udp_echo() {
 /// Test ECN marking on sent packets.
 #[test]
 fn test_udp_ecn() {
-    let mut driver = Driver::new().unwrap();
+    let mut driver = create_mio_driver();
 
     // Bind two sockets
     let sock1_id = driver.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -130,7 +139,7 @@ fn test_udp_ecn() {
 /// Test multiple datagrams.
 #[test]
 fn test_udp_multiple_datagrams() {
-    let mut driver = Driver::new().unwrap();
+    let mut driver = create_mio_driver();
 
     let server_id = driver.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     let client_id = driver.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -181,7 +190,7 @@ fn test_udp_multiple_datagrams() {
 /// Test IPv6 UDP socket.
 #[test]
 fn test_udp_ipv6() {
-    let mut driver = Driver::new().unwrap();
+    let mut driver = create_mio_driver();
 
     // Try to bind IPv6 sockets - may fail on systems without IPv6
     let server_result = driver.bind_udp("[::1]:0".parse().unwrap());
@@ -240,7 +249,7 @@ fn test_send_meta_builder() {
 /// Test closing a UDP socket that doesn't exist.
 #[test]
 fn test_close_nonexistent_udp() {
-    let mut driver = Driver::new().unwrap();
+    let mut driver = create_mio_driver();
     let fake_id = UdpSocketId::new(999);
     // Should not error, just no-op
     driver.close_udp(fake_id).unwrap();
@@ -249,7 +258,7 @@ fn test_close_nonexistent_udp() {
 /// Test recvmsg on nonexistent socket.
 #[test]
 fn test_recvmsg_nonexistent() {
-    let mut driver = Driver::new().unwrap();
+    let mut driver = create_mio_driver();
     let fake_id = UdpSocketId::new(999);
     let mut buf = [0u8; 1024];
     let result = driver.recvmsg(fake_id, &mut buf);
@@ -260,7 +269,7 @@ fn test_recvmsg_nonexistent() {
 /// Test sendmsg on nonexistent socket.
 #[test]
 fn test_sendmsg_nonexistent() {
-    let mut driver = Driver::new().unwrap();
+    let mut driver = create_mio_driver();
     let fake_id = UdpSocketId::new(999);
     let meta = SendMeta::new("127.0.0.1:8080".parse().unwrap());
     let result = driver.sendmsg(fake_id, b"test", &meta);

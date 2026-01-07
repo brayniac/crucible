@@ -3,7 +3,8 @@
 //! This module provides a cross-platform I/O driver that works on
 //! Linux, macOS, and other Unix systems.
 
-use crate::driver::IoDriver;
+use crate::driver::{IoDriver, RecvBuf};
+use crate::recv_state::ConnectionRecvState;
 use crate::types::{
     Completion, CompletionKind, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId,
 };
@@ -30,6 +31,8 @@ struct MioConnection {
     stream: MioTcpStream,
     readable: bool,
     writable: bool,
+    /// Receive buffer state for unified API.
+    recv_state: ConnectionRecvState,
 }
 
 /// Listener state for mio driver.
@@ -205,6 +208,7 @@ impl IoDriver for MioDriver {
             stream: mio_stream,
             readable: false,
             writable: false, // Wait for connect to complete (SendReady event)
+            recv_state: ConnectionRecvState::default(),
         });
 
         Ok(ConnId::new(id))
@@ -233,6 +237,7 @@ impl IoDriver for MioDriver {
             stream: mio_stream,
             readable: false,
             writable: true,
+            recv_state: ConnectionRecvState::default(),
         });
 
         Ok(ConnId::new(id))
@@ -302,6 +307,68 @@ impl IoDriver for MioDriver {
             io::ErrorKind::Unsupported,
             "submit_recv not supported on mio backend, use recv() instead",
         ))
+    }
+
+    fn with_recv_buf(&mut self, id: ConnId, f: &mut dyn FnMut(&mut dyn RecvBuf)) -> io::Result<()> {
+        let conn = self
+            .connections
+            .get_mut(id.as_usize())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // If the socket is readable, read all available data into the recv buffer
+        // We loop because mio uses edge-triggered notifications
+        while conn.readable {
+            let spare = conn.recv_state.spare_capacity_mut();
+            match conn.stream.read(spare) {
+                Ok(0) => {
+                    // EOF - connection closed by peer
+                    conn.readable = false;
+                    // Return EOF error so the caller knows the connection is closed
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed by peer",
+                    ));
+                }
+                Ok(n) => {
+                    conn.recv_state.commit_owned(n);
+                    // Continue reading - there might be more data
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // No more data available right now
+                    conn.readable = false;
+                    break;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        // Create a wrapper that implements RecvBuf
+        struct MioRecvBuf<'a> {
+            state: &'a mut ConnectionRecvState,
+        }
+
+        impl RecvBuf for MioRecvBuf<'_> {
+            fn as_slice(&self) -> &[u8] {
+                self.state.as_slice()
+            }
+
+            fn len(&self) -> usize {
+                self.state.available()
+            }
+
+            fn consume(&mut self, n: usize) {
+                self.state.consume(n);
+            }
+        }
+
+        let mut buf = MioRecvBuf {
+            state: &mut conn.recv_state,
+        };
+        f(&mut buf);
+
+        Ok(())
     }
 
     fn poll(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
@@ -650,6 +717,7 @@ impl MioDriver {
                             stream: mio_stream,
                             readable: false,
                             writable: true,
+                            recv_state: ConnectionRecvState::default(),
                         });
 
                         self.pending_completions

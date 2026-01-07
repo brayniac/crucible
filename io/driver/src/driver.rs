@@ -8,6 +8,26 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
+/// Trait for receive buffer access.
+///
+/// Implemented by connection receive states to provide a unified
+/// interface for accessing received data across all backends.
+pub trait RecvBuf {
+    /// Get a contiguous slice of all available data.
+    fn as_slice(&self) -> &[u8];
+
+    /// Get the number of bytes available.
+    fn len(&self) -> usize;
+
+    /// Check if the buffer is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Mark `n` bytes as consumed.
+    fn consume(&mut self, n: usize);
+}
+
 /// I/O driver trait - abstracts over mio and io_uring backends.
 ///
 /// This trait provides a unified interface for network I/O that works
@@ -140,6 +160,37 @@ pub trait IoDriver: Send {
     /// - `Err(WouldBlock)` - No data available, wait for `Recv` completion
     /// - `Err(other)` - An error occurred
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Access received data for a connection via callback.
+    ///
+    /// This is the preferred way to read data as it enables zero-copy access
+    /// across all backends. The callback receives a `RecvBuf` that provides:
+    /// - `as_slice()` - Get contiguous view of available data
+    /// - `len()` / `is_empty()` - Check data availability
+    /// - `consume(n)` - Mark bytes as consumed
+    ///
+    /// # Zero-Copy Behavior
+    ///
+    /// When data fits in a single kernel buffer and is fully consumed before
+    /// the next recv, access is zero-copy (direct slice into kernel buffer).
+    /// When data spans recv boundaries, it's automatically coalesced.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// driver.with_recv_buf(conn_id, &mut |buf| {
+    ///     while let Some((cmd, len)) = parse(buf.as_slice()) {
+    ///         execute(cmd);
+    ///         buf.consume(len);
+    ///     }
+    /// })?;
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - Callback executed successfully
+    /// - `Err(NotFound)` - Connection not found
+    fn with_recv_buf(&mut self, id: ConnId, f: &mut dyn FnMut(&mut dyn RecvBuf)) -> io::Result<()>;
 
     /// Submit an async recv operation with a caller-provided buffer.
     ///

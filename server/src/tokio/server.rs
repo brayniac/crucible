@@ -5,11 +5,56 @@ use crate::config::Config;
 use crate::connection::Connection;
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE};
 use cache_core::Cache;
+use io_driver::RecvBuf;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+
+/// A simple RecvBuf that owns a contiguous buffer.
+struct SimpleRecvBuf {
+    data: Vec<u8>,
+    offset: usize,
+}
+
+impl SimpleRecvBuf {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(capacity),
+            offset: 0,
+        }
+    }
+
+    /// Append data to the buffer
+    fn append(&mut self, new_data: &[u8]) {
+        // Compact if we've consumed more than half
+        if self.offset > self.data.len() / 2 && self.offset > 0 {
+            self.data.drain(..self.offset);
+            self.offset = 0;
+        }
+        self.data.extend_from_slice(new_data);
+    }
+}
+
+impl RecvBuf for SimpleRecvBuf {
+    fn as_slice(&self) -> &[u8] {
+        &self.data[self.offset..]
+    }
+
+    fn len(&self) -> usize {
+        self.data.len() - self.offset
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.offset += n;
+        // Compact when all data consumed
+        if self.offset >= self.data.len() {
+            self.data.clear();
+            self.offset = 0;
+        }
+    }
+}
 
 /// Run the tokio runtime server.
 pub fn run<C: Cache + 'static>(
@@ -102,22 +147,26 @@ async fn accept_loop<C: Cache + 'static>(listener: TcpListener, cache: Arc<C>) {
 }
 
 async fn handle_connection<C: Cache>(mut stream: TcpStream, cache: Arc<C>) -> std::io::Result<()> {
-    let mut conn = Connection::new(64 * 1024);
-    let mut recv_buf = vec![0u8; 64 * 1024];
+    let mut conn = Connection::new();
+    let mut recv_buf = SimpleRecvBuf::with_capacity(64 * 1024);
+    let mut temp_buf = vec![0u8; 64 * 1024];
 
     loop {
         // Wait for the socket to be readable
         stream.readable().await?;
 
         // Try to read data
-        match stream.try_read(&mut recv_buf) {
+        match stream.try_read(&mut temp_buf) {
             Ok(0) => {
                 // Connection closed
                 return Ok(());
             }
             Ok(n) => {
-                conn.append_recv_data(&recv_buf[..n]);
-                conn.process(&*cache);
+                // Append to our RecvBuf
+                recv_buf.append(&temp_buf[..n]);
+
+                // Process using the new API
+                conn.process_from(&mut recv_buf, &*cache);
 
                 if conn.should_close() {
                     // Flush any pending writes before closing
@@ -129,8 +178,9 @@ async fn handle_connection<C: Cache>(mut stream: TcpStream, cache: Arc<C>) -> st
 
                 // Write response if we have data
                 if conn.has_pending_write() {
-                    stream.write_all(conn.pending_write_data()).await?;
-                    conn.advance_write(conn.pending_write_data().len());
+                    let data = conn.pending_write_data();
+                    stream.write_all(data).await?;
+                    conn.advance_write(data.len());
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

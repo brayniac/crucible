@@ -4,6 +4,7 @@
 //! is in flight, we cannot modify the buffer until we receive the kernel
 //! notification that it's done with the data.
 
+use crate::recv_state::ConnectionRecvState;
 use std::os::unix::io::RawFd;
 
 /// Per-connection state for io_uring driver.
@@ -22,8 +23,10 @@ pub struct UringConnection {
     /// On completion, we check if the generation matches to detect stale
     /// completions from a previous connection that reused the same slab slot.
     pub generation: u32,
-    /// Accumulated received data (used with multishot recv).
+    /// Accumulated received data (used with multishot recv - legacy).
     pub recv_data: Vec<u8>,
+    /// Unified receive state for the new with_recv_buf API.
+    pub recv_state: ConnectionRecvState,
     /// Double send buffers for async send safety.
     send_bufs: [Vec<u8>; 2],
     /// How much of each send buffer has been sent.
@@ -42,7 +45,20 @@ pub struct UringConnection {
     pub single_recv_pending: bool,
     /// Whether to use single-shot recv mode (disables multishot).
     pub use_single_recv: bool,
+    /// User's destination buffer for single-shot recv (pointer + length).
+    ///
+    /// When a pooled recv completes successfully, data is copied from the
+    /// pool buffer to this user buffer. The pointer remains valid as long
+    /// as the connection exists because it points into the connection's
+    /// IoBuffer which cannot reallocate while loaned.
+    pub user_recv_buf: Option<(*mut u8, usize)>,
 }
+
+// Safety: The user_recv_buf pointer points to memory owned by the Connection's
+// IoBuffer, which lives in the same slab slot. When the UringDriver is moved
+// between threads, all connections move with it. The pointer is only dereferenced
+// when the connection still exists (validated by generation check).
+unsafe impl Send for UringConnection {}
 
 impl UringConnection {
     /// Create a new connection with the given buffer size and generation.
@@ -52,6 +68,7 @@ impl UringConnection {
             fixed_slot,
             generation,
             recv_data: Vec::with_capacity(buffer_size),
+            recv_state: ConnectionRecvState::default(),
             // 64KB per buffer to handle large response backlogs
             send_bufs: [Vec::with_capacity(65536), Vec::with_capacity(65536)],
             send_pos: [0, 0],
@@ -60,6 +77,7 @@ impl UringConnection {
             multishot_active: false,
             single_recv_pending: false,
             use_single_recv: false,
+            user_recv_buf: None,
         }
     }
 

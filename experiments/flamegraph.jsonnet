@@ -104,7 +104,11 @@ function(
     // Flamegraph parameters
     warmup_duration='30s',
     record_duration='30',
-    perf_frequency='99'
+    perf_frequency='99',
+
+    // IO parameters
+    io_engine='auto',
+    recv_mode='multishot'
 )
     local args = {
         server_threads: server_threads,
@@ -149,6 +153,9 @@ function(
                 segment_size: segment_size,
                 hashtable_power: hashtable_power_int,
             },
+            uring+: {
+                recv_mode: recv_mode,
+            },
         },
 
         // Warmup config - write-heavy to populate cache
@@ -157,6 +164,8 @@ function(
                 duration: warmup_duration,
                 threads: benchmark_threads_int,
                 [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
+                io_engine: io_engine,
+                recv_mode: recv_mode,
             },
             connection+: {
                 connections: connections_int,
@@ -183,6 +192,8 @@ function(
                 // Run longer than record duration to ensure we capture full profile
                 duration: std.toString(std.parseInt(args.record_duration) + 60) + 's',
                 threads: benchmark_threads_int,
+                io_engine: io_engine,
+                recv_mode: recv_mode,
             },
             connection+: {
                 connections: connections_int,

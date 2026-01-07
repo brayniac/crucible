@@ -9,7 +9,6 @@ const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 /// - Fixed capacity, never reallocates
 /// - Tracks read/write positions separately
 /// - Supports compact operation to reclaim consumed space
-/// - Tracks loan state for safe io_uring single-shot recv
 #[derive(Debug)]
 pub struct Buffer {
     data: Box<[u8]>,
@@ -17,9 +16,6 @@ pub struct Buffer {
     read_pos: usize,
     /// Write position: data has been written up to here
     write_pos: usize,
-    /// True when the spare capacity has been loaned to the kernel.
-    /// While loaned, compact() must not be called.
-    loaned: bool,
 }
 
 impl Buffer {
@@ -34,14 +30,7 @@ impl Buffer {
             data: vec![0u8; capacity].into_boxed_slice(),
             read_pos: 0,
             write_pos: 0,
-            loaned: false,
         }
-    }
-
-    /// Returns true if the buffer is currently loaned to the kernel.
-    #[inline]
-    pub fn is_loaned(&self) -> bool {
-        self.loaned
     }
 
     /// Returns the total capacity of the buffer.
@@ -80,46 +69,6 @@ impl Buffer {
         &mut self.data[self.write_pos..]
     }
 
-    /// Loan the spare capacity to the kernel for single-shot recv.
-    ///
-    /// Returns a mutable slice that can be passed to `submit_recv()`.
-    /// The buffer is marked as loaned and compact() cannot be called until
-    /// `unloan()` or `unloan_cancel()` is called.
-    ///
-    /// # Panics
-    /// Panics if the buffer is already loaned.
-    #[inline]
-    pub fn loan_spare(&mut self) -> &mut [u8] {
-        assert!(!self.loaned, "buffer already loaned to kernel");
-        self.loaned = true;
-        &mut self.data[self.write_pos..]
-    }
-
-    /// Return the buffer from the kernel and commit bytes received.
-    ///
-    /// # Panics
-    /// Panics if the buffer is not loaned, or if `bytes` exceeds writable space.
-    #[inline]
-    pub fn unloan(&mut self, bytes: usize) {
-        assert!(self.loaned, "buffer not loaned");
-        assert!(
-            bytes <= self.writable(),
-            "bytes written exceeds writable space"
-        );
-        self.loaned = false;
-        self.write_pos += bytes;
-    }
-
-    /// Cancel a loan without committing any bytes (e.g., on error).
-    ///
-    /// # Panics
-    /// Panics if the buffer is not loaned.
-    #[inline]
-    pub fn unloan_cancel(&mut self) {
-        assert!(self.loaned, "buffer not loaned");
-        self.loaned = false;
-    }
-
     /// Advances the read position, consuming data.
     ///
     /// # Panics
@@ -149,15 +98,7 @@ impl Buffer {
     /// Compacts the buffer by moving unread data to the start.
     ///
     /// This reclaims space from consumed data without allocating.
-    ///
-    /// # Panics
-    /// Panics if the buffer is loaned to the kernel.
     pub fn compact(&mut self) {
-        assert!(
-            !self.loaned,
-            "cannot compact while buffer is loaned to kernel"
-        );
-
         if self.read_pos == 0 {
             return;
         }
