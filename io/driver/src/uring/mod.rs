@@ -1012,7 +1012,13 @@ impl IoDriver for UringDriver {
 
         // Automatically start receiving data
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
-            self.submit_multishot_recv(conn_id, fixed_slot)
+            let result = self.submit_multishot_recv(conn_id, fixed_slot);
+            if result.is_ok() {
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.multishot_active = true;
+                }
+            }
+            result
         } else {
             self.submit_single_recv_internal(conn_id, generation, fixed_slot)
         };
@@ -1069,7 +1075,13 @@ impl IoDriver for UringDriver {
 
         // Automatically start receiving data
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
-            self.submit_multishot_recv(conn_id, fixed_slot)
+            let result = self.submit_multishot_recv(conn_id, fixed_slot);
+            if result.is_ok() {
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.multishot_active = true;
+                }
+            }
+            result
         } else {
             self.submit_single_recv_internal(conn_id, generation, fixed_slot)
         };
