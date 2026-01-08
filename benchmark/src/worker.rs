@@ -243,6 +243,7 @@ impl IoWorker {
             .buffer_count(buffer_count.next_power_of_two())
             .buffer_size(4096)
             .sq_depth(sq_depth.next_power_of_two())
+            .recv_mode(cfg.config.general.recv_mode)
             .build()?;
 
         let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);

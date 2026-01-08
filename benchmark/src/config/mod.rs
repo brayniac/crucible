@@ -1,4 +1,4 @@
-use io_driver::IoEngine;
+use io_driver::{IoEngine, RecvMode};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -36,6 +36,9 @@ pub struct General {
     /// I/O engine selection (auto, mio, uring)
     #[serde(default)]
     pub io_engine: IoEngine,
+    /// Recv mode for io_uring (multishot, singleshot)
+    #[serde(default)]
+    pub recv_mode: RecvMode,
 }
 
 impl Default for General {
@@ -46,6 +49,7 @@ impl Default for General {
             threads: default_threads(),
             cpu_list: None,
             io_engine: IoEngine::default(),
+            recv_mode: RecvMode::default(),
         }
     }
 }

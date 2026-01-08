@@ -399,6 +399,15 @@ pub enum RecvMode {
     SingleShot,
 }
 
+impl std::fmt::Display for RecvMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecvMode::Multishot => write!(f, "multishot"),
+            RecvMode::SingleShot => write!(f, "single-shot"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

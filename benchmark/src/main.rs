@@ -2,7 +2,7 @@ use benchmark::config::Config;
 use benchmark::worker::Phase;
 use benchmark::{AdminServer, IoWorker, IoWorkerConfig, SharedState, parse_cpu_list};
 
-use io_driver::IoEngine;
+use io_driver::{IoEngine, RecvMode};
 
 use clap::Parser;
 use metriken::{AtomicHistogram, histogram::Histogram, metric};
@@ -49,10 +49,25 @@ struct Cli {
     /// I/O engine selection (auto, mio, uring)
     #[arg(long, value_parser = parse_io_engine)]
     io_engine: Option<IoEngine>,
+
+    /// Recv mode for io_uring (multishot, singleshot)
+    #[arg(long, value_parser = parse_recv_mode)]
+    recv_mode: Option<RecvMode>,
 }
 
 fn parse_io_engine(s: &str) -> Result<IoEngine, String> {
     s.parse()
+}
+
+fn parse_recv_mode(s: &str) -> Result<RecvMode, String> {
+    match s.to_lowercase().as_str() {
+        "multishot" | "multi" => Ok(RecvMode::Multishot),
+        "singleshot" | "single" | "single-shot" => Ok(RecvMode::SingleShot),
+        _ => Err(format!(
+            "invalid recv_mode '{}', expected: multishot, singleshot",
+            s
+        )),
+    }
 }
 
 // Metrics - using static histograms that workers can reference
@@ -110,6 +125,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(io_engine) = cli.io_engine {
         config.general.io_engine = io_engine;
     }
+    if let Some(recv_mode) = cli.recv_mode {
+        config.general.recv_mode = recv_mode;
+    }
 
     // Parse CPU list if configured
     let cpu_ids = if let Some(ref cpu_list) = config.general.cpu_list {
@@ -140,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         effective_engine,
         config.general.io_engine
     );
+    tracing::info!("recv_mode: {}", config.general.recv_mode);
     tracing::info!("timestamp_mode: {:?}", config.timestamps.mode);
     if let Some(ref cpu_list) = config.general.cpu_list {
         tracing::info!("cpu_list: {}", cpu_list);
