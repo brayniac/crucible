@@ -1270,17 +1270,26 @@ impl IoDriver for UringDriver {
     fn poll(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
         self.pending_completions.clear();
 
-        // In single-shot mode, re-arm recv for connections that don't have one pending
-        if self.recv_mode == crate::types::RecvMode::SingleShot {
-            let to_rearm: Vec<_> = self
-                .connections
-                .iter()
-                .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
-                .map(|(id, c)| (id, c.generation, c.fixed_slot))
-                .collect();
+        // Re-arm recv for connections that need it
+        // This handles both single-shot mode (no pending recv) and multishot mode
+        // (multishot deactivated due to re-arm failure)
+        let to_rearm: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
+            .map(|(id, c)| (id, c.generation, c.fixed_slot))
+            .collect();
 
-            for (conn_id, generation, fixed_slot) in to_rearm {
+        for (conn_id, generation, fixed_slot) in to_rearm {
+            if self.recv_mode == crate::types::RecvMode::SingleShot {
                 let _ = self.submit_single_recv_internal(conn_id, generation, fixed_slot);
+            } else {
+                // Multishot mode - re-arm multishot recv
+                if self.submit_multishot_recv(conn_id, fixed_slot).is_ok() {
+                    if let Some(conn) = self.connections.get_mut(conn_id) {
+                        conn.multishot_active = true;
+                    }
+                }
             }
         }
 
