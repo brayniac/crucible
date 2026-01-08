@@ -16,6 +16,7 @@ mod recv_pool;
 mod registered_files;
 
 use crate::driver::{IoDriver, RecvBuf};
+use crate::recv_state::{BufferSlice, BufferSource};
 use crate::types::{
     Completion, CompletionKind, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId,
 };
@@ -427,25 +428,19 @@ impl UringDriver {
 
         let n = result as usize;
 
-        // Zero-copy: create BufferSlice pointing to ring buffer data
-        // Buffer is held until consumed, then returned via pending_returns
-        let buf_data = self.buf_ring.get(buf_id);
-        let slice = crate::recv_state::BufferSlice::from_ring(buf_id, buf_data.as_ptr(), n);
-
+        // Multishot mode: copy data and return buffer immediately
+        // Zero-copy isn't practical for multishot because the ring has limited buffers
+        // (typically 256) and holding them would quickly exhaust the ring, blocking
+        // further recvs. The kernel continuously delivers completions, so we must
+        // return buffers promptly to keep the pipeline flowing.
+        let buf_data = &self.buf_ring.get(buf_id)[..n];
         if let Some(conn) = self.connections.get_mut(conn_id) {
-            // Legacy API compatibility - still copy to recv_data
-            conn.append_recv_data(&buf_data[..n]);
-            // Zero-copy path: store slice reference, don't copy to coalesce buffer
-            // Buffer is returned after consume() via pending_returns
-            conn.recv_state.on_recv(slice);
-        } else {
-            // Connection gone - return buffer immediately
-            self.buf_ring.return_buffer(buf_id);
-            return;
+            conn.append_recv_data(buf_data);
+            conn.recv_state.append_owned(buf_data);
         }
 
-        // Note: Buffer is NOT returned here - it's held in recv_state.current
-        // and will be returned after consume() via pending_returns in with_recv_buf
+        // Return buffer to ring immediately so kernel can reuse it
+        self.buf_ring.return_buffer(buf_id);
 
         self.pending_completions
             .push(Completion::new(CompletionKind::Recv {
@@ -525,7 +520,7 @@ impl UringDriver {
             return;
         }
 
-        // Success - zero-copy access to pool buffer
+        // Success - zero-copy handoff of pool buffer
         let bytes = result as usize;
 
         // Get data from pool buffer (validated by conn_id/generation)
@@ -542,25 +537,16 @@ impl UringDriver {
                 }
             }
 
-            // Zero-copy: create BufferSlice pointing to pool buffer
-            // Buffer is held until consumed, then freed via pending_returns
-            let slice = crate::recv_state::BufferSlice::from_pool(buf_id, data.as_ptr(), bytes);
-
+            // Zero-copy handoff to recv_state - buffer is NOT freed here.
+            // It will be freed when the user consumes the data via with_recv_buf.
             if let Some(conn) = self.connections.get_mut(conn_id) {
+                let slice = BufferSlice::from_pool(buf_id, data.as_ptr(), bytes);
                 conn.recv_state.on_recv(slice);
-            } else {
-                // Connection gone - free buffer immediately
-                self.recv_pool.free(buf_id);
-                return;
             }
         } else {
-            // Buffer validation failed (shouldn't happen) - free it
+            // Buffer validation failed - free it
             self.recv_pool.free(buf_id);
-            return;
         }
-
-        // Note: Buffer is NOT freed here - held in recv_state.current
-        // and will be freed after consume() via pending_returns in with_recv_buf
 
         // Generate Recv completion (same as multishot) since data is in recv_state
         self.pending_completions
@@ -1123,17 +1109,15 @@ impl IoDriver for UringDriver {
 
     fn close(&mut self, id: ConnId) -> io::Result<()> {
         if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
-            // Clear recv_state to release any held buffers
+            // Return any held recv buffers to their pools
             conn.recv_state.clear();
-
-            // Return any pending buffers to their sources
-            for ret in conn.recv_state.take_pending_returns() {
-                match ret.source {
-                    crate::recv_state::BufferSource::Ring => {
-                        self.buf_ring.return_buffer(ret.buf_id);
+            for pending in conn.recv_state.take_pending_returns() {
+                match pending.source {
+                    BufferSource::Ring => {
+                        self.buf_ring.return_buffer(pending.buf_id);
                     }
-                    crate::recv_state::BufferSource::Pool => {
-                        self.recv_pool.free(ret.buf_id);
+                    BufferSource::Pool => {
+                        self.recv_pool.free(pending.buf_id);
                     }
                 }
             }
@@ -1152,17 +1136,15 @@ impl IoDriver for UringDriver {
 
     fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
         if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
-            // Clear recv_state to release any held buffers
+            // Return any held recv buffers to their pools
             conn.recv_state.clear();
-
-            // Return any pending buffers to their sources
-            for ret in conn.recv_state.take_pending_returns() {
-                match ret.source {
-                    crate::recv_state::BufferSource::Ring => {
-                        self.buf_ring.return_buffer(ret.buf_id);
+            for pending in conn.recv_state.take_pending_returns() {
+                match pending.source {
+                    BufferSource::Ring => {
+                        self.buf_ring.return_buffer(pending.buf_id);
                     }
-                    crate::recv_state::BufferSource::Pool => {
-                        self.recv_pool.free(ret.buf_id);
+                    BufferSource::Pool => {
+                        self.recv_pool.free(pending.buf_id);
                     }
                 }
             }
@@ -1297,15 +1279,11 @@ impl IoDriver for UringDriver {
     }
 
     fn with_recv_buf(&mut self, id: ConnId, f: &mut dyn FnMut(&mut dyn RecvBuf)) -> io::Result<()> {
-        let conn_id = id.as_usize();
-
-        // Collect pending returns after the callback runs
-        let pending_returns: Vec<crate::recv_state::PendingReturn>;
-
-        {
+        // Collect pending returns after running callback
+        let pending_returns: Vec<_> = {
             let conn = self
                 .connections
-                .get_mut(conn_id)
+                .get_mut(id.as_usize())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
             // Create a wrapper that implements RecvBuf using the connection's recv_state
@@ -1332,19 +1310,18 @@ impl IoDriver for UringDriver {
             };
             f(&mut buf);
 
-            // Collect any buffers that were consumed and need to be returned
-            pending_returns = conn.recv_state.take_pending_returns().collect();
-        }
+            // Collect any buffers that were fully consumed and need to be returned
+            conn.recv_state.take_pending_returns().collect()
+        };
 
-        // Return consumed buffers to their sources (ring or pool)
-        // This is done after the connection borrow is released
-        for ret in pending_returns {
-            match ret.source {
-                crate::recv_state::BufferSource::Ring => {
-                    self.buf_ring.return_buffer(ret.buf_id);
+        // Return consumed buffers to their respective pools
+        for pending in pending_returns {
+            match pending.source {
+                BufferSource::Ring => {
+                    self.buf_ring.return_buffer(pending.buf_id);
                 }
-                crate::recv_state::BufferSource::Pool => {
-                    self.recv_pool.free(ret.buf_id);
+                BufferSource::Pool => {
+                    self.recv_pool.free(pending.buf_id);
                 }
             }
         }

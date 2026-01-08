@@ -6,26 +6,26 @@
 //!
 //! # Copy Behavior
 //!
-//! **io_uring (multishot and single-shot)**: Zero-copy when data fits in a
-//! single buffer and is consumed before the next recv. The kernel writes
-//! directly to ring/pool buffers, and `as_slice()` returns a pointer to that
-//! memory without copying. Buffers are held until `consume()` is called.
+//! **io_uring single-shot**: Zero-copy when data fits in a single buffer and
+//! is consumed before the next recv. The kernel writes directly to pool
+//! buffers, and `as_slice()` returns a pointer to that memory without copying.
+//! Buffers are held until `consume()` is called. When data spans multiple recv
+//! operations, it's copied to an internal coalesce buffer.
 //!
-//! When data spans multiple recv operations (pipelining, large values, slow
-//! consumer), data is copied to an internal coalesce buffer. This ensures
-//! `as_slice()` always returns a contiguous view.
+//! **io_uring multishot**: Always copies (1 copy). Ring-provided buffers must
+//! be returned immediately to keep the kernel pipeline flowing. Holding buffers
+//! would exhaust the ring (typically 256 buffers) and block further recvs.
 //!
-//! - **io_uring (zero-copy path)**: 0 copies - direct access to ring/pool buffer
-//! - **io_uring (coalesce path)**: 1 copy - ring/pool → coalesce buffer
-//! - **Mio**: 1 copy - kernel socket buffer → user buffer (always copies)
+//! **Mio**: Always copies (1 copy). Reads from kernel socket buffer to user buffer.
 //!
-//! For typical cache workloads with small requests that fit in a single buffer
-//! and are consumed promptly, the zero-copy path dominates on io_uring.
+//! | Mode | Recv (best case) | Recv (coalesce) | Send |
+//! |------|------------------|-----------------|------|
+//! | io_uring single-shot | 0 copies | 1 copy | 0 copies (SendZc) |
+//! | io_uring multishot | 1 copy | 1 copy | 0 copies (SendZc) |
+//! | Mio | 1 copy | 1 copy | 1 copy |
 //!
-//! # Send Behavior
-//!
-//! Sends use SendZc (zero-copy send) on io_uring - the kernel reads directly
-//! from user buffers with no copying.
+//! For typical cache workloads, single-shot mode with small requests achieves
+//! true zero-copy on both recv and send paths.
 
 use bytes::BytesMut;
 
