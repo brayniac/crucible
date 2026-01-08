@@ -124,6 +124,7 @@ impl RecvBufferPool {
 
     /// Check if pool is exhausted (no free buffers).
     #[inline]
+    #[allow(dead_code)]
     pub fn is_exhausted(&self) -> bool {
         self.free_list.is_empty()
     }

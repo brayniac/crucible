@@ -1,17 +1,31 @@
 //! Unified receive buffer state for all I/O backends.
 //!
-//! This module provides a zero-copy-when-possible receive buffer that works
-//! identically across mio and io_uring backends. Data is accessed through
-//! a `ReadGuard` which provides a contiguous slice view.
+//! This module provides a receive buffer that works identically across mio
+//! and io_uring backends. Data is accessed through a `RecvBuf` trait which
+//! provides a contiguous slice view.
 //!
-//! # Zero-Copy Behavior
+//! # Copy Behavior
 //!
-//! - When data fits in a single buffer and is fully consumed before the next
-//!   recv, access is zero-copy (direct slice into BufRing/Pool buffer).
-//! - When data spans recv boundaries (pipelining, large values, slow consumer),
-//!   data is copied to an internal coalesce buffer.
+//! **io_uring (multishot and single-shot)**: Zero-copy when data fits in a
+//! single buffer and is consumed before the next recv. The kernel writes
+//! directly to ring/pool buffers, and `as_slice()` returns a pointer to that
+//! memory without copying. Buffers are held until `consume()` is called.
 //!
-//! For typical cache workloads with small requests, the zero-copy path dominates.
+//! When data spans multiple recv operations (pipelining, large values, slow
+//! consumer), data is copied to an internal coalesce buffer. This ensures
+//! `as_slice()` always returns a contiguous view.
+//!
+//! - **io_uring (zero-copy path)**: 0 copies - direct access to ring/pool buffer
+//! - **io_uring (coalesce path)**: 1 copy - ring/pool → coalesce buffer
+//! - **Mio**: 1 copy - kernel socket buffer → user buffer (always copies)
+//!
+//! For typical cache workloads with small requests that fit in a single buffer
+//! and are consumed promptly, the zero-copy path dominates on io_uring.
+//!
+//! # Send Behavior
+//!
+//! Sends use SendZc (zero-copy send) on io_uring - the kernel reads directly
+//! from user buffers with no copying.
 
 use bytes::BytesMut;
 
