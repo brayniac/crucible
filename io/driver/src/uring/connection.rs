@@ -52,6 +52,12 @@ pub struct UringConnection {
     /// as the connection exists because it points into the connection's
     /// IoBuffer which cannot reallocate while loaned.
     pub user_recv_buf: Option<(*mut u8, usize)>,
+    /// Number of consecutive re-arm failures for this connection.
+    ///
+    /// Reset to 0 when recv is successfully submitted. If this exceeds
+    /// a threshold, an error completion is emitted to notify the caller
+    /// that this connection is stuck.
+    pub rearm_failures: u8,
 }
 
 // Safety: The user_recv_buf pointer points to memory owned by the Connection's
@@ -78,6 +84,7 @@ impl UringConnection {
             single_recv_pending: false,
             use_single_recv: false,
             user_recv_buf: None,
+            rearm_failures: 0,
         }
     }
 

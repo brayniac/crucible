@@ -44,5 +44,5 @@ sqpoll_idle_ms = 1000
 buffer_count = 1024
 buffer_size = 4096
 sq_depth = 1024
-# Recv mode: "multishot" (default, 2 copies) or "single-shot" (1 copy)
+# Recv mode: "multishot"/"multi-shot" (default, 0-1 copies) or "singleshot"/"single-shot" (0 copies)
 recv_mode = "multishot"

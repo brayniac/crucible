@@ -209,17 +209,21 @@ impl Default for MetricsConfig {
 }
 
 /// Recv mode for io_uring connections.
+///
+/// Accepts: "multishot", "multi-shot", "singleshot", "single-shot"
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "lowercase")]
 pub enum RecvMode {
     /// Multishot recv with kernel-managed buffer ring (default).
-    /// Uses 2 copies (kernel buffer -> connection buffer -> parse).
+    /// 1 copy for long messages, 0 copies for short messages.
     /// More efficient for many small receives.
     #[default]
+    #[serde(alias = "multi-shot")]
     Multishot,
     /// Single-shot recv directly into connection buffer.
-    /// Uses 1 copy (kernel writes directly to user buffer).
+    /// 0 copies (kernel writes directly to user buffer).
     /// May be more efficient for larger messages.
+    #[serde(alias = "singleshot", alias = "single-shot")]
     SingleShot,
 }
 
@@ -247,7 +251,7 @@ pub struct UringConfig {
     #[serde(default = "default_sq_depth")]
     pub sq_depth: u32,
 
-    /// Recv mode: "multishot" (default) or "single-shot"
+    /// Recv mode: "multishot"/"multi-shot" (default) or "singleshot"/"single-shot"
     #[serde(default)]
     pub recv_mode: RecvMode,
 }

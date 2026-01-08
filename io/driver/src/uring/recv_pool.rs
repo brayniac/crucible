@@ -121,6 +121,12 @@ impl RecvBufferPool {
     pub fn capacity(&self) -> usize {
         self.buffers.len()
     }
+
+    /// Check if pool is exhausted (no free buffers).
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.free_list.is_empty()
+    }
 }
 
 #[cfg(test)]

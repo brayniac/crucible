@@ -372,6 +372,8 @@ impl std::str::FromStr for IoEngine {
 /// Recv mode selection for io_uring.
 ///
 /// Determines how the driver handles incoming data on connections.
+///
+/// Accepts: "multishot", "multi-shot", "singleshot", "single-shot"
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
@@ -385,6 +387,7 @@ pub enum RecvMode {
     /// This mode is efficient for high-throughput scenarios as the kernel
     /// can complete multiple receives without re-submission.
     #[default]
+    #[cfg_attr(feature = "serde", serde(alias = "multi-shot"))]
     Multishot,
 
     /// Single-shot recv mode.
@@ -396,6 +399,7 @@ pub enum RecvMode {
     ///
     /// This mode gives the caller more control over buffer management and
     /// is useful when zero-copy semantics are desired.
+    #[cfg_attr(feature = "serde", serde(alias = "singleshot", alias = "single-shot"))]
     SingleShot,
 }
 

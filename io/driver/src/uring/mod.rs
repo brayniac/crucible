@@ -1289,17 +1289,42 @@ impl IoDriver for UringDriver {
             .connections
             .iter()
             .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
-            .map(|(id, c)| (id, c.generation, c.fixed_slot))
+            .map(|(id, c)| (id, c.generation, c.fixed_slot, c.rearm_failures))
             .collect();
 
-        for (conn_id, generation, fixed_slot) in to_rearm {
-            if self.recv_mode == crate::types::RecvMode::SingleShot {
-                let _ = self.submit_single_recv_internal(conn_id, generation, fixed_slot);
+        // Maximum consecutive re-arm failures before emitting an error
+        const MAX_REARM_FAILURES: u8 = 10;
+
+        for (conn_id, generation, fixed_slot, failures) in to_rearm {
+            let success = if self.recv_mode == crate::types::RecvMode::SingleShot {
+                self.submit_single_recv_internal(conn_id, generation, fixed_slot)
+                    .is_ok()
             } else {
                 // Multishot mode - re-arm multishot recv
-                if self.submit_multishot_recv(conn_id, fixed_slot).is_ok() {
-                    if let Some(conn) = self.connections.get_mut(conn_id) {
+                self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
+            };
+
+            if let Some(conn) = self.connections.get_mut(conn_id) {
+                if success {
+                    conn.rearm_failures = 0;
+                    if self.recv_mode == crate::types::RecvMode::Multishot {
                         conn.multishot_active = true;
+                    }
+                } else {
+                    conn.rearm_failures = failures.saturating_add(1);
+
+                    // If we've failed too many times, emit an error so the caller
+                    // knows this connection is stuck and can take action
+                    if conn.rearm_failures >= MAX_REARM_FAILURES {
+                        self.pending_completions
+                            .push(Completion::new(CompletionKind::Error {
+                                conn_id: ConnId::new(conn_id),
+                                error: io::Error::other(
+                                    "failed to re-arm recv: buffer pool exhausted or SQ full",
+                                ),
+                            }));
+                        // Reset counter to avoid spamming errors
+                        conn.rearm_failures = 0;
                     }
                 }
             }

@@ -36,7 +36,7 @@ pub struct General {
     /// I/O engine selection (auto, mio, uring)
     #[serde(default)]
     pub io_engine: IoEngine,
-    /// Recv mode for io_uring (multishot, singleshot)
+    /// Recv mode for io_uring (multishot/multi-shot, singleshot/single-shot)
     #[serde(default)]
     pub recv_mode: RecvMode,
 }

@@ -50,7 +50,7 @@ struct Cli {
     #[arg(long, value_parser = parse_io_engine)]
     io_engine: Option<IoEngine>,
 
-    /// Recv mode for io_uring (multishot, singleshot)
+    /// Recv mode for io_uring (multishot/multi-shot, singleshot/single-shot)
     #[arg(long, value_parser = parse_recv_mode)]
     recv_mode: Option<RecvMode>,
 }
@@ -61,10 +61,10 @@ fn parse_io_engine(s: &str) -> Result<IoEngine, String> {
 
 fn parse_recv_mode(s: &str) -> Result<RecvMode, String> {
     match s.to_lowercase().as_str() {
-        "multishot" | "multi" => Ok(RecvMode::Multishot),
-        "singleshot" | "single" | "single-shot" => Ok(RecvMode::SingleShot),
+        "multishot" | "multi-shot" | "multi" => Ok(RecvMode::Multishot),
+        "singleshot" | "single-shot" | "single" => Ok(RecvMode::SingleShot),
         _ => Err(format!(
-            "invalid recv_mode '{}', expected: multishot, singleshot",
+            "invalid recv_mode '{}', expected: multishot, multi-shot, singleshot, single-shot",
             s
         )),
     }
