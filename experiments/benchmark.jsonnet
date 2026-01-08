@@ -94,8 +94,8 @@ function(
     // Benchmark parameters
     benchmark_threads='24',
     benchmark_cpu_affinity='8-31',
-    connections='256',
-    pipeline_depth='64',
+    connections='1',
+    pipeline_depth='16',
     key_length='16',
     key_count='1000000',
     value_length='64',

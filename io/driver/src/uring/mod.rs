@@ -1272,7 +1272,16 @@ impl IoDriver for UringDriver {
 
         // In single-shot mode, re-arm recv for connections that don't have one pending
         if self.recv_mode == crate::types::RecvMode::SingleShot {
-            self.rearm_single_recv();
+            let to_rearm: Vec<_> = self
+                .connections
+                .iter()
+                .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
+                .map(|(id, c)| (id, c.generation, c.fixed_slot))
+                .collect();
+
+            for (conn_id, generation, fixed_slot) in to_rearm {
+                let _ = self.submit_single_recv_internal(conn_id, generation, fixed_slot);
+            }
         }
 
         // Submit pending operations
@@ -1298,21 +1307,6 @@ impl IoDriver for UringDriver {
         }
 
         Ok(count)
-    }
-
-    /// Re-arm single-shot recv for all connections that don't have one pending.
-    fn rearm_single_recv(&mut self) {
-        // Collect connection info for those needing re-arm
-        let to_rearm: Vec<_> = self
-            .connections
-            .iter()
-            .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
-            .map(|(id, c)| (id, c.generation, c.fixed_slot))
-            .collect();
-
-        for (conn_id, generation, fixed_slot) in to_rearm {
-            let _ = self.submit_single_recv_internal(conn_id, generation, fixed_slot);
-        }
     }
 
     fn drain_completions(&mut self) -> Vec<Completion> {
