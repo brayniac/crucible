@@ -10,7 +10,13 @@ use crate::protocol::{
     RespCodec, RespError,
 };
 
-use io_driver::ConnId;
+// Import underlying protocol parsers for zero-copy path
+use protocol_memcache::Response as MemcacheResponseParser;
+use protocol_memcache::binary::ParsedBinaryResponse as MemcacheBinaryResponseParser;
+use protocol_ping::Response as PingResponseParser;
+use protocol_resp::Value as RespValueParser;
+
+use io_driver::{ConnId, RecvBuf};
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -439,6 +445,135 @@ impl Session {
                     Ok(None) => None,
                     Err(e) => return Err(SessionError::Ping(e)),
                 },
+            };
+
+            match response {
+                Some(resp) => {
+                    if let Some(req) = self.in_flight.pop_front() {
+                        let latency_ns = self.calculate_latency(&req, now, rx_timestamp);
+
+                        let hit = if req.request_type == RequestType::Get {
+                            Some(!resp.is_null)
+                        } else {
+                            None
+                        };
+
+                        results.push(RequestResult {
+                            id: req.id,
+                            success: !resp.is_error,
+                            is_error_response: resp.is_error,
+                            latency_ns,
+                            request_type: req.request_type,
+                            hit,
+                        });
+                        count += 1;
+                    } else {
+                        tracing::warn!("received response without pending request");
+                    }
+                }
+                None => break,
+            }
+        }
+
+        if count > 0 {
+            self.last_rx_timestamp = None;
+        }
+
+        Ok(count)
+    }
+
+    /// Process responses directly from a RecvBuf (zero-copy path).
+    ///
+    /// This method parses responses directly from the driver's buffer without
+    /// copying data to an intermediate buffer first. For io_uring single-shot
+    /// mode, this achieves true zero-copy receive.
+    ///
+    /// The `now` parameter should be the current time, shared across a batch of
+    /// response processing to avoid excessive clock_gettime calls.
+    #[inline]
+    pub fn poll_responses_from(
+        &mut self,
+        recv_buf: &mut dyn RecvBuf,
+        results: &mut Vec<RequestResult>,
+        now: Instant,
+    ) -> Result<usize, SessionError> {
+        let rx_timestamp = self.last_rx_timestamp;
+        let mut count = 0;
+
+        loop {
+            let data = recv_buf.as_slice();
+            if data.is_empty() {
+                break;
+            }
+
+            // Parse response based on protocol (zero-copy from RecvBuf)
+            let response = match &mut self.codec {
+                ProtocolCodec::Resp(codec) => match RespValueParser::parse(data) {
+                    Ok((value, consumed)) => {
+                        recv_buf.consume(consumed);
+                        codec.increment_parsed();
+                        Some(ResponseInfo {
+                            is_error: value.is_error(),
+                            is_null: value.is_null(),
+                        })
+                    }
+                    Err(protocol_resp::ParseError::Incomplete) => None,
+                    Err(e) => return Err(SessionError::Resp(RespError::from_parse_error(e))),
+                },
+                ProtocolCodec::Memcache(_codec) => match MemcacheResponseParser::parse(data) {
+                    Ok((value, consumed)) => {
+                        recv_buf.consume(consumed);
+                        Some(ResponseInfo {
+                            is_error: value.is_error(),
+                            is_null: value.is_miss(),
+                        })
+                    }
+                    Err(protocol_memcache::ParseError::Incomplete) => None,
+                    Err(e) => {
+                        return Err(SessionError::Memcache(MemcacheError::from_parse_error(e)));
+                    }
+                },
+                ProtocolCodec::MemcacheBinary(codec) => {
+                    match MemcacheBinaryResponseParser::parse(data) {
+                        Ok((value, consumed)) => {
+                            // Determine error/miss from the parsed response variant
+                            // Must do this before consume() since value borrows from data
+                            let (is_error, is_miss) = match &value {
+                                MemcacheBinaryResponseParser::Error { status, .. } => (
+                                    true,
+                                    *status == protocol_memcache::binary::Status::KeyNotFound,
+                                ),
+                                _ => (false, false),
+                            };
+                            recv_buf.consume(consumed);
+                            codec.decrement_pending();
+                            Some(ResponseInfo {
+                                is_error,
+                                is_null: is_miss,
+                            })
+                        }
+                        Err(protocol_memcache::ParseError::Incomplete) => None,
+                        Err(e) => {
+                            return Err(SessionError::MemcacheBinary(
+                                MemcacheBinaryError::from_parse_error(e),
+                            ));
+                        }
+                    }
+                }
+                ProtocolCodec::Ping(codec) => {
+                    match PingResponseParser::parse(data) {
+                        Ok((_response, consumed)) => {
+                            recv_buf.consume(consumed);
+                            codec.decrement_pending();
+                            Some(ResponseInfo {
+                                is_error: false, // PONG is never an error
+                                is_null: false,
+                            })
+                        }
+                        Err(protocol_ping::ParseError::Incomplete) => None,
+                        Err(e) => return Err(SessionError::Ping(PingError::from_parse_error(e))),
+                    }
+                }
             };
 
             match response {

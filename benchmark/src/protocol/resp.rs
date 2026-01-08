@@ -132,6 +132,12 @@ impl RespCodec {
     pub fn reset_counter(&mut self) {
         self.responses_parsed = 0;
     }
+
+    /// Increment the parsed counter (for zero-copy path).
+    #[inline]
+    pub fn increment_parsed(&mut self) {
+        self.responses_parsed += 1;
+    }
 }
 
 impl Default for RespCodec {
@@ -170,6 +176,13 @@ impl RespValue {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
 pub struct RespError(ParseError);
+
+impl RespError {
+    /// Create from a parse error (for zero-copy path).
+    pub fn from_parse_error(e: ParseError) -> Self {
+        Self(e)
+    }
+}
 
 #[cfg(test)]
 mod tests {

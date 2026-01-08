@@ -657,17 +657,18 @@ impl IoWorker {
                     // Data is available to read via with_recv_buf
                     let id = conn_id.as_usize();
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
+                        // Zero-copy path: parse responses directly from driver's buffer
+                        // This avoids copying data to an intermediate session buffer
+                        let now = std::time::Instant::now();
+                        self.results.clear();
+                        let results = &mut self.results;
                         let session = &mut self.sessions[idx];
 
-                        // Use with_recv_buf to access driver's buffer directly
                         let result =
                             self.driver
                                 .with_recv_buf(conn_id, &mut |buf: &mut dyn RecvBuf| {
-                                    // Copy data from driver buffer to session buffer
-                                    let data = buf.as_slice();
-                                    if !data.is_empty() {
-                                        session.bytes_received(data);
-                                        buf.consume(data.len());
+                                    if let Err(e) = session.poll_responses_from(buf, results, now) {
+                                        tracing::debug!("protocol error: {}", e);
                                     }
                                 });
 
@@ -677,6 +678,35 @@ impl IoWorker {
                                 to_close.push((idx, DisconnectReason::Eof));
                             } else if e.kind() != io::ErrorKind::NotFound {
                                 to_close.push((idx, DisconnectReason::RecvError));
+                            }
+                        }
+
+                        // Record metrics from parsed responses (outside closure)
+                        if !self.warmup {
+                            for result in &self.results {
+                                self.shared
+                                    .responses_received
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if result.is_error_response {
+                                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                                if let Some(hit) = result.hit {
+                                    if hit {
+                                        self.shared.hits.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        self.shared.misses.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                let _ = self.response_latency.increment(result.latency_ns);
+                                match result.request_type {
+                                    RequestType::Get => {
+                                        let _ = self.get_latency.increment(result.latency_ns);
+                                    }
+                                    RequestType::Set => {
+                                        let _ = self.set_latency.increment(result.latency_ns);
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }

@@ -486,78 +486,8 @@ fn run_worker<C: Cache>(
                     }
                 }
 
-                // RecvComplete is also handled the same way for single-shot mode
-                CompletionKind::RecvComplete { conn_id, bytes } => {
-                    stats.inc_recv();
-                    let idx = conn_id.as_usize();
-
-                    if bytes == 0 {
-                        // EOF
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            conn_id,
-                            stats,
-                            CloseReason::ClientEof,
-                        );
-                        continue;
-                    }
-
-                    stats.add_bytes_received(bytes as u64);
-
-                    let mut close_reason: Option<CloseReason> = None;
-
-                    // Process using with_recv_buf
-                    let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                        if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                            conn.process_from(buf, &*cache);
-
-                            if conn.should_close() {
-                                close_reason = Some(CloseReason::ProtocolClose);
-                            }
-                        }
-                    });
-
-                    if result.is_err() {
-                        close_reason = Some(CloseReason::RecvError);
-                    }
-
-                    if let Some(reason) = close_reason {
-                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
-                        continue;
-                    }
-
-                    // Send responses
-                    let mut send_error = false;
-                    while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                        if !conn.has_pending_write() {
-                            break;
-                        }
-
-                        let data = conn.pending_write_data();
-                        match driver.send(conn_id, data) {
-                            Ok(n) => {
-                                stats.add_bytes_sent(n as u64);
-                                conn.advance_write(n);
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(_) => {
-                                send_error = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if send_error {
-                        close_connection(
-                            &mut driver,
-                            &mut connections,
-                            conn_id,
-                            stats,
-                            CloseReason::SendError,
-                        );
-                    }
-                }
+                // RecvComplete is legacy - single-shot recv now emits Recv
+                CompletionKind::RecvComplete { .. } => {}
 
                 CompletionKind::SendReady { conn_id } => {
                     stats.inc_send_ready();

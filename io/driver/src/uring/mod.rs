@@ -435,7 +435,6 @@ impl UringDriver {
         // return buffers promptly to keep the pipeline flowing.
         let buf_data = &self.buf_ring.get(buf_id)[..n];
         if let Some(conn) = self.connections.get_mut(conn_id) {
-            conn.append_recv_data(buf_data);
             conn.recv_state.append_owned(buf_data);
         }
 
@@ -693,7 +692,7 @@ impl UringDriver {
 
             let generation = self.next_generation;
             self.next_generation = self.next_generation.wrapping_add(1);
-            let conn = UringConnection::new(new_fd, fixed_slot, self.buffer_size, generation);
+            let conn = UringConnection::new(new_fd, fixed_slot, generation);
             entry.insert(conn);
 
             // Don't auto-submit multishot recv - let caller decide via submit_recv()
@@ -1013,7 +1012,7 @@ impl IoDriver for UringDriver {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
-        let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
+        let conn = UringConnection::new(raw_fd, fixed_slot, generation);
         entry.insert(conn);
 
         // Automatically start receiving data
@@ -1076,7 +1075,7 @@ impl IoDriver for UringDriver {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
-        let conn = UringConnection::new(raw_fd, fixed_slot, self.buffer_size, generation);
+        let conn = UringConnection::new(raw_fd, fixed_slot, generation);
         entry.insert(conn);
 
         // Automatically start receiving data
@@ -1197,18 +1196,37 @@ impl IoDriver for UringDriver {
     }
 
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize> {
-        let conn = self
-            .connections
-            .get_mut(id.as_usize())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+        // Note: Prefer with_recv_buf() for zero-copy access.
+        // This method copies data from recv_state to the provided buffer.
+        let (n, pending_returns): (usize, Vec<_>) = {
+            let conn = self
+                .connections
+                .get_mut(id.as_usize())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
-        if conn.recv_data.is_empty() {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            let available = conn.recv_state.as_slice();
+            if available.is_empty() {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+
+            let n = std::cmp::min(buf.len(), available.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            conn.recv_state.consume(n);
+
+            (n, conn.recv_state.take_pending_returns().collect())
+        };
+
+        // Return consumed buffers to their respective pools
+        for pending in pending_returns {
+            match pending.source {
+                BufferSource::Ring => {
+                    self.buf_ring.return_buffer(pending.buf_id);
+                }
+                BufferSource::Pool => {
+                    self.recv_pool.free(pending.buf_id);
+                }
+            }
         }
-
-        let n = std::cmp::min(buf.len(), conn.recv_data.len());
-        buf[..n].copy_from_slice(&conn.recv_data[..n]);
-        conn.recv_data.drain(..n);
 
         Ok(n)
     }

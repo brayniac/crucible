@@ -23,9 +23,7 @@ pub struct UringConnection {
     /// On completion, we check if the generation matches to detect stale
     /// completions from a previous connection that reused the same slab slot.
     pub generation: u32,
-    /// Accumulated received data (used with multishot recv - legacy).
-    pub recv_data: Vec<u8>,
-    /// Unified receive state for the new with_recv_buf API.
+    /// Receive state for the with_recv_buf API.
     pub recv_state: ConnectionRecvState,
     /// Double send buffers for async send safety.
     send_bufs: [Vec<u8>; 2],
@@ -67,13 +65,12 @@ pub struct UringConnection {
 unsafe impl Send for UringConnection {}
 
 impl UringConnection {
-    /// Create a new connection with the given buffer size and generation.
-    pub fn new(raw_fd: RawFd, fixed_slot: u32, buffer_size: usize, generation: u32) -> Self {
+    /// Create a new connection with the given generation counter.
+    pub fn new(raw_fd: RawFd, fixed_slot: u32, generation: u32) -> Self {
         Self {
             raw_fd,
             fixed_slot,
             generation,
-            recv_data: Vec::with_capacity(buffer_size),
             recv_state: ConnectionRecvState::default(),
             // 64KB per buffer to handle large response backlogs
             send_bufs: [Vec::with_capacity(65536), Vec::with_capacity(65536)],
@@ -86,12 +83,6 @@ impl UringConnection {
             user_recv_buf: None,
             rearm_failures: 0,
         }
-    }
-
-    /// Append received data to the recv buffer.
-    #[inline]
-    pub fn append_recv_data(&mut self, data: &[u8]) {
-        self.recv_data.extend_from_slice(data);
     }
 
     /// Check if we can send data (at least one buffer is available).

@@ -180,6 +180,13 @@ pub use protocol_memcache::Value as MemcacheValue;
 #[error("{0}")]
 pub struct MemcacheError(ParseError);
 
+impl MemcacheError {
+    /// Create from a parse error (for zero-copy path).
+    pub fn from_parse_error(e: ParseError) -> Self {
+        Self(e)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

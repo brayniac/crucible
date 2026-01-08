@@ -55,6 +55,12 @@ impl PingCodec {
     pub fn reset(&mut self) {
         self.pending_responses = 0;
     }
+
+    /// Decrement pending responses counter (for zero-copy path).
+    #[inline]
+    pub fn decrement_pending(&mut self) {
+        self.pending_responses = self.pending_responses.saturating_sub(1);
+    }
 }
 
 impl Default for PingCodec {
@@ -78,6 +84,13 @@ impl PingResponse {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
 pub struct PingError(ParseError);
+
+impl PingError {
+    /// Create from a parse error (for zero-copy path).
+    pub fn from_parse_error(e: ParseError) -> Self {
+        Self(e)
+    }
+}
 
 #[cfg(test)]
 mod tests {
