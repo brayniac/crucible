@@ -29,6 +29,12 @@
 
 use bytes::BytesMut;
 
+/// Default coalesce buffer capacity (16KB matches TLS max record size).
+const DEFAULT_COALESCE_CAPACITY: usize = 16 * 1024;
+
+/// Shrink threshold: if buffer capacity exceeds this after clear, shrink it.
+const SHRINK_THRESHOLD: usize = 64 * 1024;
+
 /// Identifies the source of a buffer for return purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferSource {
@@ -186,6 +192,8 @@ impl ConnectionRecvState {
                 // Fully consumed - reset coalesce buffer
                 self.coalesce_buf.clear();
                 self.coalesce_offset = 0;
+                // Shrink if buffer grew too large
+                self.maybe_shrink();
             }
         } else if let Some(ref slice) = self.current {
             self.offset += n;
@@ -195,6 +203,14 @@ impl ConnectionRecvState {
                 self.pending_returns.push(slice.to_pending_return());
                 self.offset = 0;
             }
+        }
+    }
+
+    /// Shrink the coalesce buffer if it has grown too large.
+    #[inline]
+    fn maybe_shrink(&mut self) {
+        if self.coalesce_buf.capacity() > SHRINK_THRESHOLD {
+            self.coalesce_buf = BytesMut::with_capacity(DEFAULT_COALESCE_CAPACITY);
         }
     }
 
@@ -284,12 +300,14 @@ impl ConnectionRecvState {
         if let Some(slice) = self.current.take() {
             self.pending_returns.push(slice.to_pending_return());
         }
+        // Shrink if buffer grew too large
+        self.maybe_shrink();
     }
 }
 
 impl Default for ConnectionRecvState {
     fn default() -> Self {
-        Self::new(65536) // 64KB default coalesce capacity
+        Self::new(DEFAULT_COALESCE_CAPACITY)
     }
 }
 

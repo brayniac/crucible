@@ -155,28 +155,22 @@ impl IoWorker {
         let conns_per_worker = (total_connections + num_threads - 1) / num_threads;
         let pipeline_depth = cfg.config.connection.pipeline_depth;
 
-        // Buffer count needs to handle peak load where all connections might have
-        // responses arriving simultaneously. Each connection needs at least 2 buffers
-        // (one being processed, one for next recv). With pipelining, scale further.
-        // Minimum is 4x connections to handle burst responses at any pipeline depth.
-        let pipeline_factor = pipeline_depth.max(4);
-        let buffer_count = conns_per_worker
-            .saturating_mul(pipeline_factor)
-            .max(conns_per_worker.saturating_mul(4))
-            .max(1024)
-            .min(16384) as u16;
+        // Buffer count for io_uring recv pool: one active + one for next recv per connection.
+        let buffer_count = conns_per_worker.saturating_mul(2).max(256).min(4096) as u16;
 
-        // Increase sq_depth to handle high throughput - needs to accommodate
-        // both recv completions and send submissions
+        // sq_depth for io_uring submission queue: needs to accommodate sends.
+        // With pipelining, each connection may have pipeline_depth sends queued.
         let sq_depth = conns_per_worker
-            .saturating_mul(pipeline_factor)
-            .max(1024)
-            .min(8192) as u32;
+            .saturating_mul(pipeline_depth)
+            .max(256)
+            .min(4096) as u32;
 
+        // io_uring buffer size: 16KB matches TLS max record size.
+        // TCP segments are coalesced at connection level via recv_state.append_owned().
         let driver = Driver::builder()
             .engine(engine)
             .buffer_count(buffer_count.next_power_of_two())
-            .buffer_size(4096)
+            .buffer_size(16 * 1024)
             .sq_depth(sq_depth.next_power_of_two())
             .recv_mode(cfg.config.general.recv_mode)
             .build()?;

@@ -69,19 +69,42 @@ pub struct SessionConfig {
     pub connect_timeout: Duration,
     /// Use kernel timestamps
     pub use_kernel_timestamps: bool,
+    /// Buffer size for send/recv buffers
+    pub buffer_size: usize,
 }
 
 impl SessionConfig {
     pub fn from_config(addr: SocketAddr, config: &Config) -> Self {
+        // Calculate buffer size based on value size, key size, and pipeline depth.
+        // Each pipelined request/response needs space for:
+        // - Key + value + protocol overhead (~100 bytes for RESP/Memcache framing)
+        // We need space for the largest possible message in both send and recv buffers.
+        // For SET: key + value + overhead
+        // For GET response: key + value + overhead
+        let value_size = config.workload.values.length;
+        let key_size = config.workload.keyspace.length;
+        let protocol_overhead = 256; // Conservative overhead for protocol framing
+        let message_size = value_size + key_size + protocol_overhead;
+
+        // Buffer needs to hold at least one full message, but preferably enough
+        // for the pipeline depth to avoid excessive compaction.
+        // Minimum 64KB for small values, scale up for larger values.
+        let min_buffer_size = 64 * 1024;
+        let pipeline_depth = config.connection.pipeline_depth;
+        let buffer_size = (message_size * pipeline_depth)
+            .max(message_size * 2)
+            .max(min_buffer_size);
+
         Self {
             addr,
-            pipeline_depth: config.connection.pipeline_depth,
+            pipeline_depth,
             reconnect_delay: Duration::from_millis(100),
             connect_timeout: config.connection.connect_timeout,
             use_kernel_timestamps: matches!(
                 config.timestamps.mode,
                 crate::config::TimestampMode::Software
             ),
+            buffer_size,
         }
     }
 }
@@ -185,7 +208,7 @@ impl Session {
             conn_id: None,
             addr: config.addr,
             codec,
-            buffers: BufferPair::new(),
+            buffers: BufferPair::with_capacity(config.buffer_size, config.buffer_size),
             in_flight: VecDeque::with_capacity(config.pipeline_depth),
             max_pipeline_depth: config.pipeline_depth,
             next_id: 0,
