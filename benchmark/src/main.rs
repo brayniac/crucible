@@ -453,6 +453,9 @@ fn run_worker(
     shared: Arc<SharedState>,
     ratelimiter: Option<Arc<Ratelimiter>>,
 ) {
+    // Set this thread's shard ID for metrics to avoid false sharing
+    metrics::set_thread_shard(id);
+
     let worker_config = IoWorkerConfig {
         id,
         config,

@@ -5,11 +5,38 @@
 //! The [`Counter`] type references a slot in a group and implements
 //! [`metriken::Metric`] for Prometheus exposition.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CACHE_LINE: usize = 128;
 const SLOTS: usize = CACHE_LINE / 8; // 16 counters per cache line
 const NUM_SHARDS: usize = 64;
+
+thread_local! {
+    /// Thread-local shard ID, set by `set_thread_shard()`.
+    /// If not set, falls back to a hash of the TLS address.
+    static SHARD_ID: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Set the shard ID for the current thread.
+///
+/// Call this at the start of each worker thread to ensure deterministic
+/// shard assignment and avoid false sharing between workers.
+///
+/// # Example
+///
+/// ```
+/// use metrics::set_thread_shard;
+///
+/// // In worker thread startup
+/// fn run_worker(worker_id: usize) {
+///     set_thread_shard(worker_id);
+///     // ... worker loop
+/// }
+/// ```
+pub fn set_thread_shard(id: usize) {
+    SHARD_ID.set(Some(id % NUM_SHARDS));
+}
 
 #[repr(C, align(128))]
 struct Shard {
@@ -69,7 +96,7 @@ impl CounterGroup {
     #[inline]
     fn add(&self, slot: usize, value: u64) {
         debug_assert!(slot < SLOTS, "slot index out of bounds");
-        let shard = thread_id() % NUM_SHARDS;
+        let shard = shard_index();
         self.shards[shard].slots[slot].fetch_add(value, Ordering::Relaxed);
     }
 
@@ -154,15 +181,19 @@ impl metriken::Metric for Counter {
     }
 }
 
-/// Fast thread ID without syscall overhead.
+/// Get the shard index for the current thread.
 ///
-/// Uses the address of a thread-local variable as a cheap, stable identifier.
+/// Uses the explicitly set shard ID if available (via `set_thread_shard()`),
+/// otherwise falls back to a hash of a TLS address.
 #[inline]
-fn thread_id() -> usize {
-    thread_local! {
-        static ID: u8 = const { 0 };
-    }
-    ID.with(|x| x as *const u8 as usize)
+fn shard_index() -> usize {
+    SHARD_ID.get().unwrap_or_else(|| {
+        // Fallback: use TLS address as a cheap thread identifier
+        thread_local! {
+            static ID: u8 = const { 0 };
+        }
+        ID.with(|x| x as *const u8 as usize) % NUM_SHARDS
+    })
 }
 
 #[cfg(test)]

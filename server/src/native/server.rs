@@ -330,12 +330,15 @@ fn run_acceptor(
 }
 
 fn run_worker<C: Cache>(
-    _worker_id: usize,
+    worker_id: usize,
     config: WorkerConfig,
     cache: Arc<C>,
     stats: &WorkerStats,
     fd_receiver: crossbeam_channel::Receiver<(RawFd, SocketAddr)>,
 ) -> io::Result<()> {
+    // Set this thread's shard ID for metrics to avoid false sharing
+    metrics::set_thread_shard(worker_id);
+
     // Convert server RecvMode to driver RecvMode
     let driver_recv_mode = match config.recv_mode {
         RecvMode::Multishot => DriverRecvMode::Multishot,

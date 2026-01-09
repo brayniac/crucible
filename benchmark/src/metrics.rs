@@ -1,5 +1,6 @@
 //! Benchmark metrics using sharded counters.
 
+pub use metrics::set_thread_shard;
 use metrics::{Counter, CounterGroup};
 use metriken::{AtomicHistogram, metric};
 

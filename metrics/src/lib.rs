@@ -53,7 +53,7 @@
 
 mod counter;
 
-pub use counter::{Counter, CounterGroup};
+pub use counter::{Counter, CounterGroup, set_thread_shard};
 
 // Re-export metriken for convenience
 pub use metriken;
