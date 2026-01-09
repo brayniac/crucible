@@ -148,36 +148,16 @@ pub struct IoWorker {
 impl IoWorker {
     /// Create a new worker.
     pub fn new(cfg: IoWorkerConfig) -> io::Result<Self> {
-        let engine = cfg.config.general.io_engine;
-        // Calculate connections per worker for buffer/queue sizing
-        let total_connections = cfg.config.connection.total_connections();
-        let num_threads = cfg.config.general.threads.max(1);
-        let conns_per_worker = (total_connections + num_threads - 1) / num_threads;
-        let pipeline_depth = cfg.config.connection.pipeline_depth;
-
-        // Buffer count for io_uring recv pool: one active + one for next recv per connection.
-        let buffer_count = conns_per_worker.saturating_mul(2).max(256).min(4096) as u16;
-
-        // sq_depth for io_uring submission queue: needs to accommodate sends.
-        // With pipelining, each connection may have pipeline_depth sends queued.
-        let sq_depth = conns_per_worker
-            .saturating_mul(pipeline_depth)
-            .max(256)
-            .min(4096) as u32;
-
-        // io_uring buffer size: 16KB matches TLS max record size.
-        // TCP segments are coalesced at connection level via recv_state.append_owned().
+        // Use io-driver defaults for buffer sizing (16KB * 2048 buffers, sq_depth 1024)
         let driver = Driver::builder()
-            .engine(engine)
-            .buffer_count(buffer_count.next_power_of_two())
-            .buffer_size(16 * 1024)
-            .sq_depth(sq_depth.next_power_of_two())
+            .engine(cfg.config.general.io_engine)
             .recv_mode(cfg.config.general.recv_mode)
             .build()?;
 
         let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);
         let key_buf = vec![0u8; cfg.config.workload.keyspace.length];
         let mut value_buf = vec![0u8; cfg.config.workload.values.length];
+        let pipeline_depth = cfg.config.connection.pipeline_depth;
 
         // Fill value buffer with random data
         let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);

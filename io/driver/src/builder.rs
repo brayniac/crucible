@@ -13,8 +13,8 @@ use std::io;
 ///
 /// let driver = Driver::builder()
 ///     .engine(IoEngine::Auto)
-///     .buffer_size(16384)
-///     .buffer_count(256)
+///     .buffer_size(16 * 1024)
+///     .buffer_count(2048)
 ///     .build()?;
 /// ```
 #[derive(Debug, Clone)]
@@ -39,11 +39,11 @@ impl DriverBuilder {
     pub fn new() -> Self {
         Self {
             engine: IoEngine::Auto,
-            buffer_size: 16384,    // 16KB buffers
-            buffer_count: 256,     // 256 buffers in pool
-            sq_depth: 256,         // io_uring submission queue depth
-            max_connections: 8192, // Maximum registered connections
-            sqpoll: false,         // SQPOLL disabled by default
+            buffer_size: 16 * 1024, // 16KB (TLS max record size)
+            buffer_count: 2048,     // Enough for 1024 connections (2 buffers each)
+            sq_depth: 1024,         // io_uring submission queue depth
+            max_connections: 8192,  // Maximum registered connections
+            sqpoll: false,          // SQPOLL disabled by default
             recv_mode: crate::types::RecvMode::default(),
         }
     }
@@ -61,7 +61,7 @@ impl DriverBuilder {
     /// Set the size of each buffer in the buffer pool.
     ///
     /// For io_uring, this affects the ring-provided buffer size.
-    /// Default: 16384 (16KB)
+    /// Default: 16KB (TLS max record size)
     pub fn buffer_size(mut self, size: usize) -> Self {
         self.buffer_size = size;
         self
@@ -70,7 +70,7 @@ impl DriverBuilder {
     /// Set the number of buffers in the pool.
     ///
     /// For io_uring, this must be a power of 2.
-    /// Default: 256
+    /// Default: 2048 (enough for 1024 connections with 2 buffers each)
     pub fn buffer_count(mut self, count: u16) -> Self {
         self.buffer_count = count;
         self
@@ -79,7 +79,7 @@ impl DriverBuilder {
     /// Set the io_uring submission queue depth.
     ///
     /// Only applies to the io_uring backend.
-    /// Default: 256
+    /// Default: 1024
     pub fn sq_depth(mut self, depth: u32) -> Self {
         self.sq_depth = depth;
         self
@@ -185,9 +185,9 @@ mod tests {
         let builder = DriverBuilder::new();
         // Check defaults
         assert_eq!(builder.engine, IoEngine::Auto);
-        assert_eq!(builder.buffer_size, 16384);
-        assert_eq!(builder.buffer_count, 256);
-        assert_eq!(builder.sq_depth, 256);
+        assert_eq!(builder.buffer_size, 16 * 1024);
+        assert_eq!(builder.buffer_count, 2048);
+        assert_eq!(builder.sq_depth, 1024);
         assert_eq!(builder.max_connections, 8192);
         assert!(!builder.sqpoll);
         assert_eq!(builder.recv_mode, crate::types::RecvMode::Multishot);

@@ -554,16 +554,38 @@ impl UringDriver {
         // Note: next recv is submitted in poll() to handle SQ full cases
     }
 
-    fn handle_send(&mut self, conn_id: usize, buf_idx: usize, result: i32, flags: u32) {
+    fn handle_send(&mut self, conn_id: usize, _buf_idx: usize, result: i32, flags: u32) {
         // Check if this is a SendZc notification
         if cqueue::notif(flags) {
-            if let Some(conn) = self.connections.get_mut(conn_id) {
-                conn.decrement_in_flight(buf_idx);
+            // Mark send buffer as available and check for more data or deferred close
+            let (should_continue, should_finish_close) =
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.on_send_notif();
+                    let should_close = conn.closing && conn.all_sends_complete();
+                    let should_continue = !conn.closing && conn.has_pending_data();
+                    (should_continue, should_close)
+                } else {
+                    (false, false)
+                };
+
+            if should_finish_close {
+                self.finish_deferred_close(conn_id);
+            } else if should_continue {
+                // More data to send - prepare next chunk
+                self.continue_send(conn_id);
             }
             return;
         }
 
-        if !self.connections.contains(conn_id) {
+        // Check if connection exists and is not closing
+        let is_closing = self
+            .connections
+            .get(conn_id)
+            .map(|c| c.closing)
+            .unwrap_or(true);
+
+        if is_closing {
+            // Connection is closing or doesn't exist, ignore send result
             return;
         }
 
@@ -583,20 +605,21 @@ impl UringDriver {
         }
 
         let n = result as usize;
-        if let Some(conn) = self.connections.get_mut(conn_id) {
-            conn.advance_send(buf_idx, n);
 
-            // If more data to send, submit another send
-            if conn.has_pending_send(buf_idx) {
-                conn.increment_in_flight(buf_idx);
-                // Get stable pointer to the actual send buffer (not a copy!)
-                let send_ptr = conn.send_buf_ptr(buf_idx);
-                let send_len = conn.pending_send_len(buf_idx);
+        // Handle partial send - continue sending remaining data in current chunk
+        let has_remaining = if let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.on_send_complete(n)
+        } else {
+            false
+        };
+
+        if has_remaining {
+            // Partial send - continue with remaining data in send buffer
+            if let Some(conn) = self.connections.get(conn_id) {
+                let (ptr, len) = conn.remaining_send();
                 let fixed_slot = conn.fixed_slot;
-
-                // Use the stable buffer pointer for zero-copy send
-                let send_data = unsafe { std::slice::from_raw_parts(send_ptr, send_len) };
-                let _ = self.submit_send_zc(conn_id, fixed_slot, buf_idx as u8, send_data);
+                let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+                let _ = self.submit_send_zc(conn_id, fixed_slot, 0, send_data);
             }
         }
 
@@ -604,6 +627,19 @@ impl UringDriver {
             .push(Completion::new(CompletionKind::SendReady {
                 conn_id: ConnId::new(conn_id),
             }));
+    }
+
+    /// Continue sending from fragmentation buffer after notif.
+    fn continue_send(&mut self, conn_id: usize) {
+        if let Some(conn) = self.connections.get_mut(conn_id) {
+            if let Some((ptr, len)) = conn.prepare_send() {
+                let fixed_slot = conn.fixed_slot;
+                conn.mark_send_in_flight();
+
+                let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+                let _ = self.submit_send_zc(conn_id, fixed_slot, 0, send_data);
+            }
+        }
     }
 
     fn handle_accept(&mut self, listener_id: usize, result: i32, flags: u32) {
@@ -1105,30 +1141,80 @@ impl IoDriver for UringDriver {
     }
 
     fn close(&mut self, id: ConnId) -> io::Result<()> {
-        if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
-            // Return any held recv buffers to their pools
-            conn.recv_state.clear();
-            for pending in conn.recv_state.take_pending_returns() {
-                match pending.source {
-                    BufferSource::Ring => {
-                        self.buf_ring.return_buffer(pending.buf_id);
-                    }
-                    BufferSource::Pool => {
-                        self.recv_pool.free(pending.buf_id);
+        let conn_id = id.as_usize();
+
+        // Check if connection exists and has in-flight sends
+        let has_in_flight = self
+            .connections
+            .get(conn_id)
+            .map(|c| !c.all_sends_complete())
+            .unwrap_or(false);
+
+        if has_in_flight {
+            // Defer full cleanup until SendZc notifs arrive.
+            // Close the fd and deregister, but keep connection in slab
+            // so the send buffers remain valid for the kernel.
+            if let Some(conn) = self.connections.get_mut(conn_id) {
+                conn.closing = true;
+
+                // Return any held recv buffers to their pools
+                conn.recv_state.clear();
+                for pending in conn.recv_state.take_pending_returns() {
+                    match pending.source {
+                        BufferSource::Ring => {
+                            self.buf_ring.return_buffer(pending.buf_id);
+                        }
+                        BufferSource::Pool => {
+                            self.recv_pool.free(pending.buf_id);
+                        }
                     }
                 }
-            }
 
-            // Update registered fd to -1
-            let fds = [-1i32];
-            let _ = self
-                .ring
-                .submitter()
-                .register_files_update(conn.fixed_slot, &fds);
-            self.registered_files.free(conn.fixed_slot);
-            unsafe { libc::close(conn.raw_fd) };
+                // Deregister and close fd - kernel will see errors but that's ok
+                let fds = [-1i32];
+                let _ = self
+                    .ring
+                    .submitter()
+                    .register_files_update(conn.fixed_slot, &fds);
+                self.registered_files.free(conn.fixed_slot);
+                unsafe { libc::close(conn.raw_fd) };
+            }
+        } else {
+            // No in-flight sends, safe to remove immediately
+            if let Some(mut conn) = self.connections.try_remove(conn_id) {
+                // Return any held recv buffers to their pools
+                conn.recv_state.clear();
+                for pending in conn.recv_state.take_pending_returns() {
+                    match pending.source {
+                        BufferSource::Ring => {
+                            self.buf_ring.return_buffer(pending.buf_id);
+                        }
+                        BufferSource::Pool => {
+                            self.recv_pool.free(pending.buf_id);
+                        }
+                    }
+                }
+
+                // Update registered fd to -1
+                let fds = [-1i32];
+                let _ = self
+                    .ring
+                    .submitter()
+                    .register_files_update(conn.fixed_slot, &fds);
+                self.registered_files.free(conn.fixed_slot);
+                unsafe { libc::close(conn.raw_fd) };
+            }
         }
         Ok(())
+    }
+
+    /// Complete deferred close for a connection after all sends finish.
+    fn finish_deferred_close(&mut self, conn_id: usize) {
+        if let Some(conn) = self.connections.try_remove(conn_id) {
+            // fd was already closed and deregistered in close()
+            // Just drop the connection to free the send buffers
+            drop(conn);
+        }
     }
 
     fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
@@ -1164,30 +1250,30 @@ impl IoDriver for UringDriver {
     }
 
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {
+        let conn_id = id.as_usize();
         let conn = self
             .connections
-            .get_mut(id.as_usize())
+            .get_mut(conn_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
-        // Append data to send buffer
-        let buf_idx = conn
-            .append_send_data(data)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        // Don't allow sending to closing connections
+        if conn.closing {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection is closing",
+            ));
+        }
 
-        // If this is the first data in the buffer, submit a send
-        if conn.send_pos(buf_idx) == 0
-            || conn.send_pos(buf_idx) >= conn.send_buf_len(buf_idx) - data.len()
-        {
-            conn.increment_in_flight(buf_idx);
-            // Get stable pointer to the actual send buffer (not a copy!)
-            // This is safe because send_bufs don't reallocate while in_flight_count > 0
-            let send_ptr = conn.send_buf_ptr(buf_idx);
-            let send_len = conn.pending_send_len(buf_idx);
+        // Queue data in fragmentation buffer
+        conn.queue_send(data);
+
+        // Try to start sending if not already in flight
+        if let Some((ptr, len)) = conn.prepare_send() {
             let fixed_slot = conn.fixed_slot;
+            conn.mark_send_in_flight();
 
-            // Use the stable buffer pointer for zero-copy send
-            let send_data = unsafe { std::slice::from_raw_parts(send_ptr, send_len) };
-            self.submit_send_zc(id.as_usize(), fixed_slot, buf_idx as u8, send_data)?;
+            let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+            self.submit_send_zc(conn_id, fixed_slot, 0, send_data)?;
         }
 
         Ok(data.len())

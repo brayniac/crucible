@@ -300,11 +300,11 @@ fn default_sqpoll_idle_ms() -> u32 {
 }
 
 fn default_buffer_count() -> u16 {
-    1024
+    2048 // Enough for 1024 connections (2 buffers each)
 }
 
 fn default_buffer_size() -> usize {
-    4096
+    16 * 1024 // 16KB (TLS max record size)
 }
 
 fn default_sq_depth() -> u32 {

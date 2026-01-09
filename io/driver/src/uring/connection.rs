@@ -1,67 +1,69 @@
 //! Connection state for io_uring driver.
 //!
-//! Implements double-buffering for SendZc safety - when a zero-copy send
-//! is in flight, we cannot modify the buffer until we receive the kernel
-//! notification that it's done with the data.
+//! Uses a fragmentation buffer approach for sends - small sends go directly
+//! to a fixed send buffer, while large sends overflow into a growable
+//! fragmentation buffer that is drained in chunks.
 
 use crate::recv_state::ConnectionRecvState;
+use bytes::BytesMut;
 use std::os::unix::io::RawFd;
+
+/// Size of the send chunk buffer (64KB).
+const SEND_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Shrink threshold for fragmentation buffer.
+const FRAG_SHRINK_THRESHOLD: usize = 256 * 1024;
+
+/// Default fragmentation buffer capacity.
+const FRAG_DEFAULT_CAPACITY: usize = 64 * 1024;
 
 /// Per-connection state for io_uring driver.
 ///
-/// Uses double buffering for write buffers to avoid corruption when
-/// SendZc is in flight while new data needs to be sent.
+/// Uses a single send buffer for in-flight data plus a fragmentation buffer
+/// for overflow. This allows accepting large sends without pre-allocating
+/// huge buffers, while keeping small sends efficient.
 pub struct UringConnection {
     /// The socket file descriptor.
     pub raw_fd: RawFd,
     /// Registered fd slot index for io_uring fixed files.
     pub fixed_slot: u32,
     /// Generation counter for detecting stale recv completions.
-    ///
-    /// When a connection is created, it gets a unique generation number.
-    /// This is encoded in the user_data of single-shot recv operations.
-    /// On completion, we check if the generation matches to detect stale
-    /// completions from a previous connection that reused the same slab slot.
     pub generation: u32,
     /// Receive state for the with_recv_buf API.
     pub recv_state: ConnectionRecvState,
-    /// Double send buffers for async send safety.
-    send_bufs: [Vec<u8>; 2],
-    /// How much of each send buffer has been sent.
-    send_pos: [usize; 2],
-    /// Count of in-flight SendZc operations per buffer.
-    ///
-    /// Each SendZc generates a notif when the kernel releases the buffer.
-    /// With partial sends, multiple SendZc operations can reference the same buffer.
-    /// Buffer is only safe to reuse when count reaches 0.
-    in_flight_count: [u8; 2],
-    /// Which buffer to use for the next send (0 or 1).
-    current_buf: usize,
+
+    // === Send buffer state ===
+    /// Fixed-size buffer for current in-flight send chunk.
+    send_buf: Vec<u8>,
+    /// How much of send_buf has been sent.
+    send_pos: usize,
+    /// Whether a SendZc is currently in flight (waiting for notif).
+    send_in_flight: bool,
+
+    /// Fragmentation buffer for data waiting to be sent.
+    /// Grows as needed for large sends, shrinks when cleared.
+    frag_buf: BytesMut,
+
+    // === Recv state ===
     /// Whether multishot recv is currently active.
     pub multishot_active: bool,
     /// Whether a single-shot recv is pending (for zero-copy mode).
     pub single_recv_pending: bool,
     /// Whether to use single-shot recv mode (disables multishot).
     pub use_single_recv: bool,
-    /// User's destination buffer for single-shot recv (pointer + length).
-    ///
-    /// When a pooled recv completes successfully, data is copied from the
-    /// pool buffer to this user buffer. The pointer remains valid as long
-    /// as the connection exists because it points into the connection's
-    /// IoBuffer which cannot reallocate while loaned.
+    /// User's destination buffer for single-shot recv.
     pub user_recv_buf: Option<(*mut u8, usize)>,
     /// Number of consecutive re-arm failures for this connection.
-    ///
-    /// Reset to 0 when recv is successfully submitted. If this exceeds
-    /// a threshold, an error completion is emitted to notify the caller
-    /// that this connection is stuck.
     pub rearm_failures: u8,
+
+    // === Connection state ===
+    /// Whether this connection is being closed.
+    pub closing: bool,
 }
 
 // Safety: The user_recv_buf pointer points to memory owned by the Connection's
 // IoBuffer, which lives in the same slab slot. When the UringDriver is moved
-// between threads, all connections move with it. The pointer is only dereferenced
-// when the connection still exists (validated by generation check).
+// between threads, all connections move with it.
 unsafe impl Send for UringConnection {}
 
 impl UringConnection {
@@ -72,115 +74,124 @@ impl UringConnection {
             fixed_slot,
             generation,
             recv_state: ConnectionRecvState::default(),
-            // 64KB per buffer to handle large response backlogs
-            send_bufs: [Vec::with_capacity(65536), Vec::with_capacity(65536)],
-            send_pos: [0, 0],
-            in_flight_count: [0, 0],
-            current_buf: 0,
+            send_buf: Vec::with_capacity(SEND_CHUNK_SIZE),
+            send_pos: 0,
+            send_in_flight: false,
+            frag_buf: BytesMut::with_capacity(FRAG_DEFAULT_CAPACITY),
             multishot_active: false,
             single_recv_pending: false,
             use_single_recv: false,
             user_recv_buf: None,
             rearm_failures: 0,
+            closing: false,
         }
     }
 
-    /// Check if we can send data (at least one buffer is available).
-    #[inline]
-    #[allow(dead_code)]
-    pub fn can_send(&self) -> bool {
-        self.in_flight_count[0] == 0 || self.in_flight_count[1] == 0
-    }
-
-    /// Get an available buffer index for sending, or None if both are in flight.
-    #[inline]
-    fn get_available_buf(&self) -> Option<usize> {
-        if self.in_flight_count[self.current_buf] == 0 {
-            Some(self.current_buf)
-        } else if self.in_flight_count[1 - self.current_buf] == 0 {
-            Some(1 - self.current_buf)
-        } else {
-            None
-        }
-    }
-
-    /// Append data to a send buffer.
+    /// Queue data for sending.
     ///
-    /// Returns the buffer index used, or None if no buffer was available.
+    /// Data is appended to the fragmentation buffer. Call `prepare_send()`
+    /// to get data ready for SendZc submission.
     #[inline]
-    pub fn append_send_data(&mut self, data: &[u8]) -> Option<usize> {
-        let buf_idx = self.get_available_buf()?;
+    pub fn queue_send(&mut self, data: &[u8]) {
+        self.frag_buf.extend_from_slice(data);
+    }
 
-        // If this buffer was fully sent, reset it
-        if self.send_pos[buf_idx] >= self.send_bufs[buf_idx].len() {
-            self.send_bufs[buf_idx].clear();
-            self.send_pos[buf_idx] = 0;
+    /// Prepare the next chunk for sending.
+    ///
+    /// Copies data from the fragmentation buffer to the send buffer and
+    /// returns a pointer and length for SendZc. Returns None if:
+    /// - A send is already in flight
+    /// - No data to send
+    #[inline]
+    pub fn prepare_send(&mut self) -> Option<(*const u8, usize)> {
+        if self.send_in_flight {
+            return None;
         }
 
-        self.send_bufs[buf_idx].extend_from_slice(data);
-        self.current_buf = buf_idx;
+        if self.frag_buf.is_empty() {
+            return None;
+        }
 
-        Some(buf_idx)
+        // Clear send buffer and copy next chunk
+        self.send_buf.clear();
+        self.send_pos = 0;
+
+        let chunk_size = self.frag_buf.len().min(SEND_CHUNK_SIZE);
+        self.send_buf
+            .extend_from_slice(&self.frag_buf[..chunk_size]);
+
+        // Remove copied data from frag_buf
+        let _ = self.frag_buf.split_to(chunk_size);
+
+        // Shrink frag_buf if it grew too large
+        if self.frag_buf.is_empty() && self.frag_buf.capacity() > FRAG_SHRINK_THRESHOLD {
+            self.frag_buf = BytesMut::with_capacity(FRAG_DEFAULT_CAPACITY);
+        }
+
+        Some((self.send_buf.as_ptr(), self.send_buf.len()))
     }
 
-    /// Check if there's data waiting to be sent in the specified buffer.
+    /// Mark send as in-flight (called after submitting SendZc).
     #[inline]
-    pub fn has_pending_send(&self, buf_idx: usize) -> bool {
-        self.send_pos[buf_idx] < self.send_bufs[buf_idx].len()
+    pub fn mark_send_in_flight(&mut self) {
+        self.send_in_flight = true;
     }
 
-    /// Get a stable pointer to the pending send data.
+    /// Handle send completion (result, not notif).
     ///
-    /// # Safety
-    /// The returned pointer is valid as long as in_flight_count[buf_idx] > 0,
-    /// which prevents the buffer from being cleared or reallocated.
+    /// Advances the send position. Returns true if more data remains
+    /// in the current send buffer (partial send).
     #[inline]
-    pub fn send_buf_ptr(&self, buf_idx: usize) -> *const u8 {
-        unsafe { self.send_bufs[buf_idx].as_ptr().add(self.send_pos[buf_idx]) }
+    pub fn on_send_complete(&mut self, bytes_sent: usize) -> bool {
+        self.send_pos += bytes_sent;
+        self.send_pos < self.send_buf.len()
     }
 
-    /// Get the length of pending send data.
+    /// Get pointer and length for continuing a partial send.
     #[inline]
-    pub fn pending_send_len(&self, buf_idx: usize) -> usize {
-        self.send_bufs[buf_idx].len() - self.send_pos[buf_idx]
+    pub fn remaining_send(&self) -> (*const u8, usize) {
+        let ptr = unsafe { self.send_buf.as_ptr().add(self.send_pos) };
+        let len = self.send_buf.len() - self.send_pos;
+        (ptr, len)
     }
 
-    /// Get the send position for a buffer.
-    #[inline]
-    pub fn send_pos(&self, buf_idx: usize) -> usize {
-        self.send_pos[buf_idx]
-    }
-
-    /// Get the total length of data in a send buffer.
-    #[inline]
-    pub fn send_buf_len(&self, buf_idx: usize) -> usize {
-        self.send_bufs[buf_idx].len()
-    }
-
-    /// Increment the in-flight count for a buffer (called when submitting SendZc).
-    #[inline]
-    pub fn increment_in_flight(&mut self, buf_idx: usize) {
-        self.in_flight_count[buf_idx] = self.in_flight_count[buf_idx].saturating_add(1);
-    }
-
-    /// Decrement the in-flight count for a buffer (called when notif is received).
+    /// Handle send notification (kernel done with buffer).
     ///
-    /// Buffer becomes available for reuse when count reaches 0.
+    /// Marks the send buffer as available for reuse.
     #[inline]
-    pub fn decrement_in_flight(&mut self, buf_idx: usize) {
-        self.in_flight_count[buf_idx] = self.in_flight_count[buf_idx].saturating_sub(1);
+    pub fn on_send_notif(&mut self) {
+        self.send_in_flight = false;
     }
 
-    /// Check if a buffer is in flight (has pending SendZc operations).
+    /// Check if there's data waiting to be sent.
     #[inline]
-    #[allow(dead_code)]
-    pub fn is_in_flight(&self, buf_idx: usize) -> bool {
-        self.in_flight_count[buf_idx] > 0
+    pub fn has_pending_data(&self) -> bool {
+        !self.frag_buf.is_empty() || (!self.send_in_flight && self.send_pos < self.send_buf.len())
     }
 
-    /// Mark some send data as sent for the specified buffer.
+    /// Check if a send is currently in flight.
     #[inline]
-    pub fn advance_send(&mut self, buf_idx: usize, n: usize) {
-        self.send_pos[buf_idx] += n;
+    pub fn is_send_in_flight(&self) -> bool {
+        self.send_in_flight
+    }
+
+    /// Check if all sends are complete (nothing in flight, no pending data).
+    #[inline]
+    pub fn all_sends_complete(&self) -> bool {
+        !self.send_in_flight && self.frag_buf.is_empty()
+    }
+
+    // === Legacy API for compatibility (buf_idx is ignored) ===
+
+    /// Increment in-flight count (legacy API, now just marks in-flight).
+    #[inline]
+    pub fn increment_in_flight(&mut self, _buf_idx: usize) {
+        self.send_in_flight = true;
+    }
+
+    /// Decrement in-flight count (legacy API, now just clears in-flight).
+    #[inline]
+    pub fn decrement_in_flight(&mut self, _buf_idx: usize) {
+        self.send_in_flight = false;
     }
 }
