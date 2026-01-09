@@ -5,12 +5,14 @@
 //! - ASFC (Adaptive Software Frequency Counter) for frequency tracking
 //! - Ghost entries for preserving frequency after eviction
 //! - Storage-agnostic location handling
+//! - SIMD-accelerated bucket scanning on supported platforms
 
 use crate::error::{CacheError, CacheResult};
 use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::location::Location;
 use crate::sync::{AtomicU64, Ordering};
 use ahash::RandomState;
+use wide::u64x4;
 
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
@@ -175,22 +177,73 @@ impl CuckooHashtable {
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         let tag_shifted = (tag as u64) << 52;
 
-        for slot in &bucket.items {
-            // Speculative Relaxed load
-            let speculative = slot.load(Ordering::Relaxed);
+        // Batch load all 8 slots with Relaxed ordering.
+        let e0 = bucket.items[0].load(Ordering::Relaxed);
+        let e1 = bucket.items[1].load(Ordering::Relaxed);
+        let e2 = bucket.items[2].load(Ordering::Relaxed);
+        let e3 = bucket.items[3].load(Ordering::Relaxed);
+        let e4 = bucket.items[4].load(Ordering::Relaxed);
+        let e5 = bucket.items[5].load(Ordering::Relaxed);
+        let e6 = bucket.items[6].load(Ordering::Relaxed);
+        let e7 = bucket.items[7].load(Ordering::Relaxed);
 
-            // Fast path: check tag first (rejects most slots immediately)
-            // This also rejects empty slots when search tag is non-zero
-            if (speculative & TAG_MASK) != tag_shifted {
-                continue;
-            }
+        // Use SIMD to compare all 8 tags in parallel.
+        // Pack into two u64x4 vectors and compare against tag mask.
+        let vec0 = u64x4::new([e0, e1, e2, e3]);
+        let vec1 = u64x4::new([e4, e5, e6, e7]);
 
-            // Tag matches - check if empty (for tag 0 case) or ghost
-            if speculative == 0 || (speculative & GHOST_LOCATION) == GHOST_LOCATION {
-                continue;
-            }
+        let tag_vec = u64x4::splat(tag_shifted);
+        let mask_vec = u64x4::splat(TAG_MASK);
+        let ghost_vec = u64x4::splat(GHOST_LOCATION);
 
-            // Tag matches and not empty/ghost - do Acquire load to synchronize
+        // Compare tags: (entry & TAG_MASK) == tag_shifted
+        // simd_eq returns u64x4 with all 1s for true, all 0s for false
+        let tag_match0 = (vec0 & mask_vec).simd_eq(tag_vec);
+        let tag_match1 = (vec1 & mask_vec).simd_eq(tag_vec);
+
+        // Check not empty: entry != 0 (use simd_eq and invert)
+        let empty0 = vec0.simd_eq(u64x4::ZERO);
+        let empty1 = vec1.simd_eq(u64x4::ZERO);
+        let not_empty0 = !empty0;
+        let not_empty1 = !empty1;
+
+        // Check not ghost: (entry & GHOST_LOCATION) != GHOST_LOCATION
+        let is_ghost0 = (vec0 & ghost_vec).simd_eq(ghost_vec);
+        let is_ghost1 = (vec1 & ghost_vec).simd_eq(ghost_vec);
+        let not_ghost0 = !is_ghost0;
+        let not_ghost1 = !is_ghost1;
+
+        // Combine conditions: tag matches AND not empty AND not ghost
+        let valid0 = tag_match0 & not_empty0 & not_ghost0;
+        let valid1 = tag_match1 & not_empty1 & not_ghost1;
+
+        // Extract to array and build bitmask
+        let arr0 = valid0.to_array();
+        let arr1 = valid1.to_array();
+
+        let candidates: u8 = ((arr0[0] != 0) as u8)
+            | (((arr0[1] != 0) as u8) << 1)
+            | (((arr0[2] != 0) as u8) << 2)
+            | (((arr0[3] != 0) as u8) << 3)
+            | (((arr1[0] != 0) as u8) << 4)
+            | (((arr1[1] != 0) as u8) << 5)
+            | (((arr1[2] != 0) as u8) << 6)
+            | (((arr1[3] != 0) as u8) << 7);
+
+        // Fast path: no candidates
+        if candidates == 0 {
+            return None;
+        }
+
+        // Process each candidate slot
+        let mut mask = candidates;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1; // Clear lowest set bit
+
+            let slot = &bucket.items[idx];
+
+            // Do Acquire load to synchronize
             let packed = slot.load(Ordering::Acquire);
 
             // Re-verify after Acquire (state may have changed)
@@ -240,20 +293,68 @@ impl CuckooHashtable {
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         let tag_shifted = (tag as u64) << 52;
 
-        for slot in &bucket.items {
-            let speculative = slot.load(Ordering::Relaxed);
+        // Batch load all 8 slots with Relaxed ordering
+        let e0 = bucket.items[0].load(Ordering::Relaxed);
+        let e1 = bucket.items[1].load(Ordering::Relaxed);
+        let e2 = bucket.items[2].load(Ordering::Relaxed);
+        let e3 = bucket.items[3].load(Ordering::Relaxed);
+        let e4 = bucket.items[4].load(Ordering::Relaxed);
+        let e5 = bucket.items[5].load(Ordering::Relaxed);
+        let e6 = bucket.items[6].load(Ordering::Relaxed);
+        let e7 = bucket.items[7].load(Ordering::Relaxed);
 
-            // Fast path: check tag first
-            if (speculative & TAG_MASK) != tag_shifted {
-                continue;
-            }
+        // Use SIMD to compare all 8 tags in parallel
+        let vec0 = u64x4::new([e0, e1, e2, e3]);
+        let vec1 = u64x4::new([e4, e5, e6, e7]);
 
-            // Tag matches - check if empty or ghost
-            if speculative == 0 || (speculative & GHOST_LOCATION) == GHOST_LOCATION {
-                continue;
-            }
+        let tag_vec = u64x4::splat(tag_shifted);
+        let mask_vec = u64x4::splat(TAG_MASK);
+        let ghost_vec = u64x4::splat(GHOST_LOCATION);
 
-            // Do Acquire load and verify
+        // Compare tags: (entry & TAG_MASK) == tag_shifted
+        let tag_match0 = (vec0 & mask_vec).simd_eq(tag_vec);
+        let tag_match1 = (vec1 & mask_vec).simd_eq(tag_vec);
+
+        // Check not empty: entry != 0 (use simd_eq and invert)
+        let empty0 = vec0.simd_eq(u64x4::ZERO);
+        let empty1 = vec1.simd_eq(u64x4::ZERO);
+        let not_empty0 = !empty0;
+        let not_empty1 = !empty1;
+
+        // Check not ghost: (entry & GHOST_LOCATION) != GHOST_LOCATION
+        let is_ghost0 = (vec0 & ghost_vec).simd_eq(ghost_vec);
+        let is_ghost1 = (vec1 & ghost_vec).simd_eq(ghost_vec);
+        let not_ghost0 = !is_ghost0;
+        let not_ghost1 = !is_ghost1;
+
+        // Combine conditions
+        let valid0 = tag_match0 & not_empty0 & not_ghost0;
+        let valid1 = tag_match1 & not_empty1 & not_ghost1;
+
+        // Extract to array and build bitmask
+        let arr0 = valid0.to_array();
+        let arr1 = valid1.to_array();
+
+        let candidates: u8 = ((arr0[0] != 0) as u8)
+            | (((arr0[1] != 0) as u8) << 1)
+            | (((arr0[2] != 0) as u8) << 2)
+            | (((arr0[3] != 0) as u8) << 3)
+            | (((arr1[0] != 0) as u8) << 4)
+            | (((arr1[1] != 0) as u8) << 5)
+            | (((arr1[2] != 0) as u8) << 6)
+            | (((arr1[3] != 0) as u8) << 7);
+
+        if candidates == 0 {
+            return false;
+        }
+
+        // Process each candidate slot
+        let mut mask = candidates;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+
+            let slot = &bucket.items[idx];
             let packed = slot.load(Ordering::Acquire);
 
             if (packed & TAG_MASK) != tag_shifted {

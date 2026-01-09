@@ -21,6 +21,7 @@ libc = { workspace = true }
 memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
+wide = { workspace = true }
 
 # Optional loom support for concurrency testing
 loom = { workspace = true, features = ["checkpoint"], optional = true }
