@@ -272,10 +272,10 @@ impl UringDriver {
         fixed_slot: u32,
     ) -> io::Result<()> {
         // Check if recv is already pending
-        if let Some(conn) = self.connections.get(conn_id) {
-            if conn.single_recv_pending {
-                return Ok(()); // Already have a recv pending
-            }
+        if let Some(conn) = self.connections.get(conn_id)
+            && conn.single_recv_pending
+        {
+            return Ok(()); // Already have a recv pending
         }
 
         // Allocate a buffer from the pool
@@ -295,7 +295,7 @@ impl UringDriver {
             ));
 
         unsafe {
-            if let Err(_) = self.ring.submission().push(&recv_op) {
+            if self.ring.submission().push(&recv_op).is_err() {
                 self.recv_pool.free(buf_id);
                 return Err(io::Error::other("SQ full"));
             }
@@ -558,7 +558,7 @@ impl UringDriver {
         // Check if this is a SendZc notification
         if cqueue::notif(flags) {
             // Decrement in-flight count and check if all sends are done
-            let (all_done, should_continue, should_finish_close) =
+            let (_all_done, should_continue, should_finish_close) =
                 if let Some(conn) = self.connections.get_mut(conn_id) {
                     let all_done = conn.on_send_notif();
                     let should_close = conn.closing && conn.all_sends_complete();
@@ -635,14 +635,14 @@ impl UringDriver {
 
     /// Continue sending from fragmentation buffer after notif.
     fn continue_send(&mut self, conn_id: usize) {
-        if let Some(conn) = self.connections.get_mut(conn_id) {
-            if let Some((ptr, len)) = conn.prepare_send() {
-                let fixed_slot = conn.fixed_slot;
-                conn.mark_send_in_flight();
+        if let Some(conn) = self.connections.get_mut(conn_id)
+            && let Some((ptr, len)) = conn.prepare_send()
+        {
+            let fixed_slot = conn.fixed_slot;
+            conn.mark_send_in_flight();
 
-                let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                let _ = self.submit_send_zc(conn_id, fixed_slot, 0, send_data);
-            }
+            let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+            let _ = self.submit_send_zc(conn_id, fixed_slot, 0, send_data);
         }
     }
 
@@ -1065,10 +1065,10 @@ impl IoDriver for UringDriver {
         // Automatically start receiving data
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
             let result = self.submit_multishot_recv(conn_id, fixed_slot);
-            if result.is_ok() {
-                if let Some(conn) = self.connections.get_mut(conn_id) {
-                    conn.multishot_active = true;
-                }
+            if result.is_ok()
+                && let Some(conn) = self.connections.get_mut(conn_id)
+            {
+                conn.multishot_active = true;
             }
             result
         } else {
@@ -1128,10 +1128,10 @@ impl IoDriver for UringDriver {
         // Automatically start receiving data
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
             let result = self.submit_multishot_recv(conn_id, fixed_slot);
-            if result.is_ok() {
-                if let Some(conn) = self.connections.get_mut(conn_id) {
-                    conn.multishot_active = true;
-                }
+            if result.is_ok()
+                && let Some(conn) = self.connections.get_mut(conn_id)
+            {
+                conn.multishot_active = true;
             }
             result
         } else {
@@ -1366,7 +1366,7 @@ impl IoDriver for UringDriver {
             ));
 
         unsafe {
-            if let Err(_) = self.ring.submission().push(&recv_op) {
+            if self.ring.submission().push(&recv_op).is_err() {
                 // Failed to submit - free the pool buffer
                 self.recv_pool.free(buf_id);
                 if let Some(conn) = self.connections.get_mut(conn_id) {

@@ -171,29 +171,9 @@ impl UringConnection {
         !self.frag_buf.is_empty()
     }
 
-    /// Check if a send is currently in flight.
-    #[inline]
-    pub fn is_send_in_flight(&self) -> bool {
-        self.sends_in_flight > 0
-    }
-
     /// Check if all sends are complete (nothing in flight, no pending data).
     #[inline]
     pub fn all_sends_complete(&self) -> bool {
         self.sends_in_flight == 0 && self.frag_buf.is_empty()
-    }
-
-    // === Legacy API for compatibility (buf_idx is ignored) ===
-
-    /// Increment in-flight count (legacy API).
-    #[inline]
-    pub fn increment_in_flight(&mut self, _buf_idx: usize) {
-        self.sends_in_flight += 1;
-    }
-
-    /// Decrement in-flight count (legacy API).
-    #[inline]
-    pub fn decrement_in_flight(&mut self, _buf_idx: usize) {
-        self.sends_in_flight = self.sends_in_flight.saturating_sub(1);
     }
 }
