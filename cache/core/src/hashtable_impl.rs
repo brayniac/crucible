@@ -169,46 +169,56 @@ impl CuckooHashtable {
     ) -> Option<(Location, u8)> {
         let bucket = self.bucket(bucket_index);
 
+        // Pre-compute constants for faster comparisons
+        // Tag is in bits 52-63, ghost has all 44 location bits set
+        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
+        const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
+        let tag_shifted = (tag as u64) << 52;
+
         for slot in &bucket.items {
-            // Speculative Relaxed load to check tag
+            // Speculative Relaxed load
             let speculative = slot.load(Ordering::Relaxed);
 
-            if speculative == 0 || Hashbucket::is_ghost(speculative) {
+            // Fast path: check tag first (rejects most slots immediately)
+            // This also rejects empty slots when search tag is non-zero
+            if (speculative & TAG_MASK) != tag_shifted {
                 continue;
             }
 
-            if Hashbucket::tag(speculative) == tag {
-                // Tag matches - do Acquire load to synchronize
-                let packed = slot.load(Ordering::Acquire);
+            // Tag matches - check if empty (for tag 0 case) or ghost
+            if speculative == 0 || (speculative & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
 
-                // Re-check after Acquire load (slot may have changed)
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+            // Tag matches and not empty/ghost - do Acquire load to synchronize
+            let packed = slot.load(Ordering::Acquire);
+
+            // Re-verify after Acquire (state may have changed)
+            if (packed & TAG_MASK) != tag_shifted {
+                continue;
+            }
+            if packed == 0 || (packed & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
+
+            let location = Hashbucket::location(packed);
+
+            // Verify key matches using the verifier
+            if verifier.verify(key, location, false) {
+                // Update frequency (best effort)
+                let freq = Hashbucket::freq(packed);
+                if freq < 127
+                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
+                {
+                    let _ = slot.compare_exchange(
+                        packed,
+                        new_packed,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    );
                 }
 
-                if Hashbucket::tag(packed) != tag {
-                    continue;
-                }
-
-                let location = Hashbucket::location(packed);
-
-                // Verify key matches using the verifier
-                if verifier.verify(key, location, false) {
-                    // Update frequency (best effort)
-                    let freq = Hashbucket::freq(packed);
-                    if freq < 127
-                        && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
-                    {
-                        let _ = slot.compare_exchange(
-                            packed,
-                            new_packed,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        );
-                    }
-
-                    return Some((location, Hashbucket::freq(packed)));
-                }
+                return Some((location, Hashbucket::freq(packed)));
             }
         }
 
@@ -225,32 +235,38 @@ impl CuckooHashtable {
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
+        // Pre-compute constants for faster comparisons
+        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
+        const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
+        let tag_shifted = (tag as u64) << 52;
+
         for slot in &bucket.items {
-            // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
-            if speculative == 0 || Hashbucket::is_ghost(speculative) {
+            // Fast path: check tag first
+            if (speculative & TAG_MASK) != tag_shifted {
                 continue;
             }
 
-            if Hashbucket::tag(speculative) == tag {
-                // Tag matches - do Acquire load to synchronize
-                let packed = slot.load(Ordering::Acquire);
+            // Tag matches - check if empty or ghost
+            if speculative == 0 || (speculative & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
 
-                // Re-check after Acquire load (slot may have changed)
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
-                }
+            // Do Acquire load and verify
+            let packed = slot.load(Ordering::Acquire);
 
-                if Hashbucket::tag(packed) != tag {
-                    continue;
-                }
+            if (packed & TAG_MASK) != tag_shifted {
+                continue;
+            }
+            if packed == 0 || (packed & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
 
-                let location = Hashbucket::location(packed);
+            let location = Hashbucket::location(packed);
 
-                if verifier.verify(key, location, false) {
-                    return true;
-                }
+            if verifier.verify(key, location, false) {
+                return true;
             }
         }
 
