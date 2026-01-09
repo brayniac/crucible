@@ -74,10 +74,14 @@ pub enum DisconnectReason {
     ConnectFailed,
 }
 
-/// Per-worker statistics for diagnostics.
+/// Per-worker statistics - each worker has its own counters to avoid contention.
+#[repr(align(128))] // Cache line alignment to prevent false sharing
 pub struct WorkerStats {
     pub requests_sent: AtomicU64,
     pub responses_received: AtomicU64,
+    pub errors: AtomicU64,
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
 }
 
 impl WorkerStats {
@@ -85,6 +89,9 @@ impl WorkerStats {
         Self {
             requests_sent: AtomicU64::new(0),
             responses_received: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 }
@@ -99,40 +106,26 @@ impl Default for WorkerStats {
 pub struct SharedState {
     /// Current test phase (controlled by main thread)
     pub phase: AtomicU8,
-    /// Total requests sent (atomic counter)
-    pub requests_sent: AtomicU64,
-    /// Total responses received
-    pub responses_received: AtomicU64,
-    /// Total errors
-    pub errors: AtomicU64,
-    /// Cache hits (GET requests that returned a value)
-    pub hits: AtomicU64,
-    /// Cache misses (GET requests that returned null/empty)
-    pub misses: AtomicU64,
-    /// Connections currently active
+    /// Per-worker statistics - workers increment their own index to avoid contention
+    pub worker_stats: Vec<WorkerStats>,
+    /// Connections currently active (low-contention, kept as shared)
     pub connections_active: AtomicU64,
-    /// Connections that have disconnected
+    /// Connections that have disconnected (low-contention, kept as shared)
     pub connections_failed: AtomicU64,
-    /// Disconnect reasons
+    /// Disconnect reasons (low-contention, kept as shared)
     pub disconnects_eof: AtomicU64,
     pub disconnects_recv_error: AtomicU64,
     pub disconnects_send_error: AtomicU64,
     pub disconnects_closed_event: AtomicU64,
     pub disconnects_error_event: AtomicU64,
     pub disconnects_connect_failed: AtomicU64,
-    /// Per-worker statistics (for diagnosing imbalance)
-    pub worker_stats: Vec<WorkerStats>,
 }
 
 impl SharedState {
     pub fn new(num_workers: usize) -> Self {
         Self {
             phase: AtomicU8::new(Phase::Connect as u8),
-            requests_sent: AtomicU64::new(0),
-            responses_received: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            worker_stats: (0..num_workers).map(|_| WorkerStats::new()).collect(),
             connections_active: AtomicU64::new(0),
             connections_failed: AtomicU64::new(0),
             disconnects_eof: AtomicU64::new(0),
@@ -141,7 +134,6 @@ impl SharedState {
             disconnects_closed_event: AtomicU64::new(0),
             disconnects_error_event: AtomicU64::new(0),
             disconnects_connect_failed: AtomicU64::new(0),
-            worker_stats: (0..num_workers).map(|_| WorkerStats::new()).collect(),
         }
     }
 
@@ -155,6 +147,51 @@ impl SharedState {
     #[inline]
     pub fn set_phase(&self, phase: Phase) {
         self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    /// Aggregate requests_sent across all workers.
+    #[inline]
+    pub fn requests_sent(&self) -> u64 {
+        self.worker_stats
+            .iter()
+            .map(|s| s.requests_sent.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Aggregate responses_received across all workers.
+    #[inline]
+    pub fn responses_received(&self) -> u64 {
+        self.worker_stats
+            .iter()
+            .map(|s| s.responses_received.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Aggregate errors across all workers.
+    #[inline]
+    pub fn errors(&self) -> u64 {
+        self.worker_stats
+            .iter()
+            .map(|s| s.errors.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Aggregate hits across all workers.
+    #[inline]
+    pub fn hits(&self) -> u64 {
+        self.worker_stats
+            .iter()
+            .map(|s| s.hits.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Aggregate misses across all workers.
+    #[inline]
+    pub fn misses(&self) -> u64 {
+        self.worker_stats
+            .iter()
+            .map(|s| s.misses.load(Ordering::Relaxed))
+            .sum()
     }
 }
 
@@ -491,7 +528,9 @@ impl IoWorker {
                 };
 
                 if sent && !warmup {
-                    self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
+                    self.shared.worker_stats[self.id]
+                        .requests_sent
+                        .fetch_add(1, Ordering::Relaxed);
                 }
 
                 if !sent {
@@ -507,19 +546,18 @@ impl IoWorker {
             }
 
             if !warmup {
+                let stats = &self.shared.worker_stats[self.id];
                 for result in &self.results {
-                    self.shared
-                        .responses_received
-                        .fetch_add(1, Ordering::Relaxed);
+                    stats.responses_received.fetch_add(1, Ordering::Relaxed);
                     if result.is_error_response {
-                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
                     }
 
                     if let Some(hit) = result.hit {
                         if hit {
-                            self.shared.hits.fetch_add(1, Ordering::Relaxed);
+                            stats.hits.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            self.shared.misses.fetch_add(1, Ordering::Relaxed);
+                            stats.misses.fetch_add(1, Ordering::Relaxed);
                         }
                     }
 
@@ -576,10 +614,9 @@ impl IoWorker {
                 };
 
                 if sent && !warmup {
-                    self.shared.requests_sent.fetch_add(1, Ordering::Relaxed);
-                    if let Some(stats) = self.shared.worker_stats.get(self.id) {
-                        stats.requests_sent.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.shared.worker_stats[self.id]
+                        .requests_sent
+                        .fetch_add(1, Ordering::Relaxed);
                 }
 
                 if !sent {
@@ -683,18 +720,17 @@ impl IoWorker {
 
                         // Record metrics from parsed responses (outside closure)
                         if !self.warmup {
+                            let stats = &self.shared.worker_stats[self.id];
                             for result in &self.results {
-                                self.shared
-                                    .responses_received
-                                    .fetch_add(1, Ordering::Relaxed);
+                                stats.responses_received.fetch_add(1, Ordering::Relaxed);
                                 if result.is_error_response {
-                                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                                    stats.errors.fetch_add(1, Ordering::Relaxed);
                                 }
                                 if let Some(hit) = result.hit {
                                     if hit {
-                                        self.shared.hits.fetch_add(1, Ordering::Relaxed);
+                                        stats.hits.fetch_add(1, Ordering::Relaxed);
                                     } else {
-                                        self.shared.misses.fetch_add(1, Ordering::Relaxed);
+                                        stats.misses.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 let _ = self.response_latency.increment(result.latency_ns);
@@ -784,6 +820,7 @@ impl IoWorker {
             return;
         }
 
+        let stats = &self.shared.worker_stats[self.id];
         for session in &mut self.sessions {
             self.results.clear();
             if let Err(e) = session.poll_responses(&mut self.results, now) {
@@ -791,18 +828,16 @@ impl IoWorker {
             }
 
             for result in &self.results {
-                self.shared
-                    .responses_received
-                    .fetch_add(1, Ordering::Relaxed);
+                stats.responses_received.fetch_add(1, Ordering::Relaxed);
                 if result.is_error_response {
-                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
                 }
 
                 if let Some(hit) = result.hit {
                     if hit {
-                        self.shared.hits.fetch_add(1, Ordering::Relaxed);
+                        stats.hits.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        self.shared.misses.fetch_add(1, Ordering::Relaxed);
+                        stats.misses.fetch_add(1, Ordering::Relaxed);
                     }
                 }
 

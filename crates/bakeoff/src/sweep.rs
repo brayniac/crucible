@@ -78,8 +78,10 @@ impl Experiment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerEngine {
-    /// Native runtime with io_uring
-    Uring,
+    /// Native runtime with io_uring (singleshot recv - zero-copy)
+    UringSingleshot,
+    /// Native runtime with io_uring (multishot recv - 1 copy)
+    UringMultishot,
     /// Native runtime with mio (epoll)
     Mio,
     /// Tokio async runtime
@@ -89,7 +91,8 @@ pub enum ServerEngine {
 impl ServerEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ServerEngine::Uring => "uring",
+            ServerEngine::UringSingleshot => "uring-singleshot",
+            ServerEngine::UringMultishot => "uring-multishot",
             ServerEngine::Mio => "mio",
             ServerEngine::Tokio => "tokio",
         }
@@ -98,7 +101,9 @@ impl ServerEngine {
     /// Returns the runtime config value
     pub fn runtime(&self) -> &'static str {
         match self {
-            ServerEngine::Uring | ServerEngine::Mio => "native",
+            ServerEngine::UringSingleshot | ServerEngine::UringMultishot | ServerEngine::Mio => {
+                "native"
+            }
             ServerEngine::Tokio => "tokio",
         }
     }
@@ -106,9 +111,18 @@ impl ServerEngine {
     /// Returns the io_engine config value (only relevant for native runtime)
     pub fn io_engine(&self) -> &'static str {
         match self {
-            ServerEngine::Uring => "uring",
+            ServerEngine::UringSingleshot | ServerEngine::UringMultishot => "uring",
             ServerEngine::Mio => "mio",
             ServerEngine::Tokio => "auto", // not used for tokio runtime
+        }
+    }
+
+    /// Returns the recv_mode config value (only relevant for uring)
+    pub fn recv_mode(&self) -> Option<&'static str> {
+        match self {
+            ServerEngine::UringSingleshot => Some("singleshot"),
+            ServerEngine::UringMultishot => Some("multishot"),
+            ServerEngine::Mio | ServerEngine::Tokio => None,
         }
     }
 }
@@ -117,15 +131,32 @@ impl ServerEngine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientEngine {
-    Uring,
+    UringSingleshot,
+    UringMultishot,
     Mio,
 }
 
 impl ClientEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ClientEngine::Uring => "uring",
+            ClientEngine::UringSingleshot => "uring-singleshot",
+            ClientEngine::UringMultishot => "uring-multishot",
             ClientEngine::Mio => "mio",
+        }
+    }
+
+    pub fn io_engine(&self) -> &'static str {
+        match self {
+            ClientEngine::UringSingleshot | ClientEngine::UringMultishot => "uring",
+            ClientEngine::Mio => "mio",
+        }
+    }
+
+    pub fn recv_mode(&self) -> Option<&'static str> {
+        match self {
+            ClientEngine::UringSingleshot => Some("singleshot"),
+            ClientEngine::UringMultishot => Some("multishot"),
+            ClientEngine::Mio => None,
         }
     }
 }
@@ -140,25 +171,37 @@ pub struct IoExperiment {
 impl IoExperiment {
     pub fn all() -> Vec<IoExperiment> {
         vec![
+            // uring-singleshot server (zero-copy)
             IoExperiment {
-                server: ServerEngine::Uring,
-                client: ClientEngine::Uring,
+                server: ServerEngine::UringSingleshot,
+                client: ClientEngine::UringSingleshot,
             },
             IoExperiment {
-                server: ServerEngine::Uring,
+                server: ServerEngine::UringSingleshot,
                 client: ClientEngine::Mio,
+            },
+            // uring-multishot server (1 copy)
+            IoExperiment {
+                server: ServerEngine::UringMultishot,
+                client: ClientEngine::UringMultishot,
+            },
+            IoExperiment {
+                server: ServerEngine::UringMultishot,
+                client: ClientEngine::Mio,
+            },
+            // mio server (epoll)
+            IoExperiment {
+                server: ServerEngine::Mio,
+                client: ClientEngine::UringSingleshot,
             },
             IoExperiment {
                 server: ServerEngine::Mio,
-                client: ClientEngine::Uring,
-            },
-            IoExperiment {
-                server: ServerEngine::Mio,
                 client: ClientEngine::Mio,
             },
+            // tokio server
             IoExperiment {
                 server: ServerEngine::Tokio,
-                client: ClientEngine::Uring,
+                client: ClientEngine::UringSingleshot,
             },
             IoExperiment {
                 server: ServerEngine::Tokio,
@@ -176,14 +219,28 @@ impl IoExperiment {
     }
 
     pub fn extra_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "-p".to_string(),
             format!("server_runtime={}", self.server.runtime()),
             "-p".to_string(),
             format!("server_io_engine={}", self.server.io_engine()),
             "-p".to_string(),
-            format!("client_io_engine={}", self.client.as_str()),
-        ]
+            format!("client_io_engine={}", self.client.io_engine()),
+        ];
+
+        // Add recv_mode for uring server
+        if let Some(recv_mode) = self.server.recv_mode() {
+            args.push("-p".to_string());
+            args.push(format!("server_recv_mode={}", recv_mode));
+        }
+
+        // Add recv_mode for uring client
+        if let Some(recv_mode) = self.client.recv_mode() {
+            args.push("-p".to_string());
+            args.push(format!("client_recv_mode={}", recv_mode));
+        }
+
+        args
     }
 }
 
@@ -274,15 +331,32 @@ pub struct NativeExperiment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NativeEngine {
-    Uring,
+    UringSingleshot,
+    UringMultishot,
     Mio,
 }
 
 impl NativeEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
-            NativeEngine::Uring => "uring",
+            NativeEngine::UringSingleshot => "uring-singleshot",
+            NativeEngine::UringMultishot => "uring-multishot",
             NativeEngine::Mio => "mio",
+        }
+    }
+
+    pub fn io_engine(&self) -> &'static str {
+        match self {
+            NativeEngine::UringSingleshot | NativeEngine::UringMultishot => "uring",
+            NativeEngine::Mio => "mio",
+        }
+    }
+
+    pub fn recv_mode(&self) -> Option<&'static str> {
+        match self {
+            NativeEngine::UringSingleshot => Some("singleshot"),
+            NativeEngine::UringMultishot => Some("multishot"),
+            NativeEngine::Mio => None,
         }
     }
 }
@@ -290,17 +364,28 @@ impl NativeEngine {
 impl NativeExperiment {
     pub fn all() -> Vec<NativeExperiment> {
         vec![
+            // uring-singleshot (zero-copy)
             NativeExperiment {
-                server: NativeEngine::Uring,
-                client: NativeEngine::Uring,
+                server: NativeEngine::UringSingleshot,
+                client: NativeEngine::UringSingleshot,
             },
             NativeExperiment {
-                server: NativeEngine::Uring,
+                server: NativeEngine::UringSingleshot,
                 client: NativeEngine::Mio,
             },
+            // uring-multishot (1 copy)
+            NativeExperiment {
+                server: NativeEngine::UringMultishot,
+                client: NativeEngine::UringMultishot,
+            },
+            NativeExperiment {
+                server: NativeEngine::UringMultishot,
+                client: NativeEngine::Mio,
+            },
+            // mio (epoll)
             NativeExperiment {
                 server: NativeEngine::Mio,
-                client: NativeEngine::Uring,
+                client: NativeEngine::UringSingleshot,
             },
             NativeExperiment {
                 server: NativeEngine::Mio,
@@ -318,14 +403,28 @@ impl NativeExperiment {
     }
 
     pub fn extra_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "-p".to_string(),
             "server_runtime=native".to_string(),
             "-p".to_string(),
-            format!("server_io_engine={}", self.server.as_str()),
+            format!("server_io_engine={}", self.server.io_engine()),
             "-p".to_string(),
-            format!("client_io_engine={}", self.client.as_str()),
-        ]
+            format!("client_io_engine={}", self.client.io_engine()),
+        ];
+
+        // Add recv_mode for uring server
+        if let Some(recv_mode) = self.server.recv_mode() {
+            args.push("-p".to_string());
+            args.push(format!("server_recv_mode={}", recv_mode));
+        }
+
+        // Add recv_mode for uring client
+        if let Some(recv_mode) = self.client.recv_mode() {
+            args.push("-p".to_string());
+            args.push(format!("client_recv_mode={}", recv_mode));
+        }
+
+        args
     }
 }
 

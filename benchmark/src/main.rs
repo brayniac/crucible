@@ -285,10 +285,10 @@ fn run_benchmark(
             tracing::info!("warmup complete, running for {}s", duration.as_secs());
             last_report = Instant::now();
             // Initialize baseline for delta calculations
-            last_responses = shared.responses_received.load(Ordering::Relaxed);
-            last_errors = shared.errors.load(Ordering::Relaxed);
-            last_hits = shared.hits.load(Ordering::Relaxed);
-            last_misses = shared.misses.load(Ordering::Relaxed);
+            last_responses = shared.responses_received();
+            last_errors = shared.errors();
+            last_hits = shared.hits();
+            last_misses = shared.misses();
             last_histogram = RESPONSE_LATENCY.load();
         }
 
@@ -299,10 +299,10 @@ fn run_benchmark(
 
         // Periodic reporting
         if last_report.elapsed() >= report_interval {
-            let responses = shared.responses_received.load(Ordering::Relaxed);
-            let errors = shared.errors.load(Ordering::Relaxed);
-            let hits = shared.hits.load(Ordering::Relaxed);
-            let misses = shared.misses.load(Ordering::Relaxed);
+            let responses = shared.responses_received();
+            let errors = shared.errors();
+            let hits = shared.hits();
+            let misses = shared.misses();
             let active = shared.connections_active.load(Ordering::Relaxed);
             let failed = shared.connections_failed.load(Ordering::Relaxed);
 
@@ -424,11 +424,11 @@ fn run_benchmark(
     }
 
     // Final report
-    let requests = shared.requests_sent.load(Ordering::Relaxed);
-    let responses = shared.responses_received.load(Ordering::Relaxed);
-    let errors = shared.errors.load(Ordering::Relaxed);
-    let hits = shared.hits.load(Ordering::Relaxed);
-    let misses = shared.misses.load(Ordering::Relaxed);
+    let requests = shared.requests_sent();
+    let responses = shared.responses_received();
+    let errors = shared.errors();
+    let hits = shared.hits();
+    let misses = shared.misses();
     let elapsed_secs = duration.as_secs_f64();
 
     let total_gets = hits + misses;

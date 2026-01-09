@@ -157,7 +157,6 @@ pub struct UringDriver {
     /// use-after-free when a connection closes with a pending recv.
     recv_pool: RecvBufferPool,
     pending_completions: Vec<Completion>,
-    buffer_size: usize,
     recv_mode: crate::types::RecvMode,
     /// Generation counter for new connections.
     ///
@@ -244,7 +243,6 @@ impl UringDriver {
             buf_ring,
             recv_pool,
             pending_completions: Vec::with_capacity(256),
-            buffer_size,
             recv_mode,
             next_generation: 0,
         })

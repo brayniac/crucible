@@ -2,6 +2,11 @@ local systemslab = import 'systemslab.libsonnet';
 
 // IO Engine comparison experiment
 // Tests different combinations of server and client IO engines
+//
+// Example usage:
+//   systemslab submit experiments/bakeoff/io-engine.jsonnet \
+//     -p server_io_engine=uring -p server_recv_mode=singleshot \
+//     -p client_io_engine=uring -p client_recv_mode=singleshot
 
 local server_config = {
     runtime: 'native',
@@ -90,11 +95,13 @@ function(
     server_cpu_affinity='0-7',
     server_runtime='native',  // native or tokio
     server_io_engine='auto',  // auto, mio, or uring (only used for native runtime)
+    server_recv_mode='singleshot',  // multishot or singleshot (only used for uring)
 
     // Benchmark parameters
     benchmark_threads='24',
     benchmark_cpu_affinity='8-32',
     client_io_engine='auto',  // auto, mio, or uring
+    client_recv_mode='singleshot',  // multishot or singleshot (only used for uring)
     connections='256',
     pipeline_depth='64',
     key_length='20',
@@ -119,6 +126,8 @@ function(
     assert server_runtime == 'native' || server_runtime == 'tokio' : 'server_runtime must be native or tokio';
     assert server_io_engine == 'auto' || server_io_engine == 'mio' || server_io_engine == 'uring' : 'server_io_engine must be auto, mio, or uring';
     assert client_io_engine == 'auto' || client_io_engine == 'mio' || client_io_engine == 'uring' : 'client_io_engine must be auto, mio, or uring';
+    assert server_recv_mode == 'multishot' || server_recv_mode == 'singleshot' : 'server_recv_mode must be multishot or singleshot';
+    assert client_recv_mode == 'multishot' || client_recv_mode == 'singleshot' : 'client_recv_mode must be multishot or singleshot';
 
     local
         cache_config = server_config {
@@ -131,6 +140,10 @@ function(
             cache+: {
                 heap_size: heap_size,
             },
+            // Add recv_mode to uring config when using uring
+            [if server_io_engine == 'uring' || server_io_engine == 'auto' then 'uring']+: {
+                recv_mode: server_recv_mode,
+            },
         },
 
         warmup_benchmark_config = benchmark_config {
@@ -139,6 +152,7 @@ function(
                 warmup: '0s',
                 threads: benchmark_threads_int,
                 io_engine: client_io_engine,
+                [if client_io_engine == 'uring' || client_io_engine == 'auto' then 'recv_mode']: client_recv_mode,
                 [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
             },
             connection+: {
@@ -166,6 +180,7 @@ function(
                 warmup: '0s',
                 threads: benchmark_threads_int,
                 io_engine: client_io_engine,
+                [if client_io_engine == 'uring' || client_io_engine == 'auto' then 'recv_mode']: client_recv_mode,
                 [if benchmark_cpu_affinity != '' then 'cpu_list']: benchmark_cpu_affinity,
             },
             connection+: {
@@ -187,10 +202,15 @@ function(
             },
         };
 
-    local server_label = if server_runtime == 'tokio' then 'tokio' else server_io_engine;
+    // Build labels that include recv_mode when using uring
+    local server_label = if server_runtime == 'tokio' then 'tokio'
+        else if server_io_engine == 'uring' then 'uring-' + server_recv_mode
+        else server_io_engine;
+    local client_label = if client_io_engine == 'uring' then 'uring-' + client_recv_mode
+        else client_io_engine;
 
     {
-        name: 'io_engine_s' + server_label + '_c' + client_io_engine + '_c' + connections + '_p' + pipeline_depth,
+        name: 'io_engine_c' + client_label + '_s' + server_label + '_c' + connections + '_p' + pipeline_depth,
         jobs: {
             server: {
                 local config = std.manifestTomlEx(cache_config, ''),
