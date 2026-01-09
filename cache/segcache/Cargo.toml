@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Segment-based cache with TTL buckets and configurable eviction"
 
+[features]
+default = []
+validation = ["cache-core/validation"]
+
 [dependencies]
 cache-core = { workspace = true }
 clocksource = { workspace = true }

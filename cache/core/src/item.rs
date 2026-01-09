@@ -95,14 +95,17 @@ impl BasicHeader {
     }
 
     /// Compute checksum for validation.
+    /// Uses XOR of all content bytes plus magic bytes.
+    #[cfg(feature = "validation")]
+    #[inline(always)]
     fn compute_checksum(key_len: u8, optional_len: u8, value_len: u32, is_numeric: bool) -> u8 {
-        let mut checksum = Self::MAGIC0;
-        checksum ^= Self::MAGIC1;
+        // XOR all bytes together: MAGIC0 ^ MAGIC1 ^ key_len ^ optional_len ^ value_bytes ^ numeric_flag
+        // MAGIC0 ^ MAGIC1 = 0xCA ^ 0xCE = 0x04 (constant)
+        let mut checksum = 0x04_u8;
         checksum ^= key_len;
         checksum ^= optional_len;
-        checksum ^= (value_len & 0xFF) as u8;
-        checksum ^= ((value_len >> 8) & 0xFF) as u8;
-        checksum ^= ((value_len >> 16) & 0xFF) as u8;
+        // XOR all 3 bytes of value_len (24 bits)
+        checksum ^= (value_len as u8) ^ ((value_len >> 8) as u8) ^ ((value_len >> 16) as u8);
         if is_numeric {
             checksum ^= 0x55;
         }
@@ -110,13 +113,19 @@ impl BasicHeader {
     }
 
     /// Try to parse header from bytes, returning None if validation fails.
+    #[inline]
     pub fn try_from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < Self::SIZE {
             return None;
         }
 
-        let len = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
-        let flags = data[4];
+        // Load first 8 bytes in one read (includes all header data)
+        // This is safe because we checked len >= SIZE (which is 8 with validation)
+        let ptr = data.as_ptr();
+
+        // Read len (4 bytes) and flags (1 byte) directly
+        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
+        let flags = unsafe { *ptr.add(4) };
 
         let key_len = len as u8;
         let value_len = len >> 8;
@@ -126,11 +135,13 @@ impl BasicHeader {
 
         #[cfg(feature = "validation")]
         {
-            if data[5] != Self::MAGIC0 || data[6] != Self::MAGIC1 {
+            // Check magic bytes with single comparison
+            let magic = unsafe { ptr.add(5).cast::<u16>().read_unaligned() };
+            if magic != u16::from_ne_bytes([Self::MAGIC0, Self::MAGIC1]) {
                 return None;
             }
 
-            let stored_checksum = data[7];
+            let stored_checksum = unsafe { *ptr.add(7) };
             let computed_checksum =
                 Self::compute_checksum(key_len, optional_len, value_len, is_numeric);
             if stored_checksum != computed_checksum {
@@ -145,6 +156,26 @@ impl BasicHeader {
             is_numeric,
             value_len,
         })
+    }
+
+    /// Parse header from bytes without validation checks.
+    /// Only use when you know the data is valid.
+    #[inline]
+    #[cfg(not(feature = "validation"))]
+    pub fn from_bytes_unchecked(data: &[u8]) -> Self {
+        debug_assert!(data.len() >= Self::SIZE);
+        let ptr = data.as_ptr();
+
+        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
+        let flags = unsafe { *ptr.add(4) };
+
+        Self {
+            key_len: len as u8,
+            optional_len: flags & 0x3F,
+            is_deleted: (flags & 0x40) != 0,
+            is_numeric: (flags & 0x80) != 0,
+            value_len: len >> 8,
+        }
     }
 
     /// Parse header from bytes, panicking if validation fails.
@@ -336,6 +367,9 @@ impl TtlHeader {
         }
     }
 
+    /// Compute checksum for validation.
+    #[cfg(feature = "validation")]
+    #[inline(always)]
     fn compute_checksum(
         key_len: u8,
         optional_len: u8,
@@ -343,17 +377,16 @@ impl TtlHeader {
         is_numeric: bool,
         expire_at: u32,
     ) -> u8 {
-        let mut checksum = Self::MAGIC0;
-        checksum ^= Self::MAGIC1;
+        // MAGIC0 ^ MAGIC1 = 0xCA ^ 0xCE = 0x04
+        let mut checksum = 0x04_u8;
         checksum ^= key_len;
         checksum ^= optional_len;
-        checksum ^= (value_len & 0xFF) as u8;
-        checksum ^= ((value_len >> 8) & 0xFF) as u8;
-        checksum ^= ((value_len >> 16) & 0xFF) as u8;
-        checksum ^= (expire_at & 0xFF) as u8;
-        checksum ^= ((expire_at >> 8) & 0xFF) as u8;
-        checksum ^= ((expire_at >> 16) & 0xFF) as u8;
-        checksum ^= ((expire_at >> 24) & 0xFF) as u8;
+        // XOR all bytes of value_len and expire_at
+        checksum ^= (value_len as u8) ^ ((value_len >> 8) as u8) ^ ((value_len >> 16) as u8);
+        checksum ^= (expire_at as u8)
+            ^ ((expire_at >> 8) as u8)
+            ^ ((expire_at >> 16) as u8)
+            ^ ((expire_at >> 24) as u8);
         if is_numeric {
             checksum ^= 0x55;
         }
@@ -361,14 +394,18 @@ impl TtlHeader {
     }
 
     /// Try to parse header from bytes, returning None if validation fails.
+    #[inline]
     pub fn try_from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < Self::SIZE {
             return None;
         }
 
-        let len = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
-        let flags = data[4];
-        let expire_at = u32::from_ne_bytes([data[5], data[6], data[7], data[8]]);
+        let ptr = data.as_ptr();
+
+        // Read len, flags, and expire_at directly
+        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
+        let flags = unsafe { *ptr.add(4) };
+        let expire_at = unsafe { ptr.add(5).cast::<u32>().read_unaligned() };
 
         let key_len = len as u8;
         let value_len = len >> 8;
@@ -378,11 +415,13 @@ impl TtlHeader {
 
         #[cfg(feature = "validation")]
         {
-            if data[9] != Self::MAGIC0 || data[10] != Self::MAGIC1 {
+            // Check magic bytes with single comparison
+            let magic = unsafe { ptr.add(9).cast::<u16>().read_unaligned() };
+            if magic != u16::from_ne_bytes([Self::MAGIC0, Self::MAGIC1]) {
                 return None;
             }
 
-            let stored_checksum = data[11];
+            let stored_checksum = unsafe { *ptr.add(11) };
             let computed_checksum =
                 Self::compute_checksum(key_len, optional_len, value_len, is_numeric, expire_at);
             if stored_checksum != computed_checksum {
@@ -404,6 +443,28 @@ impl TtlHeader {
     pub fn from_bytes(data: &[u8]) -> Self {
         debug_assert!(data.len() >= Self::SIZE);
         Self::try_from_bytes(data).expect("Invalid TtlHeader")
+    }
+
+    /// Parse header from bytes without validation checks.
+    /// Only use when you know the data is valid.
+    #[inline]
+    #[cfg(not(feature = "validation"))]
+    pub fn from_bytes_unchecked(data: &[u8]) -> Self {
+        debug_assert!(data.len() >= Self::SIZE);
+        let ptr = data.as_ptr();
+
+        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
+        let flags = unsafe { *ptr.add(4) };
+        let expire_at = unsafe { ptr.add(5).cast::<u32>().read_unaligned() };
+
+        Self {
+            key_len: len as u8,
+            optional_len: flags & 0x3F,
+            is_deleted: (flags & 0x40) != 0,
+            is_numeric: (flags & 0x80) != 0,
+            value_len: len >> 8,
+            expire_at,
+        }
     }
 
     /// Write header to bytes.

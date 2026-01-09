@@ -8,9 +8,10 @@ repository.workspace = true
 description = "Redesigned cache-core with layer-based architecture"
 
 [features]
-default = ["validation"]
+default = []
 loom = ["dep:loom"]
-# Adds magic bytes and checksums to item headers for corruption detection
+# Adds magic bytes and checksums to item headers for corruption detection.
+# Useful for debugging but adds overhead to every read operation.
 validation = []
 
 [dependencies]

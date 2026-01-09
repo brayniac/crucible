@@ -15,7 +15,6 @@ use crate::layer::{FifoLayer, Layer, TtlLayer};
 use crate::location::Location;
 use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
-use crate::segment::SegmentKeyVerify;
 use crate::slice_segment::SliceSegment;
 use std::sync::Arc;
 use std::time::Duration;
@@ -556,10 +555,19 @@ impl<H: Hashtable> KeyVerifier for CacheKeyVerifier<'_, H> {
 
         // Go directly to pool to avoid layer enum matching overhead
         let pool = layer.pool();
-        if let Some(segment) = pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        let Some(segment) = pool.get(item_loc.segment_id()) else {
+            return false;
+        };
+
+        // Branch once at pool level instead of per-segment
+        if pool.is_per_item_ttl() {
+            segment
+                .verify_key_with_ttl_header(item_loc.offset(), key, allow_deleted)
+                .is_some()
         } else {
-            false
+            segment
+                .verify_key_with_basic_header(item_loc.offset(), key, allow_deleted)
+                .is_some()
         }
     }
 }

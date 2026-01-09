@@ -396,6 +396,88 @@ impl<'a> SliceSegment<'a> {
             &raw[optional_start..optional_end],
         ))
     }
+
+    /// Verify key with BasicHeader (segment-level TTL).
+    /// Use when you know the pool uses segment-level TTL.
+    #[inline]
+    pub fn verify_key_with_basic_header(
+        &self,
+        offset: u32,
+        key: &[u8],
+        allow_deleted: bool,
+    ) -> Option<(u8, u8, u32)> {
+        if offset as usize + BasicHeader::SIZE > self.capacity as usize {
+            return None;
+        }
+
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
+
+        #[cfg(feature = "validation")]
+        let header = BasicHeader::try_from_bytes(header_bytes)?;
+        #[cfg(not(feature = "validation"))]
+        let header = BasicHeader::from_bytes_unchecked(header_bytes);
+
+        if !allow_deleted && header.is_deleted() {
+            return None;
+        }
+
+        let item_size = header.padded_size();
+        if offset as usize + item_size > self.capacity as usize {
+            return None;
+        }
+
+        let key_start = BasicHeader::SIZE + header.optional_len() as usize;
+        let key_end = key_start + header.key_len() as usize;
+
+        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
+        if key_end <= raw.len() && &raw[key_start..key_end] == key {
+            Some((header.key_len(), header.optional_len(), header.value_len()))
+        } else {
+            None
+        }
+    }
+
+    /// Verify key with TtlHeader (per-item TTL).
+    /// Use when you know the pool uses per-item TTL.
+    #[inline]
+    pub fn verify_key_with_ttl_header(
+        &self,
+        offset: u32,
+        key: &[u8],
+        allow_deleted: bool,
+    ) -> Option<(u8, u8, u32)> {
+        if offset as usize + TtlHeader::SIZE > self.capacity as usize {
+            return None;
+        }
+
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
+
+        #[cfg(feature = "validation")]
+        let header = TtlHeader::try_from_bytes(header_bytes)?;
+        #[cfg(not(feature = "validation"))]
+        let header = TtlHeader::from_bytes_unchecked(header_bytes);
+
+        if !allow_deleted && header.is_deleted() {
+            return None;
+        }
+
+        let item_size = header.padded_size();
+        if offset as usize + item_size > self.capacity as usize {
+            return None;
+        }
+
+        let key_start = TtlHeader::SIZE + header.optional_len() as usize;
+        let key_end = key_start + header.key_len() as usize;
+
+        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
+        if key_end <= raw.len() && &raw[key_start..key_end] == key {
+            Some((header.key_len(), header.optional_len(), header.value_len()))
+        } else {
+            None
+        }
+    }
 }
 
 // Implement SegmentKeyVerify
@@ -411,70 +493,10 @@ impl SegmentKeyVerify for SliceSegment<'_> {
         key: &[u8],
         allow_deleted: bool,
     ) -> Option<(u8, u8, u32)> {
-        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-
         if self.is_per_item_ttl() {
-            // Per-item TTL header
-            if offset as usize + TtlHeader::SIZE > self.capacity as usize {
-                return None;
-            }
-
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
-
-            #[cfg(feature = "validation")]
-            let header = TtlHeader::try_from_bytes(header_bytes)?;
-            #[cfg(not(feature = "validation"))]
-            let header = TtlHeader::from_bytes_unchecked(header_bytes);
-
-            if !allow_deleted && header.is_deleted() {
-                return None;
-            }
-
-            let item_size = header.padded_size();
-            if offset as usize + item_size > self.capacity as usize {
-                return None;
-            }
-
-            let key_start = TtlHeader::SIZE + header.optional_len() as usize;
-            let key_end = key_start + header.key_len() as usize;
-
-            let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-            if key_end <= raw.len() && &raw[key_start..key_end] == key {
-                Some((header.key_len(), header.optional_len(), header.value_len()))
-            } else {
-                None
-            }
+            self.verify_key_with_ttl_header(offset, key, allow_deleted)
         } else {
-            // Segment-level TTL header
-            if offset as usize + BasicHeader::SIZE > self.capacity as usize {
-                return None;
-            }
-
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
-
-            #[cfg(feature = "validation")]
-            let header = BasicHeader::try_from_bytes(header_bytes)?;
-            #[cfg(not(feature = "validation"))]
-            let header = BasicHeader::from_bytes_unchecked(header_bytes);
-
-            if !allow_deleted && header.is_deleted() {
-                return None;
-            }
-
-            let item_size = header.padded_size();
-            if offset as usize + item_size > self.capacity as usize {
-                return None;
-            }
-
-            let key_start = BasicHeader::SIZE + header.optional_len() as usize;
-            let key_end = key_start + header.key_len() as usize;
-
-            let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-            if key_end <= raw.len() && &raw[key_start..key_end] == key {
-                Some((header.key_len(), header.optional_len(), header.value_len()))
-            } else {
-                None
-            }
+            self.verify_key_with_basic_header(offset, key, allow_deleted)
         }
     }
 

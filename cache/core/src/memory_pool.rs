@@ -31,6 +31,9 @@ pub struct MemoryPool {
     /// Pool ID (0-3).
     pool_id: u8,
 
+    /// Whether this pool uses per-item TTL (TtlHeader) or segment-level TTL (BasicHeader).
+    is_per_item_ttl: bool,
+
     /// Size of each segment in bytes.
     segment_size: usize,
 }
@@ -46,6 +49,12 @@ impl MemoryPool {
     /// Get the page size that was actually used for the allocation.
     pub fn page_size(&self) -> crate::hugepage::AllocatedPageSize {
         self.heap.page_size()
+    }
+
+    /// Check if this pool uses per-item TTL (TtlHeader) or segment-level TTL (BasicHeader).
+    #[inline]
+    pub fn is_per_item_ttl(&self) -> bool {
+        self.is_per_item_ttl
     }
 }
 
@@ -235,6 +244,7 @@ impl MemoryPoolBuilder {
             segments,
             free_queue,
             pool_id: self.pool_id,
+            is_per_item_ttl: self.is_per_item_ttl,
             segment_size: self.segment_size,
         })
     }

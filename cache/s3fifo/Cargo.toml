@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "S3-FIFO cache with segment-based storage"
 
+[features]
+default = []
+validation = ["cache-core/validation"]
+
 [dependencies]
 cache-core = { workspace = true }
 clocksource = { workspace = true }
