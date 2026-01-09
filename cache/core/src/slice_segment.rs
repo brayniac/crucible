@@ -401,68 +401,125 @@ impl<'a> SliceSegment<'a> {
 // Implement SegmentKeyVerify
 impl SegmentKeyVerify for SliceSegment<'_> {
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
+        self.verify_key_with_header(offset, key, allow_deleted)
+            .is_some()
+    }
+
+    fn verify_key_with_header(
+        &self,
+        offset: u32,
+        key: &[u8],
+        allow_deleted: bool,
+    ) -> Option<(u8, u8, u32)> {
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
 
         if self.is_per_item_ttl() {
             // Per-item TTL header
             if offset as usize + TtlHeader::SIZE > self.capacity as usize {
-                return false;
+                return None;
             }
 
             let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
 
             #[cfg(feature = "validation")]
-            let header = match TtlHeader::try_from_bytes(header_bytes) {
-                Some(h) => h,
-                None => return false,
-            };
+            let header = TtlHeader::try_from_bytes(header_bytes)?;
             #[cfg(not(feature = "validation"))]
             let header = TtlHeader::from_bytes_unchecked(header_bytes);
 
             if !allow_deleted && header.is_deleted() {
-                return false;
+                return None;
             }
 
             let item_size = header.padded_size();
             if offset as usize + item_size > self.capacity as usize {
-                return false;
+                return None;
             }
 
             let key_start = TtlHeader::SIZE + header.optional_len() as usize;
             let key_end = key_start + header.key_len() as usize;
 
             let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-            key_end <= raw.len() && &raw[key_start..key_end] == key
+            if key_end <= raw.len() && &raw[key_start..key_end] == key {
+                Some((header.key_len(), header.optional_len(), header.value_len()))
+            } else {
+                None
+            }
         } else {
             // Segment-level TTL header
             if offset as usize + BasicHeader::SIZE > self.capacity as usize {
-                return false;
+                return None;
             }
 
             let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
 
             #[cfg(feature = "validation")]
-            let header = match BasicHeader::try_from_bytes(header_bytes) {
-                Some(h) => h,
-                None => return false,
-            };
+            let header = BasicHeader::try_from_bytes(header_bytes)?;
             #[cfg(not(feature = "validation"))]
             let header = BasicHeader::from_bytes_unchecked(header_bytes);
 
             if !allow_deleted && header.is_deleted() {
-                return false;
+                return None;
             }
 
             let item_size = header.padded_size();
             if offset as usize + item_size > self.capacity as usize {
-                return false;
+                return None;
             }
 
             let key_start = BasicHeader::SIZE + header.optional_len() as usize;
             let key_end = key_start + header.key_len() as usize;
 
             let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-            key_end <= raw.len() && &raw[key_start..key_end] == key
+            if key_end <= raw.len() && &raw[key_start..key_end] == key {
+                Some((header.key_len(), header.optional_len(), header.value_len()))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn verify_key_unexpired(&self, offset: u32, key: &[u8], now: u32) -> Option<(u8, u8, u32)> {
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+
+        if self.is_per_item_ttl() {
+            // Per-item TTL header - check item's expire_at
+            if offset as usize + TtlHeader::SIZE > self.capacity as usize {
+                return None;
+            }
+
+            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
+
+            #[cfg(feature = "validation")]
+            let header = TtlHeader::try_from_bytes(header_bytes)?;
+            #[cfg(not(feature = "validation"))]
+            let header = TtlHeader::from_bytes_unchecked(header_bytes);
+
+            if header.is_deleted() {
+                return None;
+            }
+
+            // Check per-item expiration
+            if header.is_expired(now) {
+                return None;
+            }
+
+            let item_size = header.padded_size();
+            if offset as usize + item_size > self.capacity as usize {
+                return None;
+            }
+
+            let key_start = TtlHeader::SIZE + header.optional_len() as usize;
+            let key_end = key_start + header.key_len() as usize;
+
+            let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
+            if key_end <= raw.len() && &raw[key_start..key_end] == key {
+                Some((header.key_len(), header.optional_len(), header.value_len()))
+            } else {
+                None
+            }
+        } else {
+            // Segment-level TTL - just verify key, caller checks segment expiration
+            self.verify_key_with_header(offset, key, false)
         }
     }
 }
@@ -753,37 +810,23 @@ impl Segment for SliceSegment<'_> {
             return Ok(false);
         }
 
-        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+        // Verify key and get header info in one parse
+        let (key_len, optional_len, value_len) =
+            match self.verify_key_with_header(offset, key, true) {
+                Some(info) => info,
+                None => return Err(CacheError::KeyMismatch),
+            };
 
-        // Verify key
-        if !self.verify_key_at_offset(offset, key, true) {
-            return Err(CacheError::KeyMismatch);
-        }
-
-        // Get item size for statistics update
-        let item_size = if self.is_per_item_ttl() {
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
-            #[cfg(feature = "validation")]
-            let header = TtlHeader::try_from_bytes(header_bytes);
-            #[cfg(not(feature = "validation"))]
-            let header = Some(TtlHeader::from_bytes_unchecked(header_bytes));
-            match header {
-                Some(h) if !h.is_deleted() => h.padded_size() as u32,
-                _ => return Ok(false),
-            }
-        } else {
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
-            #[cfg(feature = "validation")]
-            let header = BasicHeader::try_from_bytes(header_bytes);
-            #[cfg(not(feature = "validation"))]
-            let header = Some(BasicHeader::from_bytes_unchecked(header_bytes));
-            match header {
-                Some(h) if !h.is_deleted() => h.padded_size() as u32,
-                _ => return Ok(false),
-            }
-        };
+        // Compute padded item size from header info
+        let item_size = ((header_size
+            + optional_len as usize
+            + key_len as usize
+            + value_len as usize
+            + 7)
+            & !7) as u32;
 
         // Set deleted flag (byte 4, bit 6)
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
         let flags_ptr = unsafe { data_ptr.add(4) };
 
         #[cfg(not(feature = "loom"))]
@@ -865,6 +908,64 @@ impl SegmentGuard for SliceSegment<'_> {
         } else {
             self.get_item_guard_basic(offset, key)
         }
+    }
+
+    fn get_item_verified(
+        &self,
+        offset: u32,
+        header_info: (u8, u8, u32),
+    ) -> Result<Self::Guard<'_>, CacheError> {
+        // Check state and increment ref count
+        let state = self.state();
+        if !state.is_readable() {
+            return Err(CacheError::SegmentNotAccessible);
+        }
+
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+
+        // Double-check state after increment
+        let state_after = self.state();
+        if !state_after.is_readable() {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::SegmentNotAccessible);
+        }
+
+        fence(Ordering::Acquire);
+
+        let (key_len, optional_len, value_len) = header_info;
+        let header_size = if self.is_per_item_ttl() {
+            TtlHeader::SIZE
+        } else {
+            BasicHeader::SIZE
+        };
+
+        // Compute padded item size
+        let item_size =
+            (header_size + optional_len as usize + key_len as usize + value_len as usize + 7) & !7;
+
+        // Validate offset bounds
+        if offset as usize + item_size > self.capacity as usize {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::InvalidOffset);
+        }
+
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
+
+        // Compute slice boundaries from header info
+        let optional_start = header_size;
+        let optional_end = optional_start + optional_len as usize;
+        let key_start = optional_end;
+        let key_end = key_start + key_len as usize;
+        let value_start = key_end;
+        let value_end = value_start + value_len as usize;
+
+        Ok(BasicItemGuard::new(
+            &self.ref_count,
+            &raw[key_start..key_end],
+            &raw[value_start..value_end],
+            &raw[optional_start..optional_end],
+        ))
     }
 }
 

@@ -170,13 +170,26 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag {
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load (slot may have changed)
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+
                 let location = Hashbucket::location(packed);
 
                 // Verify key matches using the verifier
@@ -213,13 +226,26 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag {
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load (slot may have changed)
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+
                 let location = Hashbucket::location(packed);
 
                 if verifier.verify(key, location, false) {
@@ -236,10 +262,17 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
-                return Some(Hashbucket::freq(packed));
+            if Hashbucket::is_ghost(speculative) && Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load (slot may have changed)
+                if Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
+                    return Some(Hashbucket::freq(packed));
+                }
             }
         }
 
@@ -257,13 +290,26 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag {
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load (slot may have changed)
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+
                 let location = Hashbucket::location(packed);
 
                 if verifier.verify(key, location, false) {
@@ -285,14 +331,25 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == location {
-                return Some(Hashbucket::freq(packed));
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load (slot may have changed)
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == location {
+                    return Some(Hashbucket::freq(packed));
+                }
             }
         }
 
@@ -312,9 +369,18 @@ impl CuckooHashtable {
 
         // First pass: look for existing entry or matching ghost
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if Hashbucket::tag(packed) == tag {
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize before CAS
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check tag after Acquire load
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+
                 if Hashbucket::is_ghost(packed) {
                     // Replace ghost, preserving frequency
                     let freq = Hashbucket::freq(packed);
@@ -324,7 +390,7 @@ impl CuckooHashtable {
                         packed,
                         new_with_freq,
                         Ordering::Release,
-                        Ordering::Acquire,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => return Some(Ok(None)),
                         Err(_) => continue,
@@ -342,7 +408,7 @@ impl CuckooHashtable {
                         packed,
                         new_with_freq,
                         Ordering::Release,
-                        Ordering::Acquire,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => {
                             return Some(Ok(Some(location)));
@@ -355,10 +421,11 @@ impl CuckooHashtable {
 
         // Second pass: look for empty slot
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Relaxed is sufficient here - CAS will verify the expected value
+            let packed = slot.load(Ordering::Relaxed);
 
             if packed == 0 {
-                match slot.compare_exchange(0, new_packed, Ordering::Release, Ordering::Acquire) {
+                match slot.compare_exchange(0, new_packed, Ordering::Release, Ordering::Relaxed) {
                     Ok(_) => return Some(Ok(None)),
                     Err(_) => continue,
                 }
@@ -367,17 +434,23 @@ impl CuckooHashtable {
 
         // Third pass: look for any ghost to evict
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check ghost status
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if Hashbucket::is_ghost(packed) {
-                match slot.compare_exchange(
-                    packed,
-                    new_packed,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => return Some(Ok(None)),
-                    Err(_) => continue,
+            if Hashbucket::is_ghost(speculative) {
+                // Do Acquire load before CAS
+                let packed = slot.load(Ordering::Acquire);
+
+                if Hashbucket::is_ghost(packed) {
+                    match slot.compare_exchange(
+                        packed,
+                        new_packed,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return Some(Ok(None)),
+                        Err(_) => continue,
+                    }
                 }
             }
         }
@@ -390,16 +463,27 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
-                match slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Acquire) {
-                    Ok(_) => return true,
-                    Err(_) => continue,
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize before CAS
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
+                    match slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Relaxed) {
+                        Ok(_) => return true,
+                        Err(_) => continue,
+                    }
                 }
             }
         }
@@ -412,17 +496,29 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
-                let ghost = Hashbucket::to_ghost(packed);
-                match slot.compare_exchange(packed, ghost, Ordering::Release, Ordering::Acquire) {
-                    Ok(_) => return true,
-                    Err(_) => continue,
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize before CAS
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
+                    let ghost = Hashbucket::to_ghost(packed);
+                    match slot.compare_exchange(packed, ghost, Ordering::Release, Ordering::Relaxed)
+                    {
+                        Ok(_) => return true,
+                        Err(_) => continue,
+                    }
                 }
             }
         }
@@ -442,25 +538,36 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == old_location {
-                let freq = if preserve_freq {
-                    Hashbucket::freq(packed)
-                } else {
-                    1
-                };
-                let new_packed = Hashbucket::pack(tag, freq, new_location);
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize before CAS
+                let packed = slot.load(Ordering::Acquire);
 
-                if slot
-                    .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return true;
+                // Re-check after Acquire load
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == old_location {
+                    let freq = if preserve_freq {
+                        Hashbucket::freq(packed)
+                    } else {
+                        1
+                    };
+                    let new_packed = Hashbucket::pack(tag, freq, new_location);
+
+                    if slot
+                        .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return true;
+                    }
                 }
             }
         }
@@ -479,12 +586,26 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
+
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag {
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+
                 let location = Hashbucket::location(packed);
 
                 if verifier.verify(key, location, false) {
@@ -506,20 +627,27 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
-                let freq = Hashbucket::freq(packed);
-                let new_packed = Hashbucket::pack(tag, freq, location);
+            if Hashbucket::is_ghost(speculative) && Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize before CAS
+                let packed = slot.load(Ordering::Acquire);
 
-                match slot.compare_exchange(
-                    packed,
-                    new_packed,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => return Some(Ok(())),
-                    Err(_) => continue,
+                // Re-check after Acquire load
+                if Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
+                    let freq = Hashbucket::freq(packed);
+                    let new_packed = Hashbucket::pack(tag, freq, location);
+
+                    match slot.compare_exchange(
+                        packed,
+                        new_packed,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return Some(Ok(())),
+                        Err(_) => continue,
+                    }
                 }
             }
         }
@@ -539,7 +667,8 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Relaxed is sufficient here - CAS will verify the expected value
+            let packed = slot.load(Ordering::Relaxed);
 
             if packed == 0 {
                 match slot.compare_exchange(0, new_packed, Ordering::Release, Ordering::Acquire) {
@@ -602,12 +731,26 @@ impl CuckooHashtable {
                     continue;
                 }
 
-                let packed = slot.load(Ordering::Acquire);
-                if packed == 0 || Hashbucket::is_ghost(packed) {
+                // Speculative Relaxed load to check tag
+                let speculative = slot.load(Ordering::Relaxed);
+
+                if speculative == 0 || Hashbucket::is_ghost(speculative) {
                     continue;
                 }
 
-                if Hashbucket::tag(packed) == tag {
+                if Hashbucket::tag(speculative) == tag {
+                    // Tag matches - do Acquire load to synchronize
+                    let packed = slot.load(Ordering::Acquire);
+
+                    // Re-check after Acquire load
+                    if packed == 0 || Hashbucket::is_ghost(packed) {
+                        continue;
+                    }
+
+                    if Hashbucket::tag(packed) != tag {
+                        continue;
+                    }
+
                     let location = Hashbucket::location(packed);
 
                     if verifier.verify(key, location, false) {
@@ -625,17 +768,23 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
+            // Speculative Relaxed load to check ghost status
+            let speculative = slot.load(Ordering::Relaxed);
 
-            if Hashbucket::is_ghost(packed) {
-                match slot.compare_exchange(
-                    packed,
-                    new_packed,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => return Some(Ok(())),
-                    Err(_) => continue,
+            if Hashbucket::is_ghost(speculative) {
+                // Do Acquire load before CAS
+                let packed = slot.load(Ordering::Acquire);
+
+                if Hashbucket::is_ghost(packed) {
+                    match slot.compare_exchange(
+                        packed,
+                        new_packed,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return Some(Ok(())),
+                        Err(_) => continue,
+                    }
                 }
             }
         }
@@ -655,12 +804,26 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
-            let packed = slot.load(Ordering::Acquire);
-            if packed == 0 || Hashbucket::is_ghost(packed) {
+            // Speculative Relaxed load to check tag
+            let speculative = slot.load(Ordering::Relaxed);
+
+            if speculative == 0 || Hashbucket::is_ghost(speculative) {
                 continue;
             }
 
-            if Hashbucket::tag(packed) == tag {
+            if Hashbucket::tag(speculative) == tag {
+                // Tag matches - do Acquire load to synchronize before CAS
+                let packed = slot.load(Ordering::Acquire);
+
+                // Re-check after Acquire load
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+
                 let old_location = Hashbucket::location(packed);
 
                 if verifier.verify(key, old_location, false) {
@@ -671,7 +834,7 @@ impl CuckooHashtable {
                         packed,
                         new_packed,
                         Ordering::Release,
-                        Ordering::Acquire,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => {
                             return Some(Ok(old_location));

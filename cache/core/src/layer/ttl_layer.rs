@@ -330,20 +330,20 @@ impl Layer for TtlLayer {
             return None;
         }
 
-        // Verify key matches (before acquiring ref count)
-        if !segment.verify_key_at_offset(location.offset(), key, false) {
-            return None;
-        }
-
-        // Check if segment is expired (segment-level TTL)
+        // Check segment-level TTL first (cheap atomic read)
         let now = Self::now_secs();
         let expire_at = segment.expire_at();
         if expire_at > 0 && now >= expire_at {
             return None;
         }
 
-        // Get item using SegmentGuard trait
-        segment.get_item(location.offset(), key).ok()
+        // Verify key matches (before acquiring ref count)
+        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
+
+        // Get item using pre-verified header info (single parse path)
+        segment
+            .get_item_verified(location.offset(), header_info)
+            .ok()
     }
 
     fn mark_deleted(&self, location: ItemLocation) {

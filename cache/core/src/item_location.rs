@@ -375,6 +375,30 @@ mod tests {
                 .iter()
                 .any(|(off, k, deleted)| *off == offset && k == key && (allow_deleted || !deleted))
         }
+
+        fn verify_key_with_header(
+            &self,
+            offset: u32,
+            key: &[u8],
+            allow_deleted: bool,
+        ) -> Option<(u8, u8, u32)> {
+            if self.verify_key_at_offset(offset, key, allow_deleted) {
+                // Return mock header values: (key_len, optional_len, value_len)
+                Some((key.len() as u8, 0, 0))
+            } else {
+                None
+            }
+        }
+
+        fn verify_key_unexpired(
+            &self,
+            offset: u32,
+            key: &[u8],
+            _now: u32,
+        ) -> Option<(u8, u8, u32)> {
+            // Mock doesn't track TTL, just verify key
+            self.verify_key_with_header(offset, key, false)
+        }
     }
 
     #[test]

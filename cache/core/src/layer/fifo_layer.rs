@@ -256,24 +256,14 @@ impl Layer for FifoLayer {
             return None;
         }
 
-        // Verify key matches (before acquiring ref count)
-        if !segment.verify_key_at_offset(location.offset(), key, false) {
-            return None;
-        }
-
-        // Check if item is expired (per-item TTL) before getting guard
+        // Verify key matches and check expiration in one parse (before acquiring ref count)
         let now = Self::now_secs();
-        if let Some(remaining) = segment.item_ttl(location.offset(), now) {
-            if remaining.is_zero() {
-                return None;
-            }
-        } else {
-            // No TTL means expired
-            return None;
-        }
+        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
 
-        // Get item using SegmentGuard trait
-        segment.get_item(location.offset(), key).ok()
+        // Get item using pre-verified header info (single parse path)
+        segment
+            .get_item_verified(location.offset(), header_info)
+            .ok()
     }
 
     fn mark_deleted(&self, location: ItemLocation) {

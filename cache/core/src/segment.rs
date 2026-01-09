@@ -33,6 +33,41 @@ pub trait SegmentKeyVerify {
     /// # Returns
     /// `true` if the key matches (and item is not deleted unless `allow_deleted`).
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool;
+
+    /// Verify key and return parsed header info if matched.
+    ///
+    /// This avoids double-parsing when the caller needs header information
+    /// after verification (e.g., for computing item size in delete operations).
+    ///
+    /// # Parameters
+    /// - `offset`: Item offset within the segment
+    /// - `key`: The key to compare against
+    /// - `allow_deleted`: If `true`, matches deleted items
+    ///
+    /// # Returns
+    /// `Some((key_len, optional_len, value_len))` if key matches, `None` otherwise.
+    fn verify_key_with_header(
+        &self,
+        offset: u32,
+        key: &[u8],
+        allow_deleted: bool,
+    ) -> Option<(u8, u8, u32)>;
+
+    /// Verify key and check expiration in one parse.
+    ///
+    /// For segments with per-item TTL (TtlHeader), this checks the item's
+    /// expiration time. For segment-level TTL (BasicHeader), this just
+    /// verifies the key since TTL is checked at the segment level.
+    ///
+    /// # Parameters
+    /// - `offset`: Item offset within the segment
+    /// - `key`: The key to compare against
+    /// - `now`: Current time as coarse seconds since epoch
+    ///
+    /// # Returns
+    /// `Some((key_len, optional_len, value_len))` if key matches and item
+    /// is not expired, `None` otherwise.
+    fn verify_key_unexpired(&self, offset: u32, key: &[u8], now: u32) -> Option<(u8, u8, u32)>;
 }
 
 /// Trait for a cache segment.
@@ -306,6 +341,29 @@ pub trait SegmentGuard: Segment {
     /// # Returns
     /// A guard providing access to key, value, and optional data.
     fn get_item(&self, offset: u32, key: &[u8]) -> Result<Self::Guard<'_>, CacheError>;
+
+    /// Get a zero-copy guard for an item that has already been verified.
+    ///
+    /// This is an optimized path that skips header parsing and key verification,
+    /// using pre-parsed header info from a prior `verify_key_unexpired` call.
+    /// The caller must ensure the item was recently verified and is valid.
+    ///
+    /// # Parameters
+    /// - `offset`: Item offset within the segment
+    /// - `header_info`: Pre-parsed `(key_len, optional_len, value_len)` from verification
+    ///
+    /// # Returns
+    /// A guard providing access to key, value, and optional data.
+    ///
+    /// # Safety
+    /// The caller must ensure:
+    /// - The header_info matches the actual item at offset
+    /// - The item was verified (key match, not deleted, not expired) recently
+    fn get_item_verified(
+        &self,
+        offset: u32,
+        header_info: (u8, u8, u32),
+    ) -> Result<Self::Guard<'_>, CacheError>;
 }
 
 /// Extension trait for segments that support copying items.
