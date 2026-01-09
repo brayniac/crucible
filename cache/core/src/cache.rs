@@ -13,6 +13,7 @@ use crate::item::ItemGuard;
 use crate::item_location::ItemLocation;
 use crate::layer::{FifoLayer, Layer, TtlLayer};
 use crate::location::Location;
+use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
 use crate::segment::SegmentKeyVerify;
 use crate::slice_segment::SliceSegment;
@@ -140,6 +141,17 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.pool().get(segment_id),
             CacheLayer::Ttl(layer) => layer.pool().get(segment_id),
+        }
+    }
+
+    /// Get the memory pool for this layer.
+    ///
+    /// This provides direct access to the pool, which can be used to create
+    /// a `PoolVerifier` for fast key verification without layer indirection.
+    pub fn pool(&self) -> &MemoryPool {
+        match self {
+            CacheLayer::Fifo(layer) => layer.pool(),
+            CacheLayer::Ttl(layer) => layer.pool(),
         }
     }
 
