@@ -1,16 +1,16 @@
 use benchmark::config::Config;
+use benchmark::metrics;
 use benchmark::worker::Phase;
 use benchmark::{AdminServer, IoWorker, IoWorkerConfig, SharedState, parse_cpu_list};
 
 use io_driver::{IoEngine, RecvMode};
 
 use clap::Parser;
-use metriken::{AtomicHistogram, histogram::Histogram, metric};
+use metriken::{AtomicHistogram, histogram::Histogram};
 use ratelimit::Ratelimiter;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -69,25 +69,6 @@ fn parse_recv_mode(s: &str) -> Result<RecvMode, String> {
         )),
     }
 }
-
-// Metrics - using static histograms that workers can reference
-#[metric(
-    name = "response_latency",
-    description = "Response latency histogram (nanoseconds)"
-)]
-static RESPONSE_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
-
-#[metric(
-    name = "get_latency",
-    description = "GET response latency histogram (nanoseconds)"
-)]
-static GET_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
-
-#[metric(
-    name = "set_latency",
-    description = "SET response latency histogram (nanoseconds)"
-)]
-static SET_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -186,7 +167,7 @@ fn run_benchmark(
     let duration = config.general.duration;
 
     // Shared state
-    let shared = Arc::new(SharedState::new(num_threads));
+    let shared = Arc::new(SharedState::new());
 
     // Create shared rate limiter if configured
     let ratelimiter = config.workload.rate_limit.map(|rate| {
@@ -285,11 +266,11 @@ fn run_benchmark(
             tracing::info!("warmup complete, running for {}s", duration.as_secs());
             last_report = Instant::now();
             // Initialize baseline for delta calculations
-            last_responses = shared.responses_received();
-            last_errors = shared.errors();
-            last_hits = shared.hits();
-            last_misses = shared.misses();
-            last_histogram = RESPONSE_LATENCY.load();
+            last_responses = metrics::RESPONSES_RECEIVED.value();
+            last_errors = metrics::REQUEST_ERRORS.value();
+            last_hits = metrics::CACHE_HITS.value();
+            last_misses = metrics::CACHE_MISSES.value();
+            last_histogram = metrics::RESPONSE_LATENCY.load();
         }
 
         // Skip reporting during warmup
@@ -299,12 +280,12 @@ fn run_benchmark(
 
         // Periodic reporting
         if last_report.elapsed() >= report_interval {
-            let responses = shared.responses_received();
-            let errors = shared.errors();
-            let hits = shared.hits();
-            let misses = shared.misses();
-            let active = shared.connections_active.load(Ordering::Relaxed);
-            let failed = shared.connections_failed.load(Ordering::Relaxed);
+            let responses = metrics::RESPONSES_RECEIVED.value();
+            let errors = metrics::REQUEST_ERRORS.value();
+            let hits = metrics::CACHE_HITS.value();
+            let misses = metrics::CACHE_MISSES.value();
+            let active = metrics::CONNECTIONS_ACTIVE.value();
+            let failed = metrics::CONNECTIONS_FAILED.value();
 
             let elapsed_secs = last_report.elapsed().as_secs_f64();
 
@@ -330,7 +311,7 @@ fn run_benchmark(
             last_misses = misses;
 
             // Get percentiles from delta histogram (this interval only)
-            let current_histogram = RESPONSE_LATENCY.load();
+            let current_histogram = metrics::RESPONSE_LATENCY.load();
             let (p50, p99, p999) = match (&current_histogram, &last_histogram) {
                 (Some(current), Some(previous)) => {
                     if let Ok(delta) = current.wrapping_sub(previous) {
@@ -367,12 +348,12 @@ fn run_benchmark(
             // Report disconnect reasons when connections have failed
             let delta_failed = failed - last_failed;
             if delta_failed > 0 {
-                let eof = shared.disconnects_eof.load(Ordering::Relaxed);
-                let recv_err = shared.disconnects_recv_error.load(Ordering::Relaxed);
-                let send_err = shared.disconnects_send_error.load(Ordering::Relaxed);
-                let closed = shared.disconnects_closed_event.load(Ordering::Relaxed);
-                let error_evt = shared.disconnects_error_event.load(Ordering::Relaxed);
-                let connect_failed = shared.disconnects_connect_failed.load(Ordering::Relaxed);
+                let eof = metrics::DISCONNECTS_EOF.value();
+                let recv_err = metrics::DISCONNECTS_RECV_ERROR.value();
+                let send_err = metrics::DISCONNECTS_SEND_ERROR.value();
+                let closed = metrics::DISCONNECTS_CLOSED_EVENT.value();
+                let error_evt = metrics::DISCONNECTS_ERROR_EVENT.value();
+                let connect_failed = metrics::DISCONNECTS_CONNECT_FAILED.value();
 
                 let d_eof = eof - last_eof;
                 let d_recv = recv_err - last_recv_err;
@@ -401,19 +382,6 @@ fn run_benchmark(
             }
             last_failed = failed;
 
-            // Print per-worker stats for diagnostics
-            if std::env::var("CRUCIBLE_DIAGNOSTICS")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                let worker_rates: Vec<u64> = shared
-                    .worker_stats
-                    .iter()
-                    .map(|s| s.requests_sent.load(Ordering::Relaxed))
-                    .collect();
-                tracing::info!("per-worker requests: {:?}", worker_rates);
-            }
-
             last_report = Instant::now();
         }
     }
@@ -424,11 +392,11 @@ fn run_benchmark(
     }
 
     // Final report
-    let requests = shared.requests_sent();
-    let responses = shared.responses_received();
-    let errors = shared.errors();
-    let hits = shared.hits();
-    let misses = shared.misses();
+    let requests = metrics::REQUESTS_SENT.value();
+    let responses = metrics::RESPONSES_RECEIVED.value();
+    let errors = metrics::REQUEST_ERRORS.value();
+    let hits = metrics::CACHE_HITS.value();
+    let misses = metrics::CACHE_MISSES.value();
     let elapsed_secs = duration.as_secs_f64();
 
     let total_gets = hits + misses;
@@ -438,10 +406,10 @@ fn run_benchmark(
         0.0
     };
 
-    let p50 = percentile(&RESPONSE_LATENCY, 50.0);
-    let p99 = percentile(&RESPONSE_LATENCY, 99.0);
-    let p999 = percentile(&RESPONSE_LATENCY, 99.9);
-    let p9999 = percentile(&RESPONSE_LATENCY, 99.99);
+    let p50 = percentile(&metrics::RESPONSE_LATENCY, 50.0);
+    let p99 = percentile(&metrics::RESPONSE_LATENCY, 99.0);
+    let p999 = percentile(&metrics::RESPONSE_LATENCY, 99.9);
+    let p9999 = percentile(&metrics::RESPONSE_LATENCY, 99.99);
 
     tracing::info!("=== Final Results ===");
     tracing::info!("total_requests: {}", requests);
@@ -460,17 +428,17 @@ fn run_benchmark(
     tracing::info!("latency p99.99: {:.2} us", p9999 / 1000.0);
 
     // Report final disconnect reason breakdown
-    let total_failed = shared.connections_failed.load(Ordering::Relaxed);
+    let total_failed = metrics::CONNECTIONS_FAILED.value();
     if total_failed > 0 {
         tracing::info!(
             "disconnects: {} (eof={} recv_err={} send_err={} closed={} error={} connect_failed={})",
             total_failed,
-            shared.disconnects_eof.load(Ordering::Relaxed),
-            shared.disconnects_recv_error.load(Ordering::Relaxed),
-            shared.disconnects_send_error.load(Ordering::Relaxed),
-            shared.disconnects_closed_event.load(Ordering::Relaxed),
-            shared.disconnects_error_event.load(Ordering::Relaxed),
-            shared.disconnects_connect_failed.load(Ordering::Relaxed),
+            metrics::DISCONNECTS_EOF.value(),
+            metrics::DISCONNECTS_RECV_ERROR.value(),
+            metrics::DISCONNECTS_SEND_ERROR.value(),
+            metrics::DISCONNECTS_CLOSED_EVENT.value(),
+            metrics::DISCONNECTS_ERROR_EVENT.value(),
+            metrics::DISCONNECTS_CONNECT_FAILED.value(),
         );
     }
 
@@ -490,9 +458,6 @@ fn run_worker(
         config,
         shared: Arc::clone(&shared),
         ratelimiter,
-        response_latency: &RESPONSE_LATENCY,
-        get_latency: &GET_LATENCY,
-        set_latency: &SET_LATENCY,
         warmup: true,
     };
 

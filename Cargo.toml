@@ -29,6 +29,9 @@ members = [
 
 	# Experiment Driver
 	"crates/bakeoff",
+
+	# Metrics
+	"metrics",
 ]
 
 [workspace.package]
@@ -80,6 +83,7 @@ protocol-memcache = { path = "protocol/memcache" }
 cache-core = { path = "cache/core" }
 segcache = { path = "cache/segcache" }
 s3fifo = { path = "cache/s3fifo" }
+metrics = { path = "metrics" }
 
 # Platform-specific (Linux io_uring)
 io-uring = "0.7"

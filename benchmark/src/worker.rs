@@ -6,10 +6,10 @@
 
 use crate::client::{MomentoSession, RequestResult, RequestType, Session};
 use crate::config::{Config, Protocol as CacheProtocol};
+use crate::metrics;
 
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver, RecvBuf};
 
-use metriken::AtomicHistogram;
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use ratelimit::Ratelimiter;
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 /// Test phase, controlled by main thread and read by workers.
@@ -74,66 +74,16 @@ pub enum DisconnectReason {
     ConnectFailed,
 }
 
-/// Per-worker statistics - each worker has its own counters to avoid contention.
-#[repr(align(128))] // Cache line alignment to prevent false sharing
-pub struct WorkerStats {
-    pub requests_sent: AtomicU64,
-    pub responses_received: AtomicU64,
-    pub errors: AtomicU64,
-    pub hits: AtomicU64,
-    pub misses: AtomicU64,
-}
-
-impl WorkerStats {
-    pub fn new() -> Self {
-        Self {
-            requests_sent: AtomicU64::new(0),
-            responses_received: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        }
-    }
-}
-
-impl Default for WorkerStats {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Shared state between workers and main thread.
 pub struct SharedState {
     /// Current test phase (controlled by main thread)
-    pub phase: AtomicU8,
-    /// Per-worker statistics - workers increment their own index to avoid contention
-    pub worker_stats: Vec<WorkerStats>,
-    /// Connections currently active (low-contention, kept as shared)
-    pub connections_active: AtomicU64,
-    /// Connections that have disconnected (low-contention, kept as shared)
-    pub connections_failed: AtomicU64,
-    /// Disconnect reasons (low-contention, kept as shared)
-    pub disconnects_eof: AtomicU64,
-    pub disconnects_recv_error: AtomicU64,
-    pub disconnects_send_error: AtomicU64,
-    pub disconnects_closed_event: AtomicU64,
-    pub disconnects_error_event: AtomicU64,
-    pub disconnects_connect_failed: AtomicU64,
+    phase: AtomicU8,
 }
 
 impl SharedState {
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             phase: AtomicU8::new(Phase::Connect as u8),
-            worker_stats: (0..num_workers).map(|_| WorkerStats::new()).collect(),
-            connections_active: AtomicU64::new(0),
-            connections_failed: AtomicU64::new(0),
-            disconnects_eof: AtomicU64::new(0),
-            disconnects_recv_error: AtomicU64::new(0),
-            disconnects_send_error: AtomicU64::new(0),
-            disconnects_closed_event: AtomicU64::new(0),
-            disconnects_error_event: AtomicU64::new(0),
-            disconnects_connect_failed: AtomicU64::new(0),
         }
     }
 
@@ -148,56 +98,11 @@ impl SharedState {
     pub fn set_phase(&self, phase: Phase) {
         self.phase.store(phase as u8, Ordering::Release);
     }
-
-    /// Aggregate requests_sent across all workers.
-    #[inline]
-    pub fn requests_sent(&self) -> u64 {
-        self.worker_stats
-            .iter()
-            .map(|s| s.requests_sent.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    /// Aggregate responses_received across all workers.
-    #[inline]
-    pub fn responses_received(&self) -> u64 {
-        self.worker_stats
-            .iter()
-            .map(|s| s.responses_received.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    /// Aggregate errors across all workers.
-    #[inline]
-    pub fn errors(&self) -> u64 {
-        self.worker_stats
-            .iter()
-            .map(|s| s.errors.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    /// Aggregate hits across all workers.
-    #[inline]
-    pub fn hits(&self) -> u64 {
-        self.worker_stats
-            .iter()
-            .map(|s| s.hits.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    /// Aggregate misses across all workers.
-    #[inline]
-    pub fn misses(&self) -> u64 {
-        self.worker_stats
-            .iter()
-            .map(|s| s.misses.load(Ordering::Relaxed))
-            .sum()
-    }
 }
 
 impl Default for SharedState {
     fn default() -> Self {
-        Self::new(0)
+        Self::new()
     }
 }
 
@@ -207,9 +112,6 @@ pub struct IoWorkerConfig {
     pub config: Config,
     pub shared: Arc<SharedState>,
     pub ratelimiter: Option<Arc<Ratelimiter>>,
-    pub response_latency: &'static AtomicHistogram,
-    pub get_latency: &'static AtomicHistogram,
-    pub set_latency: &'static AtomicHistogram,
     pub warmup: bool,
 }
 
@@ -218,7 +120,6 @@ pub struct IoWorker {
     id: usize,
     driver: Box<dyn IoDriver>,
     config: Config,
-    shared: Arc<SharedState>,
 
     /// Sessions (stable storage)
     sessions: Vec<Session>,
@@ -240,10 +141,7 @@ pub struct IoWorker {
     /// Rate limiting
     ratelimiter: Option<Arc<Ratelimiter>>,
 
-    /// Metrics
-    response_latency: &'static AtomicHistogram,
-    get_latency: &'static AtomicHistogram,
-    set_latency: &'static AtomicHistogram,
+    /// Whether we're in warmup mode (don't record metrics)
     warmup: bool,
 }
 
@@ -295,7 +193,6 @@ impl IoWorker {
             id: cfg.id,
             driver,
             config: cfg.config,
-            shared: cfg.shared,
             sessions: Vec::new(),
             conn_id_to_idx: HashMap::new(),
             momento_sessions: Vec::new(),
@@ -304,9 +201,6 @@ impl IoWorker {
             value_buf,
             results: Vec::with_capacity(pipeline_depth),
             ratelimiter: cfg.ratelimiter,
-            response_latency: cfg.response_latency,
-            get_latency: cfg.get_latency,
-            set_latency: cfg.set_latency,
             warmup: cfg.warmup,
         })
     }
@@ -345,9 +239,7 @@ impl IoWorker {
 
             match self.connect_one(endpoint) {
                 Ok(()) => {
-                    self.shared
-                        .connections_active
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics::CONNECTIONS_ACTIVE.increment();
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -356,9 +248,7 @@ impl IoWorker {
                         endpoint,
                         e
                     );
-                    self.shared
-                        .connections_failed
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics::CONNECTIONS_FAILED.increment();
                     // Create disconnected session for reconnection attempts
                     let session = Session::from_config(endpoint, &self.config);
                     self.sessions.push(session);
@@ -389,18 +279,14 @@ impl IoWorker {
                 Ok(mut session) => {
                     if let Err(e) = session.connect() {
                         tracing::warn!("failed to connect Momento session: {}", e);
-                        self.shared
-                            .connections_failed
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics::CONNECTIONS_FAILED.increment();
                     }
                     // Add session even if connect failed - we'll retry in poll_once
                     self.momento_sessions.push(session);
                 }
                 Err(e) => {
                     tracing::error!("failed to create Momento session: {}", e);
-                    self.shared
-                        .connections_failed
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics::CONNECTIONS_FAILED.increment();
                 }
             }
         }
@@ -495,9 +381,7 @@ impl IoWorker {
             if !session.is_connected() {
                 match session.drive() {
                     Ok(true) => {
-                        self.shared
-                            .connections_active
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics::CONNECTIONS_ACTIVE.increment();
                     }
                     Ok(false) => continue, // Still connecting
                     Err(e) => {
@@ -528,9 +412,7 @@ impl IoWorker {
                 };
 
                 if sent && !warmup {
-                    self.shared.worker_stats[self.id]
-                        .requests_sent
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics::REQUESTS_SENT.increment();
                 }
 
                 if !sent {
@@ -546,29 +428,28 @@ impl IoWorker {
             }
 
             if !warmup {
-                let stats = &self.shared.worker_stats[self.id];
                 for result in &self.results {
-                    stats.responses_received.fetch_add(1, Ordering::Relaxed);
+                    metrics::RESPONSES_RECEIVED.increment();
                     if result.is_error_response {
-                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                        metrics::REQUEST_ERRORS.increment();
                     }
 
                     if let Some(hit) = result.hit {
                         if hit {
-                            stats.hits.fetch_add(1, Ordering::Relaxed);
+                            metrics::CACHE_HITS.increment();
                         } else {
-                            stats.misses.fetch_add(1, Ordering::Relaxed);
+                            metrics::CACHE_MISSES.increment();
                         }
                     }
 
-                    let _ = self.response_latency.increment(result.latency_ns);
+                    let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
 
                     match result.request_type {
                         RequestType::Get => {
-                            let _ = self.get_latency.increment(result.latency_ns);
+                            let _ = metrics::GET_LATENCY.increment(result.latency_ns);
                         }
                         RequestType::Set => {
-                            let _ = self.set_latency.increment(result.latency_ns);
+                            let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                         }
                         _ => {}
                     }
@@ -614,9 +495,7 @@ impl IoWorker {
                 };
 
                 if sent && !warmup {
-                    self.shared.worker_stats[self.id]
-                        .requests_sent
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics::REQUESTS_SENT.increment();
                 }
 
                 if !sent {
@@ -670,12 +549,6 @@ impl IoWorker {
         // Close failed sessions after iteration
         for idx in to_close {
             self.close_session(idx, DisconnectReason::SendError);
-            self.shared
-                .connections_active
-                .fetch_sub(1, Ordering::Relaxed);
-            self.shared
-                .connections_failed
-                .fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -720,26 +593,25 @@ impl IoWorker {
 
                         // Record metrics from parsed responses (outside closure)
                         if !self.warmup {
-                            let stats = &self.shared.worker_stats[self.id];
                             for result in &self.results {
-                                stats.responses_received.fetch_add(1, Ordering::Relaxed);
+                                metrics::RESPONSES_RECEIVED.increment();
                                 if result.is_error_response {
-                                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                                    metrics::REQUEST_ERRORS.increment();
                                 }
                                 if let Some(hit) = result.hit {
                                     if hit {
-                                        stats.hits.fetch_add(1, Ordering::Relaxed);
+                                        metrics::CACHE_HITS.increment();
                                     } else {
-                                        stats.misses.fetch_add(1, Ordering::Relaxed);
+                                        metrics::CACHE_MISSES.increment();
                                     }
                                 }
-                                let _ = self.response_latency.increment(result.latency_ns);
+                                let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
                                 match result.request_type {
                                     RequestType::Get => {
-                                        let _ = self.get_latency.increment(result.latency_ns);
+                                        let _ = metrics::GET_LATENCY.increment(result.latency_ns);
                                     }
                                     RequestType::Set => {
-                                        let _ = self.set_latency.increment(result.latency_ns);
+                                        let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                                     }
                                     _ => {}
                                 }
@@ -798,12 +670,6 @@ impl IoWorker {
         // Close failed sessions after processing all completions
         for (idx, reason) in to_close {
             self.close_session(idx, reason);
-            self.shared
-                .connections_active
-                .fetch_sub(1, Ordering::Relaxed);
-            self.shared
-                .connections_failed
-                .fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -820,7 +686,6 @@ impl IoWorker {
             return;
         }
 
-        let stats = &self.shared.worker_stats[self.id];
         for session in &mut self.sessions {
             self.results.clear();
             if let Err(e) = session.poll_responses(&mut self.results, now) {
@@ -828,27 +693,27 @@ impl IoWorker {
             }
 
             for result in &self.results {
-                stats.responses_received.fetch_add(1, Ordering::Relaxed);
+                metrics::RESPONSES_RECEIVED.increment();
                 if result.is_error_response {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                    metrics::REQUEST_ERRORS.increment();
                 }
 
                 if let Some(hit) = result.hit {
                     if hit {
-                        stats.hits.fetch_add(1, Ordering::Relaxed);
+                        metrics::CACHE_HITS.increment();
                     } else {
-                        stats.misses.fetch_add(1, Ordering::Relaxed);
+                        metrics::CACHE_MISSES.increment();
                     }
                 }
 
-                let _ = self.response_latency.increment(result.latency_ns);
+                let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
 
                 match result.request_type {
                     RequestType::Get => {
-                        let _ = self.get_latency.increment(result.latency_ns);
+                        let _ = metrics::GET_LATENCY.increment(result.latency_ns);
                     }
                     RequestType::Set => {
-                        let _ = self.set_latency.increment(result.latency_ns);
+                        let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                     }
                     _ => {}
                 }
@@ -910,9 +775,7 @@ impl IoWorker {
 
                             self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
 
-                            self.shared
-                                .connections_active
-                                .fetch_add(1, Ordering::Relaxed);
+                            metrics::CONNECTIONS_ACTIVE.increment();
                         }
                         Err(_) => {
                             self.sessions[idx].reconnect_attempted(false);
@@ -936,35 +799,28 @@ impl IoWorker {
         }
         session.disconnect();
 
+        // Track connection state
+        metrics::CONNECTIONS_FAILED.increment();
+
         // Track disconnect reason
         match reason {
             DisconnectReason::Eof => {
-                self.shared.disconnects_eof.fetch_add(1, Ordering::Relaxed);
+                metrics::DISCONNECTS_EOF.increment();
             }
             DisconnectReason::RecvError => {
-                self.shared
-                    .disconnects_recv_error
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics::DISCONNECTS_RECV_ERROR.increment();
             }
             DisconnectReason::SendError => {
-                self.shared
-                    .disconnects_send_error
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics::DISCONNECTS_SEND_ERROR.increment();
             }
             DisconnectReason::ClosedEvent => {
-                self.shared
-                    .disconnects_closed_event
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics::DISCONNECTS_CLOSED_EVENT.increment();
             }
             DisconnectReason::ErrorEvent => {
-                self.shared
-                    .disconnects_error_event
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics::DISCONNECTS_ERROR_EVENT.increment();
             }
             DisconnectReason::ConnectFailed => {
-                self.shared
-                    .disconnects_connect_failed
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics::DISCONNECTS_CONNECT_FAILED.increment();
             }
         }
     }

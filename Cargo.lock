@@ -362,6 +362,7 @@ dependencies = [
  "io-driver",
  "itoa",
  "libc",
+ "metrics",
  "metriken",
  "metriken-exposition",
  "protocol-memcache",
@@ -1310,6 +1311,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics"
+version = "0.1.0"
+dependencies = [
+ "metriken",
+]
+
+[[package]]
 name = "metriken"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2095,6 +2103,7 @@ dependencies = [
  "io-driver",
  "itoa",
  "libc",
+ "metrics",
  "metriken",
  "num_cpus",
  "protocol-memcache",

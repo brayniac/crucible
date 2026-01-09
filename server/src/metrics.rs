@@ -1,14 +1,46 @@
 //! Cache server metrics.
 
-use metriken::{Counter, Gauge, metric};
+use metrics::{Counter, CounterGroup};
+use metriken::{Gauge, metric};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// Counter groups (sharded storage)
+static CONNECTION: CounterGroup = CounterGroup::new();
+static REQUEST: CounterGroup = CounterGroup::new();
+static CACHE: CounterGroup = CounterGroup::new();
+static ERROR: CounterGroup = CounterGroup::new();
+
+/// Counter slot indices for connection metrics.
+pub mod connection {
+    pub const ACCEPTED: usize = 0;
+}
+
+/// Counter slot indices for request metrics.
+pub mod request {
+    pub const GETS: usize = 0;
+    pub const SETS: usize = 1;
+    pub const DELETES: usize = 2;
+    pub const FLUSHES: usize = 3;
+}
+
+/// Counter slot indices for cache metrics.
+pub mod cache {
+    pub const HITS: usize = 0;
+    pub const MISSES: usize = 1;
+}
+
+/// Counter slot indices for error metrics.
+pub mod error {
+    pub const SET_ERRORS: usize = 0;
+    pub const PROTOCOL_ERRORS: usize = 1;
+}
 
 // Connection metrics
 #[metric(
     name = "connections_accepted",
     description = "Total number of connections accepted"
 )]
-pub static CONNECTIONS_ACCEPTED: Counter = Counter::new();
+pub static CONNECTIONS_ACCEPTED: Counter = Counter::new(&CONNECTION, connection::ACCEPTED);
 
 #[metric(
     name = "connections_active",
@@ -18,33 +50,33 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
 // Operation counters
 #[metric(name = "cache_gets", description = "Total GET operations")]
-pub static GETS: Counter = Counter::new();
+pub static GETS: Counter = Counter::new(&REQUEST, request::GETS);
 
 #[metric(name = "cache_sets", description = "Total SET operations")]
-pub static SETS: Counter = Counter::new();
+pub static SETS: Counter = Counter::new(&REQUEST, request::SETS);
 
 #[metric(name = "cache_deletes", description = "Total DELETE operations")]
-pub static DELETES: Counter = Counter::new();
+pub static DELETES: Counter = Counter::new(&REQUEST, request::DELETES);
 
 #[metric(name = "cache_flushes", description = "Total FLUSH operations")]
-pub static FLUSHES: Counter = Counter::new();
+pub static FLUSHES: Counter = Counter::new(&REQUEST, request::FLUSHES);
 
 // Cache effectiveness
 #[metric(name = "cache_hits", description = "Total cache hits")]
-pub static HITS: Counter = Counter::new();
+pub static HITS: Counter = Counter::new(&CACHE, cache::HITS);
 
 #[metric(name = "cache_misses", description = "Total cache misses")]
-pub static MISSES: Counter = Counter::new();
+pub static MISSES: Counter = Counter::new(&CACHE, cache::MISSES);
 
 // Errors
 #[metric(
     name = "cache_set_errors",
     description = "Total SET errors (cache full)"
 )]
-pub static SET_ERRORS: Counter = Counter::new();
+pub static SET_ERRORS: Counter = Counter::new(&ERROR, error::SET_ERRORS);
 
 #[metric(name = "protocol_errors", description = "Total protocol parse errors")]
-pub static PROTOCOL_ERRORS: Counter = Counter::new();
+pub static PROTOCOL_ERRORS: Counter = Counter::new(&ERROR, error::PROTOCOL_ERRORS);
 
 /// Reason for closing a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

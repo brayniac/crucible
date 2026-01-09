@@ -44,6 +44,7 @@ num_cpus = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 
 # Metrics
+metrics = { workspace = true }
 metriken = { workspace = true }
 
 # Tokio runtime (optional)
