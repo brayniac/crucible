@@ -837,6 +837,15 @@ impl UringDriver {
                 bytes: result as usize,
             }));
     }
+
+    /// Complete deferred close for a connection after all sends finish.
+    fn finish_deferred_close(&mut self, conn_id: usize) {
+        if let Some(conn) = self.connections.try_remove(conn_id) {
+            // fd was already closed and deregistered in close()
+            // Just drop the connection to free the send buffers
+            drop(conn);
+        }
+    }
 }
 
 impl IoDriver for UringDriver {
@@ -1206,15 +1215,6 @@ impl IoDriver for UringDriver {
             }
         }
         Ok(())
-    }
-
-    /// Complete deferred close for a connection after all sends finish.
-    fn finish_deferred_close(&mut self, conn_id: usize) {
-        if let Some(conn) = self.connections.try_remove(conn_id) {
-            // fd was already closed and deregistered in close()
-            // Just drop the connection to free the send buffers
-            drop(conn);
-        }
     }
 
     fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
