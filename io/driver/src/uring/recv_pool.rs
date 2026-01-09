@@ -97,7 +97,9 @@ impl RecvBufferPool {
         if let Some(buffer) = self.buffers.get_mut(buf_id as usize) {
             buffer.conn_id = None;
             buffer.generation = 0;
-            self.free_list.push_back(buf_id);
+            // Use push_front for LIFO behavior - recently freed buffers
+            // are more likely to be cache-hot
+            self.free_list.push_front(buf_id);
         }
     }
 
