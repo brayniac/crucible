@@ -210,6 +210,10 @@ pub struct TieredCache<H: Hashtable> {
     /// Cache layers (index 0 is the admission layer).
     layers: Vec<CacheLayer>,
 
+    /// Pre-computed pool_id -> layer index mapping for O(1) lookup.
+    /// Index is pool_id (0-3), value is index into layers vec.
+    pool_map: [Option<usize>; 4],
+
     /// Minimum free segments in Layer 0 before eviction.
     eviction_threshold: usize,
 
@@ -506,10 +510,15 @@ impl<H: Hashtable> TieredCache<H> {
     }
 
     /// Find the layer index for a given pool_id.
+    ///
+    /// Uses pre-computed O(1) lookup instead of linear scan.
+    #[inline]
     fn layer_for_pool(&self, pool_id: u8) -> Option<usize> {
-        self.layers
-            .iter()
-            .position(|layer| layer.pool_id() == pool_id)
+        if pool_id < 4 {
+            self.pool_map[pool_id as usize]
+        } else {
+            None
+        }
     }
 
     /// Create a key verifier for hashtable operations.
@@ -519,28 +528,36 @@ impl<H: Hashtable> TieredCache<H> {
 }
 
 /// Key verifier for TieredCache.
+///
+/// Uses pre-computed pool_map for O(1) pool lookup and goes directly
+/// to the pool without layer abstraction overhead.
 struct CacheKeyVerifier<'a, H: Hashtable> {
     cache: &'a TieredCache<H>,
 }
 
 impl<H: Hashtable> KeyVerifier for CacheKeyVerifier<'_, H> {
+    #[inline]
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
         let pool_id = item_loc.pool_id();
-        let segment_id = item_loc.segment_id();
-        let offset = item_loc.offset();
 
-        // Find layer by pool_id
-        let Some(layer_idx) = self.cache.layer_for_pool(pool_id) else {
+        // Fast path: use pre-computed pool_map for O(1) lookup
+        if pool_id >= 4 {
+            return false;
+        }
+
+        let Some(layer_idx) = self.cache.pool_map[pool_id as usize] else {
             return false;
         };
+
         let Some(layer) = self.cache.layers.get(layer_idx) else {
             return false;
         };
 
-        // Get segment and verify key
-        if let Some(segment) = layer.get_segment(segment_id) {
-            segment.verify_key_at_offset(offset, key, allow_deleted)
+        // Go directly to pool to avoid layer enum matching overhead
+        let pool = layer.pool();
+        if let Some(segment) = pool.get(item_loc.segment_id()) {
+            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
         } else {
             false
         }
@@ -551,6 +568,7 @@ impl<H: Hashtable> KeyVerifier for CacheKeyVerifier<'_, H> {
 pub struct TieredCacheBuilder<H: Hashtable> {
     hashtable: Arc<H>,
     layers: Vec<CacheLayer>,
+    pool_map: [Option<usize>; 4],
     eviction_threshold: usize,
     max_eviction_attempts: usize,
 }
@@ -561,6 +579,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
         Self {
             hashtable,
             layers: Vec::new(),
+            pool_map: [None; 4],
             eviction_threshold: 1,
             max_eviction_attempts: 10,
         }
@@ -568,19 +587,34 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
 
     /// Add a FIFO layer (admission queue).
     pub fn with_fifo_layer(mut self, layer: FifoLayer) -> Self {
+        let pool_id = layer.pool().pool_id();
+        let layer_idx = self.layers.len();
         self.layers.push(CacheLayer::Fifo(layer));
+        if pool_id < 4 {
+            self.pool_map[pool_id as usize] = Some(layer_idx);
+        }
         self
     }
 
     /// Add a TTL bucket layer (main cache).
     pub fn with_ttl_layer(mut self, layer: TtlLayer) -> Self {
+        let pool_id = layer.pool().pool_id();
+        let layer_idx = self.layers.len();
         self.layers.push(CacheLayer::Ttl(layer));
+        if pool_id < 4 {
+            self.pool_map[pool_id as usize] = Some(layer_idx);
+        }
         self
     }
 
     /// Add a layer (generic).
     pub fn with_layer(mut self, layer: CacheLayer) -> Self {
+        let pool_id = layer.pool_id();
+        let layer_idx = self.layers.len();
         self.layers.push(layer);
+        if pool_id < 4 {
+            self.pool_map[pool_id as usize] = Some(layer_idx);
+        }
         self
     }
 
@@ -601,6 +635,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
         TieredCache {
             hashtable: self.hashtable,
             layers: self.layers,
+            pool_map: self.pool_map,
             eviction_threshold: self.eviction_threshold,
             max_eviction_attempts: self.max_eviction_attempts,
         }

@@ -46,8 +46,8 @@
 #![warn(clippy::all)]
 
 use cache_core::{
-    CuckooHashtable, FifoLayerBuilder, Hashtable, ItemGuard, LayerConfig, TieredCache,
-    TieredCacheBuilder, TtlLayerBuilder, TwoPoolVerifier,
+    CuckooHashtable, FifoLayerBuilder, ItemGuard, LayerConfig, TieredCache, TieredCacheBuilder,
+    TtlLayerBuilder,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,23 +120,7 @@ impl S3FifoCache {
     /// Accessing an item increments its frequency counter.
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        // Get both pools directly for fast verification
-        let layer0 = self.inner.layer(0)?;
-        let layer1 = self.inner.layer(1)?;
-        let pool0 = layer0.pool();
-        let pool1 = layer1.pool();
-        let verifier = TwoPoolVerifier::new(pool0, pool1);
-
-        // Lookup in hashtable with direct pool verifier
-        let (location, _freq) = self.inner.hashtable().lookup(key, &verifier)?;
-        let item_loc = ItemLocation::from_location(location);
-
-        // Get value from the appropriate layer based on pool_id
-        match item_loc.pool_id() {
-            0 => layer0.get_value(item_loc, key),
-            1 => layer1.get_value(item_loc, key),
-            _ => None,
-        }
+        self.inner.get(key)
     }
 
     /// Execute a closure with the item if it exists.
@@ -148,23 +132,7 @@ impl S3FifoCache {
     where
         F: FnOnce(&dyn ItemGuard<'_>) -> R,
     {
-        // Get both pools directly for fast verification
-        let layer0 = self.inner.layer(0)?;
-        let layer1 = self.inner.layer(1)?;
-        let pool0 = layer0.pool();
-        let pool1 = layer1.pool();
-        let verifier = TwoPoolVerifier::new(pool0, pool1);
-
-        // Lookup in hashtable with direct pool verifier
-        let (location, _freq) = self.inner.hashtable().lookup(key, &verifier)?;
-        let item_loc = ItemLocation::from_location(location);
-
-        // Execute closure with the appropriate layer based on pool_id
-        match item_loc.pool_id() {
-            0 => layer0.with_item(item_loc, key, f),
-            1 => layer1.with_item(item_loc, key, f),
-            _ => None,
-        }
+        self.inner.with_item(key, f)
     }
 
     /// Delete an item from the cache.
@@ -180,19 +148,7 @@ impl S3FifoCache {
     /// Does not increment the frequency counter.
     #[inline]
     pub fn contains(&self, key: &[u8]) -> bool {
-        // Get both pools directly for fast verification
-        let Some(layer0) = self.inner.layer(0) else {
-            return false;
-        };
-        let Some(layer1) = self.inner.layer(1) else {
-            return false;
-        };
-        let pool0 = layer0.pool();
-        let pool1 = layer1.pool();
-        let verifier = TwoPoolVerifier::new(pool0, pool1);
-
-        // Check existence in hashtable with direct pool verifier
-        self.inner.hashtable().contains(key, &verifier)
+        self.inner.contains(key)
     }
 
     /// Get the remaining TTL for an item.
