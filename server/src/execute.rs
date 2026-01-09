@@ -67,28 +67,27 @@ pub fn execute_resp<C: Cache>(
         }
         RespCommand::Get { key } => {
             GETS.increment();
-            match cache.get(key) {
-                Some(guard) => {
-                    HITS.increment();
-                    let value = guard.as_ref();
-                    // Reserve: $ + max_len_digits(20) + \r\n + value + \r\n
-                    let needed = 1 + 20 + 2 + value.len() + 2;
-                    write_buf.reserve(needed);
+            let hit = cache.with_value(key, |value| {
+                // Reserve: $ + max_len_digits(20) + \r\n + value + \r\n
+                let needed = 1 + 20 + 2 + value.len() + 2;
+                write_buf.reserve(needed);
 
-                    let spare = write_buf.spare_capacity_mut();
-                    let buf = unsafe {
-                        std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
-                    };
-                    let written = unsafe { write_bulk_string(buf, value) };
-                    unsafe { write_buf.set_len(write_buf.len() + written) };
-                }
-                None => {
-                    MISSES.increment();
-                    if *version == RespVersion::Resp3 {
-                        write_buf.extend_from_slice(b"_\r\n");
-                    } else {
-                        write_buf.extend_from_slice(b"$-1\r\n");
-                    }
+                let spare = write_buf.spare_capacity_mut();
+                let buf = unsafe {
+                    std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+                };
+                let written = unsafe { write_bulk_string(buf, value) };
+                unsafe { write_buf.set_len(write_buf.len() + written) };
+            });
+
+            if hit.is_some() {
+                HITS.increment();
+            } else {
+                MISSES.increment();
+                if *version == RespVersion::Resp3 {
+                    write_buf.extend_from_slice(b"_\r\n");
+                } else {
+                    write_buf.extend_from_slice(b"$-1\r\n");
                 }
             }
         }
@@ -146,30 +145,26 @@ pub fn execute_resp<C: Cache>(
 
             for key in keys {
                 GETS.increment();
-                match cache.get(key) {
-                    Some(guard) => {
-                        HITS.increment();
-                        let value = guard.as_ref();
-                        let needed = 1 + 20 + 2 + value.len() + 2;
-                        write_buf.reserve(needed);
+                let hit = cache.with_value(key, |value| {
+                    let needed = 1 + 20 + 2 + value.len() + 2;
+                    write_buf.reserve(needed);
 
-                        let spare = write_buf.spare_capacity_mut();
-                        let buf = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                spare.as_mut_ptr() as *mut u8,
-                                spare.len(),
-                            )
-                        };
-                        let written = unsafe { write_bulk_string(buf, value) };
-                        unsafe { write_buf.set_len(write_buf.len() + written) };
-                    }
-                    None => {
-                        MISSES.increment();
-                        if *version == RespVersion::Resp3 {
-                            write_buf.extend_from_slice(b"_\r\n");
-                        } else {
-                            write_buf.extend_from_slice(b"$-1\r\n");
-                        }
+                    let spare = write_buf.spare_capacity_mut();
+                    let buf = unsafe {
+                        std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+                    };
+                    let written = unsafe { write_bulk_string(buf, value) };
+                    unsafe { write_buf.set_len(write_buf.len() + written) };
+                });
+
+                if hit.is_some() {
+                    HITS.increment();
+                } else {
+                    MISSES.increment();
+                    if *version == RespVersion::Resp3 {
+                        write_buf.extend_from_slice(b"_\r\n");
+                    } else {
+                        write_buf.extend_from_slice(b"$-1\r\n");
                     }
                 }
             }
@@ -237,32 +232,29 @@ pub fn execute_memcache<C: Cache>(
     match cmd {
         MemcacheCommand::Get { key } => {
             GETS.increment();
-            match cache.get(key) {
-                Some(guard) => {
-                    HITS.increment();
-                    let value = guard.as_ref();
-                    write_buf.extend_from_slice(b"VALUE ");
-                    write_buf.extend_from_slice(key);
-                    write_buf.extend_from_slice(b" 0 ");
-                    let mut len_buf = itoa::Buffer::new();
-                    write_buf.extend_from_slice(len_buf.format(value.len()).as_bytes());
-                    write_buf.extend_from_slice(b"\r\n");
-                    write_buf.extend_from_slice(value);
-                    write_buf.extend_from_slice(b"\r\nEND\r\n");
-                }
-                None => {
-                    MISSES.increment();
-                    write_buf.extend_from_slice(b"END\r\n");
-                }
+            let hit = cache.with_value(key, |value| {
+                write_buf.extend_from_slice(b"VALUE ");
+                write_buf.extend_from_slice(key);
+                write_buf.extend_from_slice(b" 0 ");
+                let mut len_buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(len_buf.format(value.len()).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+                write_buf.extend_from_slice(value);
+                write_buf.extend_from_slice(b"\r\nEND\r\n");
+            });
+
+            if hit.is_some() {
+                HITS.increment();
+            } else {
+                MISSES.increment();
+                write_buf.extend_from_slice(b"END\r\n");
             }
             false
         }
         MemcacheCommand::Gets { keys } => {
             for key in keys {
                 GETS.increment();
-                if let Some(guard) = cache.get(key) {
-                    HITS.increment();
-                    let value = guard.as_ref();
+                let hit = cache.with_value(key, |value| {
                     write_buf.extend_from_slice(b"VALUE ");
                     write_buf.extend_from_slice(key);
                     write_buf.extend_from_slice(b" 0 ");
@@ -271,6 +263,10 @@ pub fn execute_memcache<C: Cache>(
                     write_buf.extend_from_slice(b"\r\n");
                     write_buf.extend_from_slice(value);
                     write_buf.extend_from_slice(b"\r\n");
+                });
+
+                if hit.is_some() {
+                    HITS.increment();
                 } else {
                     MISSES.increment();
                 }
@@ -344,42 +340,48 @@ pub fn execute_memcache_binary<C: Cache>(
     let len = match cmd {
         BinaryCommand::Get { key, opaque } | BinaryCommand::GetK { key, opaque } => {
             GETS.increment();
-            match cache.get(key) {
-                Some(guard) => {
-                    HITS.increment();
-                    let value = guard.as_ref();
-                    let opcode = match cmd {
-                        BinaryCommand::GetK { .. } => Opcode::GetK,
-                        _ => Opcode::Get,
-                    };
-                    if matches!(cmd, BinaryCommand::GetK { .. }) {
-                        BinaryResponse::encode_getk(buf, opcode, *opaque, 0, 0, key, value)
-                    } else {
-                        BinaryResponse::encode_get(buf, opcode, *opaque, 0, 0, value)
-                    }
+            let is_getk = matches!(cmd, BinaryCommand::GetK { .. });
+            let opaque = *opaque;
+
+            let len = cache.with_value(key, |value| {
+                HITS.increment();
+                let opcode = if is_getk { Opcode::GetK } else { Opcode::Get };
+                if is_getk {
+                    BinaryResponse::encode_getk(buf, opcode, opaque, 0, 0, key, value)
+                } else {
+                    BinaryResponse::encode_get(buf, opcode, opaque, 0, 0, value)
                 }
+            });
+
+            match len {
+                Some(n) => n,
                 None => {
                     MISSES.increment();
-                    BinaryResponse::encode_not_found(buf, Opcode::Get, *opaque)
+                    BinaryResponse::encode_not_found(buf, Opcode::Get, opaque)
                 }
             }
         }
         BinaryCommand::GetQ { key, opaque } | BinaryCommand::GetKQ { key, opaque } => {
             GETS.increment();
-            match cache.get(key) {
-                Some(guard) => {
-                    HITS.increment();
-                    let value = guard.as_ref();
-                    let opcode = match cmd {
-                        BinaryCommand::GetKQ { .. } => Opcode::GetKQ,
-                        _ => Opcode::GetQ,
-                    };
-                    if matches!(cmd, BinaryCommand::GetKQ { .. }) {
-                        BinaryResponse::encode_getk(buf, opcode, *opaque, 0, 0, key, value)
-                    } else {
-                        BinaryResponse::encode_get(buf, opcode, *opaque, 0, 0, value)
-                    }
+            let is_getkq = matches!(cmd, BinaryCommand::GetKQ { .. });
+            let opaque = *opaque;
+
+            let len = cache.with_value(key, |value| {
+                HITS.increment();
+                let opcode = if is_getkq {
+                    Opcode::GetKQ
+                } else {
+                    Opcode::GetQ
+                };
+                if is_getkq {
+                    BinaryResponse::encode_getk(buf, opcode, opaque, 0, 0, key, value)
+                } else {
+                    BinaryResponse::encode_get(buf, opcode, opaque, 0, 0, value)
                 }
+            });
+
+            match len {
+                Some(n) => n,
                 None => {
                     MISSES.increment();
                     0

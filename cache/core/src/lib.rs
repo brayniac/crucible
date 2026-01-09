@@ -81,9 +81,7 @@ pub use config::{EvictionStrategy, FrequencyDecay, LayerConfig, LayerId, MergeCo
 pub use error::{CacheError, CacheResult};
 
 // Location re-exports
-pub use item_location::{
-    FnVerifier, ItemLocation, MultiPoolVerifier, PoolVerifier, SinglePoolVerifier, TwoPoolVerifier,
-};
+pub use item_location::{FnVerifier, ItemLocation, MultiPoolVerifier, SinglePoolVerifier};
 pub use location::Location;
 
 // Phase 2 re-exports

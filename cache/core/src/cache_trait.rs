@@ -52,7 +52,30 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// Returns `Some(guard)` if the key exists, `None` otherwise.
     /// The guard provides access to the value.
+    ///
+    /// Note: This method copies the value into an owned buffer. For better
+    /// performance, use [`with_value`](Self::with_value) to avoid the copy.
     fn get(&self, key: &[u8]) -> Option<OwnedGuard>;
+
+    /// Access a cached value without copying.
+    ///
+    /// Calls the provided function with the value bytes if the key exists.
+    /// The value is read directly from cache memory without copying.
+    ///
+    /// This is more efficient than [`get`](Self::get) when you only need
+    /// to read or copy the value to another buffer (e.g., a response buffer).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Write value directly to response buffer without intermediate copy
+    /// cache.with_value(key, |value| {
+    ///     response_buf.extend_from_slice(value);
+    /// });
+    /// ```
+    fn with_value<F, R>(&self, key: &[u8], f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8]) -> R;
 
     /// Set a key-value pair in the cache.
     ///

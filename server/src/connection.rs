@@ -254,6 +254,13 @@ mod tests {
             None
         }
 
+        fn with_value<F, R>(&self, _key: &[u8], _f: F) -> Option<R>
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            None
+        }
+
         fn set(
             &self,
             _key: &[u8],

@@ -431,6 +431,13 @@ impl Cache for S3FifoCache {
         self.inner.get(key).map(OwnedGuard::new)
     }
 
+    fn with_value<F, R>(&self, key: &[u8], f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        self.inner.with_item(key, |guard| f(guard.value()))
+    }
+
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
         let ttl = ttl.unwrap_or(DEFAULT_TTL);
         self.inner.set(key, value, b"", ttl)
