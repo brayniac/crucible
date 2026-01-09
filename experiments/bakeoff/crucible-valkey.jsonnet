@@ -338,6 +338,17 @@ function(
                     // Wait for the cache to start
                     systemslab.barrier('cache-start'),
 
+                    // Print git SHA for debugging
+                    systemslab.bash(
+                        |||
+                            export HOME=/tmp/crucible-build
+                            cd $HOME/crucible
+                            echo "=== Crucible Git SHA ==="
+                            git rev-parse HEAD
+                            git log -1 --oneline
+                        |||
+                    ),
+
                     // Run the warmup workload
                     systemslab.bash(
                         |||
@@ -357,6 +368,17 @@ function(
 
                     // Signal warmup is complete
                     systemslab.barrier('warmup-complete'),
+
+                    // Print git SHA for debugging
+                    systemslab.bash(
+                        |||
+                            export HOME=/tmp/crucible-build
+                            cd $HOME/crucible
+                            echo "=== Crucible Git SHA ==="
+                            git rev-parse HEAD
+                            git log -1 --oneline
+                        |||
+                    ),
 
                     // Run the benchmark
                     systemslab.bash(

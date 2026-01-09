@@ -135,6 +135,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("connections: {} (total)", total_connections);
     tracing::info!("pipeline_depth: {}", config.connection.pipeline_depth);
     tracing::info!(
+        "keyspace: {} keys, {} bytes each",
+        config.workload.keyspace.count,
+        config.workload.keyspace.length
+    );
+    tracing::info!("value_size: {} bytes", config.workload.values.length);
+    tracing::info!(
         "io_engine: {} (configured: {})",
         effective_engine,
         config.general.io_engine
