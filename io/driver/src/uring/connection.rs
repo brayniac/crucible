@@ -37,8 +37,9 @@ pub struct UringConnection {
     send_buf: Vec<u8>,
     /// How much of send_buf has been sent.
     send_pos: usize,
-    /// Whether a SendZc is currently in flight (waiting for notif).
-    send_in_flight: bool,
+    /// Count of SendZc operations in flight (waiting for notif).
+    /// Can be > 1 due to partial sends submitting continuation SendZc.
+    sends_in_flight: u32,
 
     /// Fragmentation buffer for data waiting to be sent.
     /// Grows as needed for large sends, shrinks when cleared.
@@ -76,7 +77,7 @@ impl UringConnection {
             recv_state: ConnectionRecvState::default(),
             send_buf: Vec::with_capacity(SEND_CHUNK_SIZE),
             send_pos: 0,
-            send_in_flight: false,
+            sends_in_flight: 0,
             frag_buf: BytesMut::with_capacity(FRAG_DEFAULT_CAPACITY),
             multishot_active: false,
             single_recv_pending: false,
@@ -104,7 +105,7 @@ impl UringConnection {
     /// - No data to send
     #[inline]
     pub fn prepare_send(&mut self) -> Option<(*const u8, usize)> {
-        if self.send_in_flight {
+        if self.sends_in_flight > 0 {
             return None;
         }
 
@@ -134,7 +135,7 @@ impl UringConnection {
     /// Mark send as in-flight (called after submitting SendZc).
     #[inline]
     pub fn mark_send_in_flight(&mut self) {
-        self.send_in_flight = true;
+        self.sends_in_flight += 1;
     }
 
     /// Handle send completion (result, not notif).
@@ -157,41 +158,42 @@ impl UringConnection {
 
     /// Handle send notification (kernel done with buffer).
     ///
-    /// Marks the send buffer as available for reuse.
+    /// Returns true when all sends are complete (count reaches 0).
     #[inline]
-    pub fn on_send_notif(&mut self) {
-        self.send_in_flight = false;
+    pub fn on_send_notif(&mut self) -> bool {
+        self.sends_in_flight = self.sends_in_flight.saturating_sub(1);
+        self.sends_in_flight == 0
     }
 
     /// Check if there's data waiting to be sent.
     #[inline]
     pub fn has_pending_data(&self) -> bool {
-        !self.frag_buf.is_empty() || (!self.send_in_flight && self.send_pos < self.send_buf.len())
+        !self.frag_buf.is_empty()
     }
 
     /// Check if a send is currently in flight.
     #[inline]
     pub fn is_send_in_flight(&self) -> bool {
-        self.send_in_flight
+        self.sends_in_flight > 0
     }
 
     /// Check if all sends are complete (nothing in flight, no pending data).
     #[inline]
     pub fn all_sends_complete(&self) -> bool {
-        !self.send_in_flight && self.frag_buf.is_empty()
+        self.sends_in_flight == 0 && self.frag_buf.is_empty()
     }
 
     // === Legacy API for compatibility (buf_idx is ignored) ===
 
-    /// Increment in-flight count (legacy API, now just marks in-flight).
+    /// Increment in-flight count (legacy API).
     #[inline]
     pub fn increment_in_flight(&mut self, _buf_idx: usize) {
-        self.send_in_flight = true;
+        self.sends_in_flight += 1;
     }
 
-    /// Decrement in-flight count (legacy API, now just clears in-flight).
+    /// Decrement in-flight count (legacy API).
     #[inline]
     pub fn decrement_in_flight(&mut self, _buf_idx: usize) {
-        self.send_in_flight = false;
+        self.sends_in_flight = self.sends_in_flight.saturating_sub(1);
     }
 }

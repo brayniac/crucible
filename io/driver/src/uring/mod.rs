@@ -557,23 +557,25 @@ impl UringDriver {
     fn handle_send(&mut self, conn_id: usize, _buf_idx: usize, result: i32, flags: u32) {
         // Check if this is a SendZc notification
         if cqueue::notif(flags) {
-            // Mark send buffer as available and check for more data or deferred close
-            let (should_continue, should_finish_close) =
+            // Decrement in-flight count and check if all sends are done
+            let (all_done, should_continue, should_finish_close) =
                 if let Some(conn) = self.connections.get_mut(conn_id) {
-                    conn.on_send_notif();
+                    let all_done = conn.on_send_notif();
                     let should_close = conn.closing && conn.all_sends_complete();
-                    let should_continue = !conn.closing && conn.has_pending_data();
-                    (should_continue, should_close)
+                    // Only continue when ALL notifs received (all_done) to avoid corrupting send_buf
+                    let should_continue = all_done && !conn.closing && conn.has_pending_data();
+                    (all_done, should_continue, should_close)
                 } else {
-                    (false, false)
+                    (false, false, false)
                 };
 
             if should_finish_close {
                 self.finish_deferred_close(conn_id);
             } else if should_continue {
-                // More data to send - prepare next chunk
+                // All sends complete, more data to send - prepare next chunk
                 self.continue_send(conn_id);
             }
+            // If !all_done, we're still waiting for more notifs before we can reuse send_buf
             return;
         }
 
@@ -615,9 +617,11 @@ impl UringDriver {
 
         if has_remaining {
             // Partial send - continue with remaining data in send buffer
-            if let Some(conn) = self.connections.get(conn_id) {
+            if let Some(conn) = self.connections.get_mut(conn_id) {
                 let (ptr, len) = conn.remaining_send();
                 let fixed_slot = conn.fixed_slot;
+                // Mark this continuation as in-flight (will get its own notif)
+                conn.mark_send_in_flight();
                 let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
                 let _ = self.submit_send_zc(conn_id, fixed_slot, 0, send_data);
             }
