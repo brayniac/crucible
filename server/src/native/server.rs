@@ -41,6 +41,7 @@ struct WorkerConfig {
     sq_depth: u32,
     sqpoll: bool,
     recv_mode: RecvMode,
+    max_value_size: usize,
 }
 
 /// Configuration for the acceptor thread.
@@ -75,6 +76,7 @@ pub fn run<C: Cache + 'static>(
         sq_depth: config.uring.sq_depth,
         sqpoll: config.uring.sqpoll,
         recv_mode: config.uring.recv_mode,
+        max_value_size: config.cache.max_value_size,
     };
 
     let acceptor_config = AcceptorConfig {
@@ -372,7 +374,7 @@ fn run_worker<C: Cache>(
                     }
 
                     // All connections use the same simple Connection type now
-                    connections[idx] = Some(Connection::new());
+                    connections[idx] = Some(Connection::new(config.max_value_size));
                 }
                 Err(_) => {
                     // Failed to register, fd is already closed by driver
@@ -400,7 +402,7 @@ fn run_worker<C: Cache>(
                         connections.resize_with(idx + 1, || None);
                     }
 
-                    connections[idx] = Some(Connection::new());
+                    connections[idx] = Some(Connection::new(config.max_value_size));
                 }
 
                 // Unified recv handling using with_recv_buf

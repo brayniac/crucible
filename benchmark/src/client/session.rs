@@ -4,6 +4,37 @@
 //! while the IoDriver handles the actual I/O operations.
 
 use crate::buffer::BufferPair;
+
+/// Format bytes as hex for debug output, showing first and last N bytes.
+fn format_hex_preview(data: &[u8], max_each: usize) -> String {
+    if data.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let len = data.len();
+    if len <= max_each * 2 {
+        // Short enough to show everything
+        let hex: Vec<String> = data.iter().map(|b| format!("{:02x}", b)).collect();
+        format!("[{}] ({}B)", hex.join(" "), len)
+    } else {
+        // Show first N and last N bytes
+        let first: Vec<String> = data[..max_each]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let last: Vec<String> = data[len - max_each..]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        format!(
+            "[{} ... {}] ({}B, showing first/last {})",
+            first.join(" "),
+            last.join(" "),
+            len,
+            max_each
+        )
+    }
+}
 use crate::config::{Config, Protocol};
 use crate::protocol::{
     MemcacheBinaryCodec, MemcacheBinaryError, MemcacheCodec, MemcacheError, PingCodec, PingError,
@@ -431,6 +462,13 @@ impl Session {
         let mut count = 0;
 
         loop {
+            // Capture buffer preview before parsing (for debug output if orphan response)
+            let buf_preview: Vec<u8> = {
+                let data = self.buffers.recv.as_slice();
+                let preview_len = data.len().min(128);
+                data[..preview_len].to_vec()
+            };
+
             let response = match &mut self.codec {
                 ProtocolCodec::Resp(codec) => match codec.decode_response(&mut self.buffers.recv) {
                     Ok(Some(v)) => Some(ResponseInfo {
@@ -491,7 +529,27 @@ impl Session {
                         });
                         count += 1;
                     } else {
-                        tracing::warn!("received response without pending request");
+                        // Debug: print info about the orphan response
+                        let hex_preview = format_hex_preview(&buf_preview, 64);
+                        let ascii_preview: String = buf_preview
+                            .iter()
+                            .take(128)
+                            .map(|&b| {
+                                if b.is_ascii_graphic() || b == b' ' {
+                                    b as char
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect();
+                        tracing::warn!(
+                            in_flight = self.in_flight.len(),
+                            is_error = resp.is_error,
+                            is_null = resp.is_null,
+                            "received response without pending request\n  hex: {}\n  ascii: {:?}",
+                            hex_preview,
+                            ascii_preview
+                        );
                     }
                 }
                 None => break,
@@ -528,6 +586,12 @@ impl Session {
             if data.is_empty() {
                 break;
             }
+
+            // Capture buffer preview before parsing (for debug output if orphan response)
+            let buf_preview: Vec<u8> = {
+                let preview_len = data.len().min(128);
+                data[..preview_len].to_vec()
+            };
 
             // Parse response based on protocol (zero-copy from RecvBuf)
             let response = match &mut self.codec {
@@ -620,7 +684,27 @@ impl Session {
                         });
                         count += 1;
                     } else {
-                        tracing::warn!("received response without pending request");
+                        // Debug: print info about the orphan response
+                        let hex_preview = format_hex_preview(&buf_preview, 64);
+                        let ascii_preview: String = buf_preview
+                            .iter()
+                            .take(128)
+                            .map(|&b| {
+                                if b.is_ascii_graphic() || b == b' ' {
+                                    b as char
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect();
+                        tracing::warn!(
+                            in_flight = self.in_flight.len(),
+                            is_error = resp.is_error,
+                            is_null = resp.is_null,
+                            "received response without pending request\n  hex: {}\n  ascii: {:?}",
+                            hex_preview,
+                            ascii_preview
+                        );
                     }
                 }
                 None => break,

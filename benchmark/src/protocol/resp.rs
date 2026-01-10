@@ -4,7 +4,10 @@
 //! with brrr's Buffer type for zero-copy encoding and decoding.
 
 use crate::buffer::Buffer;
-use protocol_resp::{ParseError, Request, Value};
+use protocol_resp::{ParseError, ParseOptions, Request, Value};
+
+/// Maximum bulk string size: 512MB (matches official RESP protocol spec).
+const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
 
 /// RESP2 protocol codec for Redis.
 ///
@@ -13,12 +16,15 @@ use protocol_resp::{ParseError, Request, Value};
 pub struct RespCodec {
     /// Number of complete responses parsed since last reset
     responses_parsed: usize,
+    /// Parse options with generous limits for benchmark use
+    parse_options: ParseOptions,
 }
 
 impl RespCodec {
     pub fn new() -> Self {
         Self {
             responses_parsed: 0,
+            parse_options: ParseOptions::new().max_bulk_string_len(MAX_BULK_STRING_LEN),
         }
     }
 
@@ -95,7 +101,7 @@ impl RespCodec {
             return Ok(None);
         }
 
-        match Value::parse(data) {
+        match Value::parse_with_options(data, &self.parse_options) {
             Ok((value, consumed)) => {
                 buf.consume(consumed);
                 self.responses_parsed += 1;

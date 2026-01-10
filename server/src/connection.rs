@@ -5,7 +5,7 @@ use cache_core::Cache;
 use io_driver::RecvBuf;
 use protocol_memcache::binary::{BinaryCommand, REQUEST_MAGIC};
 use protocol_memcache::{Command as MemcacheCommand, ParseError as MemcacheParseError};
-use protocol_resp::{Command as RespCommand, ParseError as RespParseError};
+use protocol_resp::{Command as RespCommand, ParseError as RespParseError, ParseOptions};
 
 use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
 use crate::metrics::PROTOCOL_ERRORS;
@@ -30,17 +30,20 @@ pub struct Connection {
     protocol: DetectedProtocol,
     should_close: bool,
     resp_version: RespVersion,
+    /// Parse options for RESP protocol (controls max value size, etc.)
+    resp_parse_options: ParseOptions,
 }
 
 impl Connection {
-    /// Create a new connection.
-    pub fn new() -> Self {
+    /// Create a new connection with the specified max value size.
+    pub fn new(max_value_size: usize) -> Self {
         Self {
             write_buf: BytesMut::with_capacity(65536),
             write_pos: 0,
             protocol: DetectedProtocol::Unknown,
             should_close: false,
             resp_version: RespVersion::default(),
+            resp_parse_options: ParseOptions::new().max_bulk_string_len(max_value_size),
         }
     }
 
@@ -120,7 +123,7 @@ impl Connection {
                 break;
             }
 
-            match RespCommand::parse(data) {
+            match RespCommand::parse_with_options(data, &self.resp_parse_options) {
                 Ok((cmd, consumed)) => {
                     execute_resp(&cmd, cache, &mut self.write_buf, &mut self.resp_version);
                     buf.consume(consumed);
@@ -238,7 +241,8 @@ impl Connection {
 
 impl Default for Connection {
     fn default() -> Self {
-        Self::new()
+        // Use 1MB as the default max value size (same as server default)
+        Self::new(1024 * 1024)
     }
 }
 
@@ -322,7 +326,7 @@ mod tests {
     #[test]
     fn test_partial_request() {
         let cache = MockCache;
-        let mut conn = Connection::new();
+        let mut conn = Connection::default();
 
         // Send partial RESP command: "*2\r\n$3\r\nGET\r\n$3\r\nke"
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nke");
@@ -346,7 +350,7 @@ mod tests {
     #[test]
     fn test_pipelined_requests() {
         let cache = MockCache;
-        let mut conn = Connection::new();
+        let mut conn = Connection::default();
 
         // Send two complete GET requests in one batch
         let mut buf =
@@ -365,7 +369,7 @@ mod tests {
     #[test]
     fn test_complete_plus_partial() {
         let cache = MockCache;
-        let mut conn = Connection::new();
+        let mut conn = Connection::default();
 
         // Send one complete request and start of another
         let mut buf =
@@ -392,7 +396,7 @@ mod tests {
     #[test]
     fn test_partial_write_advance() {
         let cache = MockCache;
-        let mut conn = Connection::new();
+        let mut conn = Connection::default();
 
         // Generate a response
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
@@ -415,7 +419,7 @@ mod tests {
     #[test]
     fn test_write_buffer_cleared_on_full_send() {
         let cache = MockCache;
-        let mut conn = Connection::new();
+        let mut conn = Connection::default();
 
         // First request
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
@@ -438,7 +442,7 @@ mod tests {
     #[test]
     fn test_write_buffer_not_cleared_on_partial_send() {
         let cache = MockCache;
-        let mut conn = Connection::new();
+        let mut conn = Connection::default();
 
         // First request
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
@@ -462,7 +466,7 @@ mod tests {
     #[test]
     fn test_backpressure_stops_processing() {
         let cache = MockCache;
-        let mut conn = Connection::new();
+        let mut conn = Connection::default();
 
         // Generate enough response data to exceed MAX_PENDING_WRITE
         // Each GET response is "$-1\r\n" (5 bytes)

@@ -90,12 +90,14 @@ pub fn run<C: Cache + 'static>(
 
     let runtime = builder.build()?;
 
-    runtime.block_on(async move { run_async(listeners, cache).await })
+    let max_value_size = config.cache.max_value_size;
+    runtime.block_on(async move { run_async(listeners, cache, max_value_size).await })
 }
 
 async fn run_async<C: Cache + 'static>(
     addresses: Vec<SocketAddr>,
     cache: Arc<C>,
+    max_value_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Bind all listeners
     let mut listeners = Vec::with_capacity(addresses.len());
@@ -108,7 +110,8 @@ async fn run_async<C: Cache + 'static>(
     let mut handles = Vec::with_capacity(listeners.len());
     for listener in listeners {
         let cache = cache.clone();
-        let handle = tokio::spawn(async move { accept_loop(listener, cache).await });
+        let handle =
+            tokio::spawn(async move { accept_loop(listener, cache, max_value_size).await });
         handles.push(handle);
     }
 
@@ -122,7 +125,11 @@ async fn run_async<C: Cache + 'static>(
     Ok(())
 }
 
-async fn accept_loop<C: Cache + 'static>(listener: TcpListener, cache: Arc<C>) {
+async fn accept_loop<C: Cache + 'static>(
+    listener: TcpListener,
+    cache: Arc<C>,
+    max_value_size: usize,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -131,7 +138,7 @@ async fn accept_loop<C: Cache + 'static>(listener: TcpListener, cache: Arc<C>) {
 
                 let cache = cache.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, cache).await
+                    if let Err(e) = handle_connection(stream, cache, max_value_size).await
                         && !is_connection_reset(&e)
                     {
                         eprintln!("Connection error: {}", e);
@@ -146,8 +153,12 @@ async fn accept_loop<C: Cache + 'static>(listener: TcpListener, cache: Arc<C>) {
     }
 }
 
-async fn handle_connection<C: Cache>(mut stream: TcpStream, cache: Arc<C>) -> std::io::Result<()> {
-    let mut conn = Connection::new();
+async fn handle_connection<C: Cache>(
+    mut stream: TcpStream,
+    cache: Arc<C>,
+    max_value_size: usize,
+) -> std::io::Result<()> {
+    let mut conn = Connection::new(max_value_size);
     let mut recv_buf = SimpleRecvBuf::with_capacity(64 * 1024);
     let mut temp_buf = vec![0u8; 64 * 1024];
 

@@ -4,6 +4,7 @@
 //! It provides zero-copy parsing where possible, with command arguments referencing the input buffer.
 
 use crate::error::ParseError;
+use crate::value::ParseOptions;
 
 /// A parsed Redis command with references to the original buffer.
 ///
@@ -51,7 +52,7 @@ pub enum Command<'a> {
 }
 
 impl<'a> Command<'a> {
-    /// Parse a command from a byte buffer.
+    /// Parse a command from a byte buffer using default limits.
     ///
     /// Returns the parsed command and the number of bytes consumed.
     ///
@@ -66,7 +67,30 @@ impl<'a> Command<'a> {
     /// Returns other errors for malformed or unknown commands.
     #[inline]
     pub fn parse(buffer: &'a [u8]) -> Result<(Self, usize), ParseError> {
-        let mut cursor = Cursor::new(buffer);
+        Self::parse_with_options(buffer, &ParseOptions::default())
+    }
+
+    /// Parse a command from a byte buffer with custom options.
+    ///
+    /// This is useful for setting custom limits on bulk string size to prevent
+    /// denial-of-service attacks or to enforce server-side value size limits.
+    ///
+    /// # Zero-copy
+    ///
+    /// The returned command contains references to the input buffer, so the buffer
+    /// must outlive the command. This avoids allocation for keys and values.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError::Incomplete` if more data is needed.
+    /// Returns `ParseError::BulkStringTooLong` if a bulk string exceeds the limit.
+    /// Returns other errors for malformed or unknown commands.
+    #[inline]
+    pub fn parse_with_options(
+        buffer: &'a [u8],
+        options: &ParseOptions,
+    ) -> Result<(Self, usize), ParseError> {
+        let mut cursor = Cursor::new(buffer, options.max_bulk_string_len);
 
         // Read array header
         if cursor.remaining() < 1 {
@@ -315,11 +339,16 @@ impl<'a> Command<'a> {
 struct Cursor<'a> {
     buffer: &'a [u8],
     pos: usize,
+    max_bulk_string_len: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buffer: &'a [u8]) -> Self {
-        Self { buffer, pos: 0 }
+    fn new(buffer: &'a [u8], max_bulk_string_len: usize) -> Self {
+        Self {
+            buffer,
+            pos: 0,
+            max_bulk_string_len,
+        }
     }
 
     #[inline]
@@ -377,6 +406,14 @@ impl<'a> Cursor<'a> {
         }
 
         let len = self.read_integer()?;
+
+        // Check bulk string length limit
+        if len > self.max_bulk_string_len {
+            return Err(ParseError::BulkStringTooLong {
+                len,
+                max: self.max_bulk_string_len,
+            });
+        }
 
         if self.remaining() < len + 2 {
             return Err(ParseError::Incomplete);

@@ -40,6 +40,10 @@ pub enum ParseError {
     #[error("nesting too deep: depth {0} exceeds limit")]
     NestingTooDeep(usize),
 
+    /// Bulk string exceeds maximum allowed size.
+    #[error("bulk string too long: {len} bytes exceeds {max} byte limit")]
+    BulkStringTooLong { len: usize, max: usize },
+
     /// Invalid floating point number (RESP3).
     #[cfg(feature = "resp3")]
     #[error("invalid double: {0}")]
@@ -78,6 +82,7 @@ mod tests {
         assert!(!ParseError::UnknownCommand("test".to_string()).is_incomplete());
         assert!(!ParseError::WrongArity("test".to_string()).is_incomplete());
         assert!(!ParseError::CollectionTooLarge(100).is_incomplete());
+        assert!(!ParseError::BulkStringTooLong { len: 100, max: 50 }.is_incomplete());
     }
 
     #[test]

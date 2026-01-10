@@ -83,6 +83,15 @@ pub struct CacheConfig {
     )]
     pub segment_size: usize,
 
+    /// Maximum value size (e.g., "1MB", "512KB").
+    /// Values larger than this will be rejected by the server.
+    /// Must be less than segment_size.
+    #[serde(
+        default = "default_max_value_size",
+        deserialize_with = "deserialize_size"
+    )]
+    pub max_value_size: usize,
+
     /// Hashtable power (2^power buckets)
     #[serde(default = "default_hashtable_power")]
     pub hashtable_power: u8,
@@ -103,6 +112,7 @@ impl Default for CacheConfig {
             backend: default_cache_backend(),
             heap_size: default_heap_size(),
             segment_size: default_segment_size(),
+            max_value_size: default_max_value_size(),
             hashtable_power: default_hashtable_power(),
             hugepage: HugepageConfig::default(),
             numa_node: None,
@@ -280,10 +290,14 @@ fn default_cache_backend() -> CacheBackend {
 }
 
 fn default_heap_size() -> usize {
-    4 * 1024 * 1024 * 1024 // 4GB
+    1024 * 1024 * 1024 // 1GB
 }
 
 fn default_segment_size() -> usize {
+    8 * 1024 * 1024 // 8MB
+}
+
+fn default_max_value_size() -> usize {
     1024 * 1024 // 1MB
 }
 
@@ -457,6 +471,14 @@ impl Config {
             return Err(format!(
                 "heap_size ({}) must be at least segment_size ({})",
                 self.cache.heap_size, self.cache.segment_size
+            )
+            .into());
+        }
+
+        if self.cache.max_value_size >= self.cache.segment_size {
+            return Err(format!(
+                "max_value_size ({}) must be less than segment_size ({})",
+                self.cache.max_value_size, self.cache.segment_size
             )
             .into());
         }
