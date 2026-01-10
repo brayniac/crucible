@@ -45,7 +45,15 @@ use crate::protocol::{
 use protocol_memcache::Response as MemcacheResponseParser;
 use protocol_memcache::binary::ParsedBinaryResponse as MemcacheBinaryResponseParser;
 use protocol_ping::Response as PingResponseParser;
-use protocol_resp::Value as RespValueParser;
+use protocol_resp::{ParseOptions as RespParseOptions, Value as RespValueParser};
+
+/// Maximum bulk string size for benchmark: 512MB (matches official RESP protocol spec).
+const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
+
+/// Parse options for RESP protocol in zero-copy path.
+fn resp_parse_options() -> RespParseOptions {
+    RespParseOptions::new().max_bulk_string_len(MAX_BULK_STRING_LEN)
+}
 
 use io_driver::{ConnId, RecvBuf};
 
@@ -595,18 +603,20 @@ impl Session {
 
             // Parse response based on protocol (zero-copy from RecvBuf)
             let response = match &mut self.codec {
-                ProtocolCodec::Resp(codec) => match RespValueParser::parse(data) {
-                    Ok((value, consumed)) => {
-                        recv_buf.consume(consumed);
-                        codec.increment_parsed();
-                        Some(ResponseInfo {
-                            is_error: value.is_error(),
-                            is_null: value.is_null(),
-                        })
+                ProtocolCodec::Resp(codec) => {
+                    match RespValueParser::parse_with_options(data, &resp_parse_options()) {
+                        Ok((value, consumed)) => {
+                            recv_buf.consume(consumed);
+                            codec.increment_parsed();
+                            Some(ResponseInfo {
+                                is_error: value.is_error(),
+                                is_null: value.is_null(),
+                            })
+                        }
+                        Err(protocol_resp::ParseError::Incomplete) => None,
+                        Err(e) => return Err(SessionError::Resp(RespError::from_parse_error(e))),
                     }
-                    Err(protocol_resp::ParseError::Incomplete) => None,
-                    Err(e) => return Err(SessionError::Resp(RespError::from_parse_error(e))),
-                },
+                }
                 ProtocolCodec::Memcache(_codec) => match MemcacheResponseParser::parse(data) {
                     Ok((value, consumed)) => {
                         recv_buf.consume(consumed);

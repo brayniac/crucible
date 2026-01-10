@@ -11,7 +11,7 @@ local server_config = {
     cache: {
         backend: error 'backend must be specified',
         heap_size: error 'heap_size must be specified',
-        segment_size: '1MB',
+        segment_size: '8MB',
         hashtable_power: 20,
     },
 
