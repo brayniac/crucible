@@ -373,6 +373,13 @@ impl Session {
         });
         self.requests_sent += 1;
 
+        tracing::trace!(
+            conn_id = ?self.conn_id,
+            id = id,
+            in_flight = self.in_flight.len(),
+            "queued GET request"
+        );
+
         Some(id)
     }
 
@@ -411,6 +418,13 @@ impl Session {
             tx_timestamp: None,
         });
         self.requests_sent += 1;
+
+        tracing::trace!(
+            conn_id = ?self.conn_id,
+            id = id,
+            in_flight = self.in_flight.len(),
+            "queued SET request"
+        );
 
         Some(id)
     }
@@ -519,6 +533,13 @@ impl Session {
             match response {
                 Some(resp) => {
                     if let Some(req) = self.in_flight.pop_front() {
+                        tracing::trace!(
+                            id = req.id,
+                            in_flight_remaining = self.in_flight.len(),
+                            path = "poll_responses",
+                            "matched response"
+                        );
+
                         let latency_ns = self.calculate_latency(&req, now, rx_timestamp);
 
                         let hit = if req.request_type == RequestType::Get {
@@ -554,6 +575,7 @@ impl Session {
                             in_flight = self.in_flight.len(),
                             is_error = resp.is_error,
                             is_null = resp.is_null,
+                            path = "poll_responses",
                             "received response without pending request\n  hex: {}\n  ascii: {:?}",
                             hex_preview,
                             ascii_preview
@@ -684,6 +706,16 @@ impl Session {
                             None
                         };
 
+                        tracing::trace!(
+                            conn_id = ?self.conn_id,
+                            id = req.id,
+                            in_flight_remaining = self.in_flight.len(),
+                            is_error = resp.is_error,
+                            is_null = resp.is_null,
+                            path = "poll_responses_from",
+                            "matched response"
+                        );
+
                         results.push(RequestResult {
                             id: req.id,
                             success: !resp.is_error,
@@ -708,9 +740,11 @@ impl Session {
                             })
                             .collect();
                         tracing::warn!(
+                            conn_id = ?self.conn_id,
                             in_flight = self.in_flight.len(),
                             is_error = resp.is_error,
                             is_null = resp.is_null,
+                            path = "poll_responses_from",
                             "received response without pending request\n  hex: {}\n  ascii: {:?}",
                             hex_preview,
                             ascii_preview

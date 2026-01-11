@@ -85,7 +85,7 @@ function(
     // Server parameters
     cache_backend='segcache',
     heap_size='8GB',
-    segment_size='1MB',
+    segment_size='8MB',
     hashtable_power='20',
     server_threads='8',
     server_cpu_affinity='0-8',
