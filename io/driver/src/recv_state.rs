@@ -18,14 +18,21 @@
 //!
 //! **Mio**: Always copies (1 copy). Reads from kernel socket buffer to user buffer.
 //!
-//! | Mode | Recv (best case) | Recv (coalesce) | Send |
-//! |------|------------------|-----------------|------|
-//! | io_uring single-shot | 0 copies | 1 copy | 0 copies (SendZc) |
-//! | io_uring multishot | 1 copy | 1 copy | 0 copies (SendZc) |
-//! | Mio | 1 copy | 1 copy | 1 copy |
+//! ## Driver-Internal Copy Counts
+//!
+//! | Mode | Recv (best case) | Recv (coalesce) | Send (driver internal) |
+//! |------|------------------|-----------------|------------------------|
+//! | io_uring single-shot | 0 copies | 1 copy | 1 copy (to frag_buf) + SendZc |
+//! | io_uring multishot | 1 copy | 1 copy | 1 copy (to frag_buf) + SendZc |
+//! | Mio | 1 copy | 1 copy | 1 copy (write syscall) |
+//!
+//! Note: The send copy counts above are driver-internal only. Application-level
+//! copies (e.g., segment → write_buf) are additional. See OPTIMIZE_BUFFERING.md
+//! for the complete end-to-end analysis.
 //!
 //! For typical cache workloads, single-shot mode with small requests achieves
-//! true zero-copy on both recv and send paths.
+//! zero-copy on the recv path. The send path has 1 driver-internal copy
+//! (to accumulation buffer) before the zero-copy SendZc to kernel.
 
 use bytes::BytesMut;
 

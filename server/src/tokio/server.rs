@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
+/// Read buffer size for socket reads.
+const READ_BUF_SIZE: usize = 64 * 1024;
+
 /// A simple RecvBuf that owns a contiguous buffer.
 struct SimpleRecvBuf {
     data: Vec<u8>,
@@ -26,14 +29,34 @@ impl SimpleRecvBuf {
         }
     }
 
-    /// Append data to the buffer
-    fn append(&mut self, new_data: &[u8]) {
+    /// Get mutable spare capacity for direct reads.
+    /// Compacts buffer first if needed to ensure adequate space.
+    #[inline]
+    fn spare_capacity_mut(&mut self) -> &mut [u8] {
         // Compact if we've consumed more than half
         if self.offset > self.data.len() / 2 && self.offset > 0 {
             self.data.drain(..self.offset);
             self.offset = 0;
         }
-        self.data.extend_from_slice(new_data);
+
+        // Ensure we have space for a read
+        self.data.reserve(READ_BUF_SIZE);
+
+        // Safety: We're returning uninitialized memory as a mutable slice.
+        // The caller (try_read) will write to it and we'll call advance() with
+        // the number of bytes written.
+        let len = self.data.len();
+        let cap = self.data.capacity();
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr().add(len), cap - len) }
+    }
+
+    /// Advance the buffer length after a successful read.
+    /// # Safety
+    /// Caller must ensure `n` bytes were written to spare capacity.
+    #[inline]
+    unsafe fn advance(&mut self, n: usize) {
+        // Safety: Caller guarantees n bytes were written to spare capacity
+        unsafe { self.data.set_len(self.data.len() + n) };
     }
 }
 
@@ -159,22 +182,21 @@ async fn handle_connection<C: Cache>(
     max_value_size: usize,
 ) -> std::io::Result<()> {
     let mut conn = Connection::new(max_value_size);
-    let mut recv_buf = SimpleRecvBuf::with_capacity(64 * 1024);
-    let mut temp_buf = vec![0u8; 64 * 1024];
+    let mut recv_buf = SimpleRecvBuf::with_capacity(READ_BUF_SIZE);
 
     loop {
         // Wait for the socket to be readable
         stream.readable().await?;
 
-        // Try to read data
-        match stream.try_read(&mut temp_buf) {
+        // Try to read directly into recv_buf's spare capacity (avoids extra copy)
+        match stream.try_read(recv_buf.spare_capacity_mut()) {
             Ok(0) => {
                 // Connection closed
                 return Ok(());
             }
             Ok(n) => {
-                // Append to our RecvBuf
-                recv_buf.append(&temp_buf[..n]);
+                // Safety: try_read wrote n bytes to spare capacity
+                unsafe { recv_buf.advance(n) };
 
                 // Process using the new API
                 conn.process_from(&mut recv_buf, &*cache);
