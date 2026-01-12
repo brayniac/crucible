@@ -1,8 +1,12 @@
 use benchmark::config::Config;
 use benchmark::metrics;
 use benchmark::worker::Phase;
-use benchmark::{AdminServer, IoWorker, IoWorkerConfig, SharedState, parse_cpu_list};
+use benchmark::{
+    AdminServer, ColorMode, IoWorker, IoWorkerConfig, LatencyStats, OutputFormat, OutputFormatter,
+    Results, Sample, SharedState, create_formatter, parse_cpu_list,
+};
 
+use chrono::Utc;
 use io_driver::{IoEngine, RecvMode};
 
 use clap::Parser;
@@ -53,6 +57,14 @@ struct Cli {
     /// Recv mode for io_uring (multishot/multi-shot, singleshot/single-shot)
     #[arg(long, value_parser = parse_recv_mode)]
     recv_mode: Option<RecvMode>,
+
+    /// Output format (clean, json, verbose, quiet)
+    #[arg(long, value_parser = parse_output_format)]
+    format: Option<OutputFormat>,
+
+    /// Color mode (auto, always, never)
+    #[arg(long, value_parser = parse_color_mode)]
+    color: Option<ColorMode>,
 }
 
 fn parse_io_engine(s: &str) -> Result<IoEngine, String> {
@@ -68,6 +80,14 @@ fn parse_recv_mode(s: &str) -> Result<RecvMode, String> {
             s
         )),
     }
+}
+
+fn parse_output_format(s: &str) -> Result<OutputFormat, String> {
+    s.parse()
+}
+
+fn parse_color_mode(s: &str) -> Result<ColorMode, String> {
+    s.parse()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -109,6 +129,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(recv_mode) = cli.recv_mode {
         config.general.recv_mode = recv_mode;
     }
+    if let Some(format) = cli.format {
+        config.admin.format = format;
+    }
+    if let Some(color) = cli.color {
+        config.admin.color = color;
+    }
 
     // Parse CPU list if configured
     let cpu_ids = if let Some(ref cpu_list) = config.general.cpu_list {
@@ -123,43 +149,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let total_connections = config.connection.total_connections();
+    // Validate io_engine selection (still need this for internal logic)
+    let _effective_engine = validate_io_engine(config.general.io_engine);
 
-    // Validate io_engine selection
-    let effective_engine = validate_io_engine(config.general.io_engine);
+    // Create the output formatter
+    let formatter = create_formatter(config.admin.format, config.admin.color);
 
-    tracing::info!("starting brrr");
-    tracing::info!("endpoints: {:?}", config.target.endpoints);
-    tracing::info!("protocol: {:?}", config.target.protocol);
-    tracing::info!("threads: {}", config.general.threads);
-    tracing::info!("connections: {} (total)", total_connections);
-    tracing::info!("pipeline_depth: {}", config.connection.pipeline_depth);
-    tracing::info!(
-        "keyspace: {} keys, {} bytes each",
-        config.workload.keyspace.count,
-        config.workload.keyspace.length
-    );
-    tracing::info!("value_size: {} bytes", config.workload.values.length);
-    tracing::info!(
-        "io_engine: {} (configured: {})",
-        effective_engine,
-        config.general.io_engine
-    );
-    tracing::info!("recv_mode: {}", config.general.recv_mode);
-    tracing::info!("timestamp_mode: {:?}", config.timestamps.mode);
-    if let Some(ref cpu_list) = config.general.cpu_list {
-        tracing::info!("cpu_list: {}", cpu_list);
-        #[cfg(not(target_os = "linux"))]
-        tracing::warn!("cpu pinning is only supported on Linux");
-    }
-    if config.admin.listen.is_some() {
-        tracing::info!("prometheus: {:?}", config.admin.listen);
-    }
-    if config.admin.parquet.is_some() {
-        tracing::info!("parquet: {:?}", config.admin.parquet);
-    }
+    // Print config using the formatter
+    formatter.print_config(&config);
 
-    run_benchmark(config, cpu_ids)?;
+    run_benchmark(config, cpu_ids, formatter)?;
 
     Ok(())
 }
@@ -167,10 +166,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_benchmark(
     config: Config,
     cpu_ids: Option<Vec<usize>>,
+    formatter: Box<dyn OutputFormatter>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let num_threads = config.general.threads;
     let warmup = config.general.warmup;
     let duration = config.general.duration;
+    let total_connections = config.connection.total_connections();
 
     // Shared state
     let shared = Arc::new(SharedState::new());
@@ -197,6 +198,9 @@ fn run_benchmark(
     } else {
         None
     };
+
+    // Print warmup phase indicator
+    formatter.print_warmup(warmup);
 
     // Spawn worker threads
     let mut handles = Vec::with_capacity(num_threads);
@@ -227,12 +231,6 @@ fn run_benchmark(
         handles.push(handle);
     }
 
-    tracing::info!(
-        "spawned {} worker threads, warming up for {}s...",
-        num_threads,
-        warmup.as_secs(),
-    );
-
     // Start in warmup phase
     shared.set_phase(Phase::Warmup);
 
@@ -245,13 +243,6 @@ fn run_benchmark(
     let mut last_hits = 0u64;
     let mut last_misses = 0u64;
     let mut last_histogram: Option<Histogram> = None;
-    let mut last_failed = 0u64;
-    let mut last_eof = 0u64;
-    let mut last_recv_err = 0u64;
-    let mut last_send_err = 0u64;
-    let mut last_closed = 0u64;
-    let mut last_error_evt = 0u64;
-    let mut last_connect_failed = 0u64;
     let mut current_phase = Phase::Warmup;
 
     loop {
@@ -269,7 +260,8 @@ fn run_benchmark(
         if current_phase == Phase::Warmup && elapsed >= warmup {
             shared.set_phase(Phase::Running);
             current_phase = Phase::Running;
-            tracing::info!("warmup complete, running for {}s", duration.as_secs());
+            formatter.print_running(duration);
+            formatter.print_header();
             last_report = Instant::now();
             // Initialize baseline for delta calculations
             last_responses = metrics::RESPONSES_RECEIVED.value();
@@ -291,7 +283,6 @@ fn run_benchmark(
             let hits = metrics::CACHE_HITS.value();
             let misses = metrics::CACHE_MISSES.value();
             let active = metrics::CONNECTIONS_ACTIVE.value();
-            let failed = metrics::CONNECTIONS_FAILED.value();
 
             let elapsed_secs = last_report.elapsed().as_secs_f64();
 
@@ -301,14 +292,20 @@ fn run_benchmark(
             last_responses = responses;
 
             let delta_errors = errors - last_errors;
-            let error_rate = delta_errors as f64 / elapsed_secs;
             last_errors = errors;
+
+            // Calculate error percentage for this interval
+            let err_pct = if delta_responses > 0 {
+                (delta_errors as f64 / delta_responses as f64) * 100.0
+            } else {
+                0.0
+            };
 
             // Calculate hit rate for this interval
             let delta_hits = hits - last_hits;
             let delta_misses = misses - last_misses;
             let delta_gets = delta_hits + delta_misses;
-            let hit_rate = if delta_gets > 0 {
+            let hit_pct = if delta_gets > 0 {
                 (delta_hits as f64 / delta_gets as f64) * 100.0
             } else {
                 0.0
@@ -316,77 +313,57 @@ fn run_benchmark(
             last_hits = hits;
             last_misses = misses;
 
+            // Calculate connection health percentage
+            let conn_pct = if total_connections > 0 {
+                (active as f64 / total_connections as f64) * 100.0
+            } else {
+                100.0
+            };
+
             // Get percentiles from delta histogram (this interval only)
             let current_histogram = metrics::RESPONSE_LATENCY.load();
-            let (p50, p99, p999) = match (&current_histogram, &last_histogram) {
+            let (p50, p90, p99, p999, p9999, max) = match (&current_histogram, &last_histogram) {
                 (Some(current), Some(previous)) => {
                     if let Ok(delta) = current.wrapping_sub(previous) {
                         (
-                            percentile_from_histogram(&delta, 50.0),
-                            percentile_from_histogram(&delta, 99.0),
-                            percentile_from_histogram(&delta, 99.9),
+                            percentile_from_histogram(&delta, 50.0) / 1000.0,
+                            percentile_from_histogram(&delta, 90.0) / 1000.0,
+                            percentile_from_histogram(&delta, 99.0) / 1000.0,
+                            percentile_from_histogram(&delta, 99.9) / 1000.0,
+                            percentile_from_histogram(&delta, 99.99) / 1000.0,
+                            max_from_histogram(&delta) / 1000.0,
                         )
                     } else {
-                        (0.0, 0.0, 0.0)
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                     }
                 }
                 (Some(current), None) => (
-                    percentile_from_histogram(current, 50.0),
-                    percentile_from_histogram(current, 99.0),
-                    percentile_from_histogram(current, 99.9),
+                    percentile_from_histogram(current, 50.0) / 1000.0,
+                    percentile_from_histogram(current, 90.0) / 1000.0,
+                    percentile_from_histogram(current, 99.0) / 1000.0,
+                    percentile_from_histogram(current, 99.9) / 1000.0,
+                    percentile_from_histogram(current, 99.99) / 1000.0,
+                    max_from_histogram(current) / 1000.0,
                 ),
-                _ => (0.0, 0.0, 0.0),
+                _ => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             };
             last_histogram = current_histogram;
 
-            tracing::info!(
-                "rate={:.0}/s errors={:.0}/s hit_rate={:.1}% conns={}/{} p50={:.2}us p99={:.2}us p999={:.2}us",
-                rate,
-                error_rate,
-                hit_rate,
-                active,
-                active + failed,
-                p50 / 1000.0,
-                p99 / 1000.0,
-                p999 / 1000.0,
-            );
+            let sample = Sample {
+                timestamp: Utc::now(),
+                req_per_sec: rate,
+                err_pct,
+                hit_pct,
+                conn_pct,
+                p50_us: p50,
+                p90_us: p90,
+                p99_us: p99,
+                p999_us: p999,
+                p9999_us: p9999,
+                max_us: max,
+            };
 
-            // Report disconnect reasons when connections have failed
-            let delta_failed = failed - last_failed;
-            if delta_failed > 0 {
-                let eof = metrics::DISCONNECTS_EOF.value();
-                let recv_err = metrics::DISCONNECTS_RECV_ERROR.value();
-                let send_err = metrics::DISCONNECTS_SEND_ERROR.value();
-                let closed = metrics::DISCONNECTS_CLOSED_EVENT.value();
-                let error_evt = metrics::DISCONNECTS_ERROR_EVENT.value();
-                let connect_failed = metrics::DISCONNECTS_CONNECT_FAILED.value();
-
-                let d_eof = eof - last_eof;
-                let d_recv = recv_err - last_recv_err;
-                let d_send = send_err - last_send_err;
-                let d_closed = closed - last_closed;
-                let d_error = error_evt - last_error_evt;
-                let d_conn = connect_failed - last_connect_failed;
-
-                tracing::info!(
-                    "disconnects: {} (eof={} recv_err={} send_err={} closed={} error={} connect_failed={})",
-                    delta_failed,
-                    d_eof,
-                    d_recv,
-                    d_send,
-                    d_closed,
-                    d_error,
-                    d_conn,
-                );
-
-                last_eof = eof;
-                last_recv_err = recv_err;
-                last_send_err = send_err;
-                last_closed = closed;
-                last_error_evt = error_evt;
-                last_connect_failed = connect_failed;
-            }
-            last_failed = failed;
+            formatter.print_sample(&sample);
 
             last_report = Instant::now();
         }
@@ -397,56 +374,59 @@ fn run_benchmark(
         let _ = handle.join();
     }
 
-    // Final report
+    // Final report - collect all metrics
     let requests = metrics::REQUESTS_SENT.value();
     let responses = metrics::RESPONSES_RECEIVED.value();
     let errors = metrics::REQUEST_ERRORS.value();
     let hits = metrics::CACHE_HITS.value();
     let misses = metrics::CACHE_MISSES.value();
+    let bytes_tx = metrics::BYTES_TX.value();
+    let bytes_rx = metrics::BYTES_RX.value();
+    let get_count = metrics::GET_COUNT.value();
+    let set_count = metrics::SET_COUNT.value();
+    let active = metrics::CONNECTIONS_ACTIVE.value();
+    let failed = metrics::CONNECTIONS_FAILED.value();
     let elapsed_secs = duration.as_secs_f64();
 
-    let total_gets = hits + misses;
-    let hit_rate = if total_gets > 0 {
-        (hits as f64 / total_gets as f64) * 100.0
-    } else {
-        0.0
+    // Get latencies for GET operations
+    let get_latencies = LatencyStats {
+        p50_us: percentile(&metrics::GET_LATENCY, 50.0) / 1000.0,
+        p90_us: percentile(&metrics::GET_LATENCY, 90.0) / 1000.0,
+        p99_us: percentile(&metrics::GET_LATENCY, 99.0) / 1000.0,
+        p999_us: percentile(&metrics::GET_LATENCY, 99.9) / 1000.0,
+        p9999_us: percentile(&metrics::GET_LATENCY, 99.99) / 1000.0,
+        max_us: max_percentile(&metrics::GET_LATENCY) / 1000.0,
     };
 
-    let p50 = percentile(&metrics::RESPONSE_LATENCY, 50.0);
-    let p99 = percentile(&metrics::RESPONSE_LATENCY, 99.0);
-    let p999 = percentile(&metrics::RESPONSE_LATENCY, 99.9);
-    let p9999 = percentile(&metrics::RESPONSE_LATENCY, 99.99);
+    // Get latencies for SET operations
+    let set_latencies = LatencyStats {
+        p50_us: percentile(&metrics::SET_LATENCY, 50.0) / 1000.0,
+        p90_us: percentile(&metrics::SET_LATENCY, 90.0) / 1000.0,
+        p99_us: percentile(&metrics::SET_LATENCY, 99.0) / 1000.0,
+        p999_us: percentile(&metrics::SET_LATENCY, 99.9) / 1000.0,
+        p9999_us: percentile(&metrics::SET_LATENCY, 99.99) / 1000.0,
+        max_us: max_percentile(&metrics::SET_LATENCY) / 1000.0,
+    };
 
-    tracing::info!("=== Final Results ===");
-    tracing::info!("total_requests: {}", requests);
-    tracing::info!("total_responses: {}", responses);
-    tracing::info!("total_errors: {}", errors);
-    tracing::info!(
-        "hit_rate: {:.2}% ({} hits, {} misses)",
-        hit_rate,
+    let results = Results {
+        duration_secs: elapsed_secs,
+        requests,
+        responses,
+        errors,
         hits,
-        misses
-    );
-    tracing::info!("throughput: {:.2} req/s", responses as f64 / elapsed_secs);
-    tracing::info!("latency p50: {:.2} us", p50 / 1000.0);
-    tracing::info!("latency p99: {:.2} us", p99 / 1000.0);
-    tracing::info!("latency p99.9: {:.2} us", p999 / 1000.0);
-    tracing::info!("latency p99.99: {:.2} us", p9999 / 1000.0);
+        misses,
+        bytes_tx,
+        bytes_rx,
+        get_count,
+        set_count,
+        get_latencies,
+        set_latencies,
+        conns_active: active,
+        conns_failed: failed,
+        conns_total: total_connections as u64,
+    };
 
-    // Report final disconnect reason breakdown
-    let total_failed = metrics::CONNECTIONS_FAILED.value();
-    if total_failed > 0 {
-        tracing::info!(
-            "disconnects: {} (eof={} recv_err={} send_err={} closed={} error={} connect_failed={})",
-            total_failed,
-            metrics::DISCONNECTS_EOF.value(),
-            metrics::DISCONNECTS_RECV_ERROR.value(),
-            metrics::DISCONNECTS_SEND_ERROR.value(),
-            metrics::DISCONNECTS_CLOSED_EVENT.value(),
-            metrics::DISCONNECTS_ERROR_EVENT.value(),
-            metrics::DISCONNECTS_CONNECT_FAILED.value(),
-        );
-    }
+    formatter.print_results(&results);
 
     drop(_admin_handle);
 
@@ -524,6 +504,26 @@ fn percentile(hist: &AtomicHistogram, p: f64) -> f64 {
 /// Get a percentile from a histogram snapshot.
 fn percentile_from_histogram(hist: &Histogram, p: f64) -> f64 {
     if let Ok(Some(results)) = hist.percentiles(&[p])
+        && let Some((_pct, bucket)) = results.first()
+    {
+        return bucket.end() as f64;
+    }
+    0.0
+}
+
+/// Get the max value from an atomic histogram.
+fn max_percentile(hist: &AtomicHistogram) -> f64 {
+    if let Some(snapshot) = hist.load() {
+        max_from_histogram(&snapshot)
+    } else {
+        0.0
+    }
+}
+
+/// Get the max value from a histogram snapshot.
+fn max_from_histogram(hist: &Histogram) -> f64 {
+    // Use 100th percentile as max
+    if let Ok(Some(results)) = hist.percentiles(&[100.0])
         && let Some((_pct, bucket)) = results.first()
     {
         return bucket.end() as f64;

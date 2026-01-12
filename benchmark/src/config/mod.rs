@@ -1,3 +1,4 @@
+use crate::output::{ColorMode, OutputFormat};
 use io_driver::{IoEngine, RecvMode};
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -77,6 +78,8 @@ pub struct Target {
     pub endpoints: Vec<SocketAddr>,
     #[serde(default)]
     pub protocol: Protocol,
+    #[serde(default)]
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -295,6 +298,12 @@ pub struct Admin {
     /// Interval for Parquet snapshots.
     #[serde(default = "default_parquet_interval", with = "humantime_serde")]
     pub parquet_interval: Duration,
+    /// Output format (clean, json, verbose, quiet).
+    #[serde(default, with = "output_format_serde")]
+    pub format: OutputFormat,
+    /// Color mode (auto, always, never).
+    #[serde(default, with = "color_mode_serde")]
+    pub color: ColorMode,
 }
 
 impl Default for Admin {
@@ -303,6 +312,8 @@ impl Default for Admin {
             listen: None,
             parquet: None,
             parquet_interval: default_parquet_interval(),
+            format: OutputFormat::default(),
+            color: ColorMode::default(),
         }
     }
 }
@@ -504,5 +515,31 @@ mod humantime_serde {
         };
 
         Ok(Duration::from_secs(value * multiplier))
+    }
+}
+
+mod output_format_serde {
+    use crate::output::OutputFormat;
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<OutputFormat, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+mod color_mode_serde {
+    use crate::output::ColorMode;
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ColorMode, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }

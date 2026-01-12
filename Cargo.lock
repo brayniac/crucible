@@ -358,6 +358,7 @@ name = "benchmark"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "clap",
  "io-driver",
  "itoa",
@@ -373,6 +374,7 @@ dependencies = [
  "rand_xoshiro",
  "ratelimit",
  "serde",
+ "serde_json",
  "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",

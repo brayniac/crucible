@@ -11,6 +11,7 @@
 //! - MOMENTO_API_KEY: Momento API key (required)
 //! - MOMENTO_ENDPOINT: Explicit endpoint (e.g., cache.us-west-2.momentohq.com:9004)
 //! - MOMENTO_WIRE_FORMAT: "grpc" or "protosocket"
+//! - MOMENTO_SNI_HOST: TLS hostname for SNI (when connecting to IP addresses)
 
 use std::env;
 use std::io::{self, Read, Write};
@@ -77,6 +78,7 @@ fn print_usage() {
         "  MOMENTO_ENDPOINT    - Explicit endpoint (e.g., cache.us-west-2.momentohq.com:9004)"
     );
     eprintln!("  MOMENTO_WIRE_FORMAT - Wire format: \"grpc\" (default) or \"protosocket\"");
+    eprintln!("  MOMENTO_SNI_HOST    - TLS hostname for SNI (when connecting to IP addresses)");
 }
 
 fn parse_ttl(args: &[String]) -> Result<Duration, Box<dyn std::error::Error>> {
@@ -103,21 +105,26 @@ fn execute_operation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve endpoint
     let host = credential.host();
+    let tls_host = credential.tls_host();
     let port = credential.port();
     let wire_format = credential.wire_format();
     let addr = format!("{}:{}", host, port);
 
     // Connect TCP
     println!("Connecting to {}...", addr);
+    if host != tls_host {
+        println!("Using SNI hostname: {}", tls_host);
+    }
     let mut stream = TcpStream::connect(&addr)?;
     stream.set_nonblocking(true)?;
 
     // Create TLS transport based on wire format
+    // Use tls_host for SNI (Server Name Indication) to support IP address connections
     let tls_config = match wire_format {
         WireFormat::Grpc => TlsConfig::http2()?,
         WireFormat::Protosocket => TlsConfig::new()?,
     };
-    let mut transport = TlsTransport::new(&tls_config, host)?;
+    let mut transport = TlsTransport::new(&tls_config, tls_host)?;
 
     // Drive TLS handshake
     println!("TLS handshake...");

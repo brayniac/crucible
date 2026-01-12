@@ -8,6 +8,8 @@ use metriken::{AtomicHistogram, metric};
 static REQUEST: CounterGroup = CounterGroup::new();
 static CACHE: CounterGroup = CounterGroup::new();
 static CONNECTION: CounterGroup = CounterGroup::new();
+static BYTES: CounterGroup = CounterGroup::new();
+static OPS: CounterGroup = CounterGroup::new();
 
 /// Counter slot indices for request metrics.
 pub mod request {
@@ -34,6 +36,18 @@ pub mod connection {
     pub const DISCONNECT_CONNECT_FAILED: usize = 7;
 }
 
+/// Counter slot indices for bytes metrics.
+pub mod bytes {
+    pub const TX: usize = 0;
+    pub const RX: usize = 1;
+}
+
+/// Counter slot indices for operation metrics.
+pub mod ops {
+    pub const GET: usize = 0;
+    pub const SET: usize = 1;
+}
+
 // Request counters
 #[metric(name = "requests_sent", description = "Total requests sent")]
 pub static REQUESTS_SENT: Counter = Counter::new(&REQUEST, request::SENT);
@@ -50,6 +64,20 @@ pub static CACHE_HITS: Counter = Counter::new(&CACHE, cache::HITS);
 
 #[metric(name = "cache_misses", description = "Total cache misses")]
 pub static CACHE_MISSES: Counter = Counter::new(&CACHE, cache::MISSES);
+
+// Bytes counters
+#[metric(name = "bytes_tx", description = "Total bytes transmitted")]
+pub static BYTES_TX: Counter = Counter::new(&BYTES, bytes::TX);
+
+#[metric(name = "bytes_rx", description = "Total bytes received")]
+pub static BYTES_RX: Counter = Counter::new(&BYTES, bytes::RX);
+
+// Operation counters
+#[metric(name = "get_count", description = "Total GET operations")]
+pub static GET_COUNT: Counter = Counter::new(&OPS, ops::GET);
+
+#[metric(name = "set_count", description = "Total SET operations")]
+pub static SET_COUNT: Counter = Counter::new(&OPS, ops::SET);
 
 // Connection counters
 #[metric(name = "connections_active", description = "Active connections")]

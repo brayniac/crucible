@@ -420,9 +420,11 @@ impl IoWorker {
 
                     match result.request_type {
                         RequestType::Get => {
+                            metrics::GET_COUNT.increment();
                             let _ = metrics::GET_LATENCY.increment(result.latency_ns);
                         }
                         RequestType::Set => {
+                            metrics::SET_COUNT.increment();
                             let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                         }
                         _ => {}
@@ -582,9 +584,11 @@ impl IoWorker {
                                 let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
                                 match result.request_type {
                                     RequestType::Get => {
+                                        metrics::GET_COUNT.increment();
                                         let _ = metrics::GET_LATENCY.increment(result.latency_ns);
                                     }
                                     RequestType::Set => {
+                                        metrics::SET_COUNT.increment();
                                         let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                                     }
                                     _ => {}
@@ -684,9 +688,11 @@ impl IoWorker {
 
                 match result.request_type {
                     RequestType::Get => {
+                        metrics::GET_COUNT.increment();
                         let _ = metrics::GET_LATENCY.increment(result.latency_ns);
                     }
                     RequestType::Set => {
+                        metrics::SET_COUNT.increment();
                         let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                     }
                     _ => {}

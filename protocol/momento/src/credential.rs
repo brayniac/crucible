@@ -14,6 +14,8 @@ pub struct Credential {
     endpoint: String,
     /// The wire format to use for communication.
     wire_format: WireFormat,
+    /// Optional SNI hostname for TLS (used when connecting to IP addresses).
+    sni_host: Option<String>,
 }
 
 impl Credential {
@@ -35,6 +37,7 @@ impl Credential {
             token,
             endpoint,
             wire_format: WireFormat::default(),
+            sni_host: None,
         })
     }
 
@@ -45,6 +48,7 @@ impl Credential {
             token: token.into(),
             endpoint: endpoint.into(),
             wire_format: WireFormat::default(),
+            sni_host: None,
         }
     }
 
@@ -52,9 +56,10 @@ impl Credential {
     ///
     /// Uses:
     /// - `MOMENTO_API_KEY` or `MOMENTO_AUTH_TOKEN` for the token
-    /// - `MOMENTO_ENDPOINT` for explicit endpoint (e.g., "cache.us-west-2.momentohq.com")
+    /// - `MOMENTO_ENDPOINT` for explicit endpoint (e.g., "cache.us-west-2.momentohq.com" or IP:port)
     /// - `MOMENTO_REGION` for region-based endpoint (e.g., "us-west-2")
     /// - `MOMENTO_WIRE_FORMAT` for wire format ("grpc" or "protosocket")
+    /// - `MOMENTO_SNI_HOST` for TLS hostname when connecting to IP addresses
     pub fn from_env() -> Result<Self> {
         let token = std::env::var("MOMENTO_API_KEY")
             .or_else(|_| std::env::var("MOMENTO_AUTH_TOKEN"))
@@ -66,12 +71,16 @@ impl Credential {
             _ => WireFormat::Grpc,
         };
 
+        // Check for SNI hostname (used when connecting to IP addresses)
+        let sni_host = std::env::var("MOMENTO_SNI_HOST").ok();
+
         // Check for explicit endpoint
         if let Ok(endpoint) = std::env::var("MOMENTO_ENDPOINT") {
             return Ok(Self {
                 token,
                 endpoint,
                 wire_format,
+                sni_host,
             });
         }
 
@@ -83,12 +92,14 @@ impl Credential {
                 token,
                 endpoint,
                 wire_format,
+                sni_host,
             });
         }
 
         // Try to extract from token (legacy tokens)
         let mut cred = Self::from_token(token)?;
         cred.wire_format = wire_format;
+        cred.sni_host = sni_host;
         Ok(cred)
     }
 
@@ -125,6 +136,14 @@ impl Credential {
     /// Get the host portion of the endpoint.
     pub fn host(&self) -> &str {
         self.endpoint.split(':').next().unwrap_or(&self.endpoint)
+    }
+
+    /// Get the TLS hostname for SNI.
+    ///
+    /// Returns the explicit SNI host if set, otherwise returns the endpoint host.
+    /// Use this when creating TLS connections to ensure proper certificate verification.
+    pub fn tls_host(&self) -> &str {
+        self.sni_host.as_deref().unwrap_or_else(|| self.host())
     }
 
     /// Get the port, defaulting to 443.
