@@ -820,16 +820,16 @@ impl CacheCommand {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
 
-        // Field 1: message_id
-        encode_uint64(1, self.message_id, &mut buf);
+        // Field 2: message_id (per official proto)
+        encode_uint64(2, self.message_id, &mut buf);
 
-        // Field 2: control_code
-        encode_uint64(2, self.control_code as u64, &mut buf);
+        // Field 3: control_code (per official proto)
+        encode_uint64(3, self.control_code as u64, &mut buf);
 
-        // Field 3: unary command (wrapped in Unary message)
+        // Field 10: unary command (per official proto)
         if let Some(ref cmd) = self.command {
             let unary = cmd.encode();
-            encode_message(3, &unary, &mut buf);
+            encode_message(10, &unary, &mut buf);
         }
 
         buf
@@ -854,9 +854,9 @@ impl CacheCommand {
         while !buf.is_empty() {
             let (field_number, wire_type) = decode_tag(&mut buf)?;
             match field_number {
-                1 => message_id = decode_varint(&mut buf)?,
-                2 => control_code = ControlCode::from_u32(decode_varint(&mut buf)? as u32),
-                3 => {
+                2 => message_id = decode_varint(&mut buf)?,
+                3 => control_code = ControlCode::from_u32(decode_varint(&mut buf)? as u32),
+                10 => {
                     let unary_data = decode_length_delimited(&mut buf)?;
                     command = UnaryCommand::decode(unary_data);
                 }
@@ -999,32 +999,32 @@ impl CacheResponse {
         // Field 2: control_code
         encode_uint64(2, self.control_code as u64, &mut buf);
 
-        // Field 3-7: response kind
+        // Response kind (per official proto field numbers)
         match &self.result {
+            CacheResponseResult::Error(err) => {
+                // Field 9: error
+                let inner = err.encode();
+                encode_message(9, &inner, &mut buf);
+            }
             CacheResponseResult::Authenticate => {
-                // Field 1: authenticate response (empty)
-                encode_message(1, &[], &mut buf);
+                // Field 10: authenticate response (empty)
+                encode_message(10, &[], &mut buf);
             }
             CacheResponseResult::Get { value } => {
-                // Field 2: get response
+                // Field 11: get response
                 let mut inner = Vec::new();
                 if let Some(v) = value {
                     encode_bytes(1, v, &mut inner);
                 }
-                encode_message(2, &inner, &mut buf);
+                encode_message(11, &inner, &mut buf);
             }
             CacheResponseResult::Set => {
-                // Field 3: set response (empty)
-                encode_message(3, &[], &mut buf);
+                // Field 12: set response (empty)
+                encode_message(12, &[], &mut buf);
             }
             CacheResponseResult::Delete => {
-                // Field 4: delete response (empty)
-                encode_message(4, &[], &mut buf);
-            }
-            CacheResponseResult::Error(err) => {
-                // Field 5: error
-                let inner = err.encode();
-                encode_message(5, &inner, &mut buf);
+                // Field 13: delete response (empty)
+                encode_message(13, &[], &mut buf);
             }
         }
 
@@ -1056,27 +1056,27 @@ impl CacheResponse {
                 2 if wire_type == WIRE_TYPE_VARINT => {
                     control_code = ControlCode::from_u32(decode_varint(&mut buf)? as u32);
                 }
-                // Response kinds (field 1 is also authenticate response when LEN type)
-                1 if wire_type == WIRE_TYPE_LEN => {
-                    let _inner = decode_length_delimited(&mut buf)?;
-                    result = Some(CacheResponseResult::Authenticate);
-                }
-                2 if wire_type == WIRE_TYPE_LEN => {
-                    let inner = decode_length_delimited(&mut buf)?;
-                    result = Some(Self::decode_get_response(inner));
-                }
-                3 if wire_type == WIRE_TYPE_LEN => {
-                    let _inner = decode_length_delimited(&mut buf)?;
-                    result = Some(CacheResponseResult::Set);
-                }
-                4 if wire_type == WIRE_TYPE_LEN => {
-                    let _inner = decode_length_delimited(&mut buf)?;
-                    result = Some(CacheResponseResult::Delete);
-                }
-                5 if wire_type == WIRE_TYPE_LEN => {
+                // Response kinds (per official proto field numbers)
+                9 if wire_type == WIRE_TYPE_LEN => {
                     let inner = decode_length_delimited(&mut buf)?;
                     let err = CommandError::decode(inner)?;
                     result = Some(CacheResponseResult::Error(err));
+                }
+                10 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited(&mut buf)?;
+                    result = Some(CacheResponseResult::Authenticate);
+                }
+                11 if wire_type == WIRE_TYPE_LEN => {
+                    let inner = decode_length_delimited(&mut buf)?;
+                    result = Some(Self::decode_get_response(inner));
+                }
+                12 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited(&mut buf)?;
+                    result = Some(CacheResponseResult::Set);
+                }
+                13 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited(&mut buf)?;
+                    result = Some(CacheResponseResult::Delete);
                 }
                 _ => skip_field(wire_type, &mut buf)?,
             }

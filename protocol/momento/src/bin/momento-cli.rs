@@ -7,7 +7,10 @@
 //!   momento-cli delete <cache> <key>
 //! ```
 //!
-//! Requires MOMENTO_API_KEY environment variable to be set.
+//! Environment:
+//! - MOMENTO_API_KEY: Momento API key (required)
+//! - MOMENTO_ENDPOINT: Explicit endpoint (e.g., cache.us-west-2.momentohq.com:9004)
+//! - MOMENTO_WIRE_FORMAT: "grpc" or "protosocket"
 
 use std::env;
 use std::io::{self, Read, Write};
@@ -15,7 +18,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use io_driver::{TlsConfig, TlsTransport, Transport, TransportState};
-use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential};
+use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential, WireFormat};
 
 fn main() {
     if let Err(e) = run() {
@@ -68,9 +71,12 @@ fn print_usage() {
     eprintln!("  momento-cli delete <cache> <key>");
     eprintln!();
     eprintln!("Environment:");
-    eprintln!("  MOMENTO_API_KEY  - Momento API key (required)");
-    eprintln!("  MOMENTO_REGION   - Region for cache endpoint (e.g., us-west-2)");
-    eprintln!("  MOMENTO_ENDPOINT - Explicit endpoint (e.g., cache.us-west-2.momentohq.com)");
+    eprintln!("  MOMENTO_API_KEY     - Momento API key (required)");
+    eprintln!("  MOMENTO_REGION      - Region for cache endpoint (e.g., us-west-2)");
+    eprintln!(
+        "  MOMENTO_ENDPOINT    - Explicit endpoint (e.g., cache.us-west-2.momentohq.com:9004)"
+    );
+    eprintln!("  MOMENTO_WIRE_FORMAT - Wire format: \"grpc\" (default) or \"protosocket\"");
 }
 
 fn parse_ttl(args: &[String]) -> Result<Duration, Box<dyn std::error::Error>> {
@@ -98,6 +104,7 @@ fn execute_operation(
     // Resolve endpoint
     let host = credential.host();
     let port = credential.port();
+    let wire_format = credential.wire_format();
     let addr = format!("{}:{}", host, port);
 
     // Connect TCP
@@ -105,28 +112,44 @@ fn execute_operation(
     let mut stream = TcpStream::connect(&addr)?;
     stream.set_nonblocking(true)?;
 
-    // Create TLS transport
-    let tls_config = TlsConfig::http2()?;
+    // Create TLS transport based on wire format
+    let tls_config = match wire_format {
+        WireFormat::Grpc => TlsConfig::http2()?,
+        WireFormat::Protosocket => TlsConfig::new()?,
+    };
     let mut transport = TlsTransport::new(&tls_config, host)?;
 
     // Drive TLS handshake
     println!("TLS handshake...");
     drive_handshake(&mut transport, &mut stream)?;
 
-    // Verify ALPN
-    if let Some(alpn) = transport.alpn_protocol() {
-        if alpn != b"h2" {
-            return Err(format!("unexpected ALPN: {:?}", alpn).into());
+    // Verify ALPN for gRPC
+    match wire_format {
+        WireFormat::Grpc => {
+            if let Some(alpn) = transport.alpn_protocol() {
+                if alpn != b"h2" {
+                    return Err(format!("unexpected ALPN: {:?}", alpn).into());
+                }
+                println!("ALPN: h2");
+            }
         }
-        println!("ALPN: h2");
+        WireFormat::Protosocket => {
+            println!("Wire format: protosocket");
+        }
     }
 
-    // Create cache client (this wraps the transport in Connection and Channel)
-    let mut client = CacheClient::with_transport(transport, credential);
+    // Create cache client based on wire format
+    let mut client = match wire_format {
+        WireFormat::Grpc => CacheClient::with_transport(transport, credential),
+        WireFormat::Protosocket => CacheClient::with_protosocket_transport(transport, credential),
+    };
     client.on_transport_ready()?;
 
-    // Drive HTTP/2 connection setup
-    println!("HTTP/2 connection setup...");
+    // Drive connection setup
+    match wire_format {
+        WireFormat::Grpc => println!("HTTP/2 connection setup..."),
+        WireFormat::Protosocket => println!("Protosocket authentication..."),
+    }
     drive_connection_setup(&mut client, &mut stream)?;
 
     // Execute operation
@@ -212,17 +235,25 @@ fn drive_handshake(transport: &mut TlsTransport, stream: &mut TcpStream) -> io::
     }
 }
 
-/// Drive HTTP/2 connection setup (preface + settings exchange).
+/// Drive connection setup (HTTP/2 for gRPC, auth for protosocket).
 fn drive_connection_setup<T: Transport>(
     client: &mut CacheClient<T>,
     stream: &mut TcpStream,
 ) -> io::Result<()> {
     let mut buf = [0u8; 16384];
+    let debug = std::env::var("DEBUG").is_ok();
 
     loop {
         // Send any pending data
         while client.has_pending_send() {
             let data = client.pending_send();
+            if debug {
+                eprintln!(
+                    "SEND {} bytes: {:02x?}",
+                    data.len(),
+                    &data[..data.len().min(64)]
+                );
+            }
             match stream.write(data) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
                 Ok(n) => client.advance_send(n),
@@ -239,7 +270,12 @@ fn drive_connection_setup<T: Transport>(
         // Read data from socket
         match stream.read(&mut buf) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            Ok(n) => client.on_recv(&buf[..n])?,
+            Ok(n) => {
+                if debug {
+                    eprintln!("RECV {} bytes: {:02x?}", n, &buf[..n.min(64)]);
+                }
+                client.on_recv(&buf[..n])?;
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }

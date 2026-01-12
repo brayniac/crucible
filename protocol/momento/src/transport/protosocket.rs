@@ -109,6 +109,9 @@ impl<T: Transport> ProtosocketTransport<T> {
         self.pending.insert(message_id, PendingOp::Authenticate);
         self.state = ConnectionState::Authenticating;
 
+        // Flush through TLS layer
+        self.flush_send_internal()?;
+
         Ok(())
     }
 
@@ -129,7 +132,25 @@ impl<T: Transport> ProtosocketTransport<T> {
 
         self.pending.insert(message_id, op);
 
+        // Flush through TLS layer
+        self.flush_send_internal()?;
+
         Ok(RequestId::new(message_id))
+    }
+
+    /// Flush send_buf through the TLS transport.
+    fn flush_send_internal(&mut self) -> io::Result<()> {
+        while !self.send_buf.is_empty() {
+            match self.transport.send(&self.send_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = self.send_buf.split_to(n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Process a received response.
@@ -257,21 +278,40 @@ impl<T: Transport> MomentoTransport for ProtosocketTransport<T> {
     }
 
     fn on_recv(&mut self, data: &[u8]) -> io::Result<()> {
-        self.recv_buf.extend_from_slice(data);
+        // Pass encrypted data to TLS layer for decryption
+        self.transport.on_recv(data)?;
+
+        // Read decrypted data from TLS layer into our buffer
+        let mut temp = [0u8; 16384];
+        loop {
+            match self.transport.recv(&mut temp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.recv_buf.extend_from_slice(&temp[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+
         self.process_recv_buffer();
         Ok(())
     }
 
     fn pending_send(&self) -> &[u8] {
-        &self.send_buf
+        // Return encrypted data from TLS layer
+        self.transport.pending_send()
     }
 
     fn advance_send(&mut self, n: usize) {
-        let _ = self.send_buf.split_to(n);
+        // Advance TLS layer's send buffer
+        self.transport.advance_send(n);
     }
 
     fn has_pending_send(&self) -> bool {
-        !self.send_buf.is_empty()
+        // Check TLS layer for pending encrypted data
+        // (send_buf should be empty since we flush immediately after adding data)
+        self.transport.has_pending_send() || !self.send_buf.is_empty()
     }
 
     fn get(&mut self, cache_name: &str, key: &[u8]) -> io::Result<RequestId> {
