@@ -11,7 +11,7 @@ local server_config = {
     cache: {
         backend: error 'backend must be specified',
         heap_size: error 'heap_size must be specified',
-        segment_size: '1MB',
+        segment_size: '4MB',
         hashtable_power: 20,
     },
 
@@ -85,7 +85,7 @@ function(
     // Server parameters
     cache_backend='segcache',
     heap_size='8GB',
-    segment_size='1MB',
+    segment_size='4MB',
     hashtable_power='20',
     server_threads='8',
     server_cpu_affinity='0-8',
@@ -278,7 +278,7 @@ function(
                             ulimit -n 500000
                             sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
-                            export CRUCIBLE_DIAGNOSTICS=1
+                            # export CRUCIBLE_DIAGNOSTICS=1
                             $HOME/crucible/target/release/crucible-server server.toml &
                             echo PID=$! > pid
                         |||,
@@ -397,7 +397,7 @@ function(
                             sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
 
-                            export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
+                            # export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
                             $HOME/crucible/target/release/crucible-benchmark warmup.toml
                         |||
                     ),
@@ -417,7 +417,7 @@ function(
                             sudo prlimit --memlock=unlimited --pid $$
                             ulimit -a
 
-                            export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
+                            # export CRUCIBLE_DIAGNOSTICS=1 RUST_LOG=benchmark=debug
                             $HOME/crucible/target/release/crucible-benchmark loadgen.toml
                         |||
                     ),

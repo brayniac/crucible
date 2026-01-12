@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 /// Test configuration for parameterized tests.
 #[derive(Clone, Debug)]
 struct TestConfig {
+    runtime: &'static str,
     io_engine: &'static str,
+    recv_mode: Option<&'static str>,
     connections: usize,
     pipeline_depth: usize,
     value_size: usize,
@@ -33,7 +35,43 @@ impl TestConfig {
         value_size: usize,
     ) -> Self {
         Self {
+            runtime: "native",
             io_engine,
+            recv_mode: None,
+            connections,
+            pipeline_depth,
+            value_size,
+        }
+    }
+
+    fn with_runtime(
+        runtime: &'static str,
+        io_engine: &'static str,
+        connections: usize,
+        pipeline_depth: usize,
+        value_size: usize,
+    ) -> Self {
+        Self {
+            runtime,
+            io_engine,
+            recv_mode: None,
+            connections,
+            pipeline_depth,
+            value_size,
+        }
+    }
+
+    fn with_recv_mode(
+        io_engine: &'static str,
+        recv_mode: &'static str,
+        connections: usize,
+        pipeline_depth: usize,
+        value_size: usize,
+    ) -> Self {
+        Self {
+            runtime: "native",
+            io_engine,
+            recv_mode: Some(recv_mode),
             connections,
             pipeline_depth,
             value_size,
@@ -59,17 +97,48 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
     false
 }
 
-/// Start a test server with the specified I/O engine.
+/// Start a test server with the specified I/O engine (native runtime).
 fn start_test_server(port: u16, io_engine: &str, worker_threads: usize) -> thread::JoinHandle<()> {
+    start_test_server_full(port, io_engine, "native", None, worker_threads)
+}
+
+/// Start a test server with the specified runtime and I/O engine.
+fn start_test_server_with_runtime(
+    port: u16,
+    io_engine: &str,
+    runtime: &str,
+    worker_threads: usize,
+) -> thread::JoinHandle<()> {
+    start_test_server_full(port, io_engine, runtime, None, worker_threads)
+}
+
+/// Start a test server with full configuration options.
+fn start_test_server_full(
+    port: u16,
+    io_engine: &str,
+    runtime: &str,
+    recv_mode: Option<&str>,
+    worker_threads: usize,
+) -> thread::JoinHandle<()> {
     let io_engine = io_engine.to_string();
+    let runtime = runtime.to_string();
+    let recv_mode = recv_mode.map(|s| s.to_string());
     thread::spawn(move || {
+        let recv_mode_config = recv_mode
+            .as_ref()
+            .map(|m| format!("recv_mode = \"{m}\""))
+            .unwrap_or_default();
+
         let config_str = format!(
             r#"
-            runtime = "native"
+            runtime = "{runtime}"
             io_engine = "{io_engine}"
 
             [workers]
             threads = {worker_threads}
+
+            [uring]
+            {recv_mode_config}
 
             [cache]
             backend = "segcache"
@@ -95,7 +164,14 @@ fn start_test_server(port: u16, io_engine: &str, worker_threads: usize) -> threa
             .unwrap();
 
         // Run server (blocks forever, thread killed on test exit)
-        let _ = server::native::run(&config, cache);
+        match runtime.as_str() {
+            "tokio" => {
+                let _ = server::tokio::run(&config, cache);
+            }
+            _ => {
+                let _ = server::native::run(&config, cache);
+            }
+        }
     })
 }
 
@@ -267,13 +343,22 @@ fn run_parameterized_test(config: TestConfig) {
     let worker_threads = std::cmp::min(4, std::cmp::max(1, config.connections / 64));
 
     // Start server
-    let _server_handle = start_test_server(port, config.io_engine, worker_threads);
+    let _server_handle = start_test_server_full(
+        port,
+        config.io_engine,
+        config.runtime,
+        config.recv_mode,
+        worker_threads,
+    );
 
     // Wait for server to be ready
+    let recv_mode_str = config.recv_mode.unwrap_or("default");
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {} backend",
-        config.io_engine
+        "Server failed to start with {} runtime/{} backend/recv_mode={}",
+        config.runtime,
+        config.io_engine,
+        recv_mode_str
     );
 
     let success_count = Arc::new(AtomicUsize::new(0));
@@ -407,18 +492,24 @@ fn send_get(stream: &mut TcpStream, key: &str, expected_value: &str) -> bool {
     response.contains(expected_value)
 }
 
-/// Run the basic integration test for a given I/O engine.
+/// Run the basic integration test for a given I/O engine (native runtime).
 fn run_basic_test(io_engine: &str) {
+    run_basic_test_with_runtime("native", io_engine);
+}
+
+/// Run the basic integration test for a given runtime and I/O engine.
+fn run_basic_test_with_runtime(runtime: &str, io_engine: &str) {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Start server
-    let _server_handle = start_test_server(port, io_engine, 1);
+    let _server_handle = start_test_server_with_runtime(port, io_engine, runtime, 1);
 
     // Wait for server to be ready
     assert!(
         wait_for_server(addr, Duration::from_secs(5)),
-        "Server failed to start with {} backend",
+        "Server failed to start with {} runtime/{} backend",
+        runtime,
         io_engine
     );
 
@@ -890,4 +981,473 @@ fn test_uring_deep_pipeline() {
         depth,
         pong_count
     );
+}
+
+// =============================================================================
+// Tokio runtime backend tests
+// =============================================================================
+
+#[test]
+fn test_tokio_basic() {
+    run_basic_test_with_runtime("tokio", "mio");
+}
+
+#[test]
+fn test_tokio_1conn_p1_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 1, 1, 64));
+}
+
+#[test]
+fn test_tokio_1conn_p1_medium() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 1, 1, 1024));
+}
+
+#[test]
+fn test_tokio_1conn_p1_large() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 1, 1, 16384));
+}
+
+#[test]
+fn test_tokio_8conn_p1_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 1, 64));
+}
+
+#[test]
+fn test_tokio_8conn_p8_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 8, 64));
+}
+
+#[test]
+fn test_tokio_8conn_p64_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 64, 64));
+}
+
+#[test]
+fn test_tokio_8conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 8, 1024));
+}
+
+#[test]
+fn test_tokio_8conn_p8_large() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 8, 16384));
+}
+
+#[test]
+fn test_tokio_64conn_p1_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 1, 64));
+}
+
+#[test]
+fn test_tokio_64conn_p8_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 8, 64));
+}
+
+#[test]
+fn test_tokio_64conn_p64_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 64, 64));
+}
+
+#[test]
+fn test_tokio_64conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 8, 1024));
+}
+
+#[test]
+fn test_tokio_64conn_p8_large() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 8, 16384));
+}
+
+#[test]
+#[ignore] // Expensive test, run with --ignored
+fn test_tokio_256conn_p1_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 256, 1, 64));
+}
+
+#[test]
+#[ignore] // Expensive test, run with --ignored
+fn test_tokio_256conn_p8_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 256, 8, 64));
+}
+
+#[test]
+#[ignore] // Expensive test, run with --ignored
+fn test_tokio_256conn_p64_small() {
+    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 256, 64, 64));
+}
+
+#[test]
+fn test_tokio_large_objects() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_with_runtime(port, "mio", "tokio", 1);
+    assert!(wait_for_server(addr, Duration::from_secs(5)));
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    // Test various object sizes
+    for &size in &[64, 256, 1024, 4096, 16384, 65536] {
+        let key = format!("largekey_{}", size);
+        let value = generate_value(size);
+
+        assert!(
+            send_set(&mut stream, &key, &value),
+            "SET failed for size {}",
+            size
+        );
+        assert!(
+            send_get(&mut stream, &key, &value),
+            "GET failed for size {}",
+            size
+        );
+    }
+}
+
+#[test]
+fn test_tokio_connection_churn() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_with_runtime(port, "mio", "tokio", 2);
+    assert!(wait_for_server(addr, Duration::from_secs(5)));
+
+    // Rapidly open and close connections while doing work
+    for i in 0..100 {
+        let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let key = format!("churn_key_{}", i);
+        let value = format!("churn_value_{}", i);
+
+        assert!(
+            send_set(&mut stream, &key, &value),
+            "SET failed on iteration {}",
+            i
+        );
+        assert!(send_ping(&mut stream), "PING failed on iteration {}", i);
+
+        // Explicit close
+        drop(stream);
+    }
+}
+
+#[test]
+fn test_tokio_deep_pipeline() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_with_runtime(port, "mio", "tokio", 1);
+    assert!(wait_for_server(addr, Duration::from_secs(5)));
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+
+    // Send 256 pipelined PING commands
+    let depth = 256;
+    let ping = build_ping_command();
+    let mut pipeline = Vec::with_capacity(ping.len() * depth);
+    for _ in 0..depth {
+        pipeline.extend(&ping);
+    }
+
+    stream.write_all(&pipeline).unwrap();
+
+    let responses = read_responses(&mut stream, depth);
+    let pong_count = String::from_utf8_lossy(&responses).matches("PONG").count();
+
+    assert!(
+        pong_count >= depth,
+        "Expected {} PONGs, got {}",
+        depth,
+        pong_count
+    );
+}
+
+// =============================================================================
+// io_uring single-shot recv mode tests (Linux only)
+//
+// These tests explicitly use single-shot recv mode to ensure coverage of the
+// zero-copy recv path (kernel writes directly to pool buffer, no intermediate copy).
+// =============================================================================
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_basic() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_full(port, "uring", "native", Some("singleshot"), 1);
+
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start with uring/singleshot"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Test PING
+    assert!(send_ping(&mut stream), "PING failed with uring/singleshot");
+
+    // Test SET
+    assert!(
+        send_set(&mut stream, "test_key", "test_value"),
+        "SET failed with uring/singleshot"
+    );
+
+    // Test GET
+    assert!(
+        send_get(&mut stream, "test_key", "test_value"),
+        "GET failed with uring/singleshot"
+    );
+
+    drop(stream);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_1conn_p1_small() {
+    run_parameterized_test(TestConfig::with_recv_mode("uring", "singleshot", 1, 1, 64));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_1conn_p1_medium() {
+    run_parameterized_test(TestConfig::with_recv_mode(
+        "uring",
+        "singleshot",
+        1,
+        1,
+        1024,
+    ));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_1conn_p1_large() {
+    run_parameterized_test(TestConfig::with_recv_mode(
+        "uring",
+        "singleshot",
+        1,
+        1,
+        16384,
+    ));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_8conn_p8_small() {
+    run_parameterized_test(TestConfig::with_recv_mode("uring", "singleshot", 8, 8, 64));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_8conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_recv_mode(
+        "uring",
+        "singleshot",
+        8,
+        8,
+        1024,
+    ));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_8conn_p8_large() {
+    run_parameterized_test(TestConfig::with_recv_mode(
+        "uring",
+        "singleshot",
+        8,
+        8,
+        16384,
+    ));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_64conn_p8_small() {
+    run_parameterized_test(TestConfig::with_recv_mode("uring", "singleshot", 64, 8, 64));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_64conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_recv_mode(
+        "uring",
+        "singleshot",
+        64,
+        8,
+        1024,
+    ));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_large_objects() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_full(port, "uring", "native", Some("singleshot"), 1);
+    assert!(wait_for_server(addr, Duration::from_secs(5)));
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    // Test various object sizes - exercises coalesce path for large values
+    for &size in &[64, 256, 1024, 4096, 16384, 65536] {
+        let key = format!("largekey_{}", size);
+        let value = generate_value(size);
+
+        assert!(
+            send_set(&mut stream, &key, &value),
+            "SET failed for size {} with singleshot",
+            size
+        );
+        assert!(
+            send_get(&mut stream, &key, &value),
+            "GET failed for size {} with singleshot",
+            size
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_singleshot_deep_pipeline() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_full(port, "uring", "native", Some("singleshot"), 1);
+    assert!(wait_for_server(addr, Duration::from_secs(5)));
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+
+    // Send 256 pipelined PING commands
+    let depth = 256;
+    let ping = build_ping_command();
+    let mut pipeline = Vec::with_capacity(ping.len() * depth);
+    for _ in 0..depth {
+        pipeline.extend(&ping);
+    }
+
+    stream.write_all(&pipeline).unwrap();
+
+    let responses = read_responses(&mut stream, depth);
+    let pong_count = String::from_utf8_lossy(&responses).matches("PONG").count();
+
+    assert!(
+        pong_count >= depth,
+        "Expected {} PONGs with singleshot, got {}",
+        depth,
+        pong_count
+    );
+}
+
+// =============================================================================
+// io_uring multishot recv mode tests (Linux only)
+//
+// These tests explicitly use multishot recv mode to ensure coverage of the
+// ring-provided buffer path (data copied from ring buffer to coalesce buffer).
+// =============================================================================
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_multishot_basic() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_full(port, "uring", "native", Some("multishot"), 1);
+
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start with uring/multishot"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Test PING
+    assert!(send_ping(&mut stream), "PING failed with uring/multishot");
+
+    // Test SET
+    assert!(
+        send_set(&mut stream, "test_key", "test_value"),
+        "SET failed with uring/multishot"
+    );
+
+    // Test GET
+    assert!(
+        send_get(&mut stream, "test_key", "test_value"),
+        "GET failed with uring/multishot"
+    );
+
+    drop(stream);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_multishot_8conn_p8_small() {
+    run_parameterized_test(TestConfig::with_recv_mode("uring", "multishot", 8, 8, 64));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_multishot_8conn_p8_large() {
+    run_parameterized_test(TestConfig::with_recv_mode(
+        "uring",
+        "multishot",
+        8,
+        8,
+        16384,
+    ));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_multishot_64conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_recv_mode(
+        "uring",
+        "multishot",
+        64,
+        8,
+        1024,
+    ));
 }
