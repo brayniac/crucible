@@ -281,10 +281,28 @@ impl Session {
         self.last_reconnect_attempt = None;
     }
 
-    /// Mark the session as disconnected.
+    /// Mark the session as disconnected and clear all connection-specific state.
+    ///
+    /// This clears in-flight requests, buffers, and timestamps since they belong
+    /// to the now-closed connection and are no longer relevant.
     pub fn disconnect(&mut self) {
         self.conn_id = None;
         self.state = ConnectionState::Disconnected;
+
+        // Clear connection-specific state since the connection is gone
+        self.in_flight.clear();
+        self.buffers.send.clear();
+        self.buffers.recv.clear();
+        self.last_tx_timestamp = None;
+        self.last_rx_timestamp = None;
+
+        // Reset codec state
+        match &mut self.codec {
+            ProtocolCodec::Resp(codec) => codec.reset_counter(),
+            ProtocolCodec::Memcache(_) => {}
+            ProtocolCodec::MemcacheBinary(codec) => codec.reset(),
+            ProtocolCodec::Ping(codec) => codec.reset(),
+        }
     }
 
     /// Check if the session is connected.

@@ -749,9 +749,11 @@ impl IoWorker {
                     match self.driver.register(stream) {
                         Ok(conn_id) => {
                             let session = &mut self.sessions[idx];
+                            // Reset state BEFORE setting new conn_id to ensure
+                            // there's no window where new conn_id has old state
+                            session.reset();
                             session.set_conn_id(conn_id);
                             session.reconnect_attempted(true);
-                            session.reset(); // Clear buffers and in-flight state
 
                             self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
 
