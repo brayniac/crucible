@@ -256,12 +256,11 @@ impl IoDriver for MioDriver {
 
     fn close(&mut self, id: ConnId) -> io::Result<()> {
         let slot = id.slot();
-        // Validate generation before removing
-        if let Some(conn) = self.connections.get(slot) {
-            if conn.generation != id.generation() {
-                // Stale ConnId - connection was already replaced
-                return Ok(());
-            }
+        // Validate generation before removing - stale ConnId means connection was already replaced
+        if let Some(conn) = self.connections.get(slot)
+            && conn.generation != id.generation()
+        {
+            return Ok(());
         }
         if let Some(mut conn) = self.connections.try_remove(slot) {
             self.poll.registry().deregister(&mut conn.stream)?;

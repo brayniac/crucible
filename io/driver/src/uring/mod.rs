@@ -395,8 +395,8 @@ impl UringDriver {
 
     fn handle_multishot_recv(&mut self, conn_id: usize, generation: u32, result: i32, flags: u32) {
         // Validate connection exists and generation matches to detect stale completions
-        let conn_generation = match self.connections.get(conn_id) {
-            Some(c) if c.generation == generation => c.generation,
+        match self.connections.get(conn_id) {
+            Some(c) if c.generation == generation => {}
             Some(_) => {
                 // Stale completion from old connection - return buffer and ignore
                 if let Some(buf_id) = cqueue::buffer_select(flags) {
@@ -411,7 +411,7 @@ impl UringDriver {
                 }
                 return;
             }
-        };
+        }
         // Create ConnId with validated generation for completions
         let full_conn_id = ConnId::with_generation(conn_id, generation);
 
