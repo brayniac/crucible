@@ -1,7 +1,7 @@
 //! I/O driver trait definition.
 
 use crate::types::{Completion, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId};
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
@@ -149,6 +149,36 @@ pub trait IoDriver: Send {
     /// - `Err(WouldBlock)` - Cannot send right now, try again after `SendReady`
     /// - `Err(other)` - An error occurred
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize>;
+
+    /// Send multiple buffers as a single vectored write.
+    ///
+    /// This is useful for scatter-gather I/O, particularly for sending
+    /// responses that consist of multiple parts (e.g., header + value + trailer)
+    /// without intermediate copying.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default implementation concatenates all buffers into a single
+    /// contiguous buffer and calls `send()`. Backends should override this
+    /// for more efficient implementations:
+    /// - **io_uring**: Uses `SendMsg` for true vectored zero-copy
+    /// - **mio**: Uses `writev` system call
+    /// - **tokio**: Uses `write_vectored`
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(n)` - Total of `n` bytes were queued for sending
+    /// - `Err(WouldBlock)` - Cannot send right now, try again after `SendReady`
+    /// - `Err(other)` - An error occurred
+    fn send_vectored(&mut self, id: ConnId, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        // Default implementation: concatenate and send
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+        let mut combined = Vec::with_capacity(total_len);
+        for buf in bufs {
+            combined.extend_from_slice(buf);
+        }
+        self.send(id, &combined)
+    }
 
     /// Receive data from a connection.
     ///

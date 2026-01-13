@@ -397,6 +397,191 @@ impl<'a> SliceSegment<'a> {
         ))
     }
 
+    /// Get raw value reference for zero-copy scatter-gather I/O.
+    ///
+    /// Returns the raw pointers needed to construct a `ValueRef`:
+    /// - `ref_count_ptr`: Pointer to this segment's ref_count (already incremented)
+    /// - `value_ptr`: Pointer to the value bytes in segment memory
+    /// - `value_len`: Length of the value
+    ///
+    /// The caller is responsible for creating a `ValueRef` that will decrement
+    /// the ref_count on drop.
+    ///
+    /// # Safety
+    ///
+    /// If this method returns `Ok`, the ref_count has been incremented and
+    /// the caller must ensure it is decremented when done (typically by
+    /// constructing a `ValueRef` from the returned pointers).
+    pub fn get_value_ref_raw(
+        &self,
+        offset: u32,
+        key: &[u8],
+    ) -> Result<(*const AtomicU32, *const u8, usize), CacheError> {
+        // Check state and increment ref count
+        let state = self.state();
+        if !state.is_readable() {
+            return Err(CacheError::SegmentNotAccessible);
+        }
+
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+
+        // Double-check state after increment
+        let state_after = self.state();
+        if !state_after.is_readable() {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::SegmentNotAccessible);
+        }
+
+        fence(Ordering::Acquire);
+
+        if self.is_per_item_ttl() {
+            self.get_value_ref_raw_ttl(offset, key)
+        } else {
+            self.get_value_ref_raw_basic(offset, key)
+        }
+    }
+
+    /// Get raw value reference for BasicHeader segments.
+    fn get_value_ref_raw_basic(
+        &self,
+        offset: u32,
+        key: &[u8],
+    ) -> Result<(*const AtomicU32, *const u8, usize), CacheError> {
+        // Check segment expiration
+        let now = clocksource::coarse::UnixInstant::now()
+            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
+            .as_secs();
+        let expire_at = self.expire_at.load(Ordering::Acquire);
+        if expire_at > 0 && now >= expire_at {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::Expired);
+        }
+
+        // Validate offset
+        if offset as usize + BasicHeader::SIZE > self.capacity as usize {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::InvalidOffset);
+        }
+
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+
+        // Parse header
+        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
+
+        #[cfg(feature = "validation")]
+        let header = BasicHeader::try_from_bytes(header_bytes);
+        #[cfg(not(feature = "validation"))]
+        let header = Some(BasicHeader::from_bytes_unchecked(header_bytes));
+
+        let header = match header {
+            Some(h) => h,
+            None => {
+                self.ref_count.fetch_sub(1, Ordering::Release);
+                return Err(CacheError::Corrupted);
+            }
+        };
+
+        if header.is_deleted() {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::ItemDeleted);
+        }
+
+        let item_size = header.padded_size();
+        if offset as usize + item_size > self.capacity as usize {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::InvalidOffset);
+        }
+
+        // Compute value location
+        let key_start = BasicHeader::SIZE + header.optional_len() as usize;
+        let key_end = key_start + header.key_len() as usize;
+        let value_start = key_end;
+        let value_len = header.value_len() as usize;
+
+        // Verify key
+        let key_bytes =
+            unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
+        if key_bytes != key {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::KeyMismatch);
+        }
+
+        let ref_count_ptr = &self.ref_count as *const AtomicU32;
+        let value_ptr = unsafe { data_ptr.add(value_start) };
+
+        Ok((ref_count_ptr, value_ptr, value_len))
+    }
+
+    /// Get raw value reference for TtlHeader segments.
+    fn get_value_ref_raw_ttl(
+        &self,
+        offset: u32,
+        key: &[u8],
+    ) -> Result<(*const AtomicU32, *const u8, usize), CacheError> {
+        // Validate offset
+        if offset as usize + TtlHeader::SIZE > self.capacity as usize {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::InvalidOffset);
+        }
+
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+
+        // Parse header
+        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
+
+        #[cfg(feature = "validation")]
+        let header = TtlHeader::try_from_bytes(header_bytes);
+        #[cfg(not(feature = "validation"))]
+        let header = Some(TtlHeader::from_bytes_unchecked(header_bytes));
+
+        let header = match header {
+            Some(h) => h,
+            None => {
+                self.ref_count.fetch_sub(1, Ordering::Release);
+                return Err(CacheError::Corrupted);
+            }
+        };
+
+        if header.is_deleted() {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::ItemDeleted);
+        }
+
+        // Check item-level TTL
+        let now = clocksource::coarse::UnixInstant::now()
+            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
+            .as_secs() as u32;
+        if header.is_expired(now) {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::Expired);
+        }
+
+        let item_size = header.padded_size();
+        if offset as usize + item_size > self.capacity as usize {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::InvalidOffset);
+        }
+
+        // Compute value location
+        let key_start = TtlHeader::SIZE + header.optional_len() as usize;
+        let key_end = key_start + header.key_len() as usize;
+        let value_start = key_end;
+        let value_len = header.value_len() as usize;
+
+        // Verify key
+        let key_bytes =
+            unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
+        if key_bytes != key {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return Err(CacheError::KeyMismatch);
+        }
+
+        let ref_count_ptr = &self.ref_count as *const AtomicU32;
+        let value_ptr = unsafe { data_ptr.add(value_start) };
+
+        Ok((ref_count_ptr, value_ptr, value_len))
+    }
+
     /// Verify key with BasicHeader (segment-level TTL).
     /// Use when you know the pool uses segment-level TTL.
     #[inline]

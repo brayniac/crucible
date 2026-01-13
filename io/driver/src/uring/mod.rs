@@ -58,14 +58,18 @@ const RECV_BGID: u16 = 0;
 /// - bits 4-7: buf_idx (4 bits) - buffer index for send operations
 /// - bits 0-3: op (4 bits) - operation type
 #[inline]
-fn encode_user_data(id: usize, buf_idx: u8, op: u64) -> u64 {
-    ((id as u64) << 8) | ((buf_idx as u64) << 4) | op
+fn encode_user_data(id: usize, generation: u32, buf_idx: u8, op: u64) -> u64 {
+    ((generation as u64 & 0xFFFFFF) << 40)
+        | ((id as u64 & 0xFFFF_FFFF) << 8)
+        | ((buf_idx as u64) << 4)
+        | op
 }
 
 #[inline]
-fn decode_user_data(user_data: u64) -> (usize, u8, u64) {
+fn decode_user_data(user_data: u64) -> (usize, u32, u8, u64) {
     (
         ((user_data >> 8) & 0xFFFF_FFFF) as usize,
+        (user_data >> 40) as u32,
         ((user_data >> 4) & 0xF) as u8,
         user_data & 0xF,
     )
@@ -249,10 +253,15 @@ impl UringDriver {
     }
 
     /// Submit a multishot recv for a connection.
-    fn submit_multishot_recv(&mut self, conn_id: usize, fixed_slot: u32) -> io::Result<()> {
+    fn submit_multishot_recv(
+        &mut self,
+        conn_id: usize,
+        generation: u32,
+        fixed_slot: u32,
+    ) -> io::Result<()> {
         let recv_op = RecvMulti::new(Fixed(fixed_slot), RECV_BGID)
             .build()
-            .user_data(encode_user_data(conn_id, 0, OP_MULTISHOT_RECV));
+            .user_data(encode_user_data(conn_id, generation, 0, OP_MULTISHOT_RECV));
 
         unsafe {
             self.ring
@@ -313,7 +322,7 @@ impl UringDriver {
     fn submit_multishot_accept(&mut self, listener_id: usize, fixed_slot: u32) -> io::Result<()> {
         let accept_op = AcceptMulti::new(Fixed(fixed_slot))
             .build()
-            .user_data(encode_user_data(listener_id, 0, OP_ACCEPT));
+            .user_data(encode_user_data(listener_id, 0, 0, OP_ACCEPT));
 
         unsafe {
             self.ring
@@ -334,7 +343,7 @@ impl UringDriver {
     ) -> io::Result<()> {
         let send_op = SendZc::new(Fixed(fixed_slot), data.as_ptr(), data.len() as u32)
             .build()
-            .user_data(encode_user_data(conn_id, buf_idx, OP_SEND));
+            .user_data(encode_user_data(conn_id, 0, buf_idx, OP_SEND));
 
         unsafe {
             self.ring
@@ -356,15 +365,15 @@ impl UringDriver {
 
         match op {
             OP_MULTISHOT_RECV => {
-                let (id, _, _) = decode_user_data(user_data);
-                self.handle_multishot_recv(id, result, flags);
+                let (id, generation, _, _) = decode_user_data(user_data);
+                self.handle_multishot_recv(id, generation, result, flags);
             }
             OP_SEND => {
-                let (id, buf_idx, _) = decode_user_data(user_data);
+                let (id, _, buf_idx, _) = decode_user_data(user_data);
                 self.handle_send(id, buf_idx as usize, result, flags);
             }
             OP_ACCEPT => {
-                let (id, _, _) = decode_user_data(user_data);
+                let (id, _, _, _) = decode_user_data(user_data);
                 self.handle_accept(id, result, flags);
             }
             OP_SINGLE_RECV => {
@@ -373,25 +382,38 @@ impl UringDriver {
                 self.handle_single_recv(conn_id, generation, buf_id, result);
             }
             OP_UDP_RECVMSG => {
-                let (id, _, _) = decode_user_data(user_data);
+                let (id, _, _, _) = decode_user_data(user_data);
                 self.handle_udp_recvmsg(id, result);
             }
             OP_UDP_SENDMSG => {
-                let (id, _, _) = decode_user_data(user_data);
+                let (id, _, _, _) = decode_user_data(user_data);
                 self.handle_udp_sendmsg(id, result);
             }
             _ => {}
         }
     }
 
-    fn handle_multishot_recv(&mut self, conn_id: usize, result: i32, flags: u32) {
-        if !self.connections.contains(conn_id) {
-            // Return buffer if allocated
-            if let Some(buf_id) = cqueue::buffer_select(flags) {
-                self.buf_ring.return_buffer(buf_id);
+    fn handle_multishot_recv(&mut self, conn_id: usize, generation: u32, result: i32, flags: u32) {
+        // Validate connection exists and generation matches to detect stale completions
+        let conn_generation = match self.connections.get(conn_id) {
+            Some(c) if c.generation == generation => c.generation,
+            Some(_) => {
+                // Stale completion from old connection - return buffer and ignore
+                if let Some(buf_id) = cqueue::buffer_select(flags) {
+                    self.buf_ring.return_buffer(buf_id);
+                }
+                return;
             }
-            return;
-        }
+            None => {
+                // Connection no longer exists - return buffer and ignore
+                if let Some(buf_id) = cqueue::buffer_select(flags) {
+                    self.buf_ring.return_buffer(buf_id);
+                }
+                return;
+            }
+        };
+        // Create ConnId with validated generation for completions
+        let full_conn_id = ConnId::with_generation(conn_id, generation);
 
         if result == 0 {
             // Clean EOF - client closed connection gracefully
@@ -400,7 +422,7 @@ impl UringDriver {
             }
             self.pending_completions
                 .push(Completion::new(CompletionKind::Closed {
-                    conn_id: ConnId::new(conn_id),
+                    conn_id: full_conn_id,
                 }));
             return;
         }
@@ -412,7 +434,7 @@ impl UringDriver {
             }
             self.pending_completions
                 .push(Completion::new(CompletionKind::Error {
-                    conn_id: ConnId::new(conn_id),
+                    conn_id: full_conn_id,
                     error: io::Error::from_raw_os_error(-result),
                 }));
             return;
@@ -441,17 +463,22 @@ impl UringDriver {
 
         self.pending_completions
             .push(Completion::new(CompletionKind::Recv {
-                conn_id: ConnId::new(conn_id),
+                conn_id: full_conn_id,
             }));
 
         // Re-arm multishot if needed
         if !cqueue::more(flags) {
-            let fixed_slot = self.connections.get(conn_id).map(|c| c.fixed_slot);
-            if let Some(fixed_slot) = fixed_slot {
+            let conn_info = self
+                .connections
+                .get(conn_id)
+                .map(|c| (c.fixed_slot, c.generation));
+            if let Some((fixed_slot, conn_gen)) = conn_info {
                 if let Some(conn) = self.connections.get_mut(conn_id) {
                     conn.multishot_active = false;
                 }
-                if self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
+                if self
+                    .submit_multishot_recv(conn_id, conn_gen, fixed_slot)
+                    .is_ok()
                     && let Some(conn) = self.connections.get_mut(conn_id)
                 {
                     conn.multishot_active = true;
@@ -460,7 +487,7 @@ impl UringDriver {
                     // Emit an error so the server can clean up.
                     self.pending_completions
                         .push(Completion::new(CompletionKind::Error {
-                            conn_id: ConnId::new(conn_id),
+                            conn_id: full_conn_id,
                             error: io::Error::other("failed to re-arm multishot recv"),
                         }));
                 }
@@ -1064,7 +1091,7 @@ impl IoDriver for UringDriver {
 
         // Automatically start receiving data
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
-            let result = self.submit_multishot_recv(conn_id, fixed_slot);
+            let result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
             if result.is_ok()
                 && let Some(conn) = self.connections.get_mut(conn_id)
             {
@@ -1127,7 +1154,7 @@ impl IoDriver for UringDriver {
 
         // Automatically start receiving data
         let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
-            let result = self.submit_multishot_recv(conn_id, fixed_slot);
+            let result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
             if result.is_ok()
                 && let Some(conn) = self.connections.get_mut(conn_id)
             {
@@ -1457,7 +1484,8 @@ impl IoDriver for UringDriver {
                     .is_ok()
             } else {
                 // Multishot mode - re-arm multishot recv
-                self.submit_multishot_recv(conn_id, fixed_slot).is_ok()
+                self.submit_multishot_recv(conn_id, generation, fixed_slot)
+                    .is_ok()
             };
 
             if let Some(conn) = self.connections.get_mut(conn_id) {
@@ -1619,7 +1647,7 @@ impl IoDriver for UringDriver {
         // Submit recvmsg operation
         let recvmsg_op = opcode::RecvMsg::new(Fixed(fixed_slot), msghdr_ptr as *mut _)
             .build()
-            .user_data(encode_user_data(socket_id, 0, OP_UDP_RECVMSG));
+            .user_data(encode_user_data(socket_id, 0, 0, OP_UDP_RECVMSG));
 
         unsafe {
             self.ring
@@ -1673,7 +1701,7 @@ impl IoDriver for UringDriver {
         // Submit sendmsg operation
         let sendmsg_op = opcode::SendMsg::new(Fixed(fixed_slot), msghdr_ptr as *const _)
             .build()
-            .user_data(encode_user_data(socket_id, 0, OP_UDP_SENDMSG));
+            .user_data(encode_user_data(socket_id, 0, 0, OP_UDP_SENDMSG));
 
         unsafe {
             self.ring

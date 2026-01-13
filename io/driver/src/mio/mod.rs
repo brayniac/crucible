@@ -14,7 +14,7 @@ use mio::net::{
 };
 use mio::{Events, Interest, Poll, Token};
 use slab::Slab;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::mem;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -33,6 +33,8 @@ struct MioConnection {
     writable: bool,
     /// Receive buffer state for unified API.
     recv_state: ConnectionRecvState,
+    /// Generation counter to detect stale ConnIds after slot reuse.
+    generation: u32,
 }
 
 /// Listener state for mio driver.
@@ -65,6 +67,8 @@ pub struct MioDriver {
     pending_completions: Vec<Completion>,
     #[allow(dead_code)]
     buffer_size: usize,
+    /// Generation counter for connection IDs to detect stale references.
+    next_generation: u32,
 }
 
 impl MioDriver {
@@ -83,6 +87,7 @@ impl MioDriver {
             udp_sockets: Slab::with_capacity(64),
             pending_completions: Vec::with_capacity(256),
             buffer_size,
+            next_generation: 0,
         })
     }
 }
@@ -195,12 +200,14 @@ impl IoDriver for MioDriver {
         let mut mio_stream = unsafe { MioTcpStream::from_raw_fd(raw_fd) };
 
         let entry = self.connections.vacant_entry();
-        let id = entry.key();
+        let slot = entry.key();
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
 
         // Register with poll
         self.poll.registry().register(
             &mut mio_stream,
-            Token(id),
+            Token(slot),
             Interest::READABLE | Interest::WRITABLE,
         )?;
 
@@ -209,9 +216,10 @@ impl IoDriver for MioDriver {
             readable: false,
             writable: false, // Wait for connect to complete (SendReady event)
             recv_state: ConnectionRecvState::default(),
+            generation,
         });
 
-        Ok(ConnId::new(id))
+        Ok(ConnId::with_generation(slot, generation))
     }
 
     fn register_fd(&mut self, raw_fd: RawFd) -> io::Result<ConnId> {
@@ -224,12 +232,14 @@ impl IoDriver for MioDriver {
         let mut mio_stream = unsafe { MioTcpStream::from_raw_fd(raw_fd) };
 
         let entry = self.connections.vacant_entry();
-        let id = entry.key();
+        let slot = entry.key();
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
 
         // Register with poll
         self.poll.registry().register(
             &mut mio_stream,
-            Token(id),
+            Token(slot),
             Interest::READABLE | Interest::WRITABLE,
         )?;
 
@@ -238,20 +248,46 @@ impl IoDriver for MioDriver {
             readable: false,
             writable: true,
             recv_state: ConnectionRecvState::default(),
+            generation,
         });
 
-        Ok(ConnId::new(id))
+        Ok(ConnId::with_generation(slot, generation))
     }
 
     fn close(&mut self, id: ConnId) -> io::Result<()> {
-        if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
+        let slot = id.slot();
+        // Validate generation before removing
+        if let Some(conn) = self.connections.get(slot) {
+            if conn.generation != id.generation() {
+                // Stale ConnId - connection was already replaced
+                return Ok(());
+            }
+        }
+        if let Some(mut conn) = self.connections.try_remove(slot) {
             self.poll.registry().deregister(&mut conn.stream)?;
         }
         Ok(())
     }
 
     fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
-        if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
+        let slot = id.slot();
+        // Validate generation before removing
+        match self.connections.get(slot) {
+            Some(conn) if conn.generation == id.generation() => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "connection generation mismatch (stale ConnId)",
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "connection not found",
+                ));
+            }
+        }
+        if let Some(mut conn) = self.connections.try_remove(slot) {
             self.poll.registry().deregister(&mut conn.stream)?;
             // Extract the raw fd without closing it
             Ok(conn.stream.into_raw_fd())
@@ -266,7 +302,8 @@ impl IoDriver for MioDriver {
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {
         let conn = self
             .connections
-            .get_mut(id.as_usize())
+            .get_mut(id.slot())
+            .filter(|c| c.generation == id.generation())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
         // Don't try to send if we know the socket isn't writable yet
@@ -285,10 +322,33 @@ impl IoDriver for MioDriver {
         }
     }
 
+    fn send_vectored(&mut self, id: ConnId, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let conn = self
+            .connections
+            .get_mut(id.slot())
+            .filter(|c| c.generation == id.generation())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Don't try to send if we know the socket isn't writable yet
+        if !conn.writable {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        match conn.stream.write_vectored(bufs) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                conn.writable = false;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize> {
         let conn = self
             .connections
-            .get_mut(id.as_usize())
+            .get_mut(id.slot())
+            .filter(|c| c.generation == id.generation())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
         match conn.stream.read(buf) {
@@ -312,7 +372,8 @@ impl IoDriver for MioDriver {
     fn with_recv_buf(&mut self, id: ConnId, f: &mut dyn FnMut(&mut dyn RecvBuf)) -> io::Result<()> {
         let conn = self
             .connections
-            .get_mut(id.as_usize())
+            .get_mut(id.slot())
+            .filter(|c| c.generation == id.generation())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
         // If the socket is readable, read all available data into the recv buffer
@@ -435,30 +496,25 @@ impl IoDriver for MioDriver {
 
             // Connection event
             if let Some(conn) = self.connections.get_mut(token) {
+                let conn_id = ConnId::with_generation(token, conn.generation);
                 if readable {
                     conn.readable = true;
                     self.pending_completions
-                        .push(Completion::new(CompletionKind::Recv {
-                            conn_id: ConnId::new(token),
-                        }));
+                        .push(Completion::new(CompletionKind::Recv { conn_id }));
                 }
                 if writable {
                     conn.writable = true;
                     self.pending_completions
-                        .push(Completion::new(CompletionKind::SendReady {
-                            conn_id: ConnId::new(token),
-                        }));
+                        .push(Completion::new(CompletionKind::SendReady { conn_id }));
                 }
                 if closed {
                     self.pending_completions
-                        .push(Completion::new(CompletionKind::Closed {
-                            conn_id: ConnId::new(token),
-                        }));
+                        .push(Completion::new(CompletionKind::Closed { conn_id }));
                 }
                 if error {
                     self.pending_completions
                         .push(Completion::new(CompletionKind::Error {
-                            conn_id: ConnId::new(token),
+                            conn_id,
                             error: io::Error::other("socket error"),
                         }));
                 }
@@ -482,7 +538,8 @@ impl IoDriver for MioDriver {
 
     fn raw_fd(&self, id: ConnId) -> Option<RawFd> {
         self.connections
-            .get(id.as_usize())
+            .get(id.slot())
+            .filter(|c| c.generation == id.generation())
             .map(|c| c.stream.as_raw_fd())
     }
 
@@ -697,11 +754,13 @@ impl MioDriver {
                             unsafe { MioTcpStream::from_raw_fd(stream.into_raw_fd()) };
 
                         let entry = self.connections.vacant_entry();
-                        let conn_id = entry.key();
+                        let slot = entry.key();
+                        let generation = self.next_generation;
+                        self.next_generation = self.next_generation.wrapping_add(1);
 
                         if let Err(e) = self.poll.registry().register(
                             &mut mio_stream,
-                            Token(conn_id),
+                            Token(slot),
                             Interest::READABLE | Interest::WRITABLE,
                         ) {
                             self.pending_completions.push(Completion::new(
@@ -718,12 +777,13 @@ impl MioDriver {
                             readable: false,
                             writable: true,
                             recv_state: ConnectionRecvState::default(),
+                            generation,
                         });
 
                         self.pending_completions
                             .push(Completion::new(CompletionKind::Accept {
                                 listener_id: ListenerId::new(listener_id),
-                                conn_id: ConnId::new(conn_id),
+                                conn_id: ConnId::with_generation(slot, generation),
                                 addr,
                             }));
                     }
@@ -747,7 +807,8 @@ impl MioDriver {
     /// Check if a connection is currently readable.
     pub fn is_readable(&self, id: ConnId) -> bool {
         self.connections
-            .get(id.as_usize())
+            .get(id.slot())
+            .filter(|c| c.generation == id.generation())
             .map(|c| c.readable)
             .unwrap_or(false)
     }
@@ -755,7 +816,8 @@ impl MioDriver {
     /// Check if a connection is currently writable.
     pub fn is_writable(&self, id: ConnId) -> bool {
         self.connections
-            .get(id.as_usize())
+            .get(id.slot())
+            .filter(|c| c.generation == id.generation())
             .map(|c| c.writable)
             .unwrap_or(false)
     }

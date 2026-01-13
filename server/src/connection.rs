@@ -1,14 +1,95 @@
 //! Per-connection state for the cache server.
 
 use bytes::BytesMut;
-use cache_core::Cache;
+use cache_core::{Cache, ValueRef};
 use io_driver::RecvBuf;
 use protocol_memcache::binary::{BinaryCommand, REQUEST_MAGIC};
 use protocol_memcache::{Command as MemcacheCommand, ParseError as MemcacheParseError};
 use protocol_resp::{Command as RespCommand, ParseError as RespParseError, ParseOptions};
+use std::io::IoSlice;
 
+use crate::config::ZeroCopyMode;
 use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
 use crate::metrics::PROTOCOL_ERRORS;
+
+/// A zero-copy GET response for vectored I/O.
+///
+/// This struct holds the header, value reference, and trailer for a GET response.
+/// The value reference points directly into cache segment memory, avoiding copies.
+pub struct ZeroCopyResponse {
+    /// RESP header: "$<len>\r\n" (max ~25 bytes)
+    header: [u8; 32],
+    header_len: usize,
+    /// Reference to value in cache segment memory
+    value_ref: ValueRef,
+    /// Static trailer: "\r\n"
+    trailer: &'static [u8],
+}
+
+impl ZeroCopyResponse {
+    /// Create a new zero-copy response for a RESP bulk string.
+    #[inline]
+    pub fn new_resp_bulk_string(value_ref: ValueRef) -> Self {
+        let mut header = [0u8; 32];
+        let mut pos = 0;
+
+        // Write "$"
+        header[pos] = b'$';
+        pos += 1;
+
+        // Write length using itoa
+        let mut len_buf = itoa::Buffer::new();
+        let len_str = len_buf.format(value_ref.len()).as_bytes();
+        header[pos..pos + len_str.len()].copy_from_slice(len_str);
+        pos += len_str.len();
+
+        // Write "\r\n"
+        header[pos] = b'\r';
+        header[pos + 1] = b'\n';
+        pos += 2;
+
+        Self {
+            header,
+            header_len: pos,
+            value_ref,
+            trailer: b"\r\n",
+        }
+    }
+
+    /// Get the header bytes.
+    #[inline]
+    pub fn header(&self) -> &[u8] {
+        &self.header[..self.header_len]
+    }
+
+    /// Get the value reference.
+    #[inline]
+    pub fn value(&self) -> &[u8] {
+        self.value_ref.as_slice()
+    }
+
+    /// Get the trailer bytes.
+    #[inline]
+    pub fn trailer(&self) -> &[u8] {
+        self.trailer
+    }
+
+    /// Get total response length.
+    #[inline]
+    pub fn total_len(&self) -> usize {
+        self.header_len + self.value_ref.len() + self.trailer.len()
+    }
+
+    /// Create IoSlices for vectored I/O.
+    #[inline]
+    pub fn as_io_slices(&self) -> [IoSlice<'_>; 3] {
+        [
+            IoSlice::new(self.header()),
+            IoSlice::new(self.value()),
+            IoSlice::new(self.trailer()),
+        ]
+    }
+}
 
 /// Protocol type detected for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +318,161 @@ impl Connection {
     pub fn should_close(&self) -> bool {
         self.should_close
     }
+
+    /// Process a single RESP command with zero-copy support.
+    ///
+    /// Returns `Some(ZeroCopyResponse)` if the command is a GET that resulted in a hit
+    /// and zero-copy is enabled for this value size. The caller should send the response
+    /// using vectored I/O.
+    ///
+    /// Returns `None` if:
+    /// - The command is not a GET
+    /// - The GET resulted in a miss
+    /// - Zero-copy is disabled or the value is below threshold
+    /// - There's no complete command in the buffer
+    ///
+    /// In these cases, check `has_pending_write()` for regular response data.
+    #[inline]
+    pub fn process_one_zero_copy<C: Cache>(
+        &mut self,
+        buf: &mut dyn RecvBuf,
+        cache: &C,
+        zero_copy_mode: ZeroCopyMode,
+    ) -> Option<ZeroCopyResponse> {
+        // Clear write buffer if all data has been sent
+        if self.write_pos >= self.write_buf.len() {
+            self.write_buf.clear();
+            self.write_pos = 0;
+        }
+
+        // Detect protocol from first byte
+        let data = buf.as_slice();
+        if data.is_empty() {
+            return None;
+        }
+
+        if self.protocol == DetectedProtocol::Unknown {
+            self.detect_protocol(data[0]);
+        }
+
+        // Only RESP protocol supports zero-copy GET for now
+        if self.protocol != DetectedProtocol::Resp {
+            // Process normally for other protocols
+            self.process_from(buf, cache);
+            return None;
+        }
+
+        // Try to parse a RESP command
+        match RespCommand::parse_with_options(data, &self.resp_parse_options) {
+            Ok((cmd, consumed)) => {
+                // Check if it's a GET command
+                if let RespCommand::Get { key } = cmd {
+                    use crate::metrics::{GETS, HITS, MISSES};
+                    GETS.increment();
+
+                    // Try zero-copy path
+                    if let Some(value_ref) = cache.get_value_ref(key) {
+                        if zero_copy_mode.should_use_zero_copy(value_ref.len()) {
+                            HITS.increment();
+                            buf.consume(consumed);
+                            return Some(ZeroCopyResponse::new_resp_bulk_string(value_ref));
+                        }
+                        // Fall through to copy path - value_ref is dropped here
+                    }
+
+                    // Copy path - either miss or below threshold
+                    let hit = cache.with_value(key, |value| {
+                        // Reserve: $ + max_len_digits(20) + \r\n + value + \r\n
+                        let needed = 1 + 20 + 2 + value.len() + 2;
+                        self.write_buf.reserve(needed);
+
+                        let spare = self.write_buf.spare_capacity_mut();
+                        let buf_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                spare.as_mut_ptr() as *mut u8,
+                                spare.len(),
+                            )
+                        };
+                        let written = unsafe { write_bulk_string(buf_slice, value) };
+                        unsafe { self.write_buf.set_len(self.write_buf.len() + written) };
+                    });
+
+                    if hit.is_some() {
+                        HITS.increment();
+                    } else {
+                        MISSES.increment();
+                        if self.resp_version == RespVersion::Resp3 {
+                            self.write_buf.extend_from_slice(b"_\r\n");
+                        } else {
+                            self.write_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    buf.consume(consumed);
+                } else {
+                    // Not a GET - execute normally
+                    execute_resp(&cmd, cache, &mut self.write_buf, &mut self.resp_version);
+                    buf.consume(consumed);
+                }
+                None
+            }
+            Err(RespParseError::Incomplete) => None,
+            Err(e) => {
+                PROTOCOL_ERRORS.increment();
+                let msg = e.to_string();
+                if msg.contains("expected array") {
+                    self.write_buf.extend_from_slice(
+                        b"-ERR Protocol error: expected Redis RESP protocol\r\n",
+                    );
+                } else {
+                    self.write_buf.extend_from_slice(b"-ERR ");
+                    self.write_buf.extend_from_slice(msg.as_bytes());
+                    self.write_buf.extend_from_slice(b"\r\n");
+                }
+                // Consume all remaining data on error
+                let len = buf.len();
+                buf.consume(len);
+                None
+            }
+        }
+    }
+}
+
+/// Write a RESP bulk string response directly to a buffer.
+/// Returns the number of bytes written.
+///
+/// # Safety
+/// Caller must ensure `buf` has enough capacity for the response:
+/// at least 1 + 20 + 2 + value.len() + 2 bytes.
+#[inline]
+unsafe fn write_bulk_string(buf: &mut [u8], value: &[u8]) -> usize {
+    let mut pos = 0;
+    buf[pos] = b'$';
+    pos += 1;
+
+    // Write length using itoa
+    let mut len_buf = itoa::Buffer::new();
+    let len_str = len_buf.format(value.len()).as_bytes();
+    // SAFETY: Caller guarantees buf has enough capacity
+    unsafe {
+        std::ptr::copy_nonoverlapping(len_str.as_ptr(), buf.as_mut_ptr().add(pos), len_str.len());
+    }
+    pos += len_str.len();
+
+    buf[pos] = b'\r';
+    buf[pos + 1] = b'\n';
+    pos += 2;
+
+    // SAFETY: Caller guarantees buf has enough capacity
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), buf.as_mut_ptr().add(pos), value.len());
+    }
+    pos += value.len();
+
+    buf[pos] = b'\r';
+    buf[pos + 1] = b'\n';
+    pos += 2;
+
+    pos
 }
 
 impl Default for Connection {
@@ -262,6 +498,10 @@ mod tests {
         where
             F: FnOnce(&[u8]) -> R,
         {
+            None
+        }
+
+        fn get_value_ref(&self, _key: &[u8]) -> Option<cache_core::ValueRef> {
             None
         }
 

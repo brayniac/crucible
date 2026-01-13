@@ -56,6 +56,7 @@ use std::time::Duration;
 pub use cache_core::{
     AtomicCounters, BasicItemGuard, Cache, CacheError, CacheMetrics, CacheResult, CounterSnapshot,
     DEFAULT_TTL, FrequencyDecay, HugepageSize, ItemLocation, LayerMetrics, OwnedGuard, PoolMetrics,
+    ValueRef,
 };
 
 /// S3-FIFO cache with two-layer architecture.
@@ -436,6 +437,10 @@ impl Cache for S3FifoCache {
         F: FnOnce(&[u8]) -> R,
     {
         self.inner.with_item(key, |guard| f(guard.value()))
+    }
+
+    fn get_value_ref(&self, key: &[u8]) -> Option<ValueRef> {
+        self.inner.get_value_ref(key)
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {

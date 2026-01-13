@@ -14,21 +14,51 @@ use std::os::unix::io::RawFd;
 ///
 /// Returned when registering a connection or accepting a new one.
 /// Used to identify the connection in subsequent operations.
+///
+/// Internally encodes both a slot index and a generation counter to prevent
+/// misattribution of data when connection IDs are reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConnId(pub(crate) usize);
+pub struct ConnId(pub(crate) u64);
 
 impl ConnId {
-    /// Create a new connection ID from a raw value.
+    /// Create a new connection ID from a raw slot value (generation 0).
     ///
     /// This is primarily useful for testing purposes.
     #[inline]
-    pub fn new(id: usize) -> Self {
-        Self(id)
+    pub fn new(slot: usize) -> Self {
+        Self(slot as u64)
+    }
+
+    /// Create a connection ID with both slot and generation.
+    #[inline]
+    pub(crate) fn with_generation(slot: usize, generation: u32) -> Self {
+        Self(((generation as u64) << 32) | (slot as u64 & 0xFFFF_FFFF))
+    }
+
+    /// Get the slot index from this connection ID.
+    #[inline]
+    pub(crate) fn slot(&self) -> usize {
+        (self.0 & 0xFFFF_FFFF) as usize
+    }
+
+    /// Get the generation counter from this connection ID.
+    #[inline]
+    pub(crate) fn generation(&self) -> u32 {
+        (self.0 >> 32) as u32
     }
 
     /// Get the raw value of the connection ID.
+    ///
+    /// This returns the full encoded value including generation,
+    /// suitable for use as a HashMap key.
     #[inline]
     pub fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
+
+    /// Get the raw u64 value of the connection ID.
+    #[inline]
+    pub fn as_u64(&self) -> u64 {
         self.0
     }
 }

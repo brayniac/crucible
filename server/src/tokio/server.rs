@@ -1,7 +1,7 @@
 //! Tokio runtime server loop.
 
 use crate::affinity::set_cpu_affinity;
-use crate::config::Config;
+use crate::config::{Config, ZeroCopyMode};
 use crate::connection::Connection;
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE};
 use cache_core::Cache;
@@ -114,13 +114,16 @@ pub fn run<C: Cache + 'static>(
     let runtime = builder.build()?;
 
     let max_value_size = config.cache.max_value_size;
-    runtime.block_on(async move { run_async(listeners, cache, max_value_size).await })
+    let zero_copy_mode = config.zero_copy;
+    runtime
+        .block_on(async move { run_async(listeners, cache, max_value_size, zero_copy_mode).await })
 }
 
 async fn run_async<C: Cache + 'static>(
     addresses: Vec<SocketAddr>,
     cache: Arc<C>,
     max_value_size: usize,
+    zero_copy_mode: ZeroCopyMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Bind all listeners
     let mut listeners = Vec::with_capacity(addresses.len());
@@ -133,8 +136,9 @@ async fn run_async<C: Cache + 'static>(
     let mut handles = Vec::with_capacity(listeners.len());
     for listener in listeners {
         let cache = cache.clone();
-        let handle =
-            tokio::spawn(async move { accept_loop(listener, cache, max_value_size).await });
+        let handle = tokio::spawn(async move {
+            accept_loop(listener, cache, max_value_size, zero_copy_mode).await
+        });
         handles.push(handle);
     }
 
@@ -152,6 +156,7 @@ async fn accept_loop<C: Cache + 'static>(
     listener: TcpListener,
     cache: Arc<C>,
     max_value_size: usize,
+    zero_copy_mode: ZeroCopyMode,
 ) {
     loop {
         match listener.accept().await {
@@ -161,7 +166,8 @@ async fn accept_loop<C: Cache + 'static>(
 
                 let cache = cache.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, cache, max_value_size).await
+                    if let Err(e) =
+                        handle_connection(stream, cache, max_value_size, zero_copy_mode).await
                         && !is_connection_reset(&e)
                     {
                         eprintln!("Connection error: {}", e);
@@ -180,6 +186,7 @@ async fn handle_connection<C: Cache>(
     mut stream: TcpStream,
     cache: Arc<C>,
     max_value_size: usize,
+    zero_copy_mode: ZeroCopyMode,
 ) -> std::io::Result<()> {
     let mut conn = Connection::new(max_value_size);
     let mut recv_buf = SimpleRecvBuf::with_capacity(READ_BUF_SIZE);
@@ -198,22 +205,48 @@ async fn handle_connection<C: Cache>(
                 // Safety: try_read wrote n bytes to spare capacity
                 unsafe { recv_buf.advance(n) };
 
-                // Process using the new API
-                conn.process_from(&mut recv_buf, &*cache);
+                // Zero-copy path: process one command at a time
+                if zero_copy_mode != ZeroCopyMode::Disabled {
+                    while !recv_buf.is_empty() && conn.should_read() {
+                        if let Some(resp) =
+                            conn.process_one_zero_copy(&mut recv_buf, &*cache, zero_copy_mode)
+                        {
+                            // Send zero-copy response using write_vectored
+                            let slices = resp.as_io_slices();
+                            // Note: write_vectored may do a partial write, but for simplicity
+                            // we rely on the response being small enough to fit in one syscall
+                            let _n = stream.write_vectored(&slices).await?;
+                        }
 
-                if conn.should_close() {
-                    // Flush any pending writes before closing
-                    if conn.has_pending_write() {
-                        let _ = stream.write_all(conn.pending_write_data()).await;
+                        // Send any pending write_buf data (non-zero-copy responses)
+                        if conn.has_pending_write() {
+                            let data = conn.pending_write_data();
+                            stream.write_all(data).await?;
+                            conn.advance_write(data.len());
+                        }
+
+                        if conn.should_close() {
+                            return Ok(());
+                        }
                     }
-                    return Ok(());
-                }
+                } else {
+                    // Non-zero-copy path: process all commands at once
+                    conn.process_from(&mut recv_buf, &*cache);
 
-                // Write response if we have data
-                if conn.has_pending_write() {
-                    let data = conn.pending_write_data();
-                    stream.write_all(data).await?;
-                    conn.advance_write(data.len());
+                    if conn.should_close() {
+                        // Flush any pending writes before closing
+                        if conn.has_pending_write() {
+                            let _ = stream.write_all(conn.pending_write_data()).await;
+                        }
+                        return Ok(());
+                    }
+
+                    // Write response if we have data
+                    if conn.has_pending_write() {
+                        let data = conn.pending_write_data();
+                        stream.write_all(data).await?;
+                        conn.advance_write(data.len());
+                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

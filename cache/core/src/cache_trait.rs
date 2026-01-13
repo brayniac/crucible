@@ -5,6 +5,7 @@
 //! protocol servers like iou-cache and tokio-cache.
 
 use crate::error::CacheError;
+use crate::sync::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// A simple guard that owns the cached value.
@@ -14,6 +15,114 @@ use std::time::Duration;
 pub struct OwnedGuard {
     value: Vec<u8>,
 }
+
+/// A zero-copy reference to a cached value.
+///
+/// This struct holds a reference to the value bytes directly in segment memory,
+/// keeping the segment's ref_count incremented to prevent eviction.
+///
+/// # Safety
+///
+/// This type is `Send` because:
+/// - The ref_count pointer points to an AtomicU32 in a 'static MemoryPool
+/// - The value pointer points to memory in that same pool
+/// - The pool outlives all ValueRefs (pool is dropped after all refs are released)
+///
+/// # Usage
+///
+/// Use this for zero-copy scatter-gather I/O where you need to send the value
+/// directly from cache memory without copying to an intermediate buffer.
+pub struct ValueRef {
+    /// Pointer to the segment's ref_count for proper cleanup.
+    ref_count: *const AtomicU32,
+    /// Pointer to the value data in segment memory.
+    value_ptr: *const u8,
+    /// Length of the value in bytes.
+    value_len: usize,
+}
+
+impl ValueRef {
+    /// Create a new ValueRef.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - `ref_count` points to a valid AtomicU32 that has been incremented
+    /// - `value_ptr` and `value_len` describe valid memory that will remain
+    ///   valid as long as the ref_count is held
+    #[inline]
+    pub unsafe fn new(ref_count: *const AtomicU32, value_ptr: *const u8, value_len: usize) -> Self {
+        Self {
+            ref_count,
+            value_ptr,
+            value_len,
+        }
+    }
+
+    /// Get the value as a byte slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: The ref_count being held guarantees the segment memory is valid
+        unsafe { std::slice::from_raw_parts(self.value_ptr, self.value_len) }
+    }
+
+    /// Get the length of the value.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.value_len
+    }
+
+    /// Check if the value is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.value_len == 0
+    }
+
+    /// Get the raw pointer to the value data.
+    ///
+    /// This is useful for scatter-gather I/O where you need to pass
+    /// the buffer directly to the kernel.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.value_ptr
+    }
+}
+
+impl AsRef<[u8]> for ValueRef {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for ValueRef {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl Drop for ValueRef {
+    fn drop(&mut self) {
+        // SAFETY: ref_count is a valid AtomicU32 pointer from the segment
+        unsafe {
+            (*self.ref_count).fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+// SAFETY: ValueRef can be sent between threads because:
+// 1. The ref_count points to an AtomicU32 in a 'static MemoryPool
+// 2. The value memory is in the same pool
+// 3. The pool's lifetime exceeds all ValueRefs
+unsafe impl Send for ValueRef {}
+
+// SAFETY: ValueRef can be shared between threads because:
+// 1. All access to the value is read-only
+// 2. The ref_count uses atomic operations
+unsafe impl Sync for ValueRef {}
 
 impl OwnedGuard {
     /// Create a new owned guard from a value.
@@ -76,6 +185,43 @@ pub trait Cache: Send + Sync + 'static {
     fn with_value<F, R>(&self, key: &[u8], f: F) -> Option<R>
     where
         F: FnOnce(&[u8]) -> R;
+
+    /// Get a zero-copy reference to a cached value.
+    ///
+    /// Returns a [`ValueRef`] that holds a reference to the value directly
+    /// in cache memory, preventing the segment from being evicted while
+    /// the reference is held.
+    ///
+    /// This is the most efficient way to read values for scatter-gather I/O,
+    /// as the value bytes can be sent directly to the network without any
+    /// intermediate copies.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Get zero-copy reference for vectored write
+    /// if let Some(value_ref) = cache.get_value_ref(key) {
+    ///     // value_ref.as_slice() points directly into cache memory
+    ///     driver.send_vectored(conn_id, &[
+    ///         IoSlice::new(header.as_bytes()),
+    ///         IoSlice::new(value_ref.as_slice()),
+    ///         IoSlice::new(b"\r\n"),
+    ///     ]);
+    ///     // Segment stays pinned until value_ref is dropped
+    /// }
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// - `Some(ValueRef)` if the key exists
+    /// - `None` if the key is not found
+    ///
+    /// # Note
+    ///
+    /// Holding `ValueRef` prevents segment eviction. For long-lived references
+    /// or slow consumers (e.g., network writes to slow clients), prefer
+    /// copying the value to avoid blocking cache eviction.
+    fn get_value_ref(&self, key: &[u8]) -> Option<ValueRef>;
 
     /// Set a key-value pair in the cache.
     ///

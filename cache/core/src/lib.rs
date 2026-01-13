@@ -151,6 +151,6 @@ pub use metrics::{
 
 // Cache trait for server compatibility
 mod cache_trait;
-pub use cache_trait::{Cache, DEFAULT_TTL, OwnedGuard};
+pub use cache_trait::{Cache, DEFAULT_TTL, OwnedGuard, ValueRef};
 mod arc_cache;
 pub use arc_cache::{ArcCache, Entry};

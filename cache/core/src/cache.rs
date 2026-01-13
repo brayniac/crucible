@@ -15,6 +15,7 @@ use crate::layer::{FifoLayer, Layer, TtlLayer};
 use crate::location::Location;
 use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
+use crate::segment::Segment;
 use crate::slice_segment::SliceSegment;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +78,38 @@ impl CacheLayer {
     /// Get value bytes from this layer (convenience method).
     pub fn get_value(&self, location: ItemLocation, key: &[u8]) -> Option<Vec<u8>> {
         self.with_item(location, key, |guard| guard.value().to_vec())
+    }
+
+    /// Get raw value reference pointers for zero-copy scatter-gather I/O.
+    ///
+    /// Returns the raw components needed to construct a `ValueRef`:
+    /// - `ref_count_ptr`: Pointer to segment's ref_count (already incremented)
+    /// - `value_ptr`: Pointer to value bytes in segment memory
+    /// - `value_len`: Length of the value
+    ///
+    /// Returns `None` if the item is not found or not accessible.
+    pub fn get_value_ref_raw(
+        &self,
+        location: ItemLocation,
+        key: &[u8],
+    ) -> Option<(*const crate::sync::AtomicU32, *const u8, usize)> {
+        let pool = self.pool();
+
+        // Verify pool ID matches
+        if location.pool_id() != pool.pool_id() {
+            return None;
+        }
+
+        let segment = pool.get(location.segment_id())?;
+
+        // Check segment state first
+        let state = segment.state();
+        if !state.is_readable() {
+            return None;
+        }
+
+        // Get raw value reference (handles ref_count increment)
+        segment.get_value_ref_raw(location.offset(), key).ok()
     }
 
     /// Mark an item as deleted.
@@ -399,6 +432,32 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Call function with item
         layer.with_item(item_loc, key, f)
+    }
+
+    /// Get a zero-copy reference to a cached value.
+    ///
+    /// Returns a [`ValueRef`] that holds a reference to the value directly
+    /// in cache memory. The segment's ref_count is incremented to prevent
+    /// eviction while the reference is held.
+    ///
+    /// This is the most efficient way to read values for scatter-gather I/O.
+    pub fn get_value_ref(&self, key: &[u8]) -> Option<crate::cache_trait::ValueRef> {
+        let verifier = self.create_key_verifier();
+
+        // Lookup in hashtable
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let item_loc = ItemLocation::from_location(location);
+
+        // Find the layer containing this item
+        let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
+        let layer = self.layers.get(layer_idx)?;
+
+        // Get raw pointers from layer
+        let (ref_count_ptr, value_ptr, value_len) = layer.get_value_ref_raw(item_loc, key)?;
+
+        // Safety: The layer's get_value_ref_raw has incremented ref_count and
+        // validated that the pointers are valid. ValueRef will decrement ref_count on drop.
+        Some(unsafe { crate::cache_trait::ValueRef::new(ref_count_ptr, value_ptr, value_len) })
     }
 
     /// Delete an item from the cache.

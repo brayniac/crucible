@@ -39,6 +39,85 @@ pub struct Config {
     /// io_uring specific configuration (only used when io_engine = "uring" or "auto" on Linux 6.0+)
     #[serde(default)]
     pub uring: UringConfig,
+
+    /// Zero-copy mode for GET responses.
+    /// Controls whether to use scatter-gather I/O to send values directly from cache segments.
+    #[serde(default)]
+    pub zero_copy: ZeroCopyMode,
+}
+
+/// Zero-copy mode for GET responses.
+///
+/// Controls whether to use scatter-gather I/O to send cached values directly
+/// from segment memory without copying to intermediate buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZeroCopyMode {
+    /// Always copy values to write buffer (current behavior).
+    /// Most compatible, no segment hold concerns.
+    Disabled,
+
+    /// Always use zero-copy scatter-gather for all values.
+    /// Maximum performance but holds segment refs during I/O.
+    Enabled,
+
+    /// Use zero-copy for values >= threshold bytes (default: 1024).
+    /// Balances performance with segment hold concerns.
+    /// Small values are copied (negligible overhead), large values are zero-copy.
+    #[default]
+    Threshold,
+}
+
+impl ZeroCopyMode {
+    /// Get the threshold size for zero-copy mode.
+    /// Returns None for Disabled/Enabled, Some(threshold) for Threshold mode.
+    pub fn threshold(&self) -> Option<usize> {
+        match self {
+            ZeroCopyMode::Disabled => None,
+            ZeroCopyMode::Enabled => Some(0), // All values
+            ZeroCopyMode::Threshold => Some(DEFAULT_ZERO_COPY_THRESHOLD),
+        }
+    }
+
+    /// Check if zero-copy should be used for a value of the given size.
+    pub fn should_use_zero_copy(&self, value_len: usize) -> bool {
+        match self {
+            ZeroCopyMode::Disabled => false,
+            ZeroCopyMode::Enabled => true,
+            ZeroCopyMode::Threshold => value_len >= DEFAULT_ZERO_COPY_THRESHOLD,
+        }
+    }
+}
+
+/// Default threshold for zero-copy mode (1KB).
+/// Values smaller than this are copied; larger values use scatter-gather.
+pub const DEFAULT_ZERO_COPY_THRESHOLD: usize = 1024;
+
+impl<'de> Deserialize<'de> for ZeroCopyMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ZeroCopyValue {
+            Bool(bool),
+            String(String),
+        }
+
+        match ZeroCopyValue::deserialize(deserializer)? {
+            ZeroCopyValue::Bool(true) => Ok(ZeroCopyMode::Enabled),
+            ZeroCopyValue::Bool(false) => Ok(ZeroCopyMode::Disabled),
+            ZeroCopyValue::String(s) => match s.to_lowercase().as_str() {
+                "disabled" | "off" | "no" | "false" => Ok(ZeroCopyMode::Disabled),
+                "enabled" | "on" | "yes" | "true" => Ok(ZeroCopyMode::Enabled),
+                "threshold" | "auto" | "default" => Ok(ZeroCopyMode::Threshold),
+                _ => Err(serde::de::Error::custom(format!(
+                    "invalid zero_copy value: '{}' (expected 'disabled', 'enabled', or 'threshold')",
+                    s
+                ))),
+            },
+        }
+    }
 }
 
 /// Runtime selection.

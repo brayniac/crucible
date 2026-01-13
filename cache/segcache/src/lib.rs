@@ -56,7 +56,7 @@ use std::time::Duration;
 pub use cache_core::{
     AtomicCounters, BasicItemGuard, Cache, CacheError, CacheMetrics, CacheResult, CounterSnapshot,
     DEFAULT_TTL, EvictionStrategy, FrequencyDecay, HugepageSize, ItemLocation, LayerMetrics,
-    MergeConfig, OwnedGuard, PoolMetrics,
+    MergeConfig, OwnedGuard, PoolMetrics, ValueRef,
 };
 
 /// Segment-based cache with single-tier architecture.
@@ -354,6 +354,10 @@ impl Cache for SegCache {
         F: FnOnce(&[u8]) -> R,
     {
         self.inner.with_item(key, |guard| f(guard.value()))
+    }
+
+    fn get_value_ref(&self, key: &[u8]) -> Option<ValueRef> {
+        self.inner.get_value_ref(key)
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {

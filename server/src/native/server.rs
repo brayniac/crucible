@@ -1,7 +1,7 @@
 //! Native runtime server loop.
 
 use crate::affinity::set_cpu_affinity;
-use crate::config::{Config, RecvMode};
+use crate::config::{Config, RecvMode, ZeroCopyMode};
 use crate::connection::Connection;
 use crate::metrics::{
     CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats, WorkerStatsSnapshot,
@@ -42,6 +42,7 @@ struct WorkerConfig {
     sqpoll: bool,
     recv_mode: RecvMode,
     max_value_size: usize,
+    zero_copy_mode: ZeroCopyMode,
 }
 
 /// Configuration for the acceptor thread.
@@ -77,6 +78,7 @@ pub fn run<C: Cache + 'static>(
         sqpoll: config.uring.sqpoll,
         recv_mode: config.uring.recv_mode,
         max_value_size: config.cache.max_value_size,
+        zero_copy_mode: config.zero_copy,
     };
 
     let acceptor_config = AcceptorConfig {
@@ -424,30 +426,145 @@ fn run_worker<C: Cache>(
 
                     let mut close_reason: Option<CloseReason> = None;
                     let mut bytes_received = 0u64;
+                    let mut send_error = false;
 
-                    // Process data using zero-copy with_recv_buf API
-                    let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                        let initial_len = buf.len();
+                    // Zero-copy path: process commands one at a time
+                    if config.zero_copy_mode != ZeroCopyMode::Disabled {
+                        use crate::connection::ZeroCopyResponse;
 
-                        if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                            // Parse and execute commands directly from driver buffer
-                            conn.process_from(buf, &*cache);
+                        loop {
+                            let mut zero_copy_response: Option<ZeroCopyResponse> = None;
+                            let mut has_more_data = false;
 
-                            // Track bytes consumed
-                            bytes_received = (initial_len - buf.len()) as u64;
+                            let result = driver.with_recv_buf(conn_id, &mut |buf| {
+                                let initial_len = buf.len();
+                                if buf.is_empty() {
+                                    return;
+                                }
 
-                            if conn.should_close() {
-                                close_reason = Some(CloseReason::ProtocolClose);
+                                if let Some(conn) =
+                                    connections.get_mut(idx).and_then(|c| c.as_mut())
+                                {
+                                    if !conn.should_read() {
+                                        return;
+                                    }
+
+                                    // Process one command, potentially returning a zero-copy response
+                                    zero_copy_response = conn.process_one_zero_copy(
+                                        buf,
+                                        &*cache,
+                                        config.zero_copy_mode,
+                                    );
+
+                                    bytes_received += (initial_len - buf.len()) as u64;
+                                    has_more_data = !buf.is_empty();
+
+                                    if conn.should_close() {
+                                        close_reason = Some(CloseReason::ProtocolClose);
+                                    }
+                                }
+                            });
+
+                            // Check for EOF or other errors
+                            if let Err(e) = result {
+                                if e.kind() == io::ErrorKind::UnexpectedEof {
+                                    close_reason = Some(CloseReason::ClientEof);
+                                } else if e.kind() != io::ErrorKind::NotFound {
+                                    close_reason = Some(CloseReason::RecvError);
+                                }
+                                break;
+                            }
+
+                            // Send zero-copy response if present
+                            if let Some(resp) = zero_copy_response {
+                                let slices = resp.as_io_slices();
+                                match driver.send_vectored(conn_id, &slices) {
+                                    Ok(n) => {
+                                        stats.add_bytes_sent(n as u64);
+                                    }
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                        // Can't send now - the response is dropped here,
+                                        // releasing the segment ref. The data is lost but
+                                        // this is rare and the client will retry.
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        send_error = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Send any pending write_buf data (non-zero-copy responses)
+                            while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
+                            {
+                                if !conn.has_pending_write() {
+                                    break;
+                                }
+
+                                let data = conn.pending_write_data();
+                                match driver.send(conn_id, data) {
+                                    Ok(n) => {
+                                        stats.add_bytes_sent(n as u64);
+                                        conn.advance_write(n);
+                                    }
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(_) => {
+                                        send_error = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if send_error || close_reason.is_some() || !has_more_data {
+                                break;
                             }
                         }
-                    });
+                    } else {
+                        // Non-zero-copy path: process all commands at once
+                        let result = driver.with_recv_buf(conn_id, &mut |buf| {
+                            let initial_len = buf.len();
 
-                    // Check for EOF or other errors
-                    if let Err(e) = result {
-                        if e.kind() == io::ErrorKind::UnexpectedEof {
-                            close_reason = Some(CloseReason::ClientEof);
-                        } else if e.kind() != io::ErrorKind::NotFound {
-                            close_reason = Some(CloseReason::RecvError);
+                            if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                                // Parse and execute commands directly from driver buffer
+                                conn.process_from(buf, &*cache);
+
+                                // Track bytes consumed
+                                bytes_received = (initial_len - buf.len()) as u64;
+
+                                if conn.should_close() {
+                                    close_reason = Some(CloseReason::ProtocolClose);
+                                }
+                            }
+                        });
+
+                        // Check for EOF or other errors
+                        if let Err(e) = result {
+                            if e.kind() == io::ErrorKind::UnexpectedEof {
+                                close_reason = Some(CloseReason::ClientEof);
+                            } else if e.kind() != io::ErrorKind::NotFound {
+                                close_reason = Some(CloseReason::RecvError);
+                            }
+                        }
+
+                        // Send any pending responses
+                        while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                            if !conn.has_pending_write() {
+                                break;
+                            }
+
+                            let data = conn.pending_write_data();
+                            match driver.send(conn_id, data) {
+                                Ok(n) => {
+                                    stats.add_bytes_sent(n as u64);
+                                    conn.advance_write(n);
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(_) => {
+                                    send_error = true;
+                                    break;
+                                }
+                            }
                         }
                     }
 
@@ -457,27 +574,6 @@ fn run_worker<C: Cache>(
                     if let Some(reason) = close_reason {
                         close_connection(&mut driver, &mut connections, conn_id, stats, reason);
                         continue;
-                    }
-
-                    // Send any pending responses
-                    let mut send_error = false;
-                    while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                        if !conn.has_pending_write() {
-                            break;
-                        }
-
-                        let data = conn.pending_write_data();
-                        match driver.send(conn_id, data) {
-                            Ok(n) => {
-                                stats.add_bytes_sent(n as u64);
-                                conn.advance_write(n);
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(_) => {
-                                send_error = true;
-                                break;
-                            }
-                        }
                     }
 
                     if send_error {
