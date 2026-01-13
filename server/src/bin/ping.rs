@@ -250,7 +250,7 @@ fn run_single_threaded(addr: SocketAddr, engine: IoEngine, uring: &UringConfig) 
         for completion in driver.drain_completions() {
             match completion.kind {
                 CompletionKind::Accept { conn_id, .. } => {
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     if idx >= connections.len() {
                         connections.resize_with(idx + 1, || None);
                     }
@@ -258,7 +258,7 @@ fn run_single_threaded(addr: SocketAddr, engine: IoEngine, uring: &UringConfig) 
                 }
 
                 CompletionKind::Recv { conn_id } => {
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     let mut should_close = false;
 
                     'recv: loop {
@@ -301,7 +301,7 @@ fn run_single_threaded(addr: SocketAddr, engine: IoEngine, uring: &UringConfig) 
                 }
 
                 CompletionKind::SendReady { conn_id } => {
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     let mut should_close = false;
 
                     loop {
@@ -339,7 +339,7 @@ fn run_single_threaded(addr: SocketAddr, engine: IoEngine, uring: &UringConfig) 
 }
 
 fn close_conn(driver: &mut Box<dyn IoDriver>, connections: &mut [Option<Conn>], conn_id: ConnId) {
-    let idx = conn_id.as_usize();
+    let idx = conn_id.slot();
     if let Some(slot) = connections.get_mut(idx)
         && slot.take().is_some()
     {
@@ -462,7 +462,7 @@ fn run_worker(
         // Accept new connections from acceptor
         while let Ok(raw_fd) = fd_receiver.try_recv() {
             if let Ok(conn_id) = driver.register_fd(raw_fd) {
-                let idx = conn_id.as_usize();
+                let idx = conn_id.slot();
                 if idx >= connections.len() {
                     connections.resize_with(idx + 1, || None);
                 }
@@ -475,7 +475,7 @@ fn run_worker(
         for completion in driver.drain_completions() {
             match completion.kind {
                 CompletionKind::Accept { conn_id, .. } => {
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     if idx >= connections.len() {
                         connections.resize_with(idx + 1, || None);
                     }
@@ -483,7 +483,7 @@ fn run_worker(
                 }
 
                 CompletionKind::Recv { conn_id } => {
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     let mut should_close = false;
 
                     'recv: loop {
@@ -520,7 +520,7 @@ fn run_worker(
                     }
 
                     if should_close {
-                        let idx = conn_id.as_usize();
+                        let idx = conn_id.slot();
                         if let Some(slot) = connections.get_mut(idx)
                             && slot.take().is_some()
                         {
@@ -530,7 +530,7 @@ fn run_worker(
                 }
 
                 CompletionKind::SendReady { conn_id } => {
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     let mut should_close = false;
 
                     loop {
@@ -553,7 +553,7 @@ fn run_worker(
                     }
 
                     if should_close {
-                        let idx = conn_id.as_usize();
+                        let idx = conn_id.slot();
                         if let Some(slot) = connections.get_mut(idx)
                             && slot.take().is_some()
                         {
@@ -563,7 +563,7 @@ fn run_worker(
                 }
 
                 CompletionKind::Closed { conn_id } | CompletionKind::Error { conn_id, .. } => {
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     if let Some(slot) = connections.get_mut(idx)
                         && slot.take().is_some()
                     {

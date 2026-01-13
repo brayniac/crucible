@@ -370,7 +370,7 @@ fn run_worker<C: Cache>(
                     CONNECTIONS_ACTIVE.increment();
                     stats.inc_channel_receive();
 
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     if idx >= connections.len() {
                         connections.resize_with(idx + 1, || None);
                     }
@@ -399,7 +399,7 @@ fn run_worker<C: Cache>(
                     CONNECTIONS_ACTIVE.increment();
                     stats.inc_accepts();
 
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     if idx >= connections.len() {
                         connections.resize_with(idx + 1, || None);
                     }
@@ -410,7 +410,7 @@ fn run_worker<C: Cache>(
                 // Unified recv handling using with_recv_buf
                 CompletionKind::Recv { conn_id } => {
                     stats.inc_recv();
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
 
                     // Check if connection exists and should read
                     let should_process = connections
@@ -434,7 +434,7 @@ fn run_worker<C: Cache>(
 
                         loop {
                             let mut zero_copy_response: Option<ZeroCopyResponse> = None;
-                            let mut has_more_data = false;
+                            let mut made_progress = false;
 
                             let result = driver.with_recv_buf(conn_id, &mut |buf| {
                                 let initial_len = buf.len();
@@ -456,8 +456,11 @@ fn run_worker<C: Cache>(
                                         config.zero_copy_mode,
                                     );
 
-                                    bytes_received += (initial_len - buf.len()) as u64;
-                                    has_more_data = !buf.is_empty();
+                                    let consumed = initial_len - buf.len();
+                                    bytes_received += consumed as u64;
+                                    // Only continue if we made progress (consumed data).
+                                    // If no progress, command was incomplete - wait for more data.
+                                    made_progress = consumed > 0;
 
                                     if conn.should_close() {
                                         close_reason = Some(CloseReason::ProtocolClose);
@@ -516,7 +519,8 @@ fn run_worker<C: Cache>(
                                 }
                             }
 
-                            if send_error || close_reason.is_some() || !has_more_data {
+                            // Break if error, close requested, or no progress (incomplete command)
+                            if send_error || close_reason.is_some() || !made_progress {
                                 break;
                             }
                         }
@@ -592,7 +596,7 @@ fn run_worker<C: Cache>(
 
                 CompletionKind::SendReady { conn_id } => {
                     stats.inc_send_ready();
-                    let idx = conn_id.as_usize();
+                    let idx = conn_id.slot();
                     let mut close_reason: Option<CloseReason> = None;
 
                     // Drain pending write data
@@ -734,7 +738,7 @@ fn close_connection(
     stats: &WorkerStats,
     reason: CloseReason,
 ) {
-    let idx = conn_id.as_usize();
+    let idx = conn_id.slot();
     if let Some(slot) = connections.get_mut(idx)
         && slot.take().is_some()
     {

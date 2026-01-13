@@ -207,7 +207,12 @@ async fn handle_connection<C: Cache>(
 
                 // Zero-copy path: process one command at a time
                 if zero_copy_mode != ZeroCopyMode::Disabled {
-                    while !recv_buf.is_empty() && conn.should_read() {
+                    loop {
+                        if recv_buf.is_empty() || !conn.should_read() {
+                            break;
+                        }
+
+                        let initial_len = recv_buf.len();
                         if let Some(resp) =
                             conn.process_one_zero_copy(&mut recv_buf, &*cache, zero_copy_mode)
                         {
@@ -216,6 +221,12 @@ async fn handle_connection<C: Cache>(
                             // Note: write_vectored may do a partial write, but for simplicity
                             // we rely on the response being small enough to fit in one syscall
                             let _n = stream.write_vectored(&slices).await?;
+                        }
+
+                        // Check if we made progress (consumed any data).
+                        // If not, command was incomplete - wait for more data.
+                        if recv_buf.len() == initial_len {
+                            break;
                         }
 
                         // Send any pending write_buf data (non-zero-copy responses)

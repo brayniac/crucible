@@ -22,6 +22,7 @@ struct TestConfig {
     runtime: &'static str,
     io_engine: &'static str,
     recv_mode: Option<&'static str>,
+    zero_copy: Option<&'static str>,
     connections: usize,
     pipeline_depth: usize,
     value_size: usize,
@@ -38,6 +39,7 @@ impl TestConfig {
             runtime: "native",
             io_engine,
             recv_mode: None,
+            zero_copy: None,
             connections,
             pipeline_depth,
             value_size,
@@ -55,12 +57,14 @@ impl TestConfig {
             runtime,
             io_engine,
             recv_mode: None,
+            zero_copy: None,
             connections,
             pipeline_depth,
             value_size,
         }
     }
 
+    #[allow(dead_code)]
     fn with_recv_mode(
         io_engine: &'static str,
         recv_mode: &'static str,
@@ -72,6 +76,25 @@ impl TestConfig {
             runtime: "native",
             io_engine,
             recv_mode: Some(recv_mode),
+            zero_copy: None,
+            connections,
+            pipeline_depth,
+            value_size,
+        }
+    }
+
+    fn with_zero_copy(
+        io_engine: &'static str,
+        zero_copy: &'static str,
+        connections: usize,
+        pipeline_depth: usize,
+        value_size: usize,
+    ) -> Self {
+        Self {
+            runtime: "native",
+            io_engine,
+            recv_mode: None,
+            zero_copy: Some(zero_copy),
             connections,
             pipeline_depth,
             value_size,
@@ -99,7 +122,7 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
 
 /// Start a test server with the specified I/O engine (native runtime).
 fn start_test_server(port: u16, io_engine: &str, worker_threads: usize) -> thread::JoinHandle<()> {
-    start_test_server_full(port, io_engine, "native", None, worker_threads)
+    start_test_server_full(port, io_engine, "native", None, None, worker_threads)
 }
 
 /// Start a test server with the specified runtime and I/O engine.
@@ -109,7 +132,24 @@ fn start_test_server_with_runtime(
     runtime: &str,
     worker_threads: usize,
 ) -> thread::JoinHandle<()> {
-    start_test_server_full(port, io_engine, runtime, None, worker_threads)
+    start_test_server_full(port, io_engine, runtime, None, None, worker_threads)
+}
+
+/// Start a test server with zero-copy mode.
+fn start_test_server_with_zero_copy(
+    port: u16,
+    io_engine: &str,
+    zero_copy: &str,
+    worker_threads: usize,
+) -> thread::JoinHandle<()> {
+    start_test_server_full(
+        port,
+        io_engine,
+        "native",
+        None,
+        Some(zero_copy),
+        worker_threads,
+    )
 }
 
 /// Start a test server with full configuration options.
@@ -118,21 +158,29 @@ fn start_test_server_full(
     io_engine: &str,
     runtime: &str,
     recv_mode: Option<&str>,
+    zero_copy: Option<&str>,
     worker_threads: usize,
 ) -> thread::JoinHandle<()> {
     let io_engine = io_engine.to_string();
     let runtime = runtime.to_string();
     let recv_mode = recv_mode.map(|s| s.to_string());
+    let zero_copy = zero_copy.map(|s| s.to_string());
     thread::spawn(move || {
         let recv_mode_config = recv_mode
             .as_ref()
             .map(|m| format!("recv_mode = \"{m}\""))
             .unwrap_or_default();
 
+        let zero_copy_config = zero_copy
+            .as_ref()
+            .map(|m| format!("zero_copy = \"{m}\""))
+            .unwrap_or_default();
+
         let config_str = format!(
             r#"
             runtime = "{runtime}"
             io_engine = "{io_engine}"
+            {zero_copy_config}
 
             [workers]
             threads = {worker_threads}
@@ -348,17 +396,20 @@ fn run_parameterized_test(config: TestConfig) {
         config.io_engine,
         config.runtime,
         config.recv_mode,
+        config.zero_copy,
         worker_threads,
     );
 
     // Wait for server to be ready
     let recv_mode_str = config.recv_mode.unwrap_or("default");
+    let zero_copy_str = config.zero_copy.unwrap_or("default");
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {} runtime/{} backend/recv_mode={}",
+        "Server failed to start with {} runtime/{} backend/recv_mode={}/zero_copy={}",
         config.runtime,
         config.io_engine,
-        recv_mode_str
+        recv_mode_str,
+        zero_copy_str
     );
 
     let success_count = Arc::new(AtomicUsize::new(0));
@@ -1450,4 +1501,225 @@ fn test_uring_multishot_64conn_p8_medium() {
         8,
         1024,
     ));
+}
+
+// =============================================================================
+// Zero-copy mode tests (mio)
+// =============================================================================
+
+/// Test mio with zero-copy enabled for all GET responses.
+#[test]
+fn test_mio_zero_copy_enabled_basic() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_with_zero_copy(port, "mio", "enabled", 1);
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start with mio/zero_copy=enabled"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Test PING
+    stream.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).expect("Failed to read PONG");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.contains("PONG"),
+        "Expected PONG, got: {}",
+        response
+    );
+
+    // Test SET then GET (zero-copy should be used for GET)
+    let key = "test_key";
+    let value = "test_value_for_zero_copy";
+    let set_cmd = format!(
+        "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+        key.len(),
+        key,
+        value.len(),
+        value
+    );
+    stream.write_all(set_cmd.as_bytes()).unwrap();
+    let n = stream.read(&mut buf).expect("Failed to read SET response");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(response.contains("OK"), "Expected OK, got: {}", response);
+
+    // GET the value back
+    let get_cmd = format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key);
+    stream.write_all(get_cmd.as_bytes()).unwrap();
+    let mut response_buf = vec![0u8; 256];
+    let n = stream
+        .read(&mut response_buf)
+        .expect("Failed to read GET response");
+    let response = String::from_utf8_lossy(&response_buf[..n]);
+    assert!(
+        response.contains(value),
+        "Expected value '{}' in response, got: {}",
+        value,
+        response
+    );
+}
+
+/// Test mio with zero-copy threshold mode (only values >= 1KB use zero-copy).
+#[test]
+fn test_mio_zero_copy_threshold_basic() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_with_zero_copy(port, "mio", "threshold", 1);
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start with mio/zero_copy=threshold"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Test with small value (should NOT use zero-copy)
+    let key1 = "small_key";
+    let value1 = "small"; // < 1KB
+    let set_cmd = format!(
+        "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+        key1.len(),
+        key1,
+        value1.len(),
+        value1
+    );
+    stream.write_all(set_cmd.as_bytes()).unwrap();
+    let mut buf = [0u8; 64];
+    let _ = stream.read(&mut buf).unwrap();
+
+    let get_cmd = format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key1.len(), key1);
+    stream.write_all(get_cmd.as_bytes()).unwrap();
+    let mut response_buf = vec![0u8; 256];
+    let n = stream.read(&mut response_buf).unwrap();
+    let response = String::from_utf8_lossy(&response_buf[..n]);
+    assert!(response.contains(value1), "Small value GET failed");
+
+    // Test with large value (should use zero-copy)
+    let key2 = "large_key";
+    let value2 = "x".repeat(2048); // > 1KB threshold
+    let set_cmd = format!(
+        "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+        key2.len(),
+        key2,
+        value2.len(),
+        value2
+    );
+    stream.write_all(set_cmd.as_bytes()).unwrap();
+    let _ = stream.read(&mut buf).unwrap();
+
+    let get_cmd = format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key2.len(), key2);
+    stream.write_all(get_cmd.as_bytes()).unwrap();
+    let mut response_buf = vec![0u8; 4096];
+    let n = stream.read(&mut response_buf).unwrap();
+    let response = String::from_utf8_lossy(&response_buf[..n]);
+    assert!(
+        response.contains(&value2[..100]), // Check at least first part
+        "Large value GET failed (zero-copy path)"
+    );
+}
+
+/// Test mio with zero-copy enabled using multiple connections and pipelining.
+#[test]
+fn test_mio_zero_copy_8conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_zero_copy("mio", "enabled", 8, 8, 1024));
+}
+
+/// Test mio with zero-copy enabled using larger values.
+#[test]
+fn test_mio_zero_copy_8conn_p8_large() {
+    run_parameterized_test(TestConfig::with_zero_copy("mio", "enabled", 8, 8, 16384));
+}
+
+/// Test mio with zero-copy threshold mode with medium values (mix of copy and zero-copy).
+#[test]
+fn test_mio_zero_copy_threshold_8conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_zero_copy("mio", "threshold", 8, 8, 1024));
+}
+
+// =============================================================================
+// Zero-copy mode tests (io_uring)
+// =============================================================================
+
+/// Test io_uring with zero-copy enabled for all GET responses.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_zero_copy_enabled_basic() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server_with_zero_copy(port, "uring", "enabled", 1);
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start with uring/zero_copy=enabled"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Test SET then GET (zero-copy should be used for GET)
+    let key = "test_key";
+    let value = "test_value_for_zero_copy";
+    let set_cmd = format!(
+        "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+        key.len(),
+        key,
+        value.len(),
+        value
+    );
+    stream.write_all(set_cmd.as_bytes()).unwrap();
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).expect("Failed to read SET response");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(response.contains("OK"), "Expected OK, got: {}", response);
+
+    // GET the value back
+    let get_cmd = format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key);
+    stream.write_all(get_cmd.as_bytes()).unwrap();
+    let mut response_buf = vec![0u8; 256];
+    let n = stream
+        .read(&mut response_buf)
+        .expect("Failed to read GET response");
+    let response = String::from_utf8_lossy(&response_buf[..n]);
+    assert!(
+        response.contains(value),
+        "Expected value '{}' in response, got: {}",
+        value,
+        response
+    );
+}
+
+/// Test io_uring with zero-copy enabled using multiple connections and pipelining.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_zero_copy_8conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_zero_copy("uring", "enabled", 8, 8, 1024));
+}
+
+/// Test io_uring with zero-copy enabled using larger values.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_zero_copy_8conn_p8_large() {
+    run_parameterized_test(TestConfig::with_zero_copy("uring", "enabled", 8, 8, 16384));
+}
+
+/// Test io_uring with zero-copy threshold mode.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_uring_zero_copy_threshold_8conn_p8_medium() {
+    run_parameterized_test(TestConfig::with_zero_copy("uring", "threshold", 8, 8, 1024));
 }

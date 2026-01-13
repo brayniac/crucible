@@ -243,15 +243,25 @@ impl IoDriver for MioDriver {
             Interest::READABLE | Interest::WRITABLE,
         )?;
 
+        let conn_id = ConnId::with_generation(slot, generation);
+
         entry.insert(MioConnection {
             stream: mio_stream,
-            readable: false,
+            // Set readable: true because with edge-triggered mode, data may already
+            // be available on the socket when it's registered (e.g., client sent
+            // data before server accepted). We queue a Recv completion to ensure
+            // the server attempts to read immediately.
+            readable: true,
             writable: true,
             recv_state: ConnectionRecvState::default(),
             generation,
         });
 
-        Ok(ConnId::with_generation(slot, generation))
+        // Queue a Recv completion so the server processes any data already available.
+        // This handles the edge-triggered case where data arrived before registration.
+        self.pending_completions
+            .push(Completion::new(CompletionKind::Recv { conn_id }));
+        Ok(conn_id)
     }
 
     fn close(&mut self, id: ConnId) -> io::Result<()> {
@@ -432,7 +442,9 @@ impl IoDriver for MioDriver {
     }
 
     fn poll(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
-        self.pending_completions.clear();
+        // Note: We do NOT clear pending_completions here because register_fd()
+        // may have queued Recv completions for newly registered connections.
+        // drain_completions() clears the vec via mem::take().
 
         self.poll.poll(&mut self.events, timeout)?;
 

@@ -36,8 +36,11 @@ impl ConnId {
     }
 
     /// Get the slot index from this connection ID.
+    ///
+    /// This extracts just the slot index, suitable for indexing into arrays.
+    /// For HashMap keys, use `as_usize()` which includes the generation.
     #[inline]
-    pub(crate) fn slot(&self) -> usize {
+    pub fn slot(&self) -> usize {
         (self.0 & 0xFFFF_FFFF) as usize
     }
 

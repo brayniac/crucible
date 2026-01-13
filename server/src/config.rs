@@ -54,6 +54,7 @@ pub struct Config {
 pub enum ZeroCopyMode {
     /// Always copy values to write buffer (current behavior).
     /// Most compatible, no segment hold concerns.
+    #[default]
     Disabled,
 
     /// Always use zero-copy scatter-gather for all values.
@@ -63,7 +64,6 @@ pub enum ZeroCopyMode {
     /// Use zero-copy for values >= threshold bytes (default: 1024).
     /// Balances performance with segment hold concerns.
     /// Small values are copied (negligible overhead), large values are zero-copy.
-    #[default]
     Threshold,
 }
 
