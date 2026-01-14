@@ -211,15 +211,25 @@ impl IoDriver for MioDriver {
             Interest::READABLE | Interest::WRITABLE,
         )?;
 
+        let conn_id = ConnId::with_generation(slot, generation);
+
         entry.insert(MioConnection {
             stream: mio_stream,
+            // Set writable: true because with edge-triggered mode, the non-blocking
+            // connect may have already completed before we registered with poll.
+            // Queue a SendReady completion to ensure the client tries to send immediately.
             readable: false,
-            writable: false, // Wait for connect to complete (SendReady event)
+            writable: true,
             recv_state: ConnectionRecvState::default(),
             generation,
         });
 
-        Ok(ConnId::with_generation(slot, generation))
+        // Queue a SendReady completion so the client tries to send immediately.
+        // This handles the edge-triggered case where connect completed before registration.
+        self.pending_completions
+            .push(Completion::new(CompletionKind::SendReady { conn_id }));
+
+        Ok(conn_id)
     }
 
     fn register_fd(&mut self, raw_fd: RawFd) -> io::Result<ConnId> {
