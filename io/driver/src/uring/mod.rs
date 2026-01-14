@@ -1114,6 +1114,13 @@ impl IoDriver for UringDriver {
             return Err(e);
         }
 
+        // Queue a SendReady completion so the client knows the socket is ready for sending.
+        // For non-blocking connect, the connection may already be established.
+        self.pending_completions
+            .push(Completion::new(CompletionKind::SendReady {
+                conn_id: ConnId::new(conn_id),
+            }));
+
         Ok(ConnId::new(conn_id))
     }
 
