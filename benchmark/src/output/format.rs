@@ -16,9 +16,10 @@ pub fn format_rate(value: f64) -> String {
 
 /// Format a number with 3 significant figures and an optional suffix.
 fn format_3sig(value: f64, suffix: &str) -> String {
-    if value < 10.0 {
+    // Account for rounding: 9.995 rounds to 10.00, 99.95 rounds to 100.0
+    if value < 9.995 {
         format!("{:.2}{}", value, suffix)
-    } else if value < 100.0 {
+    } else if value < 99.95 {
         format!("{:.1}{}", value, suffix)
     } else {
         format!("{:.0}{}", value, suffix)
@@ -160,6 +161,10 @@ mod tests {
         assert_eq!(format_rate(1_230_000.0), "1.23M");
         assert_eq!(format_rate(12_300_000.0), "12.3M");
         assert_eq!(format_rate(234_000_000.0), "234M");
+        // Edge cases: values that round up at boundaries
+        assert_eq!(format_rate(99_950.0), "100K"); // not "100.0K"
+        assert_eq!(format_rate(100_000.0), "100K");
+        assert_eq!(format_rate(9_995.0), "10.0K"); // not "10.00K"
     }
 
     #[test]
