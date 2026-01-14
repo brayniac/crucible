@@ -523,12 +523,15 @@ impl UringDriver {
         conn.single_recv_pending = false;
         let user_buf = conn.user_recv_buf.take();
 
+        // Create ConnId with generation for all completions
+        let full_conn_id = ConnId::with_generation(conn_id, generation);
+
         if result == 0 {
             // EOF - peer closed connection
             self.recv_pool.free(buf_id);
             self.pending_completions
                 .push(Completion::new(CompletionKind::Closed {
-                    conn_id: ConnId::new(conn_id),
+                    conn_id: full_conn_id,
                 }));
             return;
         }
@@ -538,7 +541,7 @@ impl UringDriver {
             self.recv_pool.free(buf_id);
             self.pending_completions
                 .push(Completion::new(CompletionKind::Error {
-                    conn_id: ConnId::new(conn_id),
+                    conn_id: full_conn_id,
                     error: io::Error::from_raw_os_error(-result),
                 }));
             return;
@@ -575,7 +578,7 @@ impl UringDriver {
         // Generate Recv completion (same as multishot) since data is in recv_state
         self.pending_completions
             .push(Completion::new(CompletionKind::Recv {
-                conn_id: ConnId::new(conn_id),
+                conn_id: full_conn_id,
             }));
 
         // Note: next recv is submitted in poll() to handle SQ full cases
@@ -606,17 +609,20 @@ impl UringDriver {
             return;
         }
 
-        // Check if connection exists and is not closing
-        let is_closing = self
+        // Get connection info including generation for ConnId
+        let (is_closing, generation) = self
             .connections
             .get(conn_id)
-            .map(|c| c.closing)
-            .unwrap_or(true);
+            .map(|c| (c.closing, c.generation))
+            .unwrap_or((true, 0));
 
         if is_closing {
             // Connection is closing or doesn't exist, ignore send result
             return;
         }
+
+        // Create ConnId with generation for completions
+        let full_conn_id = ConnId::with_generation(conn_id, generation);
 
         if result <= 0 {
             // Send error (result == 0 means connection closed, result < 0 is error)
@@ -627,7 +633,7 @@ impl UringDriver {
             };
             self.pending_completions
                 .push(Completion::new(CompletionKind::Error {
-                    conn_id: ConnId::new(conn_id),
+                    conn_id: full_conn_id,
                     error,
                 }));
             return;
@@ -656,7 +662,7 @@ impl UringDriver {
 
         self.pending_completions
             .push(Completion::new(CompletionKind::SendReady {
-                conn_id: ConnId::new(conn_id),
+                conn_id: full_conn_id,
             }));
     }
 
@@ -778,7 +784,7 @@ impl UringDriver {
             self.pending_completions
                 .push(Completion::new(CompletionKind::Accept {
                     listener_id: ListenerId::new(listener_id),
-                    conn_id: ConnId::new(conn_id),
+                    conn_id: ConnId::with_generation(conn_id, generation),
                     addr,
                 }));
         }
@@ -1118,10 +1124,10 @@ impl IoDriver for UringDriver {
         // For non-blocking connect, the connection may already be established.
         self.pending_completions
             .push(Completion::new(CompletionKind::SendReady {
-                conn_id: ConnId::new(conn_id),
+                conn_id: ConnId::with_generation(conn_id, generation),
             }));
 
-        Ok(ConnId::new(conn_id))
+        Ok(ConnId::with_generation(conn_id, generation))
     }
 
     fn register_fd(&mut self, raw_fd: RawFd) -> io::Result<ConnId> {
@@ -1184,11 +1190,17 @@ impl IoDriver for UringDriver {
             return Err(e);
         }
 
-        Ok(ConnId::new(conn_id))
+        // Queue a SendReady completion so the client knows the socket is ready for sending.
+        self.pending_completions
+            .push(Completion::new(CompletionKind::SendReady {
+                conn_id: ConnId::with_generation(conn_id, generation),
+            }));
+
+        Ok(ConnId::with_generation(conn_id, generation))
     }
 
     fn close(&mut self, id: ConnId) -> io::Result<()> {
-        let conn_id = id.as_usize();
+        let conn_id = id.slot();
 
         // Check if connection exists and has in-flight sends
         let has_in_flight = self
@@ -1256,7 +1268,7 @@ impl IoDriver for UringDriver {
     }
 
     fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
-        if let Some(mut conn) = self.connections.try_remove(id.as_usize()) {
+        if let Some(mut conn) = self.connections.try_remove(id.slot()) {
             // Return any held recv buffers to their pools
             conn.recv_state.clear();
             for pending in conn.recv_state.take_pending_returns() {
@@ -1288,7 +1300,7 @@ impl IoDriver for UringDriver {
     }
 
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {
-        let conn_id = id.as_usize();
+        let conn_id = id.slot();
         let conn = self
             .connections
             .get_mut(conn_id)
@@ -1323,7 +1335,7 @@ impl IoDriver for UringDriver {
         let (n, pending_returns): (usize, Vec<_>) = {
             let conn = self
                 .connections
-                .get_mut(id.as_usize())
+                .get_mut(id.slot())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
             let available = conn.recv_state.as_slice();
@@ -1354,7 +1366,7 @@ impl IoDriver for UringDriver {
     }
 
     fn submit_recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<()> {
-        let conn_id = id.as_usize();
+        let conn_id = id.slot();
         let conn = self
             .connections
             .get_mut(conn_id)
@@ -1423,7 +1435,7 @@ impl IoDriver for UringDriver {
         let pending_returns: Vec<_> = {
             let conn = self
                 .connections
-                .get_mut(id.as_usize())
+                .get_mut(id.slot())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
             // Create a wrapper that implements RecvBuf using the connection's recv_state
@@ -1470,7 +1482,9 @@ impl IoDriver for UringDriver {
     }
 
     fn poll(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
-        self.pending_completions.clear();
+        // Note: We do NOT clear pending_completions here because register() and
+        // register_fd() may have queued completions for newly registered connections.
+        // drain_completions() clears the vec via mem::take().
 
         // Re-arm recv for connections that need it
         // This handles both single-shot mode (no pending recv) and multishot mode
@@ -1509,7 +1523,7 @@ impl IoDriver for UringDriver {
                     if conn.rearm_failures >= MAX_REARM_FAILURES {
                         self.pending_completions
                             .push(Completion::new(CompletionKind::Error {
-                                conn_id: ConnId::new(conn_id),
+                                conn_id: ConnId::with_generation(conn_id, generation),
                                 error: io::Error::other(
                                     "failed to re-arm recv: buffer pool exhausted or SQ full",
                                 ),
@@ -1559,7 +1573,7 @@ impl IoDriver for UringDriver {
     }
 
     fn raw_fd(&self, id: ConnId) -> Option<RawFd> {
-        self.connections.get(id.as_usize()).map(|c| c.raw_fd)
+        self.connections.get(id.slot()).map(|c| c.raw_fd)
     }
 
     // === UDP socket operations ===

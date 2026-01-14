@@ -505,7 +505,7 @@ fn test_register_client_connection() {
 }
 
 #[test]
-fn test_send_before_ready() {
+fn test_send_immediately_after_register() {
     let mut client_driver = MioDriver::new().unwrap();
 
     let test_port = 19882;
@@ -525,24 +525,24 @@ fn test_send_before_ready() {
 
     let client_conn_id = client_driver.register(client_stream).unwrap();
 
-    // Try to send immediately before polling for SendReady
-    // This should return WouldBlock since the connection isn't marked writable yet
-    let result = client_driver.send(client_conn_id, b"test");
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
-
-    // Accept on the listener side to complete the connection
-    let _ = listener.accept();
-
-    // Now poll to get SendReady
-    client_driver
-        .poll(Some(Duration::from_millis(100)))
-        .unwrap();
-    client_driver.drain_completions();
-
-    // After polling, send should work
+    // With edge-triggered mode, send should work immediately after register()
+    // because connections are marked writable upon registration.
+    // This ensures clients don't miss the initial "ready" edge event.
     let result = client_driver.send(client_conn_id, b"test");
     assert!(result.is_ok());
+
+    // Accept on the listener side
+    let _ = listener.accept();
+
+    // Verify that a SendReady completion was queued during registration
+    // (this is drained but confirms the fix for edge-triggered notifications)
+    let completions = client_driver.drain_completions();
+    assert!(
+        completions
+            .iter()
+            .any(|c| matches!(c.kind, io_driver::CompletionKind::SendReady { .. })),
+        "Expected SendReady completion to be queued on registration"
+    );
 }
 
 #[test]
