@@ -6,7 +6,11 @@ use super::format::{
 use super::{ColorMode, LatencyStats, OutputFormatter, Results, Sample};
 use crate::config::Config;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Number of sample rows between header reprints.
+const HEADER_REPEAT_INTERVAL: u64 = 25;
 
 /// ANSI escape codes for colors.
 mod ansi {
@@ -17,6 +21,7 @@ mod ansi {
 /// Clean table formatter with optional color support.
 pub struct CleanFormatter {
     use_color: bool,
+    sample_count: AtomicU64,
 }
 
 impl CleanFormatter {
@@ -29,7 +34,10 @@ impl CleanFormatter {
                 io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err()
             }
         };
-        Self { use_color }
+        Self {
+            use_color,
+            sample_count: AtomicU64::new(0),
+        }
     }
 
     fn red(&self, s: &str) -> String {
@@ -145,6 +153,13 @@ impl OutputFormatter for CleanFormatter {
     }
 
     fn print_sample(&self, sample: &Sample) {
+        // Reprint header periodically for readability
+        let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
+        if count > 0 && count % HEADER_REPEAT_INTERVAL == 0 {
+            println!();
+            self.print_header();
+        }
+
         let time = sample.timestamp.format("%H:%M:%S");
         let rate = format_rate_padded(sample.req_per_sec, 7);
         let err = format_pct(sample.err_pct);
