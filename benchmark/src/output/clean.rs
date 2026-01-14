@@ -144,10 +144,10 @@ impl OutputFormatter for CleanFormatter {
 
     fn print_header(&self) {
         println!(
-            "time UTC │   req/s │ err% │ hit% │conn% │    p50 │    p90 │    p99 │  p99.9 │ p99.99 │    max"
+            "time UTC │ req/s │ err/s │ hit% │    p50 │    p90 │    p99 │  p99.9 │ p99.99 │    max"
         );
         println!(
-            "─────────┼─────────┼──────┼──────┼──────┼────────┼────────┼────────┼────────┼────────┼───────"
+            "─────────┼───────┼───────┼──────┼────────┼────────┼────────┼────────┼────────┼───────"
         );
         let _ = io::stdout().flush();
     }
@@ -156,32 +156,30 @@ impl OutputFormatter for CleanFormatter {
         // Reprint header periodically for readability
         let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
         if count > 0 && count % HEADER_REPEAT_INTERVAL == 0 {
-            println!();
+            println!(
+                "─────────┼───────┼───────┼──────┼────────┼────────┼────────┼────────┼────────┼───────"
+            );
             self.print_header();
         }
 
         let time = sample.timestamp.format("%H:%M:%S");
-        let rate = format_rate_padded(sample.req_per_sec, 7);
-        let err = format_pct(sample.err_pct);
+        let rate = format_rate_padded(sample.req_per_sec, 5);
+        let err = format_rate_padded(sample.err_per_sec, 5);
         let hit = format_pct(sample.hit_pct);
-        let conn = format_pct(sample.conn_pct);
 
-        // Color error% red if > 0
-        let err_colored = self.maybe_red(&format!("{:>5}", err), sample.err_pct > 0.0);
-
-        // Color conn% red if < 100
-        let conn_colored = self.maybe_red(&format!("{:>5}", conn), sample.conn_pct < 100.0);
+        // Color err/s red if > 0
+        let err_colored = self.maybe_red(&err, sample.err_per_sec > 0.0);
 
         let p50 = format_latency_padded(sample.p50_us, 7);
         let p90 = format_latency_padded(sample.p90_us, 7);
         let p99 = format_latency_padded(sample.p99_us, 7);
         let p999 = format_latency_padded(sample.p999_us, 7);
         let p9999 = format_latency_padded(sample.p9999_us, 7);
-        let max = format_latency_padded(sample.max_us, 6);
+        let max = format_latency_padded(sample.max_us, 7);
 
         println!(
-            "{} │ {} │{} │{:>5} │{} │ {} │ {} │ {} │ {} │ {} │ {}",
-            time, rate, err_colored, hit, conn_colored, p50, p90, p99, p999, p9999, max
+            "{} │ {} │ {} │{:>5} │{} │{} │{} │{} │{} │{}",
+            time, rate, err_colored, hit, p50, p90, p99, p999, p9999, max
         );
         let _ = io::stdout().flush();
     }
@@ -189,11 +187,11 @@ impl OutputFormatter for CleanFormatter {
     fn print_results(&self, results: &Results) {
         println!();
         println!(
-            "──────────────────────────────────────────────────────────────────────────────────────────────"
+            "─────────────────────────────────────────────────────────────────────────────────────"
         );
         println!("RESULTS ({:.0}s)", results.duration_secs);
         println!(
-            "──────────────────────────────────────────────────────────────────────────────────────────────"
+            "─────────────────────────────────────────────────────────────────────────────────────"
         );
 
         // Throughput line

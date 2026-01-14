@@ -240,6 +240,7 @@ fn run_benchmark(
     let mut last_report = Instant::now();
     let mut last_responses = 0u64;
     let mut last_errors = 0u64;
+    let mut last_conn_failures = 0u64;
     let mut last_hits = 0u64;
     let mut last_misses = 0u64;
     let mut last_histogram: Option<Histogram> = None;
@@ -266,6 +267,7 @@ fn run_benchmark(
             // Initialize baseline for delta calculations
             last_responses = metrics::RESPONSES_RECEIVED.value();
             last_errors = metrics::REQUEST_ERRORS.value();
+            last_conn_failures = metrics::CONNECTIONS_FAILED.value();
             last_hits = metrics::CACHE_HITS.value();
             last_misses = metrics::CACHE_MISSES.value();
             last_histogram = metrics::RESPONSE_LATENCY.load();
@@ -280,9 +282,9 @@ fn run_benchmark(
         if last_report.elapsed() >= report_interval {
             let responses = metrics::RESPONSES_RECEIVED.value();
             let errors = metrics::REQUEST_ERRORS.value();
+            let conn_failures = metrics::CONNECTIONS_FAILED.value();
             let hits = metrics::CACHE_HITS.value();
             let misses = metrics::CACHE_MISSES.value();
-            let active = metrics::CONNECTIONS_ACTIVE.value();
 
             let elapsed_secs = last_report.elapsed().as_secs_f64();
 
@@ -291,15 +293,12 @@ fn run_benchmark(
             let rate = delta_responses as f64 / elapsed_secs;
             last_responses = responses;
 
+            // Calculate error rate (request errors + connection failures)
             let delta_errors = errors - last_errors;
+            let delta_conn_failures = conn_failures - last_conn_failures;
+            let err_rate = (delta_errors + delta_conn_failures) as f64 / elapsed_secs;
             last_errors = errors;
-
-            // Calculate error percentage for this interval
-            let err_pct = if delta_responses > 0 {
-                (delta_errors as f64 / delta_responses as f64) * 100.0
-            } else {
-                0.0
-            };
+            last_conn_failures = conn_failures;
 
             // Calculate hit rate for this interval
             let delta_hits = hits - last_hits;
@@ -312,13 +311,6 @@ fn run_benchmark(
             };
             last_hits = hits;
             last_misses = misses;
-
-            // Calculate connection health percentage
-            let conn_pct = if total_connections > 0 {
-                (active as f64 / total_connections as f64) * 100.0
-            } else {
-                100.0
-            };
 
             // Get percentiles from delta histogram (this interval only)
             let current_histogram = metrics::RESPONSE_LATENCY.load();
@@ -352,9 +344,8 @@ fn run_benchmark(
             let sample = Sample {
                 timestamp: Utc::now(),
                 req_per_sec: rate,
-                err_pct,
+                err_per_sec: err_rate,
                 hit_pct,
-                conn_pct,
                 p50_us: p50,
                 p90_us: p90,
                 p99_us: p99,

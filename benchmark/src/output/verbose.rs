@@ -62,11 +62,10 @@ impl OutputFormatter for VerboseFormatter {
 
     fn print_sample(&self, sample: &Sample) {
         tracing::info!(
-            "rate={:.0}/s err%={} hit%={} conn%={} p50={:.0}us p90={:.0}us p99={:.0}us p99.9={:.0}us p99.99={:.0}us max={:.0}us",
+            "rate={:.0}/s err={:.0}/s hit%={} p50={:.0}us p90={:.0}us p99={:.0}us p99.9={:.0}us p99.99={:.0}us max={:.0}us",
             sample.req_per_sec,
-            format_pct(sample.err_pct),
+            sample.err_per_sec,
             format_pct(sample.hit_pct),
-            format_pct(sample.conn_pct),
             sample.p50_us,
             sample.p90_us,
             sample.p99_us,

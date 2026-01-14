@@ -85,9 +85,8 @@ impl std::str::FromStr for ColorMode {
 pub struct Sample {
     pub timestamp: DateTime<Utc>,
     pub req_per_sec: f64,
-    pub err_pct: f64,
+    pub err_per_sec: f64,
     pub hit_pct: f64,
-    pub conn_pct: f64,
     pub p50_us: f64,
     pub p90_us: f64,
     pub p99_us: f64,

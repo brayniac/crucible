@@ -17,7 +17,7 @@ use crate::metrics::PROTOCOL_ERRORS;
 /// This struct holds the header, value reference, and trailer for a GET response.
 /// The value reference points directly into cache segment memory, avoiding copies.
 pub struct ZeroCopyResponse {
-    /// RESP header: "$<len>\r\n" (max ~25 bytes)
+    /// RESP header: `$<len>\r\n` (max ~25 bytes)
     header: [u8; 32],
     header_len: usize,
     /// Reference to value in cache segment memory

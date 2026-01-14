@@ -550,7 +550,7 @@ impl<'a> SliceSegment<'a> {
         // Check item-level TTL
         let now = clocksource::coarse::UnixInstant::now()
             .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs() as u32;
+            .as_secs();
         if header.is_expired(now) {
             self.ref_count.fetch_sub(1, Ordering::Release);
             return Err(CacheError::Expired);

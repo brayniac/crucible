@@ -1242,7 +1242,8 @@ fn test_uring_singleshot_basic() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", "native", Some("singleshot"), 1);
+    let _server_handle =
+        start_test_server_full(port, "uring", "native", Some("singleshot"), None, 1);
 
     assert!(
         wait_for_server(addr, Duration::from_secs(5)),
@@ -1359,7 +1360,8 @@ fn test_uring_singleshot_large_objects() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", "native", Some("singleshot"), 1);
+    let _server_handle =
+        start_test_server_full(port, "uring", "native", Some("singleshot"), None, 1);
     assert!(wait_for_server(addr, Duration::from_secs(5)));
 
     let mut stream = TcpStream::connect(addr).expect("Failed to connect");
@@ -1394,7 +1396,8 @@ fn test_uring_singleshot_deep_pipeline() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", "native", Some("singleshot"), 1);
+    let _server_handle =
+        start_test_server_full(port, "uring", "native", Some("singleshot"), None, 1);
     assert!(wait_for_server(addr, Duration::from_secs(5)));
 
     let mut stream = TcpStream::connect(addr).expect("Failed to connect");
@@ -1440,7 +1443,8 @@ fn test_uring_multishot_basic() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", "native", Some("multishot"), 1);
+    let _server_handle =
+        start_test_server_full(port, "uring", "native", Some("multishot"), None, 1);
 
     assert!(
         wait_for_server(addr, Duration::from_secs(5)),
