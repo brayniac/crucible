@@ -136,10 +136,10 @@ impl OutputFormatter for CleanFormatter {
 
     fn print_header(&self) {
         println!(
-            "time UTC │   req/s │ err% │ hit% │conn% │  p50 │  p90 │  p99 │p99.9 │p99.99│  max"
+            "time UTC │   req/s │ err% │ hit% │conn% │    p50 │    p90 │    p99 │  p99.9 │ p99.99 │    max"
         );
         println!(
-            "─────────┼─────────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┼─────"
+            "─────────┼─────────┼──────┼──────┼──────┼────────┼────────┼────────┼────────┼────────┼───────"
         );
         let _ = io::stdout().flush();
     }
@@ -157,15 +157,15 @@ impl OutputFormatter for CleanFormatter {
         // Color conn% red if < 100
         let conn_colored = self.maybe_red(&format!("{:>5}", conn), sample.conn_pct < 100.0);
 
-        let p50 = format_latency_padded(sample.p50_us, 5);
-        let p90 = format_latency_padded(sample.p90_us, 5);
-        let p99 = format_latency_padded(sample.p99_us, 5);
-        let p999 = format_latency_padded(sample.p999_us, 5);
-        let p9999 = format_latency_padded(sample.p9999_us, 5);
-        let max = format_latency_padded(sample.max_us, 5);
+        let p50 = format_latency_padded(sample.p50_us, 7);
+        let p90 = format_latency_padded(sample.p90_us, 7);
+        let p99 = format_latency_padded(sample.p99_us, 7);
+        let p999 = format_latency_padded(sample.p999_us, 7);
+        let p9999 = format_latency_padded(sample.p9999_us, 7);
+        let max = format_latency_padded(sample.max_us, 6);
 
         println!(
-            "{} │ {} │{} │{:>5} │{} │{} │{} │{} │{} │{} │{}",
+            "{} │ {} │{} │{:>5} │{} │ {} │ {} │ {} │ {} │ {} │ {}",
             time, rate, err_colored, hit, conn_colored, p50, p90, p99, p999, p9999, max
         );
         let _ = io::stdout().flush();
@@ -174,11 +174,11 @@ impl OutputFormatter for CleanFormatter {
     fn print_results(&self, results: &Results) {
         println!();
         println!(
-            "────────────────────────────────────────────────────────────────────────────────"
+            "──────────────────────────────────────────────────────────────────────────────────────────────"
         );
         println!("RESULTS ({:.0}s)", results.duration_secs);
         println!(
-            "────────────────────────────────────────────────────────────────────────────────"
+            "──────────────────────────────────────────────────────────────────────────────────────────────"
         );
 
         // Throughput line

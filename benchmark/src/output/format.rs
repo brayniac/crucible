@@ -1,16 +1,27 @@
 //! Number formatting utilities for benchmark output.
 
-/// Format a rate (requests/second) with SI suffixes.
-/// - < 1K: raw number (e.g., "999")
-/// - 1K - 999.9K: "XXX.XK" (e.g., "234.5K")
-/// - >= 1M: "X.XXXM" (e.g., "10.23M")
+/// Format a rate (requests/second) with SI suffixes and 3 significant figures.
+/// - < 1K: "X.XX", "XX.X", or "XXX"
+/// - 1K - 999K: "X.XXK", "XX.XK", or "XXXK"
+/// - >= 1M: "X.XXM", "XX.XM", or "XXXM"
 pub fn format_rate(value: f64) -> String {
     if value < 1_000.0 {
-        format!("{:.0}", value)
+        format_3sig(value, "")
     } else if value < 1_000_000.0 {
-        format!("{:.1}K", value / 1_000.0)
+        format_3sig(value / 1_000.0, "K")
     } else {
-        format!("{:.2}M", value / 1_000_000.0)
+        format_3sig(value / 1_000_000.0, "M")
+    }
+}
+
+/// Format a number with 3 significant figures and an optional suffix.
+fn format_3sig(value: f64, suffix: &str) -> String {
+    if value < 10.0 {
+        format!("{:.2}{}", value, suffix)
+    } else if value < 100.0 {
+        format!("{:.1}{}", value, suffix)
+    } else {
+        format!("{:.0}{}", value, suffix)
     }
 }
 
@@ -20,17 +31,40 @@ pub fn format_rate_padded(value: f64, width: usize) -> String {
     format!("{:>width$}", s, width = width)
 }
 
-/// Format a latency value in microseconds with autoscaling.
-/// - < 1000us: "XXXus" (e.g., "42us")
-/// - 1ms - 999ms: "X.Xms" (e.g., "1.2ms")
-/// - >= 1s: "X.Xs" (e.g., "1.5s")
+/// Format a latency value in microseconds with autoscaling and 3 significant figures.
+/// - < 1000us: "XXXus" or "X.Xus" or "XX.Xus"
+/// - 1ms - 999ms: "X.XXms" or "XX.Xms" or "XXXms"
+/// - >= 1s: "X.XXs" or "XX.Xs" or "XXXs"
 pub fn format_latency_us(us: f64) -> String {
     if us < 1_000.0 {
-        format!("{:.0}us", us)
+        // Microseconds
+        if us < 10.0 {
+            format!("{:.2}us", us)
+        } else if us < 100.0 {
+            format!("{:.1}us", us)
+        } else {
+            format!("{:.0}us", us)
+        }
     } else if us < 1_000_000.0 {
-        format!("{:.1}ms", us / 1_000.0)
+        // Milliseconds
+        let ms = us / 1_000.0;
+        if ms < 10.0 {
+            format!("{:.2}ms", ms)
+        } else if ms < 100.0 {
+            format!("{:.1}ms", ms)
+        } else {
+            format!("{:.0}ms", ms)
+        }
     } else {
-        format!("{:.1}s", us / 1_000_000.0)
+        // Seconds
+        let s = us / 1_000_000.0;
+        if s < 10.0 {
+            format!("{:.2}s", s)
+        } else if s < 100.0 {
+            format!("{:.1}s", s)
+        } else {
+            format!("{:.0}s", s)
+        }
     }
 }
 
@@ -40,11 +74,14 @@ pub fn format_latency_padded(us: f64, width: usize) -> String {
     format!("{:>width$}", s, width = width)
 }
 
-/// Format a percentage with adaptive precision.
+/// Format a percentage with 3 significant figures.
+/// - >= 100%: no decimals (e.g., "100")
 /// - >= 10%: 1 decimal (e.g., "95.2")
 /// - < 10%: 2 decimals (e.g., "9.99", "0.01")
 pub fn format_pct(value: f64) -> String {
-    if value >= 10.0 {
+    if value >= 100.0 {
+        format!("{:.0}", value)
+    } else if value >= 10.0 {
         format!("{:.1}", value)
     } else {
         format!("{:.2}", value)
@@ -111,26 +148,41 @@ mod tests {
 
     #[test]
     fn test_format_rate() {
+        // 3 significant figures without suffix
+        assert_eq!(format_rate(1.23), "1.23");
+        assert_eq!(format_rate(12.3), "12.3");
         assert_eq!(format_rate(500.0), "500");
-        assert_eq!(format_rate(1_500.0), "1.5K");
-        assert_eq!(format_rate(234_567.0), "234.6K");
-        assert_eq!(format_rate(1_234_567.0), "1.23M");
-        assert_eq!(format_rate(10_234_567.0), "10.23M");
+        // 3 significant figures with K suffix
+        assert_eq!(format_rate(1_230.0), "1.23K");
+        assert_eq!(format_rate(12_300.0), "12.3K");
+        assert_eq!(format_rate(234_000.0), "234K");
+        // 3 significant figures with M suffix
+        assert_eq!(format_rate(1_230_000.0), "1.23M");
+        assert_eq!(format_rate(12_300_000.0), "12.3M");
+        assert_eq!(format_rate(234_000_000.0), "234M");
     }
 
     #[test]
     fn test_format_latency() {
-        assert_eq!(format_latency_us(42.0), "42us");
+        // Microseconds - 3 significant figures
+        assert_eq!(format_latency_us(1.23), "1.23us");
+        assert_eq!(format_latency_us(42.5), "42.5us");
         assert_eq!(format_latency_us(999.0), "999us");
-        assert_eq!(format_latency_us(1_200.0), "1.2ms");
-        assert_eq!(format_latency_us(200_000.0), "200.0ms");
-        assert_eq!(format_latency_us(1_500_000.0), "1.5s");
+        // Milliseconds - 3 significant figures
+        assert_eq!(format_latency_us(1_230.0), "1.23ms");
+        assert_eq!(format_latency_us(42_500.0), "42.5ms");
+        assert_eq!(format_latency_us(200_000.0), "200ms");
+        // Seconds - 3 significant figures
+        assert_eq!(format_latency_us(1_230_000.0), "1.23s");
+        assert_eq!(format_latency_us(42_500_000.0), "42.5s");
+        assert_eq!(format_latency_us(200_000_000.0), "200s");
     }
 
     #[test]
     fn test_format_pct() {
+        // 3 significant figures
+        assert_eq!(format_pct(100.0), "100");
         assert_eq!(format_pct(95.23), "95.2");
-        assert_eq!(format_pct(100.0), "100.0");
         assert_eq!(format_pct(9.99), "9.99");
         assert_eq!(format_pct(0.01), "0.01");
         assert_eq!(format_pct(0.0), "0.00");
