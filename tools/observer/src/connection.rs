@@ -135,11 +135,11 @@ impl ConnectionTracker {
 
         let state = self.connections.get_mut(&segment.conn_id).unwrap();
 
-        // Check for retransmit
-        if state.check_retransmit(segment.direction, segment.seq, segment.payload.len()) {
-            metrics::TCP_RETRANSMITS.increment();
-            return; // Don't process retransmitted data
-        }
+        // Note: Retransmit detection is disabled because it incorrectly flags
+        // out-of-order packets as retransmits. Proper detection would require
+        // tracking seen sequence ranges, not just the next expected sequence.
+        // For now, we accept that some data may be processed twice.
+        // TODO: Implement proper out-of-order handling with sequence range tracking
 
         // Process based on direction
         match segment.direction {
