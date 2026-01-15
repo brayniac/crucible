@@ -32,6 +32,9 @@ members = [
 
 	# Metrics
 	"metrics",
+
+	# Tools
+	"tools/observer",
 ]
 
 [workspace.package]
