@@ -42,7 +42,6 @@ pub struct TcpSegment {
     pub direction: Direction,
     pub timestamp_ns: u64,
     pub payload: Vec<u8>,
-    pub seq: u32,
     pub syn: bool,
     pub fin: bool,
     pub rst: bool,
@@ -162,7 +161,6 @@ impl PacketCapture {
         let tcp_data = &data[tcp_offset..];
         let src_port = u16::from_be_bytes([tcp_data[0], tcp_data[1]]);
         let dst_port = u16::from_be_bytes([tcp_data[2], tcp_data[3]]);
-        let seq = u32::from_be_bytes([tcp_data[4], tcp_data[5], tcp_data[6], tcp_data[7]]);
         let tcp_header_len = (((tcp_data[12] >> 4) & 0x0F) as usize) * 4;
         let flags = tcp_data[13];
         let syn = (flags & 0x02) != 0;
@@ -209,7 +207,6 @@ impl PacketCapture {
             direction,
             timestamp_ns,
             payload,
-            seq,
             syn,
             fin,
             rst,

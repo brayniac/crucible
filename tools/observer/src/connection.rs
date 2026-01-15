@@ -31,10 +31,6 @@ struct ConnectionState {
     pending_fifo: VecDeque<PendingRequest>,
     /// Map of opaque -> pending request (for Memcache binary).
     pending_opaque: HashMap<u32, PendingRequest>,
-    /// Next expected sequence number for request direction.
-    request_next_seq: Option<u32>,
-    /// Next expected sequence number for response direction.
-    response_next_seq: Option<u32>,
 }
 
 impl ConnectionState {
@@ -45,41 +41,6 @@ impl ConnectionState {
             response_buffer: Vec::with_capacity(4096),
             pending_fifo: VecDeque::new(),
             pending_opaque: HashMap::new(),
-            request_next_seq: None,
-            response_next_seq: None,
-        }
-    }
-
-    /// Check if this segment is a retransmit and update sequence tracking.
-    /// Returns true if this appears to be a retransmit.
-    fn check_retransmit(&mut self, direction: Direction, seq: u32, payload_len: usize) -> bool {
-        let next_seq = match direction {
-            Direction::Request => &mut self.request_next_seq,
-            Direction::Response => &mut self.response_next_seq,
-        };
-
-        match *next_seq {
-            None => {
-                // First packet in this direction - initialize tracking
-                *next_seq = Some(seq.wrapping_add(payload_len as u32));
-                false
-            }
-            Some(expected) => {
-                // Check if seq is before expected (using signed comparison for wraparound)
-                let diff = seq.wrapping_sub(expected) as i32;
-                if diff < 0 && payload_len > 0 {
-                    // Sequence number is before expected - likely a retransmit
-                    true
-                } else {
-                    // Update next expected sequence
-                    let end_seq = seq.wrapping_add(payload_len as u32);
-                    // Only advance if this packet extends beyond current expectation
-                    if (end_seq.wrapping_sub(expected) as i32) > 0 {
-                        *next_seq = Some(end_seq);
-                    }
-                    false
-                }
-            }
         }
     }
 }
@@ -134,12 +95,6 @@ impl ConnectionTracker {
         }
 
         let state = self.connections.get_mut(&segment.conn_id).unwrap();
-
-        // Note: Retransmit detection is disabled because it incorrectly flags
-        // out-of-order packets as retransmits. Proper detection would require
-        // tracking seen sequence ranges, not just the next expected sequence.
-        // For now, we accept that some data may be processed twice.
-        // TODO: Implement proper out-of-order handling with sequence range tracking
 
         // Process based on direction
         match segment.direction {

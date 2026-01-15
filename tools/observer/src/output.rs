@@ -20,7 +20,6 @@ pub struct OutputState {
     last_responses: u64,
     last_bytes_request: u64,
     last_bytes_response: u64,
-    last_retransmits: u64,
     last_histogram: Option<Histogram>,
     sample_count: AtomicU64,
 }
@@ -35,7 +34,6 @@ impl OutputState {
             last_responses: 0,
             last_bytes_request: 0,
             last_bytes_response: 0,
-            last_retransmits: 0,
             last_histogram: None,
             sample_count: AtomicU64::new(0),
         }
@@ -57,10 +55,10 @@ impl OutputState {
             return;
         }
         println!(
-            "time UTC │ req/s │    RX │    TX │ rexmt │    p50 │    p90 │    p99 │  p99.9 │ p99.99 │    max"
+            "time UTC │ req/s │    RX │    TX │    p50 │    p90 │    p99 │  p99.9 │ p99.99 │    max"
         );
         println!(
-            "─────────┼───────┼───────┼───────┼───────┼────────┼────────┼────────┼────────┼────────┼───────"
+            "─────────┼───────┼───────┼───────┼────────┼────────┼────────┼────────┼────────┼───────"
         );
         let _ = io::stdout().flush();
     }
@@ -78,7 +76,6 @@ impl OutputState {
         let responses = metrics::RESPONSES_TOTAL.value();
         let bytes_request = metrics::BYTES_REQUEST.value();
         let bytes_response = metrics::BYTES_RESPONSE.value();
-        let retransmits = metrics::TCP_RETRANSMITS.value();
 
         // Calculate request rate
         let delta_requests = requests.saturating_sub(self.last_requests);
@@ -89,9 +86,6 @@ impl OutputState {
         let delta_bytes_tx = bytes_request.saturating_sub(self.last_bytes_request);
         let rx_bps = (delta_bytes_rx as f64 / elapsed) * 8.0;
         let tx_bps = (delta_bytes_tx as f64 / elapsed) * 8.0;
-
-        // Calculate retransmits this interval
-        let delta_retransmits = retransmits.saturating_sub(self.last_retransmits);
 
         // Get histogram snapshot and calculate percentiles
         let current_histogram = metrics::LATENCY.load();
@@ -107,11 +101,11 @@ impl OutputState {
         // Output based on format
         match format {
             OutputFormat::Table => {
-                // Reprint header periodically
+                // Reprint header periodically for readability
                 let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
-                if count > 0 && count.is_multiple_of(HEADER_REPEAT_INTERVAL) {
+                if count > 0 && count % HEADER_REPEAT_INTERVAL == 0 {
                     println!(
-                        "─────────┼───────┼───────┼───────┼───────┼────────┼────────┼────────┼────────┼────────┼───────"
+                        "─────────┼───────┼───────┼───────┼────────┼────────┼────────┼────────┼────────┼───────"
                     );
                     self.print_header(format);
                 }
@@ -120,12 +114,11 @@ impl OutputState {
                 let utc_now = chrono_lite_time();
 
                 println!(
-                    "{} │ {:>5} │ {:>5} │ {:>5} │ {:>5} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>6}",
+                    "{} │ {:>5} │ {:>5} │ {:>5} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>6}",
                     utc_now,
                     format_rate(req_rate),
                     format_bandwidth_compact(rx_bps),
                     format_bandwidth_compact(tx_bps),
-                    format_rate(delta_retransmits as f64),
                     format_latency_compact(p50),
                     format_latency_compact(p90),
                     format_latency_compact(p99),
@@ -137,12 +130,11 @@ impl OutputState {
             }
             OutputFormat::Json => {
                 println!(
-                    r#"{{"elapsed_s":{},"req_per_sec":{:.1},"rx_bps":{:.0},"tx_bps":{:.0},"retransmits":{},"p50_us":{:.1},"p90_us":{:.1},"p99_us":{:.1},"p999_us":{:.1},"p9999_us":{:.1},"max_us":{:.1},"requests":{},"responses":{}}}"#,
+                    r#"{{"elapsed_s":{},"req_per_sec":{:.1},"rx_bps":{:.0},"tx_bps":{:.0},"p50_us":{:.1},"p90_us":{:.1},"p99_us":{:.1},"p999_us":{:.1},"p9999_us":{:.1},"max_us":{:.1},"requests":{},"responses":{}}}"#,
                     now.duration_since(self.start_time).as_secs(),
                     req_rate,
                     rx_bps,
                     tx_bps,
-                    delta_retransmits,
                     p50,
                     p90,
                     p99,
@@ -162,7 +154,6 @@ impl OutputState {
         self.last_responses = responses;
         self.last_bytes_request = bytes_request;
         self.last_bytes_response = bytes_response;
-        self.last_retransmits = retransmits;
         self.last_histogram = current_histogram;
     }
 
