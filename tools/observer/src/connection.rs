@@ -75,19 +75,35 @@ impl ConnectionState {
                 SequenceCheck::InOrder
             }
             Some(expected) => {
-                if seq == expected {
-                    // In order - update expected
+                let forward_diff = seq.wrapping_sub(expected);
+
+                if forward_diff == 0 {
+                    // Exactly in order
                     *next_seq = Some(expected.wrapping_add(payload_len));
                     SequenceCheck::InOrder
-                } else if seq.wrapping_sub(expected) < 0x80000000 {
-                    // seq > expected (accounting for wraparound) - we have a gap
-                    // Update expected to account for the gap
+                } else if forward_diff < MAX_REORDER_WINDOW {
+                    // Small gap - likely reordering, process anyway
+                    // Update expected past this packet
                     *next_seq = Some(seq.wrapping_add(payload_len));
-                    SequenceCheck::Gap
+                    SequenceCheck::InOrder
+                } else if forward_diff < 0x80000000 {
+                    // Large gap - definite packet loss
+                    *next_seq = Some(seq.wrapping_add(payload_len));
+                    SequenceCheck::LargeGap
                 } else {
-                    // seq < expected - this is a retransmit or out-of-order, skip it
-                    // Don't update expected, don't process this segment
-                    SequenceCheck::Retransmit
+                    // forward_diff >= 0x80000000 means seq < expected (wrapped around)
+                    let behind = expected.wrapping_sub(seq);
+
+                    if behind < MAX_REORDER_WINDOW {
+                        // Within reorder window - this packet arrived late
+                        // Process it anyway (buffer might be slightly out of order
+                        // but parser can often handle it)
+                        // Don't update expected since we've already moved past this
+                        SequenceCheck::InOrder
+                    } else {
+                        // Way behind - this is a retransmit, skip it
+                        SequenceCheck::Retransmit
+                    }
                 }
             }
         }
@@ -97,13 +113,17 @@ impl ConnectionState {
 /// Result of sequence number check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SequenceCheck {
-    /// Packet is in order - process normally.
+    /// Packet is in order (or close enough) - process normally.
     InOrder,
-    /// Gap detected - clear state then process.
-    Gap,
-    /// Retransmit detected - skip processing entirely.
+    /// Large gap detected - clear state then process.
+    LargeGap,
+    /// Definite retransmit - skip processing entirely.
     Retransmit,
 }
+
+/// Maximum gap size (in bytes) before we consider it packet loss vs reordering.
+/// Roughly 4 full-size packets.
+const MAX_REORDER_WINDOW: u32 = 6000;
 
 /// Tracks all observed connections and their state.
 pub struct ConnectionTracker {
@@ -169,10 +189,10 @@ impl ConnectionTracker {
         // Check sequence numbers for gaps/retransmits
         match state.check_sequence(segment.direction, segment.seq, segment.payload_len) {
             SequenceCheck::InOrder => {
-                // Process normally
+                // Process normally (includes small gaps and mild reordering)
             }
-            SequenceCheck::Gap => {
-                // Gap detected - clear pending queue and buffers to resync
+            SequenceCheck::LargeGap => {
+                // Large gap detected - clear pending queue and buffers to resync
                 state.pending_fifo.clear();
                 state.request_buffer.clear();
                 state.response_buffer.clear();
@@ -181,7 +201,7 @@ impl ConnectionTracker {
                 // Continue processing this segment as it starts a new "epoch"
             }
             SequenceCheck::Retransmit => {
-                // Retransmit or out-of-order - skip processing entirely
+                // Definite retransmit - skip processing entirely
                 return;
             }
         }

@@ -112,8 +112,9 @@ fn main() {
         if stats.dropped > 0 || stats.if_dropped > 0 {
             eprintln!();
             eprintln!(
-                "Warning: pcap dropped {} packets (kernel: {}, interface: {})",
+                "Warning: pcap dropped {} of {} packets (kernel: {}, interface: {})",
                 stats.dropped + stats.if_dropped,
+                stats.received,
                 stats.dropped,
                 stats.if_dropped
             );
