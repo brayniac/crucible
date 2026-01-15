@@ -173,7 +173,8 @@ impl OutputState {
         let bytes_response = metrics::BYTES_RESPONSE.value();
         let gets = metrics::REQUESTS_GET.value();
         let sets = metrics::REQUESTS_SET.value();
-        let retransmits = metrics::TCP_RETRANSMITS.value();
+        let tcp_gaps = metrics::TCP_GAPS.value();
+        let tcp_ooo = metrics::TCP_OUT_OF_ORDER.value();
 
         // Calculate rates
         let avg_resp_rate = responses as f64 / elapsed_secs;
@@ -314,8 +315,8 @@ impl OutputState {
         println!("connections  {} observed", connections);
 
         // TCP stats
-        if retransmits > 0 {
-            println!("tcp          {} retransmits", retransmits);
+        if tcp_gaps > 0 || tcp_ooo > 0 {
+            println!("tcp          {} gaps, {} out-of-order", tcp_gaps, tcp_ooo);
         }
 
         // Totals

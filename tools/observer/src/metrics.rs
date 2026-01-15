@@ -42,7 +42,8 @@ pub mod connection {
 
 /// Counter slot indices for TCP metrics.
 pub mod tcp {
-    pub const RETRANSMITS: usize = 0;
+    pub const GAPS: usize = 0;
+    pub const OUT_OF_ORDER: usize = 1;
 }
 
 // Request counters
@@ -123,10 +124,16 @@ pub static CONNECTIONS_OBSERVED: Counter = Counter::new(&CONNECTION, connection:
 
 // TCP counters
 #[metric(
-    name = "observer_tcp_retransmits",
-    description = "TCP retransmits observed"
+    name = "observer_tcp_gaps",
+    description = "TCP sequence gaps detected (missing data)"
 )]
-pub static TCP_RETRANSMITS: Counter = Counter::new(&TCP, tcp::RETRANSMITS);
+pub static TCP_GAPS: Counter = Counter::new(&TCP, tcp::GAPS);
+
+#[metric(
+    name = "observer_tcp_ooo",
+    description = "TCP out-of-order packets detected"
+)]
+pub static TCP_OUT_OF_ORDER: Counter = Counter::new(&TCP, tcp::OUT_OF_ORDER);
 
 // Latency histograms (nanoseconds)
 #[metric(
