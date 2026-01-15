@@ -14,7 +14,7 @@ use std::io;
 /// let driver = Driver::builder()
 ///     .engine(IoEngine::Auto)
 ///     .buffer_size(16 * 1024)
-///     .buffer_count(2048)
+///     .buffer_count(8192)
 ///     .build()?;
 /// ```
 #[derive(Debug, Clone)]
@@ -40,7 +40,7 @@ impl DriverBuilder {
         Self {
             engine: IoEngine::Auto,
             buffer_size: 16 * 1024, // 16KB (TLS max record size)
-            buffer_count: 2048,     // Enough for 1024 connections (2 buffers each)
+            buffer_count: 8192,     // Large pool to avoid exhaustion under load
             sq_depth: 1024,         // io_uring submission queue depth
             max_connections: 8192,  // Maximum registered connections
             sqpoll: false,          // SQPOLL disabled by default
@@ -70,7 +70,7 @@ impl DriverBuilder {
     /// Set the number of buffers in the pool.
     ///
     /// For io_uring, this must be a power of 2.
-    /// Default: 2048 (enough for 1024 connections with 2 buffers each)
+    /// Default: 8192 (large pool to avoid exhaustion under load)
     pub fn buffer_count(mut self, count: u16) -> Self {
         self.buffer_count = count;
         self
@@ -186,7 +186,7 @@ mod tests {
         // Check defaults
         assert_eq!(builder.engine, IoEngine::Auto);
         assert_eq!(builder.buffer_size, 16 * 1024);
-        assert_eq!(builder.buffer_count, 2048);
+        assert_eq!(builder.buffer_count, 8192);
         assert_eq!(builder.sq_depth, 1024);
         assert_eq!(builder.max_connections, 8192);
         assert!(!builder.sqpoll);

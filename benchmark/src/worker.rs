@@ -329,7 +329,7 @@ impl IoWorker {
         self.flush_sends()?;
 
         // Poll for I/O completions
-        let count = self.driver.poll(Some(Duration::from_millis(1)))?;
+        let count = self.driver.poll(Some(Duration::from_micros(100)))?;
 
         if count > 0 {
             // Process completions

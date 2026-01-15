@@ -397,7 +397,8 @@ fn format_latency_padded(us: f64, width: usize) -> String {
 
 /// Format percentage with 3 significant figures.
 fn format_pct(value: f64) -> String {
-    if value >= 100.0 {
+    if value >= 99.95 {
+        // Would round to 100.0 with 1 decimal, so show as integer
         "100".to_string()
     } else if value >= 10.0 {
         format!("{:.1}", value)

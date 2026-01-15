@@ -161,6 +161,10 @@ pub struct UringDriver {
     /// use-after-free when a connection closes with a pending recv.
     recv_pool: RecvBufferPool,
     pending_completions: Vec<Completion>,
+    /// Scratch buffer for collecting CQEs during poll (reused to avoid allocation).
+    cqe_scratch: Vec<io_uring::cqueue::Entry>,
+    /// Scratch buffer for collecting connections needing recv re-arm (reused to avoid allocation).
+    rearm_scratch: Vec<(usize, u32, u32, u8)>,
     recv_mode: crate::types::RecvMode,
     /// Generation counter for new connections.
     ///
@@ -246,7 +250,9 @@ impl UringDriver {
             registered_files,
             buf_ring,
             recv_pool,
-            pending_completions: Vec::with_capacity(256),
+            pending_completions: Vec::with_capacity(8192),
+            cqe_scratch: Vec::with_capacity(8192),
+            rearm_scratch: Vec::with_capacity(8192),
             recv_mode,
             next_generation: 0,
         })
@@ -1489,17 +1495,20 @@ impl IoDriver for UringDriver {
         // Re-arm recv for connections that need it
         // This handles both single-shot mode (no pending recv) and multishot mode
         // (multishot deactivated due to re-arm failure)
-        let to_rearm: Vec<_> = self
-            .connections
-            .iter()
-            .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
-            .map(|(id, c)| (id, c.generation, c.fixed_slot, c.rearm_failures))
-            .collect();
+        // Reuse scratch buffer to avoid allocation
+        self.rearm_scratch.clear();
+        self.rearm_scratch.extend(
+            self.connections
+                .iter()
+                .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
+                .map(|(id, c)| (id, c.generation, c.fixed_slot, c.rearm_failures)),
+        );
 
         // Maximum consecutive re-arm failures before emitting an error
         const MAX_REARM_FAILURES: u8 = 10;
 
-        for (conn_id, generation, fixed_slot, failures) in to_rearm {
+        for i in 0..self.rearm_scratch.len() {
+            let (conn_id, generation, fixed_slot, failures) = self.rearm_scratch[i];
             let success = if self.recv_mode == crate::types::RecvMode::SingleShot {
                 self.submit_single_recv_internal(conn_id, generation, fixed_slot)
                     .is_ok()
@@ -1549,11 +1558,13 @@ impl IoDriver for UringDriver {
             self.ring.submit_and_wait(1)?;
         }
 
-        // Collect completions
-        let cqes: Vec<_> = self.ring.completion().collect();
-        let count = cqes.len();
+        // Collect completions - reuse scratch buffer to avoid allocation
+        self.cqe_scratch.clear();
+        self.cqe_scratch.extend(self.ring.completion());
+        let count = self.cqe_scratch.len();
 
-        for cqe in cqes {
+        for i in 0..count {
+            let cqe = self.cqe_scratch[i];
             self.process_cqe(cqe);
         }
 
