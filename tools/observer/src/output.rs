@@ -52,16 +52,15 @@ impl OutputState {
     }
 
     /// Print the header for table output.
-    /// Widths: time=8, all others=5, except p99.99=6
     pub fn print_header(&self, format: OutputFormat) {
         if format != OutputFormat::Table {
             return;
         }
         println!(
-            "time UTC │ req/s │   RX │   TX │ rexmt │  p50 │  p90 │  p99 │p99.9 │p99.99 │  max"
+            "time UTC │ req/s │    RX │    TX │ rexmt │    p50 │    p90 │    p99 │  p99.9 │ p99.99 │    max"
         );
         println!(
-            "─────────┼───────┼──────┼──────┼───────┼──────┼──────┼──────┼──────┼───────┼─────"
+            "─────────┼───────┼───────┼───────┼───────┼────────┼────────┼────────┼────────┼────────┼───────"
         );
         let _ = io::stdout().flush();
     }
@@ -112,7 +111,7 @@ impl OutputState {
                 let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
                 if count > 0 && count.is_multiple_of(HEADER_REPEAT_INTERVAL) {
                     println!(
-                        "─────────┼───────┼──────┼──────┼───────┼──────┼──────┼──────┼──────┼───────┼─────"
+                        "─────────┼───────┼───────┼───────┼───────┼────────┼────────┼────────┼────────┼────────┼───────"
                     );
                     self.print_header(format);
                 }
@@ -120,14 +119,13 @@ impl OutputState {
                 // Get current UTC time
                 let utc_now = chrono_lite_time();
 
-                // Widths: time=8, all others=5, except p99.99=6
                 println!(
-                    "{} │ {:>5} │ {:>4} │ {:>4} │ {:>5} │ {:>4} │ {:>4} │ {:>4} │{:>5} │{:>6} │ {:>4}",
+                    "{} │ {:>5} │ {:>5} │ {:>5} │ {:>5} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>6}",
                     utc_now,
                     format_rate(req_rate),
                     format_bandwidth_compact(rx_bps),
                     format_bandwidth_compact(tx_bps),
-                    delta_retransmits,
+                    format_rate(delta_retransmits as f64),
                     format_latency_compact(p50),
                     format_latency_compact(p90),
                     format_latency_compact(p99),
@@ -456,24 +454,38 @@ fn format_bandwidth_compact(bps: f64) -> String {
     }
 }
 
-/// Format latency in compact form (no padding).
+/// Format latency in microseconds with 3 significant figures.
+/// Matches the benchmark's format_latency_us exactly.
 fn format_latency_compact(us: f64) -> String {
     if us < 1_000.0 {
+        // Microseconds - 3 significant figures
         if us < 10.0 {
-            format!("{:.1}u", us)
+            format!("{:.2}us", us)
+        } else if us < 100.0 {
+            format!("{:.1}us", us)
         } else {
             format!("{:.0}us", us)
         }
     } else if us < 1_000_000.0 {
+        // Milliseconds - 3 significant figures
         let ms = us / 1_000.0;
         if ms < 10.0 {
-            format!("{:.1}m", ms)
+            format!("{:.2}ms", ms)
+        } else if ms < 100.0 {
+            format!("{:.1}ms", ms)
         } else {
             format!("{:.0}ms", ms)
         }
     } else {
+        // Seconds - 3 significant figures
         let s = us / 1_000_000.0;
-        format!("{:.1}s", s)
+        if s < 10.0 {
+            format!("{:.2}s", s)
+        } else if s < 100.0 {
+            format!("{:.1}s", s)
+        } else {
+            format!("{:.0}s", s)
+        }
     }
 }
 
