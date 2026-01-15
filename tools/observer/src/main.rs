@@ -106,5 +106,17 @@ fn main() {
     // Print final summary
     if cli.format != OutputFormat::Json {
         output.print_summary(tracker.connection_count());
+
+        // Print capture statistics
+        let stats = capture.stats();
+        if stats.dropped > 0 || stats.if_dropped > 0 {
+            eprintln!();
+            eprintln!(
+                "Warning: pcap dropped {} packets (kernel: {}, interface: {})",
+                stats.dropped + stats.if_dropped,
+                stats.dropped,
+                stats.if_dropped
+            );
+        }
     }
 }

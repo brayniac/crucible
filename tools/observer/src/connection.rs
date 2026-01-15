@@ -27,10 +27,18 @@ struct ConnectionState {
     request_buffer: Vec<u8>,
     /// Buffer for incomplete response data.
     response_buffer: Vec<u8>,
+    /// Timestamp when first byte was added to request buffer (for accurate latency).
+    request_buffer_timestamp: Option<u64>,
+    /// Timestamp when first byte was added to response buffer (for accurate latency).
+    response_buffer_timestamp: Option<u64>,
     /// FIFO queue of pending requests (for RESP and Memcache ASCII).
     pending_fifo: VecDeque<PendingRequest>,
     /// Map of opaque -> pending request (for Memcache binary).
     pending_opaque: HashMap<u32, PendingRequest>,
+    /// Expected next sequence number for request direction.
+    request_next_seq: Option<u32>,
+    /// Expected next sequence number for response direction.
+    response_next_seq: Option<u32>,
 }
 
 impl ConnectionState {
@@ -39,10 +47,62 @@ impl ConnectionState {
             protocol,
             request_buffer: Vec::with_capacity(4096),
             response_buffer: Vec::with_capacity(4096),
+            request_buffer_timestamp: None,
+            response_buffer_timestamp: None,
             pending_fifo: VecDeque::new(),
             pending_opaque: HashMap::new(),
+            request_next_seq: None,
+            response_next_seq: None,
         }
     }
+
+    /// Check sequence number and determine how to handle this segment.
+    fn check_sequence(
+        &mut self,
+        direction: Direction,
+        seq: u32,
+        payload_len: u32,
+    ) -> SequenceCheck {
+        let next_seq = match direction {
+            Direction::Request => &mut self.request_next_seq,
+            Direction::Response => &mut self.response_next_seq,
+        };
+
+        match *next_seq {
+            None => {
+                // First packet in this direction - initialize sequence tracking
+                *next_seq = Some(seq.wrapping_add(payload_len));
+                SequenceCheck::InOrder
+            }
+            Some(expected) => {
+                if seq == expected {
+                    // In order - update expected
+                    *next_seq = Some(expected.wrapping_add(payload_len));
+                    SequenceCheck::InOrder
+                } else if seq.wrapping_sub(expected) < 0x80000000 {
+                    // seq > expected (accounting for wraparound) - we have a gap
+                    // Update expected to account for the gap
+                    *next_seq = Some(seq.wrapping_add(payload_len));
+                    SequenceCheck::Gap
+                } else {
+                    // seq < expected - this is a retransmit or out-of-order, skip it
+                    // Don't update expected, don't process this segment
+                    SequenceCheck::Retransmit
+                }
+            }
+        }
+    }
+}
+
+/// Result of sequence number check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceCheck {
+    /// Packet is in order - process normally.
+    InOrder,
+    /// Gap detected - clear state then process.
+    Gap,
+    /// Retransmit detected - skip processing entirely.
+    Retransmit,
 }
 
 /// Tracks all observed connections and their state.
@@ -64,15 +124,25 @@ impl ConnectionTracker {
     pub fn process_segment(&mut self, segment: TcpSegment) {
         // Handle connection lifecycle
         if segment.syn {
-            // New connection
-            let protocol = if self.protocol_hint != Protocol::Unknown {
-                self.protocol_hint
-            } else {
-                Protocol::Unknown
-            };
-            self.connections
-                .insert(segment.conn_id, ConnectionState::new(protocol));
-            metrics::CONNECTIONS_OBSERVED.increment();
+            // SYN consumes 1 sequence number, so next expected seq is ISN+1
+            // We may see client SYN first, then server SYN-ACK - handle both
+            let state = self.connections.entry(segment.conn_id).or_insert_with(|| {
+                metrics::CONNECTIONS_OBSERVED.increment();
+                let protocol = if self.protocol_hint != Protocol::Unknown {
+                    self.protocol_hint
+                } else {
+                    Protocol::Unknown
+                };
+                ConnectionState::new(protocol)
+            });
+            match segment.direction {
+                Direction::Request => {
+                    state.request_next_seq = Some(segment.seq.wrapping_add(1));
+                }
+                Direction::Response => {
+                    state.response_next_seq = Some(segment.seq.wrapping_add(1));
+                }
+            }
             return;
         }
 
@@ -96,6 +166,26 @@ impl ConnectionTracker {
 
         let state = self.connections.get_mut(&segment.conn_id).unwrap();
 
+        // Check sequence numbers for gaps/retransmits
+        match state.check_sequence(segment.direction, segment.seq, segment.payload_len) {
+            SequenceCheck::InOrder => {
+                // Process normally
+            }
+            SequenceCheck::Gap => {
+                // Gap detected - clear pending queue and buffers to resync
+                state.pending_fifo.clear();
+                state.request_buffer.clear();
+                state.response_buffer.clear();
+                state.request_buffer_timestamp = None;
+                state.response_buffer_timestamp = None;
+                // Continue processing this segment as it starts a new "epoch"
+            }
+            SequenceCheck::Retransmit => {
+                // Retransmit or out-of-order - skip processing entirely
+                return;
+            }
+        }
+
         // Process based on direction
         match segment.direction {
             Direction::Request => {
@@ -109,6 +199,11 @@ impl ConnectionTracker {
 
     /// Process request data (client to server).
     fn process_request(state: &mut ConnectionState, segment: &TcpSegment) {
+        // Track timestamp of first byte in buffer for accurate latency measurement
+        if state.request_buffer.is_empty() {
+            state.request_buffer_timestamp = Some(segment.timestamp_ns);
+        }
+
         // Append to request buffer
         state.request_buffer.extend_from_slice(&segment.payload);
         metrics::BYTES_REQUEST.add(segment.payload.len() as u64);
@@ -133,9 +228,19 @@ impl ConnectionTracker {
 
             match parsed {
                 Some(req) => {
-                    Self::record_request(state, &req, segment.timestamp_ns);
+                    // Use the timestamp from when we started receiving this request
+                    let timestamp = state
+                        .request_buffer_timestamp
+                        .unwrap_or(segment.timestamp_ns);
+                    Self::record_request(state, &req, timestamp);
+
                     // Remove consumed bytes
                     state.request_buffer.drain(..req.bytes_consumed);
+
+                    // Reset timestamp if buffer is now empty (next request starts fresh)
+                    if state.request_buffer.is_empty() {
+                        state.request_buffer_timestamp = None;
+                    }
                 }
                 None => break, // Need more data
             }
@@ -144,6 +249,11 @@ impl ConnectionTracker {
 
     /// Process response data (server to client).
     fn process_response(state: &mut ConnectionState, segment: &TcpSegment) {
+        // Track timestamp of first byte in buffer for accurate latency measurement
+        if state.response_buffer.is_empty() {
+            state.response_buffer_timestamp = Some(segment.timestamp_ns);
+        }
+
         // Append to response buffer
         state.response_buffer.extend_from_slice(&segment.payload);
         metrics::BYTES_RESPONSE.add(segment.payload.len() as u64);
@@ -163,9 +273,19 @@ impl ConnectionTracker {
 
             match parsed {
                 Some(resp) => {
-                    Self::record_response(state, &resp, segment.timestamp_ns);
+                    // Use the timestamp from when we started receiving this response
+                    let timestamp = state
+                        .response_buffer_timestamp
+                        .unwrap_or(segment.timestamp_ns);
+                    Self::record_response(state, &resp, timestamp);
+
                     // Remove consumed bytes
                     state.response_buffer.drain(..resp.bytes_consumed);
+
+                    // Reset timestamp if buffer is now empty (next response starts fresh)
+                    if state.response_buffer.is_empty() {
+                        state.response_buffer_timestamp = None;
+                    }
                 }
                 None => break, // Need more data
             }

@@ -45,12 +45,27 @@ pub struct TcpSegment {
     pub syn: bool,
     pub fin: bool,
     pub rst: bool,
+    /// TCP sequence number (start of payload).
+    pub seq: u32,
+    /// Payload length (used for sequence tracking).
+    pub payload_len: u32,
 }
 
 /// Packet capture engine using libpcap.
 pub struct PacketCapture {
     cap: Capture<pcap::Active>,
     server_port: u16,
+}
+
+/// Statistics from the packet capture.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureStats {
+    /// Packets received by the filter.
+    pub received: u32,
+    /// Packets dropped by the kernel.
+    pub dropped: u32,
+    /// Packets dropped by the interface (if supported).
+    pub if_dropped: u32,
 }
 
 impl PacketCapture {
@@ -96,6 +111,18 @@ impl PacketCapture {
             }
             Err(pcap::Error::TimeoutExpired) => Ok(None),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get capture statistics (packets received, dropped, etc).
+    pub fn stats(&mut self) -> CaptureStats {
+        match self.cap.stats() {
+            Ok(stats) => CaptureStats {
+                received: stats.received,
+                dropped: stats.dropped,
+                if_dropped: stats.if_dropped,
+            },
+            Err(_) => CaptureStats::default(),
         }
     }
 
@@ -161,6 +188,7 @@ impl PacketCapture {
         let tcp_data = &data[tcp_offset..];
         let src_port = u16::from_be_bytes([tcp_data[0], tcp_data[1]]);
         let dst_port = u16::from_be_bytes([tcp_data[2], tcp_data[3]]);
+        let seq = u32::from_be_bytes([tcp_data[4], tcp_data[5], tcp_data[6], tcp_data[7]]);
         let tcp_header_len = (((tcp_data[12] >> 4) & 0x0F) as usize) * 4;
         let flags = tcp_data[13];
         let syn = (flags & 0x02) != 0;
@@ -202,6 +230,7 @@ impl PacketCapture {
         // Calculate timestamp in nanoseconds
         let timestamp_ns = (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_usec as u64) * 1_000;
 
+        let payload_len = payload.len() as u32;
         Ok(Some(TcpSegment {
             conn_id: ConnectionId { client, server },
             direction,
@@ -210,6 +239,8 @@ impl PacketCapture {
             syn,
             fin,
             rst,
+            seq,
+            payload_len,
         }))
     }
 }
