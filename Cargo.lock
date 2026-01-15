@@ -360,6 +360,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "ctrlc",
  "io-driver",
  "itoa",
  "libc",

@@ -15,6 +15,7 @@ use ratelimit::Ratelimiter;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -158,7 +159,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Print config using the formatter
     formatter.print_config(&config);
 
-    run_benchmark(config, cpu_ids, formatter)?;
+    // Set up signal handler for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting signal handler");
+
+    run_benchmark(config, cpu_ids, formatter, running)?;
 
     Ok(())
 }
@@ -167,6 +176,7 @@ fn run_benchmark(
     config: Config,
     cpu_ids: Option<Vec<usize>>,
     formatter: Box<dyn OutputFormatter>,
+    running: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let num_threads = config.general.threads;
     let warmup = config.general.warmup;
@@ -246,10 +256,24 @@ fn run_benchmark(
     let mut last_histogram: Option<Histogram> = None;
     let mut current_phase = Phase::Warmup;
 
+    let mut actual_duration = duration;
+
     loop {
         thread::sleep(Duration::from_millis(100));
 
         let elapsed = start.elapsed();
+
+        // Check for signal or duration limit
+        if !running.load(Ordering::SeqCst) {
+            shared.set_phase(Phase::Stop);
+            // Calculate actual running duration (exclude warmup)
+            if elapsed > warmup {
+                actual_duration = elapsed - warmup;
+            } else {
+                actual_duration = Duration::ZERO;
+            }
+            break;
+        }
 
         // Check if we're done
         if elapsed >= warmup + duration {
@@ -377,7 +401,7 @@ fn run_benchmark(
     let set_count = metrics::SET_COUNT.value();
     let active = metrics::CONNECTIONS_ACTIVE.value();
     let failed = metrics::CONNECTIONS_FAILED.value();
-    let elapsed_secs = duration.as_secs_f64();
+    let elapsed_secs = actual_duration.as_secs_f64();
 
     // Get latencies for GET operations
     let get_latencies = LatencyStats {

@@ -51,6 +51,9 @@ rand_xoshiro = "0.7"
 # Rate limiting
 ratelimit = "0.10"
 
+# Signal handling
+ctrlc = { version = "3", features = ["termination"] }
+
 # Async runtime for admin server
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 
