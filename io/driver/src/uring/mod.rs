@@ -1563,8 +1563,7 @@ impl IoDriver for UringDriver {
         self.cqe_scratch.extend(self.ring.completion());
         let count = self.cqe_scratch.len();
 
-        for i in 0..count {
-            let cqe = self.cqe_scratch[i];
+        while let Some(cqe) = self.cqe_scratch.pop() {
             self.process_cqe(cqe);
         }
 
