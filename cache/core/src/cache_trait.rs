@@ -6,6 +6,7 @@
 
 use crate::error::CacheError;
 use crate::sync::{AtomicU32, Ordering};
+use bytes::Bytes;
 use std::time::Duration;
 
 /// A simple guard that owns the cached value.
@@ -85,6 +86,16 @@ impl ValueRef {
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.value_ptr
+    }
+
+    /// Convert the ValueRef into an owned `Bytes` that keeps the segment ref alive.
+    ///
+    /// This is useful for zero-copy I/O where the buffer needs to outlive the
+    /// current scope (e.g., for io_uring operations that complete asynchronously).
+    /// The segment ref count is held until the returned `Bytes` is dropped.
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
     }
 }
 

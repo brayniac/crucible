@@ -46,6 +46,7 @@ const OP_ACCEPT: u64 = 3;
 const OP_SINGLE_RECV: u64 = 4;
 const OP_UDP_RECVMSG: u64 = 5;
 const OP_UDP_SENDMSG: u64 = 6;
+const OP_SENDMSG: u64 = 7; // TCP scatter-gather send
 
 /// Buffer group ID for recv operations.
 const RECV_BGID: u16 = 0;
@@ -360,6 +361,31 @@ impl UringDriver {
         Ok(())
     }
 
+    /// Submit a SendMsgZc operation for TCP scatter-gather with zero-copy.
+    ///
+    /// Uses IORING_OP_SENDMSG_ZC which sends data directly from user buffers
+    /// without copying to kernel socket buffers. A NOTIF completion is sent
+    /// when the kernel is done with the buffers.
+    fn submit_tcp_sendmsg_zc(
+        &mut self,
+        conn_id: usize,
+        fixed_slot: u32,
+        slot: u8,
+        msghdr: *const libc::msghdr,
+    ) -> io::Result<()> {
+        let sendmsg_op = opcode::SendMsgZc::new(Fixed(fixed_slot), msghdr as *const _)
+            .build()
+            .user_data(encode_user_data(conn_id, 0, slot, OP_SENDMSG));
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&sendmsg_op)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+        Ok(())
+    }
+
     /// Process a completion queue entry.
     fn process_cqe(&mut self, cqe: io_uring::cqueue::Entry) {
         let user_data = cqe.user_data();
@@ -394,6 +420,11 @@ impl UringDriver {
             OP_UDP_SENDMSG => {
                 let (id, _, _, _) = decode_user_data(user_data);
                 self.handle_udp_sendmsg(id, result);
+            }
+            OP_SENDMSG => {
+                // TCP scatter-gather send - same handling as OP_SEND
+                let (id, _, buf_idx, _) = decode_user_data(user_data);
+                self.handle_send(id, buf_idx as usize, result, flags);
             }
             _ => {}
         }
@@ -590,28 +621,27 @@ impl UringDriver {
         // Note: next recv is submitted in poll() to handle SQ full cases
     }
 
-    fn handle_send(&mut self, conn_id: usize, _buf_idx: usize, result: i32, flags: u32) {
+    fn handle_send(&mut self, conn_id: usize, slot: usize, result: i32, flags: u32) {
+        let slot = slot as u8;
+
         // Check if this is a SendZc notification
         if cqueue::notif(flags) {
-            // Decrement in-flight count and check if all sends are done
-            let (_all_done, should_continue, should_finish_close) =
+            // Handle notification for this slot
+            let (should_continue, should_finish_close) =
                 if let Some(conn) = self.connections.get_mut(conn_id) {
-                    let all_done = conn.on_send_notif();
-                    let should_close = conn.closing && conn.all_sends_complete();
-                    // Only continue when ALL notifs received (all_done) to avoid corrupting send_buf
-                    let should_continue = all_done && !conn.closing && conn.has_pending_data();
-                    (all_done, should_continue, should_close)
+                    let (slot_freed, should_continue) = conn.on_send_notif(slot);
+                    let should_close = slot_freed && conn.closing && conn.all_sends_complete();
+                    (should_continue, should_close)
                 } else {
-                    (false, false, false)
+                    (false, false)
                 };
 
             if should_finish_close {
                 self.finish_deferred_close(conn_id);
             } else if should_continue {
-                // All sends complete, more data to send - prepare next chunk
+                // Slot freed, more data to send - prepare next chunk
                 self.continue_send(conn_id);
             }
-            // If !all_done, we're still waiting for more notifs before we can reuse send_buf
             return;
         }
 
@@ -649,7 +679,7 @@ impl UringDriver {
 
         // Handle partial send - continue sending remaining data in current chunk
         let has_remaining = if let Some(conn) = self.connections.get_mut(conn_id) {
-            conn.on_send_complete(n)
+            conn.on_send_complete(slot, n)
         } else {
             false
         };
@@ -657,12 +687,14 @@ impl UringDriver {
         if has_remaining {
             // Partial send - continue with remaining data in send buffer
             if let Some(conn) = self.connections.get_mut(conn_id) {
-                let (ptr, len) = conn.remaining_send();
-                let fixed_slot = conn.fixed_slot;
-                // Mark this continuation as in-flight (will get its own notif)
-                conn.mark_send_in_flight();
-                let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                let _ = self.submit_send_zc(conn_id, fixed_slot, 0, send_data);
+                let (ptr, len) = conn.remaining_send(slot);
+                if !ptr.is_null() && len > 0 {
+                    let fixed_slot = conn.fixed_slot;
+                    // Increment notifs for this continuation (same slot)
+                    conn.increment_notifs(slot);
+                    let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    let _ = self.submit_send_zc(conn_id, fixed_slot, slot, send_data);
+                }
             }
         }
 
@@ -672,16 +704,14 @@ impl UringDriver {
             }));
     }
 
-    /// Continue sending from fragmentation buffer after notif.
+    /// Continue sending from fragmentation buffer after a slot is freed.
     fn continue_send(&mut self, conn_id: usize) {
         if let Some(conn) = self.connections.get_mut(conn_id)
-            && let Some((ptr, len)) = conn.prepare_send()
+            && let Some((slot, ptr, len)) = conn.prepare_send()
         {
             let fixed_slot = conn.fixed_slot;
-            conn.mark_send_in_flight();
-
             let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let _ = self.submit_send_zc(conn_id, fixed_slot, 0, send_data);
+            let _ = self.submit_send_zc(conn_id, fixed_slot, slot, send_data);
         }
     }
 
@@ -1323,16 +1353,43 @@ impl IoDriver for UringDriver {
         // Queue data in fragmentation buffer
         conn.queue_send(data);
 
-        // Try to start sending if not already in flight
-        if let Some((ptr, len)) = conn.prepare_send() {
+        // Try to start sending if slots available
+        // prepare_send allocates a slot and sets up the send
+        if let Some((slot, ptr, len)) = conn.prepare_send() {
             let fixed_slot = conn.fixed_slot;
-            conn.mark_send_in_flight();
-
             let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-            self.submit_send_zc(conn_id, fixed_slot, 0, send_data)?;
+            self.submit_send_zc(conn_id, fixed_slot, slot, send_data)?;
         }
 
         Ok(data.len())
+    }
+
+    fn send_vectored_owned(&mut self, id: ConnId, buffers: Vec<bytes::Bytes>) -> io::Result<usize> {
+        let conn_id = id.slot();
+        let conn = self
+            .connections
+            .get_mut(conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Don't allow sending to closing connections
+        if conn.closing {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection is closing",
+            ));
+        }
+
+        // Prepare vectored send - allocates slot and stores buffers
+        let (slot, msghdr_ptr, total_len) = conn
+            .prepare_vectored_send(buffers)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+
+        let fixed_slot = conn.fixed_slot;
+
+        // Submit SendMsgZc operation for true zero-copy scatter-gather
+        self.submit_tcp_sendmsg_zc(conn_id, fixed_slot, slot, msghdr_ptr)?;
+
+        Ok(total_len)
     }
 
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize> {

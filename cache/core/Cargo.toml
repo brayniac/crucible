@@ -16,6 +16,7 @@ validation = []
 
 [dependencies]
 ahash = { workspace = true }
+bytes = { workspace = true }
 clocksource = { workspace = true }
 crossbeam-deque = { workspace = true }
 libc = { workspace = true }

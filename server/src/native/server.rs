@@ -480,13 +480,15 @@ fn run_worker<C: Cache>(
 
                             // Send zero-copy response if present
                             if let Some(resp) = zero_copy_response {
-                                let slices = resp.as_io_slices();
-                                match driver.send_vectored(conn_id, &slices) {
+                                // Use owned bytes API for true zero-copy scatter-gather
+                                // The segment ref is held in the Bytes until the send completes
+                                let owned_bytes = resp.into_owned_bytes();
+                                match driver.send_vectored_owned(conn_id, owned_bytes) {
                                     Ok(n) => {
                                         stats.add_bytes_sent(n as u64);
                                     }
                                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                        // Can't send now - the response is dropped here,
+                                        // No free send slots - the owned bytes are dropped here,
                                         // releasing the segment ref. The data is lost but
                                         // this is rare and the client will retry.
                                         break;

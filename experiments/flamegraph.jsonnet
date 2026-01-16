@@ -83,7 +83,7 @@ function(
     git_ref='main',
 
     // Server parameters
-    cache_backend='segcache',
+    cache_backend='s3fifo',
     heap_size='8GB',
     segment_size='8MB',
     hashtable_power='20',
@@ -95,7 +95,7 @@ function(
     benchmark_threads='24',
     benchmark_cpu_affinity='8-31',
     connections='256',
-    pipeline_depth='16',
+    pipeline_depth='1',
     key_length='16',
     key_count='1000000',
     value_length='64',
@@ -108,7 +108,8 @@ function(
 
     // IO parameters
     io_engine='auto',
-    recv_mode='multishot'
+    recv_mode='singleshot',
+    zero_copy='disabled'
 )
     local args = {
         server_threads: server_threads,
@@ -139,10 +140,12 @@ function(
     assert get_percent_int >= 0 && get_percent_int <= 100 : 'get_percent must be between 0 and 100';
     assert cache_backend == 'segcache' || cache_backend == 's3fifo' : 'cache_backend must be segcache or s3fifo';
     assert runtime == 'native' || runtime == 'tokio' : 'runtime must be native or tokio';
+    assert zero_copy == 'disabled' || zero_copy == 'threshold' || zero_copy == 'enabled' : 'zero_copy must be disabled, thresholed, or enabled';
 
     local
         cache_config = server_config {
             runtime: runtime,
+            zero_copy: zero_copy,
             workers+: {
                 threads: server_threads_int,
                 [if server_cpu_affinity != '' then 'cpu_affinity']: server_cpu_affinity,

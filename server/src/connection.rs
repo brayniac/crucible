@@ -1,6 +1,6 @@
 //! Per-connection state for the cache server.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use cache_core::{Cache, ValueRef};
 use io_driver::RecvBuf;
 use protocol_memcache::binary::{BinaryCommand, REQUEST_MAGIC};
@@ -87,6 +87,23 @@ impl ZeroCopyResponse {
             IoSlice::new(self.header()),
             IoSlice::new(self.value()),
             IoSlice::new(self.trailer()),
+        ]
+    }
+
+    /// Convert to owned Bytes for true zero-copy scatter-gather I/O.
+    ///
+    /// This method takes ownership of the response and returns a Vec of owned Bytes:
+    /// - Header: small copy (~25 bytes)
+    /// - Value: zero-copy from segment memory (ValueRef wrapped in Bytes)
+    /// - Trailer: static reference
+    ///
+    /// The segment ref count is held in the value Bytes until it's dropped.
+    #[inline]
+    pub fn into_owned_bytes(self) -> Vec<Bytes> {
+        vec![
+            Bytes::copy_from_slice(&self.header[..self.header_len]),
+            self.value_ref.into_bytes(),
+            Bytes::from_static(self.trailer),
         ]
     }
 }

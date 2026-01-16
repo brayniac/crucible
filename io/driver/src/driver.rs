@@ -1,6 +1,7 @@
 //! I/O driver trait definition.
 
 use crate::types::{Completion, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId};
+use bytes::Bytes;
 use std::io::{self, IoSlice};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -175,6 +176,36 @@ pub trait IoDriver: Send {
         let total_len: usize = bufs.iter().map(|b| b.len()).sum();
         let mut combined = Vec::with_capacity(total_len);
         for buf in bufs {
+            combined.extend_from_slice(buf);
+        }
+        self.send(id, &combined)
+    }
+
+    /// Send multiple owned buffers as a single scatter-gather operation.
+    ///
+    /// This method takes ownership of the buffers, allowing true zero-copy
+    /// operation where the buffers are kept alive until the kernel signals
+    /// completion. This is essential for sending data directly from cache
+    /// segments without intermediate copies.
+    ///
+    /// The default implementation copies all buffers and calls `send()`.
+    /// The io_uring backend uses SendMsg for true scatter-gather.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Connection identifier
+    /// * `buffers` - Owned buffers to send (up to 4 supported by io_uring)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(n)` - Total of `n` bytes were queued for sending
+    /// - `Err(WouldBlock)` - Cannot send right now, no free send slots
+    /// - `Err(other)` - An error occurred
+    fn send_vectored_owned(&mut self, id: ConnId, buffers: Vec<Bytes>) -> io::Result<usize> {
+        // Default implementation: concatenate and send
+        let total_len: usize = buffers.iter().map(|b| b.len()).sum();
+        let mut combined = Vec::with_capacity(total_len);
+        for buf in &buffers {
             combined.extend_from_slice(buf);
         }
         self.send(id, &combined)
