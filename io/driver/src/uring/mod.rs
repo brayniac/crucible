@@ -1563,9 +1563,12 @@ impl IoDriver for UringDriver {
         let count = self.cqe_scratch.len();
 
         // Process in order (FIFO) - critical for correct data sequencing with multishot recv
-        for cqe in self.cqe_scratch.drain(..) {
+        // Take ownership temporarily to avoid borrow conflict with process_cqe
+        let mut cqes = std::mem::take(&mut self.cqe_scratch);
+        for cqe in cqes.drain(..) {
             self.process_cqe(cqe);
         }
+        self.cqe_scratch = cqes; // restore empty vec with capacity preserved
 
         Ok(count)
     }
