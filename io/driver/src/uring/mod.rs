@@ -1563,8 +1563,9 @@ impl IoDriver for UringDriver {
         self.cqe_scratch.extend(self.ring.completion());
         let count = self.cqe_scratch.len();
 
-        while let Some(cqe) = self.cqe_scratch.pop() {
-            self.process_cqe(cqe);
+        // Process in order (FIFO) - critical for correct data sequencing with multishot recv
+        for i in 0..count {
+            self.process_cqe(self.cqe_scratch[i]);
         }
 
         Ok(count)
