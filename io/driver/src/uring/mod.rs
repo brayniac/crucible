@@ -1559,13 +1559,12 @@ impl IoDriver for UringDriver {
         }
 
         // Collect completions - reuse scratch buffer to avoid allocation
-        self.cqe_scratch.clear();
         self.cqe_scratch.extend(self.ring.completion());
         let count = self.cqe_scratch.len();
 
         // Process in order (FIFO) - critical for correct data sequencing with multishot recv
-        for i in 0..count {
-            self.process_cqe(self.cqe_scratch[i]);
+        for cqe in self.cqe_scratch.drain(..) {
+            self.process_cqe(cqe);
         }
 
         Ok(count)
