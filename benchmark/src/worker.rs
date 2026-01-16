@@ -623,7 +623,7 @@ impl IoWorker {
                 }
                 CompletionKind::Error { conn_id, error } => {
                     let id = conn_id.as_usize();
-                    tracing::debug!("connection {} error: {}", id, error);
+                    tracing::trace!("connection {} error: {}", id, error);
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
                         to_close.push((idx, DisconnectReason::ErrorEvent));
                     }

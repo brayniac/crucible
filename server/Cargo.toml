@@ -63,3 +63,13 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "ping-server"
 path = "src/bin/ping.rs"
+
+[package.metadata.deb]
+name = "crucible-server"
+maintainer = "Brian Martin <brayniac@gmail.com>"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/crucible-server", "usr/bin/", "755"],
+    ["config/example.toml", "etc/crucible/server.toml.example", "644"],
+]

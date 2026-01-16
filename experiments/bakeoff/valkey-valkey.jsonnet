@@ -54,7 +54,7 @@ function(
         jobs: {
             server: {
                 host: {
-                    tags: ['c8g-2xlarge'],
+                    tags: ['c8gn-2xlarge'],
                 },
 
                 steps: [
@@ -162,7 +162,7 @@ function(
 
             client: {
                 host: {
-                    tags: ['c8g-8xlarge'],
+                    tags: ['c8gn-8xlarge'],
                 },
 
                 steps: [

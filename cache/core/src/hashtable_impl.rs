@@ -12,7 +12,6 @@ use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::location::Location;
 use crate::sync::{AtomicU64, Ordering};
 use ahash::RandomState;
-use wide::u64x4;
 
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
@@ -147,7 +146,55 @@ impl CuckooHashtable {
         ((hash >> 32) & 0xFFF) as u16
     }
 
+    /// Set occupancy bit for a slot after successful insert.
+    #[inline]
+    fn set_occupancy_bit(&self, bucket_index: usize, slot_index: usize) {
+        let bucket = self.bucket(bucket_index);
+
+        loop {
+            let metadata = bucket.metadata.load(Ordering::Relaxed);
+            let new_metadata = Hashbucket::set_occupied(metadata, slot_index);
+
+            if metadata == new_metadata {
+                break; // Already set
+            }
+
+            if bucket
+                .metadata
+                .compare_exchange_weak(metadata, new_metadata, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Clear occupancy bit for a slot after successful delete.
+    #[inline]
+    fn clear_occupancy_bit(&self, bucket_index: usize, slot_index: usize) {
+        let bucket = self.bucket(bucket_index);
+
+        loop {
+            let metadata = bucket.metadata.load(Ordering::Relaxed);
+            let new_metadata = Hashbucket::clear_occupied(metadata, slot_index);
+
+            if metadata == new_metadata {
+                break; // Already clear
+            }
+
+            if bucket
+                .metadata
+                .compare_exchange_weak(metadata, new_metadata, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
     /// Count occupied (non-empty, non-ghost) slots in a bucket.
+    /// Note: This counts actual non-ghost items, not just occupancy bits
+    /// (since ghosts also have occupancy bits set).
     #[inline]
     fn count_occupied(&self, bucket_index: usize) -> usize {
         let bucket = self.bucket(bucket_index);
@@ -171,86 +218,49 @@ impl CuckooHashtable {
     ) -> Option<(Location, u8)> {
         let bucket = self.bucket(bucket_index);
 
-        // Pre-compute constants for faster comparisons
-        // Tag is in bits 52-63, ghost has all 44 location bits set
+        // Load metadata first to get occupancy mask
+        let metadata = bucket.metadata.load(Ordering::Relaxed);
+        let occupancy = Hashbucket::occupancy(metadata);
+
+        // Fast path: no occupied slots
+        if occupancy == 0 {
+            return None;
+        }
+
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         let tag_shifted = (tag as u64) << 52;
 
-        // Batch load all 8 slots with Relaxed ordering.
-        let e0 = bucket.items[0].load(Ordering::Relaxed);
-        let e1 = bucket.items[1].load(Ordering::Relaxed);
-        let e2 = bucket.items[2].load(Ordering::Relaxed);
-        let e3 = bucket.items[3].load(Ordering::Relaxed);
-        let e4 = bucket.items[4].load(Ordering::Relaxed);
-        let e5 = bucket.items[5].load(Ordering::Relaxed);
-        let e6 = bucket.items[6].load(Ordering::Relaxed);
-        let e7 = bucket.items[7].load(Ordering::Relaxed);
-
-        // Use SIMD to compare all 8 tags in parallel.
-        // Pack into two u64x4 vectors and compare against tag mask.
-        let vec0 = u64x4::new([e0, e1, e2, e3]);
-        let vec1 = u64x4::new([e4, e5, e6, e7]);
-
-        let tag_vec = u64x4::splat(tag_shifted);
-        let mask_vec = u64x4::splat(TAG_MASK);
-        let ghost_vec = u64x4::splat(GHOST_LOCATION);
-
-        // Compare tags: (entry & TAG_MASK) == tag_shifted
-        // simd_eq returns u64x4 with all 1s for true, all 0s for false
-        let tag_match0 = (vec0 & mask_vec).simd_eq(tag_vec);
-        let tag_match1 = (vec1 & mask_vec).simd_eq(tag_vec);
-
-        // Check not empty: entry != 0 (use simd_eq and invert)
-        let empty0 = vec0.simd_eq(u64x4::ZERO);
-        let empty1 = vec1.simd_eq(u64x4::ZERO);
-        let not_empty0 = !empty0;
-        let not_empty1 = !empty1;
-
-        // Check not ghost: (entry & GHOST_LOCATION) != GHOST_LOCATION
-        let is_ghost0 = (vec0 & ghost_vec).simd_eq(ghost_vec);
-        let is_ghost1 = (vec1 & ghost_vec).simd_eq(ghost_vec);
-        let not_ghost0 = !is_ghost0;
-        let not_ghost1 = !is_ghost1;
-
-        // Combine conditions: tag matches AND not empty AND not ghost
-        let valid0 = tag_match0 & not_empty0 & not_ghost0;
-        let valid1 = tag_match1 & not_empty1 & not_ghost1;
-
-        // Extract to array and build bitmask
-        let arr0 = valid0.to_array();
-        let arr1 = valid1.to_array();
-
-        let candidates: u8 = ((arr0[0] != 0) as u8)
-            | (((arr0[1] != 0) as u8) << 1)
-            | (((arr0[2] != 0) as u8) << 2)
-            | (((arr0[3] != 0) as u8) << 3)
-            | (((arr1[0] != 0) as u8) << 4)
-            | (((arr1[1] != 0) as u8) << 5)
-            | (((arr1[2] != 0) as u8) << 6)
-            | (((arr1[3] != 0) as u8) << 7);
-
-        // Fast path: no candidates
-        if candidates == 0 {
-            return None;
-        }
-
-        // Process each candidate slot
-        let mut mask = candidates;
+        // Iterate only over occupied slots
+        let mut mask = occupancy;
         while mask != 0 {
-            let idx = mask.trailing_zeros() as usize;
+            let slot_index = mask.trailing_zeros() as usize;
             mask &= mask - 1; // Clear lowest set bit
 
-            let slot = &bucket.items[idx];
+            let slot = &bucket.items[slot_index];
 
-            // Do Acquire load to synchronize
-            let packed = slot.load(Ordering::Acquire);
+            // Relaxed load to check tag
+            let packed = slot.load(Ordering::Relaxed);
 
-            // Re-verify after Acquire (state may have changed)
+            // Check: not empty, not ghost, tag matches
+            if packed == 0 {
+                continue;
+            }
+            if (packed & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
             if (packed & TAG_MASK) != tag_shifted {
                 continue;
             }
+
+            // Tag matches non-ghost - do Acquire load to synchronize
+            let packed = slot.load(Ordering::Acquire);
+
+            // Re-verify after Acquire (state may have changed)
             if packed == 0 || (packed & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
+            if (packed & TAG_MASK) != tag_shifted {
                 continue;
             }
 
@@ -288,73 +298,42 @@ impl CuckooHashtable {
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
-        // Pre-compute constants for faster comparisons
+        // Load metadata first to get occupancy mask
+        let metadata = bucket.metadata.load(Ordering::Relaxed);
+        let occupancy = Hashbucket::occupancy(metadata);
+
+        // Fast path: no occupied slots
+        if occupancy == 0 {
+            return false;
+        }
+
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         let tag_shifted = (tag as u64) << 52;
 
-        // Batch load all 8 slots with Relaxed ordering
-        let e0 = bucket.items[0].load(Ordering::Relaxed);
-        let e1 = bucket.items[1].load(Ordering::Relaxed);
-        let e2 = bucket.items[2].load(Ordering::Relaxed);
-        let e3 = bucket.items[3].load(Ordering::Relaxed);
-        let e4 = bucket.items[4].load(Ordering::Relaxed);
-        let e5 = bucket.items[5].load(Ordering::Relaxed);
-        let e6 = bucket.items[6].load(Ordering::Relaxed);
-        let e7 = bucket.items[7].load(Ordering::Relaxed);
-
-        // Use SIMD to compare all 8 tags in parallel
-        let vec0 = u64x4::new([e0, e1, e2, e3]);
-        let vec1 = u64x4::new([e4, e5, e6, e7]);
-
-        let tag_vec = u64x4::splat(tag_shifted);
-        let mask_vec = u64x4::splat(TAG_MASK);
-        let ghost_vec = u64x4::splat(GHOST_LOCATION);
-
-        // Compare tags: (entry & TAG_MASK) == tag_shifted
-        let tag_match0 = (vec0 & mask_vec).simd_eq(tag_vec);
-        let tag_match1 = (vec1 & mask_vec).simd_eq(tag_vec);
-
-        // Check not empty: entry != 0 (use simd_eq and invert)
-        let empty0 = vec0.simd_eq(u64x4::ZERO);
-        let empty1 = vec1.simd_eq(u64x4::ZERO);
-        let not_empty0 = !empty0;
-        let not_empty1 = !empty1;
-
-        // Check not ghost: (entry & GHOST_LOCATION) != GHOST_LOCATION
-        let is_ghost0 = (vec0 & ghost_vec).simd_eq(ghost_vec);
-        let is_ghost1 = (vec1 & ghost_vec).simd_eq(ghost_vec);
-        let not_ghost0 = !is_ghost0;
-        let not_ghost1 = !is_ghost1;
-
-        // Combine conditions
-        let valid0 = tag_match0 & not_empty0 & not_ghost0;
-        let valid1 = tag_match1 & not_empty1 & not_ghost1;
-
-        // Extract to array and build bitmask
-        let arr0 = valid0.to_array();
-        let arr1 = valid1.to_array();
-
-        let candidates: u8 = ((arr0[0] != 0) as u8)
-            | (((arr0[1] != 0) as u8) << 1)
-            | (((arr0[2] != 0) as u8) << 2)
-            | (((arr0[3] != 0) as u8) << 3)
-            | (((arr1[0] != 0) as u8) << 4)
-            | (((arr1[1] != 0) as u8) << 5)
-            | (((arr1[2] != 0) as u8) << 6)
-            | (((arr1[3] != 0) as u8) << 7);
-
-        if candidates == 0 {
-            return false;
-        }
-
-        // Process each candidate slot
-        let mut mask = candidates;
+        // Iterate only over occupied slots
+        let mut mask = occupancy;
         while mask != 0 {
-            let idx = mask.trailing_zeros() as usize;
+            let slot_index = mask.trailing_zeros() as usize;
             mask &= mask - 1;
 
-            let slot = &bucket.items[idx];
+            let slot = &bucket.items[slot_index];
+
+            // Relaxed load to check tag
+            let packed = slot.load(Ordering::Relaxed);
+
+            // Check: not empty, not ghost, tag matches
+            if packed == 0 {
+                continue;
+            }
+            if (packed & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
+            if (packed & TAG_MASK) != tag_shifted {
+                continue;
+            }
+
+            // Tag matches non-ghost - do Acquire load to synchronize
             let packed = slot.load(Ordering::Acquire);
 
             if (packed & TAG_MASK) != tag_shifted {
@@ -378,7 +357,9 @@ impl CuckooHashtable {
     fn search_bucket_for_ghost(&self, bucket_index: usize, tag: u16) -> Option<u8> {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -406,7 +387,9 @@ impl CuckooHashtable {
     ) -> Option<u8> {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -447,7 +430,9 @@ impl CuckooHashtable {
     ) -> Option<u8> {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -485,7 +470,9 @@ impl CuckooHashtable {
         let bucket = self.bucket(bucket_index);
 
         // First pass: look for existing entry or matching ghost
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -500,6 +487,7 @@ impl CuckooHashtable {
 
                 if Hashbucket::is_ghost(packed) {
                     // Replace ghost, preserving frequency
+                    // Occupancy bit already set (ghost was occupying)
                     let freq = Hashbucket::freq(packed);
                     let new_with_freq = Hashbucket::with_freq(new_packed, freq);
 
@@ -518,6 +506,7 @@ impl CuckooHashtable {
 
                 if verifier.verify(key, location, true) {
                     // Replace existing entry, preserving frequency
+                    // Occupancy bit already set
                     let freq = Hashbucket::freq(packed);
                     let new_with_freq = Hashbucket::with_freq(new_packed, freq);
 
@@ -537,20 +526,28 @@ impl CuckooHashtable {
         }
 
         // Second pass: look for empty slot
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Relaxed is sufficient here - CAS will verify the expected value
             let packed = slot.load(Ordering::Relaxed);
 
             if packed == 0 {
                 match slot.compare_exchange(0, new_packed, Ordering::Release, Ordering::Relaxed) {
-                    Ok(_) => return Some(Ok(None)),
+                    Ok(_) => {
+                        // Set occupancy bit after successful insert into empty slot
+                        self.set_occupancy_bit(bucket_index, slot_index);
+                        return Some(Ok(None));
+                    }
                     Err(_) => continue,
                 }
             }
         }
 
         // Third pass: look for any ghost to evict
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check ghost status
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -565,6 +562,7 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
+                        // Occupancy bit already set (ghost was occupying)
                         Ok(_) => return Some(Ok(None)),
                         Err(_) => continue,
                     }
@@ -579,7 +577,9 @@ impl CuckooHashtable {
     fn try_unlink_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -598,7 +598,11 @@ impl CuckooHashtable {
 
                 if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
                     match slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Relaxed) {
-                        Ok(_) => return true,
+                        Ok(_) => {
+                            // Clear occupancy bit after successful delete
+                            self.clear_occupancy_bit(bucket_index, slot_index);
+                            return true;
+                        }
                         Err(_) => continue,
                     }
                 }
@@ -612,7 +616,9 @@ impl CuckooHashtable {
     fn try_to_ghost_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -633,6 +639,7 @@ impl CuckooHashtable {
                     let ghost = Hashbucket::to_ghost(packed);
                     match slot.compare_exchange(packed, ghost, Ordering::Release, Ordering::Relaxed)
                     {
+                        // Ghost still occupies slot, no occupancy change needed
                         Ok(_) => return true,
                         Err(_) => continue,
                     }
@@ -654,7 +661,9 @@ impl CuckooHashtable {
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -683,6 +692,7 @@ impl CuckooHashtable {
                         .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
                         .is_ok()
                     {
+                        // Updating location, occupancy unchanged
                         return true;
                     }
                 }
@@ -702,7 +712,9 @@ impl CuckooHashtable {
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -743,7 +755,9 @@ impl CuckooHashtable {
     ) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -762,6 +776,7 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
+                        // Ghost was occupying, occupancy unchanged
                         Ok(_) => return Some(Ok(())),
                         Err(_) => continue,
                     }
@@ -783,7 +798,9 @@ impl CuckooHashtable {
     ) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Relaxed is sufficient here - CAS will verify the expected value
             let packed = slot.load(Ordering::Relaxed);
 
@@ -804,8 +821,11 @@ impl CuckooHashtable {
                                 Ordering::Release,
                                 Ordering::Relaxed,
                             );
+                            // Don't set occupancy bit since we rolled back
                             return Some(Err(CacheError::KeyExists));
                         }
+                        // Set occupancy bit after successful insert
+                        self.set_occupancy_bit(bucket_index, slot_index);
                         return Some(Ok(()));
                     }
                     Err(new_current) => {
@@ -843,7 +863,9 @@ impl CuckooHashtable {
         for &bucket_index in &buckets[..self.num_choices as usize] {
             let bucket = self.bucket(bucket_index);
 
-            for slot in &bucket.items {
+            for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+                let slot = &bucket.items[slot_index];
+
                 if bucket_index == inserted_bucket && std::ptr::eq(slot, inserted_slot) {
                     continue;
                 }
@@ -884,7 +906,9 @@ impl CuckooHashtable {
     fn try_evict_any_ghost(&self, bucket_index: usize, new_packed: u64) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check ghost status
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -899,6 +923,7 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
+                        // Ghost was occupying, occupancy unchanged
                         Ok(_) => return Some(Ok(())),
                         Err(_) => continue,
                     }
@@ -920,7 +945,9 @@ impl CuckooHashtable {
     ) -> Option<CacheResult<Location>> {
         let bucket = self.bucket(bucket_index);
 
-        for slot in &bucket.items {
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+
             // Speculative Relaxed load to check tag
             let speculative = slot.load(Ordering::Relaxed);
 
@@ -953,6 +980,7 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
+                        // Replacing existing, occupancy unchanged
                         Ok(_) => {
                             return Some(Ok(old_location));
                         }
@@ -1214,11 +1242,14 @@ impl Hashtable for CuckooHashtable {
 
 /// A single hashtable bucket (64 bytes, cache-line aligned).
 ///
-/// Contains 8 item slots, each packed as:
+/// Contains bucket metadata and 7 item slots, each packed as:
 /// `[12 bits tag][8 bits freq][44 bits location]`
 #[repr(C, align(64))]
 pub struct Hashbucket {
-    pub(crate) items: [AtomicU64; 8],
+    /// Bucket metadata (occupancy mask in low 8 bits).
+    pub(crate) metadata: AtomicU64,
+    /// Item slots (7 items per bucket).
+    pub(crate) items: [AtomicU64; 7],
 }
 
 const _: () = assert!(std::mem::size_of::<Hashbucket>() == 64);
@@ -1228,6 +1259,7 @@ impl Hashbucket {
     /// Create a new empty bucket.
     pub fn new() -> Self {
         Self {
+            metadata: AtomicU64::new(0),
             items: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -1315,6 +1347,53 @@ impl Hashbucket {
         } else {
             None
         }
+    }
+
+    // ========================================================================
+    // Bucket metadata
+    // ========================================================================
+
+    /// Number of item slots per bucket.
+    pub const NUM_ITEM_SLOTS: usize = 7;
+
+    /// Extract occupancy mask from metadata (low 7 bits).
+    /// Bit N (0-6) indicates items[N] is occupied.
+    #[inline]
+    pub fn occupancy(metadata: u64) -> u8 {
+        (metadata & 0x7F) as u8
+    }
+
+    /// Set a slot's occupancy bit.
+    #[inline]
+    pub fn set_occupied(metadata: u64, slot_index: usize) -> u64 {
+        debug_assert!(
+            slot_index < Self::NUM_ITEM_SLOTS,
+            "slot_index {} out of range",
+            slot_index
+        );
+        metadata | (1u64 << slot_index)
+    }
+
+    /// Clear a slot's occupancy bit.
+    #[inline]
+    pub fn clear_occupied(metadata: u64, slot_index: usize) -> u64 {
+        debug_assert!(
+            slot_index < Self::NUM_ITEM_SLOTS,
+            "slot_index {} out of range",
+            slot_index
+        );
+        metadata & !(1u64 << slot_index)
+    }
+
+    /// Check if a slot is marked occupied.
+    #[inline]
+    pub fn is_slot_occupied(metadata: u64, slot_index: usize) -> bool {
+        debug_assert!(
+            slot_index < Self::NUM_ITEM_SLOTS,
+            "slot_index {} out of range",
+            slot_index
+        );
+        (metadata & (1u64 << slot_index)) != 0
     }
 }
 

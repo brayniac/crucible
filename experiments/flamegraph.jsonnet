@@ -221,7 +221,7 @@ function(
                 local config = std.manifestTomlEx(cache_config, ''),
 
                 host: {
-                    tags: ['c8g-2xlarge'],
+                    tags: ['c8gn-2xlarge'],
                 },
 
                 steps: [
@@ -399,7 +399,7 @@ function(
                 local loadgen = std.manifestTomlEx(load_benchmark_config, ''),
 
                 host: {
-                    tags: ['c8g-8xlarge'],
+                    tags: ['c8gn-8xlarge'],
                 },
 
                 steps: [
