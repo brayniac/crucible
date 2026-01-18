@@ -211,13 +211,27 @@ impl SendMeta {
 pub struct Completion {
     /// The type of completion.
     pub kind: CompletionKind,
+    /// Whether more completions are expected from this operation.
+    ///
+    /// For multishot operations (recv, accept), this indicates whether the
+    /// operation is still active and will produce more completions. When
+    /// `more` is false, the operation has terminated and must be re-armed.
+    ///
+    /// For single-shot operations, this is always false.
+    pub more: bool,
 }
 
 impl Completion {
-    /// Create a new completion.
+    /// Create a new completion (more = false).
     #[inline]
     pub fn new(kind: CompletionKind) -> Self {
-        Self { kind }
+        Self { kind, more: false }
+    }
+
+    /// Create a new completion with explicit more flag.
+    #[inline]
+    pub fn with_more(kind: CompletionKind, more: bool) -> Self {
+        Self { kind, more }
     }
 }
 
@@ -441,6 +455,140 @@ impl std::fmt::Display for RecvMode {
         match self {
             RecvMode::Multishot => write!(f, "multishot"),
             RecvMode::SingleShot => write!(f, "single-shot"),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Capabilities supported by the driver backend.
+    ///
+    /// Use this to query which features are available at runtime.
+    /// This enables writing code that can take advantage of advanced features
+    /// when available while gracefully falling back on other platforms.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct DriverCapabilities: u32 {
+        /// Zero-copy send (io_uring SEND_ZC).
+        /// When available, send operations can avoid kernel copy.
+        const ZEROCOPY_SEND = 1 << 0;
+        /// Multishot receive - one submission, multiple completions.
+        /// Kernel continues delivering data without re-submission.
+        const MULTISHOT_RECV = 1 << 1;
+        /// Multishot accept - one submission accepts multiple connections.
+        /// Kernel continues accepting without re-submission.
+        const MULTISHOT_ACCEPT = 1 << 2;
+        /// Kernel-side buffer selection from provided rings.
+        /// The kernel picks buffers without user-space involvement.
+        const PROVIDED_BUFFERS = 1 << 3;
+        /// Pre-registered fixed buffers for reduced syscall overhead.
+        const FIXED_BUFFERS = 1 << 4;
+        /// Async cancel support for in-flight operations.
+        const ASYNC_CANCEL = 1 << 5;
+        /// Vectored IO via sendmsg/recvmsg.
+        const VECTORED_IO = 1 << 6;
+        /// Direct descriptor support (io_uring registered fds).
+        const DIRECT_DESCRIPTORS = 1 << 7;
+    }
+}
+
+impl DriverCapabilities {
+    /// Get all capabilities available on io_uring (Linux 6.0+).
+    pub fn all_io_uring() -> Self {
+        Self::ZEROCOPY_SEND
+            | Self::MULTISHOT_RECV
+            | Self::MULTISHOT_ACCEPT
+            | Self::PROVIDED_BUFFERS
+            | Self::FIXED_BUFFERS
+            | Self::ASYNC_CANCEL
+            | Self::VECTORED_IO
+            | Self::DIRECT_DESCRIPTORS
+    }
+
+    /// Get baseline capabilities available on mio (all platforms).
+    pub fn mio_baseline() -> Self {
+        Self::VECTORED_IO
+    }
+}
+
+/// Configuration for send behavior.
+///
+/// Controls when to use zero-copy sends vs buffered sends:
+/// - Zero-copy: Driver holds the buffer until send completes (no copy)
+/// - Buffered: Data copied to internal pool, original buffer released immediately
+///
+/// Zero-copy is optimal for large payloads but requires the driver to hold
+/// ownership of the buffer. Buffered mode allows immediate buffer reuse
+/// with predictable memory usage (no per-send allocation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum SendMode {
+    /// Always use zero-copy sends.
+    ///
+    /// The driver takes ownership of the buffer (via `ZeroCopySend` trait)
+    /// and holds it until the send completes. Best throughput for large
+    /// payloads, but the buffer cannot be reused until completion.
+    ZeroCopy,
+
+    /// Always copy to internal buffer pool before sending.
+    ///
+    /// Data is copied to a pre-allocated pooled buffer, then sent from there.
+    /// The original buffer can be reused immediately after send() returns.
+    /// No per-send allocation - pool is pre-allocated.
+    #[default]
+    Buffered,
+
+    /// Use zero-copy for sends >= threshold bytes, buffered otherwise.
+    ///
+    /// Small sends use buffered mode (low overhead for small copies).
+    /// Large sends use zero-copy (avoids copying large payloads).
+    /// The threshold should be tuned based on workload characteristics.
+    Threshold(usize),
+}
+
+impl SendMode {
+    /// Create a threshold-based mode.
+    ///
+    /// Sends >= `bytes` will use zero-copy, smaller sends use buffered.
+    pub fn threshold(bytes: usize) -> Self {
+        Self::Threshold(bytes)
+    }
+
+    /// Check if a send of `len` bytes should use zero-copy.
+    pub fn should_zerocopy(&self, len: usize) -> bool {
+        match self {
+            SendMode::ZeroCopy => true,
+            SendMode::Buffered => false,
+            SendMode::Threshold(threshold) => len >= *threshold,
+        }
+    }
+}
+
+impl std::fmt::Display for SendMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendMode::ZeroCopy => write!(f, "zerocopy"),
+            SendMode::Buffered => write!(f, "buffered"),
+            SendMode::Threshold(n) => write!(f, "threshold({})", n),
+        }
+    }
+}
+
+impl std::str::FromStr for SendMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
+            "zerocopy" | "zero-copy" | "zc" => Ok(SendMode::ZeroCopy),
+            "buffered" | "pool" | "pooled" => Ok(SendMode::Buffered),
+            _ if lower.starts_with("threshold(") && lower.ends_with(')') => {
+                let inner = &lower[10..lower.len() - 1];
+                inner
+                    .parse::<usize>()
+                    .map(SendMode::Threshold)
+                    .map_err(|_| format!("invalid threshold value: {}", inner))
+            }
+            _ => Err(format!("unknown send mode: {}", s)),
         }
     }
 }

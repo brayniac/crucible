@@ -1,6 +1,9 @@
 //! I/O driver trait definition.
 
-use crate::types::{Completion, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId};
+use crate::types::{
+    Completion, ConnId, DriverCapabilities, ListenerId, RecvMeta, SendMeta, SendMode, UdpSocketId,
+};
+use crate::zero_copy::BoxedZeroCopy;
 use bytes::Bytes;
 use std::io::{self, IoSlice};
 use std::net::{SocketAddr, TcpStream};
@@ -211,6 +214,49 @@ pub trait IoDriver: Send {
         self.send(id, &combined)
     }
 
+    /// Send data using the zero-copy interface.
+    ///
+    /// This method takes ownership of a buffer implementing `ZeroCopySend`,
+    /// holding it until the send completes. This enables true zero-copy sends
+    /// where data (e.g., cache values) is sent directly without copying.
+    ///
+    /// The buffer's `io_slices()` method provides the data to send as
+    /// scatter-gather IO slices. The driver holds the buffer until the
+    /// send completes, then drops it (releasing any held references).
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Connection identifier
+    /// * `buffer` - Owned buffer implementing `ZeroCopySend`
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(n)` - Total of `n` bytes were queued for sending
+    /// - `Err(WouldBlock)` - Cannot send right now, no free send slots
+    /// - `Err(other)` - An error occurred
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Send a RESP GET response with zero-copy value
+    /// let response = RespGetResponse::hit(item_ref);
+    /// driver.send_owned(conn_id, Box::new(response))?;
+    /// // item_ref is held by the driver until send completes
+    /// ```
+    fn send_owned(&mut self, id: ConnId, buffer: BoxedZeroCopy) -> io::Result<usize> {
+        // Default implementation: collect slices and use send_vectored
+        let slices = buffer.io_slices();
+        self.send_vectored(id, &slices)
+        // Note: buffer is dropped here, so this doesn't achieve true zero-copy
+        // Backends should override this to hold the buffer until completion
+    }
+
+    /// Get the configured send mode.
+    fn send_mode(&self) -> SendMode;
+
+    /// Set the send mode.
+    fn set_send_mode(&mut self, mode: SendMode);
+
     /// Receive data from a connection.
     ///
     /// Reads available data into the provided buffer.
@@ -392,4 +438,31 @@ pub trait IoDriver: Send {
     /// Get the raw file descriptor for a UDP socket.
     #[cfg(unix)]
     fn udp_raw_fd(&self, id: UdpSocketId) -> Option<RawFd>;
+
+    // === Capability introspection ===
+
+    /// Get the capabilities supported by this driver.
+    ///
+    /// Use this to query which features are available at runtime.
+    /// This enables writing code that can take advantage of advanced features
+    /// when available while gracefully falling back on other platforms.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let caps = driver.capabilities();
+    /// if caps.contains(DriverCapabilities::ZEROCOPY_SEND) {
+    ///     // Use zero-copy send path
+    /// } else {
+    ///     // Fall back to copy-based send
+    /// }
+    /// ```
+    fn capabilities(&self) -> DriverCapabilities;
+
+    /// Check if a specific capability is supported.
+    ///
+    /// Convenience method equivalent to `self.capabilities().contains(cap)`.
+    fn has_capability(&self, cap: DriverCapabilities) -> bool {
+        self.capabilities().contains(cap)
+    }
 }

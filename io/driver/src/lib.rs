@@ -72,9 +72,11 @@ mod buffer_pool;
 mod builder;
 mod driver;
 mod io_buffer;
+mod owned_buffer;
 mod recv_state;
 mod types;
 mod udp;
+mod zero_copy;
 
 pub mod mio;
 pub mod transport;
@@ -88,11 +90,13 @@ pub use buffer_pool::{BufferChain, BufferPool, DEFAULT_CHUNK_SIZE, DEFAULT_POOL_
 pub use builder::DriverBuilder;
 pub use driver::{IoDriver, RecvBuf};
 pub use io_buffer::IoBuffer;
+pub use owned_buffer::OwnedBuffer;
 pub use recv_state::{BufferSlice, BufferSource, ConnectionRecvState, PendingReturn, ReadGuard};
 pub use types::{
-    Completion, CompletionKind, ConnId, Ecn, IoEngine, ListenerId, RecvMeta, RecvMode, SendMeta,
-    UdpSocketId,
+    Completion, CompletionKind, ConnId, DriverCapabilities, Ecn, IoEngine, ListenerId, RecvMeta,
+    RecvMode, SendMeta, SendMode, UdpSocketId,
 };
+pub use zero_copy::{BoxedZeroCopy, OwnedBytes, ZeroCopySend, boxed_zc};
 
 // Transport re-exports
 pub use transport::{PlainTransport, ProcessResult, Transport, TransportState};

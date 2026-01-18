@@ -2,7 +2,7 @@
 
 use bytes::{Bytes, BytesMut};
 use cache_core::{Cache, ValueRef};
-use io_driver::RecvBuf;
+use io_driver::{RecvBuf, ZeroCopySend};
 use protocol_memcache::binary::{BinaryCommand, REQUEST_MAGIC};
 use protocol_memcache::{Command as MemcacheCommand, ParseError as MemcacheParseError};
 use protocol_resp::{Command as RespCommand, ParseError as RespParseError, ParseOptions};
@@ -12,18 +12,25 @@ use crate::config::ZeroCopyMode;
 use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
 use crate::metrics::PROTOCOL_ERRORS;
 
+/// RESP trailer constant for zero-copy responses.
+const RESP_CRLF: &[u8] = b"\r\n";
+
 /// A zero-copy GET response for vectored I/O.
 ///
-/// This struct holds the header, value reference, and trailer for a GET response.
+/// This struct holds the header and value reference for a GET response.
 /// The value reference points directly into cache segment memory, avoiding copies.
+///
+/// Size: 64 bytes (fits in SmallBox<S8> inline storage)
+/// - header: 32 bytes
+/// - header_len: 1 byte + 7 padding
+/// - value_ref: 24 bytes
 pub struct ZeroCopyResponse {
     /// RESP header: `$<len>\r\n` (max ~25 bytes)
     header: [u8; 32],
-    header_len: usize,
+    /// Length of valid header data (max 25)
+    header_len: u8,
     /// Reference to value in cache segment memory
     value_ref: ValueRef,
-    /// Static trailer: "\r\n"
-    trailer: &'static [u8],
 }
 
 impl ZeroCopyResponse {
@@ -50,16 +57,15 @@ impl ZeroCopyResponse {
 
         Self {
             header,
-            header_len: pos,
+            header_len: pos as u8,
             value_ref,
-            trailer: b"\r\n",
         }
     }
 
     /// Get the header bytes.
     #[inline]
     pub fn header(&self) -> &[u8] {
-        &self.header[..self.header_len]
+        &self.header[..self.header_len as usize]
     }
 
     /// Get the value reference.
@@ -68,16 +74,10 @@ impl ZeroCopyResponse {
         self.value_ref.as_slice()
     }
 
-    /// Get the trailer bytes.
-    #[inline]
-    pub fn trailer(&self) -> &[u8] {
-        self.trailer
-    }
-
     /// Get total response length.
     #[inline]
     pub fn total_len(&self) -> usize {
-        self.header_len + self.value_ref.len() + self.trailer.len()
+        self.header_len as usize + self.value_ref.len() + RESP_CRLF.len()
     }
 
     /// Create IoSlices for vectored I/O.
@@ -86,7 +86,7 @@ impl ZeroCopyResponse {
         [
             IoSlice::new(self.header()),
             IoSlice::new(self.value()),
-            IoSlice::new(self.trailer()),
+            IoSlice::new(RESP_CRLF),
         ]
     }
 
@@ -101,10 +101,31 @@ impl ZeroCopyResponse {
     #[inline]
     pub fn into_owned_bytes(self) -> Vec<Bytes> {
         vec![
-            Bytes::copy_from_slice(&self.header[..self.header_len]),
+            Bytes::copy_from_slice(&self.header[..self.header_len as usize]),
             self.value_ref.into_bytes(),
-            Bytes::from_static(self.trailer),
+            Bytes::from_static(RESP_CRLF),
         ]
+    }
+}
+
+impl ZeroCopySend for ZeroCopyResponse {
+    #[inline]
+    fn io_slices(&self) -> Vec<IoSlice<'_>> {
+        vec![
+            IoSlice::new(self.header()),
+            IoSlice::new(self.value()),
+            IoSlice::new(RESP_CRLF),
+        ]
+    }
+
+    #[inline]
+    fn total_len(&self) -> usize {
+        self.header_len as usize + self.value_ref.len() + RESP_CRLF.len()
+    }
+
+    #[inline]
+    fn slice_count(&self) -> usize {
+        3
     }
 }
 

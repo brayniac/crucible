@@ -18,9 +18,11 @@ mod registered_files;
 use crate::driver::{IoDriver, RecvBuf};
 use crate::recv_state::{BufferSlice, BufferSource};
 use crate::types::{
-    Completion, CompletionKind, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId,
+    Completion, CompletionKind, ConnId, DriverCapabilities, ListenerId, RecvMeta, SendMeta,
+    SendMode, UdpSocketId,
 };
 use crate::udp::{self, CMSG_BUFFER_SIZE};
+use crate::zero_copy::BoxedZeroCopy;
 use buf_ring::BufRing;
 use connection::UringConnection;
 use io_uring::cqueue;
@@ -47,6 +49,20 @@ const OP_SINGLE_RECV: u64 = 4;
 const OP_UDP_RECVMSG: u64 = 5;
 const OP_UDP_SENDMSG: u64 = 6;
 const OP_SENDMSG: u64 = 7; // TCP scatter-gather send
+const OP_ZC_SENDMSG: u64 = 8; // Zero-copy sendmsg via send_owned
+
+/// Pending zero-copy send that owns the buffer and supporting structures.
+///
+/// Stored in a Slab for O(1) allocation without heap boxing per send.
+/// The buffer owns the data (e.g., holds ItemRef), and iovecs point into it.
+struct PendingZcSend {
+    /// The buffer being sent (owns the data, e.g., holds ItemRef).
+    buffer: BoxedZeroCopy,
+    /// iovec array pointing into buffer's data.
+    iovecs: Vec<libc::iovec>,
+    /// msghdr for sendmsg.
+    msghdr: libc::msghdr,
+}
 
 /// Buffer group ID for recv operations.
 const RECV_BGID: u16 = 0;
@@ -172,6 +188,13 @@ pub struct UringDriver {
     /// Incremented each time a new connection is created. Used to detect
     /// stale completions when connection IDs are reused.
     next_generation: u32,
+    /// Probed capabilities for this driver instance.
+    capabilities: DriverCapabilities,
+    /// Configured send mode.
+    send_mode: SendMode,
+    /// Pending zero-copy sends awaiting completion.
+    /// Slab provides O(1) insert/remove and stable addresses for iovecs.
+    pending_zc_sends: Slab<PendingZcSend>,
 }
 
 // SAFETY: UringDriver can be safely sent between threads.
@@ -243,6 +266,9 @@ impl UringDriver {
         // Pool buffers outlive connections to prevent use-after-free.
         let recv_pool = RecvBufferPool::new(ring_entries, buffer_size);
 
+        // Probe capabilities
+        let capabilities = probe_capabilities(&ring);
+
         Ok(Self {
             ring,
             connections: Slab::with_capacity(max_connections as usize),
@@ -256,6 +282,9 @@ impl UringDriver {
             rearm_scratch: Vec::with_capacity(8192),
             recv_mode,
             next_generation: 0,
+            capabilities,
+            send_mode: SendMode::default(),
+            pending_zc_sends: Slab::with_capacity(256),
         })
     }
 
@@ -422,9 +451,22 @@ impl UringDriver {
                 self.handle_udp_sendmsg(id, result);
             }
             OP_SENDMSG => {
-                // TCP scatter-gather send - same handling as OP_SEND
+                // Regular TCP scatter-gather send (not via send_owned)
                 let (id, _, buf_idx, _) = decode_user_data(user_data);
                 self.handle_send(id, buf_idx as usize, result, flags);
+            }
+            OP_ZC_SENDMSG => {
+                // Zero-copy sendmsg completion from send_owned
+                let (conn_id, _, slab_idx, _) = decode_user_data(user_data);
+
+                // Remove and drop the PendingZcSend, releasing the BoxedZeroCopy
+                // which in turn releases the ItemRef or other held resources
+                if self.pending_zc_sends.contains(slab_idx as usize) {
+                    let _ = self.pending_zc_sends.remove(slab_idx as usize);
+                }
+
+                // Emit completion notification
+                self.handle_send(conn_id, slab_idx as usize, result, flags);
             }
             _ => {}
         }
@@ -498,13 +540,18 @@ impl UringDriver {
         // Return buffer to ring immediately so kernel can reuse it
         self.buf_ring.return_buffer(buf_id);
 
-        self.pending_completions
-            .push(Completion::new(CompletionKind::Recv {
+        // Check if kernel will deliver more completions for this multishot operation
+        let has_more = cqueue::more(flags);
+
+        self.pending_completions.push(Completion::with_more(
+            CompletionKind::Recv {
                 conn_id: full_conn_id,
-            }));
+            },
+            has_more,
+        ));
 
         // Re-arm multishot if needed
-        if !cqueue::more(flags) {
+        if !has_more {
             let conn_info = self
                 .connections
                 .get(conn_id)
@@ -750,6 +797,9 @@ impl UringDriver {
             .map(|l| l.raw_mode)
             .unwrap_or(false);
 
+        // Check if kernel will deliver more completions for this multishot operation
+        let has_more = cqueue::more(flags);
+
         if raw_mode {
             // Raw mode: don't register, just emit AcceptRaw with the fd
             let addr = unsafe {
@@ -763,12 +813,14 @@ impl UringDriver {
                 sockaddr_to_socketaddr(&storage)
             };
 
-            self.pending_completions
-                .push(Completion::new(CompletionKind::AcceptRaw {
+            self.pending_completions.push(Completion::with_more(
+                CompletionKind::AcceptRaw {
                     listener_id: ListenerId::new(listener_id),
                     raw_fd: new_fd,
                     addr,
-                }));
+                },
+                has_more,
+            ));
         } else {
             // Normal mode: register the connection automatically
             // Allocate a registered fd slot
@@ -817,16 +869,18 @@ impl UringDriver {
                 sockaddr_to_socketaddr(&storage)
             };
 
-            self.pending_completions
-                .push(Completion::new(CompletionKind::Accept {
+            self.pending_completions.push(Completion::with_more(
+                CompletionKind::Accept {
                     listener_id: ListenerId::new(listener_id),
                     conn_id: ConnId::with_generation(conn_id, generation),
                     addr,
-                }));
+                },
+                has_more,
+            ));
         }
 
         // Re-arm multishot accept if needed
-        if !cqueue::more(flags) {
+        if !has_more {
             let fixed_slot = self.listeners.get(listener_id).map(|l| l.fixed_slot);
             if let Some(fixed_slot) = fixed_slot {
                 if let Some(listener) = self.listeners.get_mut(listener_id) {
@@ -1891,6 +1945,123 @@ impl IoDriver for UringDriver {
     fn udp_raw_fd(&self, id: UdpSocketId) -> Option<RawFd> {
         self.udp_sockets.get(id.as_usize()).map(|s| s.raw_fd)
     }
+
+    fn capabilities(&self) -> DriverCapabilities {
+        self.capabilities
+    }
+
+    fn send_mode(&self) -> SendMode {
+        self.send_mode
+    }
+
+    fn set_send_mode(&mut self, mode: SendMode) {
+        self.send_mode = mode;
+    }
+
+    fn send_owned(&mut self, id: ConnId, buffer: BoxedZeroCopy) -> io::Result<usize> {
+        let conn_id = id.as_usize();
+
+        // Get connection info
+        let conn = self
+            .connections
+            .get(conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Check generation
+        if conn.generation != id.generation() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "stale connection ID",
+            ));
+        }
+
+        let fixed_slot = conn.fixed_slot;
+        let total_len = buffer.total_len();
+
+        // Build iovecs from buffer's slices
+        let slices = buffer.io_slices();
+        let iovecs: Vec<libc::iovec> = slices
+            .iter()
+            .map(|s| libc::iovec {
+                iov_base: s.as_ptr() as *mut _,
+                iov_len: s.len(),
+            })
+            .collect();
+
+        // Insert into slab - this gives us stable storage without boxing
+        let entry = self.pending_zc_sends.vacant_entry();
+        let slab_idx = entry.key();
+        entry.insert(PendingZcSend {
+            buffer,
+            iovecs,
+            msghdr: unsafe { std::mem::zeroed() },
+        });
+
+        // Get reference to update msghdr with iovec pointer
+        // SAFETY: We just inserted at slab_idx, and Slab provides stable addresses
+        let pending = self.pending_zc_sends.get_mut(slab_idx).unwrap();
+        pending.msghdr.msg_iov = pending.iovecs.as_mut_ptr();
+        pending.msghdr.msg_iovlen = pending.iovecs.len();
+
+        // Build SendMsg entry - encode slab_idx in user_data for completion lookup
+        let user_data = encode_user_data(conn_id, slab_idx as u16, OP_ZC_SENDMSG);
+        let sendmsg_entry = opcode::SendMsg::new(Fixed(fixed_slot), &pending.msghdr)
+            .build()
+            .user_data(user_data);
+
+        // SAFETY: msghdr and iovecs point to data owned by PendingZcSend in slab
+        // which is kept alive until completion removes it
+        unsafe {
+            if let Err(e) = self.ring.submission().push(&sendmsg_entry) {
+                // Clean up on failure
+                self.pending_zc_sends.remove(slab_idx);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("submission queue full: {:?}", e),
+                ));
+            }
+        }
+
+        self.ring.submit()?;
+
+        Ok(total_len)
+    }
+}
+
+/// Probe io_uring capabilities from the ring.
+fn probe_capabilities(ring: &IoUring) -> DriverCapabilities {
+    let mut caps = DriverCapabilities::empty();
+    let mut probe = Probe::new();
+
+    if ring.submitter().register_probe(&mut probe).is_ok() {
+        // Check for SendZc (requires 6.0+)
+        if probe.is_supported(opcode::SendZc::CODE) {
+            caps |= DriverCapabilities::ZEROCOPY_SEND;
+        }
+
+        // Check for multishot recv (RecvMulti)
+        if probe.is_supported(opcode::RecvMulti::CODE) {
+            caps |= DriverCapabilities::MULTISHOT_RECV;
+        }
+
+        // Check for multishot accept (AcceptMulti)
+        if probe.is_supported(opcode::AcceptMulti::CODE) {
+            caps |= DriverCapabilities::MULTISHOT_ACCEPT;
+        }
+
+        // Check for async cancel
+        if probe.is_supported(opcode::AsyncCancel::CODE) {
+            caps |= DriverCapabilities::ASYNC_CANCEL;
+        }
+    }
+
+    // These are always available when io_uring is available
+    caps |= DriverCapabilities::PROVIDED_BUFFERS;
+    caps |= DriverCapabilities::FIXED_BUFFERS;
+    caps |= DriverCapabilities::VECTORED_IO;
+    caps |= DriverCapabilities::DIRECT_DESCRIPTORS;
+
+    caps
 }
 
 /// Check if io_uring is supported on this system.

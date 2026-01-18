@@ -6,9 +6,11 @@
 use crate::driver::{IoDriver, RecvBuf};
 use crate::recv_state::ConnectionRecvState;
 use crate::types::{
-    Completion, CompletionKind, ConnId, ListenerId, RecvMeta, SendMeta, UdpSocketId,
+    Completion, CompletionKind, ConnId, DriverCapabilities, ListenerId, RecvMeta, SendMeta,
+    SendMode, UdpSocketId,
 };
 use crate::udp::{self, CMSG_BUFFER_SIZE};
+use crate::zero_copy::BoxedZeroCopy;
 use mio::net::{
     TcpListener as MioTcpListener, TcpStream as MioTcpStream, UdpSocket as MioUdpSocket,
 };
@@ -69,6 +71,8 @@ pub struct MioDriver {
     buffer_size: usize,
     /// Generation counter for connection IDs to detect stale references.
     next_generation: u32,
+    /// Configured send mode.
+    send_mode: SendMode,
 }
 
 impl MioDriver {
@@ -88,6 +92,7 @@ impl MioDriver {
             pending_completions: Vec::with_capacity(256),
             buffer_size,
             next_generation: 0,
+            send_mode: SendMode::default(),
         })
     }
 }
@@ -732,6 +737,46 @@ impl IoDriver for MioDriver {
         self.udp_sockets
             .get(id.as_usize())
             .map(|s| s.socket.as_raw_fd())
+    }
+
+    fn capabilities(&self) -> DriverCapabilities {
+        // Mio supports vectored IO via write_vectored
+        DriverCapabilities::VECTORED_IO
+    }
+
+    fn send_mode(&self) -> SendMode {
+        self.send_mode
+    }
+
+    fn set_send_mode(&mut self, mode: SendMode) {
+        self.send_mode = mode;
+    }
+
+    fn send_owned(&mut self, id: ConnId, buffer: BoxedZeroCopy) -> io::Result<usize> {
+        let slot = id.slot();
+
+        // For mio, we can't do true zero-copy - the kernel copies during write
+        // We hold the buffer during the write call, then drop it after
+        let slices = buffer.io_slices();
+
+        // Try to write
+        let conn = self
+            .connections
+            .get_mut(slot)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Check generation
+        if conn.generation != id.generation() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "stale connection ID",
+            ));
+        }
+
+        // Write all slices - mio/epoll will copy to kernel buffers
+        // On success or partial write, buffer is dropped (releasing segment ref)
+        // On WouldBlock, buffer is also dropped - caller handles retry
+        conn.stream.write_vectored(&slices)
     }
 }
 

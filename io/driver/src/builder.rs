@@ -1,7 +1,7 @@
 //! Driver builder with fluent API.
 
 use crate::driver::IoDriver;
-use crate::types::IoEngine;
+use crate::types::{IoEngine, SendMode};
 use std::io;
 
 /// Builder for creating an I/O driver with custom configuration.
@@ -26,6 +26,7 @@ pub struct DriverBuilder {
     max_connections: u32,
     sqpoll: bool,
     recv_mode: crate::types::RecvMode,
+    send_mode: SendMode,
 }
 
 impl Default for DriverBuilder {
@@ -45,6 +46,7 @@ impl DriverBuilder {
             max_connections: 8192,  // Maximum registered connections
             sqpoll: false,          // SQPOLL disabled by default
             recv_mode: crate::types::RecvMode::default(),
+            send_mode: SendMode::default(),
         }
     }
 
@@ -121,6 +123,20 @@ impl DriverBuilder {
         self
     }
 
+    /// Set the send mode.
+    ///
+    /// - `Copy` (default): Copy data directly to kernel. Simple and safe.
+    /// - `ZeroCopy`: Use zero-copy send when available (SEND_ZC on io_uring).
+    ///   Requires careful buffer lifetime management.
+    /// - `Buffered`: Copy to internal buffer pool before sending.
+    ///   Requires pre-configured send buffers.
+    ///
+    /// Default: Copy
+    pub fn send_mode(mut self, mode: SendMode) -> Self {
+        self.send_mode = mode;
+        self
+    }
+
     /// Build the driver with the configured settings.
     pub fn build(self) -> io::Result<Box<dyn IoDriver>> {
         match self.engine {
@@ -191,6 +207,7 @@ mod tests {
         assert_eq!(builder.max_connections, 8192);
         assert!(!builder.sqpoll);
         assert_eq!(builder.recv_mode, crate::types::RecvMode::Multishot);
+        assert_eq!(builder.send_mode, SendMode::Buffered);
     }
 
     #[test]
@@ -245,6 +262,15 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_send_mode() {
+        let builder = DriverBuilder::new().send_mode(SendMode::ZeroCopy);
+        assert_eq!(builder.send_mode, SendMode::ZeroCopy);
+
+        let builder = DriverBuilder::new().send_mode(SendMode::Buffered);
+        assert_eq!(builder.send_mode, SendMode::Buffered);
+    }
+
+    #[test]
     fn test_builder_chaining() {
         let builder = DriverBuilder::new()
             .engine(IoEngine::Mio)
@@ -253,7 +279,8 @@ mod tests {
             .sq_depth(128)
             .max_connections(4096)
             .sqpoll(true)
-            .recv_mode(crate::types::RecvMode::SingleShot);
+            .recv_mode(crate::types::RecvMode::SingleShot)
+            .send_mode(SendMode::ZeroCopy);
 
         assert_eq!(builder.engine, IoEngine::Mio);
         assert_eq!(builder.buffer_size, 8192);
@@ -262,6 +289,7 @@ mod tests {
         assert_eq!(builder.max_connections, 4096);
         assert!(builder.sqpoll);
         assert_eq!(builder.recv_mode, crate::types::RecvMode::SingleShot);
+        assert_eq!(builder.send_mode, SendMode::ZeroCopy);
     }
 
     #[test]
