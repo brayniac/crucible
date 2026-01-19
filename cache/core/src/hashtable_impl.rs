@@ -261,9 +261,32 @@ impl CuckooHashtable {
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
 
-        // SAFETY: We're loading pairs of u64 values using NEON (4 loads × 2 slots = 8 slots)
+        // SAFETY: Bucket is 64-byte aligned, items start at offset 0.
+        // We use inline assembly for aligned 128-bit loads to avoid read_unaligned overhead.
         unsafe {
             let items_ptr = bucket.items.as_ptr() as *const u64;
+
+            // Load all 8 slots using aligned LD1 instructions
+            let slots_0_1: uint64x2_t;
+            let slots_2_3: uint64x2_t;
+            let slots_4_5: uint64x2_t;
+            let slots_6_7: uint64x2_t;
+
+            std::arch::asm!(
+                "ld1 {{{v0:v}.2d}}, [{p0}]",
+                "ld1 {{{v1:v}.2d}}, [{p1}]",
+                "ld1 {{{v2:v}.2d}}, [{p2}]",
+                "ld1 {{{v3:v}.2d}}, [{p3}]",
+                p0 = in(reg) items_ptr,
+                p1 = in(reg) items_ptr.add(2),
+                p2 = in(reg) items_ptr.add(4),
+                p3 = in(reg) items_ptr.add(6),
+                v0 = out(vreg) slots_0_1,
+                v1 = out(vreg) slots_2_3,
+                v2 = out(vreg) slots_4_5,
+                v3 = out(vreg) slots_6_7,
+                options(nostack, preserves_flags),
+            );
 
             let tag_mask_vec = vdupq_n_u64(TAG_MASK);
             let tag_vec = vdupq_n_u64(tag_shifted);
@@ -271,7 +294,6 @@ impl CuckooHashtable {
             let zero_vec = vdupq_n_u64(0);
 
             // Process slots 0-1
-            let slots_0_1 = vld1q_u64(items_ptr);
             let tags_0_1 = vandq_u64(slots_0_1, tag_mask_vec);
             let tag_match_0_1 = vceqq_u64(tags_0_1, tag_vec);
             let nonzero_0_1 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_0_1, zero_vec)));
@@ -283,7 +305,6 @@ impl CuckooHashtable {
             );
 
             // Process slots 2-3
-            let slots_2_3 = vld1q_u64(items_ptr.add(2));
             let tags_2_3 = vandq_u64(slots_2_3, tag_mask_vec);
             let tag_match_2_3 = vceqq_u64(tags_2_3, tag_vec);
             let nonzero_2_3 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_2_3, zero_vec)));
@@ -295,7 +316,6 @@ impl CuckooHashtable {
             );
 
             // Process slots 4-5
-            let slots_4_5 = vld1q_u64(items_ptr.add(4));
             let tags_4_5 = vandq_u64(slots_4_5, tag_mask_vec);
             let tag_match_4_5 = vceqq_u64(tags_4_5, tag_vec);
             let nonzero_4_5 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_4_5, zero_vec)));
@@ -307,7 +327,6 @@ impl CuckooHashtable {
             );
 
             // Process slots 6-7
-            let slots_6_7 = vld1q_u64(items_ptr.add(6));
             let tags_6_7 = vandq_u64(slots_6_7, tag_mask_vec);
             let tag_match_6_7 = vceqq_u64(tags_6_7, tag_vec);
             let nonzero_6_7 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_6_7, zero_vec)));
