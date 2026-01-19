@@ -3,8 +3,14 @@
 use bytes::{Bytes, BytesMut};
 use cache_core::{Cache, CacheError, SegmentReservation, SetReservation, ValueRef};
 use io_driver::{RecvBuf, ZeroCopySend};
-use protocol_memcache::binary::{BinaryCommand, REQUEST_MAGIC};
-use protocol_memcache::{Command as MemcacheCommand, ParseError as MemcacheParseError};
+use protocol_memcache::binary::{
+    BINARY_STREAMING_THRESHOLD, BinaryParseProgress, REQUEST_MAGIC, parse_binary_streaming,
+};
+use protocol_memcache::{
+    ParseOptions as MemcacheParseOptions, ParseProgress as MemcacheParseProgress,
+    STREAMING_THRESHOLD as MEMCACHE_STREAMING_THRESHOLD,
+    parse_streaming as parse_memcache_streaming,
+};
 use protocol_resp::{
     Command as RespCommand, ParseError as RespParseError, ParseOptions, ParseProgress,
     STREAMING_THRESHOLD, parse_streaming,
@@ -150,19 +156,59 @@ enum DetectedProtocol {
 enum StreamingState {
     /// Normal mode - parse complete commands
     None,
-    /// Receiving value data directly into segment memory (true zero-copy)
+    /// Receiving value data directly into segment memory (true zero-copy) - RESP protocol
     ReceivingSegment {
         /// Reservation for segment memory
         reservation: SegmentReservation,
         /// Bytes received so far
         received: usize,
     },
-    /// Receiving value data into Vec buffer (fallback, one extra copy)
+    /// Receiving value data into Vec buffer (fallback, one extra copy) - RESP protocol
     ReceivingVec {
         /// Pre-allocated buffer for the value
         reservation: SetReservation,
         /// Bytes received so far
         received: usize,
+    },
+    /// Receiving value data into segment for memcache ASCII protocol
+    MemcacheAsciiSegment {
+        /// Reservation for segment memory
+        reservation: SegmentReservation,
+        /// Bytes received so far
+        received: usize,
+        /// Whether to suppress the response
+        noreply: bool,
+    },
+    /// Receiving value data into Vec for memcache ASCII protocol (fallback)
+    MemcacheAsciiVec {
+        /// Pre-allocated buffer for the value
+        reservation: SetReservation,
+        /// Bytes received so far
+        received: usize,
+        /// Whether to suppress the response
+        noreply: bool,
+    },
+    /// Receiving value data into segment for memcache binary protocol
+    MemcacheBinarySegment {
+        /// Reservation for segment memory
+        reservation: SegmentReservation,
+        /// Bytes received so far
+        received: usize,
+        /// Original opcode for response
+        opcode: protocol_memcache::binary::Opcode,
+        /// Opaque value for response
+        opaque: u32,
+    },
+    /// Receiving value data into Vec for memcache binary protocol (fallback)
+    MemcacheBinaryVec {
+        /// Pre-allocated buffer for the value
+        reservation: SetReservation,
+        /// Bytes received so far
+        received: usize,
+        /// Original opcode for response
+        opcode: protocol_memcache::binary::Opcode,
+        /// Opaque value for response
+        opaque: u32,
     },
 }
 
@@ -179,6 +225,8 @@ pub struct Connection {
     resp_version: RespVersion,
     /// Parse options for RESP protocol (controls max value size, etc.)
     resp_parse_options: ParseOptions,
+    /// Parse options for memcache ASCII protocol
+    memcache_parse_options: MemcacheParseOptions,
     /// State for streaming receive of large SET values
     streaming_state: StreamingState,
 }
@@ -193,6 +241,7 @@ impl Connection {
             should_close: false,
             resp_version: RespVersion::default(),
             resp_parse_options: ParseOptions::new().max_bulk_string_len(max_value_size),
+            memcache_parse_options: MemcacheParseOptions::new().max_value_len(max_value_size),
             streaming_state: StreamingState::None,
         }
     }
@@ -481,14 +530,19 @@ impl Connection {
 
                 true
             }
+            // Memcache streaming states are handled by their own continue methods
+            StreamingState::MemcacheAsciiSegment { .. }
+            | StreamingState::MemcacheAsciiVec { .. }
+            | StreamingState::MemcacheBinarySegment { .. }
+            | StreamingState::MemcacheBinaryVec { .. } => false,
         }
     }
 
     #[inline]
     fn process_memcache_ascii_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
         loop {
-            let data = buf.as_slice();
-            if data.is_empty() {
+            // Check for empty buffer
+            if buf.len() == 0 {
                 break;
             }
 
@@ -497,20 +551,105 @@ impl Connection {
                 break;
             }
 
-            match MemcacheCommand::parse(data) {
-                Ok((cmd, consumed)) => {
+            // Check if we're in the middle of receiving a large value
+            if self.continue_memcache_ascii_streaming_recv(buf, cache) {
+                continue;
+            }
+
+            // Normal command parsing with streaming support
+            let data = buf.as_slice();
+            match parse_memcache_streaming(
+                data,
+                &self.memcache_parse_options,
+                MEMCACHE_STREAMING_THRESHOLD,
+            ) {
+                Ok(MemcacheParseProgress::Complete(cmd, consumed)) => {
                     if execute_memcache(&cmd, cache, &mut self.write_buf) {
                         self.should_close = true;
                     }
                     buf.consume(consumed);
                 }
-                Err(MemcacheParseError::Incomplete) => break,
+                Ok(MemcacheParseProgress::NeedValue {
+                    header,
+                    value_len,
+                    value_prefix,
+                    header_consumed,
+                }) => {
+                    // Extract values before consuming buffer
+                    let key = header.key.to_vec();
+                    let prefix_len = value_prefix.len();
+                    let noreply = header.noreply;
+                    let ttl = if header.exptime == 0 {
+                        None
+                    } else if header.exptime <= 60 * 60 * 24 * 30 {
+                        // Seconds from now (up to 30 days)
+                        Some(Duration::from_secs(header.exptime as u64))
+                    } else {
+                        // Unix timestamp - calculate duration from now
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if header.exptime as u64 > now {
+                            Some(Duration::from_secs(header.exptime as u64 - now))
+                        } else {
+                            Some(Duration::from_secs(1)) // Already expired, minimal TTL
+                        }
+                    };
+
+                    // Try segment-based reservation first (true zero-copy)
+                    match cache.begin_segment_set(&key, value_len, ttl) {
+                        Ok(mut reservation) => {
+                            // Copy any value bytes already in the buffer
+                            if prefix_len > 0 {
+                                reservation.value_mut()[..prefix_len].copy_from_slice(value_prefix);
+                            }
+
+                            // Consume the header + prefix
+                            buf.consume(header_consumed + prefix_len);
+
+                            // Transition to segment-based streaming
+                            self.streaming_state = StreamingState::MemcacheAsciiSegment {
+                                reservation,
+                                received: prefix_len,
+                                noreply,
+                            };
+                        }
+                        Err(CacheError::Unsupported) => {
+                            // Fall back to Vec-based reservation
+                            let mut reservation = SetReservation::new(
+                                &key,
+                                value_len,
+                                &[],
+                                ttl.unwrap_or(Duration::from_secs(3600)),
+                            );
+
+                            if prefix_len > 0 {
+                                reservation.value_mut()[..prefix_len].copy_from_slice(value_prefix);
+                            }
+
+                            buf.consume(header_consumed + prefix_len);
+
+                            self.streaming_state = StreamingState::MemcacheAsciiVec {
+                                reservation,
+                                received: prefix_len,
+                                noreply,
+                            };
+                        }
+                        Err(_e) => {
+                            buf.consume(header_consumed + prefix_len);
+                            self.write_buf
+                                .extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                        }
+                    }
+                }
+                Ok(MemcacheParseProgress::Incomplete) => break,
                 Err(e) => {
                     PROTOCOL_ERRORS.increment();
                     self.write_buf.extend_from_slice(b"ERROR ");
                     self.write_buf.extend_from_slice(e.to_string().as_bytes());
                     self.write_buf.extend_from_slice(b"\r\n");
-                    // Consume all remaining data on error
+                    self.streaming_state = StreamingState::None;
                     let len = buf.len();
                     buf.consume(len);
                     break;
@@ -519,11 +658,130 @@ impl Connection {
         }
     }
 
+    /// Continue receiving value data for a memcache ASCII streaming SET.
+    #[inline]
+    fn continue_memcache_ascii_streaming_recv<C: Cache>(
+        &mut self,
+        buf: &mut dyn RecvBuf,
+        cache: &C,
+    ) -> bool {
+        match &mut self.streaming_state {
+            StreamingState::MemcacheAsciiSegment {
+                reservation,
+                received,
+                noreply,
+            } => {
+                let value_len = reservation.value_len();
+                let remaining = value_len - *received;
+                let data = buf.as_slice();
+
+                if data.len() < remaining {
+                    // Not enough data yet - copy what we have
+                    let to_copy = data.len();
+                    reservation.value_mut()[*received..*received + to_copy]
+                        .copy_from_slice(&data[..to_copy]);
+                    *received += to_copy;
+                    buf.consume(to_copy);
+                    return true;
+                }
+
+                // We have all the value bytes
+                reservation.value_mut()[*received..value_len].copy_from_slice(&data[..remaining]);
+                buf.consume(remaining);
+
+                // Check for trailing CRLF
+                let trailing = buf.as_slice();
+                if trailing.len() < 2 {
+                    *received = value_len;
+                    return true;
+                }
+
+                if &trailing[..2] != b"\r\n" {
+                    PROTOCOL_ERRORS.increment();
+                    self.write_buf
+                        .extend_from_slice(b"CLIENT_ERROR bad data chunk\r\n");
+                    let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                    if let StreamingState::MemcacheAsciiSegment { reservation, .. } = state {
+                        cache.cancel_segment_set(reservation);
+                    }
+                    return true;
+                }
+                buf.consume(2);
+
+                // Extract and commit
+                let noreply_val = *noreply;
+                let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                if let StreamingState::MemcacheAsciiSegment { reservation, .. } = state {
+                    if cache.commit_segment_set(reservation).is_ok() {
+                        if !noreply_val {
+                            self.write_buf.extend_from_slice(b"STORED\r\n");
+                        }
+                    } else if !noreply_val {
+                        self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                    }
+                }
+
+                true
+            }
+            StreamingState::MemcacheAsciiVec {
+                reservation,
+                received,
+                noreply,
+            } => {
+                let value_len = reservation.value_len();
+                let remaining = value_len - *received;
+                let data = buf.as_slice();
+
+                if data.len() < remaining {
+                    let to_copy = data.len();
+                    reservation.value_mut()[*received..*received + to_copy]
+                        .copy_from_slice(&data[..to_copy]);
+                    *received += to_copy;
+                    buf.consume(to_copy);
+                    return true;
+                }
+
+                reservation.value_mut()[*received..value_len].copy_from_slice(&data[..remaining]);
+                buf.consume(remaining);
+
+                let trailing = buf.as_slice();
+                if trailing.len() < 2 {
+                    *received = value_len;
+                    return true;
+                }
+
+                if &trailing[..2] != b"\r\n" {
+                    PROTOCOL_ERRORS.increment();
+                    self.write_buf
+                        .extend_from_slice(b"CLIENT_ERROR bad data chunk\r\n");
+                    self.streaming_state = StreamingState::None;
+                    return true;
+                }
+                buf.consume(2);
+
+                let noreply_val = *noreply;
+                let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                if let StreamingState::MemcacheAsciiVec { reservation, .. } = state {
+                    if cache.commit_set(reservation).is_ok() {
+                        if !noreply_val {
+                            self.write_buf.extend_from_slice(b"STORED\r\n");
+                        }
+                    } else if !noreply_val {
+                        self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                    }
+                }
+
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[inline]
     fn process_memcache_binary_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
         loop {
-            let data = buf.as_slice();
-            if data.is_empty() {
+            // Check for empty buffer
+            if buf.len() == 0 {
                 break;
             }
 
@@ -532,23 +790,271 @@ impl Connection {
                 break;
             }
 
-            match BinaryCommand::parse(data) {
-                Ok((cmd, consumed)) => {
+            // Check if we're in the middle of receiving a large value
+            if self.continue_memcache_binary_streaming_recv(buf, cache) {
+                continue;
+            }
+
+            // Normal command parsing with streaming support
+            let data = buf.as_slice();
+            match parse_binary_streaming(data, BINARY_STREAMING_THRESHOLD) {
+                Ok(BinaryParseProgress::Complete(cmd, consumed)) => {
                     if execute_memcache_binary(&cmd, cache, &mut self.write_buf) {
                         self.should_close = true;
                     }
                     buf.consume(consumed);
                 }
-                Err(MemcacheParseError::Incomplete) => break,
+                Ok(BinaryParseProgress::NeedValue {
+                    header,
+                    value_len,
+                    value_prefix,
+                    total_consumed,
+                }) => {
+                    // Extract values before consuming buffer
+                    let key = header.key.to_vec();
+                    let prefix_len = value_prefix.len();
+                    let opcode = header.opcode;
+                    let opaque = header.opaque;
+                    let ttl = if header.expiration == 0 {
+                        None
+                    } else if header.expiration <= 60 * 60 * 24 * 30 {
+                        Some(Duration::from_secs(header.expiration as u64))
+                    } else {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if header.expiration as u64 > now {
+                            Some(Duration::from_secs(header.expiration as u64 - now))
+                        } else {
+                            Some(Duration::from_secs(1))
+                        }
+                    };
+
+                    // Calculate how much of the header we've consumed
+                    // total_consumed includes header + value, we only want header for now
+                    let header_consumed = total_consumed - value_len;
+
+                    match cache.begin_segment_set(&key, value_len, ttl) {
+                        Ok(mut reservation) => {
+                            if prefix_len > 0 {
+                                reservation.value_mut()[..prefix_len].copy_from_slice(value_prefix);
+                            }
+
+                            buf.consume(header_consumed + prefix_len);
+
+                            self.streaming_state = StreamingState::MemcacheBinarySegment {
+                                reservation,
+                                received: prefix_len,
+                                opcode,
+                                opaque,
+                            };
+                        }
+                        Err(CacheError::Unsupported) => {
+                            let mut reservation = SetReservation::new(
+                                &key,
+                                value_len,
+                                &[],
+                                ttl.unwrap_or(Duration::from_secs(3600)),
+                            );
+
+                            if prefix_len > 0 {
+                                reservation.value_mut()[..prefix_len].copy_from_slice(value_prefix);
+                            }
+
+                            buf.consume(header_consumed + prefix_len);
+
+                            self.streaming_state = StreamingState::MemcacheBinaryVec {
+                                reservation,
+                                received: prefix_len,
+                                opcode,
+                                opaque,
+                            };
+                        }
+                        Err(_e) => {
+                            buf.consume(header_consumed + prefix_len);
+                            // Binary protocol error response
+                            use protocol_memcache::binary::{BinaryResponse, Status};
+                            let start = self.write_buf.len();
+                            self.write_buf.reserve(32);
+                            unsafe {
+                                self.write_buf.set_len(start + 32);
+                            }
+                            let len = BinaryResponse::encode_error(
+                                &mut self.write_buf[start..],
+                                opcode,
+                                opaque,
+                                Status::OutOfMemory,
+                            );
+                            self.write_buf.truncate(start + len);
+                        }
+                    }
+                }
+                Ok(BinaryParseProgress::Incomplete) => break,
                 Err(_) => {
                     PROTOCOL_ERRORS.increment();
                     self.should_close = true;
-                    // Consume all remaining data on error
                     let len = buf.len();
                     buf.consume(len);
                     break;
                 }
             }
+        }
+    }
+
+    /// Continue receiving value data for a memcache binary streaming SET.
+    #[inline]
+    fn continue_memcache_binary_streaming_recv<C: Cache>(
+        &mut self,
+        buf: &mut dyn RecvBuf,
+        cache: &C,
+    ) -> bool {
+        match &mut self.streaming_state {
+            StreamingState::MemcacheBinarySegment {
+                reservation,
+                received,
+                opcode,
+                opaque,
+            } => {
+                let value_len = reservation.value_len();
+                let remaining = value_len - *received;
+                let data = buf.as_slice();
+
+                if data.len() < remaining {
+                    let to_copy = data.len();
+                    reservation.value_mut()[*received..*received + to_copy]
+                        .copy_from_slice(&data[..to_copy]);
+                    *received += to_copy;
+                    buf.consume(to_copy);
+                    return true;
+                }
+
+                // We have all the value bytes (no trailing CRLF in binary protocol)
+                reservation.value_mut()[*received..value_len].copy_from_slice(&data[..remaining]);
+                buf.consume(remaining);
+
+                // Extract and commit
+                let opcode_val = *opcode;
+                let opaque_val = *opaque;
+                let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                if let StreamingState::MemcacheBinarySegment { reservation, .. } = state {
+                    use protocol_memcache::binary::BinaryResponse;
+                    if cache.commit_segment_set(reservation).is_ok() {
+                        if !opcode_val.is_quiet() {
+                            let response_len = BinaryResponse::encode_stored(
+                                &mut [0u8; 32],
+                                opcode_val,
+                                opaque_val,
+                                0,
+                            );
+                            let start = self.write_buf.len();
+                            self.write_buf.reserve(response_len);
+                            unsafe {
+                                self.write_buf.set_len(start + response_len);
+                            }
+                            BinaryResponse::encode_stored(
+                                &mut self.write_buf[start..],
+                                opcode_val,
+                                opaque_val,
+                                0,
+                            );
+                        }
+                    } else if !opcode_val.is_quiet() {
+                        use protocol_memcache::binary::Status;
+                        let response_len = BinaryResponse::encode_error(
+                            &mut [0u8; 32],
+                            opcode_val,
+                            opaque_val,
+                            Status::ItemNotStored,
+                        );
+                        let start = self.write_buf.len();
+                        self.write_buf.reserve(response_len);
+                        unsafe {
+                            self.write_buf.set_len(start + response_len);
+                        }
+                        BinaryResponse::encode_error(
+                            &mut self.write_buf[start..],
+                            opcode_val,
+                            opaque_val,
+                            Status::ItemNotStored,
+                        );
+                    }
+                }
+
+                true
+            }
+            StreamingState::MemcacheBinaryVec {
+                reservation,
+                received,
+                opcode,
+                opaque,
+            } => {
+                let value_len = reservation.value_len();
+                let remaining = value_len - *received;
+                let data = buf.as_slice();
+
+                if data.len() < remaining {
+                    let to_copy = data.len();
+                    reservation.value_mut()[*received..*received + to_copy]
+                        .copy_from_slice(&data[..to_copy]);
+                    *received += to_copy;
+                    buf.consume(to_copy);
+                    return true;
+                }
+
+                reservation.value_mut()[*received..value_len].copy_from_slice(&data[..remaining]);
+                buf.consume(remaining);
+
+                let opcode_val = *opcode;
+                let opaque_val = *opaque;
+                let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                if let StreamingState::MemcacheBinaryVec { reservation, .. } = state {
+                    use protocol_memcache::binary::BinaryResponse;
+                    if cache.commit_set(reservation).is_ok() {
+                        if !opcode_val.is_quiet() {
+                            let response_len = BinaryResponse::encode_stored(
+                                &mut [0u8; 32],
+                                opcode_val,
+                                opaque_val,
+                                0,
+                            );
+                            let start = self.write_buf.len();
+                            self.write_buf.reserve(response_len);
+                            unsafe {
+                                self.write_buf.set_len(start + response_len);
+                            }
+                            BinaryResponse::encode_stored(
+                                &mut self.write_buf[start..],
+                                opcode_val,
+                                opaque_val,
+                                0,
+                            );
+                        }
+                    } else if !opcode_val.is_quiet() {
+                        use protocol_memcache::binary::Status;
+                        let response_len = BinaryResponse::encode_error(
+                            &mut [0u8; 32],
+                            opcode_val,
+                            opaque_val,
+                            Status::ItemNotStored,
+                        );
+                        let start = self.write_buf.len();
+                        self.write_buf.reserve(response_len);
+                        unsafe {
+                            self.write_buf.set_len(start + response_len);
+                        }
+                        BinaryResponse::encode_error(
+                            &mut self.write_buf[start..],
+                            opcode_val,
+                            opaque_val,
+                            Status::ItemNotStored,
+                        );
+                    }
+                }
+
+                true
+            }
+            _ => false,
         }
     }
 

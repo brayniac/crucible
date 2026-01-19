@@ -42,6 +42,7 @@ mod command;
 mod header;
 mod request;
 mod response;
+mod streaming;
 
 pub use command::BinaryCommand;
 pub use header::{
@@ -49,6 +50,10 @@ pub use header::{
 };
 pub use request::BinaryRequest;
 pub use response::{BinaryResponse, ParsedBinaryResponse};
+pub use streaming::{
+    BINARY_STREAMING_THRESHOLD, BinaryParseProgress, BinarySetHeader,
+    complete_set as complete_binary_set, parse_streaming as parse_binary_streaming,
+};
 
 /// Detect if the data starts with a binary protocol request.
 ///

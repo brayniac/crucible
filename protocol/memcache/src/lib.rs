@@ -62,6 +62,8 @@ mod error;
 mod request;
 #[cfg(feature = "ascii")]
 mod response;
+#[cfg(feature = "ascii")]
+mod streaming;
 
 #[cfg(feature = "binary")]
 pub mod binary;
@@ -75,3 +77,5 @@ pub use error::ParseError;
 pub use request::Request;
 #[cfg(feature = "ascii")]
 pub use response::{Response, Value};
+#[cfg(feature = "ascii")]
+pub use streaming::{ParseProgress, STREAMING_THRESHOLD, SetHeader, complete_set, parse_streaming};

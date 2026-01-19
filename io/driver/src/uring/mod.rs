@@ -123,6 +123,32 @@ fn decode_pooled_recv(user_data: u64) -> (usize, u32, u16, u64) {
     )
 }
 
+/// Encode user_data for zero-copy vectored send.
+///
+/// Layout (64 bits):
+/// - bits 0-3: op (4 bits)
+/// - bits 4-19: slab_idx (16 bits) - pending send slab index
+/// - bits 20-39: conn_id (20 bits) - up to ~1M connections
+/// - bits 40-63: generation (24 bits)
+#[inline]
+fn encode_zc_sendmsg(conn_id: usize, generation: u32, slab_idx: usize, op: u64) -> u64 {
+    ((generation as u64) << 40)
+        | ((conn_id as u64 & 0xFFFFF) << 20)
+        | ((slab_idx as u64 & 0xFFFF) << 4)
+        | op
+}
+
+/// Decode user_data for zero-copy vectored send.
+#[inline]
+fn decode_zc_sendmsg(user_data: u64) -> (usize, u32, usize, u64) {
+    (
+        ((user_data >> 20) & 0xFFFFF) as usize, // conn_id (20 bits)
+        (user_data >> 40) as u32,               // generation (24 bits)
+        ((user_data >> 4) & 0xFFFF) as usize,   // slab_idx (16 bits)
+        user_data & 0xF,                        // op (4 bits)
+    )
+}
+
 /// Listener state for io_uring.
 struct UringListener {
     raw_fd: RawFd,
@@ -399,7 +425,7 @@ impl UringDriver {
     ) -> io::Result<()> {
         let mut send_builder = SendZc::new(Fixed(fixed_slot), data.as_ptr(), data.len() as u32);
         if msg_flags != 0 {
-            send_builder = send_builder.flags(msg_flags as u32);
+            send_builder = send_builder.flags(msg_flags);
         }
         let send_op = send_builder
             .build()
@@ -481,16 +507,16 @@ impl UringDriver {
             }
             OP_ZC_SENDMSG => {
                 // Zero-copy sendmsg completion from send_owned
-                let (conn_id, _, slab_idx, _) = decode_user_data(user_data);
+                let (conn_id, _generation, slab_idx, _) = decode_zc_sendmsg(user_data);
 
                 // Remove and drop the PendingZcSend, releasing the BoxedZeroCopy
                 // which in turn releases the ItemRef or other held resources
-                if self.pending_zc_sends.contains(slab_idx as usize) {
-                    let _ = self.pending_zc_sends.remove(slab_idx as usize);
+                if self.pending_zc_sends.contains(slab_idx) {
+                    let _ = self.pending_zc_sends.remove(slab_idx);
                 }
 
                 // Emit completion notification
-                self.handle_send(conn_id, slab_idx as usize, result, flags);
+                self.handle_send(conn_id, slab_idx, result, flags);
             }
             OP_DIRECT_RECV => {
                 // Zero-copy recv directly into user memory (e.g., segment)
@@ -2306,7 +2332,8 @@ impl IoDriver for UringDriver {
         pending.msghdr.msg_iovlen = pending.iovecs.len();
 
         // Build SendMsg entry - encode slab_idx in user_data for completion lookup
-        let user_data = encode_user_data(conn_id, slab_idx as u16, OP_ZC_SENDMSG);
+        let generation = conn.generation;
+        let user_data = encode_zc_sendmsg(conn_id, generation, slab_idx, OP_ZC_SENDMSG);
         let sendmsg_entry = opcode::SendMsg::new(Fixed(fixed_slot), &pending.msghdr)
             .build()
             .user_data(user_data);
