@@ -65,6 +65,8 @@ const MAX_ZC_IOVECS: usize = 8;
 /// Uses ArrayVec for inline iovec storage, avoiding heap allocation.
 struct PendingZcSend {
     /// The buffer being sent (owns the data, e.g., holds ItemRef).
+    /// Not read directly - exists to keep data alive until send completes.
+    #[allow(dead_code)]
     buffer: BoxedZeroCopy,
     /// iovec array pointing into buffer's data (inline, no heap allocation).
     iovecs: ArrayVec<libc::iovec, MAX_ZC_IOVECS>,

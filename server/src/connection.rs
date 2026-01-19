@@ -1129,19 +1129,18 @@ impl Connection {
                     use crate::metrics::{GETS, HITS, MISSES};
                     GETS.increment();
 
-                    // Try zero-copy path
+                    // Try to get value reference (single lookup)
                     if let Some(value_ref) = cache.get_value_ref(key) {
+                        HITS.increment();
+
+                        // Check if we should use zero-copy or copy path
                         if zero_copy_mode.should_use_zero_copy(value_ref.len()) {
-                            HITS.increment();
                             buf.consume(consumed);
                             return Some(ZeroCopyResponse::new_resp_bulk_string(value_ref));
                         }
-                        // Fall through to copy path - value_ref is dropped here
-                    }
 
-                    // Copy path - either miss or below threshold
-                    let hit = cache.with_value(key, |value| {
-                        // Reserve: $ + max_len_digits(20) + \r\n + value + \r\n
+                        // Below threshold - copy from the value_ref we already have
+                        let value = value_ref.as_ref();
                         let needed = 1 + 20 + 2 + value.len() + 2;
                         self.write_buf.reserve(needed);
 
@@ -1154,11 +1153,8 @@ impl Connection {
                         };
                         let written = unsafe { write_bulk_string(buf_slice, value) };
                         unsafe { self.write_buf.set_len(self.write_buf.len() + written) };
-                    });
-
-                    if hit.is_some() {
-                        HITS.increment();
                     } else {
+                        // Cache miss
                         MISSES.increment();
                         if self.resp_version == RespVersion::Resp3 {
                             self.write_buf.extend_from_slice(b"_\r\n");
