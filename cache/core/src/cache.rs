@@ -716,52 +716,87 @@ impl<H: Hashtable> TieredCache<H> {
     }
 
     /// Create a key verifier for hashtable operations.
-    fn create_key_verifier(&self) -> CacheKeyVerifier<'_, H> {
-        CacheKeyVerifier { cache: self }
+    fn create_key_verifier(&self) -> CacheKeyVerifier<'_> {
+        // Pre-compute direct pool references indexed by pool_id
+        // This avoids layer lookup and enum matching in the hot path
+        let mut pools: [Option<(&MemoryPool, bool)>; 4] = [None; 4];
+
+        for (pool_id, layer_idx) in self.pool_map.iter().enumerate() {
+            if let Some(idx) = layer_idx {
+                if let Some(layer) = self.layers.get(*idx) {
+                    let pool = layer.pool();
+                    pools[pool_id] = Some((pool, pool.is_per_item_ttl()));
+                }
+            }
+        }
+
+        CacheKeyVerifier { pools }
     }
 }
 
 /// Key verifier for TieredCache.
 ///
-/// Uses pre-computed pool_map for O(1) pool lookup and goes directly
-/// to the pool without layer abstraction overhead.
-struct CacheKeyVerifier<'a, H: Hashtable> {
-    cache: &'a TieredCache<H>,
+/// Stores pre-computed direct pool references indexed by pool_id,
+/// avoiding layer lookup and enum matching in the hot verify path.
+struct CacheKeyVerifier<'a> {
+    /// Direct pool references with is_per_item_ttl flag, indexed by pool_id.
+    pools: [Option<(&'a MemoryPool, bool)>; 4],
 }
 
-impl<H: Hashtable> KeyVerifier for CacheKeyVerifier<'_, H> {
+impl KeyVerifier for CacheKeyVerifier<'_> {
     #[inline]
-    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        let item_loc = ItemLocation::from_location(location);
-        let pool_id = item_loc.pool_id();
+    fn prefetch(&self, location: Location) {
+        // Unpack location to get segment and offset
+        let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
 
-        // Fast path: use pre-computed pool_map for O(1) lookup
-        if pool_id >= 4 {
-            return false;
+        // Get pool and segment
+        let Some((pool, _)) = self.pools.get(pool_id as usize).and_then(|p| *p) else {
+            return;
+        };
+
+        let Some(segment) = pool.get(segment_id) else {
+            return;
+        };
+
+        // Prefetch the item header location
+        let ptr = unsafe { segment.data_ptr().add(offset as usize) };
+
+        // Use platform-specific prefetch intrinsics (stable on x86_64)
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+        unsafe {
+            // PREFETCHT0 - prefetch to all cache levels
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
         }
 
-        let Some(layer_idx) = self.cache.pool_map[pool_id as usize] else {
+        // On other platforms (including aarch64), this is a no-op for now
+        // since the aarch64 prefetch intrinsics are unstable
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse")))]
+        let _ = ptr;
+    }
+
+    #[inline]
+    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+        // Unpack all location fields in one pass
+        let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
+
+        // Direct pool lookup - no layer indirection
+        let Some((pool, is_per_item_ttl)) = self.pools.get(pool_id as usize).and_then(|p| *p)
+        else {
             return false;
         };
 
-        let Some(layer) = self.cache.layers.get(layer_idx) else {
-            return false;
-        };
-
-        // Go directly to pool to avoid layer enum matching overhead
-        let pool = layer.pool();
-        let Some(segment) = pool.get(item_loc.segment_id()) else {
+        let Some(segment) = pool.get(segment_id) else {
             return false;
         };
 
         // Branch once at pool level instead of per-segment
-        if pool.is_per_item_ttl() {
+        if is_per_item_ttl {
             segment
-                .verify_key_with_ttl_header(item_loc.offset(), key, allow_deleted)
+                .verify_key_with_ttl_header(offset, key, allow_deleted)
                 .is_some()
         } else {
             segment
-                .verify_key_with_basic_header(item_loc.offset(), key, allow_deleted)
+                .verify_key_with_basic_header(offset, key, allow_deleted)
                 .is_some()
         }
     }

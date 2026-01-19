@@ -253,7 +253,12 @@ impl CuckooHashtable {
                 continue;
             }
 
-            // Tag matches non-ghost - do Acquire load to synchronize
+            // Tag matches non-ghost - prefetch segment data before Acquire barrier
+            // This overlaps memory fetch with synchronization overhead
+            let location = Hashbucket::location(packed);
+            verifier.prefetch(location);
+
+            // Now do Acquire load to synchronize
             let packed = slot.load(Ordering::Acquire);
 
             // Re-verify after Acquire (state may have changed)
@@ -264,6 +269,7 @@ impl CuckooHashtable {
                 continue;
             }
 
+            // Re-extract location after Acquire (could have changed)
             let location = Hashbucket::location(packed);
 
             // Verify key matches using the verifier
@@ -333,7 +339,11 @@ impl CuckooHashtable {
                 continue;
             }
 
-            // Tag matches non-ghost - do Acquire load to synchronize
+            // Tag matches non-ghost - prefetch segment data before Acquire barrier
+            let location = Hashbucket::location(packed);
+            verifier.prefetch(location);
+
+            // Now do Acquire load to synchronize
             let packed = slot.load(Ordering::Acquire);
 
             if (packed & TAG_MASK) != tag_shifted {
@@ -343,6 +353,7 @@ impl CuckooHashtable {
                 continue;
             }
 
+            // Re-extract location after Acquire
             let location = Hashbucket::location(packed);
 
             if verifier.verify(key, location, false) {

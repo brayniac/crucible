@@ -215,6 +215,8 @@ impl BasicHeader {
     }
 
     /// Calculate padded size rounded to 8-byte boundary.
+    ///
+    /// Uses checked arithmetic to detect overflow.
     pub fn padded_size(&self) -> usize {
         let size = Self::SIZE
             .checked_add(self.optional_len as usize)
@@ -223,6 +225,21 @@ impl BasicHeader {
             .and_then(|s| s.checked_add(7))
             .expect("Item size overflow");
 
+        size & !7
+    }
+
+    /// Calculate padded size without overflow checks.
+    ///
+    /// This is faster than `padded_size()` but assumes the header fields
+    /// are valid and won't overflow. Use in hot paths where the header
+    /// has already been validated or comes from trusted storage.
+    #[inline(always)]
+    pub fn padded_size_unchecked(&self) -> usize {
+        let size = Self::SIZE
+            + self.optional_len as usize
+            + self.key_len as usize
+            + self.value_len as usize
+            + 7;
         size & !7
     }
 
@@ -500,6 +517,8 @@ impl TtlHeader {
     }
 
     /// Calculate padded size rounded to 8-byte boundary.
+    ///
+    /// Uses checked arithmetic to detect overflow.
     pub fn padded_size(&self) -> usize {
         let size = Self::SIZE
             .checked_add(self.optional_len as usize)
@@ -508,6 +527,21 @@ impl TtlHeader {
             .and_then(|s| s.checked_add(7))
             .expect("Item size overflow");
 
+        size & !7
+    }
+
+    /// Calculate padded size without overflow checks.
+    ///
+    /// This is faster than `padded_size()` but assumes the header fields
+    /// are valid and won't overflow. Use in hot paths where the header
+    /// has already been validated or comes from trusted storage.
+    #[inline(always)]
+    pub fn padded_size_unchecked(&self) -> usize {
+        let size = Self::SIZE
+            + self.optional_len as usize
+            + self.key_len as usize
+            + self.value_len as usize
+            + 7;
         size & !7
     }
 

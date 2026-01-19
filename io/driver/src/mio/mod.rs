@@ -28,6 +28,9 @@ const LISTENER_TOKEN_OFFSET: usize = 1 << 30;
 /// Token offset for UDP sockets to avoid collision with connections and listeners.
 const UDP_TOKEN_OFFSET: usize = 1 << 29;
 
+/// Initial capacity for the pending completions vector.
+const COMPLETION_VEC_CAPACITY: usize = 256;
+
 /// Connection state for mio driver.
 struct MioConnection {
     stream: MioTcpStream,
@@ -89,7 +92,7 @@ impl MioDriver {
             connections: Slab::with_capacity(max_connections.min(4096)),
             listeners: Slab::with_capacity(16),
             udp_sockets: Slab::with_capacity(64),
-            pending_completions: Vec::with_capacity(256),
+            pending_completions: Vec::with_capacity(COMPLETION_VEC_CAPACITY),
             buffer_size,
             next_generation: 0,
             send_mode: SendMode::default(),
@@ -579,6 +582,14 @@ impl IoDriver for MioDriver {
         // may have queued Recv completions for newly registered connections.
         // drain_completions() clears the vec via mem::take().
 
+        // Ensure pending_completions has sufficient capacity.
+        // drain_completions() uses mem::take() which leaves capacity 0, so we
+        // restore capacity here to avoid repeated allocations during push.
+        if self.pending_completions.capacity() < COMPLETION_VEC_CAPACITY {
+            self.pending_completions
+                .reserve(COMPLETION_VEC_CAPACITY - self.pending_completions.len());
+        }
+
         self.poll.poll(&mut self.events, timeout)?;
 
         // Collect event info first to avoid borrow issues
@@ -868,6 +879,33 @@ impl IoDriver for MioDriver {
 
     fn set_send_mode(&mut self, mode: SendMode) {
         self.send_mode = mode;
+    }
+
+    fn send_vectored_owned(&mut self, id: ConnId, buffers: Vec<bytes::Bytes>) -> io::Result<usize> {
+        let conn = self
+            .connections
+            .get_mut(id.slot())
+            .filter(|c| c.generation == id.generation())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Don't try to send if we know the socket isn't writable yet
+        if !conn.writable {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Convert Bytes to IoSlice - no allocation or copying of data
+        // We hold the buffers during the write call for proper lifetime
+        let slices: Vec<IoSlice<'_>> = buffers.iter().map(|b| IoSlice::new(b)).collect();
+
+        match conn.stream.write_vectored(&slices) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                conn.writable = false;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+        // buffers dropped here after write completes
     }
 
     fn send_owned(&mut self, id: ConnId, buffer: BoxedZeroCopy) -> io::Result<usize> {

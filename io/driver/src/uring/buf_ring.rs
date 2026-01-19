@@ -116,18 +116,46 @@ impl BufRing {
     }
 
     /// Commit pending buffer additions by updating the tail.
+    ///
+    /// Call this after one or more `return_buffer_deferred` calls to make
+    /// the buffers visible to the kernel. Batching multiple returns before
+    /// a single commit reduces atomic operation overhead.
     #[inline]
-    fn commit(&self) {
+    pub fn commit(&self) {
         // Use release ordering so kernel sees the buffer data
         unsafe {
             (*self.tail).store(self.local_tail, Ordering::Release);
         }
     }
 
+    /// Return a buffer to the ring without committing.
+    ///
+    /// Use this when returning multiple buffers, then call `commit()` once
+    /// at the end to reduce atomic operation overhead.
+    #[inline]
+    pub fn return_buffer_deferred(&mut self, buf_id: u16) {
+        self.add_buffer(buf_id);
+    }
+
     /// Return a buffer to the ring (adds and commits immediately).
+    ///
+    /// For single buffer returns. When returning multiple buffers, prefer
+    /// `return_buffer_deferred` followed by a single `commit()`.
     #[inline]
     pub fn return_buffer(&mut self, buf_id: u16) {
         self.add_buffer(buf_id);
+        self.commit();
+    }
+
+    /// Return multiple buffers to the ring with a single commit.
+    ///
+    /// More efficient than calling `return_buffer` multiple times as it
+    /// only performs one atomic operation.
+    #[inline]
+    pub fn return_buffers(&mut self, buf_ids: impl IntoIterator<Item = u16>) {
+        for buf_id in buf_ids {
+            self.add_buffer(buf_id);
+        }
         self.commit();
     }
 }

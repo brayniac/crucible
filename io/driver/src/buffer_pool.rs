@@ -171,6 +171,8 @@ pub struct BufferChain {
     total_bytes: usize,
     /// Read cursor: (chunk_index, offset_within_chunk)
     read_pos: (usize, usize),
+    /// Cached count of consumed bytes (updated incrementally in advance())
+    consumed_bytes: usize,
 }
 
 impl BufferChain {
@@ -180,6 +182,7 @@ impl BufferChain {
             chunks: Vec::with_capacity(8),
             total_bytes: 0,
             read_pos: (0, 0),
+            consumed_bytes: 0,
         }
     }
 
@@ -197,22 +200,13 @@ impl BufferChain {
     /// Get the number of readable bytes remaining.
     #[inline]
     pub fn readable(&self) -> usize {
-        self.total_bytes - self.consumed()
+        self.total_bytes - self.consumed_bytes
     }
 
     /// Get the number of bytes that have been consumed.
     #[inline]
     pub fn consumed(&self) -> usize {
-        let mut consumed = 0;
-        for (i, (_, valid)) in self.chunks.iter().enumerate() {
-            if i < self.read_pos.0 {
-                consumed += valid;
-            } else if i == self.read_pos.0 {
-                consumed += self.read_pos.1;
-                break;
-            }
-        }
-        consumed
+        self.consumed_bytes
     }
 
     /// Check if the chain is empty (no readable data).
@@ -227,6 +221,9 @@ impl BufferChain {
     /// Panics if `n` exceeds readable bytes.
     pub fn advance(&mut self, mut n: usize) {
         assert!(n <= self.readable(), "advance exceeds readable bytes");
+
+        // Update cached consumed count
+        self.consumed_bytes += n;
 
         while n > 0 {
             let (chunk_idx, offset) = self.read_pos;
@@ -254,6 +251,8 @@ impl BufferChain {
     /// This drains consumed chunks from the front of the chain.
     pub fn drain_consumed(&mut self) -> impl Iterator<Item = u16> + '_ {
         let consumed_count = self.read_pos.0;
+        // After draining, consumed_bytes is just the offset within the new first chunk
+        self.consumed_bytes = self.read_pos.1;
         self.read_pos.0 = 0;
         self.chunks.drain(..consumed_count).map(|(id, valid)| {
             self.total_bytes -= valid;
@@ -265,6 +264,7 @@ impl BufferChain {
     pub fn clear(&mut self) -> impl Iterator<Item = u16> + '_ {
         self.total_bytes = 0;
         self.read_pos = (0, 0);
+        self.consumed_bytes = 0;
         self.chunks.drain(..).map(|(id, _)| id)
     }
 

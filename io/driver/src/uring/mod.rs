@@ -201,6 +201,9 @@ impl UringUdpSocket {
 ///
 /// Requires Linux 6.0+ for full feature support (multishot recv/accept,
 /// SendZc, ring-provided buffers).
+/// Initial capacity for completion vectors.
+const COMPLETION_VEC_CAPACITY: usize = 8192;
+
 pub struct UringDriver {
     ring: IoUring,
     connections: Slab<UringConnection>,
@@ -313,9 +316,9 @@ impl UringDriver {
             registered_files,
             buf_ring,
             recv_pool,
-            pending_completions: Vec::with_capacity(8192),
-            cqe_scratch: Vec::with_capacity(8192),
-            rearm_scratch: Vec::with_capacity(8192),
+            pending_completions: Vec::with_capacity(COMPLETION_VEC_CAPACITY),
+            cqe_scratch: Vec::with_capacity(COMPLETION_VEC_CAPACITY),
+            rearm_scratch: Vec::with_capacity(COMPLETION_VEC_CAPACITY),
             recv_mode,
             next_generation: 0,
             capabilities,
@@ -1473,17 +1476,22 @@ impl IoDriver for UringDriver {
             if let Some(conn) = self.connections.get_mut(conn_id) {
                 conn.closing = true;
 
-                // Return any held recv buffers to their pools
+                // Return any held recv buffers to their pools (batched commit)
                 conn.recv_state.clear();
+                let mut has_ring_buffers = false;
                 for pending in conn.recv_state.take_pending_returns() {
                     match pending.source {
                         BufferSource::Ring => {
-                            self.buf_ring.return_buffer(pending.buf_id);
+                            self.buf_ring.return_buffer_deferred(pending.buf_id);
+                            has_ring_buffers = true;
                         }
                         BufferSource::Pool => {
                             self.recv_pool.free(pending.buf_id);
                         }
                     }
+                }
+                if has_ring_buffers {
+                    self.buf_ring.commit();
                 }
 
                 // Deregister and close fd - kernel will see errors but that's ok
@@ -1498,17 +1506,22 @@ impl IoDriver for UringDriver {
         } else {
             // No in-flight sends, safe to remove immediately
             if let Some(mut conn) = self.connections.try_remove(conn_id) {
-                // Return any held recv buffers to their pools
+                // Return any held recv buffers to their pools (batched commit)
                 conn.recv_state.clear();
+                let mut has_ring_buffers = false;
                 for pending in conn.recv_state.take_pending_returns() {
                     match pending.source {
                         BufferSource::Ring => {
-                            self.buf_ring.return_buffer(pending.buf_id);
+                            self.buf_ring.return_buffer_deferred(pending.buf_id);
+                            has_ring_buffers = true;
                         }
                         BufferSource::Pool => {
                             self.recv_pool.free(pending.buf_id);
                         }
                     }
+                }
+                if has_ring_buffers {
+                    self.buf_ring.commit();
                 }
 
                 // Update registered fd to -1
@@ -1526,17 +1539,22 @@ impl IoDriver for UringDriver {
 
     fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd> {
         if let Some(mut conn) = self.connections.try_remove(id.slot()) {
-            // Return any held recv buffers to their pools
+            // Return any held recv buffers to their pools (batched commit)
             conn.recv_state.clear();
+            let mut has_ring_buffers = false;
             for pending in conn.recv_state.take_pending_returns() {
                 match pending.source {
                     BufferSource::Ring => {
-                        self.buf_ring.return_buffer(pending.buf_id);
+                        self.buf_ring.return_buffer_deferred(pending.buf_id);
+                        has_ring_buffers = true;
                     }
                     BufferSource::Pool => {
                         self.recv_pool.free(pending.buf_id);
                     }
                 }
+            }
+            if has_ring_buffers {
+                self.buf_ring.commit();
             }
 
             // Update registered fd to -1 (deregister)
@@ -1673,16 +1691,21 @@ impl IoDriver for UringDriver {
             (n, conn.recv_state.take_pending_returns().collect())
         };
 
-        // Return consumed buffers to their respective pools
+        // Return consumed buffers to their respective pools (batched commit)
+        let mut has_ring_buffers = false;
         for pending in pending_returns {
             match pending.source {
                 BufferSource::Ring => {
-                    self.buf_ring.return_buffer(pending.buf_id);
+                    self.buf_ring.return_buffer_deferred(pending.buf_id);
+                    has_ring_buffers = true;
                 }
                 BufferSource::Pool => {
                     self.recv_pool.free(pending.buf_id);
                 }
             }
+        }
+        if has_ring_buffers {
+            self.buf_ring.commit();
         }
 
         Ok(n)
@@ -1901,16 +1924,21 @@ impl IoDriver for UringDriver {
             conn.recv_state.take_pending_returns().collect()
         };
 
-        // Return consumed buffers to their respective pools
+        // Return consumed buffers to their respective pools (batched commit)
+        let mut has_ring_buffers = false;
         for pending in pending_returns {
             match pending.source {
                 BufferSource::Ring => {
-                    self.buf_ring.return_buffer(pending.buf_id);
+                    self.buf_ring.return_buffer_deferred(pending.buf_id);
+                    has_ring_buffers = true;
                 }
                 BufferSource::Pool => {
                     self.recv_pool.free(pending.buf_id);
                 }
             }
+        }
+        if has_ring_buffers {
+            self.buf_ring.commit();
         }
 
         Ok(())
@@ -1920,6 +1948,14 @@ impl IoDriver for UringDriver {
         // Note: We do NOT clear pending_completions here because register() and
         // register_fd() may have queued completions for newly registered connections.
         // drain_completions() clears the vec via mem::take().
+
+        // Ensure pending_completions has sufficient capacity.
+        // drain_completions() uses mem::take() which leaves capacity 0, so we
+        // restore capacity here to avoid repeated allocations during push.
+        if self.pending_completions.capacity() < COMPLETION_VEC_CAPACITY {
+            self.pending_completions
+                .reserve(COMPLETION_VEC_CAPACITY - self.pending_completions.len());
+        }
 
         // Re-arm recv for connections that need it
         // This handles both single-shot mode (no pending recv) and multishot mode

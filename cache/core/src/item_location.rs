@@ -110,6 +110,22 @@ impl ItemLocation {
         ((self.0.as_raw() & Self::OFFSET_MASK) as u32) * Self::OFFSET_ALIGN
     }
 
+    /// Unpack all fields in a single pass.
+    ///
+    /// Returns `(pool_id, segment_id, offset)`.
+    ///
+    /// This is more efficient than calling `pool_id()`, `segment_id()`, and
+    /// `offset()` separately when all three values are needed, as it only
+    /// performs one virtual method call to get the raw bits.
+    #[inline]
+    pub fn unpack(&self) -> (u8, u32, u32) {
+        let raw = self.0.as_raw();
+        let pool_id = ((raw & Self::POOL_MASK) >> Self::POOL_SHIFT) as u8;
+        let segment_id = ((raw & Self::SEG_MASK) >> Self::SEG_SHIFT) as u32;
+        let offset = ((raw & Self::OFFSET_MASK) as u32) * Self::OFFSET_ALIGN;
+        (pool_id, segment_id, offset)
+    }
+
     /// Check if this location represents a ghost entry.
     #[inline]
     pub fn is_ghost(&self) -> bool {

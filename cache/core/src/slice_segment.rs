@@ -591,11 +591,15 @@ impl<'a> SliceSegment<'a> {
         key: &[u8],
         allow_deleted: bool,
     ) -> Option<(u8, u8, u32)> {
-        if offset as usize + BasicHeader::SIZE > self.capacity as usize {
+        let offset = offset as usize;
+        let capacity = self.capacity as usize;
+
+        // First bounds check: can we read the header?
+        if offset + BasicHeader::SIZE > capacity {
             return None;
         }
 
-        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+        let data_ptr = unsafe { self.data.as_ptr().add(offset) };
         let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
 
         #[cfg(feature = "validation")]
@@ -607,16 +611,23 @@ impl<'a> SliceSegment<'a> {
             return None;
         }
 
-        let item_size = header.padded_size();
-        if offset as usize + item_size > self.capacity as usize {
+        // Early key length check before computing offsets
+        if header.key_len() as usize != key.len() {
             return None;
         }
 
         let key_start = BasicHeader::SIZE + header.optional_len() as usize;
-        let key_end = key_start + header.key_len() as usize;
+        let key_end = key_start + key.len();
 
-        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-        if key_end <= raw.len() && &raw[key_start..key_end] == key {
+        // Single combined bounds check: can we read up to key_end?
+        // (This is sufficient since we only need to compare the key)
+        if offset + key_end > capacity {
+            return None;
+        }
+
+        // Create slice only for key bytes, not entire item
+        let stored_key = unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key.len()) };
+        if stored_key == key {
             Some((header.key_len(), header.optional_len(), header.value_len()))
         } else {
             None
@@ -632,11 +643,15 @@ impl<'a> SliceSegment<'a> {
         key: &[u8],
         allow_deleted: bool,
     ) -> Option<(u8, u8, u32)> {
-        if offset as usize + TtlHeader::SIZE > self.capacity as usize {
+        let offset = offset as usize;
+        let capacity = self.capacity as usize;
+
+        // First bounds check: can we read the header?
+        if offset + TtlHeader::SIZE > capacity {
             return None;
         }
 
-        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+        let data_ptr = unsafe { self.data.as_ptr().add(offset) };
         let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
 
         #[cfg(feature = "validation")]
@@ -648,16 +663,23 @@ impl<'a> SliceSegment<'a> {
             return None;
         }
 
-        let item_size = header.padded_size();
-        if offset as usize + item_size > self.capacity as usize {
+        // Early key length check before computing offsets
+        if header.key_len() as usize != key.len() {
             return None;
         }
 
         let key_start = TtlHeader::SIZE + header.optional_len() as usize;
-        let key_end = key_start + header.key_len() as usize;
+        let key_end = key_start + key.len();
 
-        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-        if key_end <= raw.len() && &raw[key_start..key_end] == key {
+        // Single combined bounds check: can we read up to key_end?
+        // (This is sufficient since we only need to compare the key)
+        if offset + key_end > capacity {
+            return None;
+        }
+
+        // Create slice only for key bytes, not entire item
+        let stored_key = unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key.len()) };
+        if stored_key == key {
             Some((header.key_len(), header.optional_len(), header.value_len()))
         } else {
             None

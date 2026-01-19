@@ -36,6 +36,18 @@ pub trait KeyVerifier: Send + Sync {
     /// # Returns
     /// `true` if the key matches at this location.
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool;
+
+    /// Prefetch memory at the given location.
+    ///
+    /// Called by the hashtable after a tag match but before full verification.
+    /// This allows overlapping memory prefetch with the Acquire barrier overhead.
+    ///
+    /// The default implementation is a no-op. Segment-based verifiers can
+    /// override this to prefetch the segment memory at the given offset.
+    #[inline]
+    fn prefetch(&self, _location: Location) {
+        // Default no-op - implementations can override for segment-based caches
+    }
 }
 
 /// Core trait for hashtable operations.
