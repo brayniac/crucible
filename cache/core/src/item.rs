@@ -160,13 +160,17 @@ impl BasicHeader {
 
     /// Parse header from bytes without validation checks.
     /// Only use when you know the data is valid.
-    #[inline]
+    ///
+    /// # Safety assumption
+    /// The data pointer must be 8-byte aligned (items are padded to 8-byte boundaries).
+    #[inline(always)]
     #[cfg(not(feature = "validation"))]
     pub fn from_bytes_unchecked(data: &[u8]) -> Self {
         debug_assert!(data.len() >= Self::SIZE);
         let ptr = data.as_ptr();
 
-        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
+        // Items are 8-byte aligned, so 4-byte read at offset 0 is aligned
+        let len = unsafe { ptr.cast::<u32>().read() };
         let flags = unsafe { *ptr.add(4) };
 
         Self {
@@ -464,14 +468,19 @@ impl TtlHeader {
 
     /// Parse header from bytes without validation checks.
     /// Only use when you know the data is valid.
-    #[inline]
+    ///
+    /// # Safety assumption
+    /// The data pointer must be 8-byte aligned (items are padded to 8-byte boundaries).
+    #[inline(always)]
     #[cfg(not(feature = "validation"))]
     pub fn from_bytes_unchecked(data: &[u8]) -> Self {
         debug_assert!(data.len() >= Self::SIZE);
         let ptr = data.as_ptr();
 
-        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
+        // Items are 8-byte aligned, so 4-byte read at offset 0 is aligned
+        let len = unsafe { ptr.cast::<u32>().read() };
         let flags = unsafe { *ptr.add(4) };
+        // expire_at at offset 5 is NOT 4-byte aligned, must use unaligned read
         let expire_at = unsafe { ptr.add(5).cast::<u32>().read_unaligned() };
 
         Self {
