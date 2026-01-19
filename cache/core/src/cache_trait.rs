@@ -240,6 +240,51 @@ pub trait Cache: Send + Sync + 'static {
     /// TTL is used (implementation-dependent).
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError>;
 
+    /// Begin a two-phase SET operation for zero-copy receive.
+    ///
+    /// Returns a reservation with a pre-sized buffer that the caller can
+    /// write to directly (e.g., from a network receive). Call `commit_set`
+    /// to finalize the operation.
+    ///
+    /// # Benefits
+    ///
+    /// - Single allocation of exact size (vs growing coalesce buffer)
+    /// - Buffer is correctly sized before receive starts
+    /// - Avoids multiple extend() calls during network receive
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Parse header to learn value size
+    /// let (key, value_len) = parse_set_header(buffer)?;
+    ///
+    /// // Reserve space
+    /// let mut reservation = cache.begin_set(key, value_len, None)?;
+    ///
+    /// // Receive directly into reservation buffer
+    /// socket.recv_exact(reservation.value_mut())?;
+    ///
+    /// // Commit
+    /// cache.commit_set(reservation)?;
+    /// ```
+    fn begin_set(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        ttl: Option<Duration>,
+    ) -> Result<crate::SetReservation, CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        Ok(crate::SetReservation::new(key, value_len, &[], ttl))
+    }
+
+    /// Commit a two-phase SET operation.
+    ///
+    /// Writes the reservation's data to the cache. The reservation is consumed.
+    fn commit_set(&self, reservation: crate::SetReservation) -> Result<(), CacheError> {
+        let (key, value, _optional, ttl) = reservation.into_parts();
+        self.set(&key, &value, Some(ttl))
+    }
+
     /// Delete a key from the cache.
     ///
     /// Returns `true` if the key was present and deleted, `false` otherwise.
@@ -252,6 +297,51 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// Note: This may be a no-op for some implementations.
     fn flush(&self);
+
+    /// Begin a two-phase SET for zero-copy receive into segment memory.
+    ///
+    /// Returns a `SegmentReservation` with a mutable pointer to segment memory.
+    /// The caller writes the value directly to this memory, then calls
+    /// `commit_segment_set` to finalize.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `CacheError::Unsupported` - only TieredCache supports this.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut reservation = cache.begin_segment_set(key, value_len, ttl)?;
+    /// socket.recv_exact(reservation.value_mut())?;
+    /// cache.commit_segment_set(reservation)?;
+    /// ```
+    fn begin_segment_set(
+        &self,
+        _key: &[u8],
+        _value_len: usize,
+        _ttl: Option<Duration>,
+    ) -> Result<crate::SegmentReservation, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Commit a segment-based SET operation.
+    ///
+    /// Finalizes the segment write and updates the hashtable.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `CacheError::Unsupported` - only TieredCache supports this.
+    fn commit_segment_set(
+        &self,
+        _reservation: crate::SegmentReservation,
+    ) -> Result<(), CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Cancel a segment-based SET operation.
+    ///
+    /// Marks the reserved space as deleted. Call this if the receive fails.
+    fn cancel_segment_set(&self, _reservation: crate::SegmentReservation) {}
 }
 
 /// Default TTL used when None is provided (1 hour).

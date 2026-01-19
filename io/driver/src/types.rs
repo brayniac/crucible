@@ -593,6 +593,30 @@ impl std::str::FromStr for SendMode {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags for send operations.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct SendFlags: u32 {
+        /// Indicate more data is coming (MSG_MORE).
+        ///
+        /// When set, the kernel will not send a partial packet immediately,
+        /// waiting for more data to batch into fewer packets. This is useful
+        /// for pipelined responses where multiple sends should be combined.
+        ///
+        /// Usage:
+        /// - Set MORE on all sends except the last in a batch
+        /// - The kernel will combine the data into fewer TCP segments
+        /// - Reduces packet overhead for small sends
+        const MORE = 1 << 0;
+
+        /// Request zero-copy send if available.
+        ///
+        /// The kernel will DMA directly from userspace memory.
+        /// Not all backends support this.
+        const ZEROCOPY = 1 << 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

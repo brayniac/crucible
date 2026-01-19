@@ -136,6 +136,18 @@ pub struct UringConnection {
     pub use_single_recv: bool,
     /// User's destination buffer for single-shot recv.
     pub user_recv_buf: Option<(*mut u8, usize)>,
+    /// Whether a direct recv (into raw pointer) is pending.
+    pub direct_recv_pending: bool,
+    /// Raw pointer for direct recv (true zero-copy into segment memory).
+    pub direct_recv_ptr: Option<(*mut u8, usize)>,
+    /// Whether a TCP recvmsg is pending.
+    pub tcp_recvmsg_pending: bool,
+    /// iovec storage for TCP recvmsg (kept valid during async operation).
+    pub tcp_recvmsg_iovecs: [libc::iovec; MAX_TCP_RECVMSG_IOVECS],
+    /// Number of valid iovecs in tcp_recvmsg_iovecs.
+    pub tcp_recvmsg_iovec_count: usize,
+    /// msghdr for TCP recvmsg (must be kept alive during async operation).
+    pub tcp_recvmsg_msghdr: libc::msghdr,
     /// Number of consecutive re-arm failures for this connection.
     pub rearm_failures: u8,
 
@@ -143,6 +155,9 @@ pub struct UringConnection {
     /// Whether this connection is being closed.
     pub closing: bool,
 }
+
+/// Maximum number of iovecs for TCP recvmsg scatter-gather receive.
+pub const MAX_TCP_RECVMSG_IOVECS: usize = 4;
 
 // Safety: The user_recv_buf pointer points to memory owned by the Connection's
 // IoBuffer, which lives in the same slab slot. When the UringDriver is moved
@@ -168,6 +183,15 @@ impl UringConnection {
             single_recv_pending: false,
             use_single_recv: false,
             user_recv_buf: None,
+            direct_recv_pending: false,
+            direct_recv_ptr: None,
+            tcp_recvmsg_pending: false,
+            tcp_recvmsg_iovecs: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; MAX_TCP_RECVMSG_IOVECS],
+            tcp_recvmsg_iovec_count: 0,
+            tcp_recvmsg_msghdr: unsafe { std::mem::zeroed() },
             rearm_failures: 0,
             closing: false,
         }

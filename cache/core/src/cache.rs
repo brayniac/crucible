@@ -194,6 +194,36 @@ impl CacheLayer {
             CacheLayer::Ttl(layer) => layer.pool().pool_id(),
         }
     }
+
+    /// Begin a two-phase write operation for zero-copy receive.
+    pub fn begin_write_item(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+        ttl: Duration,
+    ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
+        match self {
+            CacheLayer::Fifo(layer) => layer.begin_write_item(key, value_len, optional, ttl),
+            CacheLayer::Ttl(layer) => layer.begin_write_item(key, value_len, optional, ttl),
+        }
+    }
+
+    /// Finalize a two-phase write operation.
+    pub fn finalize_write_item(&self, location: ItemLocation, item_size: u32) {
+        match self {
+            CacheLayer::Fifo(layer) => layer.finalize_write_item(location, item_size),
+            CacheLayer::Ttl(layer) => layer.finalize_write_item(location, item_size),
+        }
+    }
+
+    /// Cancel a two-phase write operation.
+    pub fn cancel_write_item(&self, location: ItemLocation) {
+        match self {
+            CacheLayer::Fifo(layer) => layer.cancel_write_item(location),
+            CacheLayer::Ttl(layer) => layer.cancel_write_item(location),
+        }
+    }
 }
 
 /// A tiered cache with multiple layers and a shared hashtable.
@@ -320,6 +350,112 @@ impl<H: Hashtable> TieredCache<H> {
         }
 
         Ok(())
+    }
+
+    /// Begin a two-phase SET for zero-copy receive.
+    ///
+    /// Reserves space in segment memory and returns a `SegmentReservation`
+    /// with a mutable pointer to the value area. The caller writes the value
+    /// directly to segment memory, then calls `commit_segment_set` to finalize.
+    ///
+    /// # Zero-Copy Receive Flow
+    ///
+    /// ```ignore
+    /// // 1. Reserve segment space
+    /// let mut reservation = cache.begin_segment_set(key, value_len, ttl)?;
+    ///
+    /// // 2. Receive value directly into segment memory
+    /// socket.recv_exact(reservation.value_mut())?;
+    ///
+    /// // 3. Commit to finalize and update hashtable
+    /// cache.commit_segment_set(reservation)?;
+    /// ```
+    ///
+    /// # Cancellation
+    ///
+    /// If the reservation is dropped without committing (e.g., connection
+    /// closed during receive), the reserved space is marked as deleted.
+    pub fn begin_segment_set(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        ttl: Duration,
+    ) -> CacheResult<crate::SegmentReservation> {
+        // Ensure we have space in Layer 0
+        self.ensure_space()?;
+
+        // Reserve space in Layer 0
+        let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
+        let (location, value_ptr, item_size) = layer.begin_write_item(key, value_len, &[], ttl)?;
+
+        // Create the reservation
+        // SAFETY: value_ptr points to valid segment memory that will remain
+        // valid until the reservation is committed or cancelled
+        Ok(unsafe {
+            crate::SegmentReservation::new(
+                location,
+                value_ptr,
+                value_len,
+                key.to_vec(),
+                ttl,
+                item_size,
+            )
+        })
+    }
+
+    /// Commit a two-phase SET operation.
+    ///
+    /// Finalizes the segment write and inserts the item into the hashtable.
+    /// The reservation is consumed.
+    pub fn commit_segment_set(
+        &self,
+        mut reservation: crate::SegmentReservation,
+    ) -> CacheResult<()> {
+        let location = reservation.location();
+        let item_size = reservation.item_size();
+
+        // Finalize the segment write
+        let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
+        layer.finalize_write_item(location, item_size);
+
+        // Create key verifier for hashtable operations
+        let verifier = self.create_key_verifier();
+
+        // Insert into hashtable (preserves ghost frequency if present)
+        match self
+            .hashtable
+            .insert(reservation.key(), location.to_location(), &verifier)
+        {
+            Ok(Some(old_location)) => {
+                // Key existed, mark old location as deleted
+                self.mark_deleted_at(old_location);
+            }
+            Ok(None) => {
+                // New key or ghost resurrection
+            }
+            Err(e) => {
+                // Hashtable full - mark item as deleted
+                layer.cancel_write_item(location);
+                return Err(e);
+            }
+        }
+
+        reservation.mark_committed();
+        Ok(())
+    }
+
+    /// Cancel a two-phase SET operation.
+    ///
+    /// Marks the reserved space as deleted. Called when a receive operation
+    /// fails (e.g., connection closed during value receive).
+    pub fn cancel_segment_set(&self, reservation: crate::SegmentReservation) {
+        if reservation.is_committed() {
+            return;
+        }
+
+        if let Some(layer) = self.layers.first() {
+            layer.cancel_write_item(reservation.location());
+        }
     }
 
     /// Store an item only if the key doesn't exist (ADD semantics).

@@ -2,7 +2,7 @@ local systemslab = import 'systemslab.libsonnet';
 
 local server_config = {
     // Runtime selection: "native" (io_uring/mio) or "tokio"
-    runtime: 'native',
+    runtime: 'tokio',
 
     workers: {
         threads: error 'threads must be specified',
@@ -83,7 +83,7 @@ function(
     git_ref='main',
 
     // Server parameters
-    cache_backend='s3fifo',
+    cache_backend='segcache',
     heap_size='8GB',
     segment_size='8MB',
     hashtable_power='20',

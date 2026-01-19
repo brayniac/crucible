@@ -1,12 +1,16 @@
 //! Per-connection state for the cache server.
 
 use bytes::{Bytes, BytesMut};
-use cache_core::{Cache, ValueRef};
+use cache_core::{Cache, CacheError, SegmentReservation, SetReservation, ValueRef};
 use io_driver::{RecvBuf, ZeroCopySend};
 use protocol_memcache::binary::{BinaryCommand, REQUEST_MAGIC};
 use protocol_memcache::{Command as MemcacheCommand, ParseError as MemcacheParseError};
-use protocol_resp::{Command as RespCommand, ParseError as RespParseError, ParseOptions};
+use protocol_resp::{
+    Command as RespCommand, ParseError as RespParseError, ParseOptions, ParseProgress,
+    STREAMING_THRESHOLD, parse_streaming,
+};
 use std::io::IoSlice;
+use std::time::Duration;
 
 use crate::config::ZeroCopyMode;
 use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
@@ -138,6 +142,30 @@ enum DetectedProtocol {
     MemcacheBinary,
 }
 
+/// State for streaming receive of large SET values.
+///
+/// When a SET command with a large value (>= STREAMING_THRESHOLD) is parsed,
+/// we reserve space and receive directly into it, avoiding the need for a
+/// growing coalesce buffer.
+enum StreamingState {
+    /// Normal mode - parse complete commands
+    None,
+    /// Receiving value data directly into segment memory (true zero-copy)
+    ReceivingSegment {
+        /// Reservation for segment memory
+        reservation: SegmentReservation,
+        /// Bytes received so far
+        received: usize,
+    },
+    /// Receiving value data into Vec buffer (fallback, one extra copy)
+    ReceivingVec {
+        /// Pre-allocated buffer for the value
+        reservation: SetReservation,
+        /// Bytes received so far
+        received: usize,
+    },
+}
+
 /// Per-connection state for the cache server.
 ///
 /// The connection no longer owns a read buffer - instead, data is accessed
@@ -151,6 +179,8 @@ pub struct Connection {
     resp_version: RespVersion,
     /// Parse options for RESP protocol (controls max value size, etc.)
     resp_parse_options: ParseOptions,
+    /// State for streaming receive of large SET values
+    streaming_state: StreamingState,
 }
 
 impl Connection {
@@ -163,6 +193,7 @@ impl Connection {
             should_close: false,
             resp_version: RespVersion::default(),
             resp_parse_options: ParseOptions::new().max_bulk_string_len(max_value_size),
+            streaming_state: StreamingState::None,
         }
     }
 
@@ -232,8 +263,8 @@ impl Connection {
     #[inline]
     fn process_resp_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
         loop {
-            let data = buf.as_slice();
-            if data.is_empty() {
+            // Check for empty buffer (use len() to avoid holding borrow)
+            if buf.len() == 0 {
                 break;
             }
 
@@ -242,12 +273,78 @@ impl Connection {
                 break;
             }
 
-            match RespCommand::parse_with_options(data, &self.resp_parse_options) {
-                Ok((cmd, consumed)) => {
+            // Check if we're in the middle of receiving a large value
+            // This must be checked before we borrow data for parsing
+            if self.continue_streaming_recv(buf, cache) {
+                // Still receiving value data, or completed a streaming SET
+                continue;
+            }
+
+            // Normal command parsing with streaming support
+            // Now safe to borrow data since streaming check is complete
+            let data = buf.as_slice();
+            match parse_streaming(data, &self.resp_parse_options, STREAMING_THRESHOLD) {
+                Ok(ParseProgress::Complete(cmd, consumed)) => {
                     execute_resp(&cmd, cache, &mut self.write_buf, &mut self.resp_version);
                     buf.consume(consumed);
                 }
-                Err(RespParseError::Incomplete) => break,
+                Ok(ParseProgress::NeedValue {
+                    header,
+                    value_len,
+                    value_prefix,
+                    header_consumed,
+                }) => {
+                    // Extract all values from header before we consume the buffer
+                    // (header borrows from data which borrows from buf)
+                    let ttl = header.ttl().unwrap_or(Duration::from_secs(3600));
+                    let key = header.key.to_vec(); // Copy key before consuming
+                    let prefix_len = value_prefix.len();
+
+                    // Try segment-based reservation first (true zero-copy)
+                    match cache.begin_segment_set(&key, value_len, Some(ttl)) {
+                        Ok(mut reservation) => {
+                            // Copy any value bytes already in the buffer
+                            if prefix_len > 0 {
+                                reservation.value_mut()[..prefix_len].copy_from_slice(value_prefix);
+                            }
+
+                            // Consume the header + prefix
+                            buf.consume(header_consumed + prefix_len);
+
+                            // Transition to segment-based streaming
+                            self.streaming_state = StreamingState::ReceivingSegment {
+                                reservation,
+                                received: prefix_len,
+                            };
+                        }
+                        Err(CacheError::Unsupported) => {
+                            // Fall back to Vec-based reservation (one extra copy)
+                            let mut reservation = SetReservation::new(&key, value_len, &[], ttl);
+
+                            // Copy any value bytes already in the buffer
+                            if prefix_len > 0 {
+                                reservation.value_mut()[..prefix_len].copy_from_slice(value_prefix);
+                            }
+
+                            // Consume the header + prefix
+                            buf.consume(header_consumed + prefix_len);
+
+                            // Transition to Vec-based streaming
+                            self.streaming_state = StreamingState::ReceivingVec {
+                                reservation,
+                                received: prefix_len,
+                            };
+                        }
+                        Err(e) => {
+                            // Cache error (out of memory, etc.)
+                            buf.consume(header_consumed + prefix_len);
+                            self.write_buf.extend_from_slice(b"-ERR ");
+                            self.write_buf.extend_from_slice(e.to_string().as_bytes());
+                            self.write_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+                Ok(ParseProgress::Incomplete) => break,
                 Err(e) => {
                     PROTOCOL_ERRORS.increment();
                     let msg = e.to_string();
@@ -260,11 +357,129 @@ impl Connection {
                         self.write_buf.extend_from_slice(msg.as_bytes());
                         self.write_buf.extend_from_slice(b"\r\n");
                     }
+                    // Reset streaming state on error
+                    self.streaming_state = StreamingState::None;
                     // Consume all remaining data on error
                     let len = buf.len();
                     buf.consume(len);
                     break;
                 }
+            }
+        }
+    }
+
+    /// Continue receiving value data for a streaming SET.
+    ///
+    /// Returns true if we were in streaming mode (regardless of completion).
+    #[inline]
+    fn continue_streaming_recv<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) -> bool {
+        match &mut self.streaming_state {
+            StreamingState::None => false,
+            StreamingState::ReceivingSegment {
+                reservation,
+                received,
+            } => {
+                let value_len = reservation.value_len();
+                let remaining = value_len - *received;
+                let data = buf.as_slice();
+
+                if data.len() < remaining {
+                    // Not enough data yet - copy what we have to segment memory
+                    let to_copy = data.len();
+                    reservation.value_mut()[*received..*received + to_copy]
+                        .copy_from_slice(&data[..to_copy]);
+                    *received += to_copy;
+                    buf.consume(to_copy);
+                    return true;
+                }
+
+                // We have all the value bytes - copy to segment memory
+                reservation.value_mut()[*received..value_len].copy_from_slice(&data[..remaining]);
+                buf.consume(remaining);
+
+                // Check for trailing CRLF
+                let trailing = buf.as_slice();
+                if trailing.len() < 2 {
+                    *received = value_len;
+                    return true;
+                }
+
+                if &trailing[..2] != b"\r\n" {
+                    PROTOCOL_ERRORS.increment();
+                    self.write_buf
+                        .extend_from_slice(b"-ERR Protocol error: expected CRLF after value\r\n");
+                    // Cancel the segment reservation
+                    let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                    if let StreamingState::ReceivingSegment { reservation, .. } = state {
+                        cache.cancel_segment_set(reservation);
+                    }
+                    return true;
+                }
+                buf.consume(2);
+
+                // Extract reservation and commit
+                let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                if let StreamingState::ReceivingSegment { reservation, .. } = state {
+                    if let Err(_e) = cache.commit_segment_set(reservation) {
+                        self.write_buf
+                            .extend_from_slice(b"-ERR Failed to store value\r\n");
+                    } else {
+                        self.write_buf.extend_from_slice(b"+OK\r\n");
+                    }
+                }
+
+                true
+            }
+            StreamingState::ReceivingVec {
+                reservation,
+                received,
+            } => {
+                let value_len = reservation.value_len();
+                let remaining = value_len - *received;
+                let data = buf.as_slice();
+
+                if data.len() < remaining {
+                    // Not enough data yet - copy what we have
+                    let to_copy = data.len();
+                    reservation.value_mut()[*received..*received + to_copy]
+                        .copy_from_slice(&data[..to_copy]);
+                    *received += to_copy;
+                    buf.consume(to_copy);
+                    return true;
+                }
+
+                // We have all the value bytes
+                reservation.value_mut()[*received..value_len].copy_from_slice(&data[..remaining]);
+                buf.consume(remaining);
+
+                // Check for trailing CRLF
+                let trailing = buf.as_slice();
+                if trailing.len() < 2 {
+                    *received = value_len;
+                    return true;
+                }
+
+                if &trailing[..2] != b"\r\n" {
+                    PROTOCOL_ERRORS.increment();
+                    self.write_buf
+                        .extend_from_slice(b"-ERR Protocol error: expected CRLF after value\r\n");
+                    self.streaming_state = StreamingState::None;
+                    return true;
+                }
+                buf.consume(2);
+
+                // Extract reservation and commit (Vec-based uses commit_set)
+                let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
+                if let StreamingState::ReceivingVec { reservation, .. } = state {
+                    if let Err(_e) = cache.commit_set(reservation) {
+                        self.write_buf
+                            .extend_from_slice(b"-ERR Failed to store value\r\n");
+                    } else {
+                        self.write_buf.extend_from_slice(b"+OK\r\n");
+                    }
+                }
+
+                true
             }
         }
     }

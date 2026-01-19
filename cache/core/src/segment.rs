@@ -292,6 +292,77 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
         expire_at: u32,
     ) -> Option<u32>;
 
+    /// Begin a two-phase append operation (for zero-copy receive).
+    ///
+    /// This reserves space and writes the header, optional, and key,
+    /// returning a mutable pointer to the value area. The caller must:
+    /// 1. Write exactly `value_len` bytes to the returned pointer
+    /// 2. Call `finalize_append` to complete the operation
+    ///
+    /// If the caller doesn't complete the operation (e.g., connection closes),
+    /// the item will have garbage in the value but the segment remains valid.
+    /// Use `mark_deleted_at_offset` to clean up incomplete items.
+    ///
+    /// # Parameters
+    /// - `key`: The item's key
+    /// - `value_len`: Size of value to reserve (caller will write this many bytes)
+    /// - `optional`: Optional metadata
+    /// - `expire_at`: Expiration time as coarse seconds since epoch
+    ///
+    /// # Returns
+    /// `Some((offset, item_size, value_ptr))` where:
+    /// - `offset` is the item offset within the segment
+    /// - `item_size` is the padded item size (for use with `finalize_append`)
+    /// - `value_ptr` points to the reserved value area
+    ///
+    /// Returns `None` if the segment is full.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid until the segment is cleared. The caller must:
+    /// - Write exactly `value_len` bytes to the pointer
+    /// - Not hold the pointer beyond the segment's lifetime
+    fn begin_append_with_ttl(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+        expire_at: u32,
+    ) -> Option<(u32, u32, *mut u8)>;
+
+    /// Begin a two-phase append operation for segments without per-item TTL.
+    ///
+    /// This is similar to `begin_append_with_ttl` but uses `BasicHeader` instead
+    /// of `TtlHeader`. Used by TtlLayer where TTL is tracked at segment level.
+    ///
+    /// # Parameters
+    /// - `key`: The item's key
+    /// - `value_len`: Size of value to reserve
+    /// - `optional`: Optional metadata
+    ///
+    /// # Returns
+    /// `Some((offset, item_size, value_ptr))` - see `begin_append_with_ttl` for details.
+    fn begin_append(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+    ) -> Option<(u32, u32, *mut u8)>;
+
+    /// Finalize a two-phase append operation.
+    ///
+    /// Called after writing the value data to complete the append.
+    /// Updates live_items and live_bytes statistics.
+    ///
+    /// # Parameters
+    /// - `item_size`: Total padded item size (from begin_append_with_ttl)
+    fn finalize_append(&self, item_size: u32);
+
+    /// Mark an item as deleted at a given offset (without key verification).
+    ///
+    /// Used for cleanup of incomplete two-phase appends.
+    fn mark_deleted_at_offset(&self, offset: u32);
+
     /// Mark an item as deleted.
     ///
     /// Decrements `live_items` and `live_bytes` if successful.

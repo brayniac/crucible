@@ -459,6 +459,27 @@ impl Cache for S3FifoCache {
     fn flush(&self) {
         // No-op: S3FifoCache doesn't support flushing individual items
     }
+
+    fn begin_segment_set(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        ttl: Option<Duration>,
+    ) -> Result<cache_core::SegmentReservation, CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        self.inner.begin_segment_set(key, value_len, ttl)
+    }
+
+    fn commit_segment_set(
+        &self,
+        reservation: cache_core::SegmentReservation,
+    ) -> Result<(), CacheError> {
+        self.inner.commit_segment_set(reservation)
+    }
+
+    fn cancel_segment_set(&self, reservation: cache_core::SegmentReservation) {
+        self.inner.cancel_segment_set(reservation);
+    }
 }
 
 #[cfg(test)]

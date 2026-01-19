@@ -23,6 +23,7 @@ use crate::types::{
 };
 use crate::udp::{self, CMSG_BUFFER_SIZE};
 use crate::zero_copy::BoxedZeroCopy;
+use arrayvec::ArrayVec;
 use buf_ring::BufRing;
 use connection::UringConnection;
 use io_uring::cqueue;
@@ -50,16 +51,23 @@ const OP_UDP_RECVMSG: u64 = 5;
 const OP_UDP_SENDMSG: u64 = 6;
 const OP_SENDMSG: u64 = 7; // TCP scatter-gather send
 const OP_ZC_SENDMSG: u64 = 8; // Zero-copy sendmsg via send_owned
+const OP_DIRECT_RECV: u64 = 9; // Zero-copy recv into raw pointer
+const OP_TCP_RECVMSG: u64 = 10; // TCP scatter-gather recvmsg
+
+/// Maximum number of iovecs for zero-copy sends.
+/// 8 covers typical responses (header + value + trailer = 3) with room to spare.
+const MAX_ZC_IOVECS: usize = 8;
 
 /// Pending zero-copy send that owns the buffer and supporting structures.
 ///
 /// Stored in a Slab for O(1) allocation without heap boxing per send.
 /// The buffer owns the data (e.g., holds ItemRef), and iovecs point into it.
+/// Uses ArrayVec for inline iovec storage, avoiding heap allocation.
 struct PendingZcSend {
     /// The buffer being sent (owns the data, e.g., holds ItemRef).
     buffer: BoxedZeroCopy,
-    /// iovec array pointing into buffer's data.
-    iovecs: Vec<libc::iovec>,
+    /// iovec array pointing into buffer's data (inline, no heap allocation).
+    iovecs: ArrayVec<libc::iovec, MAX_ZC_IOVECS>,
     /// msghdr for sendmsg.
     msghdr: libc::msghdr,
 }
@@ -377,7 +385,23 @@ impl UringDriver {
         buf_idx: u8,
         data: &[u8],
     ) -> io::Result<()> {
-        let send_op = SendZc::new(Fixed(fixed_slot), data.as_ptr(), data.len() as u32)
+        self.submit_send_zc_flags(conn_id, fixed_slot, buf_idx, data, 0)
+    }
+
+    /// Submit a SendZc operation with optional flags (MSG_MORE, etc).
+    fn submit_send_zc_flags(
+        &mut self,
+        conn_id: usize,
+        fixed_slot: u32,
+        buf_idx: u8,
+        data: &[u8],
+        msg_flags: i32,
+    ) -> io::Result<()> {
+        let mut send_builder = SendZc::new(Fixed(fixed_slot), data.as_ptr(), data.len() as u32);
+        if msg_flags != 0 {
+            send_builder = send_builder.flags(msg_flags as u32);
+        }
+        let send_op = send_builder
             .build()
             .user_data(encode_user_data(conn_id, 0, buf_idx, OP_SEND));
 
@@ -467,6 +491,16 @@ impl UringDriver {
 
                 // Emit completion notification
                 self.handle_send(conn_id, slab_idx as usize, result, flags);
+            }
+            OP_DIRECT_RECV => {
+                // Zero-copy recv directly into user memory (e.g., segment)
+                let (conn_id, generation, _, _) = decode_user_data(user_data);
+                self.handle_direct_recv(conn_id, generation, result);
+            }
+            OP_TCP_RECVMSG => {
+                // TCP scatter-gather recvmsg completion
+                let (conn_id, generation, _, _) = decode_user_data(user_data);
+                self.handle_tcp_recvmsg(conn_id, generation, result);
             }
             _ => {}
         }
@@ -666,6 +700,111 @@ impl UringDriver {
             }));
 
         // Note: next recv is submitted in poll() to handle SQ full cases
+    }
+
+    /// Handle completion of a direct recv (zero-copy into user memory).
+    ///
+    /// Unlike single_recv which uses pooled buffers, direct_recv writes
+    /// directly to user-provided memory (e.g., segment memory for cache SET).
+    /// No data copying is needed - just report the result.
+    fn handle_direct_recv(&mut self, conn_id: usize, generation: u32, result: i32) {
+        // Check if this is a stale completion
+        let conn = match self.connections.get_mut(conn_id) {
+            Some(c) if c.generation == generation => c,
+            Some(_) => {
+                // Stale completion - the connection was reused
+                return;
+            }
+            None => {
+                // Connection doesn't exist anymore
+                return;
+            }
+        };
+
+        // Clear pending flag and pointer
+        conn.direct_recv_pending = false;
+        let _direct_ptr = conn.direct_recv_ptr.take();
+
+        // Create ConnId with generation for completions
+        let full_conn_id = ConnId::with_generation(conn_id, generation);
+
+        if result == 0 {
+            // EOF - peer closed connection
+            // Caller is responsible for cleaning up any reservation
+            self.pending_completions
+                .push(Completion::new(CompletionKind::Closed {
+                    conn_id: full_conn_id,
+                }));
+            return;
+        }
+
+        if result < 0 {
+            // Recv error - caller should cancel any pending reservation
+            self.pending_completions
+                .push(Completion::new(CompletionKind::Error {
+                    conn_id: full_conn_id,
+                    error: io::Error::from_raw_os_error(-result),
+                }));
+            return;
+        }
+
+        // Success - data was written directly to user memory (true zero-copy)
+        let bytes = result as usize;
+        self.pending_completions
+            .push(Completion::new(CompletionKind::RecvComplete {
+                conn_id: full_conn_id,
+                bytes,
+            }));
+    }
+
+    /// Handle completion of a TCP recvmsg (scatter-gather receive).
+    fn handle_tcp_recvmsg(&mut self, conn_id: usize, generation: u32, result: i32) {
+        // Check if this is a stale completion
+        let conn = match self.connections.get_mut(conn_id) {
+            Some(c) if c.generation == generation => c,
+            Some(_) => {
+                // Stale completion - the connection was reused
+                return;
+            }
+            None => {
+                // Connection doesn't exist anymore
+                return;
+            }
+        };
+
+        // Clear pending flag and state
+        conn.tcp_recvmsg_pending = false;
+        conn.tcp_recvmsg_iovec_count = 0;
+
+        // Create ConnId with generation for completions
+        let full_conn_id = ConnId::with_generation(conn_id, generation);
+
+        if result == 0 {
+            // EOF - peer closed connection
+            self.pending_completions
+                .push(Completion::new(CompletionKind::Closed {
+                    conn_id: full_conn_id,
+                }));
+            return;
+        }
+
+        if result < 0 {
+            // Recv error
+            self.pending_completions
+                .push(Completion::new(CompletionKind::Error {
+                    conn_id: full_conn_id,
+                    error: io::Error::from_raw_os_error(-result),
+                }));
+            return;
+        }
+
+        // Success - data was written to user's iovecs
+        let bytes = result as usize;
+        self.pending_completions
+            .push(Completion::new(CompletionKind::RecvComplete {
+                conn_id: full_conn_id,
+                bytes,
+            }));
     }
 
     fn handle_send(&mut self, conn_id: usize, slot: usize, result: i32, flags: u32) {
@@ -1446,6 +1585,45 @@ impl IoDriver for UringDriver {
         Ok(total_len)
     }
 
+    fn send_with_flags(
+        &mut self,
+        id: ConnId,
+        data: &[u8],
+        flags: crate::types::SendFlags,
+    ) -> io::Result<usize> {
+        let conn_id = id.slot();
+        let conn = self
+            .connections
+            .get_mut(conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Don't allow sending to closing connections
+        if conn.closing {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection is closing",
+            ));
+        }
+
+        // Convert SendFlags to libc flags
+        let mut msg_flags = 0;
+        if flags.contains(crate::types::SendFlags::MORE) {
+            msg_flags |= libc::MSG_MORE;
+        }
+
+        // Queue data in fragmentation buffer
+        conn.queue_send(data);
+
+        // Try to start sending if slots available
+        if let Some((slot, ptr, len)) = conn.prepare_send() {
+            let fixed_slot = conn.fixed_slot;
+            let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+            self.submit_send_zc_flags(conn_id, fixed_slot, slot, send_data, msg_flags)?;
+        }
+
+        Ok(data.len())
+    }
+
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize> {
         // Note: Prefer with_recv_buf() for zero-copy access.
         // This method copies data from recv_state to the provided buffer.
@@ -1547,6 +1725,118 @@ impl IoDriver for UringDriver {
         Ok(())
     }
 
+    fn submit_recv_into(&mut self, id: ConnId, ptr: *mut u8, len: usize) -> io::Result<()> {
+        let conn_id = id.slot();
+        let conn = self
+            .connections
+            .get_mut(conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Only one recv can be pending at a time
+        if conn.single_recv_pending || conn.direct_recv_pending {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Mark this connection as using direct recv mode
+        conn.use_single_recv = true;
+
+        let fixed_slot = conn.fixed_slot;
+        let generation = conn.generation;
+
+        // Store the direct pointer for validation on completion
+        conn.direct_recv_ptr = Some((ptr, len));
+
+        // Submit recv directly to user's pointer (true zero-copy)
+        // Uses standard user_data encoding since we don't need pool buffer tracking
+        let recv_op = opcode::Recv::new(Fixed(fixed_slot), ptr, len as u32)
+            .build()
+            .user_data(encode_user_data(conn_id, generation, 0, OP_DIRECT_RECV));
+
+        unsafe {
+            if self.ring.submission().push(&recv_op).is_err() {
+                // Failed to submit - clear state
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.direct_recv_ptr = None;
+                }
+                return Err(io::Error::other("SQ full"));
+            }
+        }
+
+        // Mark recv as pending
+        if let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.direct_recv_pending = true;
+        }
+
+        Ok(())
+    }
+
+    fn submit_recvmsg_tcp(&mut self, id: ConnId, iovecs: &[libc::iovec]) -> io::Result<()> {
+        use connection::MAX_TCP_RECVMSG_IOVECS;
+
+        let conn_id = id.slot();
+        let conn = self
+            .connections
+            .get_mut(conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Check for too many iovecs
+        if iovecs.len() > MAX_TCP_RECVMSG_IOVECS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "too many iovecs ({} > {})",
+                    iovecs.len(),
+                    MAX_TCP_RECVMSG_IOVECS
+                ),
+            ));
+        }
+
+        // Only one recv can be pending at a time
+        if conn.single_recv_pending || conn.direct_recv_pending || conn.tcp_recvmsg_pending {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Mark this connection as using single-shot mode (disables multishot)
+        conn.use_single_recv = true;
+
+        let fixed_slot = conn.fixed_slot;
+        let generation = conn.generation;
+
+        // Copy iovecs to connection-owned storage (they must outlive the async op)
+        conn.tcp_recvmsg_iovec_count = iovecs.len();
+        conn.tcp_recvmsg_iovecs[..iovecs.len()].copy_from_slice(iovecs);
+
+        // Set up msghdr pointing to our stored iovecs
+        conn.tcp_recvmsg_msghdr = unsafe { std::mem::zeroed() };
+        conn.tcp_recvmsg_msghdr.msg_iov = conn.tcp_recvmsg_iovecs.as_mut_ptr();
+        conn.tcp_recvmsg_msghdr.msg_iovlen = iovecs.len() as _;
+
+        // Get pointer to msghdr (it's stored in connection, so outlives the call)
+        let msghdr_ptr = &conn.tcp_recvmsg_msghdr as *const libc::msghdr;
+
+        // Submit recvmsg operation
+        let recvmsg_op = opcode::RecvMsg::new(Fixed(fixed_slot), msghdr_ptr as *mut _)
+            .build()
+            .user_data(encode_user_data(conn_id, generation, 0, OP_TCP_RECVMSG));
+
+        unsafe {
+            if self.ring.submission().push(&recvmsg_op).is_err() {
+                // Failed to submit - clear state
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.tcp_recvmsg_iovec_count = 0;
+                }
+                return Err(io::Error::other("SQ full"));
+            }
+        }
+
+        // Mark recvmsg as pending
+        if let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.tcp_recvmsg_pending = true;
+        }
+
+        Ok(())
+    }
+
     fn with_recv_buf(&mut self, id: ConnId, f: &mut dyn FnMut(&mut dyn RecvBuf)) -> io::Result<()> {
         // Collect pending returns after running callback
         let pending_returns: Vec<_> = {
@@ -1606,12 +1896,18 @@ impl IoDriver for UringDriver {
         // Re-arm recv for connections that need it
         // This handles both single-shot mode (no pending recv) and multishot mode
         // (multishot deactivated due to re-arm failure)
+        // Skip connections with direct_recv_pending or tcp_recvmsg_pending - they manage their own recv
         // Reuse scratch buffer to avoid allocation
         self.rearm_scratch.clear();
         self.rearm_scratch.extend(
             self.connections
                 .iter()
-                .filter(|(_, c)| !c.single_recv_pending && !c.multishot_active)
+                .filter(|(_, c)| {
+                    !c.single_recv_pending
+                        && !c.multishot_active
+                        && !c.direct_recv_pending
+                        && !c.tcp_recvmsg_pending
+                })
                 .map(|(id, c)| (id, c.generation, c.fixed_slot, c.rearm_failures)),
         );
 
@@ -1978,9 +2274,15 @@ impl IoDriver for UringDriver {
         let fixed_slot = conn.fixed_slot;
         let total_len = buffer.total_len();
 
-        // Build iovecs from buffer's slices
+        // Build iovecs from buffer's slices (inline storage, no heap allocation)
         let slices = buffer.io_slices();
-        let iovecs: Vec<libc::iovec> = slices
+        if slices.len() > MAX_ZC_IOVECS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("too many iovecs: {} > {}", slices.len(), MAX_ZC_IOVECS),
+            ));
+        }
+        let iovecs: ArrayVec<libc::iovec, MAX_ZC_IOVECS> = slices
             .iter()
             .map(|s| libc::iovec {
                 iov_base: s.as_ptr() as *mut _,

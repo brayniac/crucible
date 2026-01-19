@@ -154,6 +154,34 @@ pub trait IoDriver: Send {
     /// - `Err(other)` - An error occurred
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize>;
 
+    /// Send data with flags.
+    ///
+    /// Like `send()` but allows specifying flags like `MSG_MORE` to indicate
+    /// more data is coming, enabling the kernel to batch multiple sends into
+    /// fewer TCP packets.
+    ///
+    /// # Example: Pipelined Responses
+    ///
+    /// ```ignore
+    /// // Send multiple responses, batching into fewer packets
+    /// driver.send_with_flags(conn_id, &response1, SendFlags::MORE)?;
+    /// driver.send_with_flags(conn_id, &response2, SendFlags::MORE)?;
+    /// driver.send_with_flags(conn_id, &response3, SendFlags::empty())?; // last
+    /// ```
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `send()`, ignoring flags.
+    fn send_with_flags(
+        &mut self,
+        id: ConnId,
+        data: &[u8],
+        flags: crate::types::SendFlags,
+    ) -> io::Result<usize> {
+        let _ = flags;
+        self.send(id, data)
+    }
+
     /// Send multiple buffers as a single vectored write.
     ///
     /// This is useful for scatter-gather I/O, particularly for sending
@@ -182,6 +210,23 @@ pub trait IoDriver: Send {
             combined.extend_from_slice(buf);
         }
         self.send(id, &combined)
+    }
+
+    /// Send multiple buffers with flags.
+    ///
+    /// Like `send_vectored()` but allows specifying flags like `MSG_MORE`.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `send_vectored()`, ignoring flags.
+    fn send_vectored_with_flags(
+        &mut self,
+        id: ConnId,
+        bufs: &[IoSlice<'_>],
+        flags: crate::types::SendFlags,
+    ) -> io::Result<usize> {
+        let _ = flags;
+        self.send_vectored(id, bufs)
     }
 
     /// Send multiple owned buffers as a single scatter-gather operation.
@@ -326,6 +371,110 @@ pub trait IoDriver: Send {
     /// - **io_uring**: Submits a single-shot recv with the provided buffer
     /// - **mio**: Falls back to returning `Err(Unsupported)` - use `recv()` instead
     fn submit_recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Submit an async recv operation directly into a raw pointer.
+    ///
+    /// This is the true zero-copy recv API. Data is received directly into
+    /// the provided memory without any intermediate copies. This is ideal for
+    /// receiving large values directly into cache segment memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - `ptr` points to valid, writable memory of at least `len` bytes
+    /// - The memory remains valid until either:
+    ///   - A `RecvComplete` completion is received for this connection
+    ///   - A `Closed` or `Error` completion is received for this connection
+    ///
+    /// On disconnect or error, the caller is responsible for cleaning up
+    /// any reservation (e.g., calling `cache.cancel_segment_set()`).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - The recv was submitted successfully
+    /// - `Err(WouldBlock)` - A recv is already pending for this connection
+    /// - `Err(Unsupported)` - Backend doesn't support direct recv (use `recv()`)
+    /// - `Err(other)` - An error occurred
+    ///
+    /// # Completion
+    ///
+    /// When data is received, a `RecvComplete { conn_id, bytes }` completion
+    /// is emitted. If `bytes` is 0, the peer closed the connection and the
+    /// caller should cancel any pending reservation.
+    ///
+    /// # Backend Support
+    ///
+    /// - **io_uring**: Submits a single-shot recv directly to the pointer
+    /// - **mio**: Returns `Err(Unsupported)` - use `recv()` instead
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Reserve space in segment memory
+    /// let mut reservation = cache.begin_segment_set(key, value_len, ttl)?;
+    ///
+    /// // Receive directly into segment memory
+    /// let ptr = reservation.value_mut().as_mut_ptr();
+    /// driver.submit_recv_into(conn_id, ptr, remaining_len)?;
+    ///
+    /// // On RecvComplete:
+    /// //   - If bytes > 0: data is now in segment memory
+    /// //   - If bytes == 0 or Error: call cache.cancel_segment_set(reservation)
+    /// ```
+    fn submit_recv_into(&mut self, id: ConnId, ptr: *mut u8, len: usize) -> io::Result<()>;
+
+    /// Submit an async scatter-gather receive for TCP connections.
+    ///
+    /// This allows receiving data into multiple non-contiguous buffers,
+    /// which is useful for protocols with fixed-size headers followed by
+    /// variable-length values. The header can be received into a small
+    /// stack buffer while the value goes directly into segment memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all iovec buffers remain valid until either:
+    /// - A `RecvComplete` completion is received
+    /// - A `Closed` or `Error` completion is received
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Connection identifier
+    /// * `iovecs` - Array of iovec structures describing receive buffers
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - The recvmsg was submitted successfully
+    /// - `Err(WouldBlock)` - A recv is already pending
+    /// - `Err(Unsupported)` - Backend doesn't support recvmsg
+    ///
+    /// # Completion
+    ///
+    /// Emits `RecvComplete { conn_id, bytes }` where bytes is the total
+    /// received across all iovecs. Data is filled starting from the first
+    /// iovec; subsequent iovecs are filled only after earlier ones are full.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Receive header into stack buffer, value into segment
+    /// let mut header = [0u8; 64];
+    /// let iovecs = [
+    ///     libc::iovec { iov_base: header.as_mut_ptr() as _, iov_len: header.len() },
+    ///     libc::iovec { iov_base: reservation.value_mut().as_mut_ptr() as _, iov_len: value_len },
+    /// ];
+    /// driver.submit_recvmsg_tcp(conn_id, &iovecs)?;
+    /// ```
+    ///
+    /// # Backend Support
+    ///
+    /// - **io_uring**: Uses IORING_OP_RECVMSG
+    /// - **mio**: Returns `Err(Unsupported)` - use synchronous `readv()` after Recv completion
+    fn submit_recvmsg_tcp(&mut self, _id: ConnId, _iovecs: &[libc::iovec]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "submit_recvmsg_tcp not supported",
+        ))
+    }
 
     // === Event loop ===
 

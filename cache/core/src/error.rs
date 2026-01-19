@@ -54,6 +54,9 @@ pub enum CacheError {
 
     /// Segment is not in an accessible state for the operation.
     SegmentNotAccessible,
+
+    /// Operation not supported by this cache implementation.
+    Unsupported,
 }
 
 impl fmt::Display for CacheError {
@@ -75,6 +78,7 @@ impl fmt::Display for CacheError {
             Self::Corrupted => write!(f, "data corrupted"),
             Self::KeyMismatch => write!(f, "key mismatch"),
             Self::SegmentNotAccessible => write!(f, "segment not accessible"),
+            Self::Unsupported => write!(f, "operation not supported"),
         }
     }
 }

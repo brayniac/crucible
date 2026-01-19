@@ -995,6 +995,149 @@ impl Segment for SliceSegment<'_> {
         self.append_with_header(key, value, optional, &header_bytes, TtlHeader::SIZE)
     }
 
+    fn begin_append_with_ttl(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+        expire_at: u32,
+    ) -> Option<(u32, u32, *mut u8)> {
+        assert!(
+            self.is_per_item_ttl(),
+            "begin_append_with_ttl requires per-item TTL segments"
+        );
+        assert!(!key.is_empty() && key.len() <= TtlHeader::MAX_KEY_LEN);
+        assert!(optional.len() <= TtlHeader::MAX_OPTIONAL_LEN);
+        assert!(value_len <= TtlHeader::MAX_VALUE_LEN);
+
+        let header = TtlHeader::new(
+            key.len() as u8,
+            optional.len() as u8,
+            value_len as u32,
+            expire_at,
+        );
+
+        let mut header_bytes = [0u8; TtlHeader::SIZE];
+        header.to_bytes(&mut header_bytes);
+
+        let item_size = TtlHeader::SIZE + optional.len() + key.len() + value_len;
+        let padded_size = (item_size + 7) & !7; // 8-byte alignment
+
+        let offset = self.reserve_space(padded_size as u32)?;
+
+        // Write header + optional + key (but NOT value)
+        unsafe {
+            let mut ptr = self.data.as_ptr().add(offset as usize);
+
+            // Write header
+            std::ptr::copy_nonoverlapping(header_bytes.as_ptr(), ptr, TtlHeader::SIZE);
+            ptr = ptr.add(TtlHeader::SIZE);
+
+            // Write optional
+            if !optional.is_empty() {
+                std::ptr::copy_nonoverlapping(optional.as_ptr(), ptr, optional.len());
+                ptr = ptr.add(optional.len());
+            }
+
+            // Write key
+            std::ptr::copy_nonoverlapping(key.as_ptr(), ptr, key.len());
+            ptr = ptr.add(key.len());
+
+            // Return (offset, item_size, value_ptr)
+            Some((offset, padded_size as u32, ptr))
+        }
+    }
+
+    fn begin_append(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+    ) -> Option<(u32, u32, *mut u8)> {
+        assert!(
+            !self.is_per_item_ttl(),
+            "begin_append requires non-per-item-TTL segments"
+        );
+        assert!(!key.is_empty() && key.len() <= BasicHeader::MAX_KEY_LEN);
+        assert!(optional.len() <= BasicHeader::MAX_OPTIONAL_LEN);
+        assert!(value_len <= BasicHeader::MAX_VALUE_LEN);
+
+        let header = BasicHeader::new(key.len() as u8, optional.len() as u8, value_len as u32);
+
+        let mut header_bytes = [0u8; BasicHeader::SIZE];
+        header.to_bytes(&mut header_bytes);
+
+        let item_size = BasicHeader::SIZE + optional.len() + key.len() + value_len;
+        let padded_size = (item_size + 7) & !7; // 8-byte alignment
+
+        let offset = self.reserve_space(padded_size as u32)?;
+
+        // Write header + optional + key (but NOT value)
+        unsafe {
+            let mut ptr = self.data.as_ptr().add(offset as usize);
+
+            // Write header
+            std::ptr::copy_nonoverlapping(header_bytes.as_ptr(), ptr, BasicHeader::SIZE);
+            ptr = ptr.add(BasicHeader::SIZE);
+
+            // Write optional
+            if !optional.is_empty() {
+                std::ptr::copy_nonoverlapping(optional.as_ptr(), ptr, optional.len());
+                ptr = ptr.add(optional.len());
+            }
+
+            // Write key
+            std::ptr::copy_nonoverlapping(key.as_ptr(), ptr, key.len());
+            ptr = ptr.add(key.len());
+
+            // Return (offset, item_size, value_ptr)
+            Some((offset, padded_size as u32, ptr))
+        }
+    }
+
+    fn finalize_append(&self, item_size: u32) {
+        fence(Ordering::Release);
+
+        // Update statistics
+        self.live_items.fetch_add(1, Ordering::Relaxed);
+        self.live_bytes.fetch_add(item_size, Ordering::Relaxed);
+    }
+
+    fn mark_deleted_at_offset(&self, offset: u32) {
+        let header_size = if self.is_per_item_ttl() {
+            TtlHeader::SIZE
+        } else {
+            BasicHeader::SIZE
+        };
+
+        if offset as usize + header_size > self.capacity as usize {
+            return;
+        }
+
+        // Set deleted flag (byte 4, bit 6) without key verification
+        let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+        let flags_ptr = unsafe { data_ptr.add(4) };
+
+        #[cfg(not(feature = "loom"))]
+        {
+            let flags_atomic = unsafe { &*(flags_ptr as *const AtomicU8) };
+            flags_atomic.fetch_or(0x40, Ordering::Release);
+        }
+
+        #[cfg(feature = "loom")]
+        {
+            fence(Ordering::Release);
+            let old_val = unsafe { std::ptr::read_volatile(flags_ptr) };
+            unsafe {
+                std::ptr::write_volatile(flags_ptr, old_val | 0x40);
+            }
+        }
+
+        // Note: We don't update live_items/live_bytes here because we don't
+        // know the full item size. The segment will be cleaned up eventually
+        // through normal eviction.
+    }
+
     fn mark_deleted(&self, offset: u32, key: &[u8]) -> Result<bool, CacheError> {
         let current_state = self.state();
         match current_state {

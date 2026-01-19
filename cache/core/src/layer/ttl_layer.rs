@@ -411,6 +411,69 @@ impl Layer for TtlLayer {
     fn total_segment_count(&self) -> usize {
         self.pool.segment_count()
     }
+
+    fn begin_write_item(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+        ttl: Duration,
+    ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
+        // Validate inputs
+        if key.len() > BasicHeader::MAX_KEY_LEN {
+            return Err(CacheError::KeyTooLong);
+        }
+        if optional.len() > BasicHeader::MAX_OPTIONAL_LEN {
+            return Err(CacheError::OptionalTooLong);
+        }
+
+        // Try to reserve space in current write segment
+        loop {
+            let segment_id = self.get_or_allocate_write_segment(ttl)?;
+
+            if let Some(segment) = self.pool.get(segment_id) {
+                // Try to reserve space for the item (no per-item TTL)
+                if let Some((offset, item_size, value_ptr)) =
+                    segment.begin_append(key, value_len, optional)
+                {
+                    let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                    return Ok((location, value_ptr, item_size));
+                }
+
+                // Segment is full, clear cached write segment
+                let bucket_index = self.buckets.get_bucket_index(ttl);
+                if bucket_index < self.current_write_segments.len() {
+                    self.current_write_segments[bucket_index]
+                        .store(u32::MAX, std::sync::atomic::Ordering::Release);
+                }
+            }
+
+            // Allocate a new segment
+            let bucket_index = self.buckets.get_bucket_index(ttl);
+            let bucket = self.buckets.get_bucket_by_index(bucket_index);
+            self.allocate_segment_for_bucket(bucket_index, bucket.ttl())?;
+        }
+    }
+
+    fn finalize_write_item(&self, location: ItemLocation, item_size: u32) {
+        if location.pool_id() != self.pool.pool_id() {
+            return;
+        }
+
+        if let Some(segment) = self.pool.get(location.segment_id()) {
+            segment.finalize_append(item_size);
+        }
+    }
+
+    fn cancel_write_item(&self, location: ItemLocation) {
+        if location.pool_id() != self.pool.pool_id() {
+            return;
+        }
+
+        if let Some(segment) = self.pool.get(location.segment_id()) {
+            segment.mark_deleted_at_offset(location.offset());
+        }
+    }
 }
 
 /// Builder for [`TtlLayer`].

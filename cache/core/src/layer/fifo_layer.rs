@@ -324,6 +324,65 @@ impl Layer for FifoLayer {
     fn total_segment_count(&self) -> usize {
         self.pool.segment_count()
     }
+
+    fn begin_write_item(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+        ttl: Duration,
+    ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
+        // Validate inputs
+        if key.len() > 255 {
+            return Err(CacheError::KeyTooLong);
+        }
+        if optional.len() > 64 {
+            return Err(CacheError::OptionalTooLong);
+        }
+
+        // Try to reserve space in current write segment
+        loop {
+            let segment_id = self.get_or_allocate_write_segment()?;
+
+            if let Some(segment) = self.pool.get(segment_id) {
+                // Calculate expiration
+                let expire_at = Self::now_secs() + ttl.as_secs() as u32;
+
+                // Try to reserve space for the item
+                if let Some((offset, item_size, value_ptr)) =
+                    segment.begin_append_with_ttl(key, value_len, optional, expire_at)
+                {
+                    let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                    return Ok((location, value_ptr, item_size));
+                }
+
+                // Segment is full, need to allocate a new one
+            }
+
+            // Allocate a new segment
+            self.allocate_segment()?;
+        }
+    }
+
+    fn finalize_write_item(&self, location: ItemLocation, item_size: u32) {
+        if location.pool_id() != self.pool.pool_id() {
+            return;
+        }
+
+        if let Some(segment) = self.pool.get(location.segment_id()) {
+            segment.finalize_append(item_size);
+        }
+    }
+
+    fn cancel_write_item(&self, location: ItemLocation) {
+        if location.pool_id() != self.pool.pool_id() {
+            return;
+        }
+
+        if let Some(segment) = self.pool.get(location.segment_id()) {
+            segment.mark_deleted_at_offset(location.offset());
+        }
+    }
 }
 
 /// Builder for [`FifoLayer`].

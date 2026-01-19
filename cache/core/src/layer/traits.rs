@@ -121,4 +121,53 @@ pub trait Layer: Send + Sync {
     fn used_segment_count(&self) -> usize {
         self.total_segment_count() - self.free_segment_count()
     }
+
+    /// Begin a two-phase write operation for zero-copy receive.
+    ///
+    /// Reserves space in a segment for the item and returns a pointer to the
+    /// value area. The caller writes the value directly to segment memory,
+    /// then calls `finalize_write_item` to complete the operation.
+    ///
+    /// # Arguments
+    /// * `key` - Item key (max 255 bytes)
+    /// * `value_len` - Size of the value to be written
+    /// * `optional` - Optional metadata (max 64 bytes)
+    /// * `ttl` - Time to live
+    ///
+    /// # Returns
+    /// * `Ok((location, value_ptr, item_size))` - Space reserved successfully
+    /// * `Err(CacheError)` - Reservation failed
+    ///
+    /// # Safety
+    ///
+    /// The returned `value_ptr` points into segment memory. The caller must:
+    /// - Write exactly `value_len` bytes to the pointer
+    /// - Call `finalize_write_item` with the same `item_size`
+    /// - Not hold the pointer beyond the `finalize_write_item` call
+    fn begin_write_item(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        optional: &[u8],
+        ttl: Duration,
+    ) -> CacheResult<(ItemLocation, *mut u8, u32)>;
+
+    /// Complete a two-phase write operation.
+    ///
+    /// Called after writing the value data to the pointer returned by
+    /// `begin_write_item`. Updates segment statistics (live_items, live_bytes).
+    ///
+    /// # Arguments
+    /// * `location` - Item location from `begin_write_item`
+    /// * `item_size` - The item_size returned by `begin_write_item`
+    fn finalize_write_item(&self, location: ItemLocation, item_size: u32);
+
+    /// Cancel a two-phase write operation.
+    ///
+    /// Called if the write cannot be completed (e.g., connection closed).
+    /// Marks the reserved space as deleted.
+    ///
+    /// # Arguments
+    /// * `location` - Item location from `begin_write_item`
+    fn cancel_write_item(&self, location: ItemLocation);
 }

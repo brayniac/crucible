@@ -368,6 +368,116 @@ impl IoDriver for MioDriver {
         }
     }
 
+    fn send_with_flags(
+        &mut self,
+        id: ConnId,
+        data: &[u8],
+        flags: crate::types::SendFlags,
+    ) -> io::Result<usize> {
+        let conn = self
+            .connections
+            .get_mut(id.slot())
+            .filter(|c| c.generation == id.generation())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        if !conn.writable {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Use raw send() syscall to pass MSG_MORE flag (Linux only)
+        let raw_fd = conn.stream.as_raw_fd();
+
+        #[cfg(target_os = "linux")]
+        let msg_flags = if flags.contains(crate::types::SendFlags::MORE) {
+            libc::MSG_MORE
+        } else {
+            0
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let msg_flags = {
+            let _ = flags; // MSG_MORE not available on non-Linux
+            0
+        };
+
+        let result = unsafe {
+            libc::send(
+                raw_fd,
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
+                msg_flags,
+            )
+        };
+
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                conn.writable = false;
+            }
+            return Err(err);
+        }
+
+        Ok(result as usize)
+    }
+
+    fn send_vectored_with_flags(
+        &mut self,
+        id: ConnId,
+        bufs: &[IoSlice<'_>],
+        flags: crate::types::SendFlags,
+    ) -> io::Result<usize> {
+        let conn = self
+            .connections
+            .get_mut(id.slot())
+            .filter(|c| c.generation == id.generation())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        if !conn.writable {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        // Use sendmsg() syscall to pass MSG_MORE flag with vectored data (Linux only)
+        let raw_fd = conn.stream.as_raw_fd();
+
+        #[cfg(target_os = "linux")]
+        let msg_flags = if flags.contains(crate::types::SendFlags::MORE) {
+            libc::MSG_MORE
+        } else {
+            0
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let msg_flags = {
+            let _ = flags; // MSG_MORE not available on non-Linux
+            0
+        };
+
+        // Convert IoSlice to iovec - they have the same layout
+        let iovecs: Vec<libc::iovec> = bufs
+            .iter()
+            .map(|s| libc::iovec {
+                iov_base: s.as_ptr() as *mut libc::c_void,
+                iov_len: s.len(),
+            })
+            .collect();
+
+        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+        msghdr.msg_iov = iovecs.as_ptr() as *mut libc::iovec;
+        msghdr.msg_iovlen = iovecs.len() as _;
+
+        let result = unsafe { libc::sendmsg(raw_fd, &msghdr, msg_flags) };
+
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                conn.writable = false;
+            }
+            return Err(err);
+        }
+
+        Ok(result as usize)
+    }
+
     fn recv(&mut self, id: ConnId, buf: &mut [u8]) -> io::Result<usize> {
         let conn = self
             .connections
@@ -390,6 +500,14 @@ impl IoDriver for MioDriver {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "submit_recv not supported on mio backend, use recv() instead",
+        ))
+    }
+
+    fn submit_recv_into(&mut self, _id: ConnId, _ptr: *mut u8, _len: usize) -> io::Result<()> {
+        // mio doesn't support async recv submission - use recv() after Recv completion
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "submit_recv_into not supported on mio backend, use recv() instead",
         ))
     }
 

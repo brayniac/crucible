@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-deb:
+    name: Build ${{ matrix.binary }} (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch:
+          - amd64
+          - arm64
+        binary:
+          - crucible-server
+          - crucible-benchmark
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build with cross
+        run: cross build --release --target ${{ matrix.target }} --bin ${{ matrix.binary }}
+
+      - name: Determine package directory
+        id: pkg
+        run: |
+          if [[ "${{ matrix.binary }}" == "crucible-server" ]]; then
+            echo "dir=server" >> $GITHUB_OUTPUT
+          else
+            echo "dir=benchmark" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build deb package
+        run: |
+          cargo deb --no-build --target ${{ matrix.target }} \
+            -p ${{ steps.pkg.outputs.dir }} \
+            --deb-version "${{ github.ref_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}_${{ matrix.arch }}
+          path: target/${{ matrix.target }}/debian/*.deb
+
+  publish:
+    name: Publish to APT repository
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: debs
+          merge-multiple: true
+
+      - name: List packages
+        run: find debs -name "*.deb" -type f
+
+      - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          for deb in debs/*.deb; do
+            aws s3 cp "$deb" "s3://${{ secrets.S3_BUCKET }}/${{ secrets.S3_PATH }}/pool/"
+          done
+
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # Trust the key
+          KEY_ID=$(gpg --list-secret-keys --keyid-format long | grep sec | head -1 | awk '{print $2}' | cut -d'/' -f2)
+          echo "${KEY_ID}:6:" | gpg --import-ownertrust
+
+      - name: Update APT repository index
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          # Download existing pool
+          aws s3 sync "s3://${{ secrets.S3_BUCKET }}/${{ secrets.S3_PATH }}/" repo/ || mkdir -p repo/pool
+
+          cd repo
+          mkdir -p pool dists/stable/main/binary-amd64 dists/stable/main/binary-arm64
+
+          # Generate Packages files filtered by architecture
+          dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages
+          dpkg-scanpackages --arch arm64 pool > dists/stable/main/binary-arm64/Packages
+
+          gzip -kf dists/stable/main/binary-amd64/Packages
+          gzip -kf dists/stable/main/binary-arm64/Packages
+
+          # Generate Release file
+          cd dists/stable
+          cat > Release << 'EOF'
+          Origin: Crucible
+          Label: Crucible
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: Crucible APT repository
+          EOF
+          # Remove leading whitespace from Release file
+          sed -i 's/^          //' Release
+
+          # Add checksums
+          apt-ftparchive release . >> Release
+
+          # Sign the Release file
+          rm -f Release.gpg InRelease
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 -abs -o Release.gpg Release
+            echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --clearsign -o InRelease Release
+          else
+            gpg --batch --yes -abs -o Release.gpg Release
+            gpg --batch --yes --clearsign -o InRelease Release
+          fi
+
+          cd ../..
+
+          # Upload updated repo
+          aws s3 sync . "s3://${{ secrets.S3_BUCKET }}/${{ secrets.S3_PATH }}/"
