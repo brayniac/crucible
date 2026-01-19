@@ -106,6 +106,23 @@ impl CuckooHashtable {
         &self.buckets[index]
     }
 
+    /// Prefetch a bucket into cache.
+    ///
+    /// Call this before accessing a bucket to hide memory latency.
+    #[inline]
+    fn prefetch_bucket(&self, index: usize) {
+        debug_assert!(index < self.num_buckets);
+        let bucket_ptr = &self.buckets[index] as *const Hashbucket as *const i8;
+
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(bucket_ptr);
+        }
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse")))]
+        let _ = bucket_ptr;
+    }
+
     /// Compute hash for a key.
     #[inline]
     fn hash_key(&self, key: &[u8]) -> u64 {
@@ -1010,8 +1027,14 @@ impl Hashtable for CuckooHashtable {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
+        let num_choices = self.num_choices as usize;
 
-        for &bucket_index in &buckets[..self.num_choices as usize] {
+        // Prefetch all candidate buckets upfront to hide memory latency
+        for &bucket_index in &buckets[..num_choices] {
+            self.prefetch_bucket(bucket_index);
+        }
+
+        for &bucket_index in &buckets[..num_choices] {
             if let Some(result) = self.search_bucket_for_get(bucket_index, tag, key, verifier) {
                 return Some(result);
             }
@@ -1024,8 +1047,14 @@ impl Hashtable for CuckooHashtable {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
+        let num_choices = self.num_choices as usize;
 
-        for &bucket_index in &buckets[..self.num_choices as usize] {
+        // Prefetch all candidate buckets upfront to hide memory latency
+        for &bucket_index in &buckets[..num_choices] {
+            self.prefetch_bucket(bucket_index);
+        }
+
+        for &bucket_index in &buckets[..num_choices] {
             if self.search_bucket_exists(bucket_index, tag, key, verifier) {
                 return true;
             }
@@ -1287,25 +1316,25 @@ impl Hashbucket {
     }
 
     /// Extract tag (12 bits).
-    #[inline]
+    #[inline(always)]
     pub fn tag(packed: u64) -> u16 {
         (packed >> 52) as u16
     }
 
     /// Extract frequency (8 bits).
-    #[inline]
+    #[inline(always)]
     pub fn freq(packed: u64) -> u8 {
         ((packed >> 44) & 0xFF) as u8
     }
 
     /// Extract location (44 bits).
-    #[inline]
+    #[inline(always)]
     pub fn location(packed: u64) -> Location {
         Location::from_raw(packed)
     }
 
     /// Check if entry is a ghost.
-    #[inline]
+    #[inline(always)]
     pub fn is_ghost(packed: u64) -> bool {
         packed != 0 && Self::location(packed).is_ghost()
     }
@@ -1369,7 +1398,7 @@ impl Hashbucket {
 
     /// Extract occupancy mask from metadata (low 7 bits).
     /// Bit N (0-6) indicates items[N] is occupied.
-    #[inline]
+    #[inline(always)]
     pub fn occupancy(metadata: u64) -> u8 {
         (metadata & 0x7F) as u8
     }

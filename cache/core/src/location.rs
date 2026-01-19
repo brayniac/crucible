@@ -47,19 +47,19 @@ impl Location {
     }
 
     /// Get the raw 44-bit value.
-    #[inline]
+    #[inline(always)]
     pub fn as_raw(&self) -> u64 {
         self.0
     }
 
     /// Construct from raw value, masking to 44 bits.
-    #[inline]
+    #[inline(always)]
     pub fn from_raw(raw: u64) -> Self {
         Self(raw & Self::MAX_RAW)
     }
 
     /// Check if this is the ghost sentinel.
-    #[inline]
+    #[inline(always)]
     pub fn is_ghost(&self) -> bool {
         *self == Self::GHOST
     }
