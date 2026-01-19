@@ -262,6 +262,50 @@ impl UringConnection {
         Some((slot, ptr, len))
     }
 
+    /// Prepare the next chunk for regular (non-zero-copy) sending.
+    ///
+    /// Like `prepare_send()` but sets notifs_pending = 0 since regular sends
+    /// don't generate a notification - the slot can be freed immediately
+    /// when the send completes.
+    #[inline]
+    pub fn prepare_send_regular(&mut self) -> Option<(u8, *const u8, usize)> {
+        if self.frag_buf.is_empty() {
+            return None;
+        }
+
+        let slot = self.alloc_send_slot()?;
+
+        let chunk_size = self.frag_buf.len().min(SEND_CHUNK_SIZE);
+        let chunk = self.frag_buf.split_to(chunk_size).freeze();
+
+        let ptr = chunk.as_ptr();
+        let len = chunk.len();
+
+        self.send_slots[slot as usize] = Some(InFlightSend {
+            buffers: SendBuffers::Single(chunk),
+            pos: 0,
+            notifs_pending: 0, // No notification expected for regular send
+        });
+        self.sends_in_flight += 1;
+
+        if self.frag_buf.is_empty() && self.frag_buf.capacity() > FRAG_SHRINK_THRESHOLD {
+            self.frag_buf = BytesMut::with_capacity(FRAG_DEFAULT_CAPACITY);
+        }
+
+        Some((slot, ptr, len))
+    }
+
+    /// Free a send slot for regular (non-zero-copy) sends.
+    ///
+    /// For regular sends, we free the slot immediately when the send completes
+    /// (no notification to wait for). This combines freeing the slot and
+    /// decrementing sends_in_flight.
+    #[inline]
+    pub fn free_send_slot_regular(&mut self, slot: u8) {
+        self.free_send_slot(slot);
+        self.sends_in_flight = self.sends_in_flight.saturating_sub(1);
+    }
+
     /// Prepare a vectored (scatter-gather) send from owned Bytes buffers.
     ///
     /// Returns (slot_index, msghdr_ptr, total_len) for SendMsg. Returns None if:

@@ -142,10 +142,13 @@ pub trait IoDriver: Send {
     #[cfg(unix)]
     fn take_fd(&mut self, id: ConnId) -> io::Result<RawFd>;
 
-    /// Send data on a connection.
+    /// Send data on a connection using regular (copying) send.
     ///
-    /// Automatically uses zero-copy operations (SendZc) when available.
-    /// The driver handles buffer management internally.
+    /// The kernel copies data from the provided buffer immediately, so the
+    /// buffer can be reused as soon as this call returns. This has lower
+    /// per-operation overhead than zero-copy send for small buffers.
+    ///
+    /// For large buffers where avoiding the copy matters, use `send_zc()`.
     ///
     /// # Returns
     ///
@@ -153,6 +156,29 @@ pub trait IoDriver: Send {
     /// - `Err(WouldBlock)` - Cannot send right now, try again after `SendReady`
     /// - `Err(other)` - An error occurred
     fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize>;
+
+    /// Send data on a connection using zero-copy send.
+    ///
+    /// On io_uring, this uses `SendZc` which avoids copying data to the kernel.
+    /// The tradeoff is higher per-operation overhead (two completions instead
+    /// of one) and the buffer must remain valid until the kernel signals
+    /// completion.
+    ///
+    /// For small buffers, prefer `send()` as the copy cost is negligible
+    /// but the zero-copy coordination overhead is fixed.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `send()` on backends without zero-copy support.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(n)` - `n` bytes were queued for sending
+    /// - `Err(WouldBlock)` - Cannot send right now, try again after `SendReady`
+    /// - `Err(other)` - An error occurred
+    fn send_zc(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {
+        self.send(id, data)
+    }
 
     /// Send data with flags.
     ///

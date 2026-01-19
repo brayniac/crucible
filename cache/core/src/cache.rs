@@ -761,16 +761,28 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
         // Prefetch the item header location
         let ptr = unsafe { segment.data_ptr().add(offset as usize) };
 
-        // Use platform-specific prefetch intrinsics (stable on x86_64)
+        // Use platform-specific prefetch intrinsics
         #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
         unsafe {
             // PREFETCHT0 - prefetch to all cache levels
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
         }
 
-        // On other platforms (including aarch64), this is a no-op for now
-        // since the aarch64 prefetch intrinsics are unstable
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse")))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // PRFM PLDL1KEEP - prefetch for load, L1 cache, keep in cache
+            std::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+
+        // On other platforms, this is a no-op
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "sse"),
+            target_arch = "aarch64"
+        )))]
         let _ = ptr;
     }
 
