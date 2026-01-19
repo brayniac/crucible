@@ -428,16 +428,17 @@ fn run_worker<C: Cache>(
                     let mut bytes_received = 0u64;
                     let mut send_error = false;
 
-                    // Zero-copy path: process commands one at a time
+                    // Zero-copy/threshold path: batch small values, immediate send for large
                     if config.zero_copy_mode != ZeroCopyMode::Disabled {
                         use crate::connection::ZeroCopyResponse;
 
+                        // Process commands, batching small values in write_buf
                         loop {
                             let mut zero_copy_response: Option<ZeroCopyResponse> = None;
                             let mut made_progress = false;
+                            let mut backpressure = false;
 
                             let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                                let initial_len = buf.len();
                                 if buf.is_empty() {
                                     return;
                                 }
@@ -446,10 +447,11 @@ fn run_worker<C: Cache>(
                                     connections.get_mut(idx).and_then(|c| c.as_mut())
                                 {
                                     if !conn.should_read() {
+                                        backpressure = true;
                                         return;
                                     }
 
-                                    // Process one command, potentially returning a zero-copy response
+                                    let initial_len = buf.len();
                                     zero_copy_response = conn.process_one_zero_copy(
                                         buf,
                                         &*cache,
@@ -458,8 +460,6 @@ fn run_worker<C: Cache>(
 
                                     let consumed = initial_len - buf.len();
                                     bytes_received += consumed as u64;
-                                    // Only continue if we made progress (consumed data).
-                                    // If no progress, command was incomplete - wait for more data.
                                     made_progress = consumed > 0;
 
                                     if conn.should_close() {
@@ -478,19 +478,40 @@ fn run_worker<C: Cache>(
                                 break;
                             }
 
-                            // Send zero-copy response if present
+                            // Large value: send accumulated write_buf first (preserve order),
+                            // then send zero-copy response
                             if let Some(resp) = zero_copy_response {
-                                // Use send_owned API for true zero-copy scatter-gather
-                                // The ZeroCopyResponse is stored inline via smallbox (no heap allocation)
-                                // and held by the driver until the send completes
+                                // Flush write_buf before sending zero-copy response
+                                while let Some(conn) =
+                                    connections.get_mut(idx).and_then(|c| c.as_mut())
+                                {
+                                    if !conn.has_pending_write() {
+                                        break;
+                                    }
+                                    let data = conn.pending_write_data();
+                                    match driver.send(conn_id, data) {
+                                        Ok(n) => {
+                                            stats.add_bytes_sent(n as u64);
+                                            conn.advance_write(n);
+                                        }
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                        Err(_) => {
+                                            send_error = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if send_error {
+                                    break;
+                                }
+
+                                // Now send zero-copy response
                                 match driver.send_owned(conn_id, io_driver::boxed_zc!(resp)) {
                                     Ok(n) => {
                                         stats.add_bytes_sent(n as u64);
                                     }
                                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                        // No free send slots - the response is dropped here,
-                                        // releasing the segment ref. The data is lost but
-                                        // this is rare and the client will retry.
                                         break;
                                     }
                                     Err(_) => {
@@ -499,31 +520,35 @@ fn run_worker<C: Cache>(
                                     }
                                 }
                             }
+                            // Small values accumulate in write_buf - don't send yet
 
-                            // Send any pending write_buf data (non-zero-copy responses)
-                            while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
+                            // Break if error, close, backpressure, or no progress
+                            if send_error
+                                || close_reason.is_some()
+                                || backpressure
+                                || !made_progress
                             {
-                                if !conn.has_pending_write() {
+                                break;
+                            }
+                        }
+
+                        // Send all accumulated write_buf data (batched small values)
+                        while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                            if !conn.has_pending_write() {
+                                break;
+                            }
+
+                            let data = conn.pending_write_data();
+                            match driver.send(conn_id, data) {
+                                Ok(n) => {
+                                    stats.add_bytes_sent(n as u64);
+                                    conn.advance_write(n);
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(_) => {
+                                    send_error = true;
                                     break;
                                 }
-
-                                let data = conn.pending_write_data();
-                                match driver.send(conn_id, data) {
-                                    Ok(n) => {
-                                        stats.add_bytes_sent(n as u64);
-                                        conn.advance_write(n);
-                                    }
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => {
-                                        send_error = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Break if error, close requested, or no progress (incomplete command)
-                            if send_error || close_reason.is_some() || !made_progress {
-                                break;
                             }
                         }
                     } else {
@@ -643,12 +668,13 @@ fn run_worker<C: Cache>(
 
                     // Process buffered data using same path as Recv completions
                     if config.zero_copy_mode != ZeroCopyMode::Disabled {
-                        // Zero-copy path: process one command at a time
+                        // Zero-copy/threshold path: batch small values
                         loop {
                             let mut zero_copy_response: Option<
                                 crate::connection::ZeroCopyResponse,
                             > = None;
                             let mut made_progress = false;
+                            let mut backpressure = false;
 
                             let result = driver.with_recv_buf(conn_id, &mut |buf| {
                                 if buf.is_empty() {
@@ -658,6 +684,7 @@ fn run_worker<C: Cache>(
                                     connections.get_mut(idx).and_then(|c| c.as_mut())
                                 {
                                     if !conn.should_read() {
+                                        backpressure = true;
                                         return;
                                     }
                                     let initial_len = buf.len();
@@ -678,8 +705,36 @@ fn run_worker<C: Cache>(
                                 break;
                             }
 
-                            // Send zero-copy response if present
+                            // Large value: flush write_buf first, then send zero-copy
                             if let Some(resp) = zero_copy_response {
+                                // Flush write_buf before sending zero-copy response
+                                while let Some(conn) =
+                                    connections.get_mut(idx).and_then(|c| c.as_mut())
+                                {
+                                    if !conn.has_pending_write() {
+                                        break;
+                                    }
+                                    let data = conn.pending_write_data();
+                                    match driver.send(conn_id, data) {
+                                        Ok(n) => {
+                                            stats.add_bytes_sent(n as u64);
+                                            conn.advance_write(n);
+                                        }
+                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            close_reason = Some(CloseReason::SendError);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if close_reason.is_some() {
+                                    break;
+                                }
+
+                                // Now send zero-copy response
                                 if let Err(e) =
                                     driver.send_owned(conn_id, io_driver::boxed_zc!(resp))
                                 {
@@ -689,29 +744,29 @@ fn run_worker<C: Cache>(
                                     break;
                                 }
                             }
+                            // Small values accumulate in write_buf - don't send yet
 
-                            // Send any pending write_buf data
-                            while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
-                            {
-                                if !conn.has_pending_write() {
+                            if !made_progress || close_reason.is_some() || backpressure {
+                                break;
+                            }
+                        }
+
+                        // Send all accumulated write_buf data (batched small values)
+                        while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                            if !conn.has_pending_write() {
+                                break;
+                            }
+                            let data = conn.pending_write_data();
+                            match driver.send(conn_id, data) {
+                                Ok(n) => {
+                                    stats.add_bytes_sent(n as u64);
+                                    conn.advance_write(n);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(_) => {
+                                    close_reason = Some(CloseReason::SendError);
                                     break;
                                 }
-                                let data = conn.pending_write_data();
-                                match driver.send(conn_id, data) {
-                                    Ok(n) => {
-                                        stats.add_bytes_sent(n as u64);
-                                        conn.advance_write(n);
-                                    }
-                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                    Err(_) => {
-                                        close_reason = Some(CloseReason::SendError);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !made_progress || close_reason.is_some() {
-                                break;
                             }
                         }
                     } else {

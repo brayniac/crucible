@@ -744,13 +744,14 @@ struct CacheKeyVerifier<'a> {
 }
 
 impl KeyVerifier for CacheKeyVerifier<'_> {
-    #[inline]
+    #[inline(always)]
     fn prefetch(&self, location: Location) {
         // Unpack location to get segment and offset
         let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
 
-        // Get pool and segment
-        let Some((pool, _)) = self.pools.get(pool_id as usize).and_then(|p| *p) else {
+        // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
+        // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
+        let Some((pool, _)) = (unsafe { *self.pools.get_unchecked(pool_id as usize) }) else {
             return;
         };
 
@@ -786,13 +787,15 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
         let _ = ptr;
     }
 
-    #[inline]
+    #[inline(always)]
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         // Unpack all location fields in one pass
         let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
 
-        // Direct pool lookup - no layer indirection
-        let Some((pool, is_per_item_ttl)) = self.pools.get(pool_id as usize).and_then(|p| *p)
+        // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
+        // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
+        let Some((pool, is_per_item_ttl)) =
+            (unsafe { *self.pools.get_unchecked(pool_id as usize) })
         else {
             return false;
         };

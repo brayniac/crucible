@@ -584,7 +584,7 @@ impl<'a> SliceSegment<'a> {
 
     /// Verify key with BasicHeader (segment-level TTL).
     /// Use when you know the pool uses segment-level TTL.
-    #[inline]
+    #[inline(always)]
     pub fn verify_key_with_basic_header(
         &self,
         offset: u32,
@@ -636,7 +636,7 @@ impl<'a> SliceSegment<'a> {
 
     /// Verify key with TtlHeader (per-item TTL).
     /// Use when you know the pool uses per-item TTL.
-    #[inline]
+    #[inline(always)]
     pub fn verify_key_with_ttl_header(
         &self,
         offset: u32,

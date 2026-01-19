@@ -119,7 +119,20 @@ impl CuckooHashtable {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(bucket_ptr);
         }
 
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse")))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // PRFM PLDL1KEEP - prefetch for load, L1 cache, keep in cache
+            std::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) bucket_ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "sse"),
+            target_arch = "aarch64"
+        )))]
         let _ = bucket_ptr;
     }
 
@@ -163,55 +176,7 @@ impl CuckooHashtable {
         ((hash >> 32) & 0xFFF) as u16
     }
 
-    /// Set occupancy bit for a slot after successful insert.
-    #[inline]
-    fn set_occupancy_bit(&self, bucket_index: usize, slot_index: usize) {
-        let bucket = self.bucket(bucket_index);
-
-        loop {
-            let metadata = bucket.metadata.load(Ordering::Relaxed);
-            let new_metadata = Hashbucket::set_occupied(metadata, slot_index);
-
-            if metadata == new_metadata {
-                break; // Already set
-            }
-
-            if bucket
-                .metadata
-                .compare_exchange_weak(metadata, new_metadata, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    /// Clear occupancy bit for a slot after successful delete.
-    #[inline]
-    fn clear_occupancy_bit(&self, bucket_index: usize, slot_index: usize) {
-        let bucket = self.bucket(bucket_index);
-
-        loop {
-            let metadata = bucket.metadata.load(Ordering::Relaxed);
-            let new_metadata = Hashbucket::clear_occupied(metadata, slot_index);
-
-            if metadata == new_metadata {
-                break; // Already clear
-            }
-
-            if bucket
-                .metadata
-                .compare_exchange_weak(metadata, new_metadata, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
     /// Count occupied (non-empty, non-ghost) slots in a bucket.
-    /// Note: This counts actual non-ghost items, not just occupancy bits
-    /// (since ghosts also have occupancy bits set).
     #[inline]
     fn count_occupied(&self, bucket_index: usize) -> usize {
         let bucket = self.bucket(bucket_index);
@@ -228,111 +193,182 @@ impl CuckooHashtable {
     /// Find slots with matching tags using SIMD (AVX2).
     ///
     /// Returns a bitmask where bit N is set if items[N] has a matching tag
-    /// and is not empty/ghost. Combined with occupancy for final mask.
+    /// and is not empty/ghost. Scans all 8 slots using 2 × 256-bit loads.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[inline]
-    fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64, occupancy: u8) -> u8 {
+    fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::x86_64::*;
 
-        // SAFETY: bucket is 64-byte aligned, items start at offset 8
-        // We load items[0..4] with 256-bit, items[4..6] with 128-bit, items[6] scalar
+        // SAFETY: bucket is 64-byte aligned with 8 × 8-byte items
+        // We load all 8 slots with 2 × 256-bit loads
         unsafe {
             let items_ptr = bucket.items.as_ptr() as *const u8;
 
             // Load items[0..4] (32 bytes)
-            let slots_0_3 = _mm256_loadu_si256(items_ptr as *const __m256i);
-
-            // Load items[4..6] (16 bytes)
-            let slots_4_5 = _mm_loadu_si128(items_ptr.add(32) as *const __m128i);
-
-            // Load items[6] scalar
-            let slot_6 = bucket.items[6].load(Ordering::Relaxed);
+            let slots_0_3 = _mm256_load_si256(items_ptr as *const __m256i);
+            // Load items[4..8] (32 bytes)
+            let slots_4_7 = _mm256_load_si256(items_ptr.add(32) as *const __m256i);
 
             // Tag mask and broadcast tag
             let tag_mask_val = 0xFFF0_0000_0000_0000_u64 as i64;
             let tag_shifted_i64 = tag_shifted as i64;
 
-            let tag_mask_256 = _mm256_set1_epi64x(tag_mask_val);
-            let tag_vec_256 = _mm256_set1_epi64x(tag_shifted_i64);
-            let tag_mask_128 = _mm_set1_epi64x(tag_mask_val);
-            let tag_vec_128 = _mm_set1_epi64x(tag_shifted_i64);
+            let tag_mask = _mm256_set1_epi64x(tag_mask_val);
+            let tag_vec = _mm256_set1_epi64x(tag_shifted_i64);
 
             // Ghost mask (44 bits all set = ghost location)
             let ghost_mask_val = 0x0000_0FFF_FFFF_FFFF_u64 as i64;
-            let ghost_vec_256 = _mm256_set1_epi64x(ghost_mask_val);
-            let ghost_vec_128 = _mm_set1_epi64x(ghost_mask_val);
+            let ghost_vec = _mm256_set1_epi64x(ghost_mask_val);
+            let zero = _mm256_setzero_si256();
+            let all_ones = _mm256_set1_epi64x(-1);
 
-            // Extract and compare tags for slots 0-3
-            let tags_0_3 = _mm256_and_si256(slots_0_3, tag_mask_256);
-            let tag_match_0_3 = _mm256_cmpeq_epi64(tags_0_3, tag_vec_256);
-
-            // Check for non-empty (packed != 0)
-            let zero_256 = _mm256_setzero_si256();
-            let nonzero_0_3 = _mm256_xor_si256(
-                _mm256_cmpeq_epi64(slots_0_3, zero_256),
-                _mm256_set1_epi64x(-1),
-            );
-
-            // Check for non-ghost (location != GHOST)
+            // Process slots 0-3
+            let tags_0_3 = _mm256_and_si256(slots_0_3, tag_mask);
+            let tag_match_0_3 = _mm256_cmpeq_epi64(tags_0_3, tag_vec);
+            let nonzero_0_3 = _mm256_xor_si256(_mm256_cmpeq_epi64(slots_0_3, zero), all_ones);
             let locs_0_3 = _mm256_and_si256(slots_0_3, _mm256_set1_epi64x(ghost_mask_val));
-            let nonghost_0_3 = _mm256_xor_si256(
-                _mm256_cmpeq_epi64(locs_0_3, ghost_vec_256),
-                _mm256_set1_epi64x(-1),
-            );
-
-            // Combine: tag matches AND non-empty AND non-ghost
+            let nonghost_0_3 = _mm256_xor_si256(_mm256_cmpeq_epi64(locs_0_3, ghost_vec), all_ones);
             let valid_0_3 =
                 _mm256_and_si256(tag_match_0_3, _mm256_and_si256(nonzero_0_3, nonghost_0_3));
 
-            // Same for slots 4-5
-            let tags_4_5 = _mm_and_si128(slots_4_5, tag_mask_128);
-            let tag_match_4_5 = _mm_cmpeq_epi64(tags_4_5, tag_vec_128);
-
-            let zero_128 = _mm_setzero_si128();
-            let nonzero_4_5 =
-                _mm_xor_si128(_mm_cmpeq_epi64(slots_4_5, zero_128), _mm_set1_epi64x(-1));
-
-            let locs_4_5 = _mm_and_si128(slots_4_5, _mm_set1_epi64x(ghost_mask_val));
-            let nonghost_4_5 = _mm_xor_si128(
-                _mm_cmpeq_epi64(locs_4_5, ghost_vec_128),
-                _mm_set1_epi64x(-1),
-            );
-
-            let valid_4_5 = _mm_and_si128(tag_match_4_5, _mm_and_si128(nonzero_4_5, nonghost_4_5));
-
-            // Scalar check for slot 6
-            let tag_match_6 = (slot_6 & 0xFFF0_0000_0000_0000) == tag_shifted;
-            let nonzero_6 = slot_6 != 0;
-            let nonghost_6 = (slot_6 & 0x0000_0FFF_FFFF_FFFF) != 0x0000_0FFF_FFFF_FFFF;
-            let valid_6 = tag_match_6 && nonzero_6 && nonghost_6;
+            // Process slots 4-7
+            let tags_4_7 = _mm256_and_si256(slots_4_7, tag_mask);
+            let tag_match_4_7 = _mm256_cmpeq_epi64(tags_4_7, tag_vec);
+            let nonzero_4_7 = _mm256_xor_si256(_mm256_cmpeq_epi64(slots_4_7, zero), all_ones);
+            let locs_4_7 = _mm256_and_si256(slots_4_7, _mm256_set1_epi64x(ghost_mask_val));
+            let nonghost_4_7 = _mm256_xor_si256(_mm256_cmpeq_epi64(locs_4_7, ghost_vec), all_ones);
+            let valid_4_7 =
+                _mm256_and_si256(tag_match_4_7, _mm256_and_si256(nonzero_4_7, nonghost_4_7));
 
             // Convert to bitmasks
             let mask_0_3 = _mm256_movemask_pd(_mm256_castsi256_pd(valid_0_3)) as u8;
-            let mask_4_5 = _mm_movemask_pd(_mm_castsi128_pd(valid_4_5)) as u8;
-            let mask_6 = if valid_6 { 1u8 } else { 0u8 };
+            let mask_4_7 = _mm256_movemask_pd(_mm256_castsi256_pd(valid_4_7)) as u8;
 
-            // Combine: bits 0-3 from AVX, bits 4-5 from SSE, bit 6 from scalar
-            let combined = mask_0_3 | (mask_4_5 << 4) | (mask_6 << 6);
+            // Combine: bits 0-3 from first load, bits 4-7 from second load
+            mask_0_3 | (mask_4_7 << 4)
+        }
+    }
 
-            // AND with occupancy (slots must be marked occupied in metadata)
-            combined & occupancy
+    /// Find slots with matching tags using NEON (ARM64).
+    ///
+    /// Returns a bitmask where bit N is set if items[N] has a matching tag
+    /// and is not empty/ghost. Scans all 8 slots using 4 × 128-bit loads.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
+        use std::arch::aarch64::*;
+
+        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
+        const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
+
+        // SAFETY: We're loading pairs of u64 values using NEON (4 loads × 2 slots = 8 slots)
+        unsafe {
+            let items_ptr = bucket.items.as_ptr() as *const u64;
+
+            let tag_mask_vec = vdupq_n_u64(TAG_MASK);
+            let tag_vec = vdupq_n_u64(tag_shifted);
+            let ghost_vec = vdupq_n_u64(GHOST_LOCATION);
+            let zero_vec = vdupq_n_u64(0);
+
+            // Process slots 0-1
+            let slots_0_1 = vld1q_u64(items_ptr);
+            let tags_0_1 = vandq_u64(slots_0_1, tag_mask_vec);
+            let tag_match_0_1 = vceqq_u64(tags_0_1, tag_vec);
+            let nonzero_0_1 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_0_1, zero_vec)));
+            let locs_0_1 = vandq_u64(slots_0_1, vdupq_n_u64(GHOST_LOCATION));
+            let nonghost_0_1 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(locs_0_1, ghost_vec)));
+            let valid_0_1 = vandq_u32(
+                vreinterpretq_u32_u64(tag_match_0_1),
+                vandq_u32(nonzero_0_1, nonghost_0_1),
+            );
+
+            // Process slots 2-3
+            let slots_2_3 = vld1q_u64(items_ptr.add(2));
+            let tags_2_3 = vandq_u64(slots_2_3, tag_mask_vec);
+            let tag_match_2_3 = vceqq_u64(tags_2_3, tag_vec);
+            let nonzero_2_3 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_2_3, zero_vec)));
+            let locs_2_3 = vandq_u64(slots_2_3, vdupq_n_u64(GHOST_LOCATION));
+            let nonghost_2_3 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(locs_2_3, ghost_vec)));
+            let valid_2_3 = vandq_u32(
+                vreinterpretq_u32_u64(tag_match_2_3),
+                vandq_u32(nonzero_2_3, nonghost_2_3),
+            );
+
+            // Process slots 4-5
+            let slots_4_5 = vld1q_u64(items_ptr.add(4));
+            let tags_4_5 = vandq_u64(slots_4_5, tag_mask_vec);
+            let tag_match_4_5 = vceqq_u64(tags_4_5, tag_vec);
+            let nonzero_4_5 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_4_5, zero_vec)));
+            let locs_4_5 = vandq_u64(slots_4_5, vdupq_n_u64(GHOST_LOCATION));
+            let nonghost_4_5 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(locs_4_5, ghost_vec)));
+            let valid_4_5 = vandq_u32(
+                vreinterpretq_u32_u64(tag_match_4_5),
+                vandq_u32(nonzero_4_5, nonghost_4_5),
+            );
+
+            // Process slots 6-7
+            let slots_6_7 = vld1q_u64(items_ptr.add(6));
+            let tags_6_7 = vandq_u64(slots_6_7, tag_mask_vec);
+            let tag_match_6_7 = vceqq_u64(tags_6_7, tag_vec);
+            let nonzero_6_7 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(slots_6_7, zero_vec)));
+            let locs_6_7 = vandq_u64(slots_6_7, vdupq_n_u64(GHOST_LOCATION));
+            let nonghost_6_7 = vmvnq_u32(vreinterpretq_u32_u64(vceqq_u64(locs_6_7, ghost_vec)));
+            let valid_6_7 = vandq_u32(
+                vreinterpretq_u32_u64(tag_match_6_7),
+                vandq_u32(nonzero_6_7, nonghost_6_7),
+            );
+
+            // Extract results from each pair
+            let v0_1 = vreinterpretq_u64_u32(valid_0_1);
+            let v2_3 = vreinterpretq_u64_u32(valid_2_3);
+            let v4_5 = vreinterpretq_u64_u32(valid_4_5);
+            let v6_7 = vreinterpretq_u64_u32(valid_6_7);
+
+            let bit0 = if vgetq_lane_u64(v0_1, 0) != 0 { 1u8 } else { 0 };
+            let bit1 = if vgetq_lane_u64(v0_1, 1) != 0 { 2u8 } else { 0 };
+            let bit2 = if vgetq_lane_u64(v2_3, 0) != 0 { 4u8 } else { 0 };
+            let bit3 = if vgetq_lane_u64(v2_3, 1) != 0 { 8u8 } else { 0 };
+            let bit4 = if vgetq_lane_u64(v4_5, 0) != 0 {
+                16u8
+            } else {
+                0
+            };
+            let bit5 = if vgetq_lane_u64(v4_5, 1) != 0 {
+                32u8
+            } else {
+                0
+            };
+            let bit6 = if vgetq_lane_u64(v6_7, 0) != 0 {
+                64u8
+            } else {
+                0
+            };
+            let bit7 = if vgetq_lane_u64(v6_7, 1) != 0 {
+                128u8
+            } else {
+                0
+            };
+
+            bit0 | bit1 | bit2 | bit3 | bit4 | bit5 | bit6 | bit7
         }
     }
 
     /// Scalar fallback for finding tag matches.
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    ///
+    /// Returns a bitmask where bit N is set if items[N] has a matching tag
+    /// and is not empty/ghost. Scans all 8 slots.
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        target_arch = "aarch64"
+    )))]
     #[inline]
-    fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64, occupancy: u8) -> u8 {
+    fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
 
         let mut result = 0u8;
-        let mut mask = occupancy;
 
-        while mask != 0 {
-            let slot_index = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-
+        for slot_index in 0..8 {
             let packed = bucket.items[slot_index].load(Ordering::Relaxed);
 
             if packed != 0
@@ -347,6 +383,7 @@ impl CuckooHashtable {
     }
 
     /// Search a bucket for an item, updating frequency on hit.
+    #[inline]
     fn search_bucket_for_get(
         &self,
         bucket_index: usize,
@@ -356,37 +393,21 @@ impl CuckooHashtable {
     ) -> Option<(Location, u8)> {
         let bucket = self.bucket(bucket_index);
 
-        // Load metadata and extract occupancy mask (low 7 bits) inline
-        let metadata = bucket.metadata.load(Ordering::Relaxed);
-        let occupancy = (metadata & 0x7F) as u8;
-
-        // Fast path: no occupied slots
-        if occupancy == 0 {
-            return None;
-        }
-
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         let tag_shifted = (tag as u64) << 52;
 
         // Use SIMD to find slots with matching tags (filters out empty/ghost)
-        let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted, occupancy);
+        let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted);
 
         // Iterate only over slots with matching tags
         while mask != 0 {
             let slot_index = mask.trailing_zeros() as usize;
             mask &= mask - 1; // Clear lowest set bit
 
-            let slot = &bucket.items[slot_index];
-
-            // Prefetch segment data before Acquire barrier
-            // (We already know tag matches from SIMD check)
-            let packed_relaxed = slot.load(Ordering::Relaxed);
-            let location = Hashbucket::location(packed_relaxed);
-            verifier.prefetch(location);
-
-            // Now do Acquire load to synchronize
-            let packed = slot.load(Ordering::Acquire);
+            // Single Acquire load for synchronization
+            // (SIMD already did Relaxed loads to find matches)
+            let packed = bucket.items[slot_index].load(Ordering::Acquire);
 
             // Re-verify after Acquire (state may have changed)
             if packed == 0 || (packed & GHOST_LOCATION) == GHOST_LOCATION {
@@ -396,25 +417,27 @@ impl CuckooHashtable {
                 continue;
             }
 
-            // Re-extract location after Acquire (could have changed)
             let location = Hashbucket::location(packed);
+
+            // Prefetch segment data while we verify - pipeline the memory access
+            verifier.prefetch(location);
 
             // Verify key matches using the verifier
             if verifier.verify(key, location, false) {
                 // Update frequency (best effort)
                 let freq = Hashbucket::freq(packed);
-                if freq < 127
-                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
-                {
-                    let _ = slot.compare_exchange(
-                        packed,
-                        new_packed,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    );
+                if freq < 127 {
+                    if let Some(new_packed) = Hashbucket::try_update_freq(packed, freq) {
+                        let _ = bucket.items[slot_index].compare_exchange(
+                            packed,
+                            new_packed,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
+                    }
                 }
 
-                return Some((location, Hashbucket::freq(packed)));
+                return Some((location, freq));
             }
         }
 
@@ -431,46 +454,33 @@ impl CuckooHashtable {
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
-        // Load metadata and extract occupancy mask (low 7 bits) inline
-        let metadata = bucket.metadata.load(Ordering::Relaxed);
-        let occupancy = (metadata & 0x7F) as u8;
-
-        // Fast path: no occupied slots
-        if occupancy == 0 {
-            return false;
-        }
-
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         let tag_shifted = (tag as u64) << 52;
 
         // Use SIMD to find slots with matching tags (filters out empty/ghost)
-        let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted, occupancy);
+        let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted);
 
         // Iterate only over slots with matching tags
         while mask != 0 {
             let slot_index = mask.trailing_zeros() as usize;
             mask &= mask - 1;
 
-            let slot = &bucket.items[slot_index];
+            // Single Acquire load for synchronization
+            let packed = bucket.items[slot_index].load(Ordering::Acquire);
 
-            // Prefetch segment data before Acquire barrier
-            let packed_relaxed = slot.load(Ordering::Relaxed);
-            let location = Hashbucket::location(packed_relaxed);
-            verifier.prefetch(location);
-
-            // Now do Acquire load to synchronize
-            let packed = slot.load(Ordering::Acquire);
-
-            if (packed & TAG_MASK) != tag_shifted {
-                continue;
-            }
+            // Re-verify after Acquire (state may have changed)
             if packed == 0 || (packed & GHOST_LOCATION) == GHOST_LOCATION {
                 continue;
             }
+            if (packed & TAG_MASK) != tag_shifted {
+                continue;
+            }
 
-            // Re-extract location after Acquire
             let location = Hashbucket::location(packed);
+
+            // Prefetch segment data while we verify
+            verifier.prefetch(location);
 
             if verifier.verify(key, location, false) {
                 return true;
@@ -614,7 +624,6 @@ impl CuckooHashtable {
 
                 if Hashbucket::is_ghost(packed) {
                     // Replace ghost, preserving frequency
-                    // Occupancy bit already set (ghost was occupying)
                     let freq = Hashbucket::freq(packed);
                     let new_with_freq = Hashbucket::with_freq(new_packed, freq);
 
@@ -633,7 +642,6 @@ impl CuckooHashtable {
 
                 if verifier.verify(key, location, true) {
                     // Replace existing entry, preserving frequency
-                    // Occupancy bit already set
                     let freq = Hashbucket::freq(packed);
                     let new_with_freq = Hashbucket::with_freq(new_packed, freq);
 
@@ -661,11 +669,7 @@ impl CuckooHashtable {
 
             if packed == 0 {
                 match slot.compare_exchange(0, new_packed, Ordering::Release, Ordering::Relaxed) {
-                    Ok(_) => {
-                        // Set occupancy bit after successful insert into empty slot
-                        self.set_occupancy_bit(bucket_index, slot_index);
-                        return Some(Ok(None));
-                    }
+                    Ok(_) => return Some(Ok(None)),
                     Err(_) => continue,
                 }
             }
@@ -689,7 +693,6 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
-                        // Occupancy bit already set (ghost was occupying)
                         Ok(_) => return Some(Ok(None)),
                         Err(_) => continue,
                     }
@@ -725,11 +728,7 @@ impl CuckooHashtable {
 
                 if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
                     match slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Relaxed) {
-                        Ok(_) => {
-                            // Clear occupancy bit after successful delete
-                            self.clear_occupancy_bit(bucket_index, slot_index);
-                            return true;
-                        }
+                        Ok(_) => return true,
                         Err(_) => continue,
                     }
                 }
@@ -766,7 +765,6 @@ impl CuckooHashtable {
                     let ghost = Hashbucket::to_ghost(packed);
                     match slot.compare_exchange(packed, ghost, Ordering::Release, Ordering::Relaxed)
                     {
-                        // Ghost still occupies slot, no occupancy change needed
                         Ok(_) => return true,
                         Err(_) => continue,
                     }
@@ -819,7 +817,6 @@ impl CuckooHashtable {
                         .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
                         .is_ok()
                     {
-                        // Updating location, occupancy unchanged
                         return true;
                     }
                 }
@@ -903,7 +900,6 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
-                        // Ghost was occupying, occupancy unchanged
                         Ok(_) => return Some(Ok(())),
                         Err(_) => continue,
                     }
@@ -948,11 +944,8 @@ impl CuckooHashtable {
                                 Ordering::Release,
                                 Ordering::Relaxed,
                             );
-                            // Don't set occupancy bit since we rolled back
                             return Some(Err(CacheError::KeyExists));
                         }
-                        // Set occupancy bit after successful insert
-                        self.set_occupancy_bit(bucket_index, slot_index);
                         return Some(Ok(()));
                     }
                     Err(new_current) => {
@@ -1050,7 +1043,6 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
-                        // Ghost was occupying, occupancy unchanged
                         Ok(_) => return Some(Ok(())),
                         Err(_) => continue,
                     }
@@ -1107,10 +1099,7 @@ impl CuckooHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
-                        // Replacing existing, occupancy unchanged
-                        Ok(_) => {
-                            return Some(Ok(old_location));
-                        }
+                        Ok(_) => return Some(Ok(old_location)),
                         Err(_) => continue,
                     }
                 }
@@ -1381,14 +1370,14 @@ impl Hashtable for CuckooHashtable {
 
 /// A single hashtable bucket (64 bytes, cache-line aligned).
 ///
-/// Contains bucket metadata and 7 item slots, each packed as:
+/// Contains 8 item slots, each packed as:
 /// `[12 bits tag][8 bits freq][44 bits location]`
+///
+/// Empty slots have value 0. No separate metadata - SIMD scans all 8 slots.
 #[repr(C, align(64))]
 pub struct Hashbucket {
-    /// Bucket metadata (occupancy mask in low 8 bits).
-    pub(crate) metadata: AtomicU64,
-    /// Item slots (7 items per bucket).
-    pub(crate) items: [AtomicU64; 7],
+    /// Item slots (8 items per bucket, no metadata).
+    pub(crate) items: [AtomicU64; 8],
 }
 
 const _: () = assert!(std::mem::size_of::<Hashbucket>() == 64);
@@ -1398,7 +1387,6 @@ impl Hashbucket {
     /// Create a new empty bucket.
     pub fn new() -> Self {
         Self {
-            metadata: AtomicU64::new(0),
             items: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -1488,52 +1476,8 @@ impl Hashbucket {
         }
     }
 
-    // ========================================================================
-    // Bucket metadata
-    // ========================================================================
-
     /// Number of item slots per bucket.
-    pub const NUM_ITEM_SLOTS: usize = 7;
-
-    /// Extract occupancy mask from metadata (low 7 bits).
-    /// Bit N (0-6) indicates items[N] is occupied.
-    #[inline(always)]
-    pub fn occupancy(metadata: u64) -> u8 {
-        (metadata & 0x7F) as u8
-    }
-
-    /// Set a slot's occupancy bit.
-    #[inline]
-    pub fn set_occupied(metadata: u64, slot_index: usize) -> u64 {
-        debug_assert!(
-            slot_index < Self::NUM_ITEM_SLOTS,
-            "slot_index {} out of range",
-            slot_index
-        );
-        metadata | (1u64 << slot_index)
-    }
-
-    /// Clear a slot's occupancy bit.
-    #[inline]
-    pub fn clear_occupied(metadata: u64, slot_index: usize) -> u64 {
-        debug_assert!(
-            slot_index < Self::NUM_ITEM_SLOTS,
-            "slot_index {} out of range",
-            slot_index
-        );
-        metadata & !(1u64 << slot_index)
-    }
-
-    /// Check if a slot is marked occupied.
-    #[inline]
-    pub fn is_slot_occupied(metadata: u64, slot_index: usize) -> bool {
-        debug_assert!(
-            slot_index < Self::NUM_ITEM_SLOTS,
-            "slot_index {} out of range",
-            slot_index
-        );
-        (metadata & (1u64 << slot_index)) != 0
-    }
+    pub const NUM_ITEM_SLOTS: usize = 8;
 }
 
 impl Default for Hashbucket {
