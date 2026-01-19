@@ -641,47 +641,117 @@ fn run_worker<C: Cache>(
                         continue;
                     }
 
-                    // Process buffered data
-                    let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                        if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                            conn.process_from(buf, &*cache);
+                    // Process buffered data using same path as Recv completions
+                    if config.zero_copy_mode != ZeroCopyMode::Disabled {
+                        // Zero-copy path: process one command at a time
+                        loop {
+                            let mut zero_copy_response: Option<
+                                crate::connection::ZeroCopyResponse,
+                            > = None;
+                            let mut made_progress = false;
 
-                            if conn.should_close() {
-                                close_reason = Some(CloseReason::ProtocolClose);
-                            }
-                        }
-                    });
+                            let result = driver.with_recv_buf(conn_id, &mut |buf| {
+                                if buf.is_empty() {
+                                    return;
+                                }
+                                if let Some(conn) =
+                                    connections.get_mut(idx).and_then(|c| c.as_mut())
+                                {
+                                    if !conn.should_read() {
+                                        return;
+                                    }
+                                    let initial_len = buf.len();
+                                    zero_copy_response = conn.process_one_zero_copy(
+                                        buf,
+                                        &*cache,
+                                        config.zero_copy_mode,
+                                    );
+                                    made_progress = buf.len() < initial_len;
 
-                    if result.is_err() {
-                        // Connection not found - already closed
-                        continue;
-                    }
+                                    if conn.should_close() {
+                                        close_reason = Some(CloseReason::ProtocolClose);
+                                    }
+                                }
+                            });
 
-                    if let Some(reason) = close_reason {
-                        close_connection(&mut driver, &mut connections, conn_id, stats, reason);
-                        continue;
-                    }
-
-                    // Send any new responses
-                    loop {
-                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
-                            break;
-                        };
-
-                        if !conn.has_pending_write() {
-                            break;
-                        }
-
-                        let data = conn.pending_write_data();
-                        match driver.send(conn_id, data) {
-                            Ok(n) => {
-                                stats.add_bytes_sent(n as u64);
-                                conn.advance_write(n);
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(_) => {
-                                close_reason = Some(CloseReason::SendError);
+                            if result.is_err() || close_reason.is_some() {
                                 break;
+                            }
+
+                            // Send zero-copy response if present
+                            if let Some(resp) = zero_copy_response {
+                                if let Err(e) =
+                                    driver.send_owned(conn_id, io_driver::boxed_zc!(resp))
+                                {
+                                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                                        close_reason = Some(CloseReason::SendError);
+                                    }
+                                    break;
+                                }
+                            }
+
+                            // Send any pending write_buf data
+                            while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
+                            {
+                                if !conn.has_pending_write() {
+                                    break;
+                                }
+                                let data = conn.pending_write_data();
+                                match driver.send(conn_id, data) {
+                                    Ok(n) => {
+                                        stats.add_bytes_sent(n as u64);
+                                        conn.advance_write(n);
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(_) => {
+                                        close_reason = Some(CloseReason::SendError);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !made_progress || close_reason.is_some() {
+                                break;
+                            }
+                        }
+                    } else {
+                        // Non-zero-copy path
+                        let result = driver.with_recv_buf(conn_id, &mut |buf| {
+                            if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                                conn.process_from(buf, &*cache);
+
+                                if conn.should_close() {
+                                    close_reason = Some(CloseReason::ProtocolClose);
+                                }
+                            }
+                        });
+
+                        if result.is_err() {
+                            continue;
+                        }
+
+                        // Send any new responses for non-zero-copy path
+                        loop {
+                            let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
+                            else {
+                                break;
+                            };
+
+                            if !conn.has_pending_write() {
+                                break;
+                            }
+
+                            let data = conn.pending_write_data();
+                            match driver.send(conn_id, data) {
+                                Ok(n) => {
+                                    stats.add_bytes_sent(n as u64);
+                                    conn.advance_write(n);
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(_) => {
+                                    close_reason = Some(CloseReason::SendError);
+                                    break;
+                                }
                             }
                         }
                     }

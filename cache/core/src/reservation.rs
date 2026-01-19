@@ -49,8 +49,6 @@ pub struct SetReservation {
     optional: Vec<u8>,
     /// TTL for the item.
     ttl: Duration,
-    /// Whether this reservation has been committed.
-    committed: bool,
 }
 
 impl SetReservation {
@@ -61,7 +59,6 @@ impl SetReservation {
             key: key.to_vec(),
             optional: optional.to_vec(),
             ttl,
-            committed: false,
         }
     }
 
@@ -102,20 +99,6 @@ impl SetReservation {
     #[inline]
     pub fn ttl(&self) -> Duration {
         self.ttl
-    }
-
-    /// Check if this reservation has been committed.
-    #[inline]
-    pub fn is_committed(&self) -> bool {
-        self.committed
-    }
-
-    /// Mark this reservation as committed.
-    ///
-    /// Called internally by the cache after successfully storing the value.
-    #[inline]
-    pub(crate) fn mark_committed(&mut self) {
-        self.committed = true;
     }
 
     /// Consume the reservation and return its parts for cache insertion.
@@ -274,7 +257,6 @@ mod tests {
         assert_eq!(reservation.value_len(), 1024);
         assert_eq!(reservation.optional(), b"flags");
         assert_eq!(reservation.ttl(), Duration::from_secs(60));
-        assert!(!reservation.is_committed());
     }
 
     #[test]
