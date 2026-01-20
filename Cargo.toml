@@ -6,6 +6,7 @@ members = [
 	"cache/core",
 	"cache/segcache",
 	"cache/s3fifo",
+	"cache/slab",
 
 	# IO Driver and Transport
 	"io/grpc",
@@ -87,6 +88,7 @@ protocol-memcache = { path = "protocol/memcache" }
 cache-core = { path = "cache/core" }
 segcache = { path = "cache/segcache" }
 s3fifo = { path = "cache/s3fifo" }
+slab-cache = { path = "cache/slab" }
 metrics = { path = "metrics" }
 
 # Platform-specific (Linux io_uring)
