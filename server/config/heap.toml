@@ -1,0 +1,49 @@
+# Crucible Server Configuration - Heap Backend
+#
+# The heap backend uses the system allocator for item storage.
+# Each item is individually heap-allocated, which:
+# - Avoids segment fragmentation
+# - Supports any item size (no segment_size limit)
+# - Uses approximate LFU eviction
+# - Has per-item allocator overhead
+
+runtime = "native"
+
+[workers]
+threads = 4
+
+[cache]
+backend = "heap"
+policy = "s3fifo"  # or "lfu"
+
+# Total heap size - determines maximum number of items.
+# Capacity is calculated as: heap_size / estimated_average_item_size (256 bytes)
+# For example, 1GB allows ~4 million items
+heap_size = "1GB"
+
+# Hashtable power (2^power buckets)
+# Should be sized for expected item count (aim for <50% load factor)
+hashtable_power = 24
+
+# Note: segment_size and max_value_size are not used by heap backend
+# but won't cause errors if present
+
+# RESP protocol listener (Redis-compatible)
+[[listener]]
+protocol = "resp"
+address = "127.0.0.1:6379"
+
+# Memcache protocol listener
+[[listener]]
+protocol = "memcache"
+address = "127.0.0.1:11211"
+
+[metrics]
+address = "127.0.0.1:9090"
+
+[uring]
+sqpoll = false
+buffer_count = 2048
+buffer_size = "16KB"
+sq_depth = 1024
+recv_mode = "multishot"

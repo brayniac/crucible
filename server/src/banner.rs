@@ -1,6 +1,6 @@
 //! Startup banner utilities.
 
-use crate::config::{CacheBackend, Protocol, Runtime, format_size};
+use crate::config::{CacheBackend, EvictionPolicy, Protocol, Runtime, format_size};
 use std::fmt::Write;
 use std::net::SocketAddr;
 
@@ -12,8 +12,10 @@ pub struct BannerConfig<'a> {
     pub runtime: Runtime,
     /// I/O backend detail (e.g., "io_uring", "mio")
     pub backend_detail: &'a str,
-    /// Cache backend
+    /// Cache backend (storage type)
     pub cache_backend: CacheBackend,
+    /// Eviction policy
+    pub eviction_policy: EvictionPolicy,
     /// Number of worker threads
     pub workers: usize,
     /// Protocol listeners
@@ -51,13 +53,24 @@ pub fn print_banner(config: &BannerConfig) {
     };
     writeln!(output, "Runtime:     {}", runtime_str).unwrap();
 
-    // Cache backend
-    let cache_str = match config.cache_backend {
-        CacheBackend::Segcache => "segcache",
-        CacheBackend::S3fifo => "s3fifo",
+    // Cache backend and policy
+    let backend_str = match config.cache_backend {
+        CacheBackend::Segment => "segment",
         CacheBackend::Slab => "slab",
+        CacheBackend::Heap => "heap",
     };
-    writeln!(output, "Cache:       {}", cache_str).unwrap();
+    let policy_str = match config.eviction_policy {
+        EvictionPolicy::S3Fifo => "s3fifo",
+        EvictionPolicy::Fifo => "fifo",
+        EvictionPolicy::Random => "random",
+        EvictionPolicy::Cte => "cte",
+        EvictionPolicy::Merge => "merge",
+        EvictionPolicy::Lfu => "lfu",
+        EvictionPolicy::Lra => "lra",
+        EvictionPolicy::Lrc => "lrc",
+        EvictionPolicy::None => "none",
+    };
+    writeln!(output, "Cache:       {} ({})", backend_str, policy_str).unwrap();
     writeln!(output, "Workers:     {}", config.workers).unwrap();
 
     if let Some(cpus) = config.cpu_affinity {

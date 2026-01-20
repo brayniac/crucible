@@ -1,0 +1,55 @@
+# Crucible Server - Slab Backend Configuration
+#
+# The slab backend uses a memcached-style slab allocator with per-object LRU
+# eviction. This is ideal for workloads with:
+# - High churn (frequent inserts/deletes)
+# - Large objects (up to slab_size)
+# - Need for traditional LRU eviction semantics
+
+runtime = "native"
+
+[workers]
+threads = 4
+
+[cache]
+# Slab backend with slab-level eviction
+backend = "slab"
+# Eviction policy: "lra" (least recently accessed), "lrc" (least recently created), "random", "none"
+policy = "lra"
+
+# Total heap size
+heap_size = "4GB"
+
+# Slab size - determines the maximum item size
+# Items up to this size can be stored. Larger slabs = larger max items
+# but fewer slabs available for different size classes.
+slab_size = "16MB"
+
+# Hashtable power (2^power buckets)
+hashtable_power = 20
+
+# Hugepage support for better TLB performance (Linux only)
+# Options: "none", "2mb", "1gb"
+hugepage = "none"
+
+# NUMA node binding (Linux only, optional)
+# numa_node = 0
+
+# RESP protocol listener (Redis-compatible)
+[[listener]]
+protocol = "resp"
+address = "127.0.0.1:6379"
+
+# Memcache protocol listener
+[[listener]]
+protocol = "memcache"
+address = "127.0.0.1:11211"
+
+[metrics]
+address = "127.0.0.1:9090"
+
+[uring]
+sqpoll = false
+buffer_count = 2048
+buffer_size = "16KB"
+sq_depth = 1024

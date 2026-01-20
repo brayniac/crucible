@@ -13,7 +13,7 @@ tokio-runtime = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util
 io_uring = ["io-driver/io_uring"]
 # Enables magic bytes and checksum validation for item headers. Useful for
 # debugging corruption issues but adds overhead to every read operation.
-validation = ["segcache/validation", "s3fifo/validation"]
+validation = ["segcache/validation"]
 
 [dependencies]
 # Cache core trait
@@ -21,8 +21,8 @@ cache-core = { workspace = true }
 
 # Cache implementations
 segcache = { workspace = true }
-s3fifo = { workspace = true }
 slab-cache = { workspace = true }
+heap-cache = { workspace = true }
 
 # Protocol implementations
 protocol-ping = { workspace = true }

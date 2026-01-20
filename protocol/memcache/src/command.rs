@@ -92,6 +92,20 @@ pub enum Command<'a> {
         exptime: u32,
         data: &'a [u8],
     },
+    /// ADD command - store only if key doesn't exist
+    Add {
+        key: &'a [u8],
+        flags: u32,
+        exptime: u32,
+        data: &'a [u8],
+    },
+    /// REPLACE command - store only if key exists
+    Replace {
+        key: &'a [u8],
+        flags: u32,
+        exptime: u32,
+        data: &'a [u8],
+    },
     /// CAS (compare-and-swap) command
     Cas {
         key: &'a [u8],
@@ -212,6 +226,116 @@ impl<'a> Command<'a> {
                 ))
             }
 
+            b"add" | b"ADD" => {
+                let key = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("add requires key"))?;
+                if key.is_empty() {
+                    return Err(ParseError::Protocol("empty key"));
+                }
+                if key.len() > options.max_key_len {
+                    return Err(ParseError::Protocol("key too large"));
+                }
+                let flags_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("add requires flags"))?;
+                let exptime_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("add requires exptime"))?;
+                let bytes_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("add requires bytes"))?;
+
+                let flags = parse_u32(flags_str)?;
+                let exptime = parse_u32(exptime_str)?;
+                let data_len = parse_usize(bytes_str)?;
+                if data_len > options.max_value_len {
+                    return Err(ParseError::Protocol("value too large"));
+                }
+
+                // Data block follows the command line: <data>\r\n
+                let data_start = line_end + 2;
+                let data_end = data_start
+                    .checked_add(data_len)
+                    .ok_or(ParseError::InvalidNumber)?;
+                let total_len = data_end.checked_add(2).ok_or(ParseError::InvalidNumber)?;
+
+                if buffer.len() < total_len {
+                    return Err(ParseError::Incomplete);
+                }
+
+                // Verify trailing \r\n
+                if buffer[data_end] != b'\r' || buffer[data_end + 1] != b'\n' {
+                    return Err(ParseError::Protocol("missing data terminator"));
+                }
+
+                let data = &buffer[data_start..data_end];
+                Ok((
+                    Command::Add {
+                        key,
+                        flags,
+                        exptime,
+                        data,
+                    },
+                    total_len,
+                ))
+            }
+
+            b"replace" | b"REPLACE" => {
+                let key = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("replace requires key"))?;
+                if key.is_empty() {
+                    return Err(ParseError::Protocol("empty key"));
+                }
+                if key.len() > options.max_key_len {
+                    return Err(ParseError::Protocol("key too large"));
+                }
+                let flags_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("replace requires flags"))?;
+                let exptime_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("replace requires exptime"))?;
+                let bytes_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("replace requires bytes"))?;
+
+                let flags = parse_u32(flags_str)?;
+                let exptime = parse_u32(exptime_str)?;
+                let data_len = parse_usize(bytes_str)?;
+                if data_len > options.max_value_len {
+                    return Err(ParseError::Protocol("value too large"));
+                }
+
+                // Data block follows the command line: <data>\r\n
+                let data_start = line_end + 2;
+                let data_end = data_start
+                    .checked_add(data_len)
+                    .ok_or(ParseError::InvalidNumber)?;
+                let total_len = data_end.checked_add(2).ok_or(ParseError::InvalidNumber)?;
+
+                if buffer.len() < total_len {
+                    return Err(ParseError::Incomplete);
+                }
+
+                // Verify trailing \r\n
+                if buffer[data_end] != b'\r' || buffer[data_end + 1] != b'\n' {
+                    return Err(ParseError::Protocol("missing data terminator"));
+                }
+
+                let data = &buffer[data_start..data_end];
+                Ok((
+                    Command::Replace {
+                        key,
+                        flags,
+                        exptime,
+                        data,
+                    },
+                    total_len,
+                ))
+            }
+
             b"cas" | b"CAS" => {
                 let key = parts
                     .next()
@@ -298,6 +422,8 @@ impl<'a> Command<'a> {
             Command::Get { .. } => "GET",
             Command::Gets { .. } => "GETS",
             Command::Set { .. } => "SET",
+            Command::Add { .. } => "ADD",
+            Command::Replace { .. } => "REPLACE",
             Command::Cas { .. } => "CAS",
             Command::Delete { .. } => "DELETE",
             Command::FlushAll => "FLUSH_ALL",

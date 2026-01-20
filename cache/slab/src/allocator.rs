@@ -6,12 +6,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use cache_core::{Hashtable, HugepageAllocation, HugepageSize, allocate_on_node};
+use cache_core::{Hashtable, HugepageAllocation, allocate_on_node};
 use crossbeam_deque::Injector;
 use parking_lot::Mutex;
 
 use crate::class::SlabClass;
-use crate::config::{HEADER_SIZE, SLAB_CLASSES, SlabCacheConfig, select_class};
+use crate::config::{EvictionStrategy, HEADER_SIZE, SlabCacheConfig, SlabClasses};
 use crate::item::SlabItemHeader;
 use crate::location::SlabLocation;
 use crate::verifier::SlabVerifier;
@@ -20,6 +20,8 @@ use crate::verifier::SlabVerifier;
 pub struct SlabAllocator {
     /// Slab classes (indexed by class_id).
     classes: Vec<SlabClass>,
+    /// Slab class configuration (slot sizes).
+    slab_classes: SlabClasses,
     /// Heap memory allocation.
     heap: HugepageAllocation,
     /// Slab size in bytes.
@@ -32,6 +34,8 @@ pub struct SlabAllocator {
     free_slabs: Injector<*mut u8>,
     /// Lock for allocating new slabs (prevents races).
     alloc_lock: Mutex<()>,
+    /// Eviction strategy (twemcache-style).
+    eviction_strategy: EvictionStrategy,
 }
 
 // Safety: The allocator manages heap memory safely.
@@ -44,8 +48,12 @@ impl SlabAllocator {
         // Allocate the heap
         let heap = allocate_on_node(config.heap_size, config.hugepage_size, config.numa_node)?;
 
-        // Create slab classes
-        let classes: Vec<SlabClass> = SLAB_CLASSES
+        // Generate slab classes from config
+        let slab_classes = SlabClasses::from_config(config);
+
+        // Create slab class instances
+        let classes: Vec<SlabClass> = slab_classes
+            .sizes()
             .iter()
             .enumerate()
             .map(|(i, &slot_size)| SlabClass::new(i as u8, slot_size, config.slab_size))
@@ -63,12 +71,14 @@ impl SlabAllocator {
 
         Ok(Self {
             classes,
+            slab_classes,
             heap,
             slab_size: config.slab_size,
             memory_limit: config.heap_size,
             memory_used: AtomicUsize::new(0),
             free_slabs,
             alloc_lock: Mutex::new(()),
+            eviction_strategy: config.eviction_strategy,
         })
     }
 
@@ -77,7 +87,7 @@ impl SlabAllocator {
     /// `item_size` should be `key.len() + value.len() + HEADER_SIZE`.
     #[inline]
     pub fn select_class(&self, item_size: usize) -> Option<u8> {
-        select_class(item_size)
+        self.slab_classes.select_class(item_size)
     }
 
     /// Get a reference to a slab class.
@@ -142,7 +152,14 @@ impl SlabAllocator {
     /// Allocate a slot with eviction if needed.
     ///
     /// Tries to allocate a slot. If no free slots or slabs are available,
-    /// evicts the LRU item from the same class.
+    /// uses the configured eviction strategy to free up space.
+    ///
+    /// Eviction strategies are tried in order from highest to lowest bit:
+    /// - SLAB_LRC (8) - Evict least recently created slab
+    /// - SLAB_LRA (4) - Evict least recently accessed slab
+    /// - RANDOM (2) - Evict a random slab
+    ///
+    /// If no eviction strategy is configured (NONE), returns `None` when full.
     pub fn allocate_with_eviction<H: Hashtable>(
         &self,
         class_id: u8,
@@ -153,43 +170,167 @@ impl SlabAllocator {
             return Some(slot);
         }
 
-        // Need to evict
-        self.evict_from_class(class_id, hashtable)?;
-
-        // Try allocation again
-        self.allocate(class_id)
-    }
-
-    /// Evict the LRU item from a class.
-    ///
-    /// Returns `Some(())` if an item was evicted, `None` if the class is empty.
-    pub fn evict_from_class<H: Hashtable>(&self, class_id: u8, hashtable: &H) -> Option<()> {
-        let class = self.classes.get(class_id as usize)?;
-
-        // Pop the LRU tail
-        let (slab_id, slot_index) = class.lru_pop_tail()?;
-
-        // Get the key and remove from hashtable
-        let location = SlabLocation::new(class_id, slab_id, slot_index).to_location();
-
-        unsafe {
-            let header = class.header(slab_id, slot_index);
-            let key = header.key();
-
-            // Remove from hashtable
-            hashtable.remove(key, location);
-
-            // Mark as deleted
-            header.mark_deleted();
-
-            // Update bytes used
-            class.sub_bytes(header.item_size());
+        // Check if eviction is disabled
+        if self.eviction_strategy.is_none() {
+            return None;
         }
 
-        // Return slot to free list
-        class.deallocate(slab_id, slot_index);
+        // Try slab-level eviction
+        if self.eviction_strategy.has_slab_eviction() {
+            if self.try_slab_eviction(hashtable) {
+                // Slab evicted - try allocation again
+                if let Some(slot) = self.allocate(class_id) {
+                    return Some(slot);
+                }
+            }
+        }
 
-        Some(())
+        None
+    }
+
+    /// Find the least recently accessed slab across all classes.
+    ///
+    /// Returns `(class_id, slab_id)` of the LRA slab, or `None` if no slabs exist.
+    pub fn find_lra_slab(&self) -> Option<(u8, u32)> {
+        let mut oldest: Option<(u8, u32, u32)> = None; // (class_id, slab_id, last_accessed)
+
+        for (class_id, class) in self.classes.iter().enumerate() {
+            for (slab_id, _created_at, last_accessed) in class.slab_timestamps() {
+                match oldest {
+                    None => oldest = Some((class_id as u8, slab_id, last_accessed)),
+                    Some((_, _, old_ts)) if last_accessed < old_ts => {
+                        oldest = Some((class_id as u8, slab_id, last_accessed));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        oldest.map(|(class_id, slab_id, _)| (class_id, slab_id))
+    }
+
+    /// Find the least recently created slab across all classes.
+    ///
+    /// Returns `(class_id, slab_id)` of the LRC slab, or `None` if no slabs exist.
+    pub fn find_lrc_slab(&self) -> Option<(u8, u32)> {
+        let mut oldest: Option<(u8, u32, u32)> = None; // (class_id, slab_id, created_at)
+
+        for (class_id, class) in self.classes.iter().enumerate() {
+            for (slab_id, created_at, _last_accessed) in class.slab_timestamps() {
+                match oldest {
+                    None => oldest = Some((class_id as u8, slab_id, created_at)),
+                    Some((_, _, old_ts)) if created_at < old_ts => {
+                        oldest = Some((class_id as u8, slab_id, created_at));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        oldest.map(|(class_id, slab_id, _)| (class_id, slab_id))
+    }
+
+    /// Find a random slab across all classes.
+    ///
+    /// Returns `(class_id, slab_id)` of a random slab, or `None` if no slabs exist.
+    pub fn find_random_slab(&self) -> Option<(u8, u32)> {
+        // Collect all (class_id, slab_id) pairs
+        let mut slabs = Vec::new();
+        for (class_id, class) in self.classes.iter().enumerate() {
+            let count = class.slab_count();
+            for slab_id in 0..count {
+                slabs.push((class_id as u8, slab_id as u32));
+            }
+        }
+
+        if slabs.is_empty() {
+            return None;
+        }
+
+        // Simple pseudo-random selection using timestamp
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as usize)
+            .unwrap_or(0);
+        let idx = now % slabs.len();
+        Some(slabs[idx])
+    }
+
+    /// Evict all items from a specific slab.
+    ///
+    /// Removes all items from the slab, removes them from the hashtable,
+    /// and returns the slab memory to the global free pool.
+    ///
+    /// Returns `true` if successful, `false` if the slab doesn't exist.
+    pub fn evict_slab<H: Hashtable>(&self, class_id: u8, slab_id: u32, hashtable: &H) -> bool {
+        let class = match self.classes.get(class_id as usize) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // Evict all items from the slab
+        let slab_ptr = unsafe {
+            class.evict_slab(slab_id, |key, cid, sid, slot| {
+                let location = SlabLocation::new(cid, sid, slot).to_location();
+                hashtable.remove(key, location);
+            })
+        };
+
+        if let Some(ptr) = slab_ptr {
+            // Return the slab to the global free pool
+            self.free_slabs.push(ptr);
+
+            // Update memory accounting (slab is now free but memory is still allocated)
+            // Note: We don't decrement memory_used because the slab is still in our heap,
+            // just available for reuse by any class
+
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try slab-level eviction using the configured strategy.
+    ///
+    /// Tries strategies in order: SLAB_LRC (8), SLAB_LRA (4), RANDOM (2).
+    /// Returns `true` if a slab was evicted.
+    pub fn try_slab_eviction<H: Hashtable>(&self, hashtable: &H) -> bool {
+        let strategy = self.eviction_strategy;
+
+        // Try strategies in order from highest to lowest bit
+        // SLAB_LRC (8)
+        if strategy.contains(EvictionStrategy::SLAB_LRC) {
+            if let Some((class_id, slab_id)) = self.find_lrc_slab() {
+                if self.evict_slab(class_id, slab_id, hashtable) {
+                    return true;
+                }
+            }
+        }
+
+        // SLAB_LRA (4)
+        if strategy.contains(EvictionStrategy::SLAB_LRA) {
+            if let Some((class_id, slab_id)) = self.find_lra_slab() {
+                if self.evict_slab(class_id, slab_id, hashtable) {
+                    return true;
+                }
+            }
+        }
+
+        // RANDOM (2)
+        if strategy.contains(EvictionStrategy::RANDOM) {
+            if let Some((class_id, slab_id)) = self.find_random_slab() {
+                if self.evict_slab(class_id, slab_id, hashtable) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Get the eviction strategy.
+    pub fn eviction_strategy(&self) -> EvictionStrategy {
+        self.eviction_strategy
     }
 
     /// Write an item to a slot.
@@ -224,11 +365,9 @@ impl SlabAllocator {
                 value.len(),
             );
 
-            // Update bytes used
+            // Update stats
             class.add_bytes(HEADER_SIZE + key.len() + value.len());
-
-            // Insert at LRU head
-            class.lru_insert_head(slab_id, slot_index);
+            class.add_item();
         }
     }
 
@@ -260,19 +399,11 @@ impl SlabAllocator {
         }
     }
 
-    /// Touch an item in the LRU (move to head).
-    pub fn lru_touch(&self, location: SlabLocation) {
-        let (class_id, slab_id, slot_index) = location.unpack();
+    /// Touch a slab for LRA tracking.
+    pub fn touch_slab(&self, location: SlabLocation) {
+        let (class_id, slab_id, _slot_index) = location.unpack();
         if let Some(class) = self.classes.get(class_id as usize) {
-            class.lru_touch(slab_id, slot_index);
-        }
-    }
-
-    /// Remove an item from the LRU list.
-    pub fn lru_remove(&self, location: SlabLocation) {
-        let (class_id, slab_id, slot_index) = location.unpack();
-        if let Some(class) = self.classes.get(class_id as usize) {
-            class.lru_remove(slab_id, slot_index);
+            class.touch_slab(slab_id);
         }
     }
 
@@ -312,6 +443,13 @@ impl SlabAllocator {
     pub fn verifier(&self) -> SlabVerifier<'_> {
         SlabVerifier::new(self)
     }
+
+    /// Create a verifier that allows expired items.
+    ///
+    /// Used for lazy cleanup of expired items.
+    pub fn verifier_allowing_expired(&self) -> SlabVerifier<'_> {
+        SlabVerifier::allowing_expired(self)
+    }
 }
 
 /// Statistics for a slab class.
@@ -332,11 +470,14 @@ pub struct ClassStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cache_core::HugepageSize;
 
     fn test_config() -> SlabCacheConfig {
         SlabCacheConfig {
             heap_size: 4 * 1024 * 1024, // 4MB
             slab_size: 64 * 1024,       // 64KB slabs
+            min_slot_size: 64,
+            growth_factor: 1.25,
             hugepage_size: HugepageSize::None,
             ..Default::default()
         }
@@ -346,7 +487,8 @@ mod tests {
     fn test_allocator_creation() {
         let config = test_config();
         let allocator = SlabAllocator::new(&config).unwrap();
-        assert_eq!(allocator.num_classes(), SLAB_CLASSES.len());
+        // Number of classes depends on slab_size and growth_factor
+        assert!(allocator.num_classes() > 0);
         assert_eq!(allocator.slab_size(), 64 * 1024);
     }
 
@@ -361,11 +503,10 @@ mod tests {
         // Exact fit
         assert_eq!(allocator.select_class(64), Some(0));
 
-        // Just over 64 -> class 1 (80 bytes)
-        assert_eq!(allocator.select_class(65), Some(1));
-
-        // 1KB item -> class 12
-        assert_eq!(allocator.select_class(1024), Some(12));
+        // Just over 64 -> next class
+        let class = allocator.select_class(65);
+        assert!(class.is_some());
+        assert!(class.unwrap() > 0);
     }
 
     #[test]
@@ -408,5 +549,23 @@ mod tests {
             assert_eq!(header.key(), key);
             assert_eq!(header.value(), value);
         }
+    }
+
+    #[test]
+    fn test_allocator_large_slab_size() {
+        // Test with 16MB slab size - should have classes up to 16MB
+        let config = SlabCacheConfig {
+            heap_size: 64 * 1024 * 1024, // 64MB
+            slab_size: 16 * 1024 * 1024, // 16MB slabs
+            min_slot_size: 64,
+            growth_factor: 1.25,
+            hugepage_size: HugepageSize::None,
+            ..Default::default()
+        };
+        let allocator = SlabAllocator::new(&config).unwrap();
+
+        // Should be able to select a class for a 10MB item
+        let class_id = allocator.select_class(10 * 1024 * 1024);
+        assert!(class_id.is_some(), "Should have class for 10MB item");
     }
 }

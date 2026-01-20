@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use server::banner::{BannerConfig, print_banner};
-use server::config::{CacheBackend, Config, HugepageConfig, Runtime};
+use server::config::{CacheBackend, Config, EvictionPolicy, HugepageConfig, Runtime};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -76,12 +76,14 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let numa_node = config.numa_node();
+    let policy = config.cache.effective_policy();
 
     print_banner(&BannerConfig {
         version: env!("CARGO_PKG_VERSION"),
         runtime: config.runtime,
         backend_detail: &backend_detail,
         cache_backend: config.cache.backend,
+        eviction_policy: policy,
         workers: config.threads(),
         listeners: &listeners,
         metrics_address: config.metrics.address,
@@ -91,18 +93,19 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         numa_node,
     });
 
-    // Create cache based on backend selection
+    // Create cache based on backend + policy selection
+
     match config.cache.backend {
-        CacheBackend::Segcache => {
-            let cache = create_segcache(&config)?;
-            run_with_cache(config, cache)
-        }
-        CacheBackend::S3fifo => {
-            let cache = create_s3fifo(&config)?;
+        CacheBackend::Segment => {
+            let cache = create_segment(&config, policy)?;
             run_with_cache(config, cache)
         }
         CacheBackend::Slab => {
-            let cache = create_slab(&config)?;
+            let cache = create_slab(&config, policy)?;
+            run_with_cache(config, cache)
+        }
+        CacheBackend::Heap => {
+            let cache = create_heap(&config, policy)?;
             run_with_cache(config, cache)
         }
     }
@@ -121,8 +124,11 @@ fn run_with_cache<C: cache_core::Cache + 'static>(
     }
 }
 
-fn create_segcache(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use segcache::{HugepageSize, SegCache};
+fn create_segment(
+    config: &Config,
+    policy: EvictionPolicy,
+) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
+    use segcache::{EvictionPolicy as SegEvictionPolicy, HugepageSize, MergeConfig, SegCache};
 
     let hugepage_size = match config.cache.hugepage {
         HugepageConfig::None => HugepageSize::None,
@@ -136,6 +142,18 @@ fn create_segcache(config: &Config) -> Result<impl cache_core::Cache, Box<dyn st
         .hashtable_power(config.cache.hashtable_power)
         .hugepage_size(hugepage_size);
 
+    // Apply eviction policy
+    builder = match policy {
+        EvictionPolicy::S3Fifo => builder.s3fifo(),
+        EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),
+        EvictionPolicy::Random => builder.eviction_policy(SegEvictionPolicy::Random),
+        EvictionPolicy::Cte => builder.eviction_policy(SegEvictionPolicy::Cte),
+        EvictionPolicy::Merge => {
+            builder.eviction_policy(SegEvictionPolicy::Merge(MergeConfig::default()))
+        }
+        _ => unreachable!("invalid policy for segment backend"),
+    };
+
     // Use auto-detected or explicit NUMA node
     if let Some(node) = config.numa_node() {
         builder = builder.numa_node(node);
@@ -146,8 +164,11 @@ fn create_segcache(config: &Config) -> Result<impl cache_core::Cache, Box<dyn st
     Ok(cache)
 }
 
-fn create_s3fifo(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use s3fifo::{HugepageSize, S3FifoCache};
+fn create_slab(
+    config: &Config,
+    policy: EvictionPolicy,
+) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
+    use slab_cache::{EvictionStrategy, HugepageSize, SlabCache};
 
     let hugepage_size = match config.cache.hugepage {
         HugepageConfig::None => HugepageSize::None,
@@ -155,36 +176,20 @@ fn create_s3fifo(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std:
         HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
     };
 
-    let mut builder = S3FifoCache::builder()
-        .ram_size(config.cache.heap_size)
-        .segment_size(config.cache.segment_size)
-        .hashtable_power(config.cache.hashtable_power)
-        .hugepage_size(hugepage_size);
-
-    // Use auto-detected or explicit NUMA node
-    if let Some(node) = config.numa_node() {
-        builder = builder.numa_node(node);
-    }
-
-    let cache = builder.build()?;
-
-    Ok(cache)
-}
-
-fn create_slab(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use slab_cache::{HugepageSize, SlabCache};
-
-    let hugepage_size = match config.cache.hugepage {
-        HugepageConfig::None => HugepageSize::None,
-        HugepageConfig::TwoMegabyte => HugepageSize::TwoMegabyte,
-        HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
+    let eviction_strategy = match policy {
+        EvictionPolicy::Lra => EvictionStrategy::SLAB_LRA,
+        EvictionPolicy::Lrc => EvictionStrategy::SLAB_LRC,
+        EvictionPolicy::Random => EvictionStrategy::RANDOM,
+        EvictionPolicy::None => EvictionStrategy::NONE,
+        _ => unreachable!("invalid policy for slab backend"),
     };
 
     let mut builder = SlabCache::builder()
         .heap_size(config.cache.heap_size)
         .slab_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power)
-        .hugepage_size(hugepage_size);
+        .hugepage_size(hugepage_size)
+        .eviction_strategy(eviction_strategy);
 
     // Use auto-detected or explicit NUMA node
     if let Some(node) = config.numa_node() {
@@ -192,6 +197,27 @@ fn create_slab(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std::e
     }
 
     let cache = builder.build()?;
+
+    Ok(cache)
+}
+
+fn create_heap(
+    config: &Config,
+    policy: EvictionPolicy,
+) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
+    use heap_cache::HeapCache;
+
+    // TODO: Integrate S3-FIFO policy into HeapCache builder
+    // For now, both S3Fifo and Lfu use the default LFU eviction
+    match policy {
+        EvictionPolicy::S3Fifo | EvictionPolicy::Lfu => {}
+        _ => unreachable!("invalid policy for heap backend"),
+    }
+
+    let cache = HeapCache::builder()
+        .memory_limit(config.cache.heap_size)
+        .hashtable_power(config.cache.hashtable_power)
+        .build();
 
     Ok(cache)
 }
@@ -210,8 +236,14 @@ runtime = "native"
 # cpu_affinity = "0-7"
 
 [cache]
-# Cache backend: "segcache", "s3fifo", or "slab"
-backend = "segcache"
+# Cache backend (storage type): "segment", "slab", or "heap"
+backend = "segment"
+
+# Eviction policy (depends on backend):
+#   segment: "s3fifo" (default), "fifo", "random", "cte", "merge"
+#   heap:    "s3fifo" (default), "lfu"
+#   slab:    "lra" (default), "lrc", "random", "none"
+policy = "s3fifo"
 
 # Total heap size (e.g., "4GB", "512MB")
 heap_size = "4GB"

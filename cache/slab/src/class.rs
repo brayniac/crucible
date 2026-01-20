@@ -1,4 +1,4 @@
-//! Slab class management with free list and LRU tracking.
+//! Slab class management with free list.
 //!
 //! Each slab class manages slots of a fixed size. Slabs are allocated from
 //! a shared heap and divided into equal-sized slots.
@@ -6,10 +6,10 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crossbeam_deque::Injector;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::config::HEADER_SIZE;
-use crate::item::{LRU_NONE, SlabItemHeader, pack_lru_link, unpack_lru_link};
+use crate::item::{SlabItemHeader, now_secs, pack_slot_ref, unpack_slot_ref};
 
 /// A single slab of memory divided into fixed-size slots.
 pub struct Slab {
@@ -19,6 +19,14 @@ pub struct Slab {
     size: usize,
     /// Active readers (prevents deallocation).
     ref_count: AtomicU32,
+    /// Creation timestamp (seconds since epoch).
+    created_at: u32,
+    /// Last access timestamp (seconds since epoch, updated on item access).
+    last_accessed: AtomicU32,
+    /// Class ID this slab belongs to.
+    class_id: u8,
+    /// Slab ID within the class.
+    slab_id: u32,
 }
 
 impl Slab {
@@ -27,11 +35,16 @@ impl Slab {
     /// # Safety
     ///
     /// The caller must ensure `data` points to valid memory of at least `size` bytes.
-    pub unsafe fn new(data: *mut u8, size: usize) -> Self {
+    pub unsafe fn new(data: *mut u8, size: usize, class_id: u8, slab_id: u32) -> Self {
+        let now = now_secs();
         Self {
             data,
             size,
             ref_count: AtomicU32::new(0),
+            created_at: now,
+            last_accessed: AtomicU32::new(now),
+            class_id,
+            slab_id,
         }
     }
 
@@ -86,6 +99,36 @@ impl Slab {
         // SAFETY: Caller ensures slot contains valid item
         unsafe { SlabItemHeader::from_ptr(self.slot_ptr(slot_index, slot_size)) }
     }
+
+    /// Get the creation timestamp (seconds since epoch).
+    #[inline]
+    pub fn created_at(&self) -> u32 {
+        self.created_at
+    }
+
+    /// Get the last access timestamp (seconds since epoch).
+    #[inline]
+    pub fn last_accessed(&self) -> u32 {
+        self.last_accessed.load(Ordering::Relaxed)
+    }
+
+    /// Update the last access timestamp to now.
+    #[inline]
+    pub fn touch(&self) {
+        self.last_accessed.store(now_secs(), Ordering::Relaxed);
+    }
+
+    /// Get the class ID this slab belongs to.
+    #[inline]
+    pub fn class_id(&self) -> u8 {
+        self.class_id
+    }
+
+    /// Get the slab ID within the class.
+    #[inline]
+    pub fn slab_id(&self) -> u32 {
+        self.slab_id
+    }
 }
 
 // Safety: Slab just contains raw pointers to heap memory which is stable.
@@ -104,12 +147,6 @@ pub struct SlabClass {
     slabs: RwLock<Vec<Slab>>,
     /// Free slot stack: packed as (slab_id << 16 | slot_index).
     free_slots: Injector<u32>,
-    /// LRU head (most recently used), packed slot reference.
-    lru_head: AtomicU32,
-    /// LRU tail (least recently used), packed slot reference.
-    lru_tail: AtomicU32,
-    /// LRU modification lock.
-    lru_lock: Mutex<()>,
     /// Number of items in this class.
     item_count: AtomicU64,
     /// Total bytes used by items in this class.
@@ -125,9 +162,6 @@ impl SlabClass {
             slots_per_slab: slab_size / slot_size,
             slabs: RwLock::new(Vec::new()),
             free_slots: Injector::new(),
-            lru_head: AtomicU32::new(LRU_NONE),
-            lru_tail: AtomicU32::new(LRU_NONE),
-            lru_lock: Mutex::new(()),
             item_count: AtomicU64::new(0),
             bytes_used: AtomicU64::new(0),
         }
@@ -156,6 +190,29 @@ impl SlabClass {
         self.slabs.read().len()
     }
 
+    /// Touch a slab to update its last_accessed timestamp.
+    ///
+    /// Call this when accessing an item in the slab.
+    #[inline]
+    pub fn touch_slab(&self, slab_id: u32) {
+        let slabs = self.slabs.read();
+        if let Some(slab) = slabs.get(slab_id as usize) {
+            slab.touch();
+        }
+    }
+
+    /// Get slab timestamps for LRA/LRC selection.
+    ///
+    /// Returns (slab_id, created_at, last_accessed) for each slab.
+    pub fn slab_timestamps(&self) -> Vec<(u32, u32, u32)> {
+        let slabs = self.slabs.read();
+        slabs
+            .iter()
+            .enumerate()
+            .map(|(id, slab)| (id as u32, slab.created_at(), slab.last_accessed()))
+            .collect()
+    }
+
     /// Get the number of items in this class.
     #[inline]
     pub fn item_count(&self) -> u64 {
@@ -179,13 +236,13 @@ impl SlabClass {
             let mut slabs = self.slabs.write();
             let slab_id = slabs.len() as u32;
 
-            // Create the slab
-            let slab = Slab::new(data, slab_size);
+            // Create the slab with class_id and slab_id for tracking
+            let slab = Slab::new(data, slab_size, self.class_id, slab_id);
             slabs.push(slab);
 
             // Add all slots to the free list
             for slot_index in 0..self.slots_per_slab {
-                let packed = pack_lru_link(slab_id, slot_index as u16);
+                let packed = pack_slot_ref(slab_id, slot_index as u16);
                 self.free_slots.push(packed);
             }
 
@@ -199,7 +256,7 @@ impl SlabClass {
     pub fn allocate(&self) -> Option<(u32, u16)> {
         match self.free_slots.steal() {
             crossbeam_deque::Steal::Success(packed) => {
-                let (slab_id, slot_index) = unpack_lru_link(packed);
+                let (slab_id, slot_index) = unpack_slot_ref(packed);
                 Some((slab_id, slot_index))
             }
             _ => None,
@@ -208,7 +265,7 @@ impl SlabClass {
 
     /// Return a slot to the free list.
     pub fn deallocate(&self, slab_id: u32, slot_index: u16) {
-        let packed = pack_lru_link(slab_id, slot_index);
+        let packed = pack_slot_ref(slab_id, slot_index);
         self.free_slots.push(packed);
     }
 
@@ -253,168 +310,83 @@ impl SlabClass {
         }
     }
 
-    /// Insert a slot at the LRU head (most recently used).
-    pub fn lru_insert_head(&self, slab_id: u32, slot_index: u16) {
-        let _lock = self.lru_lock.lock();
-        let new_packed = pack_lru_link(slab_id, slot_index);
-
-        // Get the current head
-        let old_head = self.lru_head.load(Ordering::Acquire);
-
-        // Set the new item's links
-        unsafe {
-            let header = self.header(slab_id, slot_index);
-            header.set_lru_prev(LRU_NONE);
-            header.set_lru_next(old_head);
-        }
-
-        // Update the old head's prev link
-        if old_head != LRU_NONE {
-            let (old_slab, old_slot) = unpack_lru_link(old_head);
-            unsafe {
-                let old_header = self.header(old_slab, old_slot);
-                old_header.set_lru_prev(new_packed);
-            }
-        } else {
-            // List was empty, this is also the tail
-            self.lru_tail.store(new_packed, Ordering::Release);
-        }
-
-        // Update head to point to new item
-        self.lru_head.store(new_packed, Ordering::Release);
-
-        // Update stats
+    /// Increment the item count.
+    pub fn add_item(&self) {
         self.item_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Remove a slot from the LRU list.
-    pub fn lru_remove(&self, slab_id: u32, slot_index: u16) {
-        let _lock = self.lru_lock.lock();
-        let packed = pack_lru_link(slab_id, slot_index);
-
-        unsafe {
-            let header = self.header(slab_id, slot_index);
-            let prev = header.lru_prev();
-            let next = header.lru_next();
-
-            // Update previous item's next link
-            if prev != LRU_NONE {
-                let (prev_slab, prev_slot) = unpack_lru_link(prev);
-                let prev_header = self.header(prev_slab, prev_slot);
-                prev_header.set_lru_next(next);
-            } else {
-                // This was the head
-                self.lru_head.store(next, Ordering::Release);
-            }
-
-            // Update next item's prev link
-            if next != LRU_NONE {
-                let (next_slab, next_slot) = unpack_lru_link(next);
-                let next_header = self.header(next_slab, next_slot);
-                next_header.set_lru_prev(prev);
-            } else {
-                // This was the tail
-                self.lru_tail.store(prev, Ordering::Release);
-            }
-
-            // Clear this item's links
-            header.set_lru_prev(LRU_NONE);
-            header.set_lru_next(LRU_NONE);
-        }
-
-        // Update stats
+    /// Decrement the item count.
+    pub fn remove_item(&self) {
         self.item_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Move a slot to the LRU head (touch on access).
-    pub fn lru_touch(&self, slab_id: u32, slot_index: u16) {
-        let _lock = self.lru_lock.lock();
-        let packed = pack_lru_link(slab_id, slot_index);
-
-        // If already at head, nothing to do
-        if self.lru_head.load(Ordering::Acquire) == packed {
-            return;
-        }
-
-        unsafe {
-            let header = self.header(slab_id, slot_index);
-            let prev = header.lru_prev();
-            let next = header.lru_next();
-
-            // Remove from current position
-            if prev != LRU_NONE {
-                let (prev_slab, prev_slot) = unpack_lru_link(prev);
-                let prev_header = self.header(prev_slab, prev_slot);
-                prev_header.set_lru_next(next);
-            }
-
-            if next != LRU_NONE {
-                let (next_slab, next_slot) = unpack_lru_link(next);
-                let next_header = self.header(next_slab, next_slot);
-                next_header.set_lru_prev(prev);
-            } else {
-                // This was the tail, update tail
-                self.lru_tail.store(prev, Ordering::Release);
-            }
-
-            // Insert at head
-            let old_head = self.lru_head.load(Ordering::Acquire);
-            header.set_lru_prev(LRU_NONE);
-            header.set_lru_next(old_head);
-
-            if old_head != LRU_NONE {
-                let (old_slab, old_slot) = unpack_lru_link(old_head);
-                let old_header = self.header(old_slab, old_slot);
-                old_header.set_lru_prev(packed);
-            }
-
-            self.lru_head.store(packed, Ordering::Release);
-        }
-    }
-
-    /// Pop the LRU tail (evict oldest item).
+    /// Evict all items from a specific slab.
     ///
-    /// Returns `Some((slab_id, slot_index))` if the list is not empty.
-    pub fn lru_pop_tail(&self) -> Option<(u32, u16)> {
-        let _lock = self.lru_lock.lock();
+    /// Calls the provided callback for each evicted item with (key, class_id, slab_id, slot_index).
+    /// The callback should remove the item from the hashtable.
+    ///
+    /// Returns the slab's data pointer so it can be returned to the global free pool,
+    /// or `None` if the slab doesn't exist.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer must only be used to return the slab to the allocator's
+    /// free pool. The slab should not be used by this class after eviction.
+    pub unsafe fn evict_slab<F>(&self, slab_id: u32, mut on_evict: F) -> Option<*mut u8>
+    where
+        F: FnMut(&[u8], u8, u32, u16),
+    {
+        let slabs = self.slabs.read();
 
-        let tail = self.lru_tail.load(Ordering::Acquire);
-        if tail == LRU_NONE {
-            return None;
-        }
+        let slab = slabs.get(slab_id as usize)?;
+        let slab_ptr = slab.data();
 
-        let (slab_id, slot_index) = unpack_lru_link(tail);
+        // Iterate through all slots in the slab
+        for slot_index in 0..self.slots_per_slab {
+            let slot_index = slot_index as u16;
 
-        unsafe {
-            let header = self.header(slab_id, slot_index);
-            let prev = header.lru_prev();
+            // SAFETY: We're iterating valid slot indices
+            unsafe {
+                let header = self.header(slab_id, slot_index);
 
-            // Update the previous item to be the new tail
-            if prev != LRU_NONE {
-                let (prev_slab, prev_slot) = unpack_lru_link(prev);
-                let prev_header = self.header(prev_slab, prev_slot);
-                prev_header.set_lru_next(LRU_NONE);
-            } else {
-                // List is now empty
-                self.lru_head.store(LRU_NONE, Ordering::Release);
+                // Skip deleted/empty slots
+                if header.is_deleted() {
+                    continue;
+                }
+
+                // Get the key for hashtable removal
+                let key = header.key();
+
+                // Call the callback to remove from hashtable
+                on_evict(key, self.class_id, slab_id, slot_index);
+
+                // Update stats
+                self.sub_bytes(header.item_size());
+                self.remove_item();
+
+                // Mark as deleted
+                header.mark_deleted();
             }
-
-            self.lru_tail.store(prev, Ordering::Release);
-
-            // Clear the evicted item's links
-            header.set_lru_prev(LRU_NONE);
-            header.set_lru_next(LRU_NONE);
         }
 
-        // Update stats
-        self.item_count.fetch_sub(1, Ordering::Relaxed);
+        // Return all slots to free list
+        for slot_index in 0..self.slots_per_slab {
+            let packed = pack_slot_ref(slab_id, slot_index as u16);
+            self.free_slots.push(packed);
+        }
 
-        Some((slab_id, slot_index))
+        Some(slab_ptr)
     }
 
-    /// Check if the LRU list is empty.
+    /// Get the data pointer for a slab (for returning to global pool).
+    pub fn slab_data_ptr(&self, slab_id: u32) -> Option<*mut u8> {
+        let slabs = self.slabs.read();
+        slabs.get(slab_id as usize).map(|s| s.data())
+    }
+
+    /// Check if the class has any items.
     pub fn is_empty(&self) -> bool {
-        self.lru_head.load(Ordering::Acquire) == LRU_NONE
+        self.item_count.load(Ordering::Relaxed) == 0
     }
 
     /// Update bytes used when an item is added.
@@ -508,59 +480,37 @@ mod tests {
     }
 
     #[test]
-    fn test_slab_class_lru() {
+    fn test_slab_class_allocate_deallocate() {
         let class = SlabClass::new(0, 64, 1024);
 
-        // Add a slab
         let mut buffer = vec![0u8; 1024];
         unsafe {
             class.add_slab(buffer.as_mut_ptr(), 1024);
         }
 
-        // Allocate some slots and add to LRU
-        let (slab_id1, slot1) = class.allocate().unwrap();
-        let (slab_id2, slot2) = class.allocate().unwrap();
-        let (slab_id3, slot3) = class.allocate().unwrap();
-
-        // Initialize headers
-        unsafe {
-            use std::time::Duration;
-            let ptr1 = class.slot_ptr(slab_id1, slot1);
-            let ptr2 = class.slot_ptr(slab_id2, slot2);
-            let ptr3 = class.slot_ptr(slab_id3, slot3);
-            SlabItemHeader::init(ptr1, 4, 10, Duration::from_secs(100));
-            SlabItemHeader::init(ptr2, 4, 10, Duration::from_secs(100));
-            SlabItemHeader::init(ptr3, 4, 10, Duration::from_secs(100));
+        // Allocate all slots
+        let slots_per_slab = 1024 / 64;
+        let mut allocated = Vec::new();
+        for _ in 0..slots_per_slab {
+            let slot = class.allocate();
+            assert!(slot.is_some());
+            allocated.push(slot.unwrap());
         }
 
-        // Insert in order: 1, 2, 3
-        class.lru_insert_head(slab_id1, slot1);
-        class.lru_insert_head(slab_id2, slot2);
-        class.lru_insert_head(slab_id3, slot3);
+        // No more slots
+        assert!(class.allocate().is_none());
 
-        // Head should be 3, tail should be 1
-        assert_eq!(class.item_count(), 3);
+        // Deallocate one
+        let (slab_id, slot_index) = allocated.pop().unwrap();
+        class.deallocate(slab_id, slot_index);
 
-        // Pop tail should give us 1
-        let popped = class.lru_pop_tail();
-        assert_eq!(popped, Some((slab_id1, slot1)));
-        assert_eq!(class.item_count(), 2);
-
-        // Pop tail should give us 2
-        let popped = class.lru_pop_tail();
-        assert_eq!(popped, Some((slab_id2, slot2)));
-
-        // Pop tail should give us 3
-        let popped = class.lru_pop_tail();
-        assert_eq!(popped, Some((slab_id3, slot3)));
-
-        // List should be empty
-        assert!(class.is_empty());
-        assert_eq!(class.lru_pop_tail(), None);
+        // Can allocate again
+        let slot = class.allocate();
+        assert!(slot.is_some());
     }
 
     #[test]
-    fn test_slab_class_lru_touch() {
+    fn test_slab_timestamps() {
         let class = SlabClass::new(0, 64, 1024);
 
         let mut buffer = vec![0u8; 1024];
@@ -568,26 +518,37 @@ mod tests {
             class.add_slab(buffer.as_mut_ptr(), 1024);
         }
 
-        let (slab_id1, slot1) = class.allocate().unwrap();
-        let (slab_id2, slot2) = class.allocate().unwrap();
+        let timestamps = class.slab_timestamps();
+        assert_eq!(timestamps.len(), 1);
 
-        unsafe {
-            use std::time::Duration;
-            let ptr1 = class.slot_ptr(slab_id1, slot1);
-            let ptr2 = class.slot_ptr(slab_id2, slot2);
-            SlabItemHeader::init(ptr1, 4, 10, Duration::from_secs(100));
-            SlabItemHeader::init(ptr2, 4, 10, Duration::from_secs(100));
-        }
+        let (slab_id, created_at, last_accessed) = timestamps[0];
+        assert_eq!(slab_id, 0);
+        assert!(created_at > 0);
+        assert_eq!(created_at, last_accessed); // Initially equal
 
-        // Insert 1, then 2 (head is 2)
-        class.lru_insert_head(slab_id1, slot1);
-        class.lru_insert_head(slab_id2, slot2);
+        // Touch the slab
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        class.touch_slab(0);
 
-        // Touch 1 (move to head)
-        class.lru_touch(slab_id1, slot1);
+        let timestamps = class.slab_timestamps();
+        let (_, _, new_last_accessed) = timestamps[0];
+        // last_accessed should be >= created_at
+        assert!(new_last_accessed >= created_at);
+    }
 
-        // Now head should be 1, tail should be 2
-        let popped = class.lru_pop_tail();
-        assert_eq!(popped, Some((slab_id2, slot2)));
+    #[test]
+    fn test_item_count() {
+        let class = SlabClass::new(0, 64, 1024);
+
+        assert_eq!(class.item_count(), 0);
+
+        class.add_item();
+        assert_eq!(class.item_count(), 1);
+
+        class.add_item();
+        assert_eq!(class.item_count(), 2);
+
+        class.remove_item();
+        assert_eq!(class.item_count(), 1);
     }
 }

@@ -84,6 +84,11 @@ pub struct LayerConfig {
     /// On read, if `freq > threshold`, item is promoted to memory layer.
     /// `None` for memory layers (no promotion needed).
     pub promotion_threshold: Option<u8>,
+
+    /// Eviction strategy for this layer.
+    /// Determines how segments are selected for eviction.
+    /// Default: `Random`
+    pub eviction_strategy: EvictionStrategy,
 }
 
 impl LayerConfig {
@@ -119,6 +124,12 @@ impl LayerConfig {
     /// Set the promotion threshold (for disk layers).
     pub fn with_promotion_threshold(mut self, threshold: u8) -> Self {
         self.promotion_threshold = Some(threshold);
+        self
+    }
+
+    /// Set the eviction strategy for this layer.
+    pub fn with_eviction_strategy(mut self, strategy: EvictionStrategy) -> Self {
+        self.eviction_strategy = strategy;
         self
     }
 }

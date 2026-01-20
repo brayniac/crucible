@@ -22,7 +22,7 @@ pub const MAX_CHOICES: u8 = 8;
 /// - 12-bit tag (hash suffix for fast filtering)
 /// - 8-bit frequency counter (ASFC algorithm)
 /// - 44-bit location (opaque, meaning defined by storage backend)
-pub struct CuckooHashtable {
+pub struct MultiChoiceHashtable {
     hash_builder: Box<RandomState>,
     buckets: Box<[Hashbucket]>,
     num_buckets: usize,
@@ -32,7 +32,7 @@ pub struct CuckooHashtable {
     num_choices: u8,
 }
 
-impl CuckooHashtable {
+impl MultiChoiceHashtable {
     /// Create a new hashtable with two-choice hashing (default).
     ///
     /// # Parameters
@@ -1129,7 +1129,7 @@ impl CuckooHashtable {
     }
 }
 
-impl Hashtable for CuckooHashtable {
+impl Hashtable for MultiChoiceHashtable {
     fn lookup(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<(Location, u8)> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
@@ -1587,24 +1587,24 @@ mod tests {
     #[test]
     fn test_hashtable_creation() {
         // Default is 2-choice
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         assert_eq!(ht.num_buckets(), 1024);
         assert_eq!(ht.num_choices(), 2);
 
         // Test various choice counts
-        let ht1 = CuckooHashtable::with_choices(10, 1);
+        let ht1 = MultiChoiceHashtable::with_choices(10, 1);
         assert_eq!(ht1.num_choices(), 1);
 
-        let ht3 = CuckooHashtable::with_choices(10, 3);
+        let ht3 = MultiChoiceHashtable::with_choices(10, 3);
         assert_eq!(ht3.num_choices(), 3);
 
-        let ht8 = CuckooHashtable::with_choices(10, 8);
+        let ht8 = MultiChoiceHashtable::with_choices(10, 8);
         assert_eq!(ht8.num_choices(), 8);
     }
 
     #[test]
     fn test_insert_and_lookup() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location = Location::new(12345);
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn test_insert_if_absent() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location1 = Location::new(100);
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[test]
     fn test_update_if_present() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location1 = Location::new(100);
@@ -1663,7 +1663,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location = Location::new(12345);
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[test]
     fn test_convert_to_ghost() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location = Location::new(12345);
@@ -1705,7 +1705,7 @@ mod tests {
 
     #[test]
     fn test_cas_location() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location1 = Location::new(100);
@@ -1726,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_get_frequency() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location = Location::new(12345);
@@ -1745,7 +1745,7 @@ mod tests {
 
     #[test]
     fn test_lookup_nonexistent() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let verifier = MockVerifier::new();
 
         assert!(ht.lookup(b"nonexistent", &verifier).is_none());
@@ -1753,7 +1753,7 @@ mod tests {
 
     #[test]
     fn test_contains_nonexistent() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let verifier = MockVerifier::new();
 
         assert!(!ht.contains(b"nonexistent", &verifier));
@@ -1761,7 +1761,7 @@ mod tests {
 
     #[test]
     fn test_remove_nonexistent() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
 
         let location = Location::new(12345);
         assert!(!ht.remove(b"nonexistent", location));
@@ -1769,7 +1769,7 @@ mod tests {
 
     #[test]
     fn test_cas_location_wrong_old() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location1 = Location::new(100);
@@ -1785,7 +1785,7 @@ mod tests {
 
     #[test]
     fn test_insert_multiple_keys() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         // Create multiple keys
@@ -1816,7 +1816,7 @@ mod tests {
 
     #[test]
     fn test_insert_overwrite() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location1 = Location::new(100);
@@ -1886,7 +1886,7 @@ mod tests {
 
     #[test]
     fn test_ghost_resurrection() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location1 = Location::new(100);
@@ -1926,7 +1926,7 @@ mod tests {
 
     #[test]
     fn test_get_item_frequency() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location = Location::new(12345);
@@ -1949,7 +1949,7 @@ mod tests {
 
     #[test]
     fn test_deleted_entry() {
-        let ht = CuckooHashtable::new(10);
+        let ht = MultiChoiceHashtable::new(10);
         let mut verifier = MockVerifier::new();
 
         let location = Location::new(12345);
@@ -1984,50 +1984,50 @@ mod loom_tests {
         }
     }
 
-    /// Helper to call insert_if_absent on CuckooHashtable
+    /// Helper to call insert_if_absent on MultiChoiceHashtable
     fn ht_insert(
-        ht: &CuckooHashtable,
+        ht: &MultiChoiceHashtable,
         key: &[u8],
         location: Location,
         verifier: &impl KeyVerifier,
     ) -> CacheResult<()> {
-        <CuckooHashtable as Hashtable>::insert_if_absent(ht, key, location, verifier)
+        <MultiChoiceHashtable as Hashtable>::insert_if_absent(ht, key, location, verifier)
     }
 
-    /// Helper to call lookup on CuckooHashtable
+    /// Helper to call lookup on MultiChoiceHashtable
     fn ht_lookup(
-        ht: &CuckooHashtable,
+        ht: &MultiChoiceHashtable,
         key: &[u8],
         verifier: &impl KeyVerifier,
     ) -> Option<(Location, u8)> {
-        <CuckooHashtable as Hashtable>::lookup(ht, key, verifier)
+        <MultiChoiceHashtable as Hashtable>::lookup(ht, key, verifier)
     }
 
-    /// Helper to call remove on CuckooHashtable
-    fn ht_remove(ht: &CuckooHashtable, key: &[u8], location: Location) -> bool {
-        <CuckooHashtable as Hashtable>::remove(ht, key, location)
+    /// Helper to call remove on MultiChoiceHashtable
+    fn ht_remove(ht: &MultiChoiceHashtable, key: &[u8], location: Location) -> bool {
+        <MultiChoiceHashtable as Hashtable>::remove(ht, key, location)
     }
 
-    /// Helper to call cas_location on CuckooHashtable
+    /// Helper to call cas_location on MultiChoiceHashtable
     fn ht_cas(
-        ht: &CuckooHashtable,
+        ht: &MultiChoiceHashtable,
         key: &[u8],
         old_loc: Location,
         new_loc: Location,
         preserve_freq: bool,
     ) -> bool {
-        <CuckooHashtable as Hashtable>::cas_location(ht, key, old_loc, new_loc, preserve_freq)
+        <MultiChoiceHashtable as Hashtable>::cas_location(ht, key, old_loc, new_loc, preserve_freq)
     }
 
-    /// Helper to call get_ghost_frequency on CuckooHashtable
-    fn ht_ghost_freq(ht: &CuckooHashtable, key: &[u8]) -> Option<u8> {
-        <CuckooHashtable as Hashtable>::get_ghost_frequency(ht, key)
+    /// Helper to call get_ghost_frequency on MultiChoiceHashtable
+    fn ht_ghost_freq(ht: &MultiChoiceHashtable, key: &[u8]) -> Option<u8> {
+        <MultiChoiceHashtable as Hashtable>::get_ghost_frequency(ht, key)
     }
 
     #[test]
     fn test_concurrent_insert_different_keys() {
         loom::model(|| {
-            let ht = Arc::new(CuckooHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
             let verifier = Arc::new(AlwaysVerifier);
 
             let ht1 = ht.clone();
@@ -2059,7 +2059,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_insert_same_key() {
         loom::model(|| {
-            let ht = Arc::new(CuckooHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
             let verifier = Arc::new(AlwaysVerifier);
 
             let ht1 = ht.clone();
@@ -2088,7 +2088,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_lookup_frequency_update() {
         loom::model(|| {
-            let ht = Arc::new(CuckooHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
             let verifier = Arc::new(AlwaysVerifier);
 
             // Insert a key first
@@ -2119,7 +2119,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_insert_and_remove() {
         loom::model(|| {
-            let ht = Arc::new(CuckooHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
             let verifier = Arc::new(AlwaysVerifier);
 
             // Insert a key first
@@ -2151,7 +2151,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_cas_operations() {
         loom::model(|| {
-            let ht = Arc::new(CuckooHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
             let verifier = Arc::new(AlwaysVerifier);
 
             // Insert a key first

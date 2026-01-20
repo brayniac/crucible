@@ -14,12 +14,28 @@ use crate::location::SlabLocation;
 /// at a given slab location.
 pub struct SlabVerifier<'a> {
     allocator: &'a SlabAllocator,
+    /// Allow expired items (for cleanup operations).
+    allow_expired: bool,
 }
 
 impl<'a> SlabVerifier<'a> {
     /// Create a new verifier.
     pub fn new(allocator: &'a SlabAllocator) -> Self {
-        Self { allocator }
+        Self {
+            allocator,
+            allow_expired: false,
+        }
+    }
+
+    /// Create a verifier that allows expired items.
+    ///
+    /// This is used for cleanup operations where we need to find
+    /// expired items to remove them.
+    pub fn allowing_expired(allocator: &'a SlabAllocator) -> Self {
+        Self {
+            allocator,
+            allow_expired: true,
+        }
     }
 }
 
@@ -54,7 +70,7 @@ impl KeyVerifier for SlabVerifier<'_> {
             }
 
             // Check expiration
-            if header.is_expired() {
+            if !self.allow_expired && header.is_expired() {
                 return false;
             }
 

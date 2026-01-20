@@ -770,10 +770,10 @@ mod tests {
 
     #[test]
     fn test_evict_empty_layer() {
-        use crate::hashtable_impl::CuckooHashtable;
+        use crate::hashtable_impl::MultiChoiceHashtable;
 
         let layer = create_test_layer();
-        let hashtable = CuckooHashtable::new(10);
+        let hashtable = MultiChoiceHashtable::new(10);
 
         // Evict on empty layer should return false
         let evicted = layer.evict(&hashtable);
@@ -782,10 +782,10 @@ mod tests {
 
     #[test]
     fn test_expire_returns_zero() {
-        use crate::hashtable_impl::CuckooHashtable;
+        use crate::hashtable_impl::MultiChoiceHashtable;
 
         let layer = create_test_layer();
-        let hashtable = CuckooHashtable::new(10);
+        let hashtable = MultiChoiceHashtable::new(10);
 
         // FIFO layer expire always returns 0 (no-op)
         let expired = layer.expire(&hashtable);
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_evict_with_items() {
-        use crate::hashtable_impl::CuckooHashtable;
+        use crate::hashtable_impl::MultiChoiceHashtable;
 
         // Create layer with small segments to trigger eviction
         let layer = FifoLayerBuilder::new()
@@ -805,7 +805,7 @@ mod tests {
             .build()
             .expect("Failed to create layer");
 
-        let hashtable = CuckooHashtable::new(10);
+        let hashtable = MultiChoiceHashtable::new(10);
 
         // Fill segments with items
         let value = vec![b'x'; 512];

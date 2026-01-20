@@ -1,0 +1,81 @@
+# Crucible Server - Memcached Migration Configuration
+#
+# This configuration is optimized for users migrating from Memcached.
+# It provides a drop-in replacement on the standard Memcached port with
+# both ASCII and binary protocol support.
+#
+# Supported Memcached commands:
+#   - get, gets (retrieval)
+#   - set (storage)
+#   - cas (compare-and-swap)
+#   - delete
+#   - version, quit
+#
+# Accepted but not implemented (returns OK, does nothing):
+#   - flush_all
+#
+# Not yet supported:
+#   - add, replace, append, prepend
+#   - incr, decr
+#   - gat, gats, touch
+#   - stats (partial)
+#
+# Migration notes:
+#   - Crucible uses a different memory allocator than Memcached's slab allocator
+#   - For identical slab semantics, use backend = "slab" instead
+#   - SASL authentication is not yet supported
+
+runtime = "native"
+
+[workers]
+# Match your Memcached -t thread count
+threads = 4
+
+# Pin to specific cores for NUMA locality (optional)
+# cpu_affinity = "0-3"
+
+[cache]
+# Slab backend with LRA eviction - most similar to Memcached's slab allocator
+# Alternatives:
+#   backend = "segment", policy = "s3fifo" - better hit rates
+#   backend = "heap", policy = "lfu" - no internal fragmentation
+backend = "slab"
+policy = "lra"
+
+# Size appropriately for your working set
+# Memcached: check stats for bytes
+heap_size = "4GB"
+
+# Slab size - determines maximum item size
+# Memcached default max item size: 1MB
+# Increase if you have larger objects
+slab_size = "16MB"
+
+# Hashtable sizing
+# Memcached: check stats for curr_items
+# Use 2^N where N gives ~50% load factor
+hashtable_power = 21
+
+# Hugepage support for better TLB performance (Linux only)
+# Requires: echo 2048 > /proc/sys/vm/nr_hugepages
+hugepage = "none"  # Options: "none", "2mb", "1gb"
+
+# NUMA binding (optional, Linux only)
+# numa_node = 0
+
+# Memcache listener on standard port
+[[listener]]
+protocol = "memcache"
+address = "0.0.0.0:11211"
+
+[metrics]
+# Prometheus metrics endpoint
+# Memcached stats are also available via the memcache protocol
+address = "0.0.0.0:9090"
+
+[uring]
+sqpoll = false
+buffer_count = 4096
+buffer_size = "16KB"
+sq_depth = 2048
+recv_mode = "multishot"

@@ -180,6 +180,52 @@ pub trait Hashtable: Send + Sync {
     /// Used to check if we should give "second chance" admission to a key
     /// that was previously evicted.
     fn get_ghost_frequency(&self, key: &[u8]) -> Option<u8>;
+
+    // =========================================================================
+    // S3-FIFO support methods
+    // =========================================================================
+    // These methods provide bucket-level access for the S3-FIFO eviction policy.
+    // They allow efficient tracking of items by their bucket index rather than
+    // requiring key hashing on every eviction check.
+
+    /// Get item info from a bucket matching a predicate.
+    ///
+    /// This is used by S3-FIFO to verify that a queue entry is still valid
+    /// in the hashtable.
+    ///
+    /// # Arguments
+    /// - `bucket_index`: The bucket to search
+    /// - `predicate`: Function that returns true if the item info matches
+    ///
+    /// # Returns
+    /// The full item info (tag, frequency, location) if found and predicate matches.
+    fn get_info_at_bucket<F>(&self, _bucket_index: u64, _predicate: F) -> Option<u64>
+    where
+        F: Fn(u64) -> bool,
+    {
+        None // Default: not supported
+    }
+
+    /// Set the frequency for an item at a specific bucket and location.
+    ///
+    /// Used by S3-FIFO to decay frequency during eviction.
+    fn set_frequency_at_bucket(&self, _bucket_index: u64, _location: u64, _freq: u8) {
+        // Default: no-op
+    }
+
+    /// Convert an item to a ghost at a specific bucket and location.
+    ///
+    /// Used by S3-FIFO during eviction when ghost tracking is enabled.
+    fn convert_to_ghost_at_bucket(&self, _bucket_index: u64, _location: u64) {
+        // Default: no-op
+    }
+
+    /// Remove an item at a specific bucket and location.
+    ///
+    /// Used by S3-FIFO during eviction when ghost tracking is disabled.
+    fn remove_at_bucket(&self, _bucket_index: u64, _location: u64) {
+        // Default: no-op
+    }
 }
 
 #[cfg(all(test, not(feature = "loom")))]

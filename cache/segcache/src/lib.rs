@@ -46,8 +46,8 @@
 #![warn(clippy::all)]
 
 use cache_core::{
-    CacheLayer, CasToken, CuckooHashtable, ItemGuard, LayerConfig, TieredCache, TieredCacheBuilder,
-    TtlLayerBuilder,
+    CacheLayer, CasToken, FifoLayerBuilder, ItemGuard, LayerConfig, MultiChoiceHashtable,
+    TieredCache, TieredCacheBuilder, TtlLayerBuilder,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,12 +59,59 @@ pub use cache_core::{
     MergeConfig, OwnedGuard, PoolMetrics, ValueRef,
 };
 
+/// Eviction policy for the segmented cache.
+///
+/// This determines the overall cache architecture and eviction strategy.
+#[derive(Debug, Clone)]
+pub enum EvictionPolicy {
+    /// Random segment selection within TTL buckets (default).
+    ///
+    /// Simple and efficient, good for general-purpose caching.
+    Random,
+
+    /// Strict FIFO segment eviction.
+    ///
+    /// Evicts oldest segments first, regardless of access frequency.
+    Fifo,
+
+    /// Closest to expiration eviction.
+    ///
+    /// Prioritizes evicting segments closest to their TTL expiration.
+    Cte,
+
+    /// Adaptive merge eviction.
+    ///
+    /// Prunes low-frequency items from segments before full eviction.
+    /// Can reclaim space more efficiently when segments have mixed-frequency items.
+    Merge(MergeConfig),
+
+    /// S3-FIFO: Two-tier admission filtering architecture.
+    ///
+    /// Uses a small FIFO queue as an admission filter (~10% of capacity)
+    /// and a main cache with merge eviction (~90% of capacity).
+    ///
+    /// Items must be accessed multiple times to be promoted to the main cache.
+    /// Provides better hit rates for workloads with one-hit wonders.
+    S3Fifo {
+        /// Percentage of total capacity for the small queue (1-50, default: 10).
+        small_queue_percent: u8,
+        /// Frequency threshold for promotion (default: 1).
+        demotion_threshold: u8,
+    },
+}
+
+impl Default for EvictionPolicy {
+    fn default() -> Self {
+        Self::Random
+    }
+}
+
 /// Segment-based cache with single-tier architecture.
 ///
 /// All items are stored directly in a TTL-organized layer with
 /// configurable eviction policy.
 pub struct SegCache {
-    inner: TieredCache<CuckooHashtable>,
+    inner: TieredCache<MultiChoiceHashtable>,
 }
 
 impl SegCache {
@@ -229,6 +276,9 @@ pub struct SegCacheBuilder {
 
     /// NUMA node to bind memory to (Linux only).
     numa_node: Option<u32>,
+
+    /// Eviction policy for the cache.
+    eviction_policy: EvictionPolicy,
 }
 
 impl Default for SegCacheBuilder {
@@ -244,6 +294,7 @@ impl SegCacheBuilder {
     /// - Heap: 64MB with 1MB segments
     /// - Hashtable: 2^16 = 64K buckets
     /// - Ghosts: disabled
+    /// - Eviction: Random
     pub fn new() -> Self {
         Self {
             heap_size: 64 * 1024 * 1024, // 64MB
@@ -252,6 +303,7 @@ impl SegCacheBuilder {
             hugepage_size: HugepageSize::None,
             enable_ghosts: false,
             numa_node: None,
+            eviction_policy: EvictionPolicy::Random,
         }
     }
 
@@ -309,14 +361,69 @@ impl SegCacheBuilder {
         self
     }
 
+    /// Set the eviction policy.
+    ///
+    /// - `EvictionPolicy::Random` - Random segment selection (default)
+    /// - `EvictionPolicy::Fifo` - Strict FIFO segment selection
+    /// - `EvictionPolicy::Cte` - Closest to expiration
+    /// - `EvictionPolicy::Merge(config)` - Adaptive merge eviction
+    /// - `EvictionPolicy::S3Fifo { .. }` - Two-tier S3-FIFO architecture
+    pub fn eviction_policy(mut self, policy: EvictionPolicy) -> Self {
+        self.eviction_policy = policy;
+        self
+    }
+
+    /// Use S3-FIFO eviction policy with default settings.
+    ///
+    /// S3-FIFO uses a small FIFO queue (10% of capacity) as an admission filter
+    /// and promotes frequently accessed items to a main cache (90% of capacity).
+    pub fn s3fifo(mut self) -> Self {
+        self.eviction_policy = EvictionPolicy::S3Fifo {
+            small_queue_percent: 10,
+            demotion_threshold: 1,
+        };
+        self
+    }
+
     /// Build the SegCache.
     ///
     /// # Errors
     ///
     /// Returns an error if memory allocation fails or configuration is invalid.
     pub fn build(self) -> Result<SegCache, std::io::Error> {
-        // Create TtlLayer
-        let layer_config = LayerConfig::new().with_ghosts(self.enable_ghosts);
+        // Create hashtable
+        let hashtable = Arc::new(MultiChoiceHashtable::new(self.hashtable_power));
+
+        // Build based on eviction policy
+        let inner = match self.eviction_policy {
+            EvictionPolicy::S3Fifo {
+                small_queue_percent,
+                demotion_threshold,
+            } => self.build_s3fifo(hashtable, small_queue_percent, demotion_threshold)?,
+
+            _ => self.build_single_layer(hashtable)?,
+        };
+
+        Ok(SegCache { inner })
+    }
+
+    /// Build a single-layer cache architecture.
+    fn build_single_layer(
+        self,
+        hashtable: Arc<MultiChoiceHashtable>,
+    ) -> Result<TieredCache<MultiChoiceHashtable>, std::io::Error> {
+        // Convert EvictionPolicy to EvictionStrategy
+        let eviction_strategy = match &self.eviction_policy {
+            EvictionPolicy::Random => EvictionStrategy::Random,
+            EvictionPolicy::Fifo => EvictionStrategy::Fifo,
+            EvictionPolicy::Cte => EvictionStrategy::Cte,
+            EvictionPolicy::Merge(config) => EvictionStrategy::Merge(config.clone()),
+            EvictionPolicy::S3Fifo { .. } => unreachable!(),
+        };
+
+        let layer_config = LayerConfig::new()
+            .with_ghosts(self.enable_ghosts)
+            .with_eviction_strategy(eviction_strategy);
 
         let mut layer_builder = TtlLayerBuilder::new()
             .layer_id(0)
@@ -332,15 +439,77 @@ impl SegCacheBuilder {
 
         let layer = layer_builder.build()?;
 
-        // Create hashtable
-        let hashtable = Arc::new(CuckooHashtable::new(self.hashtable_power));
-
-        // Build the tiered cache (with just one layer)
-        let inner = TieredCacheBuilder::new(hashtable)
+        Ok(TieredCacheBuilder::new(hashtable)
             .with_layer(CacheLayer::Ttl(layer))
-            .build();
+            .build())
+    }
 
-        Ok(SegCache { inner })
+    /// Build a two-layer S3-FIFO cache architecture.
+    fn build_s3fifo(
+        self,
+        hashtable: Arc<MultiChoiceHashtable>,
+        small_queue_percent: u8,
+        demotion_threshold: u8,
+    ) -> Result<TieredCache<MultiChoiceHashtable>, std::io::Error> {
+        // Calculate segment counts
+        let total_segments = self.heap_size / self.segment_size;
+        let small_percent = small_queue_percent.clamp(1, 50) as usize;
+        let small_queue_segments = ((total_segments * small_percent) / 100).max(1);
+        let main_cache_segments = total_segments.saturating_sub(small_queue_segments);
+
+        if main_cache_segments == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Not enough segments for main cache",
+            ));
+        }
+
+        let small_queue_size = small_queue_segments * self.segment_size;
+        let main_cache_size = main_cache_segments * self.segment_size;
+
+        // Layer 0: FIFO small queue with ghosts and demotion
+        let layer0_config = LayerConfig::new()
+            .with_ghosts(true)
+            .with_next_layer(1)
+            .with_demotion_threshold(demotion_threshold);
+
+        let mut layer0_builder = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .config(layer0_config)
+            .segment_size(self.segment_size)
+            .heap_size(small_queue_size)
+            .hugepage_size(self.hugepage_size);
+
+        if let Some(node) = self.numa_node {
+            layer0_builder = layer0_builder.numa_node(node);
+        }
+
+        let layer0 = layer0_builder.build()?;
+
+        // Layer 1: TTL-organized main cache with merge eviction
+        let layer1_config = LayerConfig::new()
+            .with_ghosts(true)
+            .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default()));
+
+        let mut layer1_builder = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .config(layer1_config)
+            .segment_size(self.segment_size)
+            .heap_size(main_cache_size)
+            .hugepage_size(self.hugepage_size);
+
+        if let Some(node) = self.numa_node {
+            layer1_builder = layer1_builder.numa_node(node);
+        }
+
+        let layer1 = layer1_builder.build()?;
+
+        Ok(TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(layer0)
+            .with_ttl_layer(layer1)
+            .build())
     }
 }
 
@@ -375,6 +544,16 @@ impl Cache for SegCache {
 
     fn flush(&self) {
         // No-op: SegCache doesn't support flushing individual items
+    }
+
+    fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        self.inner.add(key, value, b"", ttl)
+    }
+
+    fn replace(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        self.inner.replace(key, value, b"", ttl)
     }
 
     fn begin_segment_set(

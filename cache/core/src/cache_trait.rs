@@ -389,6 +389,35 @@ pub trait Cache: Send + Sync + 'static {
     ) -> Result<bool, CacheError> {
         Err(CacheError::Unsupported)
     }
+
+    /// Store an item only if the key doesn't exist (ADD/NX semantics).
+    ///
+    /// Returns `Ok(())` if the item was stored, `Err(CacheError::KeyExists)` if
+    /// the key already exists.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn add(&self, _key: &[u8], _value: &[u8], _ttl: Option<Duration>) -> Result<(), CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Update an existing item only (REPLACE/XX semantics).
+    ///
+    /// Returns `Ok(())` if the item was updated, `Err(CacheError::KeyNotFound)` if
+    /// the key doesn't exist.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn replace(
+        &self,
+        _key: &[u8],
+        _value: &[u8],
+        _ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
+        Err(CacheError::Unsupported)
+    }
 }
 
 /// Default TTL used when None is provided (1 hour).

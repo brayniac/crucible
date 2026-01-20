@@ -34,7 +34,7 @@
 
 use crate::error::{CacheError, CacheResult};
 use crate::hashtable::{Hashtable, KeyVerifier};
-use crate::hashtable_impl::CuckooHashtable;
+use crate::hashtable_impl::MultiChoiceHashtable;
 use crate::location::Location;
 use crate::sync::{AtomicU32, AtomicU64, Ordering};
 
@@ -558,7 +558,7 @@ const EVICTION_SAMPLES: usize = 5;
 /// - `V`: Value type
 /// - `S`: Hash builder (default: RandomState)
 pub struct ArcCache<K, V, S = RandomState> {
-    hashtable: CuckooHashtable,
+    hashtable: MultiChoiceHashtable,
     storage: SlotStorage<K, V>,
     #[allow(dead_code)]
     hash_builder: S,
@@ -586,12 +586,12 @@ where
     /// Create a new ArcCache with a custom hasher.
     pub fn with_hasher(capacity: usize, hash_builder: S) -> Self {
         // Size hashtable for ~50% load factor (good balance of space/performance)
-        // CuckooHashtable::new takes power as u8, buckets = 1 << power
+        // MultiChoiceHashtable::new takes power as u8, buckets = 1 << power
         let target_buckets = (capacity * 2).max(1024);
         let power = (target_buckets as f64).log2().ceil() as u8;
 
         Self {
-            hashtable: CuckooHashtable::new(power),
+            hashtable: MultiChoiceHashtable::new(power),
             storage: SlotStorage::new(capacity),
             hash_builder,
             eviction_counter: AtomicU32::new(0),

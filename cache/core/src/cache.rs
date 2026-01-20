@@ -1036,11 +1036,11 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
-    use crate::hashtable_impl::CuckooHashtable;
+    use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::layer::{FifoLayerBuilder, TtlLayerBuilder};
 
-    fn create_test_cache() -> TieredCache<CuckooHashtable> {
-        let hashtable = Arc::new(CuckooHashtable::new(10)); // 2^10 = 1024 buckets
+    fn create_test_cache() -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10)); // 2^10 = 1024 buckets
 
         let fifo_layer = FifoLayerBuilder::new()
             .layer_id(0)
@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn test_builder_pattern() {
-        let hashtable = Arc::new(CuckooHashtable::new(10));
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
         let cache = TieredCache::builder(hashtable.clone())
             .eviction_threshold(2)
             .max_eviction_attempts(5)
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_layer() {
-        let hashtable = Arc::new(CuckooHashtable::new(10));
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
 
         let fifo_layer = FifoLayerBuilder::new()
             .layer_id(0)
@@ -1448,8 +1448,8 @@ mod tests {
 
     // TTL layer specific tests to improve coverage
 
-    fn create_ttl_only_cache() -> TieredCache<CuckooHashtable> {
-        let hashtable = Arc::new(CuckooHashtable::new(10));
+    fn create_ttl_only_cache() -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
 
         let ttl_layer = TtlLayerBuilder::new()
             .layer_id(0)

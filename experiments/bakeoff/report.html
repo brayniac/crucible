@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crucible Bakeoff Results</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 30px;
+        }
+        h2 {
+            color: #34495e;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        .summary-card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .summary-card h3 {
+            margin-top: 0;
+            color: #2c3e50;
+        }
+        .metric {
+            font-size: 2em;
+            font-weight: bold;
+            color: #3498db;
+        }
+        .metric-label {
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .chart-container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .chart-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 900px) {
+            .chart-row {
+                grid-template-columns: 1fr;
+            }
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 12px 15px;
+            text-align: right;
+            border-bottom: 1px solid #ecf0f1;
+        }
+        th {
+            background: #3498db;
+            color: white;
+            font-weight: 600;
+        }
+        th:first-child, td:first-child {
+            text-align: left;
+        }
+        tr:hover {
+            background: #f8f9fa;
+        }
+        .winner {
+            background: #d5f5e3;
+        }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 10px 20px;
+            background: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .tab:hover {
+            background: #3498db;
+            color: white;
+        }
+        .tab.active {
+            background: #3498db;
+            color: white;
+        }
+        .view {
+            display: none;
+        }
+        .view.active {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Crucible Bakeoff Results</h1>
+
+        <div class="summary" id="summary"></div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="showView('throughput')">Throughput</button>
+            <button class="tab" onclick="showView('latency')">Latency</button>
+            <button class="tab" onclick="showView('data')">Raw Data</button>
+        </div>
+
+        <div id="throughput" class="view active">
+            <h2>Throughput by Configuration</h2>
+            <div class="chart-container">
+                <canvas id="throughputChart"></canvas>
+            </div>
+            <div class="chart-row">
+                <div class="chart-container">
+                    <h3>Throughput vs Connections (pipeline=1)</h3>
+                    <canvas id="throughputByConns"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Throughput vs Pipeline Depth (conns=256)</h3>
+                    <canvas id="throughputByPipeline"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div id="latency" class="view">
+            <h2>Latency (p99) by Configuration</h2>
+            <div class="chart-container">
+                <canvas id="latencyChart"></canvas>
+            </div>
+            <div class="chart-row">
+                <div class="chart-container">
+                    <h3>Throughput vs p99 Latency</h3>
+                    <canvas id="throughputVsLatency"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>p99 Latency at Different Load Levels</h3>
+                    <canvas id="latencyByLoad"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div id="data" class="view">
+            <h2>Raw Data</h2>
+            <div id="dataTables"></div>
+        </div>
+    </div>
+
+    <script>
+        const data = {"experiments":{"valkey-valkey":[{"connections":64,"pipeline_depth":1,"state":"success","metrics":{"throughput":530397.06,"p50_us":127.0,"p99_us":207.0,"p999_us":null}},{"connections":64,"pipeline_depth":8,"state":"success","metrics":{"throughput":1560939.0,"p50_us":327.0,"p99_us":519.0,"p999_us":null}},{"connections":64,"pipeline_depth":32,"state":"success","metrics":{"throughput":2058290.75,"p50_us":975.0,"p99_us":1479.0,"p999_us":null}},{"connections":64,"pipeline_depth":64,"state":"success","metrics":{"throughput":2268088.0,"p50_us":1775.0,"p99_us":2855.0,"p999_us":null}},{"connections":64,"pipeline_depth":128,"state":"success","metrics":{"throughput":2432498.25,"p50_us":3335.0,"p99_us":5711.0,"p999_us":null}},{"connections":256,"pipeline_depth":1,"state":"success","metrics":{"throughput":865201.56,"p50_us":279.0,"p99_us":407.0,"p999_us":null}},{"connections":256,"pipeline_depth":8,"state":"success","metrics":{"throughput":1625012.25,"p50_us":1255.0,"p99_us":1495.0,"p999_us":null}},{"connections":256,"pipeline_depth":32,"state":"success","metrics":{"throughput":2059477.75,"p50_us":3927.0,"p99_us":4391.0,"p999_us":null}},{"connections":256,"pipeline_depth":64,"state":"success","metrics":{"throughput":2268088.0,"p50_us":7183.0,"p99_us":7703.0,"p999_us":null}},{"connections":256,"pipeline_depth":128,"state":"success","metrics":{"throughput":2346646.75,"p50_us":13831.0,"p99_us":14487.0,"p999_us":null}},{"connections":512,"pipeline_depth":1,"state":"success","metrics":{"throughput":904289.94,"p50_us":543.0,"p99_us":879.0,"p999_us":null}},{"connections":512,"pipeline_depth":8,"state":"success","metrics":{"throughput":1624273.12,"p50_us":2495.0,"p99_us":2751.0,"p999_us":null}},{"connections":512,"pipeline_depth":32,"state":"success","metrics":{"throughput":2058036.62,"p50_us":7887.0,"p99_us":8383.0,"p999_us":null}},{"connections":512,"pipeline_depth":64,"state":"success","metrics":{"throughput":2267779.25,"p50_us":14391.0,"p99_us":15415.0,"p999_us":null}},{"connections":512,"pipeline_depth":128,"state":"success","metrics":{"throughput":2374169.0,"p50_us":27503.0,"p99_us":29327.0,"p999_us":null}},{"connections":1024,"pipeline_depth":1,"state":"success","metrics":{"throughput":802568.25,"p50_us":1295.0,"p99_us":1599.0,"p999_us":null}},{"connections":1024,"pipeline_depth":8,"state":"success","metrics":{"throughput":1598159.0,"p50_us":5111.0,"p99_us":5479.0,"p999_us":null}},{"connections":1024,"pipeline_depth":32,"state":"success","metrics":{"throughput":2036908.75,"p50_us":16023.0,"p99_us":17263.0,"p999_us":null}},{"connections":1024,"pipeline_depth":64,"state":"success","metrics":{"throughput":2241851.0,"p50_us":29071.0,"p99_us":32831.0,"p999_us":null}},{"connections":1024,"pipeline_depth":128,"state":"success","metrics":{"throughput":2345655.75,"p50_us":55775.0,"p99_us":58431.0,"p999_us":null}}],"valkey-segcache":[{"connections":64,"pipeline_depth":1,"state":"success","metrics":{"throughput":318240.41,"p50_us":79.0,"p99_us":159.0,"p999_us":null}},{"connections":64,"pipeline_depth":8,"state":"success","metrics":{"throughput":2210344.25,"p50_us":119.0,"p99_us":207.0,"p999_us":null}},{"connections":64,"pipeline_depth":32,"state":"success","metrics":{"throughput":5548774.0,"p50_us":215.0,"p99_us":407.0,"p999_us":null}},{"connections":64,"pipeline_depth":64,"state":"success","metrics":{"throughput":5705157.5,"p50_us":359.0,"p99_us":711.0,"p999_us":null}},{"connections":64,"pipeline_depth":128,"state":"success","metrics":{"throughput":6045949.0,"p50_us":583.0,"p99_us":1263.0,"p999_us":null}},{"connections":256,"pipeline_depth":1,"state":"success","metrics":{"throughput":1030184.38,"p50_us":247.0,"p99_us":335.0,"p999_us":null}},{"connections":256,"pipeline_depth":8,"state":"success","metrics":{"throughput":4995005.0,"p50_us":359.0,"p99_us":543.0,"p999_us":null}},{"connections":256,"pipeline_depth":32,"state":"success","metrics":{"throughput":6048875.0,"p50_us":711.0,"p99_us":1199.0,"p999_us":null}},{"connections":256,"pipeline_depth":64,"state":"success","metrics":{"throughput":6228201.5,"p50_us":1335.0,"p99_us":2207.0,"p999_us":null}},{"connections":256,"pipeline_depth":128,"state":"success","metrics":{"throughput":6406150.0,"p50_us":2519.0,"p99_us":3879.0,"p999_us":null}},{"connections":512,"pipeline_depth":1,"state":"success","metrics":{"throughput":1155214.62,"p50_us":423.0,"p99_us":639.0,"p999_us":null}},{"connections":512,"pipeline_depth":8,"state":"success","metrics":{"throughput":4995005.0,"p50_us":759.0,"p99_us":999.0,"p999_us":null}},{"connections":512,"pipeline_depth":32,"state":"success","metrics":{"throughput":5694112.0,"p50_us":1463.0,"p99_us":2207.0,"p999_us":null}},{"connections":512,"pipeline_depth":64,"state":"success","metrics":{"throughput":5839075.5,"p50_us":2799.0,"p99_us":4199.0,"p999_us":null}},{"connections":512,"pipeline_depth":128,"state":"success","metrics":{"throughput":5973002.0,"p50_us":5335.0,"p99_us":7583.0,"p999_us":null}},{"connections":1024,"pipeline_depth":1,"state":"success","metrics":{"throughput":1196744.88,"p50_us":839.0,"p99_us":1071.0,"p999_us":null}},{"connections":1024,"pipeline_depth":8,"state":"success","metrics":{"throughput":4870920.5,"p50_us":1463.0,"p99_us":1983.0,"p999_us":null}},{"connections":1024,"pipeline_depth":32,"state":"success","metrics":{"throughput":6208095.5,"p50_us":2663.0,"p99_us":3687.0,"p999_us":null}},{"connections":1024,"pipeline_depth":64,"state":"success","metrics":{"throughput":5978716.0,"p50_us":5383.0,"p99_us":7607.0,"p999_us":null}},{"connections":1024,"pipeline_depth":128,"state":"success","metrics":{"throughput":6134216.5,"p50_us":10343.0,"p99_us":14943.0,"p999_us":null}}],"crucible-segcache":[{"connections":64,"pipeline_depth":1,"state":"success","metrics":{"throughput":622953.17,"p50_us":80.38,"p99_us":158.72,"p999_us":211.97}},{"connections":64,"pipeline_depth":8,"state":"success","metrics":{"throughput":4070566.27,"p50_us":123.39,"p99_us":214.01,"p999_us":272.38}},{"connections":64,"pipeline_depth":32,"state":"success","metrics":{"throughput":8091257.6,"p50_us":229.38,"p99_us":370.69,"p999_us":444.42}},{"connections":64,"pipeline_depth":64,"state":"success","metrics":{"throughput":7805197.87,"p50_us":454.65,"p99_us":729.09,"p999_us":876.54}},{"connections":64,"pipeline_depth":128,"state":"success","metrics":{"throughput":8160187.43,"p50_us":839.68,"p99_us":1261.57,"p999_us":1458.17}},{"connections":256,"pipeline_depth":1,"state":"success","metrics":{"throughput":1053907.15,"p50_us":250.88,"p99_us":344.06,"p999_us":448.51}},{"connections":256,"pipeline_depth":8,"state":"success","metrics":{"throughput":5061477.47,"p50_us":405.5,"p99_us":536.58,"p999_us":614.4}},{"connections":256,"pipeline_depth":32,"state":"success","metrics":{"throughput":8760355.73,"p50_us":811.01,"p99_us":1187.84,"p999_us":1335.3}},{"connections":256,"pipeline_depth":64,"state":"success","metrics":{"throughput":8348685.87,"p50_us":1622.02,"p99_us":1728.51,"p999_us":2293.76}},{"connections":256,"pipeline_depth":128,"state":"success","metrics":{"throughput":8689038.8,"p50_us":3112.96,"p99_us":3391.49,"p999_us":4915.2}},{"connections":512,"pipeline_depth":1,"state":"success","metrics":{"throughput":1161051.9,"p50_us":434.18,"p99_us":643.07,"p999_us":737.28}},{"connections":512,"pipeline_depth":8,"state":"success","metrics":{"throughput":5094956.4,"p50_us":798.72,"p99_us":1036.29,"p999_us":1286.14}},{"connections":512,"pipeline_depth":32,"state":"success","metrics":{"throughput":8140418.13,"p50_us":1654.78,"p99_us":1900.54,"p999_us":2621.44}},{"connections":512,"pipeline_depth":64,"state":"success","metrics":{"throughput":7554978.13,"p50_us":3522.56,"p99_us":3883.01,"p999_us":5308.41}},{"connections":512,"pipeline_depth":128,"state":"success","metrics":{"throughput":7823112.47,"p50_us":6782.98,"p99_us":7569.41,"p999_us":9764.86}},{"connections":1024,"pipeline_depth":1,"state":"success","metrics":{"throughput":1201543.97,"p50_us":847.87,"p99_us":999.42,"p999_us":1220.61}},{"connections":1024,"pipeline_depth":8,"state":"success","metrics":{"throughput":5408361.33,"p50_us":1490.94,"p99_us":2310.14,"p999_us":2637.82}},{"connections":1024,"pipeline_depth":32,"state":"success","metrics":{"throughput":7719786.13,"p50_us":3473.41,"p99_us":4194.3,"p999_us":11141.12}},{"connections":1024,"pipeline_depth":64,"state":"success","metrics":{"throughput":7774100.27,"p50_us":6848.51,"p99_us":7471.1,"p999_us":9961.47}},{"connections":1024,"pipeline_depth":128,"state":"success","metrics":{"throughput":7322999.43,"p50_us":14548.99,"p99_us":15663.1,"p999_us":16056.32}}],"crucible-valkey":[{"connections":64,"pipeline_depth":1,"state":"success","metrics":{"throughput":547898.43,"p50_us":120.83,"p99_us":206.85,"p999_us":315.39}},{"connections":64,"pipeline_depth":8,"state":"success","metrics":{"throughput":1592712.0,"p50_us":315.39,"p99_us":509.95,"p999_us":741.38}},{"connections":64,"pipeline_depth":32,"state":"success","metrics":{"throughput":2005203.2,"p50_us":1015.81,"p99_us":1523.71,"p999_us":2785.28}},{"connections":64,"pipeline_depth":64,"state":"success","metrics":{"throughput":2224724.27,"p50_us":1835.01,"p99_us":2949.12,"p999_us":3670.01}},{"connections":64,"pipeline_depth":128,"state":"success","metrics":{"throughput":2335555.9,"p50_us":3506.18,"p99_us":5865.47,"p999_us":6782.98}},{"connections":256,"pipeline_depth":1,"state":"success","metrics":{"throughput":851374.85,"p50_us":296.96,"p99_us":417.79,"p999_us":557.05}},{"connections":256,"pipeline_depth":8,"state":"success","metrics":{"throughput":1606294.27,"p50_us":1269.76,"p99_us":1515.52,"p999_us":3129.34}},{"connections":256,"pipeline_depth":32,"state":"success","metrics":{"throughput":2012754.67,"p50_us":4079.61,"p99_us":4489.22,"p999_us":6127.61}},{"connections":256,"pipeline_depth":64,"state":"success","metrics":{"throughput":2258356.27,"p50_us":7274.49,"p99_us":7864.32,"p999_us":10485.76}},{"connections":256,"pipeline_depth":128,"state":"success","metrics":{"throughput":2392176.83,"p50_us":13697.02,"p99_us":15204.35,"p999_us":25821.18}},{"connections":512,"pipeline_depth":1,"state":"success","metrics":{"throughput":863052.9,"p50_us":577.53,"p99_us":942.08,"p999_us":1130.49}},{"connections":512,"pipeline_depth":8,"state":"success","metrics":{"throughput":1573669.87,"p50_us":2605.05,"p99_us":2867.2,"p999_us":3932.16}},{"connections":512,"pipeline_depth":32,"state":"success","metrics":{"throughput":2071153.07,"p50_us":7897.09,"p99_us":8454.14,"p999_us":11075.58}},{"connections":512,"pipeline_depth":64,"state":"success","metrics":{"throughput":2172504.53,"p50_us":15073.28,"p99_us":17694.72,"p999_us":21233.66}},{"connections":512,"pipeline_depth":128,"state":"success","metrics":{"throughput":2365540.27,"p50_us":27656.19,"p99_us":29753.34,"p999_us":32768.0}},{"connections":1024,"pipeline_depth":1,"state":"success","metrics":{"throughput":814267.72,"p50_us":1269.76,"p99_us":1613.82,"p999_us":4030.46}},{"connections":1024,"pipeline_depth":8,"state":"success","metrics":{"throughput":1576900.13,"p50_us":5210.11,"p99_us":5537.79,"p999_us":7503.87}},{"connections":1024,"pipeline_depth":32,"state":"success","metrics":{"throughput":2016031.47,"p50_us":16318.46,"p99_us":17301.5,"p999_us":19136.51}},{"connections":1024,"pipeline_depth":64,"state":"success","metrics":{"throughput":2215050.67,"p50_us":29491.2,"p99_us":33030.14,"p999_us":35389.44}},{"connections":1024,"pipeline_depth":128,"state":"success","metrics":{"throughput":2396204.77,"p50_us":54788.1,"p99_us":57409.54,"p999_us":69206.01}}]}};
+        const colors = {
+            'crucible-segcache': '#3498db',
+            'crucible-valkey': '#e74c3c',
+            'valkey-segcache': '#2ecc71',
+            'valkey-valkey': '#9b59b6'
+        };
+
+        function formatThroughput(val) {
+            if (!val) return '-';
+            if (val >= 1000000) return (val / 1000000).toFixed(2) + 'M/s';
+            if (val >= 1000) return (val / 1000).toFixed(1) + 'K/s';
+            return val.toFixed(0) + '/s';
+        }
+
+        function formatLatency(us) {
+            if (!us) return '-';
+            if (us >= 1000) return (us / 1000).toFixed(2) + 'ms';
+            return us.toFixed(0) + 'us';
+        }
+
+        function showView(viewId) {
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById(viewId).classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        // Build summary cards
+        function buildSummary() {
+            const summary = document.getElementById('summary');
+            let html = '';
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                const successResults = results.filter(r => r.state === 'success' && r.metrics.throughput);
+                if (successResults.length === 0) continue;
+
+                const maxThroughput = Math.max(...successResults.map(r => r.metrics.throughput));
+                const bestResult = successResults.find(r => r.metrics.throughput === maxThroughput);
+
+                html += `
+                    <div class="summary-card">
+                        <h3>${name}</h3>
+                        <div class="metric">${formatThroughput(maxThroughput)}</div>
+                        <div class="metric-label">Peak throughput at c${bestResult.connections}/p${bestResult.pipeline_depth}</div>
+                    </div>
+                `;
+            }
+            summary.innerHTML = html;
+        }
+
+        // Build throughput chart
+        function buildThroughputChart() {
+            const ctx = document.getElementById('throughputChart').getContext('2d');
+            const datasets = [];
+            const labels = new Set();
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                results.forEach(r => labels.add(`c${r.connections}/p${r.pipeline_depth}`));
+            }
+
+            const sortedLabels = Array.from(labels).sort((a, b) => {
+                const [ca, pa] = a.match(/\d+/g).map(Number);
+                const [cb, pb] = b.match(/\d+/g).map(Number);
+                return ca - cb || pa - pb;
+            });
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                const throughputData = sortedLabels.map(label => {
+                    const [c, p] = label.match(/\d+/g).map(Number);
+                    const r = results.find(r => r.connections === c && r.pipeline_depth === p);
+                    return r?.metrics?.throughput ? r.metrics.throughput / 1000000 : null;
+                });
+
+                datasets.push({
+                    label: name,
+                    data: throughputData,
+                    backgroundColor: colors[name] + '80',
+                    borderColor: colors[name],
+                    borderWidth: 2
+                });
+            }
+
+            new Chart(ctx, {
+                type: 'bar',
+                data: { labels: sortedLabels, datasets },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        title: { display: false },
+                        legend: { position: 'top' }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Throughput (M req/s)' }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Build throughput by connections chart
+        function buildThroughputByConns() {
+            const ctx = document.getElementById('throughputByConns').getContext('2d');
+            const connections = [64, 256, 512, 1024];
+            const datasets = [];
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                const throughputData = connections.map(c => {
+                    const r = results.find(r => r.connections === c && r.pipeline_depth === 1);
+                    return r?.metrics?.throughput ? r.metrics.throughput / 1000000 : null;
+                });
+
+                datasets.push({
+                    label: name,
+                    data: throughputData,
+                    borderColor: colors[name],
+                    backgroundColor: colors[name] + '20',
+                    tension: 0.3,
+                    fill: false
+                });
+            }
+
+            new Chart(ctx, {
+                type: 'line',
+                data: { labels: connections.map(c => c.toString()), datasets },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { position: 'top' } },
+                    scales: {
+                        x: { title: { display: true, text: 'Connections' } },
+                        y: { beginAtZero: true, title: { display: true, text: 'Throughput (M req/s)' } }
+                    }
+                }
+            });
+        }
+
+        // Build throughput by pipeline chart
+        function buildThroughputByPipeline() {
+            const ctx = document.getElementById('throughputByPipeline').getContext('2d');
+            const pipelines = [1, 8, 32, 64, 128];
+            const datasets = [];
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                const throughputData = pipelines.map(p => {
+                    const r = results.find(r => r.connections === 256 && r.pipeline_depth === p);
+                    return r?.metrics?.throughput ? r.metrics.throughput / 1000000 : null;
+                });
+
+                datasets.push({
+                    label: name,
+                    data: throughputData,
+                    borderColor: colors[name],
+                    backgroundColor: colors[name] + '20',
+                    tension: 0.3,
+                    fill: false
+                });
+            }
+
+            new Chart(ctx, {
+                type: 'line',
+                data: { labels: pipelines.map(p => p.toString()), datasets },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { position: 'top' } },
+                    scales: {
+                        x: { title: { display: true, text: 'Pipeline Depth' } },
+                        y: { beginAtZero: true, title: { display: true, text: 'Throughput (M req/s)' } }
+                    }
+                }
+            });
+        }
+
+        // Build latency chart
+        function buildLatencyChart() {
+            const ctx = document.getElementById('latencyChart').getContext('2d');
+            const datasets = [];
+            const labels = new Set();
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                results.forEach(r => labels.add(`c${r.connections}/p${r.pipeline_depth}`));
+            }
+
+            const sortedLabels = Array.from(labels).sort((a, b) => {
+                const [ca, pa] = a.match(/\d+/g).map(Number);
+                const [cb, pb] = b.match(/\d+/g).map(Number);
+                return ca - cb || pa - pb;
+            });
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                const latencyData = sortedLabels.map(label => {
+                    const [c, p] = label.match(/\d+/g).map(Number);
+                    const r = results.find(r => r.connections === c && r.pipeline_depth === p);
+                    return r?.metrics?.p99_us ? r.metrics.p99_us / 1000 : null;
+                });
+
+                datasets.push({
+                    label: name,
+                    data: latencyData,
+                    backgroundColor: colors[name] + '80',
+                    borderColor: colors[name],
+                    borderWidth: 2
+                });
+            }
+
+            new Chart(ctx, {
+                type: 'bar',
+                data: { labels: sortedLabels, datasets },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { position: 'top' } },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'p99 Latency (ms)' }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Build throughput vs latency scatter plot
+        function buildThroughputVsLatency() {
+            const ctx = document.getElementById('throughputVsLatency').getContext('2d');
+            const datasets = [];
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                const points = results
+                    .filter(r => r.metrics.throughput && r.metrics.p99_us)
+                    .map(r => ({
+                        x: r.metrics.throughput / 1000000,
+                        y: r.metrics.p99_us / 1000
+                    }));
+
+                datasets.push({
+                    label: name,
+                    data: points,
+                    backgroundColor: colors[name],
+                    borderColor: colors[name],
+                    pointRadius: 6
+                });
+            }
+
+            new Chart(ctx, {
+                type: 'scatter',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { position: 'top' } },
+                    scales: {
+                        x: { title: { display: true, text: 'Throughput (M req/s)' } },
+                        y: { title: { display: true, text: 'p99 Latency (ms)' } }
+                    }
+                }
+            });
+        }
+
+        // Build latency by load chart
+        function buildLatencyByLoad() {
+            const ctx = document.getElementById('latencyByLoad').getContext('2d');
+            const configs = ['c64/p1', 'c256/p1', 'c256/p32', 'c1024/p64'];
+            const datasets = [];
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                const latencyData = configs.map(cfg => {
+                    const [c, p] = cfg.match(/\d+/g).map(Number);
+                    const r = results.find(r => r.connections === c && r.pipeline_depth === p);
+                    return r?.metrics?.p99_us ? r.metrics.p99_us / 1000 : null;
+                });
+
+                datasets.push({
+                    label: name,
+                    data: latencyData,
+                    borderColor: colors[name],
+                    backgroundColor: colors[name] + '20',
+                    tension: 0.3,
+                    fill: false
+                });
+            }
+
+            new Chart(ctx, {
+                type: 'line',
+                data: { labels: configs, datasets },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { position: 'top' } },
+                    scales: {
+                        x: { title: { display: true, text: 'Configuration' } },
+                        y: { title: { display: true, text: 'p99 Latency (ms)' } }
+                    }
+                }
+            });
+        }
+
+        // Build raw data tables
+        function buildDataTables() {
+            let html = '';
+
+            for (const [name, results] of Object.entries(data.experiments)) {
+                html += `<h3>${name}</h3><table>
+                    <thead>
+                        <tr>
+                            <th>Connections</th>
+                            <th>Pipeline</th>
+                            <th>State</th>
+                            <th>Throughput</th>
+                            <th>p50</th>
+                            <th>p99</th>
+                            <th>p99.9</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                `;
+
+                results.forEach(r => {
+                    html += `
+                        <tr>
+                            <td>${r.connections}</td>
+                            <td>${r.pipeline_depth}</td>
+                            <td>${r.state === 'success' ? 'ok' : r.state}</td>
+                            <td>${formatThroughput(r.metrics.throughput)}</td>
+                            <td>${formatLatency(r.metrics.p50_us)}</td>
+                            <td>${formatLatency(r.metrics.p99_us)}</td>
+                            <td>${formatLatency(r.metrics.p999_us)}</td>
+                        </tr>
+                    `;
+                });
+
+                html += '</tbody></table>';
+            }
+
+            document.getElementById('dataTables').innerHTML = html;
+        }
+
+        // Initialize all charts
+        buildSummary();
+        buildThroughputChart();
+        buildThroughputByConns();
+        buildThroughputByPipeline();
+        buildLatencyChart();
+        buildThroughputVsLatency();
+        buildLatencyByLoad();
+        buildDataTables();
+    </script>
+</body>
+</html>

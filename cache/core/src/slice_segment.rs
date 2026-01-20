@@ -2070,6 +2070,303 @@ mod tests {
 }
 
 // -----------------------------------------------------------------------------
+// SegmentPrune implementation
+// -----------------------------------------------------------------------------
+
+use crate::segment::{PruneCollectingResult, SegmentPrune};
+
+impl SegmentPrune for SliceSegment<'_> {
+    fn prune<F>(&self, threshold: u8, get_frequency: F) -> (u32, u32, u32, u32)
+    where
+        F: Fn(&[u8]) -> Option<u8>,
+    {
+        let mut items_retained = 0u32;
+        let mut items_pruned = 0u32;
+        let mut bytes_retained = 0u32;
+        let mut bytes_pruned = 0u32;
+
+        let header_size = if self.is_per_item_ttl() {
+            TtlHeader::SIZE
+        } else {
+            BasicHeader::SIZE
+        };
+
+        let mut offset = 0u32;
+        let write_offset = self.write_offset();
+
+        while offset < write_offset {
+            // Check bounds for header
+            if offset as usize + header_size > self.capacity as usize {
+                break;
+            }
+
+            let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, header_size) };
+
+            // Parse header based on TTL mode
+            let (key_len, optional_len, value_len, is_deleted) = if self.is_per_item_ttl() {
+                match TtlHeader::try_from_bytes(header_bytes) {
+                    Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
+                    None => break,
+                }
+            } else {
+                match BasicHeader::try_from_bytes(header_bytes) {
+                    Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
+                    None => break,
+                }
+            };
+
+            // Calculate padded item size
+            let item_size =
+                header_size + optional_len as usize + key_len as usize + value_len as usize;
+            let padded_size = ((item_size + 7) & !7) as u32;
+
+            // Skip if already deleted
+            if is_deleted {
+                offset += padded_size;
+                continue;
+            }
+
+            // Extract key
+            let key_start = offset as usize + header_size + optional_len as usize;
+            let key_end = key_start + key_len as usize;
+            if key_end > self.capacity as usize {
+                break;
+            }
+            let key = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().add(key_start), key_len as usize)
+            };
+
+            // Get frequency for this key
+            let freq = get_frequency(key).unwrap_or(0);
+
+            if freq <= threshold {
+                // Mark as deleted - use mark_deleted to properly update live_items/live_bytes
+                let _ = self.mark_deleted(offset, key);
+                items_pruned += 1;
+                bytes_pruned += padded_size;
+            } else {
+                items_retained += 1;
+                bytes_retained += padded_size;
+            }
+
+            offset += padded_size;
+        }
+
+        (items_retained, items_pruned, bytes_retained, bytes_pruned)
+    }
+
+    fn prune_collecting<F>(&self, threshold: u8, get_frequency: F) -> PruneCollectingResult
+    where
+        F: Fn(&[u8]) -> Option<u8>,
+    {
+        let mut items_retained = 0u32;
+        let mut items_pruned = 0u32;
+        let mut bytes_retained = 0u32;
+        let mut bytes_pruned = 0u32;
+        let mut items_to_demote = Vec::new();
+
+        let header_size = if self.is_per_item_ttl() {
+            TtlHeader::SIZE
+        } else {
+            BasicHeader::SIZE
+        };
+
+        let now = clocksource::coarse::UnixInstant::now()
+            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
+            .as_secs();
+
+        let mut offset = 0u32;
+        let write_offset = self.write_offset();
+
+        while offset < write_offset {
+            // Check bounds for header
+            if offset as usize + header_size > self.capacity as usize {
+                break;
+            }
+
+            let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, header_size) };
+
+            // Parse header based on TTL mode
+            let (key_len, optional_len, value_len, is_deleted, expire_at) =
+                if self.is_per_item_ttl() {
+                    match TtlHeader::try_from_bytes(header_bytes) {
+                        Some(h) => (
+                            h.key_len(),
+                            h.optional_len(),
+                            h.value_len(),
+                            h.is_deleted(),
+                            h.expire_at(),
+                        ),
+                        None => break,
+                    }
+                } else {
+                    match BasicHeader::try_from_bytes(header_bytes) {
+                        Some(h) => (
+                            h.key_len(),
+                            h.optional_len(),
+                            h.value_len(),
+                            h.is_deleted(),
+                            self.expire_at.load(Ordering::Acquire),
+                        ),
+                        None => break,
+                    }
+                };
+
+            // Calculate padded item size
+            let item_size =
+                header_size + optional_len as usize + key_len as usize + value_len as usize;
+            let padded_size = ((item_size + 7) & !7) as u32;
+
+            // Skip if already deleted
+            if is_deleted {
+                offset += padded_size;
+                continue;
+            }
+
+            // Extract key, value, optional
+            let optional_start = offset as usize + header_size;
+            let key_start = optional_start + optional_len as usize;
+            let value_start = key_start + key_len as usize;
+            let value_end = value_start + value_len as usize;
+
+            if value_end > self.capacity as usize {
+                break;
+            }
+
+            let optional = if optional_len > 0 {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        self.data.as_ptr().add(optional_start),
+                        optional_len as usize,
+                    )
+                }
+            } else {
+                &[]
+            };
+            let key = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().add(key_start), key_len as usize)
+            };
+            let value = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().add(value_start), value_len as usize)
+            };
+
+            // Get frequency for this key
+            let freq = get_frequency(key).unwrap_or(0);
+
+            if freq <= threshold {
+                // Collect item for demotion
+                let ttl_secs = if expire_at > now { expire_at - now } else { 0 };
+                items_to_demote.push((key.to_vec(), value.to_vec(), optional.to_vec(), ttl_secs));
+
+                // Mark as deleted
+                let _ = self.mark_deleted(offset, key);
+                items_pruned += 1;
+                bytes_pruned += padded_size;
+            } else {
+                items_retained += 1;
+                bytes_retained += padded_size;
+            }
+
+            offset += padded_size;
+        }
+
+        (
+            items_retained,
+            items_pruned,
+            bytes_retained,
+            bytes_pruned,
+            items_to_demote,
+        )
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SegmentIter implementation
+// -----------------------------------------------------------------------------
+
+use crate::segment::SegmentIter;
+
+impl SegmentIter for SliceSegment<'_> {
+    fn for_each_item<F>(&self, mut callback: F)
+    where
+        F: FnMut(u32, &[u8], &[u8], &[u8], bool) -> bool,
+    {
+        let header_size = if self.is_per_item_ttl() {
+            TtlHeader::SIZE
+        } else {
+            BasicHeader::SIZE
+        };
+
+        let mut offset = 0u32;
+        let write_offset = self.write_offset();
+
+        while offset < write_offset {
+            // Check bounds for header
+            if offset as usize + header_size > self.capacity as usize {
+                break;
+            }
+
+            let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
+            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, header_size) };
+
+            // Parse header based on TTL mode
+            let (key_len, optional_len, value_len, is_deleted) = if self.is_per_item_ttl() {
+                match TtlHeader::try_from_bytes(header_bytes) {
+                    Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
+                    None => break,
+                }
+            } else {
+                match BasicHeader::try_from_bytes(header_bytes) {
+                    Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
+                    None => break,
+                }
+            };
+
+            // Calculate padded item size
+            let item_size =
+                header_size + optional_len as usize + key_len as usize + value_len as usize;
+            let padded_size = ((item_size + 7) & !7) as u32;
+
+            // Extract key, value, optional
+            let optional_start = offset as usize + header_size;
+            let key_start = optional_start + optional_len as usize;
+            let value_start = key_start + key_len as usize;
+            let value_end = value_start + value_len as usize;
+
+            if value_end > self.capacity as usize {
+                break;
+            }
+
+            let optional = if optional_len > 0 {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        self.data.as_ptr().add(optional_start),
+                        optional_len as usize,
+                    )
+                }
+            } else {
+                &[]
+            };
+            let key = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().add(key_start), key_len as usize)
+            };
+            let value = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().add(value_start), value_len as usize)
+            };
+
+            // Call callback
+            if !callback(offset, key, value, optional, is_deleted) {
+                break;
+            }
+
+            offset += padded_size;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Loom concurrency tests
 // -----------------------------------------------------------------------------
 

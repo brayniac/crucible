@@ -25,7 +25,7 @@ fn start_test_server(port: u16) -> thread::JoinHandle<()> {
             threads = 1
 
             [cache]
-            backend = "segcache"
+            backend = "segment"
             heap_size = "16MB"
             segment_size = "1MB"
             hashtable_power = 16

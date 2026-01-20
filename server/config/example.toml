@@ -1,4 +1,11 @@
 # Crucible Server Example Configuration
+#
+# This is a general-purpose configuration suitable for most workloads.
+# For specific use cases, see:
+#   - redis.toml    - Redis-compatible configuration
+#   - memcached.toml - Memcached-compatible configuration
+#   - heap.toml     - Heap backend (no segment fragmentation)
+#   - slab.toml     - Slab allocator with per-object LRU
 
 # Runtime selection: "native" (io_uring/mio) or "tokio"
 runtime = "native"
@@ -11,19 +18,29 @@ threads = 4
 # cpu_affinity = "0-3"
 
 [cache]
-# Cache backend: "segcache" or "s3fifo"
-backend = "segcache"
+# Cache backend (storage type): "segment", "slab", or "heap"
+backend = "segment"
+
+# Eviction policy (depends on backend):
+#   segment: "s3fifo" (default), "fifo", "random", "cte", "merge"
+#   heap:    "s3fifo" (default), "lfu"
+#   slab:    "lra" (default), "lrc", "random", "none"
+policy = "s3fifo"
 
 # Total heap size
 heap_size = "1GB"
 
-# Segment size
+# Segment size (not used by heap backend)
 segment_size = "8MB"
 
 # Maximum value size (must be less than segment_size)
 max_value_size = "1MB"
 
 # Hashtable power (2^power buckets)
+# Size the hashtable for your expected item count:
+#   2^16 = 65K buckets, good for ~30K items
+#   2^20 = 1M buckets, good for ~500K items
+#   2^24 = 16M buckets, good for ~8M items
 hashtable_power = 16
 
 # RESP protocol listener (Redis-compatible)

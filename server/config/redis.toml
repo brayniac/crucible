@@ -1,0 +1,79 @@
+# Crucible Server - Redis Migration Configuration
+#
+# This configuration is optimized for users migrating from Redis.
+# It provides a drop-in replacement on the standard Redis port with
+# RESP protocol support.
+#
+# Supported Redis commands:
+#   - GET, SET, MGET, DEL
+#   - SET with EX (TTL in seconds)
+#   - PING, HELLO, CONFIG GET/SET
+#
+# Accepted but not implemented (returns OK, does nothing):
+#   - FLUSHDB, FLUSHALL
+#   - SET with PX (millisecond TTL) - treated as no TTL
+#   - SET with NX/XX (conditional) - always overwrites
+#
+# Not supported:
+#   - MSET, EXISTS, TOUCH, TTL, PTTL, EXPIRE, EXPIREAT, PERSIST
+#   - INCR, INCRBY, INCRBYFLOAT, DECR, DECRBY
+#   - APPEND, STRLEN, GETSET, SETNX, GETEX
+#
+# Migration notes:
+#   - Crucible is a pure key-value cache, not a full Redis replacement
+#   - Data structures (lists, sets, hashes, sorted sets) are not supported
+#   - Persistence (RDB/AOF) is not supported - this is a cache
+#   - Pub/Sub and Lua scripting are not supported
+
+runtime = "native"
+
+[workers]
+# Match your Redis instance thread count or use all CPUs
+threads = 4
+
+# Pin to specific cores for consistent latency (optional)
+# cpu_affinity = "0-3"
+
+[cache]
+# Segment storage with S3-FIFO eviction for excellent hit rates
+backend = "segment"
+policy = "s3fifo"
+
+# Size appropriately for your working set
+# Redis: check INFO memory for used_memory
+heap_size = "4GB"
+
+# Segment size - larger values reduce overhead for big objects
+segment_size = "8MB"
+
+# Maximum value size
+# Redis default: 512MB, but most values are much smaller
+max_value_size = "1MB"
+
+# Hashtable sizing for expected key count
+# Redis: check INFO keyspace for db0:keys=N
+# Use 2^N where N gives ~50% load factor
+# Example: 1M keys -> 2^21 = 2M buckets
+hashtable_power = 21
+
+# RESP listener on standard Redis port
+[[listener]]
+protocol = "resp"
+address = "0.0.0.0:6379"
+
+# Optional: TLS for encrypted connections
+# [listener.tls]
+# cert = "/path/to/cert.pem"
+# key = "/path/to/key.pem"
+
+[metrics]
+# Prometheus metrics endpoint
+address = "0.0.0.0:9090"
+
+[uring]
+# io_uring settings (Linux 6.0+ only)
+sqpoll = false
+buffer_count = 4096
+buffer_size = "16KB"
+sq_depth = 2048
+recv_mode = "multishot"

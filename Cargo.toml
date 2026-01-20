@@ -5,8 +5,8 @@ members = [
 	# Cache Implementations and Core
 	"cache/core",
 	"cache/segcache",
-	"cache/s3fifo",
 	"cache/slab",
+	"cache/heap",
 
 	# IO Driver and Transport
 	"io/grpc",
@@ -34,8 +34,6 @@ members = [
 	# Metrics
 	"metrics",
 
-	# Tools
-	"tools/observer",
 ]
 
 [workspace.package]
@@ -87,8 +85,8 @@ protocol-resp = { path = "protocol/resp" }
 protocol-memcache = { path = "protocol/memcache" }
 cache-core = { path = "cache/core" }
 segcache = { path = "cache/segcache" }
-s3fifo = { path = "cache/s3fifo" }
 slab-cache = { path = "cache/slab" }
+heap-cache = { path = "cache/heap" }
 metrics = { path = "metrics" }
 
 # Platform-specific (Linux io_uring)

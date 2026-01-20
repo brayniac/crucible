@@ -147,18 +147,27 @@ pub struct WorkersConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
-    /// Cache backend: "segcache", "s3fifo", or "slab"
+    /// Cache backend (storage type): "segment", "slab", or "heap"
     #[serde(default = "default_cache_backend")]
     pub backend: CacheBackend,
+
+    /// Eviction policy. Valid options depend on backend:
+    /// - segment: "s3fifo" (default), "fifo", "random", "cte", "merge"
+    /// - heap: "s3fifo" (default), "lfu"
+    /// - slab: "lra" (default), "lrc", "random", "none"
+    #[serde(default)]
+    pub policy: Option<EvictionPolicy>,
 
     /// Total heap size for cache (e.g., "4GB", "512MB")
     #[serde(default = "default_heap_size", deserialize_with = "deserialize_size")]
     pub heap_size: usize,
 
-    /// Segment size (e.g., "1MB", "512KB")
+    /// Segment size / slab size (e.g., "1MB", "512KB").
+    /// For slab backend, this determines the maximum item size.
     #[serde(
         default = "default_segment_size",
-        deserialize_with = "deserialize_size"
+        deserialize_with = "deserialize_size",
+        alias = "slab_size"
     )]
     pub segment_size: usize,
 
@@ -189,6 +198,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             backend: default_cache_backend(),
+            policy: None,
             heap_size: default_heap_size(),
             segment_size: default_segment_size(),
             max_value_size: default_max_value_size(),
@@ -199,17 +209,99 @@ impl Default for CacheConfig {
     }
 }
 
-/// Cache backend selection.
+impl CacheConfig {
+    /// Get the effective eviction policy for this backend.
+    ///
+    /// If no policy is specified, returns the default for the backend.
+    pub fn effective_policy(&self) -> EvictionPolicy {
+        self.policy.unwrap_or_else(|| self.backend.default_policy())
+    }
+}
+
+/// Cache backend (storage type) selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheBackend {
-    /// Segcache - segment-based cache
+    /// Segment-based cache with fixed-size segments
     #[default]
-    Segcache,
-    /// S3-FIFO - Simple, Scalable eviction with three FIFO queues
-    S3fifo,
-    /// Slab - memcached-style slab allocator with per-object LRU
+    Segment,
+    /// Slab allocator with size classes (memcached-style)
     Slab,
+    /// Heap-allocated cache using system allocator
+    Heap,
+}
+
+impl CacheBackend {
+    /// Get the default eviction policy for this backend.
+    pub fn default_policy(self) -> EvictionPolicy {
+        match self {
+            CacheBackend::Segment => EvictionPolicy::S3Fifo,
+            CacheBackend::Heap => EvictionPolicy::S3Fifo,
+            CacheBackend::Slab => EvictionPolicy::Lra,
+        }
+    }
+
+    /// Check if a policy is valid for this backend.
+    pub fn is_valid_policy(self, policy: EvictionPolicy) -> bool {
+        match self {
+            CacheBackend::Segment => matches!(
+                policy,
+                EvictionPolicy::S3Fifo
+                    | EvictionPolicy::Fifo
+                    | EvictionPolicy::Random
+                    | EvictionPolicy::Cte
+                    | EvictionPolicy::Merge
+            ),
+            CacheBackend::Heap => {
+                matches!(policy, EvictionPolicy::S3Fifo | EvictionPolicy::Lfu)
+            }
+            CacheBackend::Slab => matches!(
+                policy,
+                EvictionPolicy::Lra
+                    | EvictionPolicy::Lrc
+                    | EvictionPolicy::Random
+                    | EvictionPolicy::None
+            ),
+        }
+    }
+}
+
+/// Eviction policy selection.
+///
+/// Not all policies are valid for all backends:
+/// - Segment: s3fifo, fifo, random, cte, merge
+/// - Heap: s3fifo, lfu
+/// - Slab: lra, lrc, random, none
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EvictionPolicy {
+    /// S3-FIFO: admission filter (small queue) + main cache
+    /// Valid for: segment, heap
+    S3Fifo,
+    /// Simple FIFO eviction
+    /// Valid for: segment
+    Fifo,
+    /// Random eviction
+    /// Valid for: segment, slab
+    Random,
+    /// Closest to expiration (TTL-aware)
+    /// Valid for: segment
+    Cte,
+    /// Merge eviction (compaction)
+    /// Valid for: segment
+    Merge,
+    /// Approximate LFU (least frequently used)
+    /// Valid for: heap
+    Lfu,
+    /// Least recently accessed slab
+    /// Valid for: slab
+    Lra,
+    /// Least recently created slab
+    /// Valid for: slab
+    Lrc,
+    /// No eviction (return error when full)
+    /// Valid for: slab
+    None,
 }
 
 /// Hugepage size configuration.
@@ -367,7 +459,7 @@ fn default_runtime() -> Runtime {
 }
 
 fn default_cache_backend() -> CacheBackend {
-    CacheBackend::Segcache
+    CacheBackend::Segment
 }
 
 fn default_heap_size() -> usize {
@@ -548,6 +640,17 @@ impl Config {
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Validate backend + policy combination
+        if let Some(policy) = self.cache.policy {
+            if !self.cache.backend.is_valid_policy(policy) {
+                return Err(format!(
+                    "eviction policy {:?} is not valid for backend {:?}",
+                    policy, self.cache.backend
+                )
+                .into());
+            }
+        }
+
         if self.cache.heap_size < self.cache.segment_size {
             return Err(format!(
                 "heap_size ({}) must be at least segment_size ({})",

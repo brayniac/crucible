@@ -91,26 +91,69 @@ pub fn execute_resp<C: Cache>(
                 }
             }
         }
-        RespCommand::Set { key, value, ex, .. } => {
+        RespCommand::Set {
+            key,
+            value,
+            ex,
+            px,
+            nx,
+            xx,
+        } => {
             SETS.increment();
-            let ttl = ex.map(Duration::from_secs);
 
-            for attempt in 0..10 {
-                match cache.set(key, value, ttl) {
-                    Ok(()) => {
-                        write_buf.extend_from_slice(b"+OK\r\n");
-                        return;
-                    }
-                    Err(_) => {
-                        if attempt < 9 {
-                            let delay = Duration::from_micros(100 << attempt);
-                            std::thread::sleep(delay);
+            // Handle TTL: EX (seconds) or PX (milliseconds)
+            let ttl = if let Some(secs) = ex {
+                Some(Duration::from_secs(*secs))
+            } else if let Some(ms) = px {
+                Some(Duration::from_millis(*ms))
+            } else {
+                None
+            };
+
+            // Determine operation type based on NX/XX flags
+            let result = match (*nx, *xx) {
+                (true, false) => cache.add(key, value, ttl),
+                (false, true) => cache.replace(key, value, ttl),
+                _ => {
+                    // Default SET behavior (with retries)
+                    let mut last_err = None;
+                    for attempt in 0..10 {
+                        match cache.set(key, value, ttl) {
+                            Ok(()) => {
+                                write_buf.extend_from_slice(b"+OK\r\n");
+                                return;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                if attempt < 9 {
+                                    let delay = Duration::from_micros(100 << attempt);
+                                    std::thread::sleep(delay);
+                                }
+                            }
                         }
                     }
+                    Err(last_err.unwrap_or(cache_core::CacheError::OutOfMemory))
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    write_buf.extend_from_slice(b"+OK\r\n");
+                }
+                Err(cache_core::CacheError::KeyExists)
+                | Err(cache_core::CacheError::KeyNotFound) => {
+                    // NX/XX condition not met - return nil
+                    if *version == RespVersion::Resp3 {
+                        write_buf.extend_from_slice(b"_\r\n");
+                    } else {
+                        write_buf.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    write_buf.extend_from_slice(b"-ERR cache full\r\n");
                 }
             }
-            SET_ERRORS.increment();
-            write_buf.extend_from_slice(b"-ERR cache full\r\n");
         }
         RespCommand::Del { key } => {
             DELETES.increment();
@@ -307,6 +350,54 @@ pub fn execute_memcache<C: Cache>(
             write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
             false
         }
+        MemcacheCommand::Add {
+            key, exptime, data, ..
+        } => {
+            SETS.increment();
+            let ttl = if *exptime == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(*exptime as u64))
+            };
+
+            match cache.add(key, data, ttl) {
+                Ok(()) => {
+                    write_buf.extend_from_slice(b"STORED\r\n");
+                }
+                Err(cache_core::CacheError::KeyExists) => {
+                    write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                }
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                }
+            }
+            false
+        }
+        MemcacheCommand::Replace {
+            key, exptime, data, ..
+        } => {
+            SETS.increment();
+            let ttl = if *exptime == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(*exptime as u64))
+            };
+
+            match cache.replace(key, data, ttl) {
+                Ok(()) => {
+                    write_buf.extend_from_slice(b"STORED\r\n");
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                }
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                }
+            }
+            false
+        }
         MemcacheCommand::Cas {
             key,
             exptime,
@@ -486,6 +577,56 @@ pub fn execute_memcache_binary<C: Cache>(
             }
             SET_ERRORS.increment();
             0
+        }
+        BinaryCommand::Add {
+            key,
+            value,
+            expiration,
+            opaque,
+            ..
+        } => {
+            SETS.increment();
+            let ttl = if *expiration == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(*expiration as u64))
+            };
+
+            match cache.add(key, value, ttl) {
+                Ok(()) => BinaryResponse::encode_stored(buf, Opcode::Add, *opaque, 0),
+                Err(cache_core::CacheError::KeyExists) => {
+                    BinaryResponse::encode_exists(buf, Opcode::Add, *opaque)
+                }
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    BinaryResponse::encode_out_of_memory(buf, Opcode::Add, *opaque)
+                }
+            }
+        }
+        BinaryCommand::Replace {
+            key,
+            value,
+            expiration,
+            opaque,
+            ..
+        } => {
+            SETS.increment();
+            let ttl = if *expiration == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(*expiration as u64))
+            };
+
+            match cache.replace(key, value, ttl) {
+                Ok(()) => BinaryResponse::encode_stored(buf, Opcode::Replace, *opaque, 0),
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    BinaryResponse::encode_not_found(buf, Opcode::Replace, *opaque)
+                }
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    BinaryResponse::encode_out_of_memory(buf, Opcode::Replace, *opaque)
+                }
+            }
         }
         BinaryCommand::Delete { key, opaque, .. } => {
             DELETES.increment();

@@ -10,7 +10,7 @@
 //! - Weighted random eviction by bucket segment count
 //! - Optional merge eviction for segment compaction
 
-use crate::config::LayerConfig;
+use crate::config::{EvictionStrategy, LayerConfig};
 use crate::error::{CacheError, CacheResult};
 use crate::eviction::{ItemFate, determine_item_fate};
 use crate::hashtable::{Hashtable, KeyVerifier};
@@ -21,7 +21,7 @@ use crate::location::Location;
 use crate::memory_pool::{MemoryPool, MemoryPoolBuilder};
 use crate::organization::TtlBuckets;
 use crate::pool::RamPool;
-use crate::segment::{Segment, SegmentGuard, SegmentKeyVerify};
+use crate::segment::{Segment, SegmentGuard, SegmentKeyVerify, SegmentPrune};
 use crate::state::State;
 use std::time::Duration;
 
@@ -54,6 +54,22 @@ pub struct TtlLayer {
     /// Current write segment ID per bucket (optimization to avoid walking chain).
     /// Uses u32::MAX to indicate no current write segment.
     current_write_segments: Vec<std::sync::atomic::AtomicU32>,
+}
+
+/// Helper struct for verifying keys in segments
+struct SinglePoolVerifier<'a> {
+    pool: &'a MemoryPool,
+}
+
+impl KeyVerifier for SinglePoolVerifier<'_> {
+    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+        let item_loc = ItemLocation::from_location(location);
+        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
+            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        } else {
+            false
+        }
+    }
 }
 
 impl TtlLayer {
@@ -246,21 +262,119 @@ impl TtlLayer {
 
         expired_count
     }
-}
 
-/// Helper struct for verifying keys in segments
-struct SinglePoolVerifier<'a> {
-    pool: &'a MemoryPool,
-}
+    /// Default eviction: weighted random bucket selection, evict head segment
+    fn evict_randomfifo<H: Hashtable>(&self, hashtable: &H) -> bool {
+        // Select a bucket for eviction (weighted by segment count)
+        let (_, bucket) = match self.buckets.select_bucket_for_eviction() {
+            Some(b) => b,
+            None => return false,
+        };
 
-impl KeyVerifier for SinglePoolVerifier<'_> {
-    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        let item_loc = ItemLocation::from_location(location);
-        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
-        } else {
-            false
+        // Evict head segment from selected bucket
+        match bucket.evict_head_segment(&self.pool) {
+            Ok(segment_id) => {
+                self.process_evicted_segment(segment_id, hashtable);
+                true
+            }
+            Err(_) => false,
         }
+    }
+
+    /// Merge eviction: select oldest segments and prune low-frequency items
+    fn try_merge_eviction<H: Hashtable>(
+        &self,
+        merge_config: &crate::config::MergeConfig,
+        hashtable: &H,
+    ) -> bool {
+        // Collect candidate segments from all buckets (oldest first)
+        let mut candidates: Vec<(usize, u32)> = Vec::new();
+
+        for (bucket_idx, bucket) in self.buckets.iter().enumerate() {
+            // Skip buckets with only 1 segment (need to keep the write segment)
+            if bucket.segment_count() < 2 {
+                continue;
+            }
+
+            // Add head segment as candidate
+            if let Some(head_id) = bucket.head() {
+                candidates.push((bucket_idx, head_id));
+            }
+        }
+
+        // Need at least min_segments to proceed
+        if candidates.len() < merge_config.min_segments {
+            // Fall back to random eviction
+            return self.evict_randomfifo(hashtable);
+        }
+
+        // Prune each candidate segment
+        let verifier = SinglePoolVerifier { pool: &self.pool };
+        let threshold = self.config.demotion_threshold;
+
+        for (_bucket_idx, segment_id) in candidates.iter().take(merge_config.min_segments) {
+            if let Some(segment) = self.pool.get(*segment_id) {
+                // Use SegmentPrune to prune low-frequency items
+                let (retained, pruned, _bytes_retained, _bytes_pruned) =
+                    segment.prune(threshold, |key| hashtable.get_frequency(key, &verifier));
+
+                // Remove pruned items from hashtable
+                if pruned > 0 {
+                    // Iterate segment again to find and remove deleted items
+                    let mut offset = 0u32;
+                    let write_offset = segment.write_offset();
+
+                    while offset < write_offset {
+                        if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
+                            if let Some(header) = BasicHeader::try_from_bytes(data) {
+                                let item_size = header.padded_size() as u32;
+
+                                if header.is_deleted() {
+                                    // Get key and remove from hashtable
+                                    let key_start = offset as usize
+                                        + BasicHeader::SIZE
+                                        + header.optional_len() as usize;
+                                    let key_len = header.key_len() as usize;
+                                    if let Some(key) = segment.data_slice(key_start as u32, key_len)
+                                    {
+                                        let location = ItemLocation::new(
+                                            self.pool.pool_id(),
+                                            *segment_id,
+                                            offset,
+                                        );
+                                        if self.config.create_ghosts {
+                                            hashtable.convert_to_ghost(key, location.to_location());
+                                        } else {
+                                            hashtable.remove(key, location.to_location());
+                                        }
+                                    }
+                                }
+
+                                offset += item_size;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                // If segment is mostly empty after pruning, reclaim it
+                if retained == 0 {
+                    // All items pruned, can reclaim the segment
+                    if let Some((_, bucket)) = self.buckets.select_bucket_for_eviction() {
+                        if bucket.head() == Some(*segment_id) {
+                            if let Ok(evicted_id) = bucket.evict_head_segment(&self.pool) {
+                                self.process_evicted_segment(evicted_id, hashtable);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        true
     }
 }
 
@@ -384,19 +498,12 @@ impl Layer for TtlLayer {
             return true;
         }
 
-        // Select a bucket for eviction (weighted by segment count)
-        let (_, bucket) = match self.buckets.select_bucket_for_eviction() {
-            Some(b) => b,
-            None => return false,
-        };
-
-        // Evict head segment from selected bucket
-        match bucket.evict_head_segment(&self.pool) {
-            Ok(segment_id) => {
-                self.process_evicted_segment(segment_id, hashtable);
-                true
+        // Check eviction strategy from config
+        match &self.config.eviction_strategy {
+            EvictionStrategy::Merge(merge_config) => {
+                self.try_merge_eviction(merge_config, hashtable)
             }
-            Err(_) => false,
+            _ => self.evict_randomfifo(hashtable),
         }
     }
 
@@ -866,10 +973,10 @@ mod tests {
 
     #[test]
     fn test_evict_empty_layer() {
-        use crate::hashtable_impl::CuckooHashtable;
+        use crate::hashtable_impl::MultiChoiceHashtable;
 
         let layer = create_test_layer();
-        let hashtable = CuckooHashtable::new(10);
+        let hashtable = MultiChoiceHashtable::new(10);
 
         // Evict from empty layer should return false
         let evicted = layer.evict(&hashtable);
@@ -878,10 +985,10 @@ mod tests {
 
     #[test]
     fn test_expire_empty_layer() {
-        use crate::hashtable_impl::CuckooHashtable;
+        use crate::hashtable_impl::MultiChoiceHashtable;
 
         let layer = create_test_layer();
-        let hashtable = CuckooHashtable::new(10);
+        let hashtable = MultiChoiceHashtable::new(10);
 
         // Expire on empty layer should return 0
         let expired = layer.expire(&hashtable);
@@ -890,10 +997,10 @@ mod tests {
 
     #[test]
     fn test_evict_with_items() {
-        use crate::hashtable_impl::CuckooHashtable;
+        use crate::hashtable_impl::MultiChoiceHashtable;
 
         let layer = create_test_layer();
-        let hashtable = CuckooHashtable::new(10);
+        let hashtable = MultiChoiceHashtable::new(10);
 
         // Fill up segments to trigger eviction
         for i in 0..500 {

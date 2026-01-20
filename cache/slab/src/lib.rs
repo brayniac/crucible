@@ -1,7 +1,7 @@
-//! Memcached-style slab allocator cache with per-object LRU eviction.
+//! Memcached-style slab allocator cache with slab-level eviction.
 //!
 //! This crate provides a high-performance cache using a traditional slab
-//! allocator design with per-object LRU eviction, similar to memcached.
+//! allocator design with slab-level eviction strategies (LRA, LRC, or random).
 //!
 //! # Architecture
 //!
@@ -10,7 +10,7 @@
 //! |              SlabCache                    |
 //! |                                           |
 //! |  +-------------------------------------+  |
-//! |  | CuckooHashtable                     |  |
+//! |  | MultiChoiceHashtable                     |  |
 //! |  | - Key -> (Location, Frequency)      |  |
 //! |  +-------------------------------------+  |
 //! |        |                                  |
@@ -20,7 +20,7 @@
 //! |  | +--------------------------------+  |  |
 //! |  | | SlabClass 0 (64B slots)        |  |  |
 //! |  | | - Free list (lock-free)        |  |  |
-//! |  | | - LRU list (per-class)         |  |  |
+//! |  | | - Slab timestamps (LRA/LRC)    |  |  |
 //! |  | +--------------------------------+  |  |
 //! |  | | SlabClass 1 (80B slots)        |  |  |
 //! |  | +--------------------------------+  |  |
@@ -35,7 +35,8 @@
 //! # Advantages
 //!
 //! - O(1) allocation/deallocation (pop/push from free list)
-//! - Per-object LRU eviction (traditional memcached semantics)
+//! - Slab-level eviction (LRA, LRC, random)
+//! - Compact 12-byte item headers
 //! - No merge/compaction overhead
 //! - Better for high-churn workloads
 //!
@@ -73,6 +74,7 @@ mod class;
 mod config;
 mod item;
 mod location;
+mod sync;
 mod verifier;
 
 use std::sync::Arc;
@@ -80,22 +82,21 @@ use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use cache_core::{
-    Cache, CacheError, CacheResult, CuckooHashtable, Hashtable, OwnedGuard, ValueRef,
+    Cache, CacheError, CacheResult, Hashtable, MultiChoiceHashtable, OwnedGuard, ValueRef,
 };
 
 pub use cache_core::HugepageSize;
-pub use config::{HEADER_SIZE, SLAB_CLASSES, SlabCacheConfig};
+pub use config::{EvictionStrategy, HEADER_SIZE, SlabCacheConfig, SlabClasses};
 
 use allocator::SlabAllocator;
 use location::SlabLocation;
-use verifier::SlabVerifier;
 
 /// Memcached-style slab allocator cache.
 ///
-/// Uses a traditional slab allocator with per-object LRU eviction.
+/// Uses a traditional slab allocator with slab-level eviction.
 pub struct SlabCache {
     /// The hashtable for key lookups.
-    hashtable: Arc<CuckooHashtable>,
+    hashtable: Arc<MultiChoiceHashtable>,
     /// The slab allocator.
     allocator: SlabAllocator,
     /// Default TTL for items.
@@ -108,6 +109,136 @@ impl SlabCache {
     /// Create a new builder for SlabCache.
     pub fn builder() -> SlabCacheBuilder {
         SlabCacheBuilder::new()
+    }
+
+    /// Store an item only if the key doesn't exist (ADD semantics).
+    pub fn add_item(&self, key: &[u8], value: &[u8], ttl: Duration) -> CacheResult<()> {
+        // Validate key length
+        if key.len() > 255 {
+            return Err(CacheError::KeyTooLong);
+        }
+
+        // Check if key already exists
+        let verifier = self.allocator.verifier();
+        if self.hashtable.contains(key, &verifier) {
+            return Err(CacheError::KeyExists);
+        }
+
+        // Calculate item size
+        let item_size = HEADER_SIZE + key.len() + value.len();
+
+        // Select class
+        let class_id = self
+            .allocator
+            .select_class(item_size)
+            .ok_or(CacheError::ValueTooLong)?;
+
+        // Allocate slot (may evict)
+        let (slab_id, slot_index) = self
+            .allocator
+            .allocate_with_eviction(class_id, &*self.hashtable)
+            .ok_or(CacheError::OutOfMemory)?;
+
+        // Write item
+        unsafe {
+            self.allocator
+                .write_item(class_id, slab_id, slot_index, key, value, ttl);
+        }
+
+        // Insert into hashtable using insert_if_absent
+        let location = SlabLocation::new(class_id, slab_id, slot_index).to_location();
+        let verifier = self.allocator.verifier();
+
+        match self.hashtable.insert_if_absent(key, location, &verifier) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Failed to insert, clean up the allocated slot
+                let loc = SlabLocation::new(class_id, slab_id, slot_index);
+                unsafe {
+                    let header = self.allocator.header(loc);
+                    if let Some(class) = self.allocator.class(class_id) {
+                        class.sub_bytes(header.item_size());
+                        class.remove_item();
+                    }
+                    header.mark_deleted();
+                }
+                self.allocator.deallocate(class_id, slab_id, slot_index);
+                Err(e)
+            }
+        }
+    }
+
+    /// Update an existing item only (REPLACE semantics).
+    pub fn replace_item(&self, key: &[u8], value: &[u8], ttl: Duration) -> CacheResult<()> {
+        // Validate key length
+        if key.len() > 255 {
+            return Err(CacheError::KeyTooLong);
+        }
+
+        // Check if key exists
+        let verifier = self.allocator.verifier();
+        if !self.hashtable.contains(key, &verifier) {
+            return Err(CacheError::KeyNotFound);
+        }
+
+        // Calculate item size
+        let item_size = HEADER_SIZE + key.len() + value.len();
+
+        // Select class
+        let class_id = self
+            .allocator
+            .select_class(item_size)
+            .ok_or(CacheError::ValueTooLong)?;
+
+        // Allocate slot (may evict)
+        let (slab_id, slot_index) = self
+            .allocator
+            .allocate_with_eviction(class_id, &*self.hashtable)
+            .ok_or(CacheError::OutOfMemory)?;
+
+        // Write item
+        unsafe {
+            self.allocator
+                .write_item(class_id, slab_id, slot_index, key, value, ttl);
+        }
+
+        // Update in hashtable using update_if_present
+        let location = SlabLocation::new(class_id, slab_id, slot_index).to_location();
+        let verifier = self.allocator.verifier();
+
+        match self.hashtable.update_if_present(key, location, &verifier) {
+            Ok(old_loc) => {
+                // Deallocate old slot
+                let old = SlabLocation::from_location(old_loc);
+                let (old_class, old_slab, old_slot) = old.unpack();
+
+                // Mark deleted and update stats
+                unsafe {
+                    let header = self.allocator.header(old);
+                    if let Some(class) = self.allocator.class(old_class) {
+                        class.sub_bytes(header.item_size());
+                        class.remove_item();
+                    }
+                    header.mark_deleted();
+                }
+                self.allocator.deallocate(old_class, old_slab, old_slot);
+                Ok(())
+            }
+            Err(e) => {
+                // Failed to update, clean up the allocated slot
+                let loc = SlabLocation::new(class_id, slab_id, slot_index);
+                unsafe {
+                    let header = self.allocator.header(loc);
+                    if let Some(class) = self.allocator.class(class_id) {
+                        class.sub_bytes(header.item_size());
+                        class.remove_item();
+                    }
+                    header.mark_deleted();
+                }
+                self.allocator.deallocate(class_id, slab_id, slot_index);
+                Err(e)
+            }
+        }
     }
 
     /// Store an item in the cache.
@@ -148,12 +279,12 @@ impl SlabCache {
                 let old = SlabLocation::from_location(old_loc);
                 let (old_class, old_slab, old_slot) = old.unpack();
 
-                // Remove from LRU and mark deleted
-                self.allocator.lru_remove(old);
+                // Mark deleted and update stats
                 unsafe {
                     let header = self.allocator.header(old);
                     if let Some(class) = self.allocator.class(old_class) {
                         class.sub_bytes(header.item_size());
+                        class.remove_item();
                     }
                     header.mark_deleted();
                 }
@@ -165,11 +296,11 @@ impl SlabCache {
             Err(e) => {
                 // Hashtable insert failed, clean up the allocated slot
                 let loc = SlabLocation::new(class_id, slab_id, slot_index);
-                self.allocator.lru_remove(loc);
                 unsafe {
                     let header = self.allocator.header(loc);
                     if let Some(class) = self.allocator.class(class_id) {
                         class.sub_bytes(header.item_size());
+                        class.remove_item();
                     }
                     header.mark_deleted();
                 }
@@ -184,18 +315,70 @@ impl SlabCache {
     /// Retrieve an item's value from the cache.
     pub fn get_item(&self, key: &[u8]) -> Option<Vec<u8>> {
         let verifier = self.allocator.verifier();
-        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+
+        if let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) {
+            let slab_loc = SlabLocation::from_location(location);
+
+            // Touch slab for LRA tracking
+            self.allocator.touch_slab(slab_loc);
+
+            // Copy value
+            unsafe {
+                let header = self.allocator.header(slab_loc);
+                return Some(header.value().to_vec());
+            }
+        }
+
+        // Lookup failed - try to clean up expired item if present
+        self.cleanup_expired(key);
+
+        None
+    }
+
+    /// Clean up an expired item if present.
+    ///
+    /// This is called after a failed lookup to lazily remove expired items
+    /// from the cache, freeing their slot for reuse.
+    fn cleanup_expired(&self, key: &[u8]) {
+        // Use a verifier that allows expired items to find the entry
+        let verifier = self.allocator.verifier_allowing_expired();
+
+        let (location, _freq) = match self.hashtable.lookup(key, &verifier) {
+            Some(result) => result,
+            None => return, // Key truly doesn't exist
+        };
 
         let slab_loc = SlabLocation::from_location(location);
 
-        // Touch LRU
-        self.allocator.lru_touch(slab_loc);
+        // Check if it's actually expired (not just deleted or wrong key)
+        let is_expired = unsafe {
+            let header = self.allocator.header(slab_loc);
+            header.is_expired()
+        };
 
-        // Copy value
+        if !is_expired {
+            return; // Not expired, some other reason for the failed lookup
+        }
+
+        // Remove from hashtable
+        if !self.hashtable.remove(key, location) {
+            return; // Someone else already removed it
+        }
+
+        let (class_id, slab_id, slot_index) = slab_loc.unpack();
+
+        // Update stats and mark deleted
         unsafe {
             let header = self.allocator.header(slab_loc);
-            Some(header.value().to_vec())
+            if let Some(class) = self.allocator.class(class_id) {
+                class.sub_bytes(header.item_size());
+                class.remove_item();
+            }
+            header.mark_deleted();
         }
+
+        // Return to free list
+        self.allocator.deallocate(class_id, slab_id, slot_index);
     }
 
     /// Access an item without copying.
@@ -204,18 +387,24 @@ impl SlabCache {
         F: FnOnce(&[u8]) -> R,
     {
         let verifier = self.allocator.verifier();
-        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
 
-        let slab_loc = SlabLocation::from_location(location);
+        if let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) {
+            let slab_loc = SlabLocation::from_location(location);
 
-        // Touch LRU
-        self.allocator.lru_touch(slab_loc);
+            // Touch slab for LRA tracking
+            self.allocator.touch_slab(slab_loc);
 
-        // Access value
-        unsafe {
-            let header = self.allocator.header(slab_loc);
-            Some(f(header.value()))
+            // Access value
+            unsafe {
+                let header = self.allocator.header(slab_loc);
+                return Some(f(header.value()));
+            }
         }
+
+        // Lookup failed - try to clean up expired item if present
+        self.cleanup_expired(key);
+
+        None
     }
 
     /// Delete an item from the cache.
@@ -236,14 +425,12 @@ impl SlabCache {
         let slab_loc = SlabLocation::from_location(location);
         let (class_id, slab_id, slot_index) = slab_loc.unpack();
 
-        // Remove from LRU
-        self.allocator.lru_remove(slab_loc);
-
         // Update stats and mark deleted
         unsafe {
             let header = self.allocator.header(slab_loc);
             if let Some(class) = self.allocator.class(class_id) {
                 class.sub_bytes(header.item_size());
+                class.remove_item();
             }
             header.mark_deleted();
         }
@@ -257,7 +444,14 @@ impl SlabCache {
     /// Check if a key exists.
     pub fn contains_key(&self, key: &[u8]) -> bool {
         let verifier = self.allocator.verifier();
-        self.hashtable.contains(key, &verifier)
+        if self.hashtable.contains(key, &verifier) {
+            return true;
+        }
+
+        // Key not found - try to clean up expired item if present
+        self.cleanup_expired(key);
+
+        false
     }
 
     /// Get the remaining TTL for an item.
@@ -276,13 +470,6 @@ impl SlabCache {
     pub fn frequency(&self, key: &[u8]) -> Option<u8> {
         let verifier = self.allocator.verifier();
         self.hashtable.get_frequency(key, &verifier)
-    }
-
-    /// Evict the LRU item from a specific class.
-    pub fn evict_from_class(&self, class_id: u8) -> bool {
-        self.allocator
-            .evict_from_class(class_id, &*self.hashtable)
-            .is_some()
     }
 
     /// Get the total memory used.
@@ -319,8 +506,8 @@ impl Cache for SlabCache {
 
         let slab_loc = SlabLocation::from_location(location);
 
-        // Touch LRU
-        self.allocator.lru_touch(slab_loc);
+        // Touch slab for LRA tracking
+        self.allocator.touch_slab(slab_loc);
 
         // For slab cache, we don't have segment-level ref counting.
         // We need to copy the value for safety.
@@ -363,6 +550,16 @@ impl Cache for SlabCache {
         // No-op: SlabCache doesn't support flushing
         // A full implementation would iterate and delete all items
     }
+
+    fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        self.add_item(key, value, ttl)
+    }
+
+    fn replace(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        self.replace_item(key, value, ttl)
+    }
 }
 
 /// Builder for [`SlabCache`].
@@ -392,8 +589,29 @@ impl SlabCacheBuilder {
     }
 
     /// Set the slab size in bytes.
+    ///
+    /// This also determines the maximum item size (items cannot be larger
+    /// than the slab size). Classes will be generated up to this size.
     pub fn slab_size(mut self, bytes: usize) -> Self {
         self.config.slab_size = bytes;
+        self
+    }
+
+    /// Set the minimum slot size (smallest slab class).
+    ///
+    /// Default is 64 bytes. Items smaller than this will use this class.
+    pub fn min_slot_size(mut self, bytes: usize) -> Self {
+        self.config.min_slot_size = bytes;
+        self
+    }
+
+    /// Set the growth factor between slab classes.
+    ///
+    /// Default is 1.25 (~20% worst-case fragmentation).
+    /// Higher values mean fewer classes but more fragmentation.
+    /// Must be > 1.0.
+    pub fn growth_factor(mut self, factor: f64) -> Self {
+        self.config.growth_factor = factor;
         self
     }
 
@@ -427,13 +645,28 @@ impl SlabCacheBuilder {
         self
     }
 
+    /// Set the eviction strategy (twemcache-style).
+    ///
+    /// Strategies can be combined using `|`:
+    /// - `EvictionStrategy::NONE` - No eviction (return error when full)
+    /// - `EvictionStrategy::RANDOM` - Random slab eviction
+    /// - `EvictionStrategy::SLAB_LRA` - Least recently accessed slab (default)
+    /// - `EvictionStrategy::SLAB_LRC` - Least recently created slab
+    ///
+    /// Example: `EvictionStrategy::SLAB_LRA | EvictionStrategy::RANDOM`
+    /// tries slab LRA first, falls back to random.
+    pub fn eviction_strategy(mut self, strategy: EvictionStrategy) -> Self {
+        self.config.eviction_strategy = strategy;
+        self
+    }
+
     /// Build the SlabCache.
     pub fn build(self) -> Result<SlabCache, std::io::Error> {
         // Create allocator
         let allocator = SlabAllocator::new(&self.config)?;
 
         // Create hashtable
-        let hashtable = Arc::new(CuckooHashtable::new(self.config.hashtable_power));
+        let hashtable = Arc::new(MultiChoiceHashtable::new(self.config.hashtable_power));
 
         Ok(SlabCache {
             hashtable,
@@ -585,7 +818,7 @@ mod tests {
     fn test_eviction() {
         // Create a small cache that will need to evict
         // 64KB heap, 32KB slabs = 2 slabs
-        // Using 200 byte values + ~10 byte key + 24 byte header = ~234 bytes
+        // Using 200 byte values + ~10 byte key + 12 byte header = ~222 bytes
         // Fits in 256 byte class, so 32KB/256 = 128 slots per slab
         // Total capacity: ~256 items
         let cache = SlabCacheBuilder::new()
@@ -617,5 +850,133 @@ mod tests {
         // With ~256 capacity and 500 inserts, we should have evicted some
         assert!(found > 0);
         assert!(found < 500, "Expected eviction but found {} items", found);
+    }
+
+    #[test]
+    fn test_expiration_lazy_cleanup() {
+        let cache = create_test_cache();
+
+        // Set an item with a short TTL (1 second minimum since we use second precision)
+        let key = b"expire_me";
+        let value = b"temporary_value";
+        cache.set_item(key, value, Duration::from_secs(1)).unwrap();
+
+        // Should exist initially
+        assert!(cache.contains_key(key));
+
+        // Wait for expiration (add buffer for timing)
+        std::thread::sleep(Duration::from_millis(1500));
+
+        // Should not exist after expiration
+        assert!(!cache.contains_key(key));
+
+        // The expired item should have been cleaned up by the lookup
+        // Verify by checking that we can still insert and the old slot was freed
+        cache
+            .set_item(key, b"new_value", Duration::from_secs(3600))
+            .unwrap();
+        assert!(cache.contains_key(key));
+        assert_eq!(cache.get_item(key), Some(b"new_value".to_vec()));
+    }
+
+    #[test]
+    fn test_eviction_strategy_none() {
+        // With NONE strategy, should return error when full
+        let cache = SlabCacheBuilder::new()
+            .heap_size(64 * 1024) // 64KB - very small
+            .slab_size(32 * 1024) // 32KB slabs
+            .hashtable_power(8)
+            .eviction_strategy(EvictionStrategy::NONE)
+            .build()
+            .expect("Failed to create cache");
+
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'x'; 200];
+
+        // Fill the cache
+        let mut inserted = 0;
+        for i in 0..500 {
+            let key = format!("key_{:04}", i);
+            if cache.set_item(key.as_bytes(), &value, ttl).is_ok() {
+                inserted += 1;
+            }
+        }
+
+        // Should have inserted some but not all
+        assert!(inserted > 0);
+        assert!(inserted < 500, "Expected some failures with NONE strategy");
+    }
+
+    #[test]
+    fn test_eviction_strategy_slab_lrc() {
+        // With SLAB_LRC, should evict oldest created slab
+        let cache = SlabCacheBuilder::new()
+            .heap_size(64 * 1024) // 64KB
+            .slab_size(32 * 1024) // 32KB slabs = 2 slabs total
+            .hashtable_power(8)
+            .eviction_strategy(EvictionStrategy::SLAB_LRC)
+            .build()
+            .expect("Failed to create cache");
+
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'x'; 100];
+
+        // Fill the cache (will use both slabs)
+        for i in 0..200 {
+            let key = format!("key_{:04}", i);
+            let _ = cache.set_item(key.as_bytes(), &value, ttl);
+        }
+
+        // Continue inserting - should trigger slab eviction
+        for i in 200..400 {
+            let key = format!("key_{:04}", i);
+            let _ = cache.set_item(key.as_bytes(), &value, ttl);
+        }
+
+        // Some items should still exist
+        let mut found = 0;
+        for i in 0..400 {
+            let key = format!("key_{:04}", i);
+            if cache.contains_key(key.as_bytes()) {
+                found += 1;
+            }
+        }
+
+        assert!(
+            found > 0,
+            "Expected some items to remain after slab eviction"
+        );
+    }
+
+    #[test]
+    fn test_eviction_strategy_combined() {
+        // With SLAB_LRA | RANDOM, should try slab LRA eviction first, then random
+        let cache = SlabCacheBuilder::new()
+            .heap_size(64 * 1024)
+            .slab_size(32 * 1024)
+            .hashtable_power(8)
+            .eviction_strategy(EvictionStrategy::SLAB_LRA | EvictionStrategy::RANDOM)
+            .build()
+            .expect("Failed to create cache");
+
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'x'; 100];
+
+        // Fill and overfill
+        for i in 0..300 {
+            let key = format!("key_{:04}", i);
+            let _ = cache.set_item(key.as_bytes(), &value, ttl);
+        }
+
+        // Some items should exist
+        let mut found = 0;
+        for i in 0..300 {
+            let key = format!("key_{:04}", i);
+            if cache.contains_key(key.as_bytes()) {
+                found += 1;
+            }
+        }
+
+        assert!(found > 0, "Expected some items after combined eviction");
     }
 }

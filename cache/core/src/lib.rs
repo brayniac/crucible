@@ -97,7 +97,7 @@ mod hashtable_impl;
 
 // Phase 3 re-exports
 pub use hashtable::{Hashtable, KeyVerifier};
-pub use hashtable_impl::{CuckooHashtable, Hashbucket};
+pub use hashtable_impl::{Hashbucket, MultiChoiceHashtable};
 
 // Phase 4 - Pools
 mod hugepage;

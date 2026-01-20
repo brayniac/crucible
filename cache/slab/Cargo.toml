@@ -10,9 +10,11 @@ description = "Memcached-style slab allocator cache with per-object LRU eviction
 [features]
 default = []
 validation = ["cache-core/validation"]
+loom = ["dep:loom"]
 
 [dependencies]
 cache-core = { workspace = true }
 clocksource = { workspace = true }
 crossbeam-deque = { workspace = true }
 parking_lot = { workspace = true }
+loom = { workspace = true, optional = true }

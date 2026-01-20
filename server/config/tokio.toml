@@ -6,7 +6,8 @@ runtime = "tokio"
 threads = 4
 
 [cache]
-backend = "s3fifo"
+backend = "segment"
+policy = "s3fifo"
 heap_size = "1GB"
 segment_size = "8MB"
 max_value_size = "1MB"

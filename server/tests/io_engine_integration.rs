@@ -189,7 +189,7 @@ fn start_test_server_full(
             {recv_mode_config}
 
             [cache]
-            backend = "segcache"
+            backend = "segment"
             heap_size = "64MB"
             segment_size = "1MB"
             hashtable_power = 18

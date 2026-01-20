@@ -1,0 +1,35 @@
+# Desync test configuration - high concurrency
+
+[general]
+duration = "30s"
+warmup = "5s"
+threads = 4
+
+[target]
+endpoints = ["127.0.0.1:6379"]
+protocol = "resp"
+
+[connection]
+connections = 128
+pipeline_depth = 32
+connect_timeout = "5s"
+request_timeout = "1s"
+
+[workload]
+# rate_limit = 100000
+
+[workload.keyspace]
+length = 16
+count = 1000000
+distribution = "uniform"
+
+[workload.commands]
+get = 80
+set = 20
+
+[workload.values]
+length = 64
+
+[timestamps]
+enabled = true
+mode = "userspace"

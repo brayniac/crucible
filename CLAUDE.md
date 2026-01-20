@@ -8,7 +8,7 @@ Crucible is a high-performance cache server and benchmarking toolkit written in 
 
 - **Cache Server** (`crucible-server`) - Multi-protocol cache server supporting Redis (RESP) and Memcache protocols
 - **Benchmark Tool** (`crucible-benchmark`) - Load generator with detailed latency metrics
-- **Cache Libraries** - Segment-based cache implementations (S3-FIFO, Segcache)
+- **Cache Libraries** - Multiple cache implementations (Segcache, Slab, Heap)
 - **I/O Framework** (`io-driver`) - Unified I/O abstraction with io_uring and mio backends
 
 ## Build Commands
@@ -68,9 +68,10 @@ cargo xtask flamegraph --duration 10 --output profile.svg
 ```
 crucible/
   cache/
-    core/       # Cache traits, segments, hashtable, pools, layers
+    core/       # Cache traits, segments, hashtable, pools, layers (TieredCache)
     segcache/   # Segment-based cache with TTL buckets
-    s3fifo/     # S3-FIFO eviction policy (FIFO admission + main cache)
+    slab/       # Memcached-style slab allocator with slab-level eviction
+    heap/       # Heap-allocated cache using system allocator
   io/
     driver/     # Unified I/O driver (io_uring + mio backends)
     http2/      # HTTP/2 framing
@@ -92,7 +93,7 @@ The cache uses a tiered layer architecture:
 
 ```
 +---------------------------+
-|        Hashtable          |  <- Lock-free cuckoo hashtable
+|        Hashtable          |  <- Lock-free multi-choice hashtable
 | (location + freq + ghost) |     Key -> (ItemLocation, Frequency)
 +---------------------------+
              |
@@ -114,7 +115,7 @@ The cache uses a tiered layer architecture:
 - `FifoLayer` / `TtlLayer` - Layer implementations with different eviction strategies
 - `Segment` - Fixed-size memory regions storing items sequentially
 - `MemoryPool` - Segment allocation with optional hugepage support
-- `CuckooHashtable` - Lock-free hashtable with ghost entries for "second chance"
+- `MultiChoiceHashtable` - Lock-free hashtable with ghost entries for "second chance"
 
 **Eviction Strategies:** FIFO, Random, CTE (closest to expiration), Merge
 
@@ -141,9 +142,33 @@ The driver provides a completion-based event loop: `poll()` -> `drain_completion
 
 ## Configuration
 
-Server config (`server/config/example.toml`):
+Server config files (`server/config/`):
+- `example.toml` - General-purpose configuration
+- `redis.toml` - Redis migration configuration (RESP protocol on port 6379)
+- `memcached.toml` - Memcached migration configuration (port 11211)
+- `heap.toml` - Heap backend (no segment fragmentation)
+- `slab.toml` - Slab allocator with slab-level eviction
+
+Cache configuration uses separate **backend** (storage) and **policy** (eviction) settings:
+
+```toml
+[cache]
+backend = "segment"  # Storage type: segment, slab, heap
+policy = "s3fifo"    # Eviction policy (depends on backend)
+```
+
+**Backends (storage type):**
+- `segment` - Fixed-size segments, sequential item storage (default)
+- `slab` - Memcached-style slab allocator with size classes
+- `heap` - System allocator, per-item allocation
+
+**Eviction policies by backend:**
+- `segment`: s3fifo (default), fifo, random, cte, merge
+- `slab`: lra (default), lrc, random, none
+- `heap`: s3fifo (default), lfu
+
+Other configuration options:
 - Runtime selection (native/tokio)
-- Cache backend (segcache/s3fifo), heap size, segment size
 - Protocol listeners (resp/memcache) with optional TLS
 - io_uring settings (sqpoll, buffer pools, recv mode)
 
