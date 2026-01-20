@@ -22,6 +22,7 @@ cache-core = { workspace = true }
 # Cache implementations
 segcache = { workspace = true }
 s3fifo = { workspace = true }
+slab-cache = { workspace = true }
 
 # Protocol implementations
 protocol-ping = { workspace = true }

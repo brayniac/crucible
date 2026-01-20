@@ -101,6 +101,10 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             let cache = create_s3fifo(&config)?;
             run_with_cache(config, cache)
         }
+        CacheBackend::Slab => {
+            let cache = create_slab(&config)?;
+            run_with_cache(config, cache)
+        }
     }
 }
 
@@ -167,6 +171,31 @@ fn create_s3fifo(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std:
     Ok(cache)
 }
 
+fn create_slab(config: &Config) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
+    use slab_cache::{HugepageSize, SlabCache};
+
+    let hugepage_size = match config.cache.hugepage {
+        HugepageConfig::None => HugepageSize::None,
+        HugepageConfig::TwoMegabyte => HugepageSize::TwoMegabyte,
+        HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
+    };
+
+    let mut builder = SlabCache::builder()
+        .heap_size(config.cache.heap_size)
+        .slab_size(config.cache.segment_size)
+        .hashtable_power(config.cache.hashtable_power)
+        .hugepage_size(hugepage_size);
+
+    // Use auto-detected or explicit NUMA node
+    if let Some(node) = config.numa_node() {
+        builder = builder.numa_node(node);
+    }
+
+    let cache = builder.build()?;
+
+    Ok(cache)
+}
+
 fn print_default_config() {
     let config = r#"# Crucible Server Configuration
 
@@ -181,7 +210,7 @@ runtime = "native"
 # cpu_affinity = "0-7"
 
 [cache]
-# Cache backend: "segcache" or "s3fifo"
+# Cache backend: "segcache", "s3fifo", or "slab"
 backend = "segcache"
 
 # Total heap size (e.g., "4GB", "512MB")

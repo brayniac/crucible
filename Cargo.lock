@@ -2279,6 +2279,7 @@ dependencies = [
  "segcache",
  "serde",
  "slab",
+ "slab-cache",
  "tokio",
  "toml",
 ]

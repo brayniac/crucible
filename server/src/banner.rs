@@ -55,6 +55,7 @@ pub fn print_banner(config: &BannerConfig) {
     let cache_str = match config.cache_backend {
         CacheBackend::Segcache => "segcache",
         CacheBackend::S3fifo => "s3fifo",
+        CacheBackend::Slab => "slab",
     };
     writeln!(output, "Cache:       {}", cache_str).unwrap();
     writeln!(output, "Workers:     {}", config.workers).unwrap();

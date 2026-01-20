@@ -147,7 +147,7 @@ pub struct WorkersConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
-    /// Cache backend: "segcache" or "s3fifo"
+    /// Cache backend: "segcache", "s3fifo", or "slab"
     #[serde(default = "default_cache_backend")]
     pub backend: CacheBackend,
 
@@ -208,6 +208,8 @@ pub enum CacheBackend {
     Segcache,
     /// S3-FIFO - Simple, Scalable eviction with three FIFO queues
     S3fifo,
+    /// Slab - memcached-style slab allocator with per-object LRU
+    Slab,
 }
 
 /// Hugepage size configuration.
