@@ -326,6 +326,49 @@ impl Response {
         pos + 5
     }
 
+    /// Encode a single VALUE response with CAS token directly to buffer (GETS response).
+    ///
+    /// Format: `VALUE <key> <flags> <bytes> <cas>\r\n<data>\r\nEND\r\n`
+    #[inline]
+    pub fn encode_value_with_cas(
+        buf: &mut [u8],
+        key: &[u8],
+        flags: u32,
+        data: &[u8],
+        cas: u64,
+    ) -> usize {
+        let mut pos = 0;
+
+        // VALUE <key> <flags> <bytes> <cas>\r\n
+        buf[pos..pos + 6].copy_from_slice(b"VALUE ");
+        pos += 6;
+        buf[pos..pos + key.len()].copy_from_slice(key);
+        pos += key.len();
+        buf[pos] = b' ';
+        pos += 1;
+
+        let mut cursor = std::io::Cursor::new(&mut buf[pos..]);
+        write!(cursor, "{} {} {}\r\n", flags, data.len(), cas).unwrap();
+        pos += cursor.position() as usize;
+
+        // <data>\r\n
+        buf[pos..pos + data.len()].copy_from_slice(data);
+        pos += data.len();
+        buf[pos..pos + 2].copy_from_slice(b"\r\n");
+        pos += 2;
+
+        // END\r\n
+        buf[pos..pos + 5].copy_from_slice(b"END\r\n");
+        pos + 5
+    }
+
+    /// Encode EXISTS response directly to buffer.
+    #[inline]
+    pub fn encode_exists(buf: &mut [u8]) -> usize {
+        buf[..8].copy_from_slice(b"EXISTS\r\n");
+        8
+    }
+
     /// Encode a SERVER_ERROR response directly to buffer.
     #[inline]
     pub fn encode_server_error(buf: &mut [u8], msg: &[u8]) -> usize {

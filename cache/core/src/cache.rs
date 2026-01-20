@@ -6,6 +6,7 @@
 //! - Synchronous eviction when space is needed
 //! - Layer-based read with proper frequency tracking
 
+use crate::cas::CasToken;
 use crate::config::LayerConfig;
 use crate::error::{CacheError, CacheResult};
 use crate::hashtable::{Hashtable, KeyVerifier};
@@ -594,6 +595,143 @@ impl<H: Hashtable> TieredCache<H> {
         // Safety: The layer's get_value_ref_raw has incremented ref_count and
         // validated that the pointers are valid. ValueRef will decrement ref_count on drop.
         Some(unsafe { crate::cache_trait::ValueRef::new(ref_count_ptr, value_ptr, value_len) })
+    }
+
+    /// Get an item from the cache with a CAS token.
+    ///
+    /// Returns the value as a `Vec<u8>` along with a CAS token that can be
+    /// used for subsequent CAS operations. The token combines the item's
+    /// location with the segment's generation counter to detect modifications.
+    ///
+    /// This is used for memcached GETS command.
+    pub fn get_with_cas(&self, key: &[u8]) -> Option<(Vec<u8>, CasToken)> {
+        let verifier = self.create_key_verifier();
+
+        // Lookup in hashtable
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let item_loc = ItemLocation::from_location(location);
+
+        // Find the layer containing this item
+        let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
+        let layer = self.layers.get(layer_idx)?;
+
+        // Get the segment to retrieve its generation
+        let segment = layer.get_segment(item_loc.segment_id())?;
+        let generation = segment.generation();
+
+        // Get value from layer
+        let value = layer.get_value(item_loc, key)?;
+
+        // Build CAS token from location + generation
+        let cas_token = CasToken::new(location, generation);
+
+        Some((value, cas_token))
+    }
+
+    /// Get an item with CAS token via callback (zero-copy).
+    ///
+    /// Calls the provided function with access to the value bytes,
+    /// returning the result along with the CAS token.
+    ///
+    /// This is more efficient than `get_with_cas` when you only need
+    /// to read or copy the value to another buffer.
+    pub fn with_value_cas<F, R>(&self, key: &[u8], f: F) -> Option<(R, CasToken)>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        let verifier = self.create_key_verifier();
+
+        // Lookup in hashtable
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let item_loc = ItemLocation::from_location(location);
+
+        // Find the layer containing this item
+        let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
+        let layer = self.layers.get(layer_idx)?;
+
+        // Get the segment to retrieve its generation
+        let segment = layer.get_segment(item_loc.segment_id())?;
+        let generation = segment.generation();
+
+        // Call function with value
+        let result = layer.with_item(item_loc, key, |guard| f(guard.value()))?;
+
+        // Build CAS token from location + generation
+        let cas_token = CasToken::new(location, generation);
+
+        Some((result, cas_token))
+    }
+
+    /// Compare-and-swap: update an item only if the CAS token matches.
+    ///
+    /// This implements memcached CAS semantics:
+    /// - If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`
+    /// - If the CAS token doesn't match (item was modified), returns `Ok(false)`
+    /// - If the CAS token matches, updates the item and returns `Ok(true)`
+    ///
+    /// # Arguments
+    /// * `key` - The key to update
+    /// * `value` - The new value
+    /// * `optional` - Optional metadata (e.g., flags)
+    /// * `ttl` - Time-to-live for the new item
+    /// * `cas_token` - The CAS token from a previous GETS operation
+    pub fn cas(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        optional: &[u8],
+        ttl: Duration,
+        cas_token: CasToken,
+    ) -> CacheResult<bool> {
+        let verifier = self.create_key_verifier();
+
+        // Lookup current item
+        let Some((current_location, _freq)) = self.hashtable.lookup(key, &verifier) else {
+            return Err(CacheError::KeyNotFound);
+        };
+
+        let item_loc = ItemLocation::from_location(current_location);
+
+        // Find the layer containing this item
+        let layer_idx = self
+            .layer_for_pool(item_loc.pool_id())
+            .ok_or(CacheError::KeyNotFound)?;
+        let layer = self.layers.get(layer_idx).ok_or(CacheError::KeyNotFound)?;
+
+        // Get the segment to check generation
+        let segment = layer
+            .get_segment(item_loc.segment_id())
+            .ok_or(CacheError::KeyNotFound)?;
+        let current_generation = segment.generation();
+
+        // Build current CAS token and compare
+        let current_cas = CasToken::new(current_location, current_generation);
+        if current_cas != cas_token {
+            // CAS mismatch - item was modified
+            return Ok(false);
+        }
+
+        // CAS matches - perform the update (same as replace but we've already verified)
+        self.ensure_space()?;
+
+        // Write to Layer 0
+        let write_layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
+        let new_location = write_layer.write_item(key, value, optional, ttl)?;
+
+        // Update in hashtable
+        match self
+            .hashtable
+            .update_if_present(key, new_location.to_location(), &verifier)
+        {
+            Ok(old_location) => {
+                self.mark_deleted_at(old_location);
+                Ok(true)
+            }
+            Err(e) => {
+                write_layer.mark_deleted(new_location);
+                Err(e)
+            }
+        }
     }
 
     /// Delete an item from the cache.

@@ -158,3 +158,7 @@ pub use arc_cache::{ArcCache, Entry};
 // Reservation for zero-copy receive
 mod reservation;
 pub use reservation::{SegmentReservation, SetReservation};
+
+// CAS (Compare-And-Swap) token
+mod cas;
+pub use cas::CasToken;

@@ -46,7 +46,7 @@
 #![warn(clippy::all)]
 
 use cache_core::{
-    CacheLayer, CuckooHashtable, ItemGuard, LayerConfig, TieredCache, TieredCacheBuilder,
+    CacheLayer, CasToken, CuckooHashtable, ItemGuard, LayerConfig, TieredCache, TieredCacheBuilder,
     TtlLayerBuilder,
 };
 use std::sync::Arc;
@@ -396,6 +396,33 @@ impl Cache for SegCache {
 
     fn cancel_segment_set(&self, reservation: cache_core::SegmentReservation) {
         self.inner.cancel_segment_set(reservation);
+    }
+
+    fn get_with_cas(&self, key: &[u8]) -> Option<(Vec<u8>, u64)> {
+        self.inner
+            .get_with_cas(key)
+            .map(|(value, cas_token)| (value, cas_token.as_raw()))
+    }
+
+    fn with_value_cas<F, R>(&self, key: &[u8], f: F) -> Option<(R, u64)>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        self.inner
+            .with_value_cas(key, f)
+            .map(|(result, cas_token)| (result, cas_token.as_raw()))
+    }
+
+    fn cas(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<Duration>,
+        cas: u64,
+    ) -> Result<bool, CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        let cas_token = CasToken::from_raw(cas);
+        self.inner.cas(key, value, b"", ttl, cas_token)
     }
 }
 

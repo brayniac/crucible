@@ -254,19 +254,24 @@ pub fn execute_memcache<C: Cache>(
         MemcacheCommand::Gets { keys } => {
             for key in keys {
                 GETS.increment();
-                let hit = cache.with_value(key, |value| {
+                // Use with_value_cas to get value and CAS token together
+                let hit = cache.with_value_cas(key, |value| {
+                    // We need the value for the response, so return a copy
+                    value.to_vec()
+                });
+
+                if let Some((value, cas)) = hit {
+                    HITS.increment();
                     write_buf.extend_from_slice(b"VALUE ");
                     write_buf.extend_from_slice(key);
                     write_buf.extend_from_slice(b" 0 ");
                     let mut len_buf = itoa::Buffer::new();
                     write_buf.extend_from_slice(len_buf.format(value.len()).as_bytes());
+                    write_buf.extend_from_slice(b" ");
+                    write_buf.extend_from_slice(len_buf.format(cas).as_bytes());
                     write_buf.extend_from_slice(b"\r\n");
-                    write_buf.extend_from_slice(value);
+                    write_buf.extend_from_slice(&value);
                     write_buf.extend_from_slice(b"\r\n");
-                });
-
-                if hit.is_some() {
-                    HITS.increment();
                 } else {
                     MISSES.increment();
                 }
@@ -300,6 +305,41 @@ pub fn execute_memcache<C: Cache>(
             }
             SET_ERRORS.increment();
             write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+            false
+        }
+        MemcacheCommand::Cas {
+            key,
+            exptime,
+            data,
+            cas_unique,
+            ..
+        } => {
+            SETS.increment();
+            let ttl = if *exptime == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(*exptime as u64))
+            };
+
+            match cache.cas(key, data, ttl, *cas_unique) {
+                Ok(true) => {
+                    // CAS succeeded - item was updated
+                    write_buf.extend_from_slice(b"STORED\r\n");
+                }
+                Ok(false) => {
+                    // CAS failed - item was modified since GETS
+                    write_buf.extend_from_slice(b"EXISTS\r\n");
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    // Key doesn't exist
+                    write_buf.extend_from_slice(b"NOT_FOUND\r\n");
+                }
+                Err(_) => {
+                    // Other error (e.g., out of memory)
+                    SET_ERRORS.increment();
+                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                }
+            }
             false
         }
         MemcacheCommand::Delete { key } => {

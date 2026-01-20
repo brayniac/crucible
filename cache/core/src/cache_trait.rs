@@ -342,6 +342,53 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// Marks the reserved space as deleted. Call this if the receive fails.
     fn cancel_segment_set(&self, _reservation: crate::SegmentReservation) {}
+
+    /// Get a value with its CAS token for GETS response.
+    ///
+    /// Returns the value and a CAS token that can be used for subsequent
+    /// CAS operations. The token is unique to this version of the item.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `None` - only TieredCache-based implementations support this.
+    fn get_with_cas(&self, _key: &[u8]) -> Option<(Vec<u8>, u64)> {
+        None
+    }
+
+    /// Zero-copy variant of get_with_cas.
+    ///
+    /// Calls the provided function with the value bytes and returns
+    /// the result along with the CAS token.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `None` - only TieredCache-based implementations support this.
+    fn with_value_cas<F, R>(&self, _key: &[u8], _f: F) -> Option<(R, u64)>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        None
+    }
+
+    /// Compare-and-swap: update an item only if the CAS token matches.
+    ///
+    /// This implements memcached CAS semantics:
+    /// - If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`
+    /// - If the CAS token doesn't match, returns `Ok(false)` (EXISTS response)
+    /// - If the CAS token matches, updates the item and returns `Ok(true)` (STORED)
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - only TieredCache supports this.
+    fn cas(
+        &self,
+        _key: &[u8],
+        _value: &[u8],
+        _ttl: Option<Duration>,
+        _cas: u64,
+    ) -> Result<bool, CacheError> {
+        Err(CacheError::Unsupported)
+    }
 }
 
 /// Default TTL used when None is provided (1 hour).

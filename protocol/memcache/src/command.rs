@@ -92,6 +92,14 @@ pub enum Command<'a> {
         exptime: u32,
         data: &'a [u8],
     },
+    /// CAS (compare-and-swap) command
+    Cas {
+        key: &'a [u8],
+        flags: u32,
+        exptime: u32,
+        data: &'a [u8],
+        cas_unique: u64,
+    },
     /// DELETE command
     Delete { key: &'a [u8] },
     /// FLUSH_ALL command
@@ -204,6 +212,66 @@ impl<'a> Command<'a> {
                 ))
             }
 
+            b"cas" | b"CAS" => {
+                let key = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("cas requires key"))?;
+                if key.is_empty() {
+                    return Err(ParseError::Protocol("empty key"));
+                }
+                if key.len() > options.max_key_len {
+                    return Err(ParseError::Protocol("key too large"));
+                }
+                let flags_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("cas requires flags"))?;
+                let exptime_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("cas requires exptime"))?;
+                let bytes_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("cas requires bytes"))?;
+                let cas_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("cas requires cas_unique"))?;
+
+                let flags = parse_u32(flags_str)?;
+                let exptime = parse_u32(exptime_str)?;
+                let data_len = parse_usize(bytes_str)?;
+                let cas_unique = parse_u64(cas_str)?;
+                if data_len > options.max_value_len {
+                    return Err(ParseError::Protocol("value too large"));
+                }
+
+                // Data block follows the command line: <data>\r\n
+                let data_start = line_end + 2;
+                let data_end = data_start
+                    .checked_add(data_len)
+                    .ok_or(ParseError::InvalidNumber)?;
+                let total_len = data_end.checked_add(2).ok_or(ParseError::InvalidNumber)?;
+
+                if buffer.len() < total_len {
+                    return Err(ParseError::Incomplete);
+                }
+
+                // Verify trailing \r\n
+                if buffer[data_end] != b'\r' || buffer[data_end + 1] != b'\n' {
+                    return Err(ParseError::Protocol("missing data terminator"));
+                }
+
+                let data = &buffer[data_start..data_end];
+                Ok((
+                    Command::Cas {
+                        key,
+                        flags,
+                        exptime,
+                        data,
+                        cas_unique,
+                    },
+                    total_len,
+                ))
+            }
+
             b"delete" | b"DELETE" => {
                 let key = parts
                     .next()
@@ -230,6 +298,7 @@ impl<'a> Command<'a> {
             Command::Get { .. } => "GET",
             Command::Gets { .. } => "GETS",
             Command::Set { .. } => "SET",
+            Command::Cas { .. } => "CAS",
             Command::Delete { .. } => "DELETE",
             Command::FlushAll => "FLUSH_ALL",
             Command::Version => "VERSION",
@@ -266,6 +335,14 @@ fn find_crlf(buffer: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseE
 
 /// Parse a u32 from ASCII decimal.
 fn parse_u32(data: &[u8]) -> Result<u32, ParseError> {
+    std::str::from_utf8(data)
+        .map_err(|_| ParseError::InvalidNumber)?
+        .parse()
+        .map_err(|_| ParseError::InvalidNumber)
+}
+
+/// Parse a u64 from ASCII decimal.
+fn parse_u64(data: &[u8]) -> Result<u64, ParseError> {
     std::str::from_utf8(data)
         .map_err(|_| ParseError::InvalidNumber)?
         .parse()
