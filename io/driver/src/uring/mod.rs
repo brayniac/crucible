@@ -2500,35 +2500,39 @@ impl IoDriver for UringDriver {
 
         let fixed_slot = conn.fixed_slot;
         let total_len = buffer.total_len();
+        let slice_count = buffer.slice_count();
 
-        // Build iovecs from buffer's slices (inline storage, no heap allocation)
-        let slices = buffer.io_slices();
-        if slices.len() > MAX_ZC_IOVECS {
+        // Validate slice count before inserting into slab
+        if slice_count > MAX_ZC_IOVECS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("too many iovecs: {} > {}", slices.len(), MAX_ZC_IOVECS),
+                format!("too many iovecs: {} > {}", slice_count, MAX_ZC_IOVECS),
             ));
         }
-        let iovecs: ArrayVec<libc::iovec, MAX_ZC_IOVECS> = slices
+
+        // Insert buffer into slab FIRST to get stable storage.
+        // We must build iovecs AFTER the buffer is in its final location,
+        // because SmallBox may store data inline - if we build iovecs before
+        // moving the buffer, pointers to inline data become dangling.
+        let entry = self.pending_zc_sends.vacant_entry();
+        let slab_idx = entry.key();
+        entry.insert(PendingZcSend {
+            buffer,
+            iovecs: ArrayVec::new(),
+            msghdr: unsafe { std::mem::zeroed() },
+        });
+
+        // Now build iovecs from buffer in its final stable location
+        // SAFETY: We just inserted at slab_idx, and Slab provides stable addresses
+        let pending = self.pending_zc_sends.get_mut(slab_idx).unwrap();
+        let slices = pending.buffer.io_slices();
+        pending.iovecs = slices
             .iter()
             .map(|s| libc::iovec {
                 iov_base: s.as_ptr() as *mut _,
                 iov_len: s.len(),
             })
             .collect();
-
-        // Insert into slab - this gives us stable storage without boxing
-        let entry = self.pending_zc_sends.vacant_entry();
-        let slab_idx = entry.key();
-        entry.insert(PendingZcSend {
-            buffer,
-            iovecs,
-            msghdr: unsafe { std::mem::zeroed() },
-        });
-
-        // Get reference to update msghdr with iovec pointer
-        // SAFETY: We just inserted at slab_idx, and Slab provides stable addresses
-        let pending = self.pending_zc_sends.get_mut(slab_idx).unwrap();
         pending.msghdr.msg_iov = pending.iovecs.as_mut_ptr();
         pending.msghdr.msg_iovlen = pending.iovecs.len();
 
