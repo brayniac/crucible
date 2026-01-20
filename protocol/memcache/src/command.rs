@@ -122,6 +122,30 @@ pub enum Command<'a> {
     Version,
     /// QUIT command
     Quit,
+    /// INCR command - increment numeric value
+    Incr {
+        key: &'a [u8],
+        delta: u64,
+        noreply: bool,
+    },
+    /// DECR command - decrement numeric value
+    Decr {
+        key: &'a [u8],
+        delta: u64,
+        noreply: bool,
+    },
+    /// APPEND command - append data to existing value
+    Append {
+        key: &'a [u8],
+        data: &'a [u8],
+        noreply: bool,
+    },
+    /// PREPEND command - prepend data to existing value
+    Prepend {
+        key: &'a [u8],
+        data: &'a [u8],
+        noreply: bool,
+    },
 }
 
 impl<'a> Command<'a> {
@@ -412,6 +436,166 @@ impl<'a> Command<'a> {
 
             b"quit" | b"QUIT" => Ok((Command::Quit, line_end + 2)),
 
+            b"incr" | b"INCR" => {
+                let key = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("incr requires key"))?;
+                if key.is_empty() {
+                    return Err(ParseError::Protocol("empty key"));
+                }
+                if key.len() > options.max_key_len {
+                    return Err(ParseError::Protocol("key too large"));
+                }
+                let delta_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("incr requires delta"))?;
+                let delta = parse_u64(delta_str)?;
+                let noreply = parts
+                    .next()
+                    .map(|s| s == b"noreply" || s == b"NOREPLY")
+                    .unwrap_or(false);
+                Ok((
+                    Command::Incr {
+                        key,
+                        delta,
+                        noreply,
+                    },
+                    line_end + 2,
+                ))
+            }
+
+            b"decr" | b"DECR" => {
+                let key = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("decr requires key"))?;
+                if key.is_empty() {
+                    return Err(ParseError::Protocol("empty key"));
+                }
+                if key.len() > options.max_key_len {
+                    return Err(ParseError::Protocol("key too large"));
+                }
+                let delta_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("decr requires delta"))?;
+                let delta = parse_u64(delta_str)?;
+                let noreply = parts
+                    .next()
+                    .map(|s| s == b"noreply" || s == b"NOREPLY")
+                    .unwrap_or(false);
+                Ok((
+                    Command::Decr {
+                        key,
+                        delta,
+                        noreply,
+                    },
+                    line_end + 2,
+                ))
+            }
+
+            b"append" | b"APPEND" => {
+                let key = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("append requires key"))?;
+                if key.is_empty() {
+                    return Err(ParseError::Protocol("empty key"));
+                }
+                if key.len() > options.max_key_len {
+                    return Err(ParseError::Protocol("key too large"));
+                }
+                // flags and exptime are required by protocol but ignored for append
+                let _flags_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("append requires flags"))?;
+                let _exptime_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("append requires exptime"))?;
+                let bytes_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("append requires bytes"))?;
+
+                let data_len = parse_usize(bytes_str)?;
+                if data_len > options.max_value_len {
+                    return Err(ParseError::Protocol("value too large"));
+                }
+
+                // Check for noreply
+                let noreply = parts
+                    .next()
+                    .map(|s| s == b"noreply" || s == b"NOREPLY")
+                    .unwrap_or(false);
+
+                // Data block follows the command line: <data>\r\n
+                let data_start = line_end + 2;
+                let data_end = data_start
+                    .checked_add(data_len)
+                    .ok_or(ParseError::InvalidNumber)?;
+                let total_len = data_end.checked_add(2).ok_or(ParseError::InvalidNumber)?;
+
+                if buffer.len() < total_len {
+                    return Err(ParseError::Incomplete);
+                }
+
+                // Verify trailing \r\n
+                if buffer[data_end] != b'\r' || buffer[data_end + 1] != b'\n' {
+                    return Err(ParseError::Protocol("missing data terminator"));
+                }
+
+                let data = &buffer[data_start..data_end];
+                Ok((Command::Append { key, data, noreply }, total_len))
+            }
+
+            b"prepend" | b"PREPEND" => {
+                let key = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("prepend requires key"))?;
+                if key.is_empty() {
+                    return Err(ParseError::Protocol("empty key"));
+                }
+                if key.len() > options.max_key_len {
+                    return Err(ParseError::Protocol("key too large"));
+                }
+                // flags and exptime are required by protocol but ignored for prepend
+                let _flags_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("prepend requires flags"))?;
+                let _exptime_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("prepend requires exptime"))?;
+                let bytes_str = parts
+                    .next()
+                    .ok_or(ParseError::Protocol("prepend requires bytes"))?;
+
+                let data_len = parse_usize(bytes_str)?;
+                if data_len > options.max_value_len {
+                    return Err(ParseError::Protocol("value too large"));
+                }
+
+                // Check for noreply
+                let noreply = parts
+                    .next()
+                    .map(|s| s == b"noreply" || s == b"NOREPLY")
+                    .unwrap_or(false);
+
+                // Data block follows the command line: <data>\r\n
+                let data_start = line_end + 2;
+                let data_end = data_start
+                    .checked_add(data_len)
+                    .ok_or(ParseError::InvalidNumber)?;
+                let total_len = data_end.checked_add(2).ok_or(ParseError::InvalidNumber)?;
+
+                if buffer.len() < total_len {
+                    return Err(ParseError::Incomplete);
+                }
+
+                // Verify trailing \r\n
+                if buffer[data_end] != b'\r' || buffer[data_end + 1] != b'\n' {
+                    return Err(ParseError::Protocol("missing data terminator"));
+                }
+
+                let data = &buffer[data_start..data_end];
+                Ok((Command::Prepend { key, data, noreply }, total_len))
+            }
+
             _ => Err(ParseError::UnknownCommand),
         }
     }
@@ -429,6 +613,10 @@ impl<'a> Command<'a> {
             Command::FlushAll => "FLUSH_ALL",
             Command::Version => "VERSION",
             Command::Quit => "QUIT",
+            Command::Incr { .. } => "INCR",
+            Command::Decr { .. } => "DECR",
+            Command::Append { .. } => "APPEND",
+            Command::Prepend { .. } => "PREPEND",
         }
     }
 
@@ -1100,5 +1288,227 @@ mod tests {
         let data = b"get k1 k2 k3 k4 k5 k6\r\n";
         let result = Command::parse_with_options(data, &options);
         assert!(matches!(result, Err(ParseError::Protocol("too many keys"))));
+    }
+
+    // ========================================================================
+    // INCR/DECR Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_incr() {
+        let data = b"incr counter 5\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        match cmd {
+            Command::Incr {
+                key,
+                delta,
+                noreply,
+            } => {
+                assert_eq!(key, b"counter");
+                assert_eq!(delta, 5);
+                assert!(!noreply);
+            }
+            _ => panic!("expected Incr"),
+        }
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_incr_noreply() {
+        let data = b"incr counter 10 noreply\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        match cmd {
+            Command::Incr {
+                key,
+                delta,
+                noreply,
+            } => {
+                assert_eq!(key, b"counter");
+                assert_eq!(delta, 10);
+                assert!(noreply);
+            }
+            _ => panic!("expected Incr"),
+        }
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_incr_case_insensitive() {
+        let (cmd, _) = Command::parse(b"INCR key 1\r\n").unwrap();
+        assert!(matches!(cmd, Command::Incr { .. }));
+    }
+
+    #[test]
+    fn test_parse_incr_noreply_case_insensitive() {
+        let (cmd, _) = Command::parse(b"incr key 1 NOREPLY\r\n").unwrap();
+        match cmd {
+            Command::Incr { noreply, .. } => assert!(noreply),
+            _ => panic!("expected Incr"),
+        }
+    }
+
+    #[test]
+    fn test_parse_incr_missing_key() {
+        assert!(matches!(
+            Command::parse(b"incr\r\n"),
+            Err(ParseError::Protocol("incr requires key"))
+        ));
+    }
+
+    #[test]
+    fn test_parse_incr_empty_key() {
+        assert!(matches!(
+            Command::parse(b"incr  5\r\n"),
+            Err(ParseError::Protocol("empty key"))
+        ));
+    }
+
+    #[test]
+    fn test_parse_incr_missing_delta() {
+        assert!(matches!(
+            Command::parse(b"incr key\r\n"),
+            Err(ParseError::Protocol("incr requires delta"))
+        ));
+    }
+
+    #[test]
+    fn test_parse_incr_invalid_delta() {
+        assert!(matches!(
+            Command::parse(b"incr key abc\r\n"),
+            Err(ParseError::InvalidNumber)
+        ));
+    }
+
+    #[test]
+    fn test_parse_incr_key_too_large() {
+        let mut data = b"incr ".to_vec();
+        data.extend(std::iter::repeat_n(b'k', DEFAULT_MAX_KEY_LEN + 1));
+        data.extend(b" 5\r\n");
+        assert!(matches!(
+            Command::parse(&data),
+            Err(ParseError::Protocol("key too large"))
+        ));
+    }
+
+    #[test]
+    fn test_parse_decr() {
+        let data = b"decr counter 3\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        match cmd {
+            Command::Decr {
+                key,
+                delta,
+                noreply,
+            } => {
+                assert_eq!(key, b"counter");
+                assert_eq!(delta, 3);
+                assert!(!noreply);
+            }
+            _ => panic!("expected Decr"),
+        }
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_decr_noreply() {
+        let data = b"decr counter 10 noreply\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        match cmd {
+            Command::Decr {
+                key,
+                delta,
+                noreply,
+            } => {
+                assert_eq!(key, b"counter");
+                assert_eq!(delta, 10);
+                assert!(noreply);
+            }
+            _ => panic!("expected Decr"),
+        }
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_decr_case_insensitive() {
+        let (cmd, _) = Command::parse(b"DECR key 1\r\n").unwrap();
+        assert!(matches!(cmd, Command::Decr { .. }));
+    }
+
+    #[test]
+    fn test_parse_decr_missing_key() {
+        assert!(matches!(
+            Command::parse(b"decr\r\n"),
+            Err(ParseError::Protocol("decr requires key"))
+        ));
+    }
+
+    #[test]
+    fn test_parse_decr_missing_delta() {
+        assert!(matches!(
+            Command::parse(b"decr key\r\n"),
+            Err(ParseError::Protocol("decr requires delta"))
+        ));
+    }
+
+    #[test]
+    fn test_parse_decr_invalid_delta() {
+        assert!(matches!(
+            Command::parse(b"decr key xyz\r\n"),
+            Err(ParseError::InvalidNumber)
+        ));
+    }
+
+    #[test]
+    fn test_incr_decr_command_names() {
+        assert_eq!(
+            Command::Incr {
+                key: b"k",
+                delta: 1,
+                noreply: false
+            }
+            .name(),
+            "INCR"
+        );
+        assert_eq!(
+            Command::Decr {
+                key: b"k",
+                delta: 1,
+                noreply: false
+            }
+            .name(),
+            "DECR"
+        );
+    }
+
+    #[test]
+    fn test_incr_decr_is_quit() {
+        assert!(
+            !Command::Incr {
+                key: b"k",
+                delta: 1,
+                noreply: false
+            }
+            .is_quit()
+        );
+        assert!(
+            !Command::Decr {
+                key: b"k",
+                delta: 1,
+                noreply: false
+            }
+            .is_quit()
+        );
+    }
+
+    #[test]
+    fn test_incr_large_delta() {
+        let data = b"incr key 18446744073709551615\r\n"; // u64::MAX
+        let (cmd, _) = Command::parse(data).unwrap();
+        match cmd {
+            Command::Incr { delta, .. } => {
+                assert_eq!(delta, u64::MAX);
+            }
+            _ => panic!("expected Incr"),
+        }
     }
 }

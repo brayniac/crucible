@@ -162,3 +162,6 @@ pub use reservation::{SegmentReservation, SetReservation};
 // CAS (Compare-And-Swap) token
 mod cas;
 pub use cas::CasToken;
+
+// Numeric utilities for efficient storage of numeric values
+pub mod numeric;

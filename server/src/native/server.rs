@@ -43,6 +43,7 @@ struct WorkerConfig {
     recv_mode: RecvMode,
     max_value_size: usize,
     zero_copy_mode: ZeroCopyMode,
+    allow_flush: bool,
 }
 
 /// Configuration for the acceptor thread.
@@ -70,6 +71,9 @@ pub fn run<C: Cache + 'static>(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // Compute global allow_flush: enabled if ANY listener allows it
+    let allow_flush = config.listener.iter().any(|l| l.allow_flush);
+
     let worker_config = WorkerConfig {
         io_engine: config.io_engine,
         buffer_size: config.uring.buffer_size,
@@ -79,6 +83,7 @@ pub fn run<C: Cache + 'static>(
         recv_mode: config.uring.recv_mode,
         max_value_size: config.cache.max_value_size,
         zero_copy_mode: config.zero_copy,
+        allow_flush,
     };
 
     let acceptor_config = AcceptorConfig {
@@ -376,7 +381,10 @@ fn run_worker<C: Cache>(
                     }
 
                     // All connections use the same simple Connection type now
-                    connections[idx] = Some(Connection::new(config.max_value_size));
+                    connections[idx] = Some(Connection::with_options(
+                        config.max_value_size,
+                        config.allow_flush,
+                    ));
                 }
                 Err(_) => {
                     // Failed to register, fd is already closed by driver
@@ -404,7 +412,10 @@ fn run_worker<C: Cache>(
                         connections.resize_with(idx + 1, || None);
                     }
 
-                    connections[idx] = Some(Connection::new(config.max_value_size));
+                    connections[idx] = Some(Connection::with_options(
+                        config.max_value_size,
+                        config.allow_flush,
+                    ));
                 }
 
                 // Unified recv handling using with_recv_buf

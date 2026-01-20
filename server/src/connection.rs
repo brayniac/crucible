@@ -229,11 +229,18 @@ pub struct Connection {
     memcache_parse_options: MemcacheParseOptions,
     /// State for streaming receive of large SET values
     streaming_state: StreamingState,
+    /// Whether flush commands are allowed on this connection
+    allow_flush: bool,
 }
 
 impl Connection {
     /// Create a new connection with the specified max value size.
     pub fn new(max_value_size: usize) -> Self {
+        Self::with_options(max_value_size, false)
+    }
+
+    /// Create a new connection with the specified max value size and flush permission.
+    pub fn with_options(max_value_size: usize, allow_flush: bool) -> Self {
         Self {
             write_buf: BytesMut::with_capacity(65536),
             write_pos: 0,
@@ -243,6 +250,7 @@ impl Connection {
             resp_parse_options: ParseOptions::new().max_bulk_string_len(max_value_size),
             memcache_parse_options: MemcacheParseOptions::new().max_value_len(max_value_size),
             streaming_state: StreamingState::None,
+            allow_flush,
         }
     }
 
@@ -334,7 +342,13 @@ impl Connection {
             let data = buf.as_slice();
             match parse_streaming(data, &self.resp_parse_options, STREAMING_THRESHOLD) {
                 Ok(ParseProgress::Complete(cmd, consumed)) => {
-                    execute_resp(&cmd, cache, &mut self.write_buf, &mut self.resp_version);
+                    execute_resp(
+                        &cmd,
+                        cache,
+                        &mut self.write_buf,
+                        &mut self.resp_version,
+                        self.allow_flush,
+                    );
                     buf.consume(consumed);
                 }
                 Ok(ParseProgress::NeedValue {
@@ -564,7 +578,7 @@ impl Connection {
                 MEMCACHE_STREAMING_THRESHOLD,
             ) {
                 Ok(MemcacheParseProgress::Complete(cmd, consumed)) => {
-                    if execute_memcache(&cmd, cache, &mut self.write_buf) {
+                    if execute_memcache(&cmd, cache, &mut self.write_buf, self.allow_flush) {
                         self.should_close = true;
                     }
                     buf.consume(consumed);
@@ -799,7 +813,7 @@ impl Connection {
             let data = buf.as_slice();
             match parse_binary_streaming(data, BINARY_STREAMING_THRESHOLD) {
                 Ok(BinaryParseProgress::Complete(cmd, consumed)) => {
-                    if execute_memcache_binary(&cmd, cache, &mut self.write_buf) {
+                    if execute_memcache_binary(&cmd, cache, &mut self.write_buf, self.allow_flush) {
                         self.should_close = true;
                     }
                     buf.consume(consumed);
@@ -1165,7 +1179,13 @@ impl Connection {
                     buf.consume(consumed);
                 } else {
                     // Not a GET - execute normally
-                    execute_resp(&cmd, cache, &mut self.write_buf, &mut self.resp_version);
+                    execute_resp(
+                        &cmd,
+                        cache,
+                        &mut self.write_buf,
+                        &mut self.resp_version,
+                        self.allow_flush,
+                    );
                     buf.consume(consumed);
                 }
                 None

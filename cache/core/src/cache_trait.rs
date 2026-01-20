@@ -418,6 +418,115 @@ pub trait Cache: Send + Sync + 'static {
     ) -> Result<(), CacheError> {
         Err(CacheError::Unsupported)
     }
+
+    /// Atomically increment a numeric value stored as ASCII decimal.
+    ///
+    /// If the key doesn't exist and `initial` is provided, creates the key
+    /// with the initial value and then applies the delta. If `initial` is `None`
+    /// and the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// # Arguments
+    /// * `key` - The key to increment
+    /// * `delta` - Amount to add (for INCR this is 1, for INCRBY this is the value)
+    /// * `initial` - Initial value if key doesn't exist (memcache binary semantics)
+    /// * `ttl` - TTL for newly created keys
+    ///
+    /// # Returns
+    /// * `Ok(new_value)` - The value after incrementing
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist and no initial provided
+    /// * `Err(CacheError::NotNumeric)` - Value exists but isn't a valid ASCII number
+    /// * `Err(CacheError::Overflow)` - Operation would overflow u64
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn increment(
+        &self,
+        _key: &[u8],
+        _delta: u64,
+        _initial: Option<u64>,
+        _ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Atomically decrement a numeric value stored as ASCII decimal.
+    ///
+    /// If the key doesn't exist and `initial` is provided, creates the key
+    /// with the initial value and then applies the delta. If `initial` is `None`
+    /// and the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// Memcache semantics: underflow clamps to 0 (saturating subtraction).
+    ///
+    /// # Arguments
+    /// * `key` - The key to decrement
+    /// * `delta` - Amount to subtract
+    /// * `initial` - Initial value if key doesn't exist (memcache binary semantics)
+    /// * `ttl` - TTL for newly created keys
+    ///
+    /// # Returns
+    /// * `Ok(new_value)` - The value after decrementing (clamped to 0 on underflow)
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist and no initial provided
+    /// * `Err(CacheError::NotNumeric)` - Value exists but isn't a valid ASCII number
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn decrement(
+        &self,
+        _key: &[u8],
+        _delta: u64,
+        _initial: Option<u64>,
+        _ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Append data to an existing value.
+    ///
+    /// Concatenates `data` to the end of the existing value for `key`.
+    /// If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// After appending, the cache checks if the result is a "simple numeric"
+    /// value and may store it more efficiently. This is transparent to the caller.
+    ///
+    /// # Arguments
+    /// * `key` - The key to append to
+    /// * `data` - Data to append to the existing value
+    ///
+    /// # Returns
+    /// * `Ok(new_length)` - The length of the value after appending
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn append(&self, _key: &[u8], _data: &[u8]) -> Result<usize, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Prepend data to an existing value.
+    ///
+    /// Concatenates `data` to the beginning of the existing value for `key`.
+    /// If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// After prepending, the cache checks if the result is a "simple numeric"
+    /// value and may store it more efficiently. This is transparent to the caller.
+    ///
+    /// # Arguments
+    /// * `key` - The key to prepend to
+    /// * `data` - Data to prepend to the existing value
+    ///
+    /// # Returns
+    /// * `Ok(new_length)` - The length of the value after prepending
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn prepend(&self, _key: &[u8], _data: &[u8]) -> Result<usize, CacheError> {
+        Err(CacheError::Unsupported)
+    }
 }
 
 /// Default TTL used when None is provided (1 hour).

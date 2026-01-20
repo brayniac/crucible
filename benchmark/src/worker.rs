@@ -224,8 +224,17 @@ impl IoWorker {
                     );
                     metrics::CONNECTIONS_FAILED.increment();
                     // Create disconnected session for reconnection attempts
-                    let session = Session::from_config(endpoint, &self.config);
-                    self.sessions.push(session);
+                    match Session::from_config(endpoint, &self.config) {
+                        Ok(session) => self.sessions.push(session),
+                        Err(e) => {
+                            tracing::error!(
+                                "worker {} failed to create session for {}: {}",
+                                self.id,
+                                endpoint,
+                                e
+                            );
+                        }
+                    }
                     // Not added to send_queue - will be added on successful reconnect
                 }
             }
@@ -272,7 +281,8 @@ impl IoWorker {
         let stream = Self::create_connection(addr, self.config.connection.connect_timeout)?;
         let conn_id = self.driver.register(stream)?;
 
-        let mut session = Session::from_config(addr, &self.config);
+        let mut session = Session::from_config(addr, &self.config)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         session.set_conn_id(conn_id);
 
         let idx = self.sessions.len();

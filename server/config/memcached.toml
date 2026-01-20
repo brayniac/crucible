@@ -6,17 +6,15 @@
 #
 # Supported Memcached commands:
 #   - get, gets (retrieval)
-#   - set (storage)
+#   - set, add, replace (storage)
 #   - cas (compare-and-swap)
+#   - append, prepend
+#   - incr, decr
 #   - delete
+#   - flush_all (disabled by default, enable with allow_flush = true)
 #   - version, quit
 #
-# Accepted but not implemented (returns OK, does nothing):
-#   - flush_all
-#
 # Not yet supported:
-#   - add, replace, append, prepend
-#   - incr, decr
 #   - gat, gats, touch
 #   - stats (partial)
 #
@@ -67,6 +65,8 @@ hugepage = "none"  # Options: "none", "2mb", "1gb"
 [[listener]]
 protocol = "memcache"
 address = "0.0.0.0:11211"
+# Enable flush_all command (dangerous - clears entire cache)
+# allow_flush = false
 
 [metrics]
 # Prometheus metrics endpoint

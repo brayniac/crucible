@@ -225,6 +225,13 @@ impl CacheLayer {
             CacheLayer::Ttl(layer) => layer.cancel_write_item(location),
         }
     }
+
+    /// Reset all segments in this layer to Free state.
+    ///
+    /// This is used during flush operations to reset the entire layer.
+    pub fn reset_all_segments(&self) {
+        self.pool().reset_all();
+    }
 }
 
 /// A tiered cache with multiple layers and a shared hashtable.
@@ -804,6 +811,209 @@ impl<H: Hashtable> TieredCache<H> {
         }
     }
 
+    /// Atomically increment a numeric value stored as ASCII decimal.
+    ///
+    /// If the key doesn't exist and `initial` is provided, creates the key
+    /// with `initial + delta`. If `initial` is `None` and the key doesn't exist,
+    /// returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// # Returns
+    /// * `Ok(new_value)` - The value after incrementing
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist and no initial provided
+    /// * `Err(CacheError::NotNumeric)` - Value exists but isn't a valid ASCII number
+    /// * `Err(CacheError::Overflow)` - Operation would overflow u64
+    pub fn increment(
+        &self,
+        key: &[u8],
+        delta: u64,
+        initial: Option<u64>,
+        ttl: Duration,
+    ) -> CacheResult<u64> {
+        // Try to get the current value
+        let current_value = self.get(key);
+
+        match current_value {
+            Some(data) => {
+                // Parse existing value as ASCII decimal
+                let value_str = std::str::from_utf8(&data).map_err(|_| CacheError::NotNumeric)?;
+                let current: u64 = value_str
+                    .trim()
+                    .parse()
+                    .map_err(|_| CacheError::NotNumeric)?;
+
+                // Compute new value with overflow check
+                let new_value = current.checked_add(delta).ok_or(CacheError::Overflow)?;
+
+                // Store the new value
+                let new_str = new_value.to_string();
+                self.set(key, new_str.as_bytes(), &[], ttl)?;
+
+                Ok(new_value)
+            }
+            None => {
+                // Key doesn't exist
+                match initial {
+                    Some(init) => {
+                        // Create with initial + delta
+                        let new_value = init.checked_add(delta).ok_or(CacheError::Overflow)?;
+                        let new_str = new_value.to_string();
+                        self.set(key, new_str.as_bytes(), &[], ttl)?;
+                        Ok(new_value)
+                    }
+                    None => Err(CacheError::KeyNotFound),
+                }
+            }
+        }
+    }
+
+    /// Atomically decrement a numeric value stored as ASCII decimal.
+    ///
+    /// If the key doesn't exist and `initial` is provided, creates the key
+    /// with `initial.saturating_sub(delta)`. If `initial` is `None` and the key
+    /// doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// Underflow clamps to 0 (saturating subtraction) per memcache semantics.
+    ///
+    /// # Returns
+    /// * `Ok(new_value)` - The value after decrementing (clamped to 0 on underflow)
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist and no initial provided
+    /// * `Err(CacheError::NotNumeric)` - Value exists but isn't a valid ASCII number
+    pub fn decrement(
+        &self,
+        key: &[u8],
+        delta: u64,
+        initial: Option<u64>,
+        ttl: Duration,
+    ) -> CacheResult<u64> {
+        // Try to get the current value
+        let current_value = self.get(key);
+
+        match current_value {
+            Some(data) => {
+                // Parse existing value as ASCII decimal
+                let value_str = std::str::from_utf8(&data).map_err(|_| CacheError::NotNumeric)?;
+                let current: u64 = value_str
+                    .trim()
+                    .parse()
+                    .map_err(|_| CacheError::NotNumeric)?;
+
+                // Compute new value with saturating subtraction (clamp to 0)
+                let new_value = current.saturating_sub(delta);
+
+                // Store the new value
+                let new_str = new_value.to_string();
+                self.set(key, new_str.as_bytes(), &[], ttl)?;
+
+                Ok(new_value)
+            }
+            None => {
+                // Key doesn't exist
+                match initial {
+                    Some(init) => {
+                        // Create with initial - delta (saturating)
+                        let new_value = init.saturating_sub(delta);
+                        let new_str = new_value.to_string();
+                        self.set(key, new_str.as_bytes(), &[], ttl)?;
+                        Ok(new_value)
+                    }
+                    None => Err(CacheError::KeyNotFound),
+                }
+            }
+        }
+    }
+
+    /// Append data to an existing value.
+    ///
+    /// Concatenates `data` to the end of the existing value for `key`.
+    /// If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// # Returns
+    /// * `Ok(new_length)` - The length of the value after appending
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    pub fn append(&self, key: &[u8], data: &[u8]) -> CacheResult<usize> {
+        // Get the current value and TTL
+        let verifier = self.create_key_verifier();
+
+        let (location, _freq) = self
+            .hashtable
+            .lookup(key, &verifier)
+            .ok_or(CacheError::KeyNotFound)?;
+        let item_loc = ItemLocation::from_location(location);
+
+        // Find the layer containing this item
+        let layer_idx = self
+            .layer_for_pool(item_loc.pool_id())
+            .ok_or(CacheError::KeyNotFound)?;
+        let layer = self.layers.get(layer_idx).ok_or(CacheError::KeyNotFound)?;
+
+        // Get current value and remaining TTL
+        let (current_value, ttl) = layer
+            .with_item(item_loc, key, |guard| {
+                let value = guard.value().to_vec();
+                let remaining_ttl = layer
+                    .item_ttl(item_loc)
+                    .unwrap_or(Duration::from_secs(3600));
+                (value, remaining_ttl)
+            })
+            .ok_or(CacheError::KeyNotFound)?;
+
+        // Create new value with appended data
+        let mut new_value = current_value;
+        new_value.extend_from_slice(data);
+        let new_len = new_value.len();
+
+        // Store the new value, preserving TTL
+        self.set(key, &new_value, &[], ttl)?;
+
+        Ok(new_len)
+    }
+
+    /// Prepend data to an existing value.
+    ///
+    /// Concatenates `data` to the beginning of the existing value for `key`.
+    /// If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// # Returns
+    /// * `Ok(new_length)` - The length of the value after prepending
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    pub fn prepend(&self, key: &[u8], data: &[u8]) -> CacheResult<usize> {
+        // Get the current value and TTL
+        let verifier = self.create_key_verifier();
+
+        let (location, _freq) = self
+            .hashtable
+            .lookup(key, &verifier)
+            .ok_or(CacheError::KeyNotFound)?;
+        let item_loc = ItemLocation::from_location(location);
+
+        // Find the layer containing this item
+        let layer_idx = self
+            .layer_for_pool(item_loc.pool_id())
+            .ok_or(CacheError::KeyNotFound)?;
+        let layer = self.layers.get(layer_idx).ok_or(CacheError::KeyNotFound)?;
+
+        // Get current value and remaining TTL
+        let (current_value, ttl) = layer
+            .with_item(item_loc, key, |guard| {
+                let value = guard.value().to_vec();
+                let remaining_ttl = layer
+                    .item_ttl(item_loc)
+                    .unwrap_or(Duration::from_secs(3600));
+                (value, remaining_ttl)
+            })
+            .ok_or(CacheError::KeyNotFound)?;
+
+        // Create new value with prepended data
+        let mut new_value = data.to_vec();
+        new_value.extend_from_slice(&current_value);
+        let new_len = new_value.len();
+
+        // Store the new value, preserving TTL
+        self.set(key, &new_value, &[], ttl)?;
+
+        Ok(new_len)
+    }
+
     /// Ensure Layer 0 has space for a new item.
     fn ensure_space(&self) -> CacheResult<()> {
         let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
@@ -869,6 +1079,20 @@ impl<H: Hashtable> TieredCache<H> {
         }
 
         CacheKeyVerifier { pools }
+    }
+
+    /// Flush all items from the cache.
+    ///
+    /// This clears the hashtable and resets all segments to their initial state.
+    /// After calling flush, the cache will be empty.
+    pub fn flush(&self) {
+        // Clear the hashtable first - this makes all items "invisible"
+        self.hashtable.clear();
+
+        // Reset all segments in all layers
+        for layer in &self.layers {
+            layer.reset_all_segments();
+        }
     }
 }
 

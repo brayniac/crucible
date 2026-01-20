@@ -57,6 +57,12 @@ pub enum CacheError {
 
     /// Operation not supported by this cache implementation.
     Unsupported,
+
+    /// Value is not a valid numeric string.
+    NotNumeric,
+
+    /// Operation would cause numeric overflow.
+    Overflow,
 }
 
 impl fmt::Display for CacheError {
@@ -79,6 +85,8 @@ impl fmt::Display for CacheError {
             Self::KeyMismatch => write!(f, "key mismatch"),
             Self::SegmentNotAccessible => write!(f, "segment not accessible"),
             Self::Unsupported => write!(f, "operation not supported"),
+            Self::NotNumeric => write!(f, "value is not numeric"),
+            Self::Overflow => write!(f, "numeric overflow"),
         }
     }
 }

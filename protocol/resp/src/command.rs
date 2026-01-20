@@ -38,6 +38,16 @@ pub enum Command<'a> {
     FlushDb,
     /// FLUSHALL
     FlushAll,
+    /// INCR key - Increment the integer value of a key by one
+    Incr { key: &'a [u8] },
+    /// DECR key - Decrement the integer value of a key by one
+    Decr { key: &'a [u8] },
+    /// INCRBY key delta - Increment the integer value of a key by delta
+    IncrBy { key: &'a [u8], delta: i64 },
+    /// DECRBY key delta - Decrement the integer value of a key by delta
+    DecrBy { key: &'a [u8], delta: i64 },
+    /// APPEND key value - Append a value to a key
+    Append { key: &'a [u8], value: &'a [u8] },
     /// HELLO [protover [AUTH username password] [SETNAME clientname]]
     /// Used for RESP3 protocol negotiation.
     #[cfg(feature = "resp3")]
@@ -249,6 +259,69 @@ impl<'a> Command<'a> {
             _ if cmd_str.eq_ignore_ascii_case("flushdb") => Command::FlushDb,
             _ if cmd_str.eq_ignore_ascii_case("flushall") => Command::FlushAll,
 
+            _ if cmd_str.eq_ignore_ascii_case("incr") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "INCR requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::Incr { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("decr") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "DECR requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::Decr { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("incrby") => {
+                if count != 3 {
+                    return Err(ParseError::WrongArity(
+                        "INCRBY requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let delta_bytes = cursor.read_bulk_string()?;
+                let delta_str = std::str::from_utf8(delta_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in delta".to_string()))?;
+                let delta = delta_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid delta value".to_string()))?;
+                Command::IncrBy { key, delta }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("decrby") => {
+                if count != 3 {
+                    return Err(ParseError::WrongArity(
+                        "DECRBY requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let delta_bytes = cursor.read_bulk_string()?;
+                let delta_str = std::str::from_utf8(delta_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in delta".to_string()))?;
+                let delta = delta_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid delta value".to_string()))?;
+                Command::DecrBy { key, delta }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("append") => {
+                if count != 3 {
+                    return Err(ParseError::WrongArity(
+                        "APPEND requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let value = cursor.read_bulk_string()?;
+                Command::Append { key, value }
+            }
+
             #[cfg(feature = "resp3")]
             _ if cmd_str.eq_ignore_ascii_case("hello") => {
                 let mut proto_version = None;
@@ -329,6 +402,11 @@ impl<'a> Command<'a> {
             Command::Config { .. } => "CONFIG",
             Command::FlushDb => "FLUSHDB",
             Command::FlushAll => "FLUSHALL",
+            Command::Incr { .. } => "INCR",
+            Command::Decr { .. } => "DECR",
+            Command::IncrBy { .. } => "INCRBY",
+            Command::DecrBy { .. } => "DECRBY",
+            Command::Append { .. } => "APPEND",
             #[cfg(feature = "resp3")]
             Command::Hello { .. } => "HELLO",
         }
@@ -899,6 +977,179 @@ mod tests {
         let data = b"*1048577\r\n$4\r\nPING\r\n"; // 1M + 1
         let result = Command::parse(data);
         assert!(matches!(result, Err(ParseError::Protocol(_))));
+    }
+
+    // ========================================================================
+    // INCR/DECR Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_incr() {
+        let data = b"*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::Incr { key: b"counter" });
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_incr_case_insensitive() {
+        let data = b"*2\r\n$4\r\nincr\r\n$3\r\nkey\r\n";
+        let (cmd, _) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::Incr { key: b"key" });
+    }
+
+    #[test]
+    fn test_parse_incr_wrong_arity_no_key() {
+        let data = b"*1\r\n$4\r\nINCR\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_incr_wrong_arity_extra_args() {
+        let data = b"*3\r\n$4\r\nINCR\r\n$3\r\nkey\r\n$5\r\nextra\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_decr() {
+        let data = b"*2\r\n$4\r\nDECR\r\n$7\r\ncounter\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::Decr { key: b"counter" });
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_decr_case_insensitive() {
+        let data = b"*2\r\n$4\r\ndecr\r\n$3\r\nkey\r\n";
+        let (cmd, _) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::Decr { key: b"key" });
+    }
+
+    #[test]
+    fn test_parse_decr_wrong_arity() {
+        let data = b"*1\r\n$4\r\nDECR\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_incrby() {
+        let data = b"*3\r\n$6\r\nINCRBY\r\n$7\r\ncounter\r\n$2\r\n10\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(
+            cmd,
+            Command::IncrBy {
+                key: b"counter",
+                delta: 10
+            }
+        );
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_incrby_negative() {
+        let data = b"*3\r\n$6\r\nINCRBY\r\n$3\r\nkey\r\n$3\r\n-10\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(
+            cmd,
+            Command::IncrBy {
+                key: b"key",
+                delta: -10
+            }
+        );
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_incrby_case_insensitive() {
+        let data = b"*3\r\n$6\r\nincrby\r\n$3\r\nkey\r\n$1\r\n5\r\n";
+        let (cmd, _) = Command::parse(data).unwrap();
+        assert_eq!(
+            cmd,
+            Command::IncrBy {
+                key: b"key",
+                delta: 5
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_incrby_wrong_arity() {
+        let data = b"*2\r\n$6\r\nINCRBY\r\n$3\r\nkey\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_incrby_invalid_delta() {
+        let data = b"*3\r\n$6\r\nINCRBY\r\n$3\r\nkey\r\n$3\r\nabc\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::Protocol(_))));
+    }
+
+    #[test]
+    fn test_parse_decrby() {
+        let data = b"*3\r\n$6\r\nDECRBY\r\n$7\r\ncounter\r\n$2\r\n10\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(
+            cmd,
+            Command::DecrBy {
+                key: b"counter",
+                delta: 10
+            }
+        );
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_decrby_case_insensitive() {
+        let data = b"*3\r\n$6\r\ndecrby\r\n$3\r\nkey\r\n$1\r\n5\r\n";
+        let (cmd, _) = Command::parse(data).unwrap();
+        assert_eq!(
+            cmd,
+            Command::DecrBy {
+                key: b"key",
+                delta: 5
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_decrby_wrong_arity() {
+        let data = b"*2\r\n$6\r\nDECRBY\r\n$3\r\nkey\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_decrby_invalid_delta() {
+        let data = b"*3\r\n$6\r\nDECRBY\r\n$3\r\nkey\r\n$3\r\nabc\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::Protocol(_))));
+    }
+
+    #[test]
+    fn test_incr_decr_command_names() {
+        assert_eq!(Command::Incr { key: b"k" }.name(), "INCR");
+        assert_eq!(Command::Decr { key: b"k" }.name(), "DECR");
+        assert_eq!(
+            Command::IncrBy {
+                key: b"k",
+                delta: 1
+            }
+            .name(),
+            "INCRBY"
+        );
+        assert_eq!(
+            Command::DecrBy {
+                key: b"k",
+                delta: 1
+            }
+            .name(),
+            "DECRBY"
+        );
     }
 
     // ========================================================================

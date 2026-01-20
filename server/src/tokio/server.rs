@@ -115,8 +115,18 @@ pub fn run<C: Cache + 'static>(
 
     let max_value_size = config.cache.max_value_size;
     let zero_copy_mode = config.zero_copy;
-    runtime
-        .block_on(async move { run_async(listeners, cache, max_value_size, zero_copy_mode).await })
+    // Allow flush if ANY listener allows it (since tokio runtime doesn't track per-listener)
+    let allow_flush = config.listener.iter().any(|l| l.allow_flush);
+    runtime.block_on(async move {
+        run_async(
+            listeners,
+            cache,
+            max_value_size,
+            zero_copy_mode,
+            allow_flush,
+        )
+        .await
+    })
 }
 
 async fn run_async<C: Cache + 'static>(
@@ -124,6 +134,7 @@ async fn run_async<C: Cache + 'static>(
     cache: Arc<C>,
     max_value_size: usize,
     zero_copy_mode: ZeroCopyMode,
+    allow_flush: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Bind all listeners
     let mut listeners = Vec::with_capacity(addresses.len());
@@ -137,7 +148,7 @@ async fn run_async<C: Cache + 'static>(
     for listener in listeners {
         let cache = cache.clone();
         let handle = tokio::spawn(async move {
-            accept_loop(listener, cache, max_value_size, zero_copy_mode).await
+            accept_loop(listener, cache, max_value_size, zero_copy_mode, allow_flush).await
         });
         handles.push(handle);
     }
@@ -157,6 +168,7 @@ async fn accept_loop<C: Cache + 'static>(
     cache: Arc<C>,
     max_value_size: usize,
     zero_copy_mode: ZeroCopyMode,
+    allow_flush: bool,
 ) {
     loop {
         match listener.accept().await {
@@ -166,8 +178,14 @@ async fn accept_loop<C: Cache + 'static>(
 
                 let cache = cache.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_connection(stream, cache, max_value_size, zero_copy_mode).await
+                    if let Err(e) = handle_connection(
+                        stream,
+                        cache,
+                        max_value_size,
+                        zero_copy_mode,
+                        allow_flush,
+                    )
+                    .await
                         && !is_connection_reset(&e)
                     {
                         eprintln!("Connection error: {}", e);
@@ -187,8 +205,9 @@ async fn handle_connection<C: Cache>(
     cache: Arc<C>,
     max_value_size: usize,
     zero_copy_mode: ZeroCopyMode,
+    allow_flush: bool,
 ) -> std::io::Result<()> {
-    let mut conn = Connection::new(max_value_size);
+    let mut conn = Connection::with_options(max_value_size, allow_flush);
     let mut recv_buf = SimpleRecvBuf::with_capacity(READ_BUF_SIZE);
 
     loop {

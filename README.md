@@ -12,8 +12,9 @@ Crucible provides:
 ## Features
 
 ### Cache Server
-- Multiple cache backends: S3-FIFO (admission-filtered), Segcache (TTL-organized)
-- Protocol support: RESP2/RESP3 (Redis-compatible), Memcache ASCII/Binary
+- Multiple storage backends: Segment (default), Slab, Heap
+- Pluggable eviction policies: S3-FIFO, FIFO, LRU variants, Random, CTE
+- Protocol support: RESP2/RESP3 (Redis-compatible), Memcache ASCII
 - Dual runtime backends: Native (io_uring/mio) or Tokio
 - io_uring optimizations: multishot recv/accept, zero-copy send, ring-provided buffers
 - Thread-per-core architecture with CPU pinning and NUMA-aware allocation
@@ -60,6 +61,91 @@ cargo build --release -p server --no-default-features --features io_uring
 cargo build --release -p server --features validation
 ```
 
+## Architecture
+
+### Cache Design
+
+Crucible uses a tiered cache architecture with a shared lock-free hashtable:
+
+```
+┌─────────────────────────────────────┐
+│           Hashtable                 │  Lock-free multi-choice hashtable
+│  key → (location, freq, ghost bit)  │  with ghost entries for "second chance"
+└─────────────────┬───────────────────┘
+                  │
+         ┌────────┴────────┐
+         ▼                 ▼
+┌─────────────────┐ ┌─────────────────┐
+│    Layer 0      │ │    Layer 1      │
+│  (FIFO Queue)   │ │  (TTL Buckets)  │
+│                 │ │                 │
+│  New items      │ │  Hot items      │
+│  enter here     │ │  promoted here  │
+└────────┬────────┘ └─────────────────┘
+         │
+         └─→ Eviction: items with freq > threshold
+             are demoted to Layer 1
+```
+
+**Key features:**
+- Ghost entries track recently-evicted keys for admission filtering
+- Frequency counter prevents scan-resistant pollution
+- Items start in FIFO layer, hot items promoted to TTL layer
+
+### Storage Backends
+
+| Backend | Description | Best For |
+|---------|-------------|----------|
+| `segment` | Fixed-size segments with sequential item storage | General purpose, good hit rates with S3-FIFO |
+| `slab` | Memcached-style slab allocator with size classes | Memcached migration, high churn workloads |
+| `heap` | System allocator, per-item allocation | Variable-size items, no fragmentation concerns |
+
+### Eviction Policies
+
+| Backend | Available Policies |
+|---------|-------------------|
+| `segment` | `s3fifo` (default), `fifo`, `random`, `cte`, `merge` |
+| `slab` | `lra` (default), `lrc`, `random`, `none` |
+| `heap` | `s3fifo` (default), `lfu` |
+
+- **s3fifo**: Admission-filtered FIFO with frequency counter
+- **fifo**: Simple first-in-first-out
+- **lra/lrc**: Least recently accessed/created (slab only)
+- **lfu**: Least frequently used
+- **cte**: Closest to expiration
+- **random**: Random eviction
+- **merge**: Merge eviction strategy
+
+### I/O Driver
+
+Unified async I/O abstraction with automatic backend selection:
+- **Linux 6.0+**: io_uring with multishot recv/accept, SendZc, ring-provided buffers
+- **Other platforms**: mio (epoll on Linux, kqueue on macOS)
+
+See [io/driver/ARCHITECTURE.md](io/driver/ARCHITECTURE.md) for detailed copy/allocation analysis.
+
+## Protocol Support
+
+### Redis (RESP)
+
+Supported commands:
+- **Basic**: `GET`, `SET`, `MGET`, `DEL`
+- **SET options**: `EX` (seconds), `PX` (milliseconds), `NX`, `XX`
+- **Counters**: `INCR`, `DECR`, `INCRBY`, `DECRBY`
+- **Admin**: `PING`, `HELLO`, `CONFIG GET/SET`
+- **No-op**: `FLUSHDB`, `FLUSHALL` (accepted, does nothing)
+
+Not supported: data structures (lists, sets, hashes), persistence, pub/sub, Lua scripting.
+
+### Memcache
+
+Supported commands:
+- **Retrieval**: `get`, `gets` (multi-get)
+- **Storage**: `set`, `add`, `replace`, `cas`
+- **Deletion**: `delete`
+- **Counters**: `incr`, `decr`
+- **Admin**: `version`, `quit`, `flush_all` (no-op)
+
 ## Usage
 
 ### Cache Server
@@ -72,7 +158,10 @@ cargo build --release -p server --features validation
 ./target/release/crucible-server server/config/tokio.toml
 ```
 
-Example server configuration (`server/config/example.toml`):
+#### Configuration
+
+The server separates **storage backend** from **eviction policy**:
+
 ```toml
 runtime = "native"
 
@@ -81,12 +170,28 @@ threads = 4
 # cpu_affinity = "0-3"  # Pin to specific CPUs
 
 [cache]
-backend = "segcache"    # or "s3fifo"
-heap_size = "1GB"
-segment_size = "8MB"
-# hugepage = "2mb"      # Use hugepages
-# numa_node = 0         # Bind to NUMA node
+# Storage backend: "segment", "slab", or "heap"
+backend = "segment"
 
+# Eviction policy (available policies depend on backend)
+policy = "s3fifo"
+
+# Memory allocation
+heap_size = "1GB"
+segment_size = "8MB"      # segment/slab only
+max_value_size = "1MB"    # segment only
+
+# Hashtable sizing: 2^power buckets
+# Size for ~50% load factor of expected item count
+hashtable_power = 20
+
+# Hugepage support (Linux only): "none", "2mb", "1gb"
+# hugepage = "2mb"
+
+# NUMA binding (Linux only)
+# numa_node = 0
+
+# Protocol listeners
 [[listener]]
 protocol = "resp"
 address = "127.0.0.1:6379"
@@ -97,7 +202,26 @@ address = "127.0.0.1:11211"
 
 [metrics]
 address = "127.0.0.1:9090"
+
+# io_uring settings (Linux only)
+[uring]
+sqpoll = false
+buffer_count = 2048
+buffer_size = "16KB"
+sq_depth = 1024
+recv_mode = "multishot"  # or "singleshot"
 ```
+
+#### Pre-built Configurations
+
+| Config | Use Case |
+|--------|----------|
+| `example.toml` | General purpose with segment backend |
+| `redis.toml` | Redis migration (RESP on port 6379) |
+| `memcached.toml` | Memcached migration (slab backend, port 11211) |
+| `heap.toml` | Heap backend for variable-size items |
+| `slab.toml` | Slab allocator with LRA eviction |
+| `tokio.toml` | Tokio runtime instead of native |
 
 ### Benchmark Tool
 
@@ -121,32 +245,34 @@ address = "127.0.0.1:9090"
 ```
 
 Available benchmark configurations:
-- `benchmark/config/redis.toml` - Redis RESP protocol
-- `benchmark/config/memcache.toml` - Memcache protocol
-- `benchmark/config/momento.toml` - Momento gRPC protocol
-- `benchmark/config/quick-test.toml` - Quick validation test
+- `redis.toml` - Redis RESP protocol
+- `memcache.toml` - Memcache protocol
+- `momento.toml` - Momento gRPC protocol
+- `ping.toml` - Simple ping test
+- `quick-test.toml` - Quick validation test
 
 ## Workspace Structure
 
 ```
 crucible/
-  cache/
-    core/       # Cache traits, segments, hashtable, pools, layers
-    segcache/   # Segment-based cache with TTL buckets
-    s3fifo/     # S3-FIFO eviction policy (admission filter + main cache)
-  io/
-    driver/     # Unified I/O driver (io_uring + mio backends)
-    http2/      # HTTP/2 framing
-    grpc/       # gRPC client implementation
-  protocol/
-    resp/       # Redis RESP2/RESP3 protocol
-    memcache/   # Memcache ASCII and binary protocols
-    momento/    # Momento cache protocol
-    ping/       # Simple ping protocol for testing
-  server/       # Cache server binary
-  benchmark/    # Benchmark tool binary
-  xtask/        # Development tasks (fuzz testing, flamegraphs)
-  metrics/      # Metrics infrastructure
+├── cache/
+│   ├── core/       # Cache traits, hashtable, layers, memory pools
+│   ├── segcache/   # Segment-based cache with TTL buckets
+│   ├── slab/       # Memcached-style slab allocator
+│   └── heap/       # Heap-allocated cache using system allocator
+├── io/
+│   ├── driver/     # Unified I/O driver (io_uring + mio backends)
+│   ├── http2/      # HTTP/2 framing
+│   └── grpc/       # gRPC client implementation
+├── protocol/
+│   ├── resp/       # Redis RESP2/RESP3 protocol
+│   ├── memcache/   # Memcache ASCII protocol
+│   ├── momento/    # Momento cache protocol
+│   └── ping/       # Simple ping protocol for testing
+├── server/         # Cache server binary
+├── benchmark/      # Benchmark tool binary
+├── metrics/        # Metrics infrastructure
+└── xtask/          # Development tasks (fuzz testing, flamegraphs)
 ```
 
 ## Development
@@ -174,6 +300,9 @@ cargo clippy
 For best performance on Linux:
 
 1. **Enable hugepages**: Configure 2MB or 1GB hugepages and set `hugepage = "2mb"` in config
+   ```bash
+   echo 2048 > /proc/sys/vm/nr_hugepages
+   ```
 2. **CPU pinning**: Use `cpu_affinity` to pin workers to specific cores
 3. **NUMA awareness**: Set `numa_node` to bind cache memory to the local NUMA node
 4. **io_uring tuning**: Adjust `buffer_count`, `buffer_size`, and `sq_depth` in `[uring]` section

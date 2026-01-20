@@ -350,6 +350,11 @@ pub struct ListenerConfig {
 
     /// TLS configuration (optional)
     pub tls: Option<TlsConfig>,
+
+    /// Allow FLUSH commands (flush_all for memcache, FLUSHDB/FLUSHALL for RESP).
+    /// Default: false (flush commands return error)
+    #[serde(default)]
+    pub allow_flush: bool,
 }
 
 /// Supported protocols.

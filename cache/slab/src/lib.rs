@@ -547,8 +547,11 @@ impl Cache for SlabCache {
     }
 
     fn flush(&self) {
-        // No-op: SlabCache doesn't support flushing
-        // A full implementation would iterate and delete all items
+        // Clear the hashtable first - makes all items "invisible"
+        self.hashtable.clear();
+
+        // Reset the allocator (returns all slabs to free pool)
+        self.allocator.reset_all();
     }
 
     fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
@@ -559,6 +562,128 @@ impl Cache for SlabCache {
     fn replace(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
         let ttl = ttl.unwrap_or(self.default_ttl);
         self.replace_item(key, value, ttl)
+    }
+
+    fn increment(
+        &self,
+        key: &[u8],
+        delta: u64,
+        initial: Option<u64>,
+        ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+
+        // Try to get the current value
+        let current_value = self.get_item(key);
+
+        match current_value {
+            Some(data) => {
+                // Parse existing value as ASCII decimal
+                let value_str = std::str::from_utf8(&data).map_err(|_| CacheError::NotNumeric)?;
+                let current: u64 = value_str
+                    .trim()
+                    .parse()
+                    .map_err(|_| CacheError::NotNumeric)?;
+
+                // Compute new value with overflow check
+                let new_value = current.checked_add(delta).ok_or(CacheError::Overflow)?;
+
+                // Store the new value
+                let new_str = new_value.to_string();
+                self.set_item(key, new_str.as_bytes(), ttl)?;
+
+                Ok(new_value)
+            }
+            None => {
+                // Key doesn't exist
+                match initial {
+                    Some(init) => {
+                        // Create with initial + delta
+                        let new_value = init.checked_add(delta).ok_or(CacheError::Overflow)?;
+                        let new_str = new_value.to_string();
+                        self.set_item(key, new_str.as_bytes(), ttl)?;
+                        Ok(new_value)
+                    }
+                    None => Err(CacheError::KeyNotFound),
+                }
+            }
+        }
+    }
+
+    fn decrement(
+        &self,
+        key: &[u8],
+        delta: u64,
+        initial: Option<u64>,
+        ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+
+        // Try to get the current value
+        let current_value = self.get_item(key);
+
+        match current_value {
+            Some(data) => {
+                // Parse existing value as ASCII decimal
+                let value_str = std::str::from_utf8(&data).map_err(|_| CacheError::NotNumeric)?;
+                let current: u64 = value_str
+                    .trim()
+                    .parse()
+                    .map_err(|_| CacheError::NotNumeric)?;
+
+                // Compute new value with saturating subtraction (clamp to 0)
+                let new_value = current.saturating_sub(delta);
+
+                // Store the new value
+                let new_str = new_value.to_string();
+                self.set_item(key, new_str.as_bytes(), ttl)?;
+
+                Ok(new_value)
+            }
+            None => {
+                // Key doesn't exist
+                match initial {
+                    Some(init) => {
+                        // Create with initial - delta (saturating)
+                        let new_value = init.saturating_sub(delta);
+                        let new_str = new_value.to_string();
+                        self.set_item(key, new_str.as_bytes(), ttl)?;
+                        Ok(new_value)
+                    }
+                    None => Err(CacheError::KeyNotFound),
+                }
+            }
+        }
+    }
+
+    fn append(&self, key: &[u8], data: &[u8]) -> Result<usize, CacheError> {
+        // Get the current value
+        let current_value = self.get_item(key).ok_or(CacheError::KeyNotFound)?;
+
+        // Create new value with appended data
+        let mut new_value = current_value;
+        new_value.extend_from_slice(data);
+        let new_len = new_value.len();
+
+        // Store the new value
+        self.set_item(key, &new_value, self.default_ttl)?;
+
+        Ok(new_len)
+    }
+
+    fn prepend(&self, key: &[u8], data: &[u8]) -> Result<usize, CacheError> {
+        // Get the current value
+        let current_value = self.get_item(key).ok_or(CacheError::KeyNotFound)?;
+
+        // Create new value with prepended data
+        let mut new_value = data.to_vec();
+        new_value.extend_from_slice(&current_value);
+        let new_len = new_value.len();
+
+        // Store the new value
+        self.set_item(key, &new_value, self.default_ttl)?;
+
+        Ok(new_len)
     }
 }
 

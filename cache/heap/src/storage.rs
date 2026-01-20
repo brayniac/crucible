@@ -156,6 +156,39 @@ impl SlotStorage {
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
+
+    /// Reset all slots and rebuild the free list.
+    ///
+    /// This clears all occupied slots (freeing their entries) and rebuilds
+    /// the free list to its initial state. Used during flush operations.
+    ///
+    /// # Safety
+    ///
+    /// This should only be called when no concurrent operations are accessing
+    /// the storage (e.g., after the hashtable has been cleared).
+    pub fn reset_all(&self) {
+        // Clear all occupied slots
+        for slot in &self.slots {
+            if slot.is_occupied() {
+                slot.clear();
+            }
+        }
+
+        // Rebuild the free list: link all slots sequentially
+        let capacity = self.slots.len();
+        for (i, slot) in self.slots.iter().enumerate() {
+            let next = if i + 1 < capacity {
+                (i + 1) as u32
+            } else {
+                EMPTY_FREE_LIST
+            };
+            slot.set_next_free(next);
+        }
+
+        // Reset counters
+        self.free_head.store(0, Ordering::Release);
+        self.occupied_count.store(0, Ordering::Release);
+    }
 }
 
 // Ensure SlotStorage is Send + Sync

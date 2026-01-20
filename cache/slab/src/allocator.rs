@@ -450,6 +450,55 @@ impl SlabAllocator {
     pub fn verifier_allowing_expired(&self) -> SlabVerifier<'_> {
         SlabVerifier::allowing_expired(self)
     }
+
+    /// Reset the entire allocator, returning all memory to the free pool.
+    ///
+    /// This resets all slab classes and returns their slabs to the global
+    /// free list. Used during flush operations.
+    pub fn reset_all(&self) {
+        // First, drain the existing free slab list
+        loop {
+            match self.free_slabs.steal() {
+                crossbeam_deque::Steal::Empty => break,
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Success(_) => continue,
+            }
+        }
+
+        // Reset each class and collect all slab data pointers
+        let mut all_slab_ptrs = Vec::new();
+        for class in &self.classes {
+            let ptrs = class.reset();
+            all_slab_ptrs.extend(ptrs);
+        }
+
+        // Return all slabs to the free pool
+        for ptr in all_slab_ptrs {
+            self.free_slabs.push(ptr);
+        }
+
+        // Also add back the unused heap memory
+        // (Re-build from scratch based on heap layout)
+        let slab_count = self.memory_limit / self.slab_size;
+        let heap_ptr = self.heap.as_ptr();
+
+        // Clear and rebuild - push all slab addresses
+        loop {
+            match self.free_slabs.steal() {
+                crossbeam_deque::Steal::Empty => break,
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Success(_) => continue,
+            }
+        }
+
+        for i in 0..slab_count {
+            let slab_ptr = unsafe { heap_ptr.add(i * self.slab_size) };
+            self.free_slabs.push(slab_ptr);
+        }
+
+        // Reset memory tracking
+        self.memory_used.store(0, Ordering::Release);
+    }
 }
 
 /// Statistics for a slab class.

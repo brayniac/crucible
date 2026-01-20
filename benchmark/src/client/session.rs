@@ -228,17 +228,18 @@ impl Session {
     }
 
     /// Create a new session from config.
-    pub fn from_config(addr: SocketAddr, config: &Config) -> Self {
+    ///
+    /// Returns an error if the protocol is not supported by Session (e.g., Momento).
+    pub fn from_config(addr: SocketAddr, config: &Config) -> Result<Self, SessionError> {
         let session_config = SessionConfig::from_config(addr, config);
         match config.target.protocol {
-            Protocol::Resp | Protocol::Resp3 => Self::new_resp(session_config),
-            Protocol::Memcache => Self::new_memcache(session_config),
-            Protocol::MemcacheBinary => Self::new_memcache_binary(session_config),
-            Protocol::Ping => Self::new_ping(session_config),
-            Protocol::Momento => {
-                // Momento uses MomentoSession, not Session
-                panic!("Momento protocol uses MomentoSession, not Session")
-            }
+            Protocol::Resp | Protocol::Resp3 => Ok(Self::new_resp(session_config)),
+            Protocol::Memcache => Ok(Self::new_memcache(session_config)),
+            Protocol::MemcacheBinary => Ok(Self::new_memcache_binary(session_config)),
+            Protocol::Ping => Ok(Self::new_ping(session_config)),
+            Protocol::Momento => Err(SessionError::UnsupportedProtocol(
+                "Momento uses MomentoSession, not Session",
+            )),
         }
     }
 
@@ -838,6 +839,8 @@ pub enum SessionError {
     Memcache(MemcacheError),
     MemcacheBinary(MemcacheBinaryError),
     Ping(PingError),
+    /// Protocol not supported by Session (e.g., Momento uses MomentoSession)
+    UnsupportedProtocol(&'static str),
 }
 
 impl std::fmt::Display for SessionError {
@@ -847,6 +850,9 @@ impl std::fmt::Display for SessionError {
             SessionError::Memcache(e) => write!(f, "Memcache error: {}", e),
             SessionError::MemcacheBinary(e) => write!(f, "Memcache binary error: {}", e),
             SessionError::Ping(e) => write!(f, "Ping error: {}", e),
+            SessionError::UnsupportedProtocol(proto) => {
+                write!(f, "unsupported protocol: {}", proto)
+            }
         }
     }
 }

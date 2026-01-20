@@ -1250,6 +1250,39 @@ impl Segment for SliceSegment<'_> {
     }
 }
 
+impl SliceSegment<'_> {
+    /// Force reset this segment to Free state.
+    ///
+    /// This is used during flush operations to reset all segments regardless
+    /// of their current state. It resets all data fields and sets the state
+    /// to Free.
+    ///
+    /// # Safety
+    ///
+    /// This should only be called when the cache is being flushed and no
+    /// concurrent operations are accessing the segments (e.g., after the
+    /// hashtable has been cleared).
+    pub fn force_free(&self) {
+        // Reset all data fields
+        self.write_offset.store(0, Ordering::Relaxed);
+        self.live_items.store(0, Ordering::Relaxed);
+        self.live_bytes.store(0, Ordering::Relaxed);
+        self.ref_count.store(0, Ordering::Relaxed);
+        self.expire_at.store(0, Ordering::Relaxed);
+        self.bucket_id
+            .store(Self::INVALID_BUCKET_ID, Ordering::Relaxed);
+        self.merge_count.store(0, Ordering::Relaxed);
+
+        // Set state to Free with invalid chain pointers
+        let free_meta = Metadata {
+            next: INVALID_SEGMENT_ID,
+            prev: INVALID_SEGMENT_ID,
+            state: State::Free,
+        };
+        self.metadata.store(free_meta.pack(), Ordering::Release);
+    }
+}
+
 // Implement SegmentGuard for zero-copy access
 impl SegmentGuard for SliceSegment<'_> {
     type Guard<'a>

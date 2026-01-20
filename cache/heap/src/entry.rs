@@ -46,6 +46,9 @@ pub fn item_size(key_len: usize, value_len: usize) -> usize {
 /// Flag indicating the entry has been deleted.
 const FLAG_DELETED: u32 = 1 << 0;
 
+/// Flag indicating the value is stored as a numeric (8-byte little-endian u64).
+const FLAG_NUMERIC: u32 = 1 << 1;
+
 /// Get current time as seconds since Unix epoch.
 #[inline]
 fn current_time_secs() -> u32 {
@@ -224,6 +227,24 @@ impl HeapEntry {
     #[inline]
     pub fn mark_deleted(&self) {
         self.flags.fetch_or(FLAG_DELETED, Ordering::Release);
+    }
+
+    /// Check if the value is stored as a numeric.
+    #[inline]
+    pub fn is_numeric(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & FLAG_NUMERIC != 0
+    }
+
+    /// Set the numeric flag.
+    #[inline]
+    pub fn set_numeric(&self) {
+        self.flags.fetch_or(FLAG_NUMERIC, Ordering::Release);
+    }
+
+    /// Clear the numeric flag.
+    #[inline]
+    pub fn clear_numeric(&self) {
+        self.flags.fetch_and(!FLAG_NUMERIC, Ordering::Release);
     }
 
     /// Get the CAS token.

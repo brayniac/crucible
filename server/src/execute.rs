@@ -60,6 +60,7 @@ pub fn execute_resp<C: Cache>(
     cache: &C,
     write_buf: &mut BytesMut,
     version: &mut RespVersion,
+    allow_flush: bool,
 ) {
     match cmd {
         RespCommand::Ping => {
@@ -224,9 +225,147 @@ pub fn execute_resp<C: Cache>(
             }
         }
         RespCommand::FlushDb | RespCommand::FlushAll => {
-            FLUSHES.increment();
-            cache.flush();
-            write_buf.extend_from_slice(b"+OK\r\n");
+            if allow_flush {
+                FLUSHES.increment();
+                cache.flush();
+                write_buf.extend_from_slice(b"+OK\r\n");
+            } else {
+                write_buf.extend_from_slice(b"-ERR FLUSH command disabled on this port\r\n");
+            }
+        }
+        RespCommand::Incr { key } => {
+            // Redis INCR: if key doesn't exist, create with 0, then increment
+            match cache.increment(key, 1, Some(0), None) {
+                Ok(new_val) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(new_val).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    write_buf
+                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                }
+                Err(cache_core::CacheError::Overflow) => {
+                    write_buf.extend_from_slice(b"-ERR increment or decrement would overflow\r\n");
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::Decr { key } => {
+            // Redis DECR: if key doesn't exist, create with 0, then decrement
+            match cache.decrement(key, 1, Some(0), None) {
+                Ok(new_val) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(new_val).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    write_buf
+                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::IncrBy { key, delta } => {
+            // Redis INCRBY: supports negative delta (acts like DECRBY)
+            let result = if *delta >= 0 {
+                cache.increment(key, *delta as u64, Some(0), None)
+            } else {
+                cache.decrement(key, (-*delta) as u64, Some(0), None)
+            };
+            match result {
+                Ok(new_val) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(new_val).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    write_buf
+                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                }
+                Err(cache_core::CacheError::Overflow) => {
+                    write_buf.extend_from_slice(b"-ERR increment or decrement would overflow\r\n");
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::DecrBy { key, delta } => {
+            // Redis DECRBY: supports negative delta (acts like INCRBY)
+            let result = if *delta >= 0 {
+                cache.decrement(key, *delta as u64, Some(0), None)
+            } else {
+                cache.increment(key, (-*delta) as u64, Some(0), None)
+            };
+            match result {
+                Ok(new_val) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(new_val).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    write_buf
+                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::Append { key, value } => {
+            // Redis APPEND: if key doesn't exist, creates it; returns new length
+            // First check if key exists
+            if !cache.contains(key) {
+                // Create the key with the value
+                match cache.set(key, value, None) {
+                    Ok(()) => {
+                        write_buf.extend_from_slice(b":");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(value.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                }
+            } else {
+                // Append to existing key
+                match cache.append(key, value) {
+                    Ok(new_len) => {
+                        write_buf.extend_from_slice(b":");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(new_len).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                    Err(cache_core::CacheError::KeyNotFound) => {
+                        // Race condition: key was deleted between contains and append
+                        // Try to set instead
+                        match cache.set(key, value, None) {
+                            Ok(()) => {
+                                write_buf.extend_from_slice(b":");
+                                let mut buf = itoa::Buffer::new();
+                                write_buf.extend_from_slice(buf.format(value.len()).as_bytes());
+                                write_buf.extend_from_slice(b"\r\n");
+                            }
+                            Err(_) => {
+                                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                }
+            }
         }
         RespCommand::Hello { proto_version, .. } => {
             let requested_version = proto_version.unwrap_or(2);
@@ -271,6 +410,7 @@ pub fn execute_memcache<C: Cache>(
     cmd: &MemcacheCommand<'_>,
     cache: &C,
     write_buf: &mut BytesMut,
+    allow_flush: bool,
 ) -> bool {
     match cmd {
         MemcacheCommand::Get { key } => {
@@ -443,9 +583,13 @@ pub fn execute_memcache<C: Cache>(
             false
         }
         MemcacheCommand::FlushAll => {
-            FLUSHES.increment();
-            cache.flush();
-            write_buf.extend_from_slice(b"OK\r\n");
+            if allow_flush {
+                FLUSHES.increment();
+                cache.flush();
+                write_buf.extend_from_slice(b"OK\r\n");
+            } else {
+                write_buf.extend_from_slice(b"SERVER_ERROR flush_all disabled on this port\r\n");
+            }
             false
         }
         MemcacheCommand::Version => {
@@ -453,6 +597,102 @@ pub fn execute_memcache<C: Cache>(
             false
         }
         MemcacheCommand::Quit => true,
+        MemcacheCommand::Incr {
+            key,
+            delta,
+            noreply,
+        } => {
+            // Memcache incr: returns NOT_FOUND if key doesn't exist (no initial value)
+            match cache.increment(key, *delta, None, None) {
+                Ok(new_val) => {
+                    if !noreply {
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(new_val).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    if !noreply {
+                        write_buf.extend_from_slice(b"NOT_FOUND\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    write_buf
+                        .extend_from_slice(b"CLIENT_ERROR cannot increment non-numeric value\r\n");
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                }
+            }
+            false
+        }
+        MemcacheCommand::Decr {
+            key,
+            delta,
+            noreply,
+        } => {
+            // Memcache decr: returns NOT_FOUND if key doesn't exist, clamps to 0 on underflow
+            match cache.decrement(key, *delta, None, None) {
+                Ok(new_val) => {
+                    if !noreply {
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(new_val).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    if !noreply {
+                        write_buf.extend_from_slice(b"NOT_FOUND\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    write_buf
+                        .extend_from_slice(b"CLIENT_ERROR cannot decrement non-numeric value\r\n");
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                }
+            }
+            false
+        }
+        MemcacheCommand::Append { key, data, noreply } => {
+            // Memcache append: returns NOT_STORED if key doesn't exist
+            match cache.append(key, data) {
+                Ok(_) => {
+                    if !noreply {
+                        write_buf.extend_from_slice(b"STORED\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    if !noreply {
+                        write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                    }
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                }
+            }
+            false
+        }
+        MemcacheCommand::Prepend { key, data, noreply } => {
+            // Memcache prepend: returns NOT_STORED if key doesn't exist
+            match cache.prepend(key, data) {
+                Ok(_) => {
+                    if !noreply {
+                        write_buf.extend_from_slice(b"STORED\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    if !noreply {
+                        write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                    }
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                }
+            }
+            false
+        }
     }
 }
 
@@ -463,6 +703,7 @@ pub fn execute_memcache_binary<C: Cache>(
     cmd: &BinaryCommand<'_>,
     cache: &C,
     write_buf: &mut BytesMut,
+    allow_flush: bool,
 ) -> bool {
     write_buf.reserve(256);
     let buf = write_buf.spare_capacity_mut();
@@ -642,9 +883,14 @@ pub fn execute_memcache_binary<C: Cache>(
             0
         }
         BinaryCommand::Flush { opaque, .. } => {
-            FLUSHES.increment();
-            cache.flush();
-            BinaryResponse::encode_flushed(buf, *opaque)
+            if allow_flush {
+                FLUSHES.increment();
+                cache.flush();
+                BinaryResponse::encode_flushed(buf, *opaque)
+            } else {
+                // Return "unknown command" error for disabled flush
+                BinaryResponse::encode_unknown_command(buf, Opcode::Flush, *opaque)
+            }
         }
         BinaryCommand::Noop { opaque } => BinaryResponse::encode_noop(buf, *opaque),
         BinaryCommand::Version { opaque } => {
@@ -654,6 +900,62 @@ pub fn execute_memcache_binary<C: Cache>(
             return true;
         }
         BinaryCommand::Stat { opaque, .. } => BinaryResponse::encode_stat_end(buf, *opaque),
+        BinaryCommand::Increment {
+            key,
+            delta,
+            initial,
+            expiration,
+            opaque,
+            ..
+        } => {
+            let ttl = if *expiration == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(*expiration as u64))
+            };
+
+            match cache.increment(key, *delta, Some(*initial), ttl) {
+                Ok(new_val) => {
+                    // Return the new counter value
+                    BinaryResponse::encode_counter(buf, Opcode::Increment, *opaque, new_val, 0)
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    BinaryResponse::encode_not_found(buf, Opcode::Increment, *opaque)
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    BinaryResponse::encode_non_numeric(buf, Opcode::Increment, *opaque)
+                }
+                Err(_) => BinaryResponse::encode_out_of_memory(buf, Opcode::Increment, *opaque),
+            }
+        }
+        BinaryCommand::Decrement {
+            key,
+            delta,
+            initial,
+            expiration,
+            opaque,
+            ..
+        } => {
+            let ttl = if *expiration == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(*expiration as u64))
+            };
+
+            match cache.decrement(key, *delta, Some(*initial), ttl) {
+                Ok(new_val) => {
+                    // Return the new counter value
+                    BinaryResponse::encode_counter(buf, Opcode::Decrement, *opaque, new_val, 0)
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    BinaryResponse::encode_not_found(buf, Opcode::Decrement, *opaque)
+                }
+                Err(cache_core::CacheError::NotNumeric) => {
+                    BinaryResponse::encode_non_numeric(buf, Opcode::Decrement, *opaque)
+                }
+                Err(_) => BinaryResponse::encode_out_of_memory(buf, Opcode::Decrement, *opaque),
+            }
+        }
         _ => {
             // Unsupported commands
             0

@@ -124,6 +124,35 @@ impl RamPool for MemoryPool {
     }
 }
 
+impl MemoryPool {
+    /// Reset all segments to Free state and rebuild the free queue.
+    ///
+    /// This is used during flush operations to reset the entire pool.
+    /// All segments are reset to their initial state and added back to
+    /// the free queue.
+    ///
+    /// # Safety
+    ///
+    /// This should only be called when no concurrent operations are accessing
+    /// the segments (e.g., after the hashtable has been cleared).
+    pub fn reset_all(&self) {
+        // Drain the free queue first (discard all current entries)
+        loop {
+            match self.free_queue.steal() {
+                crossbeam_deque::Steal::Empty => break,
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Success(_) => continue,
+            }
+        }
+
+        // Reset each segment and add it back to the free queue
+        for (id, segment) in self.segments.iter().enumerate() {
+            segment.force_free();
+            self.free_queue.push(id as u32);
+        }
+    }
+}
+
 /// Builder for creating a MemoryPool.
 pub struct MemoryPoolBuilder {
     pool_id: u8,

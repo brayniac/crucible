@@ -11,8 +11,11 @@ use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential, WireFor
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
+
+/// Default fallback address when credential endpoint cannot be parsed.
+const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 443);
 
 /// A request in the pipeline waiting for a response.
 #[derive(Debug)]
@@ -97,9 +100,7 @@ impl MomentoSession {
         // Parse from credential endpoint
         let host = self.credential.host();
         let port = self.credential.port();
-        format!("{}:{}", host, port)
-            .parse()
-            .unwrap_or_else(|_| "0.0.0.0:443".parse().unwrap())
+        format!("{}:{}", host, port).parse().unwrap_or(DEFAULT_ADDR)
     }
 
     /// Connect to the Momento server.

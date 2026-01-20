@@ -16,8 +16,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Timeout for waiting on worker threads to finish during shutdown.
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(name = "crucible-benchmark")]
@@ -212,6 +216,9 @@ fn run_benchmark(
     // Print warmup phase indicator
     formatter.print_warmup(warmup);
 
+    // Channel for worker completion notifications
+    let (completion_tx, completion_rx) = mpsc::channel::<usize>();
+
     // Spawn worker threads
     let mut handles = Vec::with_capacity(num_threads);
 
@@ -220,6 +227,7 @@ fn run_benchmark(
         let shared = Arc::clone(&shared);
         let ratelimiter = ratelimiter.clone();
         let cpu_ids = cpu_ids.clone();
+        let completion_tx = completion_tx.clone();
 
         let handle = thread::Builder::new()
             .name(format!("worker-{}", id))
@@ -236,10 +244,15 @@ fn run_benchmark(
                     }
                 }
                 run_worker(id, config, shared, ratelimiter);
+                // Signal completion (ignore send errors - receiver may be gone)
+                let _ = completion_tx.send(id);
             })?;
 
         handles.push(handle);
     }
+
+    // Drop our copy of the sender so the channel closes when all workers finish
+    drop(completion_tx);
 
     // Start in warmup phase
     shared.set_phase(Phase::Warmup);
@@ -384,7 +397,44 @@ fn run_benchmark(
         }
     }
 
-    // Wait for workers to finish
+    // Wait for workers to finish with timeout
+    let shutdown_start = Instant::now();
+    let mut completed = 0;
+
+    while completed < num_threads {
+        let remaining = WORKER_SHUTDOWN_TIMEOUT.saturating_sub(shutdown_start.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!(
+                "shutdown timeout: {} of {} workers did not finish within {:?}",
+                num_threads - completed,
+                num_threads,
+                WORKER_SHUTDOWN_TIMEOUT
+            );
+            break;
+        }
+
+        match completion_rx.recv_timeout(remaining) {
+            Ok(id) => {
+                tracing::debug!("worker {} finished", id);
+                completed += 1;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "shutdown timeout: {} of {} workers did not finish within {:?}",
+                    num_threads - completed,
+                    num_threads,
+                    WORKER_SHUTDOWN_TIMEOUT
+                );
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // All senders dropped, all workers finished
+                break;
+            }
+        }
+    }
+
+    // Join the handles (should be immediate for completed workers)
     for handle in handles {
         let _ = handle.join();
     }

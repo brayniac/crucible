@@ -188,6 +188,16 @@ pub trait Hashtable: Send + Sync {
     // They allow efficient tracking of items by their bucket index rather than
     // requiring key hashing on every eviction check.
 
+    /// Look up a key and return its bucket index and packed item info.
+    ///
+    /// Used by S3-FIFO to record inserts for tracking. Returns the bucket_index
+    /// where the item is stored and the full item_info (tag, freq, location).
+    ///
+    /// Does NOT update frequency (use `lookup` for that).
+    fn lookup_for_tracking(&self, _key: &[u8], _verifier: &impl KeyVerifier) -> Option<(u64, u64)> {
+        None // Default: not supported
+    }
+
     /// Get item info from a bucket matching a predicate.
     ///
     /// This is used by S3-FIFO to verify that a queue entry is still valid
@@ -226,6 +236,13 @@ pub trait Hashtable: Send + Sync {
     fn remove_at_bucket(&self, _bucket_index: u64, _location: u64) {
         // Default: no-op
     }
+
+    /// Clear all entries from the hashtable.
+    ///
+    /// This resets all entries to empty (zero). Used by flush operations.
+    /// After calling this, all lookups will return None until new items
+    /// are inserted.
+    fn clear(&self);
 }
 
 #[cfg(all(test, not(feature = "loom")))]

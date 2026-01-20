@@ -543,7 +543,7 @@ impl Cache for SegCache {
     }
 
     fn flush(&self) {
-        // No-op: SegCache doesn't support flushing individual items
+        self.inner.flush();
     }
 
     fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
@@ -602,6 +602,36 @@ impl Cache for SegCache {
         let ttl = ttl.unwrap_or(DEFAULT_TTL);
         let cas_token = CasToken::from_raw(cas);
         self.inner.cas(key, value, b"", ttl, cas_token)
+    }
+
+    fn increment(
+        &self,
+        key: &[u8],
+        delta: u64,
+        initial: Option<u64>,
+        ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        self.inner.increment(key, delta, initial, ttl)
+    }
+
+    fn decrement(
+        &self,
+        key: &[u8],
+        delta: u64,
+        initial: Option<u64>,
+        ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        self.inner.decrement(key, delta, initial, ttl)
+    }
+
+    fn append(&self, key: &[u8], data: &[u8]) -> Result<usize, CacheError> {
+        self.inner.append(key, data)
+    }
+
+    fn prepend(&self, key: &[u8], data: &[u8]) -> Result<usize, CacheError> {
+        self.inner.prepend(key, data)
     }
 }
 
@@ -969,12 +999,13 @@ mod tests {
         let ttl = Duration::from_secs(3600);
 
         cache.set(b"key", b"value", ttl).unwrap();
+        assert!(cache.contains(b"key"));
 
-        // flush is a no-op for SegCache, but shouldn't panic
+        // flush clears all items from the cache
         Cache::flush(&cache);
 
-        // Item should still exist (flush is no-op)
-        assert!(cache.contains(b"key"));
+        // Item should no longer exist
+        assert!(!cache.contains(b"key"));
     }
 
     #[test]

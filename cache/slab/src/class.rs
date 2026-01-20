@@ -403,6 +403,32 @@ impl SlabClass {
     pub fn max_item_size(&self) -> usize {
         self.slot_size.saturating_sub(HEADER_SIZE)
     }
+
+    /// Reset this slab class, returning all slab data pointers.
+    ///
+    /// This clears all slabs and returns their data pointers so they can
+    /// be returned to the global free pool.
+    pub fn reset(&self) -> Vec<*mut u8> {
+        // Clear the free slots queue
+        loop {
+            match self.free_slots.steal() {
+                crossbeam_deque::Steal::Empty => break,
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Success(_) => continue,
+            }
+        }
+
+        // Get all slab data pointers and clear the slabs list
+        let mut slabs = self.slabs.write();
+        let data_ptrs: Vec<*mut u8> = slabs.iter().map(|s| s.data()).collect();
+        slabs.clear();
+
+        // Reset counters
+        self.item_count.store(0, Ordering::Release);
+        self.bytes_used.store(0, Ordering::Release);
+
+        data_ptrs
+    }
 }
 
 /// RAII guard for slab access.

@@ -509,6 +509,52 @@ impl MultiChoiceHashtable {
         false
     }
 
+    /// Search a bucket for S3-FIFO tracking (returns packed item_info, no frequency update).
+    fn search_bucket_for_tracking(
+        &self,
+        bucket_index: usize,
+        tag: u16,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+    ) -> Option<u64> {
+        let bucket = self.bucket(bucket_index);
+
+        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
+        const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
+        let tag_shifted = (tag as u64) << 52;
+
+        // Use SIMD to find slots with matching tags (filters out empty/ghost)
+        let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted);
+
+        // Iterate only over slots with matching tags
+        while mask != 0 {
+            let slot_index = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+
+            // Single Acquire load for synchronization
+            let packed = bucket.items[slot_index].load(Ordering::Acquire);
+
+            // Re-verify after Acquire (state may have changed)
+            if packed == 0 || (packed & GHOST_LOCATION) == GHOST_LOCATION {
+                continue;
+            }
+            if (packed & TAG_MASK) != tag_shifted {
+                continue;
+            }
+
+            let location = Hashbucket::location(packed);
+
+            // Prefetch segment data while we verify
+            verifier.prefetch(location);
+
+            if verifier.verify(key, location, false) {
+                return Some(packed);
+            }
+        }
+
+        None
+    }
+
     /// Search for a ghost entry's frequency.
     fn search_bucket_for_ghost(&self, bucket_index: usize, tag: u16) -> Option<u8> {
         let bucket = self.bucket(bucket_index);
@@ -1380,6 +1426,154 @@ impl Hashtable for MultiChoiceHashtable {
         }
 
         None
+    }
+
+    // =========================================================================
+    // S3-FIFO bucket-level methods
+    // =========================================================================
+
+    fn lookup_for_tracking(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<(u64, u64)> {
+        let hash = self.hash_key(key);
+        let tag = Self::tag_from_hash(hash);
+        let buckets = self.bucket_indices(hash);
+        let num_choices = self.num_choices as usize;
+
+        for &bucket_index in &buckets[..num_choices] {
+            if let Some(item_info) =
+                self.search_bucket_for_tracking(bucket_index, tag, key, verifier)
+            {
+                return Some((bucket_index as u64, item_info));
+            }
+        }
+
+        None
+    }
+
+    fn get_info_at_bucket<F>(&self, bucket_index: u64, predicate: F) -> Option<u64>
+    where
+        F: Fn(u64) -> bool,
+    {
+        let bucket_index = bucket_index as usize;
+        if bucket_index >= self.num_buckets {
+            return None;
+        }
+
+        let bucket = self.bucket(bucket_index);
+
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+            let packed = slot.load(Ordering::Acquire);
+
+            // Skip empty and ghost entries
+            if packed == 0 || Hashbucket::is_ghost(packed) {
+                continue;
+            }
+
+            // Check if predicate matches
+            if predicate(packed) {
+                return Some(packed);
+            }
+        }
+
+        None
+    }
+
+    fn set_frequency_at_bucket(&self, bucket_index: u64, location: u64, freq: u8) {
+        let bucket_index = bucket_index as usize;
+        if bucket_index >= self.num_buckets {
+            return;
+        }
+
+        let bucket = self.bucket(bucket_index);
+        let target_location = Location::from_raw(location);
+
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+            let packed = slot.load(Ordering::Acquire);
+
+            // Skip empty and ghost entries
+            if packed == 0 || Hashbucket::is_ghost(packed) {
+                continue;
+            }
+
+            // Check if location matches
+            if Hashbucket::location(packed) == target_location {
+                let new_packed = Hashbucket::with_freq(packed, freq);
+                // Best-effort CAS (ignore failures from concurrent modifications)
+                let _ =
+                    slot.compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    fn convert_to_ghost_at_bucket(&self, bucket_index: u64, location: u64) {
+        let bucket_index = bucket_index as usize;
+        if bucket_index >= self.num_buckets {
+            return;
+        }
+
+        let bucket = self.bucket(bucket_index);
+        let target_location = Location::from_raw(location);
+
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+            let packed = slot.load(Ordering::Acquire);
+
+            // Skip empty and ghost entries
+            if packed == 0 || Hashbucket::is_ghost(packed) {
+                continue;
+            }
+
+            // Check if location matches
+            if Hashbucket::location(packed) == target_location {
+                let ghost_packed = Hashbucket::to_ghost(packed);
+                // Best-effort CAS
+                let _ = slot.compare_exchange(
+                    packed,
+                    ghost_packed,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
+                return;
+            }
+        }
+    }
+
+    fn remove_at_bucket(&self, bucket_index: u64, location: u64) {
+        let bucket_index = bucket_index as usize;
+        if bucket_index >= self.num_buckets {
+            return;
+        }
+
+        let bucket = self.bucket(bucket_index);
+        let target_location = Location::from_raw(location);
+
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let slot = &bucket.items[slot_index];
+            let packed = slot.load(Ordering::Acquire);
+
+            // Skip empty and ghost entries
+            if packed == 0 || Hashbucket::is_ghost(packed) {
+                continue;
+            }
+
+            // Check if location matches
+            if Hashbucket::location(packed) == target_location {
+                // Best-effort CAS to remove
+                let _ = slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    fn clear(&self) {
+        // Reset all entries in all buckets to zero
+        for bucket in self.buckets.iter() {
+            for slot in bucket.items.iter() {
+                slot.store(0, Ordering::Release);
+            }
+        }
     }
 }
 

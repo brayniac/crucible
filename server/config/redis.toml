@@ -6,18 +6,16 @@
 #
 # Supported Redis commands:
 #   - GET, SET, MGET, DEL
-#   - SET with EX (TTL in seconds)
+#   - SET with EX (TTL in seconds), PX (TTL in milliseconds)
+#   - SET with NX (only if key doesn't exist), XX (only if key exists)
+#   - INCR, INCRBY, DECR, DECRBY
+#   - APPEND
 #   - PING, HELLO, CONFIG GET/SET
-#
-# Accepted but not implemented (returns OK, does nothing):
-#   - FLUSHDB, FLUSHALL
-#   - SET with PX (millisecond TTL) - treated as no TTL
-#   - SET with NX/XX (conditional) - always overwrites
+#   - FLUSHDB, FLUSHALL (disabled by default, enable with allow_flush = true)
 #
 # Not supported:
 #   - MSET, EXISTS, TOUCH, TTL, PTTL, EXPIRE, EXPIREAT, PERSIST
-#   - INCR, INCRBY, INCRBYFLOAT, DECR, DECRBY
-#   - APPEND, STRLEN, GETSET, SETNX, GETEX
+#   - INCRBYFLOAT, STRLEN, GETSET, SETNX, GETEX
 #
 # Migration notes:
 #   - Crucible is a pure key-value cache, not a full Redis replacement
@@ -60,6 +58,8 @@ hashtable_power = 21
 [[listener]]
 protocol = "resp"
 address = "0.0.0.0:6379"
+# Enable FLUSHDB/FLUSHALL commands (dangerous - clears entire cache)
+# allow_flush = false
 
 # Optional: TLS for encrypted connections
 # [listener.tls]

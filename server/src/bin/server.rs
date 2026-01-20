@@ -205,18 +205,18 @@ fn create_heap(
     config: &Config,
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use heap_cache::HeapCache;
+    use heap_cache::{EvictionPolicy as HeapEvictionPolicy, HeapCache};
 
-    // TODO: Integrate S3-FIFO policy into HeapCache builder
-    // For now, both S3Fifo and Lfu use the default LFU eviction
-    match policy {
-        EvictionPolicy::S3Fifo | EvictionPolicy::Lfu => {}
+    let heap_policy = match policy {
+        EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
+        EvictionPolicy::Lfu => HeapEvictionPolicy::Lfu,
         _ => unreachable!("invalid policy for heap backend"),
-    }
+    };
 
     let cache = HeapCache::builder()
         .memory_limit(config.cache.heap_size)
         .hashtable_power(config.cache.hashtable_power)
+        .eviction_policy(heap_policy)
         .build();
 
     Ok(cache)
