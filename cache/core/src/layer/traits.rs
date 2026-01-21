@@ -102,6 +102,32 @@ pub trait Layer: Send + Sync {
     /// * `false` - No segment could be evicted
     fn evict<H: Hashtable>(&self, hashtable: &H) -> bool;
 
+    /// Try to evict a segment with a callback for item demotion.
+    ///
+    /// Like `evict`, but calls the provided callback for items that should be
+    /// demoted to the next layer. The callback receives:
+    /// - `key`: Item key
+    /// - `value`: Item value
+    /// - `optional`: Optional metadata
+    /// - `ttl`: Remaining time to live
+    /// - `old_location`: Current location (to update hashtable)
+    ///
+    /// The callback should:
+    /// 1. Write the item to the disk layer
+    /// 2. Update the hashtable with the new disk location
+    ///
+    /// # Arguments
+    /// * `hashtable` - Hashtable for unlinking items and creating ghosts
+    /// * `demoter` - Callback for items that should be demoted
+    ///
+    /// # Returns
+    /// * `true` - A segment was evicted
+    /// * `false` - No segment could be evicted
+    fn evict_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, crate::location::Location);
+
     /// Try to expire segments whose TTL has passed.
     ///
     /// # Arguments

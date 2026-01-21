@@ -396,6 +396,16 @@ impl Layer for DiskLayer {
         }
     }
 
+    fn evict_with_demoter<H, F>(&self, hashtable: &H, _demoter: F) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        // Disk is the last tier, so there's nowhere to demote to.
+        // Just use normal eviction.
+        self.evict(hashtable)
+    }
+
     fn expire<H: Hashtable>(&self, hashtable: &H) -> usize {
         self.try_expire_segments(hashtable)
     }

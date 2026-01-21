@@ -166,6 +166,22 @@ impl CacheLayer {
         }
     }
 
+    /// Try to evict a segment with a demotion callback.
+    ///
+    /// For items that should be demoted, the callback is called with the item data
+    /// to allow writing to a lower layer (e.g., disk).
+    pub fn evict_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        match self {
+            CacheLayer::Fifo(layer) => layer.evict_with_demoter(hashtable, demoter),
+            CacheLayer::Ttl(layer) => layer.evict_with_demoter(hashtable, demoter),
+            CacheLayer::Disk(layer) => layer.evict_with_demoter(hashtable, demoter),
+        }
+    }
+
     /// Try to expire segments in this layer.
     pub fn expire<H: Hashtable>(&self, hashtable: &H) -> usize {
         match self {

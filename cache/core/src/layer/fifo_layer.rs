@@ -175,6 +175,109 @@ impl FifoLayer {
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
         self.pool.release(segment_id);
     }
+
+    /// Process items in an evicted segment with a demotion callback.
+    ///
+    /// For items that should be demoted, the callback is called with the item data
+    /// instead of removing from hashtable. This allows TieredCache to write to disk.
+    fn process_evicted_segment_with_demoter<H, F>(
+        &self,
+        segment_id: u32,
+        hashtable: &H,
+        mut demoter: F,
+    ) where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        let segment = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Wait for readers to finish
+        while segment.ref_count() > 0 {
+            std::hint::spin_loop();
+        }
+
+        // Transition to Locked for clearing
+        segment.cas_metadata(State::Draining, State::Locked, None, None);
+
+        // Process each item in the segment
+        let now = Self::now_secs();
+        let mut offset = 0u32;
+        let write_offset = segment.write_offset();
+
+        while offset < write_offset {
+            // Try to read header at offset
+            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
+                if let Some(header) = TtlHeader::try_from_bytes(data) {
+                    let item_size = header.padded_size() as u32;
+
+                    // Skip if already deleted or expired
+                    if !header.is_deleted() && !header.is_expired(now) {
+                        // Calculate offsets for key, value, optional
+                        let optional_start = offset as usize + TtlHeader::SIZE;
+                        let optional_len = header.optional_len() as usize;
+                        let key_start = optional_start + optional_len;
+                        let key_len = header.key_len() as usize;
+                        let value_start = key_start + key_len;
+                        let value_len = header.value_len() as usize;
+
+                        if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                            let location =
+                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+
+                            // Get frequency from hashtable
+                            let verifier = SinglePoolVerifier { pool: &self.pool };
+                            let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+
+                            // Determine item fate
+                            let fate = determine_item_fate(freq, &self.config);
+
+                            match fate {
+                                ItemFate::Ghost => {
+                                    // Convert to ghost in hashtable
+                                    hashtable.convert_to_ghost(key, location.to_location());
+                                }
+                                ItemFate::Demote => {
+                                    // Extract item data for demotion
+                                    let optional = segment
+                                        .data_slice(optional_start as u32, optional_len)
+                                        .unwrap_or(&[]);
+                                    let value = segment
+                                        .data_slice(value_start as u32, value_len)
+                                        .unwrap_or(&[]);
+
+                                    // Calculate remaining TTL
+                                    let expire_at = header.expire_at();
+                                    let remaining_secs = expire_at.saturating_sub(now);
+                                    let ttl = Duration::from_secs(remaining_secs as u64);
+
+                                    // Call demoter callback (which will write to disk and update hashtable)
+                                    demoter(key, value, optional, ttl, location.to_location());
+                                }
+                                ItemFate::Discard => {
+                                    // Simply remove from hashtable
+                                    hashtable.remove(key, location.to_location());
+                                }
+                            }
+                        }
+                    }
+
+                    offset += item_size;
+                } else {
+                    // Invalid header, stop processing
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Clear segment state and release to pool
+        segment.cas_metadata(State::Locked, State::Reserved, None, None);
+        self.pool.release(segment_id);
+    }
 }
 
 /// Helper struct for verifying keys in segments
@@ -304,6 +407,22 @@ impl Layer for FifoLayer {
             Ok(segment_id) => {
                 // Process items in the evicted segment
                 self.process_evicted_segment(segment_id, hashtable);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn evict_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        // Try to pop head segment from chain
+        match self.chain.pop(&self.pool) {
+            Ok(segment_id) => {
+                // Process items with demoter callback
+                self.process_evicted_segment_with_demoter(segment_id, hashtable, demoter);
                 true
             }
             Err(_) => false,

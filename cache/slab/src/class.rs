@@ -347,7 +347,10 @@ impl SlabClass {
 
             // SAFETY: We're iterating valid slot indices
             unsafe {
-                let header = self.header(slab_id, slot_index);
+                // Use the slab directly instead of self.header() to avoid
+                // re-acquiring the read lock (which would deadlock with
+                // parking_lot's fair RwLock when a writer is waiting)
+                let header = slab.header(slot_index, self.slot_size);
 
                 // Skip deleted/empty slots
                 if header.is_deleted() {
