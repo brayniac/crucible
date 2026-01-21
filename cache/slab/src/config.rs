@@ -91,8 +91,12 @@ pub const DEFAULT_HASHTABLE_POWER: u8 = 16;
 /// Default TTL (1 hour).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 
-/// Header size in bytes (12 bytes).
-pub const HEADER_SIZE: usize = 12;
+/// Header size in bytes (8 bytes).
+///
+/// The header contains:
+/// - kv_lens: 4 bytes (key_len: 8 bits, value_len: 24 bits)
+/// - expire_and_flags: 4 bytes (expire_at: 28 bits, flags: 4 bits)
+pub const HEADER_SIZE: usize = 8;
 
 /// Default minimum slot size (64 bytes).
 pub const DEFAULT_MIN_SLOT_SIZE: usize = 64;

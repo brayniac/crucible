@@ -1101,12 +1101,17 @@ impl<H: Hashtable> TieredCache<H> {
             return Ok(());
         }
 
+        // Find disk layer for demotion (if any)
+        let disk_layer_idx = self.layers.iter().position(|l| l.is_disk());
+
         // Try to evict until we have enough space
         for _ in 0..self.max_eviction_attempts {
-            if !layer.evict(self.hashtable.as_ref()) {
+            let evicted = self.evict_from_layer(0, disk_layer_idx);
+
+            if !evicted {
                 // Can't evict from Layer 0, try Layer 1 if it exists
                 if self.layers.len() > 1 {
-                    self.layers[1].evict(self.hashtable.as_ref());
+                    self.evict_from_layer(1, disk_layer_idx);
                 }
             }
 
@@ -1117,6 +1122,50 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Still no space after max attempts
         Err(CacheError::OutOfMemory)
+    }
+
+    /// Evict from a specific layer, optionally demoting to disk.
+    fn evict_from_layer(&self, layer_idx: usize, disk_layer_idx: Option<usize>) -> bool {
+        let layer = match self.layers.get(layer_idx) {
+            Some(l) => l,
+            None => return false,
+        };
+
+        // If we have a disk layer and this isn't the disk layer, use demotion
+        if let Some(disk_idx) = disk_layer_idx {
+            if layer_idx != disk_idx {
+                if let Some(disk_layer) = self.layers.get(disk_idx) {
+                    let hashtable = self.hashtable.as_ref();
+
+                    // Create demoter callback that writes to disk and updates hashtable
+                    let demoter = |key: &[u8],
+                                   value: &[u8],
+                                   optional: &[u8],
+                                   ttl: Duration,
+                                   old_location: Location| {
+                        // Write item to disk layer
+                        if let Ok(new_location) = disk_layer.write_item(key, value, optional, ttl) {
+                            // Atomically update hashtable to point to disk location
+                            // preserve_freq=true to keep the frequency counter
+                            hashtable.cas_location(
+                                key,
+                                old_location,
+                                new_location.to_location(),
+                                true,
+                            );
+                        } else {
+                            // Disk write failed, just remove from hashtable
+                            hashtable.remove(key, old_location);
+                        }
+                    };
+
+                    return layer.evict_with_demoter(hashtable, demoter);
+                }
+            }
+        }
+
+        // No disk layer or this is the disk layer - use regular eviction
+        layer.evict(self.hashtable.as_ref())
     }
 
     /// Mark an item as deleted at the given location.

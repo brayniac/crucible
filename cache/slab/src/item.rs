@@ -1,7 +1,7 @@
 //! Slab item header and access guards.
 //!
 //! Each slot in a slab contains:
-//! - Fixed header (12 bytes)
+//! - Fixed header (8 bytes)
 //! - Optional CAS token (8 bytes if has_cas flag set)
 //! - Optional data (4 bytes if has_optional flag set)
 //! - Key bytes
@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::HEADER_SIZE;
-use crate::sync::spin_loop;
 
 /// Base epoch for expiration timestamps (2024-01-01 00:00:00 UTC).
 /// Using a recent base allows 28 bits (~8.5 years) to cover times through ~2032.
@@ -52,31 +51,29 @@ const FLAG_HAS_OPTIONAL: u32 = 1 << 31;
 // Mask for expiration time (low 28 bits)
 const EXPIRE_MASK: u32 = (1 << 28) - 1;
 
-// RwLock states in the rwlock field
-const RWLOCK_UNLOCKED: u32 = 0;
-const RWLOCK_WRITER: u32 = u32::MAX;
-// Values 1..u32::MAX-1 represent reader counts
-
-/// Slab item header (12 bytes).
+/// Slab item header (8 bytes).
 ///
 /// ```text
 /// Offset  Size  Field
 /// ------  ----  -----
-/// 0       4     rwlock (atomic): reader-writer lock
-/// 4       4     kv_lens: key_len (8 bits) | value_len (24 bits)
-/// 8       4     expire_and_flags: expire_at (28 bits) | flags (4 bits)
+/// 0       4     kv_lens: key_len (8 bits) | value_len (24 bits)
+/// 4       4     expire_and_flags: expire_at (28 bits) | flags (4 bits)
 /// ```
 ///
 /// After the header (optional fields determined by flags):
-/// - `[12..12+8]`: CAS token (if FLAG_HAS_CAS)
-/// - `[12+cas_size..12+cas_size+4]`: Optional data (if FLAG_HAS_OPTIONAL)
+/// - `[8..8+8]`: CAS token (if FLAG_HAS_CAS)
+/// - `[8+cas_size..8+cas_size+4]`: Optional data (if FLAG_HAS_OPTIONAL)
 /// - Key bytes
 /// - Value bytes
+///
+/// # Concurrency
+///
+/// Items are protected by slab-level reference counting, not per-item locks.
+/// All mutations use copy-modify-write semantics (allocate new slot, update
+/// hashtable atomically). The `expire_and_flags` field uses atomic operations
+/// for flag updates (mark_deleted, set_numeric, etc.).
 #[repr(C)]
 pub struct SlabItemHeader {
-    /// Reader-writer lock for concurrent access.
-    /// 0 = unlocked, 1..MAX-1 = reader count, MAX = writer held.
-    rwlock: AtomicU32,
     /// Packed key length (8 bits) and value length (24 bits).
     kv_lens: u32,
     /// Packed expiration time (28 bits) and flags (4 bits).
@@ -119,7 +116,6 @@ impl SlabItemHeader {
 
             // Use relaxed stores during initialization since we haven't published
             // the item yet
-            header.rwlock = AtomicU32::new(RWLOCK_UNLOCKED);
             header.kv_lens = kv_lens;
             header.expire_and_flags = AtomicU32::new(expire_at);
 
@@ -148,68 +144,6 @@ impl SlabItemHeader {
     pub unsafe fn from_ptr_mut(ptr: *mut u8) -> &'static mut Self {
         // SAFETY: Caller ensures ptr points to a valid SlabItemHeader
         unsafe { &mut *(ptr as *mut SlabItemHeader) }
-    }
-
-    // ========== RwLock operations ==========
-
-    /// Try to acquire a read lock. Returns true if successful.
-    #[inline]
-    pub fn try_read_lock(&self) -> bool {
-        let current = self.rwlock.load(Ordering::Relaxed);
-        if current == RWLOCK_WRITER {
-            return false; // Writer held
-        }
-        // Try to increment reader count
-        self.rwlock
-            .compare_exchange_weak(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    /// Acquire a read lock, spinning until successful.
-    #[inline]
-    pub fn read_lock(&self) {
-        loop {
-            if self.try_read_lock() {
-                return;
-            }
-            spin_loop();
-        }
-    }
-
-    /// Release a read lock.
-    #[inline]
-    pub fn read_unlock(&self) {
-        self.rwlock.fetch_sub(1, Ordering::Release);
-    }
-
-    /// Try to acquire a write lock. Returns true if successful.
-    #[inline]
-    pub fn try_write_lock(&self) -> bool {
-        self.rwlock
-            .compare_exchange(
-                RWLOCK_UNLOCKED,
-                RWLOCK_WRITER,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-
-    /// Acquire a write lock, spinning until successful.
-    #[inline]
-    pub fn write_lock(&self) {
-        loop {
-            if self.try_write_lock() {
-                return;
-            }
-            spin_loop();
-        }
-    }
-
-    /// Release a write lock.
-    #[inline]
-    pub fn write_unlock(&self) {
-        self.rwlock.store(RWLOCK_UNLOCKED, Ordering::Release);
     }
 
     // ========== Flag operations ==========
@@ -582,7 +516,7 @@ mod tests {
     #[test]
     fn test_header_size() {
         assert_eq!(std::mem::size_of::<SlabItemHeader>(), HEADER_SIZE);
-        assert_eq!(HEADER_SIZE, 12);
+        assert_eq!(HEADER_SIZE, 8);
     }
 
     #[test]
@@ -701,30 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rwlock() {
-        let mut buf = [0u8; 64];
-        unsafe {
-            let header = SlabItemHeader::init(buf.as_mut_ptr(), 4, 10, Duration::from_secs(3600));
-
-            // Test read lock
-            assert!(header.try_read_lock());
-            assert!(header.try_read_lock()); // Multiple readers OK
-            header.read_unlock();
-            header.read_unlock();
-
-            // Test write lock
-            assert!(header.try_write_lock());
-            assert!(!header.try_read_lock()); // Can't read with writer
-            assert!(!header.try_write_lock()); // Can't write with writer
-            header.write_unlock();
-
-            // Can lock again after unlock
-            assert!(header.try_read_lock());
-            header.read_unlock();
-        }
-    }
-
-    #[test]
     fn test_packed_lengths() {
         let mut buf = [0u8; 64];
 
@@ -767,141 +677,13 @@ mod tests {
     }
 }
 
-/// Loom concurrency tests for the item header's RwLock.
+/// Loom concurrency tests for the item header's atomic flag operations.
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
     use super::*;
     use crate::sync::{AtomicU32 as LoomAtomicU32, Ordering as LoomOrdering};
     use loom::sync::Arc;
     use loom::thread;
-
-    /// Test concurrent read lock acquisition.
-    ///
-    /// Multiple readers should be able to hold locks simultaneously.
-    #[test]
-    fn test_concurrent_readers() {
-        loom::model(|| {
-            // Create a simple atomic to simulate the rwlock
-            let rwlock = Arc::new(LoomAtomicU32::new(RWLOCK_UNLOCKED));
-
-            let r1 = rwlock.clone();
-            let r2 = rwlock.clone();
-
-            let t1 = thread::spawn(move || {
-                // Try to acquire read lock
-                loop {
-                    let current = r1.load(LoomOrdering::Relaxed);
-                    if current == RWLOCK_WRITER {
-                        spin_loop();
-                        continue;
-                    }
-                    if r1
-                        .compare_exchange_weak(
-                            current,
-                            current + 1,
-                            LoomOrdering::Acquire,
-                            LoomOrdering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        break;
-                    }
-                }
-                // Hold lock briefly
-                r1.fetch_sub(1, LoomOrdering::Release);
-            });
-
-            let t2 = thread::spawn(move || {
-                // Try to acquire read lock
-                loop {
-                    let current = r2.load(LoomOrdering::Relaxed);
-                    if current == RWLOCK_WRITER {
-                        spin_loop();
-                        continue;
-                    }
-                    if r2
-                        .compare_exchange_weak(
-                            current,
-                            current + 1,
-                            LoomOrdering::Acquire,
-                            LoomOrdering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        break;
-                    }
-                }
-                // Hold lock briefly
-                r2.fetch_sub(1, LoomOrdering::Release);
-            });
-
-            t1.join().unwrap();
-            t2.join().unwrap();
-
-            // Lock should be unlocked
-            assert_eq!(rwlock.load(LoomOrdering::Relaxed), RWLOCK_UNLOCKED);
-        });
-    }
-
-    /// Test that writer excludes readers.
-    ///
-    /// When a writer holds the lock, readers should wait.
-    #[test]
-    fn test_writer_excludes_readers() {
-        loom::model(|| {
-            let rwlock = Arc::new(LoomAtomicU32::new(RWLOCK_UNLOCKED));
-
-            let w = rwlock.clone();
-            let r = rwlock.clone();
-
-            // Writer thread
-            let t1 = thread::spawn(move || {
-                // Acquire write lock
-                loop {
-                    if w.compare_exchange(
-                        RWLOCK_UNLOCKED,
-                        RWLOCK_WRITER,
-                        LoomOrdering::Acquire,
-                        LoomOrdering::Relaxed,
-                    )
-                    .is_ok()
-                    {
-                        break;
-                    }
-                    spin_loop();
-                }
-                // Hold lock briefly then release
-                w.store(RWLOCK_UNLOCKED, LoomOrdering::Release);
-            });
-
-            // Reader thread
-            let t2 = thread::spawn(move || {
-                loop {
-                    let current = r.load(LoomOrdering::Relaxed);
-                    if current == RWLOCK_WRITER {
-                        spin_loop();
-                        continue;
-                    }
-                    if r.compare_exchange_weak(
-                        current,
-                        current + 1,
-                        LoomOrdering::Acquire,
-                        LoomOrdering::Relaxed,
-                    )
-                    .is_ok()
-                    {
-                        break;
-                    }
-                }
-                r.fetch_sub(1, LoomOrdering::Release);
-            });
-
-            t1.join().unwrap();
-            t2.join().unwrap();
-
-            assert_eq!(rwlock.load(LoomOrdering::Relaxed), RWLOCK_UNLOCKED);
-        });
-    }
 
     /// Test concurrent flag updates (deleted flag).
     ///

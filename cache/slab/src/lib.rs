@@ -74,12 +74,12 @@ mod class;
 mod config;
 mod item;
 mod location;
+mod reservation;
 mod sync;
 mod verifier;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use cache_core::{
@@ -90,6 +90,7 @@ use cache_core::{
 pub use cache_core::HugepageSize;
 pub use cache_core::SyncMode;
 pub use config::{EvictionStrategy, HEADER_SIZE, SlabCacheConfig, SlabClasses};
+pub use reservation::SlabReservation;
 
 use allocator::SlabAllocator;
 use location::SlabLocation;
@@ -509,6 +510,113 @@ impl SlabCache {
     pub fn frequency(&self, key: &[u8]) -> Option<u8> {
         let verifier = self.allocator.verifier();
         self.hashtable.get_frequency(key, &verifier)
+    }
+
+    /// Begin a two-phase SET for zero-copy receive.
+    ///
+    /// Reserves space in a slab slot and returns a `SlabReservation`
+    /// with a mutable pointer to the value area. The caller writes the value
+    /// directly to slab memory, then calls `commit_slab_set` to finalize.
+    ///
+    /// # Zero-Copy Receive Flow
+    ///
+    /// ```ignore
+    /// // 1. Reserve slab slot
+    /// let mut reservation = cache.begin_slab_set(key, value_len, ttl)?;
+    ///
+    /// // 2. Receive value directly into slab memory
+    /// socket.recv_exact(reservation.value_mut())?;
+    ///
+    /// // 3. Commit to finalize and update hashtable
+    /// cache.commit_slab_set(reservation)?;
+    /// ```
+    ///
+    /// # Cancellation
+    ///
+    /// If the reservation is dropped without committing (e.g., connection
+    /// closed during receive), call `cancel_slab_set` to return the slot
+    /// to the free list.
+    pub fn begin_slab_set(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        ttl: Duration,
+    ) -> CacheResult<SlabReservation> {
+        // Validate key length
+        if key.len() > 255 {
+            return Err(CacheError::KeyTooLong);
+        }
+
+        // Reserve slot in slab
+        let (location, value_ptr, item_size) = self
+            .allocator
+            .begin_write_item(key, value_len, ttl, &*self.hashtable)
+            .ok_or(CacheError::OutOfMemory)?;
+
+        // Create the reservation
+        // SAFETY: value_ptr points to valid slab memory that will remain
+        // valid until the reservation is committed or cancelled
+        Ok(unsafe {
+            SlabReservation::new(location, value_ptr, value_len, key.to_vec(), ttl, item_size)
+        })
+    }
+
+    /// Commit a two-phase SET operation.
+    ///
+    /// Finalizes the slab write and inserts the item into the hashtable.
+    /// The reservation is consumed.
+    pub fn commit_slab_set(&self, mut reservation: SlabReservation) -> CacheResult<()> {
+        let location = reservation.location();
+        let item_size = reservation.item_size();
+
+        // Finalize the slab write (update stats)
+        self.allocator.finalize_write_item(location, item_size);
+
+        // Insert into hashtable
+        let loc = location.to_location();
+        let verifier = self.allocator.verifier();
+
+        match self.hashtable.insert(reservation.key(), loc, &verifier) {
+            Ok(Some(old_loc)) => {
+                // Deallocate old slot
+                let old = SlabLocation::from_location(old_loc);
+                let (old_class, old_slab, old_slot) = old.unpack();
+
+                // Mark deleted and update stats
+                unsafe {
+                    let header = self.allocator.header(old);
+                    if let Some(class) = self.allocator.class(old_class) {
+                        class.sub_bytes(header.item_size());
+                        class.remove_item();
+                    }
+                    header.mark_deleted();
+                }
+                self.allocator.deallocate(old_class, old_slab, old_slot);
+            }
+            Ok(None) => {
+                // New entry, nothing to deallocate
+            }
+            Err(e) => {
+                // Hashtable insert failed, cancel the reservation
+                self.allocator.cancel_write_item(location);
+                return Err(e);
+            }
+        }
+
+        reservation.mark_committed();
+        Ok(())
+    }
+
+    /// Cancel a two-phase SET operation.
+    ///
+    /// Marks the reserved slot as deleted and returns it to the free list.
+    /// Called when a receive operation fails (e.g., connection closed during
+    /// value receive).
+    pub fn cancel_slab_set(&self, reservation: SlabReservation) {
+        if reservation.is_committed() {
+            return;
+        }
+        self.allocator.cancel_write_item(reservation.location());
     }
 
     /// Get the total memory used.
@@ -1205,5 +1313,112 @@ mod tests {
         }
 
         assert!(found > 0, "Expected some items after combined eviction");
+    }
+
+    #[test]
+    fn test_two_phase_set_basic() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        // Begin a reservation
+        let mut reservation = cache
+            .begin_slab_set(b"key", 5, ttl)
+            .expect("Failed to begin slab set");
+
+        // Write value directly to slab memory
+        reservation.value_mut().copy_from_slice(b"hello");
+
+        // Commit the reservation
+        cache
+            .commit_slab_set(reservation)
+            .expect("Failed to commit slab set");
+
+        // Verify item is in cache
+        let result = cache.get_item(b"key");
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_two_phase_set_cancel() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        // Begin a reservation
+        let reservation = cache
+            .begin_slab_set(b"key", 5, ttl)
+            .expect("Failed to begin slab set");
+
+        // Cancel the reservation
+        cache.cancel_slab_set(reservation);
+
+        // Item should not be in cache
+        assert!(!cache.contains_key(b"key"));
+    }
+
+    #[test]
+    fn test_two_phase_set_overwrite() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        // Set initial value using regular method
+        cache.set_item(b"key", b"first", ttl).unwrap();
+        assert_eq!(cache.get_item(b"key"), Some(b"first".to_vec()));
+
+        // Overwrite using two-phase set
+        let mut reservation = cache
+            .begin_slab_set(b"key", 6, ttl)
+            .expect("Failed to begin slab set");
+        reservation.value_mut().copy_from_slice(b"second");
+        cache
+            .commit_slab_set(reservation)
+            .expect("Failed to commit slab set");
+
+        // Verify new value
+        assert_eq!(cache.get_item(b"key"), Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn test_two_phase_set_reservation_properties() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        let reservation = cache
+            .begin_slab_set(b"testkey", 100, ttl)
+            .expect("Failed to begin slab set");
+
+        // Check reservation properties
+        assert_eq!(reservation.key(), b"testkey");
+        assert_eq!(reservation.value_len(), 100);
+        assert_eq!(reservation.ttl(), ttl);
+        assert!(!reservation.is_committed());
+
+        // Clean up
+        cache.cancel_slab_set(reservation);
+    }
+
+    #[test]
+    fn test_two_phase_set_large_value() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+        let value_size = 10_000;
+        let expected: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
+
+        // Begin reservation for large value
+        let mut reservation = cache
+            .begin_slab_set(b"large", value_size, ttl)
+            .expect("Failed to begin slab set");
+
+        // Write pattern to slab memory
+        reservation.value_mut().copy_from_slice(&expected);
+
+        // Commit
+        cache
+            .commit_slab_set(reservation)
+            .expect("Failed to commit slab set");
+
+        // Verify
+        let result = cache.get_item(b"large");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), expected);
     }
 }

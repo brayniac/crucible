@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use cache_core::{Hashtable, HugepageAllocation, allocate_on_node};
 use crossbeam_deque::Injector;
-use parking_lot::Mutex;
 
 use crate::class::SlabClass;
 use crate::config::{EvictionStrategy, HEADER_SIZE, SlabCacheConfig, SlabClasses};
@@ -31,9 +30,8 @@ pub struct SlabAllocator {
     /// Current memory used (number of slabs allocated * slab_size).
     memory_used: AtomicUsize,
     /// Free slab pages (pointers to unallocated slab memory).
+    /// Lock-free: multiple threads can steal slabs concurrently.
     free_slabs: Injector<*mut u8>,
-    /// Lock for allocating new slabs (prevents races).
-    alloc_lock: Mutex<()>,
     /// Eviction strategy (twemcache-style).
     eviction_strategy: EvictionStrategy,
 }
@@ -77,7 +75,6 @@ impl SlabAllocator {
             memory_limit: config.heap_size,
             memory_used: AtomicUsize::new(0),
             free_slabs,
-            alloc_lock: Mutex::new(()),
             eviction_strategy: config.eviction_strategy,
         })
     }
@@ -113,17 +110,15 @@ impl SlabAllocator {
     }
 
     /// Allocate a new slab for a class.
+    ///
+    /// This is lock-free: multiple threads can concurrently allocate slabs
+    /// for different (or even the same) classes. If two threads allocate
+    /// slabs for the same class simultaneously, both slabs are added and
+    /// used - this is intentional to avoid lock contention.
     fn allocate_slab_for_class(&self, class_id: u8) -> Option<(u32, u16)> {
-        let _lock = self.alloc_lock.lock();
-
         let class = self.classes.get(class_id as usize)?;
 
-        // Double-check: maybe another thread already allocated
-        if let Some(slot) = class.allocate() {
-            return Some(slot);
-        }
-
-        // Try to get a free slab from the pool
+        // Try to get a free slab from the pool (lock-free steal)
         let slab_ptr = match self.free_slabs.steal() {
             crossbeam_deque::Steal::Success(ptr) => ptr,
             _ => return None, // No free slabs available
@@ -133,12 +128,12 @@ impl SlabAllocator {
         self.memory_used
             .fetch_add(self.slab_size, Ordering::Relaxed);
 
-        // Add the slab to the class
+        // Add the slab to the class (internally synchronized via slabs write lock)
         unsafe {
             class.add_slab(slab_ptr, self.slab_size);
         }
 
-        // Now allocate from the class
+        // Now allocate from the class (lock-free)
         class.allocate()
     }
 
@@ -452,6 +447,108 @@ impl SlabAllocator {
         self.classes
             .get(class_id as usize)?
             .get_value_ref_raw(slab_id, slot_index)
+    }
+
+    /// Begin a two-phase write operation for zero-copy receive.
+    ///
+    /// This method:
+    /// 1. Selects the appropriate size class
+    /// 2. Allocates a slot (may allocate new slab or trigger eviction)
+    /// 3. Initializes the header with key_len, value_len, ttl
+    /// 4. Copies the key to slot memory
+    /// 5. Returns the location and a pointer to the value area
+    ///
+    /// The caller then writes the value directly to the returned pointer,
+    /// then calls `finalize_write_item` to update statistics.
+    ///
+    /// # Arguments
+    /// * `key` - The key for this item
+    /// * `value_len` - Length of the value to be written
+    /// * `ttl` - Time-to-live for this item
+    /// * `hashtable` - Hashtable for eviction callbacks
+    ///
+    /// # Returns
+    /// `Some((location, value_ptr, item_size))` on success, `None` if allocation fails.
+    pub fn begin_write_item<H: Hashtable>(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        ttl: Duration,
+        hashtable: &H,
+    ) -> Option<(SlabLocation, *mut u8, usize)> {
+        // Calculate item size
+        let item_size = HEADER_SIZE + key.len() + value_len;
+
+        // Select class
+        let class_id = self.select_class(item_size)?;
+        let class = self.classes.get(class_id as usize)?;
+
+        // Try direct allocation first
+        if let Some((slab_id, slot_index, value_ptr, item_size)) =
+            class.begin_write_item(key, value_len, ttl)
+        {
+            let location = SlabLocation::new(class_id, slab_id, slot_index);
+            return Some((location, value_ptr, item_size));
+        }
+
+        // Need to allocate a new slab or evict
+        // First try allocating a new slab
+        if self.allocate_slab_for_class(class_id).is_some() {
+            // Try allocation again
+            if let Some((slab_id, slot_index, value_ptr, item_size)) =
+                class.begin_write_item(key, value_len, ttl)
+            {
+                let location = SlabLocation::new(class_id, slab_id, slot_index);
+                return Some((location, value_ptr, item_size));
+            }
+        }
+
+        // Check if eviction is enabled
+        if self.eviction_strategy.is_none() {
+            return None;
+        }
+
+        // Try slab-level eviction
+        if self.eviction_strategy.has_slab_eviction() && self.try_slab_eviction(hashtable) {
+            // Eviction freed some slots, try allocation again
+            if let Some((slab_id, slot_index, value_ptr, item_size)) =
+                class.begin_write_item(key, value_len, ttl)
+            {
+                let location = SlabLocation::new(class_id, slab_id, slot_index);
+                return Some((location, value_ptr, item_size));
+            }
+        }
+
+        None
+    }
+
+    /// Finalize a two-phase write operation.
+    ///
+    /// Called after the value has been written to the pointer returned by
+    /// `begin_write_item`. Updates statistics (bytes_used, item_count).
+    ///
+    /// # Arguments
+    /// * `location` - The location returned by `begin_write_item`
+    /// * `item_size` - The item_size returned by `begin_write_item`
+    pub fn finalize_write_item(&self, location: SlabLocation, item_size: usize) {
+        let (class_id, _slab_id, _slot_index) = location.unpack();
+        if let Some(class) = self.classes.get(class_id as usize) {
+            class.finalize_write_item(item_size);
+        }
+    }
+
+    /// Cancel a two-phase write operation.
+    ///
+    /// Called if the write cannot be completed (e.g., connection closed).
+    /// Marks the item as deleted and returns the slot to the free list.
+    ///
+    /// # Arguments
+    /// * `location` - The location returned by `begin_write_item`
+    pub fn cancel_write_item(&self, location: SlabLocation) {
+        let (class_id, slab_id, slot_index) = location.unpack();
+        if let Some(class) = self.classes.get(class_id as usize) {
+            class.cancel_write_item(slab_id, slot_index);
+        }
     }
 
     /// Get the total memory used.
