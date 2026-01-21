@@ -46,6 +46,7 @@ pub mod bytes {
 pub mod ops {
     pub const GET: usize = 0;
     pub const SET: usize = 1;
+    pub const DELETE: usize = 2;
 }
 
 // Request counters
@@ -78,6 +79,9 @@ pub static GET_COUNT: Counter = Counter::new(&OPS, ops::GET);
 
 #[metric(name = "set_count", description = "Total SET operations")]
 pub static SET_COUNT: Counter = Counter::new(&OPS, ops::SET);
+
+#[metric(name = "delete_count", description = "Total DELETE operations")]
+pub static DELETE_COUNT: Counter = Counter::new(&OPS, ops::DELETE);
 
 // Connection counters
 #[metric(name = "connections_active", description = "Active connections")]
@@ -142,3 +146,9 @@ pub static GET_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
     description = "SET response latency histogram (nanoseconds)"
 )]
 pub static SET_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "delete_latency",
+    description = "DELETE response latency histogram (nanoseconds)"
+)]
+pub static DELETE_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);

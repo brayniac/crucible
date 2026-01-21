@@ -251,6 +251,8 @@ Available benchmark configurations:
 - `ping.toml` - Simple ping test
 - `quick-test.toml` - Quick validation test
 
+See [benchmark/README.md](benchmark/README.md) for complete configuration reference and tuning guide.
+
 ## Workspace Structure
 
 ```

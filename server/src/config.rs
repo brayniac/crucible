@@ -192,6 +192,89 @@ pub struct CacheConfig {
     /// If not specified, memory is allocated according to the default policy.
     #[serde(default)]
     pub numa_node: Option<u32>,
+
+    /// Disk tier configuration.
+    /// When enabled, items evicted from RAM are demoted to disk storage.
+    #[serde(default)]
+    pub disk: Option<DiskConfig>,
+}
+
+/// Disk tier configuration.
+///
+/// When enabled, the cache extends its capacity using disk storage.
+/// Items evicted from RAM are demoted to disk instead of being discarded.
+/// On disk hit, items can be promoted back to RAM based on access frequency.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskConfig {
+    /// Whether the disk tier is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Path to the disk cache file.
+    #[serde(default = "default_disk_path")]
+    pub path: std::path::PathBuf,
+
+    /// Total size of disk storage (e.g., "100GB", "1TB").
+    #[serde(default = "default_disk_size", deserialize_with = "deserialize_size")]
+    pub size: usize,
+
+    /// Frequency threshold for promoting items from disk to RAM.
+    /// Items with frequency > threshold are promoted on read.
+    /// Default: 2
+    #[serde(default = "default_promotion_threshold")]
+    pub promotion_threshold: u8,
+
+    /// Synchronization mode for disk writes: "sync", "async", or "none".
+    /// - sync: fsync after each write (safest, slowest)
+    /// - async: periodic background fsync (balanced)
+    /// - none: let OS handle flushing (fastest, may lose data on crash)
+    #[serde(default)]
+    pub sync_mode: DiskSyncMode,
+
+    /// Whether to attempt recovery from existing disk cache on startup.
+    /// Default: true
+    #[serde(default = "default_true")]
+    pub recover_on_startup: bool,
+}
+
+fn default_disk_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/cache/crucible/disk.dat")
+}
+
+fn default_disk_size() -> usize {
+    10 * 1024 * 1024 * 1024 // 10GB
+}
+
+fn default_promotion_threshold() -> u8 {
+    2
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Disk synchronization mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskSyncMode {
+    /// Synchronous writes - fsync after each write.
+    Sync,
+    /// Asynchronous writes - periodic background fsync.
+    #[default]
+    Async,
+    /// No explicit sync - let OS handle flushing.
+    None,
+}
+
+impl From<DiskSyncMode> for cache_core::disk::SyncMode {
+    fn from(mode: DiskSyncMode) -> Self {
+        match mode {
+            DiskSyncMode::Sync => cache_core::disk::SyncMode::Sync,
+            DiskSyncMode::Async => cache_core::disk::SyncMode::Async,
+            DiskSyncMode::None => cache_core::disk::SyncMode::None,
+        }
+    }
 }
 
 impl Default for CacheConfig {
@@ -205,6 +288,7 @@ impl Default for CacheConfig {
             hashtable_power: default_hashtable_power(),
             hugepage: HugepageConfig::default(),
             numa_node: None,
+            disk: None,
         }
     }
 }

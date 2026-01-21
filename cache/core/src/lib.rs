@@ -149,6 +149,12 @@ pub use metrics::{
     AtomicCounters, CacheMetrics, CounterSnapshot, LayerMetrics, MetricsExport, PoolMetrics,
 };
 
+// Phase 10 - Disk storage tier
+pub mod disk;
+
+// Phase 10 re-exports
+pub use disk::{DiskConfig, DiskLayer, DiskLayerBuilder, FilePool, FilePoolBuilder, SyncMode};
+
 // Cache trait for server compatibility
 mod cache_trait;
 pub use cache_trait::{Cache, DEFAULT_TTL, OwnedGuard, ValueRef};

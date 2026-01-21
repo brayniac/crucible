@@ -8,6 +8,7 @@
 
 use crate::cas::CasToken;
 use crate::config::LayerConfig;
+use crate::disk::{DiskLayer, FilePool};
 use crate::error::{CacheError, CacheResult};
 use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::item::ItemGuard;
@@ -16,7 +17,7 @@ use crate::layer::{FifoLayer, Layer, TtlLayer};
 use crate::location::Location;
 use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
-use crate::segment::Segment;
+use crate::segment::{Segment, SegmentKeyVerify};
 use crate::slice_segment::SliceSegment;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +31,8 @@ pub enum CacheLayer {
     Fifo(FifoLayer),
     /// TTL bucket-organized layer (for main cache storage).
     Ttl(TtlLayer),
+    /// Disk-backed layer (for extended capacity beyond RAM).
+    Disk(DiskLayer),
 }
 
 impl CacheLayer {
@@ -38,6 +41,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.config(),
             CacheLayer::Ttl(layer) => layer.config(),
+            CacheLayer::Disk(layer) => layer.config(),
         }
     }
 
@@ -46,6 +50,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.layer_id(),
             CacheLayer::Ttl(layer) => layer.layer_id(),
+            CacheLayer::Disk(layer) => layer.layer_id(),
         }
     }
 
@@ -60,6 +65,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.write_item(key, value, optional, ttl),
             CacheLayer::Ttl(layer) => layer.write_item(key, value, optional, ttl),
+            CacheLayer::Disk(layer) => layer.write_item(key, value, optional, ttl),
         }
     }
 
@@ -73,6 +79,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.get_item(location, key).map(|guard| f(&guard)),
             CacheLayer::Ttl(layer) => layer.get_item(location, key).map(|guard| f(&guard)),
+            CacheLayer::Disk(layer) => layer.get_item(location, key).map(|guard| f(&guard)),
         }
     }
 
@@ -89,28 +96,47 @@ impl CacheLayer {
     /// - `value_len`: Length of the value
     ///
     /// Returns `None` if the item is not found or not accessible.
+    /// Note: For disk layers, this returns pointers to mmap'd memory.
     pub fn get_value_ref_raw(
         &self,
         location: ItemLocation,
         key: &[u8],
     ) -> Option<(*const crate::sync::AtomicU32, *const u8, usize)> {
-        let pool = self.pool();
-
-        // Verify pool ID matches
-        if location.pool_id() != pool.pool_id() {
-            return None;
+        match self {
+            CacheLayer::Fifo(layer) => {
+                let pool = layer.pool();
+                if location.pool_id() != pool.pool_id() {
+                    return None;
+                }
+                let segment = pool.get(location.segment_id())?;
+                if !segment.state().is_readable() {
+                    return None;
+                }
+                segment.get_value_ref_raw(location.offset(), key).ok()
+            }
+            CacheLayer::Ttl(layer) => {
+                let pool = layer.pool();
+                if location.pool_id() != pool.pool_id() {
+                    return None;
+                }
+                let segment = pool.get(location.segment_id())?;
+                if !segment.state().is_readable() {
+                    return None;
+                }
+                segment.get_value_ref_raw(location.offset(), key).ok()
+            }
+            CacheLayer::Disk(layer) => {
+                let pool = layer.pool();
+                if location.pool_id() != pool.pool_id() {
+                    return None;
+                }
+                let segment = pool.get(location.segment_id())?;
+                if !segment.state().is_readable() {
+                    return None;
+                }
+                segment.get_value_ref_raw(location.offset(), key).ok()
+            }
         }
-
-        let segment = pool.get(location.segment_id())?;
-
-        // Check segment state first
-        let state = segment.state();
-        if !state.is_readable() {
-            return None;
-        }
-
-        // Get raw value reference (handles ref_count increment)
-        segment.get_value_ref_raw(location.offset(), key).ok()
     }
 
     /// Mark an item as deleted.
@@ -118,6 +144,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.mark_deleted(location),
             CacheLayer::Ttl(layer) => layer.mark_deleted(location),
+            CacheLayer::Disk(layer) => layer.mark_deleted(location),
         }
     }
 
@@ -126,6 +153,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.item_ttl(location),
             CacheLayer::Ttl(layer) => layer.item_ttl(location),
+            CacheLayer::Disk(layer) => layer.item_ttl(location),
         }
     }
 
@@ -134,6 +162,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.evict(hashtable),
             CacheLayer::Ttl(layer) => layer.evict(hashtable),
+            CacheLayer::Disk(layer) => layer.evict(hashtable),
         }
     }
 
@@ -142,6 +171,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.expire(hashtable),
             CacheLayer::Ttl(layer) => layer.expire(hashtable),
+            CacheLayer::Disk(layer) => layer.expire(hashtable),
         }
     }
 
@@ -150,6 +180,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.free_segment_count(),
             CacheLayer::Ttl(layer) => layer.free_segment_count(),
+            CacheLayer::Disk(layer) => layer.free_segment_count(),
         }
     }
 
@@ -158,6 +189,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.total_segment_count(),
             CacheLayer::Ttl(layer) => layer.total_segment_count(),
+            CacheLayer::Disk(layer) => layer.total_segment_count(),
         }
     }
 
@@ -166,26 +198,48 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.used_segment_count(),
             CacheLayer::Ttl(layer) => layer.used_segment_count(),
+            CacheLayer::Disk(layer) => layer.used_segment_count(),
         }
     }
 
-    /// Get a segment from this layer's pool by segment ID.
+    /// Get a segment from this layer's pool by segment ID (RAM layers only).
+    ///
+    /// For disk layers, use `disk_pool()` instead.
+    /// Returns `None` for disk layers.
     pub fn get_segment(&self, segment_id: u32) -> Option<&SliceSegment<'static>> {
         match self {
             CacheLayer::Fifo(layer) => layer.pool().get(segment_id),
             CacheLayer::Ttl(layer) => layer.pool().get(segment_id),
+            CacheLayer::Disk(_) => None, // Disk segments have different type
         }
     }
 
-    /// Get the memory pool for this layer.
+    /// Get the memory pool for this layer (RAM layers only).
     ///
-    /// This provides direct access to the pool, which can be used to create
-    /// a `PoolVerifier` for fast key verification without layer indirection.
+    /// # Panics
+    ///
+    /// Panics if called on a disk layer. Use `disk_pool()` instead.
     pub fn pool(&self) -> &MemoryPool {
         match self {
             CacheLayer::Fifo(layer) => layer.pool(),
             CacheLayer::Ttl(layer) => layer.pool(),
+            CacheLayer::Disk(_) => panic!("Cannot get MemoryPool from disk layer; use disk_pool()"),
         }
+    }
+
+    /// Get the disk pool for this layer (disk layers only).
+    ///
+    /// Returns `None` for RAM layers.
+    pub fn disk_pool(&self) -> Option<&FilePool> {
+        match self {
+            CacheLayer::Fifo(_) | CacheLayer::Ttl(_) => None,
+            CacheLayer::Disk(layer) => Some(layer.pool()),
+        }
+    }
+
+    /// Check if this is a disk layer.
+    pub fn is_disk(&self) -> bool {
+        matches!(self, CacheLayer::Disk(_))
     }
 
     /// Get the pool ID for this layer.
@@ -193,6 +247,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.pool().pool_id(),
             CacheLayer::Ttl(layer) => layer.pool().pool_id(),
+            CacheLayer::Disk(layer) => layer.pool().pool_id(),
         }
     }
 
@@ -207,6 +262,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.begin_write_item(key, value_len, optional, ttl),
             CacheLayer::Ttl(layer) => layer.begin_write_item(key, value_len, optional, ttl),
+            CacheLayer::Disk(layer) => layer.begin_write_item(key, value_len, optional, ttl),
         }
     }
 
@@ -215,6 +271,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.finalize_write_item(location, item_size),
             CacheLayer::Ttl(layer) => layer.finalize_write_item(location, item_size),
+            CacheLayer::Disk(layer) => layer.finalize_write_item(location, item_size),
         }
     }
 
@@ -223,6 +280,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.cancel_write_item(location),
             CacheLayer::Ttl(layer) => layer.cancel_write_item(location),
+            CacheLayer::Disk(layer) => layer.cancel_write_item(location),
         }
     }
 
@@ -230,7 +288,11 @@ impl CacheLayer {
     ///
     /// This is used during flush operations to reset the entire layer.
     pub fn reset_all_segments(&self) {
-        self.pool().reset_all();
+        match self {
+            CacheLayer::Fifo(layer) => layer.pool().reset_all(),
+            CacheLayer::Ttl(layer) => layer.pool().reset_all(),
+            CacheLayer::Disk(layer) => layer.pool().reset_all(),
+        }
     }
 }
 
@@ -1067,13 +1129,26 @@ impl<H: Hashtable> TieredCache<H> {
     fn create_key_verifier(&self) -> CacheKeyVerifier<'_> {
         // Pre-compute direct pool references indexed by pool_id
         // This avoids layer lookup and enum matching in the hot path
-        let mut pools: [Option<(&MemoryPool, bool)>; 4] = [None; 4];
+        let mut pools: [Option<(PoolRef<'_>, bool)>; 4] = [None; 4];
 
         for (pool_id, layer_idx) in self.pool_map.iter().enumerate() {
             if let Some(idx) = layer_idx {
                 if let Some(layer) = self.layers.get(*idx) {
-                    let pool = layer.pool();
-                    pools[pool_id] = Some((pool, pool.is_per_item_ttl()));
+                    match layer {
+                        CacheLayer::Fifo(l) => {
+                            let pool = l.pool();
+                            pools[pool_id] = Some((PoolRef::Memory(pool), pool.is_per_item_ttl()));
+                        }
+                        CacheLayer::Ttl(l) => {
+                            let pool = l.pool();
+                            pools[pool_id] = Some((PoolRef::Memory(pool), pool.is_per_item_ttl()));
+                        }
+                        CacheLayer::Disk(l) => {
+                            let pool = l.pool();
+                            // Disk pools always use segment-level TTL
+                            pools[pool_id] = Some((PoolRef::Disk(pool), false));
+                        }
+                    }
                 }
             }
         }
@@ -1096,13 +1171,22 @@ impl<H: Hashtable> TieredCache<H> {
     }
 }
 
+/// Reference to either a memory pool or a file pool.
+///
+/// Used by CacheKeyVerifier to support both RAM and disk layers.
+#[derive(Clone, Copy)]
+enum PoolRef<'a> {
+    Memory(&'a MemoryPool),
+    Disk(&'a FilePool),
+}
+
 /// Key verifier for TieredCache.
 ///
 /// Stores pre-computed direct pool references indexed by pool_id,
 /// avoiding layer lookup and enum matching in the hot verify path.
 struct CacheKeyVerifier<'a> {
     /// Direct pool references with is_per_item_ttl flag, indexed by pool_id.
-    pools: [Option<(&'a MemoryPool, bool)>; 4],
+    pools: [Option<(PoolRef<'a>, bool)>; 4],
 }
 
 impl KeyVerifier for CacheKeyVerifier<'_> {
@@ -1113,16 +1197,25 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
 
         // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
         // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
-        let Some((pool, _)) = (unsafe { *self.pools.get_unchecked(pool_id as usize) }) else {
+        let Some((pool_ref, _)) = (unsafe { *self.pools.get_unchecked(pool_id as usize) }) else {
             return;
         };
 
-        let Some(segment) = pool.get(segment_id) else {
-            return;
+        // Get data pointer based on pool type
+        let ptr = match pool_ref {
+            PoolRef::Memory(pool) => {
+                let Some(segment) = pool.get(segment_id) else {
+                    return;
+                };
+                unsafe { segment.data_ptr().add(offset as usize) }
+            }
+            PoolRef::Disk(pool) => {
+                let Some(segment) = pool.get(segment_id) else {
+                    return;
+                };
+                unsafe { segment.data_ptr().add(offset as usize) }
+            }
         };
-
-        // Prefetch the item header location
-        let ptr = unsafe { segment.data_ptr().add(offset as usize) };
 
         // Use platform-specific prefetch intrinsics
         #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
@@ -1156,25 +1249,27 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
 
         // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
         // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
-        let Some((pool, is_per_item_ttl)) =
+        let Some((pool_ref, _is_per_item_ttl)) =
             (unsafe { *self.pools.get_unchecked(pool_id as usize) })
         else {
             return false;
         };
 
-        let Some(segment) = pool.get(segment_id) else {
-            return false;
-        };
-
-        // Branch once at pool level instead of per-segment
-        if is_per_item_ttl {
-            segment
-                .verify_key_with_ttl_header(offset, key, allow_deleted)
-                .is_some()
-        } else {
-            segment
-                .verify_key_with_basic_header(offset, key, allow_deleted)
-                .is_some()
+        // Branch based on pool type
+        // Use verify_key_at_offset from SegmentKeyVerify trait
+        match pool_ref {
+            PoolRef::Memory(pool) => {
+                let Some(segment) = pool.get(segment_id) else {
+                    return false;
+                };
+                segment.verify_key_at_offset(offset, key, allow_deleted)
+            }
+            PoolRef::Disk(pool) => {
+                let Some(segment) = pool.get(segment_id) else {
+                    return false;
+                };
+                segment.verify_key_at_offset(offset, key, allow_deleted)
+            }
         }
     }
 }
@@ -1216,6 +1311,17 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
         let pool_id = layer.pool().pool_id();
         let layer_idx = self.layers.len();
         self.layers.push(CacheLayer::Ttl(layer));
+        if pool_id < 4 {
+            self.pool_map[pool_id as usize] = Some(layer_idx);
+        }
+        self
+    }
+
+    /// Add a disk layer (extended capacity tier).
+    pub fn with_disk_layer(mut self, layer: DiskLayer) -> Self {
+        let pool_id = layer.pool().pool_id();
+        let layer_idx = self.layers.len();
+        self.layers.push(CacheLayer::Disk(layer));
         if pool_id < 4 {
             self.pool_map[pool_id as usize] = Some(layer_idx);
         }

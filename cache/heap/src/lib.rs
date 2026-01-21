@@ -75,6 +75,9 @@ mod verifier;
 
 pub use s3fifo_policy::S3FifoPolicy;
 
+// Re-export from cache-core for disk tier configuration
+pub use cache_core::SyncMode;
+
 use std::time::Duration;
 
 // Use loom-compatible atomics for some fields, std for others
@@ -85,9 +88,10 @@ use sync::{Arc, AtomicU32, AtomicU64, Ordering};
 use std::sync::atomic::AtomicUsize;
 
 use cache_core::{
-    Cache, CacheError, CacheResult, DEFAULT_TTL, Hashtable, MultiChoiceHashtable, OwnedGuard,
-    ValueRef,
+    Cache, CacheError, CacheResult, DEFAULT_TTL, DiskLayer, DiskLayerBuilder, Hashtable,
+    MultiChoiceHashtable, OwnedGuard, ValueRef,
 };
+use std::path::PathBuf;
 
 use entry::HeapEntry;
 use location::SlotLocation;
@@ -134,6 +138,10 @@ enum EvictionState {
 /// Uses the MultiChoiceHashtable for key lookups and SlotStorage for
 /// managing heap-allocated entries. Tracks memory usage and evicts
 /// based on byte limits rather than item count.
+///
+/// Optionally supports a disk tier for extended capacity. When enabled,
+/// items evicted from RAM are demoted to disk storage instead of being
+/// discarded.
 pub struct HeapCache {
     /// The hashtable for key lookups.
     hashtable: Arc<MultiChoiceHashtable>,
@@ -158,6 +166,9 @@ pub struct HeapCache {
     fragmentation_ratio: AtomicU32,
     /// Operations counter for periodic calibration.
     ops_counter: AtomicU64,
+
+    /// Optional disk tier for extended capacity.
+    disk_layer: Option<DiskLayer>,
 }
 
 impl HeapCache {
@@ -985,6 +996,52 @@ impl Cache for HeapCache {
     }
 }
 
+/// Configuration for the disk tier.
+#[derive(Debug, Clone)]
+pub struct DiskTierConfig {
+    /// Path to the disk cache file.
+    pub path: PathBuf,
+    /// Total size of disk storage in bytes.
+    pub size: usize,
+    /// Frequency threshold for promoting items from disk to RAM.
+    pub promotion_threshold: u8,
+    /// Synchronization mode for disk writes.
+    pub sync_mode: SyncMode,
+    /// Whether to recover from existing disk cache on startup.
+    pub recover_on_startup: bool,
+}
+
+impl DiskTierConfig {
+    /// Create a new disk tier configuration.
+    pub fn new(path: impl Into<PathBuf>, size: usize) -> Self {
+        Self {
+            path: path.into(),
+            size,
+            promotion_threshold: 2,
+            sync_mode: SyncMode::default(),
+            recover_on_startup: true,
+        }
+    }
+
+    /// Set the promotion threshold.
+    pub fn promotion_threshold(mut self, threshold: u8) -> Self {
+        self.promotion_threshold = threshold;
+        self
+    }
+
+    /// Set the sync mode.
+    pub fn sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
+        self
+    }
+
+    /// Set whether to recover on startup.
+    pub fn recover_on_startup(mut self, recover: bool) -> Self {
+        self.recover_on_startup = recover;
+        self
+    }
+}
+
 /// Builder for [`HeapCache`].
 #[derive(Debug, Clone)]
 pub struct HeapCacheBuilder {
@@ -995,6 +1052,7 @@ pub struct HeapCacheBuilder {
     eviction_policy: EvictionPolicy,
     small_queue_percent: u8,
     demotion_threshold: u8,
+    disk_tier: Option<DiskTierConfig>,
 }
 
 impl Default for HeapCacheBuilder {
@@ -1014,6 +1072,7 @@ impl HeapCacheBuilder {
             eviction_policy: EvictionPolicy::default(),
             small_queue_percent: DEFAULT_SMALL_QUEUE_PERCENT,
             demotion_threshold: DEFAULT_DEMOTION_THRESHOLD,
+            disk_tier: None,
         }
     }
 
@@ -1076,8 +1135,23 @@ impl HeapCacheBuilder {
         self
     }
 
+    /// Enable disk tier with the given configuration.
+    ///
+    /// When enabled, items evicted from RAM are demoted to disk storage
+    /// instead of being discarded. On disk hit, items can be promoted
+    /// back to RAM based on access frequency.
+    pub fn disk_tier(mut self, config: DiskTierConfig) -> Self {
+        self.disk_tier = Some(config);
+        self
+    }
+
     /// Build the HeapCache.
-    pub fn build(self) -> HeapCache {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk tier is configured but the disk layer
+    /// cannot be created (e.g., path doesn't exist, I/O error).
+    pub fn build(self) -> Result<HeapCache, std::io::Error> {
         // Slot capacity is derived from hashtable power - the hashtable
         // constrains max items, so slot storage matches that limit.
         // MultiChoiceHashtable has 8 items per bucket, so max items = 2^power * 8.
@@ -1092,7 +1166,24 @@ impl HeapCacheBuilder {
             EvictionPolicy::Lfu => EvictionState::Lfu,
         };
 
-        HeapCache {
+        // Build disk layer if configured
+        let disk_layer = match self.disk_tier {
+            Some(config) => {
+                let layer = DiskLayerBuilder::new()
+                    .layer_id(1)
+                    .pool_id(2)
+                    .segment_size(8 * 1024 * 1024) // 8MB segments
+                    .path(&config.path)
+                    .size(config.size)
+                    .sync_mode(config.sync_mode)
+                    .recover_on_startup(config.recover_on_startup)
+                    .build()?;
+                Some(layer)
+            }
+            None => None,
+        };
+
+        Ok(HeapCache {
             hashtable: Arc::new(MultiChoiceHashtable::new(self.hashtable_power)),
             storage: SlotStorage::new(slot_capacity),
             default_ttl: self.default_ttl,
@@ -1103,7 +1194,8 @@ impl HeapCacheBuilder {
             bytes_limit: self.memory_limit,
             fragmentation_ratio: AtomicU32::new(self.initial_fragmentation_ratio),
             ops_counter: AtomicU64::new(0),
-        }
+            disk_layer,
+        })
     }
 }
 
@@ -1117,6 +1209,7 @@ mod tests {
             .hashtable_power(10) // 2^10 = 1024 slots
             .initial_fragmentation_ratio(100) // No fragmentation for predictable tests
             .build()
+            .expect("Failed to create test cache")
     }
 
     #[test]
@@ -1173,7 +1266,8 @@ mod tests {
             .memory_limit(1024) // 1KB limit
             .hashtable_power(7) // 2^7 = 128 slots (plenty for this test)
             .initial_fragmentation_ratio(100)
-            .build();
+            .build()
+            .expect("Failed to build cache");
 
         // Fill with items until we hit the memory limit
         let value = vec![b'x'; 100]; // 100 byte values
@@ -1222,7 +1316,8 @@ mod tests {
             .memory_limit(10000)
             .hashtable_power(7) // 2^7 = 128 slots
             .initial_fragmentation_ratio(150) // 50% overhead
-            .build();
+            .build()
+            .expect("Failed to build cache");
 
         assert_eq!(cache.fragmentation_ratio(), 150);
 
@@ -1305,7 +1400,8 @@ mod tests {
             .hashtable_power(7)
             .initial_fragmentation_ratio(100)
             .eviction_policy(EvictionPolicy::S3Fifo)
-            .build();
+            .build()
+            .expect("Failed to build cache");
 
         // Fill with items until we hit the memory limit
         let value = vec![b'x'; 100];
@@ -1327,7 +1423,8 @@ mod tests {
             .hashtable_power(7)
             .initial_fragmentation_ratio(100)
             .eviction_policy(EvictionPolicy::Lfu)
-            .build();
+            .build()
+            .expect("Failed to build cache");
 
         // Fill with items until we hit the memory limit
         let value = vec![b'x'; 100];
@@ -1349,7 +1446,8 @@ mod tests {
             .hashtable_power(7)
             .initial_fragmentation_ratio(100)
             .eviction_policy(EvictionPolicy::S3Fifo)
-            .build();
+            .build()
+            .expect("Failed to build cache");
 
         // Insert a "hot" key and access it multiple times
         let hot_key = b"hot_key";
@@ -1386,13 +1484,15 @@ mod tests {
             .eviction_policy(EvictionPolicy::S3Fifo)
             .small_queue_percent(20) // Non-default small queue size
             .demotion_threshold(2) // Non-default threshold
-            .build();
+            .build()
+            .expect("Failed to build cache");
 
         let lfu_cache = HeapCacheBuilder::new()
             .memory_limit(1024)
             .hashtable_power(7)
             .eviction_policy(EvictionPolicy::Lfu)
-            .build();
+            .build()
+            .expect("Failed to build cache");
 
         // Both caches should work
         s3fifo_cache.set(b"key", b"value", None).unwrap();

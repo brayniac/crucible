@@ -77,15 +77,18 @@ mod location;
 mod sync;
 mod verifier;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use cache_core::{
-    Cache, CacheError, CacheResult, Hashtable, MultiChoiceHashtable, OwnedGuard, ValueRef,
+    Cache, CacheError, CacheResult, DiskLayer, DiskLayerBuilder, Hashtable, MultiChoiceHashtable,
+    OwnedGuard, ValueRef,
 };
 
 pub use cache_core::HugepageSize;
+pub use cache_core::SyncMode;
 pub use config::{EvictionStrategy, HEADER_SIZE, SlabCacheConfig, SlabClasses};
 
 use allocator::SlabAllocator;
@@ -94,6 +97,10 @@ use location::SlabLocation;
 /// Memcached-style slab allocator cache.
 ///
 /// Uses a traditional slab allocator with slab-level eviction.
+///
+/// Optionally supports a disk tier for extended capacity. When enabled,
+/// items evicted from RAM are demoted to disk storage instead of being
+/// discarded.
 pub struct SlabCache {
     /// The hashtable for key lookups.
     hashtable: Arc<MultiChoiceHashtable>,
@@ -103,6 +110,8 @@ pub struct SlabCache {
     default_ttl: Duration,
     /// Enable ghost entries.
     enable_ghosts: bool,
+    /// Optional disk tier for extended capacity.
+    disk_layer: Option<DiskLayer>,
 }
 
 impl SlabCache {
@@ -687,15 +696,65 @@ impl Cache for SlabCache {
     }
 }
 
+/// Configuration for the disk tier.
+#[derive(Debug, Clone)]
+pub struct DiskTierConfig {
+    /// Path to the disk cache file.
+    pub path: PathBuf,
+    /// Total size of disk storage in bytes.
+    pub size: usize,
+    /// Frequency threshold for promoting items from disk to RAM.
+    pub promotion_threshold: u8,
+    /// Synchronization mode for disk writes.
+    pub sync_mode: SyncMode,
+    /// Whether to recover from existing disk cache on startup.
+    pub recover_on_startup: bool,
+}
+
+impl DiskTierConfig {
+    /// Create a new disk tier configuration.
+    pub fn new(path: impl Into<PathBuf>, size: usize) -> Self {
+        Self {
+            path: path.into(),
+            size,
+            promotion_threshold: 2,
+            sync_mode: SyncMode::default(),
+            recover_on_startup: true,
+        }
+    }
+
+    /// Set the promotion threshold.
+    pub fn promotion_threshold(mut self, threshold: u8) -> Self {
+        self.promotion_threshold = threshold;
+        self
+    }
+
+    /// Set the sync mode.
+    pub fn sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
+        self
+    }
+
+    /// Set whether to recover on startup.
+    pub fn recover_on_startup(mut self, recover: bool) -> Self {
+        self.recover_on_startup = recover;
+        self
+    }
+}
+
 /// Builder for [`SlabCache`].
 #[derive(Debug, Clone)]
 pub struct SlabCacheBuilder {
     config: SlabCacheConfig,
+    disk_tier: Option<DiskTierConfig>,
 }
 
 impl Default for SlabCacheBuilder {
     fn default() -> Self {
-        Self::new()
+        Self {
+            config: SlabCacheConfig::default(),
+            disk_tier: None,
+        }
     }
 }
 
@@ -704,6 +763,7 @@ impl SlabCacheBuilder {
     pub fn new() -> Self {
         Self {
             config: SlabCacheConfig::default(),
+            disk_tier: None,
         }
     }
 
@@ -785,6 +845,16 @@ impl SlabCacheBuilder {
         self
     }
 
+    /// Enable disk tier with the given configuration.
+    ///
+    /// When enabled, items evicted from RAM are demoted to disk storage
+    /// instead of being discarded. On disk hit, items can be promoted
+    /// back to RAM based on access frequency.
+    pub fn disk_tier(mut self, config: DiskTierConfig) -> Self {
+        self.disk_tier = Some(config);
+        self
+    }
+
     /// Build the SlabCache.
     pub fn build(self) -> Result<SlabCache, std::io::Error> {
         // Create allocator
@@ -793,11 +863,29 @@ impl SlabCacheBuilder {
         // Create hashtable
         let hashtable = Arc::new(MultiChoiceHashtable::new(self.config.hashtable_power));
 
+        // Build disk layer if configured
+        let disk_layer = match self.disk_tier {
+            Some(config) => {
+                let layer = DiskLayerBuilder::new()
+                    .layer_id(1)
+                    .pool_id(2)
+                    .segment_size(8 * 1024 * 1024) // 8MB segments
+                    .path(&config.path)
+                    .size(config.size)
+                    .sync_mode(config.sync_mode)
+                    .recover_on_startup(config.recover_on_startup)
+                    .build()?;
+                Some(layer)
+            }
+            None => None,
+        };
+
         Ok(SlabCache {
             hashtable,
             allocator,
             default_ttl: self.config.default_ttl,
             enable_ghosts: self.config.enable_ghosts,
+            disk_layer,
         })
     }
 }

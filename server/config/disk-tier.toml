@@ -1,0 +1,61 @@
+# Crucible Server Configuration with Disk Tier
+#
+# This configuration enables disk tiering to extend cache capacity
+# beyond available RAM. Items evicted from RAM are demoted to disk
+# storage instead of being discarded.
+
+runtime = "native"
+
+[workers]
+# threads = 8
+# cpu_affinity = "0-7"
+
+[cache]
+# RAM tier configuration
+backend = "segment"
+policy = "s3fifo"
+heap_size = "4GB"
+segment_size = "1MB"
+hashtable_power = 26
+hugepage = "none"
+
+# Disk tier configuration
+[cache.disk]
+enabled = true
+# Path to the disk cache file
+# The directory must exist and be writable
+path = "/var/cache/crucible/disk.dat"
+# Total size of disk storage
+# This should typically be larger than heap_size for meaningful extension
+size = "100GB"
+# Frequency threshold for promotion from disk to RAM
+# Items accessed more than this many times while on disk will be promoted
+# Higher values = fewer promotions, more stable disk tier
+# Lower values = more promotions, faster access for hot items
+promotion_threshold = 2
+# Synchronization mode:
+#   "sync"  - fsync after each write (safest, slowest)
+#   "async" - periodic background fsync (balanced, recommended)
+#   "none"  - OS handles flushing (fastest, may lose data on crash)
+sync_mode = "async"
+# Attempt to recover existing disk cache on startup
+# Set to false to always start with a fresh disk cache
+recover_on_startup = true
+
+[[listener]]
+protocol = "resp"
+address = "0.0.0.0:6379"
+
+[[listener]]
+protocol = "memcache"
+address = "0.0.0.0:11211"
+
+[metrics]
+address = "0.0.0.0:9090"
+
+[uring]
+sqpoll = false
+sqpoll_idle_ms = 1000
+buffer_count = 1024
+buffer_size = 4096
+sq_depth = 1024

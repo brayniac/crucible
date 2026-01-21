@@ -50,6 +50,17 @@ impl RespCodec {
         len
     }
 
+    /// Encodes a DEL command.
+    #[inline]
+    pub fn encode_delete(&self, buf: &mut Buffer, key: &[u8]) -> usize {
+        let req = Request::del(key);
+        let needed = req.encoded_len();
+        Self::ensure_space(buf, needed);
+        let len = req.encode(buf.spare_mut());
+        buf.advance(len);
+        len
+    }
+
     /// Encodes a SET command with expiration (EX seconds).
     #[inline]
     pub fn encode_set_ex(&self, buf: &mut Buffer, key: &[u8], value: &[u8], ex: u64) -> usize {

@@ -448,6 +448,53 @@ impl Session {
         Some(id)
     }
 
+    /// Queue a DELETE request.
+    ///
+    /// The `now` parameter should be the current time, shared across a batch of
+    /// requests to avoid excessive clock_gettime calls.
+    #[inline]
+    pub fn delete(&mut self, key: &[u8], now: Instant) -> Option<u64> {
+        if !self.can_send() {
+            return None;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        match &mut self.codec {
+            ProtocolCodec::Resp(codec) => {
+                codec.encode_delete(&mut self.buffers.send, key);
+            }
+            ProtocolCodec::Memcache(codec) => {
+                codec.encode_delete(&mut self.buffers.send, key);
+            }
+            ProtocolCodec::MemcacheBinary(codec) => {
+                codec.encode_delete(&mut self.buffers.send, key);
+            }
+            ProtocolCodec::Ping(codec) => {
+                // Ping protocol doesn't support DELETE, send PING instead
+                codec.encode_ping(&mut self.buffers.send);
+            }
+        }
+
+        self.in_flight.push_back(InFlightRequest {
+            id,
+            request_type: RequestType::Delete,
+            queued_at: now,
+            tx_timestamp: None,
+        });
+        self.requests_sent += 1;
+
+        tracing::trace!(
+            conn_id = ?self.conn_id,
+            id = id,
+            in_flight = self.in_flight.len(),
+            "queued DELETE request"
+        );
+
+        Some(id)
+    }
+
     /// Get the send buffer to be written to the socket.
     pub fn send_buffer(&self) -> &[u8] {
         self.buffers.send.as_slice()

@@ -46,9 +46,10 @@
 #![warn(clippy::all)]
 
 use cache_core::{
-    CacheLayer, CasToken, FifoLayerBuilder, ItemGuard, LayerConfig, MultiChoiceHashtable,
-    TieredCache, TieredCacheBuilder, TtlLayerBuilder,
+    CacheLayer, CasToken, DiskLayerBuilder, FifoLayerBuilder, ItemGuard, LayerConfig,
+    MultiChoiceHashtable, TieredCache, TieredCacheBuilder, TtlLayerBuilder,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,7 +57,7 @@ use std::time::Duration;
 pub use cache_core::{
     AtomicCounters, BasicItemGuard, Cache, CacheError, CacheMetrics, CacheResult, CounterSnapshot,
     DEFAULT_TTL, EvictionStrategy, FrequencyDecay, HugepageSize, ItemLocation, LayerMetrics,
-    MergeConfig, OwnedGuard, PoolMetrics, ValueRef,
+    MergeConfig, OwnedGuard, PoolMetrics, SyncMode, ValueRef,
 };
 
 /// Eviction policy for the segmented cache.
@@ -244,6 +245,53 @@ impl SegCache {
     }
 }
 
+/// Configuration for the disk tier.
+#[derive(Debug, Clone)]
+pub struct DiskTierConfig {
+    /// Path to the disk cache file.
+    pub path: PathBuf,
+    /// Total size of disk storage in bytes.
+    pub size: usize,
+    /// Frequency threshold for promoting items from disk to RAM.
+    /// Items with frequency > threshold are promoted on read.
+    pub promotion_threshold: u8,
+    /// Synchronization mode for disk writes.
+    pub sync_mode: SyncMode,
+    /// Whether to recover from existing disk cache on startup.
+    pub recover_on_startup: bool,
+}
+
+impl DiskTierConfig {
+    /// Create a new disk tier configuration.
+    pub fn new(path: impl Into<PathBuf>, size: usize) -> Self {
+        Self {
+            path: path.into(),
+            size,
+            promotion_threshold: 2,
+            sync_mode: SyncMode::default(),
+            recover_on_startup: true,
+        }
+    }
+
+    /// Set the promotion threshold.
+    pub fn promotion_threshold(mut self, threshold: u8) -> Self {
+        self.promotion_threshold = threshold;
+        self
+    }
+
+    /// Set the sync mode.
+    pub fn sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
+        self
+    }
+
+    /// Set whether to recover on startup.
+    pub fn recover_on_startup(mut self, recover: bool) -> Self {
+        self.recover_on_startup = recover;
+        self
+    }
+}
+
 /// Builder for [`SegCache`].
 ///
 /// # Example
@@ -279,6 +327,9 @@ pub struct SegCacheBuilder {
 
     /// Eviction policy for the cache.
     eviction_policy: EvictionPolicy,
+
+    /// Disk tier configuration (optional).
+    disk_tier: Option<DiskTierConfig>,
 }
 
 impl Default for SegCacheBuilder {
@@ -295,6 +346,7 @@ impl SegCacheBuilder {
     /// - Hashtable: 2^16 = 64K buckets
     /// - Ghosts: disabled
     /// - Eviction: Random
+    /// - Disk tier: disabled
     pub fn new() -> Self {
         Self {
             heap_size: 64 * 1024 * 1024, // 64MB
@@ -304,6 +356,7 @@ impl SegCacheBuilder {
             enable_ghosts: false,
             numa_node: None,
             eviction_policy: EvictionPolicy::Random,
+            disk_tier: None,
         }
     }
 
@@ -385,6 +438,27 @@ impl SegCacheBuilder {
         self
     }
 
+    /// Enable disk tier with the given configuration.
+    ///
+    /// When enabled, items evicted from RAM are demoted to disk storage
+    /// instead of being discarded. On disk hit, items can be promoted
+    /// back to RAM based on access frequency.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use segcache::{SegCacheBuilder, DiskTierConfig};
+    ///
+    /// let cache = SegCacheBuilder::new()
+    ///     .heap_size(4 * 1024 * 1024 * 1024)  // 4GB RAM
+    ///     .disk_tier(DiskTierConfig::new("/var/cache/crucible/disk.dat", 100 * 1024 * 1024 * 1024))  // 100GB disk
+    ///     .build()?;
+    /// ```
+    pub fn disk_tier(mut self, config: DiskTierConfig) -> Self {
+        self.disk_tier = Some(config);
+        self
+    }
+
     /// Build the SegCache.
     ///
     /// # Errors
@@ -421,9 +495,16 @@ impl SegCacheBuilder {
             EvictionPolicy::S3Fifo { .. } => unreachable!(),
         };
 
-        let layer_config = LayerConfig::new()
+        // If disk tier is enabled, configure demotion to disk layer (layer 1)
+        let mut layer_config = LayerConfig::new()
             .with_ghosts(self.enable_ghosts)
             .with_eviction_strategy(eviction_strategy);
+
+        if self.disk_tier.is_some() {
+            // Demote to disk layer (layer 1) with demotion threshold of 1
+            // (demote items that have been accessed at least once)
+            layer_config = layer_config.with_next_layer(1).with_demotion_threshold(1);
+        }
 
         let mut layer_builder = TtlLayerBuilder::new()
             .layer_id(0)
@@ -439,9 +520,28 @@ impl SegCacheBuilder {
 
         let layer = layer_builder.build()?;
 
-        Ok(TieredCacheBuilder::new(hashtable)
-            .with_layer(CacheLayer::Ttl(layer))
-            .build())
+        let mut builder = TieredCacheBuilder::new(hashtable).with_layer(CacheLayer::Ttl(layer));
+
+        // Add disk layer if configured
+        if let Some(disk_config) = self.disk_tier {
+            let disk_layer_config = LayerConfig::new()
+                .with_ghosts(self.enable_ghosts)
+                .with_eviction_strategy(EvictionStrategy::Random);
+
+            let disk_layer = DiskLayerBuilder::new()
+                .layer_id(1)
+                .pool_id(2) // Use pool_id 2 for disk
+                .config(disk_layer_config)
+                .segment_size(self.segment_size)
+                .path(disk_config.path)
+                .size(disk_config.size)
+                .sync_mode(disk_config.sync_mode)
+                .build()?;
+
+            builder = builder.with_disk_layer(disk_layer);
+        }
+
+        Ok(builder.build())
     }
 
     /// Build a two-layer S3-FIFO cache architecture.
@@ -467,7 +567,7 @@ impl SegCacheBuilder {
         let small_queue_size = small_queue_segments * self.segment_size;
         let main_cache_size = main_cache_segments * self.segment_size;
 
-        // Layer 0: FIFO small queue with ghosts and demotion
+        // Layer 0: FIFO small queue with ghosts and demotion to layer 1
         let layer0_config = LayerConfig::new()
             .with_ghosts(true)
             .with_next_layer(1)
@@ -488,9 +588,15 @@ impl SegCacheBuilder {
         let layer0 = layer0_builder.build()?;
 
         // Layer 1: TTL-organized main cache with merge eviction
-        let layer1_config = LayerConfig::new()
+        // If disk tier is enabled, configure demotion to disk layer (layer 2)
+        let mut layer1_config = LayerConfig::new()
             .with_ghosts(true)
             .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default()));
+
+        if self.disk_tier.is_some() {
+            // Demote to disk layer (layer 2) with demotion threshold of 1
+            layer1_config = layer1_config.with_next_layer(2).with_demotion_threshold(1);
+        }
 
         let mut layer1_builder = TtlLayerBuilder::new()
             .layer_id(1)
@@ -506,10 +612,30 @@ impl SegCacheBuilder {
 
         let layer1 = layer1_builder.build()?;
 
-        Ok(TieredCacheBuilder::new(hashtable)
+        let mut builder = TieredCacheBuilder::new(hashtable)
             .with_fifo_layer(layer0)
-            .with_ttl_layer(layer1)
-            .build())
+            .with_ttl_layer(layer1);
+
+        // Add disk layer if configured
+        if let Some(disk_config) = self.disk_tier {
+            let disk_layer_config = LayerConfig::new()
+                .with_ghosts(true)
+                .with_eviction_strategy(EvictionStrategy::Random);
+
+            let disk_layer = DiskLayerBuilder::new()
+                .layer_id(2)
+                .pool_id(2) // Use pool_id 2 for disk
+                .config(disk_layer_config)
+                .segment_size(self.segment_size)
+                .path(disk_config.path)
+                .size(disk_config.size)
+                .sync_mode(disk_config.sync_mode)
+                .build()?;
+
+            builder = builder.with_disk_layer(disk_layer);
+        }
+
+        Ok(builder.build())
     }
 }
 

@@ -220,6 +220,8 @@ pub struct Commands {
     pub get: u8,
     #[serde(default = "default_set_ratio")]
     pub set: u8,
+    #[serde(default = "default_delete_ratio")]
+    pub delete: u8,
 }
 
 impl Default for Commands {
@@ -227,6 +229,7 @@ impl Default for Commands {
         Self {
             get: default_get_ratio(),
             set: default_set_ratio(),
+            delete: default_delete_ratio(),
         }
     }
 }
@@ -237,6 +240,10 @@ fn default_get_ratio() -> u8 {
 
 fn default_set_ratio() -> u8 {
     20
+}
+
+fn default_delete_ratio() -> u8 {
+    0
 }
 
 #[derive(Debug, Clone, Deserialize)]

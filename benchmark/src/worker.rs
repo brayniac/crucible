@@ -358,6 +358,7 @@ impl IoWorker {
     fn poll_once_momento(&mut self, now: std::time::Instant) -> io::Result<()> {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
+        let delete_ratio = self.config.workload.commands.delete;
         let warmup = self.warmup;
 
         for session in &mut self.momento_sessions {
@@ -387,9 +388,12 @@ impl IoWorker {
                 let key_id = self.rng.random_range(0..key_count);
                 write_key(&mut self.key_buf, key_id);
 
-                let is_get = self.rng.random_range(0..100) < get_ratio;
-                let sent = if is_get {
+                // Command selection: GET if < get_ratio, DELETE if < get_ratio + delete_ratio, else SET
+                let roll = self.rng.random_range(0..100);
+                let sent = if roll < get_ratio {
                     session.get(&self.key_buf, now).is_some()
+                } else if roll < get_ratio + delete_ratio {
+                    session.delete(&self.key_buf, now).is_some()
                 } else {
                     self.rng.fill_bytes(&mut self.value_buf);
                     session.set(&self.key_buf, &self.value_buf, now).is_some()
@@ -437,7 +441,11 @@ impl IoWorker {
                             metrics::SET_COUNT.increment();
                             let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                         }
-                        _ => {}
+                        RequestType::Delete => {
+                            metrics::DELETE_COUNT.increment();
+                            let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);
+                        }
+                        RequestType::Ping | RequestType::Other => {}
                     }
                 }
             }
@@ -450,6 +458,7 @@ impl IoWorker {
     fn drive_requests(&mut self, now: std::time::Instant) -> io::Result<()> {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
+        let delete_ratio = self.config.workload.commands.delete;
         let warmup = self.warmup;
 
         // Pack each connection's pipeline to maximize throughput.
@@ -472,9 +481,12 @@ impl IoWorker {
                 let key_id = self.rng.random_range(0..key_count);
                 write_key(&mut self.key_buf, key_id);
 
-                let is_get = self.rng.random_range(0..100) < get_ratio;
-                let sent = if is_get {
+                // Command selection: GET if < get_ratio, DELETE if < get_ratio + delete_ratio, else SET
+                let roll = self.rng.random_range(0..100);
+                let sent = if roll < get_ratio {
                     session.get(&self.key_buf, now).is_some()
+                } else if roll < get_ratio + delete_ratio {
+                    session.delete(&self.key_buf, now).is_some()
                 } else {
                     self.rng.fill_bytes(&mut self.value_buf);
                     session.set(&self.key_buf, &self.value_buf, now).is_some()
@@ -601,7 +613,12 @@ impl IoWorker {
                                         metrics::SET_COUNT.increment();
                                         let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                                     }
-                                    _ => {}
+                                    RequestType::Delete => {
+                                        metrics::DELETE_COUNT.increment();
+                                        let _ =
+                                            metrics::DELETE_LATENCY.increment(result.latency_ns);
+                                    }
+                                    RequestType::Ping | RequestType::Other => {}
                                 }
                             }
                         }
@@ -705,7 +722,11 @@ impl IoWorker {
                         metrics::SET_COUNT.increment();
                         let _ = metrics::SET_LATENCY.increment(result.latency_ns);
                     }
-                    _ => {}
+                    RequestType::Delete => {
+                        metrics::DELETE_COUNT.increment();
+                        let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);
+                    }
+                    RequestType::Ping | RequestType::Other => {}
                 }
             }
         }

@@ -128,7 +128,10 @@ fn create_segment(
     config: &Config,
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use segcache::{EvictionPolicy as SegEvictionPolicy, HugepageSize, MergeConfig, SegCache};
+    use segcache::{
+        DiskTierConfig, EvictionPolicy as SegEvictionPolicy, HugepageSize, MergeConfig, SegCache,
+        SyncMode,
+    };
 
     let hugepage_size = match config.cache.hugepage {
         HugepageConfig::None => HugepageSize::None,
@@ -159,6 +162,24 @@ fn create_segment(
         builder = builder.numa_node(node);
     }
 
+    // Configure disk tier if enabled
+    if let Some(ref disk_config) = config.cache.disk {
+        if disk_config.enabled {
+            let sync_mode = match disk_config.sync_mode {
+                server::config::DiskSyncMode::Sync => SyncMode::Sync,
+                server::config::DiskSyncMode::Async => SyncMode::Async,
+                server::config::DiskSyncMode::None => SyncMode::None,
+            };
+
+            let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+                .promotion_threshold(disk_config.promotion_threshold)
+                .sync_mode(sync_mode)
+                .recover_on_startup(disk_config.recover_on_startup);
+
+            builder = builder.disk_tier(disk_tier);
+        }
+    }
+
     let cache = builder.build()?;
 
     Ok(cache)
@@ -168,7 +189,7 @@ fn create_slab(
     config: &Config,
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use slab_cache::{EvictionStrategy, HugepageSize, SlabCache};
+    use slab_cache::{DiskTierConfig, EvictionStrategy, HugepageSize, SlabCache, SyncMode};
 
     let hugepage_size = match config.cache.hugepage {
         HugepageConfig::None => HugepageSize::None,
@@ -196,6 +217,24 @@ fn create_slab(
         builder = builder.numa_node(node);
     }
 
+    // Configure disk tier if enabled
+    if let Some(ref disk_config) = config.cache.disk {
+        if disk_config.enabled {
+            let sync_mode = match disk_config.sync_mode {
+                server::config::DiskSyncMode::Sync => SyncMode::Sync,
+                server::config::DiskSyncMode::Async => SyncMode::Async,
+                server::config::DiskSyncMode::None => SyncMode::None,
+            };
+
+            let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+                .promotion_threshold(disk_config.promotion_threshold)
+                .sync_mode(sync_mode)
+                .recover_on_startup(disk_config.recover_on_startup);
+
+            builder = builder.disk_tier(disk_tier);
+        }
+    }
+
     let cache = builder.build()?;
 
     Ok(cache)
@@ -205,7 +244,7 @@ fn create_heap(
     config: &Config,
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use heap_cache::{EvictionPolicy as HeapEvictionPolicy, HeapCache};
+    use heap_cache::{DiskTierConfig, EvictionPolicy as HeapEvictionPolicy, HeapCache, SyncMode};
 
     let heap_policy = match policy {
         EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
@@ -213,11 +252,30 @@ fn create_heap(
         _ => unreachable!("invalid policy for heap backend"),
     };
 
-    let cache = HeapCache::builder()
+    let mut builder = HeapCache::builder()
         .memory_limit(config.cache.heap_size)
         .hashtable_power(config.cache.hashtable_power)
-        .eviction_policy(heap_policy)
-        .build();
+        .eviction_policy(heap_policy);
+
+    // Configure disk tier if enabled
+    if let Some(ref disk_config) = config.cache.disk {
+        if disk_config.enabled {
+            let sync_mode = match disk_config.sync_mode {
+                server::config::DiskSyncMode::Sync => SyncMode::Sync,
+                server::config::DiskSyncMode::Async => SyncMode::Async,
+                server::config::DiskSyncMode::None => SyncMode::None,
+            };
+
+            let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+                .promotion_threshold(disk_config.promotion_threshold)
+                .sync_mode(sync_mode)
+                .recover_on_startup(disk_config.recover_on_startup);
+
+            builder = builder.disk_tier(disk_tier);
+        }
+    }
+
+    let cache = builder.build()?;
 
     Ok(cache)
 }
@@ -261,6 +319,16 @@ hugepage = "none"
 # NUMA node to bind cache memory to (Linux only)
 # If not set, auto-detected from cpu_affinity when all CPUs are on the same node
 # numa_node = 0
+
+# Disk tier configuration (optional)
+# When enabled, items evicted from RAM are demoted to disk instead of being discarded
+# [cache.disk]
+# enabled = true
+# path = "/var/cache/crucible/disk.dat"
+# size = "100GB"
+# promotion_threshold = 2       # Promote items with freq > threshold to RAM
+# sync_mode = "async"           # "sync", "async", or "none"
+# recover_on_startup = true     # Recover existing disk cache on startup
 
 # Protocol listeners - configure one or more
 [[listener]]
