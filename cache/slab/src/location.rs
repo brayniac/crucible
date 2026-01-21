@@ -55,14 +55,25 @@ impl SlabLocation {
     ///
     /// # Panics
     ///
-    /// Panics in debug mode if:
-    /// - pool_id exceeds 2 bits
-    /// - class_id exceeds 6 bits
-    /// - slab_id exceeds 20 bits
+    /// Panics if:
+    /// - pool_id > 3 (exceeds 2 bits)
+    /// - class_id > 63 (exceeds 6 bits) - reduce slab_size or increase growth_factor
+    /// - slab_id exceeds 20 bits (debug only)
     #[inline]
     pub fn with_pool(pool_id: u8, class_id: u8, slab_id: u32, slot_index: u16) -> Self {
-        debug_assert!(pool_id <= MAX_POOL_ID, "pool_id exceeds 2 bits");
-        debug_assert!(class_id <= MAX_CLASS_ID, "class_id exceeds 6 bits");
+        // Runtime checks to prevent silent data corruption from bit truncation
+        assert!(
+            pool_id <= MAX_POOL_ID,
+            "pool_id {} exceeds max {}",
+            pool_id,
+            MAX_POOL_ID
+        );
+        assert!(
+            class_id <= MAX_CLASS_ID,
+            "class_id {} exceeds max {} - reduce slab_size or increase growth_factor to generate fewer classes",
+            class_id,
+            MAX_CLASS_ID
+        );
         debug_assert!(slab_id <= MAX_SLAB_ID, "slab_id exceeds 20 bits");
         Self {
             pool_id,

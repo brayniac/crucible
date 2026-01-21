@@ -213,15 +213,39 @@ pub struct SlabClasses {
 }
 
 impl SlabClasses {
+    /// Maximum number of slab classes (limited by 6-bit class_id in location encoding).
+    pub const MAX_CLASSES: usize = 64;
+
     /// Create slab classes from configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configuration generates more than 64 slab classes.
+    /// To fix: increase growth_factor or reduce slab_size.
     pub fn from_config(config: &SlabCacheConfig) -> Self {
-        Self {
-            sizes: config.generate_classes(),
-        }
+        let sizes = config.generate_classes();
+        assert!(
+            sizes.len() <= Self::MAX_CLASSES,
+            "Configuration generates {} slab classes, but max is {} (6-bit class_id). \
+             Increase growth_factor or reduce slab_size.",
+            sizes.len(),
+            Self::MAX_CLASSES
+        );
+        Self { sizes }
     }
 
     /// Create slab classes from explicit sizes (for testing).
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than 64 sizes are provided.
     pub fn from_sizes(sizes: Vec<usize>) -> Self {
+        assert!(
+            sizes.len() <= Self::MAX_CLASSES,
+            "Too many slab classes: {} (max {})",
+            sizes.len(),
+            Self::MAX_CLASSES
+        );
         Self { sizes }
     }
 
