@@ -13,9 +13,11 @@ use crate::config::HEADER_SIZE;
 use crate::item::{SlabItemHeader, now_secs, pack_slot_ref, unpack_slot_ref};
 
 /// Maximum number of slabs per class for lock-free pointer array.
-/// This is generous - with 1MB slabs and 64GB heap, total slabs = 65536.
-/// Per class, even distribution would be ~1000-2000 slabs.
-const MAX_SLABS_PER_CLASS: usize = 4096;
+/// With 1MB slabs and 64GB heap, total slabs = 65536. Since slabs can
+/// concentrate in popular size classes, we need to support the full count.
+/// Memory overhead: 12 bytes per slot (8 byte pointer + 4 byte state).
+/// At 65536 slots = 768KB per class, acceptable for large caches.
+const MAX_SLABS_PER_CLASS: usize = 65536;
 
 /// Slab state for the state machine.
 ///
