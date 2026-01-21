@@ -28,6 +28,17 @@ hashtable_power = 24
 # Note: segment_size and max_value_size are not used by heap backend
 # but won't cause errors if present
 
+# Disk tier - extend cache capacity beyond RAM (optional)
+# When enabled, evicted items are demoted to disk instead of discarded.
+# Uncomment to enable:
+# [cache.disk]
+# enabled = true
+# path = "/var/cache/crucible/disk.dat"
+# size = "100GB"
+# promotion_threshold = 2    # Promote items accessed > N times to RAM
+# sync_mode = "async"        # "sync", "async", or "none"
+# recover_on_startup = true  # Recover disk cache on restart
+
 # RESP protocol listener (Redis-compatible)
 [[listener]]
 protocol = "resp"

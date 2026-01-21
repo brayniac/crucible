@@ -13,6 +13,17 @@ segment_size = "8MB"
 max_value_size = "1MB"
 hashtable_power = 16
 
+# Disk tier - extend cache capacity beyond RAM (optional)
+# When enabled, evicted items are demoted to disk instead of discarded.
+# Uncomment to enable:
+# [cache.disk]
+# enabled = true
+# path = "/var/cache/crucible/disk.dat"
+# size = "100GB"
+# promotion_threshold = 2    # Promote items accessed > N times to RAM
+# sync_mode = "async"        # "sync", "async", or "none"
+# recover_on_startup = true  # Recover disk cache on restart
+
 [[listener]]
 protocol = "resp"
 address = "127.0.0.1:6379"
