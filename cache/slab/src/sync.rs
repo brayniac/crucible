@@ -3,9 +3,22 @@
 //! This module provides atomic types that work with both std and loom,
 //! enabling concurrency testing with loom while using efficient std
 //! atomics in production.
-//!
-//! Note: The struct layout (SlabItemHeader) always uses std atomics to ensure
-//! consistent size. Loom atomics are only used in loom tests for model checking.
+
+#[cfg(not(feature = "loom"))]
+pub use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 #[cfg(feature = "loom")]
-pub use loom::sync::atomic::{AtomicU32, Ordering};
+pub use loom::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+/// Spin loop hint - yields to other threads in loom.
+#[cfg(not(feature = "loom"))]
+#[inline]
+pub fn spin_loop() {
+    std::hint::spin_loop();
+}
+
+#[cfg(feature = "loom")]
+#[inline]
+pub fn spin_loop() {
+    loom::thread::yield_now();
+}

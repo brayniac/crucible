@@ -3,8 +3,10 @@
 //! The allocator coordinates between slab classes, allocating new slabs
 //! from the heap when needed and managing eviction when memory is exhausted.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
+
+use crate::sync::{AtomicU32, Ordering};
 
 use cache_core::{Hashtable, HugepageAllocation, allocate_on_node};
 use crossbeam_deque::Injector;
@@ -442,7 +444,7 @@ impl SlabAllocator {
     pub unsafe fn get_value_ref_raw(
         &self,
         location: SlabLocation,
-    ) -> Option<(*const std::sync::atomic::AtomicU32, *const u8, usize)> {
+    ) -> Option<(*const AtomicU32, *const u8, usize)> {
         let (class_id, slab_id, slot_index) = location.unpack();
         self.classes
             .get(class_id as usize)?

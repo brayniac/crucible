@@ -10,7 +10,7 @@ description = "Memcached-style slab allocator cache with per-object LRU eviction
 [features]
 default = []
 validation = ["cache-core/validation"]
-loom = ["dep:loom"]
+loom = ["dep:loom", "cache-core/loom"]
 
 [dependencies]
 cache-core = { workspace = true }

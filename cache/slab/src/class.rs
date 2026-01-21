@@ -4,7 +4,8 @@
 //! a shared heap and divided into equal-sized slots.
 
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+use crate::sync::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crossbeam_deque::Injector;
 use parking_lot::RwLock;
@@ -87,7 +88,7 @@ impl SlabState {
 /// Format: [state: 8 bits][ref_count: 24 bits]
 mod packed_state {
     use super::SlabState;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::sync::{AtomicU32, Ordering};
 
     const REF_MASK: u32 = 0x00FF_FFFF;
     const STATE_SHIFT: u32 = 24;
@@ -500,13 +501,32 @@ impl SlabClass {
     /// Try to allocate a slot from the free list.
     ///
     /// Returns `Some((slab_id, slot_index))` if successful, `None` if no free slots.
+    ///
+    /// This method filters out slots from evicted slabs. When a slab is evicted,
+    /// its state becomes Unallocated, but the free_slots queue may still contain
+    /// entries for that slab. We discard those entries and keep trying.
     pub fn allocate(&self) -> Option<(u32, u16)> {
-        match self.free_slots.steal() {
-            crossbeam_deque::Steal::Success(packed) => {
-                let (slab_id, slot_index) = unpack_slot_ref(packed);
-                Some((slab_id, slot_index))
+        loop {
+            match self.free_slots.steal() {
+                crossbeam_deque::Steal::Success(packed) => {
+                    let (slab_id, slot_index) = unpack_slot_ref(packed);
+
+                    // Check if the slab is still Live (not evicted).
+                    // This is necessary because eviction sets the slab state to
+                    // Unallocated but cannot efficiently drain all matching entries
+                    // from the lock-free free_slots queue.
+                    let state_packed = self.slab_states[slab_id as usize].load(Ordering::Acquire);
+                    let (state, _) = packed_state::unpack(state_packed);
+
+                    if state == SlabState::Live {
+                        return Some((slab_id, slot_index));
+                    }
+                    // Slab was evicted, discard this slot and try again
+                    continue;
+                }
+                crossbeam_deque::Steal::Empty => return None,
+                crossbeam_deque::Steal::Retry => continue,
             }
-            _ => None,
         }
     }
 
@@ -1017,5 +1037,306 @@ mod tests {
 
         class.remove_item();
         assert_eq!(class.item_count(), 1);
+    }
+}
+
+/// Loom concurrency tests for the slab state machine and concurrent operations.
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use crate::sync::{AtomicU32, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    // Use the shared packed_state implementation (now uses loom atomics when feature enabled)
+    use super::SlabState;
+    use super::packed_state;
+
+    /// Test concurrent acquire operations (multiple readers).
+    ///
+    /// Multiple threads can successfully acquire references to the same slab.
+    #[test]
+    fn test_concurrent_acquire() {
+        loom::model(|| {
+            // Start in Live state with 0 refs
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Live, 0)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+
+            // Thread 1: acquire
+            let t1 = thread::spawn(move || packed_state::try_acquire(&*s1));
+
+            // Thread 2: acquire
+            let t2 = thread::spawn(move || packed_state::try_acquire(&*s2));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both should succeed
+            assert!(r1, "Thread 1 acquire should succeed");
+            assert!(r2, "Thread 2 acquire should succeed");
+
+            // Ref count should be 2
+            let (final_state, ref_count) = packed_state::unpack(state.load(Ordering::Acquire));
+            assert_eq!(final_state, SlabState::Live);
+            assert_eq!(ref_count, 2);
+        });
+    }
+
+    /// Test acquire racing with release.
+    ///
+    /// One thread acquires while another releases - both should complete correctly.
+    #[test]
+    fn test_acquire_release_race() {
+        loom::model(|| {
+            // Start in Live state with 1 ref
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Live, 1)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+
+            // Thread 1: release existing ref
+            let t1 = thread::spawn(move || {
+                packed_state::release(&*s1);
+            });
+
+            // Thread 2: acquire new ref
+            let t2 = thread::spawn(move || packed_state::try_acquire(&*s2));
+
+            t1.join().unwrap();
+            let acquired = t2.join().unwrap();
+
+            // Acquire should always succeed (state is Live)
+            assert!(acquired, "Acquire should succeed on Live slab");
+
+            // Final ref count should be 1 (started with 1, -1 release, +1 acquire)
+            let (final_state, ref_count) = packed_state::unpack(state.load(Ordering::Acquire));
+            assert_eq!(final_state, SlabState::Live);
+            assert_eq!(ref_count, 1);
+        });
+    }
+
+    /// Test acquire failing when draining.
+    ///
+    /// Once draining starts, new acquires should fail.
+    #[test]
+    fn test_acquire_fails_when_draining() {
+        loom::model(|| {
+            // Start in Live state
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Live, 0)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+
+            // Thread 1: start drain
+            let t1 = thread::spawn(move || packed_state::try_start_drain(&*s1));
+
+            // Thread 2: try to acquire
+            let t2 = thread::spawn(move || packed_state::try_acquire(&*s2));
+
+            let drain_started = t1.join().unwrap();
+            let acquired = t2.join().unwrap();
+
+            // Drain should succeed
+            assert!(drain_started, "Drain should start");
+
+            // The acquire result depends on ordering:
+            // - If acquire runs first: succeeds, then drain fails (state has refs)
+            // - If drain runs first: acquire fails
+            // Since we assert drain_started is true, acquire must have failed
+            // OR acquire completed before drain and drain observed the ref
+
+            let (final_state, ref_count) = packed_state::unpack(state.load(Ordering::Acquire));
+
+            // Valid final states:
+            // 1. Draining with 0 refs (drain first, acquire failed)
+            // 2. Draining with 1 ref (acquire first, then drain - acquire succeeded before drain)
+            assert!(
+                final_state == SlabState::Draining,
+                "Should be in Draining state"
+            );
+            assert!(ref_count <= 1, "Ref count should be 0 or 1");
+        });
+    }
+
+    /// Test drain racing with multiple releases.
+    ///
+    /// When draining, releases should eventually bring ref_count to 0.
+    #[test]
+    fn test_drain_with_releases() {
+        loom::model(|| {
+            // Start in Live state with 2 refs
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Live, 2)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+            let s3 = state.clone();
+
+            // Thread 1: start drain
+            let t1 = thread::spawn(move || packed_state::try_start_drain(&*s1));
+
+            // Thread 2: release
+            let t2 = thread::spawn(move || packed_state::release(&*s2));
+
+            // Thread 3: release
+            let t3 = thread::spawn(move || packed_state::release(&*s3));
+
+            let drain_started = t1.join().unwrap();
+            t2.join().unwrap();
+            t3.join().unwrap();
+
+            assert!(drain_started, "Drain should start");
+
+            // Final state should be Draining with 0 refs
+            let (final_state, ref_count) = packed_state::unpack(state.load(Ordering::Acquire));
+            assert_eq!(final_state, SlabState::Draining);
+            assert_eq!(ref_count, 0);
+
+            // Now try_lock should succeed
+            assert!(
+                packed_state::try_lock(&*state),
+                "Lock should succeed after drain complete"
+            );
+        });
+    }
+
+    /// Test try_lock only succeeds when ref_count is 0.
+    ///
+    /// try_lock should fail if there are outstanding references.
+    #[test]
+    fn test_try_lock_requires_zero_refs() {
+        loom::model(|| {
+            // Start in Draining state with 1 ref
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Draining, 1)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+
+            // Thread 1: try to lock (should fail - refs > 0)
+            let t1 = thread::spawn(move || packed_state::try_lock(&*s1));
+
+            // Thread 2: release the ref
+            let t2 = thread::spawn(move || packed_state::release(&*s2));
+
+            let lock1 = t1.join().unwrap();
+            t2.join().unwrap();
+
+            // First lock attempt depends on ordering
+            // If lock runs before release: fails (refs = 1)
+            // If lock runs after release: succeeds (refs = 0)
+
+            let (final_state, ref_count) = packed_state::unpack(state.load(Ordering::Acquire));
+
+            if lock1 {
+                // Lock succeeded - we're now in Locked state
+                assert_eq!(final_state, SlabState::Locked);
+                assert_eq!(ref_count, 0);
+            } else {
+                // Lock failed - state should still be Draining with 0 refs
+                // (release completed but lock already failed)
+                assert_eq!(final_state, SlabState::Draining);
+                assert_eq!(ref_count, 0);
+            }
+        });
+    }
+
+    /// Test abort_drain racing with release.
+    ///
+    /// Eviction can be aborted while refs are being released.
+    #[test]
+    fn test_abort_drain_race() {
+        loom::model(|| {
+            // Start in Draining state with 1 ref
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Draining, 1)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+
+            // Thread 1: abort drain
+            let t1 = thread::spawn(move || packed_state::abort_drain(&*s1));
+
+            // Thread 2: release
+            let t2 = thread::spawn(move || packed_state::release(&*s2));
+
+            let aborted = t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert!(aborted, "Abort should succeed from Draining state");
+
+            // Final state should be Live with 0 refs
+            let (final_state, ref_count) = packed_state::unpack(state.load(Ordering::Acquire));
+            assert_eq!(final_state, SlabState::Live);
+            assert_eq!(ref_count, 0);
+        });
+    }
+
+    /// Test drain followed by lock after release.
+    ///
+    /// This simpler test avoids unbounded loops that cause loom to exceed branch limits.
+    /// It tests the critical path: drain started, release happens, then lock succeeds.
+    #[test]
+    fn test_drain_then_release_then_lock() {
+        loom::model(|| {
+            // Start in Draining state with 1 ref (drain already started, reader active)
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Draining, 1)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+
+            // Thread 1 (reader): release ref
+            let t1 = thread::spawn(move || {
+                packed_state::release(&*s1);
+            });
+
+            // Thread 2 (evictor): try to lock (may fail if release hasn't happened)
+            let t2 = thread::spawn(move || packed_state::try_lock(&*s2));
+
+            t1.join().unwrap();
+            let lock_result = t2.join().unwrap();
+
+            let (final_state, ref_count) = packed_state::unpack(state.load(Ordering::Acquire));
+
+            // Either lock succeeded (final state is Locked) or it failed (still Draining with 0 refs)
+            if lock_result {
+                assert_eq!(final_state, SlabState::Locked);
+            } else {
+                // Lock failed, but release completed, so we can try again
+                assert_eq!(final_state, SlabState::Draining);
+                assert_eq!(ref_count, 0);
+                // Second try should succeed
+                assert!(packed_state::try_lock(&*state));
+            }
+        });
+    }
+
+    /// Test concurrent start_drain attempts.
+    ///
+    /// Only one thread should successfully start drain.
+    #[test]
+    fn test_concurrent_drain_start() {
+        loom::model(|| {
+            let state = Arc::new(AtomicU32::new(packed_state::pack(SlabState::Live, 0)));
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+
+            // Two threads try to start drain
+            let t1 = thread::spawn(move || packed_state::try_start_drain(&*s1));
+            let t2 = thread::spawn(move || packed_state::try_start_drain(&*s2));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one should succeed
+            assert!(
+                (r1 && !r2) || (!r1 && r2),
+                "Exactly one drain should succeed: r1={}, r2={}",
+                r1,
+                r2
+            );
+
+            let (final_state, _) = packed_state::unpack(state.load(Ordering::Acquire));
+            assert_eq!(final_state, SlabState::Draining);
+        });
     }
 }

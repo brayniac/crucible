@@ -278,7 +278,7 @@ async fn run_parquet_recorder(
         let file = File::create(&path).map_err(|e| io::Error::other(e.to_string()))?;
 
         let metadata = HashMap::from([
-            ("source".to_string(), env!("CARGO_PKG_NAME").to_string()),
+            ("source".to_string(), "crucible-benchmark".to_string()),
             ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
             (
                 "sampling_interval_ms".to_string(),
