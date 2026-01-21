@@ -407,6 +407,53 @@ impl SlabAllocator {
         }
     }
 
+    /// Try to acquire a reference to a slab for reading.
+    ///
+    /// Returns `true` if the slab is readable and ref_count was incremented.
+    /// Returns `false` if the slab is not readable (unallocated or draining).
+    ///
+    /// Caller must call `release_slab()` when done reading.
+    #[inline]
+    pub fn acquire_slab(&self, location: SlabLocation) -> bool {
+        let (class_id, slab_id, _) = location.unpack();
+        if let Some(class) = self.classes.get(class_id as usize) {
+            class.acquire_slab(slab_id)
+        } else {
+            false
+        }
+    }
+
+    /// Release a reference to a slab after reading.
+    ///
+    /// Must be called after a successful `acquire_slab()`.
+    #[inline]
+    pub fn release_slab(&self, location: SlabLocation) {
+        let (class_id, slab_id, _) = location.unpack();
+        if let Some(class) = self.classes.get(class_id as usize) {
+            class.release_slab(slab_id);
+        }
+    }
+
+    /// Get raw value reference pointers for zero-copy reads.
+    ///
+    /// Returns `(ref_count_ptr, value_ptr, value_len)` if successful.
+    /// The ref_count has already been incremented; caller must decrement on drop
+    /// (typically by constructing a `ValueRef`).
+    ///
+    /// # Safety
+    ///
+    /// The location must point to a valid item.
+    #[inline]
+    pub unsafe fn get_value_ref_raw(
+        &self,
+        location: SlabLocation,
+    ) -> Option<(*const std::sync::atomic::AtomicU32, *const u8, usize)> {
+        let (class_id, slab_id, slot_index) = location.unpack();
+        self.classes
+            .get(class_id as usize)?
+            .get_value_ref_raw(slab_id, slot_index)
+    }
+
     /// Get the total memory used.
     pub fn memory_used(&self) -> usize {
         self.memory_used.load(Ordering::Relaxed)

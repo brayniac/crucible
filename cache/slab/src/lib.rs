@@ -328,14 +328,25 @@ impl SlabCache {
         if let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) {
             let slab_loc = SlabLocation::from_location(location);
 
+            // Acquire slab reference to prevent eviction during read
+            if !self.allocator.acquire_slab(slab_loc) {
+                // Slab is being evicted, treat as miss
+                return None;
+            }
+
             // Touch slab for LRA tracking
             self.allocator.touch_slab(slab_loc);
 
-            // Copy value
-            unsafe {
+            // Copy value while holding slab reference
+            let value = unsafe {
                 let header = self.allocator.header(slab_loc);
-                return Some(header.value().to_vec());
-            }
+                header.value().to_vec()
+            };
+
+            // Release slab reference
+            self.allocator.release_slab(slab_loc);
+
+            return Some(value);
         }
 
         // Lookup failed - try to clean up expired item if present
@@ -400,14 +411,24 @@ impl SlabCache {
         if let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) {
             let slab_loc = SlabLocation::from_location(location);
 
+            // Acquire slab reference to prevent eviction during read
+            if !self.allocator.acquire_slab(slab_loc) {
+                return None;
+            }
+
             // Touch slab for LRA tracking
             self.allocator.touch_slab(slab_loc);
 
-            // Access value
-            unsafe {
+            // Access value while holding slab reference
+            let result = unsafe {
                 let header = self.allocator.header(slab_loc);
-                return Some(f(header.value()));
-            }
+                f(header.value())
+            };
+
+            // Release slab reference
+            self.allocator.release_slab(slab_loc);
+
+            return Some(result);
         }
 
         // Lookup failed - try to clean up expired item if present
@@ -469,10 +490,19 @@ impl SlabCache {
         let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
 
         let slab_loc = SlabLocation::from_location(location);
-        unsafe {
+
+        // Acquire slab reference
+        if !self.allocator.acquire_slab(slab_loc) {
+            return None;
+        }
+
+        let result = unsafe {
             let header = self.allocator.header(slab_loc);
             header.remaining_ttl()
-        }
+        };
+
+        self.allocator.release_slab(slab_loc);
+        result
     }
 
     /// Get the frequency counter for an item.
@@ -518,28 +548,12 @@ impl Cache for SlabCache {
         // Touch slab for LRA tracking
         self.allocator.touch_slab(slab_loc);
 
-        // For slab cache, we don't have segment-level ref counting.
-        // We need to copy the value for safety.
-        // A proper zero-copy implementation would require per-slot ref counting.
-        // For now, we allocate and use a dummy ref counter.
-        unsafe {
-            let header = self.allocator.header(slab_loc);
-            let value = header.value();
+        // Get zero-copy value reference (acquires slab ref internally)
+        let (ref_count_ptr, value_ptr, value_len) =
+            unsafe { self.allocator.get_value_ref_raw(slab_loc)? };
 
-            // Create a leaked AtomicU32 for the ref count
-            // This is a limitation of the slab design - true zero-copy would need
-            // more infrastructure
-            let ref_count = Box::leak(Box::new(AtomicU32::new(1)));
-
-            // Copy the value to a stable location
-            let value_copy = value.to_vec().leak();
-
-            Some(ValueRef::new(
-                ref_count as *const AtomicU32,
-                value_copy.as_ptr(),
-                value_copy.len(),
-            ))
-        }
+        // Construct ValueRef - it will decrement ref_count on drop
+        Some(unsafe { ValueRef::new(ref_count_ptr, value_ptr, value_len) })
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {

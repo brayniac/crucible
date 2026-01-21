@@ -3,13 +3,152 @@
 //! Each slab class manages slots of a fixed size. Slabs are allocated from
 //! a shared heap and divided into equal-sized slots.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crossbeam_deque::Injector;
 use parking_lot::RwLock;
 
 use crate::config::HEADER_SIZE;
 use crate::item::{SlabItemHeader, now_secs, pack_slot_ref, unpack_slot_ref};
+
+/// Maximum number of slabs per class for lock-free pointer array.
+/// This is generous - with 1MB slabs and 64GB heap, total slabs = 65536.
+/// Per class, even distribution would be ~1000-2000 slabs.
+const MAX_SLABS_PER_CLASS: usize = 4096;
+
+/// Slab state for the state machine.
+///
+/// Packed with ref_count into a single AtomicU32:
+/// - Bits 0-23: ref_count (max 16M concurrent readers)
+/// - Bits 24-31: state
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlabState {
+    /// Slab is not yet allocated (null pointer).
+    Unallocated = 0,
+    /// Normal operation - can be read and written.
+    Live = 1,
+    /// Being evicted - new readers rejected, waiting for ref_count → 0.
+    Draining = 2,
+}
+
+impl SlabState {
+    #[inline]
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => SlabState::Unallocated,
+            1 => SlabState::Live,
+            2 => SlabState::Draining,
+            _ => SlabState::Unallocated,
+        }
+    }
+}
+
+/// Packed state + ref_count operations.
+/// Format: [state: 8 bits][ref_count: 24 bits]
+mod packed_state {
+    use super::SlabState;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const REF_MASK: u32 = 0x00FF_FFFF;
+    const STATE_SHIFT: u32 = 24;
+
+    #[inline]
+    pub fn pack(state: SlabState, ref_count: u32) -> u32 {
+        ((state as u32) << STATE_SHIFT) | (ref_count & REF_MASK)
+    }
+
+    #[inline]
+    pub fn unpack(packed: u32) -> (SlabState, u32) {
+        let state = SlabState::from_u8((packed >> STATE_SHIFT) as u8);
+        let ref_count = packed & REF_MASK;
+        (state, ref_count)
+    }
+
+    /// Try to acquire a reference (increment ref_count) if state is Live.
+    /// Returns true if successful, false if slab is not readable.
+    #[inline]
+    pub fn try_acquire(atom: &AtomicU32) -> bool {
+        loop {
+            let current = atom.load(Ordering::Acquire);
+            let (state, ref_count) = unpack(current);
+
+            if state != SlabState::Live {
+                return false;
+            }
+
+            let new = pack(state, ref_count + 1);
+            match atom.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Release a reference (decrement ref_count).
+    #[inline]
+    pub fn release(atom: &AtomicU32) {
+        loop {
+            let current = atom.load(Ordering::Acquire);
+            let (state, ref_count) = unpack(current);
+            debug_assert!(ref_count > 0, "release called with zero ref_count");
+
+            let new = pack(state, ref_count.saturating_sub(1));
+            match atom.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Try to transition from Live to Draining.
+    /// Returns true if successful.
+    #[inline]
+    pub fn try_start_drain(atom: &AtomicU32) -> bool {
+        loop {
+            let current = atom.load(Ordering::Acquire);
+            let (state, ref_count) = unpack(current);
+
+            if state != SlabState::Live {
+                return false;
+            }
+
+            let new = pack(SlabState::Draining, ref_count);
+            match atom.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Check if draining is complete (state == Draining && ref_count == 0).
+    #[inline]
+    pub fn is_drain_complete(atom: &AtomicU32) -> bool {
+        let current = atom.load(Ordering::Acquire);
+        let (state, ref_count) = unpack(current);
+        state == SlabState::Draining && ref_count == 0
+    }
+
+    /// Get current ref_count.
+    #[inline]
+    pub fn ref_count(atom: &AtomicU32) -> u32 {
+        let (_, ref_count) = unpack(atom.load(Ordering::Acquire));
+        ref_count
+    }
+
+    /// Reset to Live state with zero ref_count (for reuse after eviction).
+    #[inline]
+    pub fn reset_to_live(atom: &AtomicU32) {
+        atom.store(pack(SlabState::Live, 0), Ordering::Release);
+    }
+
+    /// Set to Live state (for newly added slabs).
+    #[inline]
+    pub fn set_live(atom: &AtomicU32) {
+        atom.store(pack(SlabState::Live, 0), Ordering::Release);
+    }
+}
 
 /// A single slab of memory divided into fixed-size slots.
 pub struct Slab {
@@ -143,8 +282,16 @@ pub struct SlabClass {
     slot_size: usize,
     /// Slots per slab (slab_size / slot_size).
     slots_per_slab: usize,
-    /// Allocated slabs.
+    /// Allocated slabs (holds metadata, protected by RwLock).
     slabs: RwLock<Vec<Slab>>,
+    /// Lock-free slab pointer array for hot path reads.
+    /// Indexed by slab_id, stores the data pointer for each slab.
+    /// Null pointer means slab not yet allocated.
+    slab_ptrs: Box<[AtomicPtr<u8>]>,
+    /// Lock-free packed state + ref_count for each slab.
+    /// Format: [state: 8 bits][ref_count: 24 bits]
+    /// Used for safe concurrent access and eviction coordination.
+    slab_states: Box<[AtomicU32]>,
     /// Free slot stack: packed as (slab_id << 16 | slot_index).
     free_slots: Injector<u32>,
     /// Number of items in this class.
@@ -156,11 +303,23 @@ pub struct SlabClass {
 impl SlabClass {
     /// Create a new slab class.
     pub fn new(class_id: u8, slot_size: usize, slab_size: usize) -> Self {
+        // Pre-allocate lock-free arrays
+        let slab_ptrs: Box<[AtomicPtr<u8>]> = (0..MAX_SLABS_PER_CLASS)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect();
+
+        // Initialize all states to Unallocated (0)
+        let slab_states: Box<[AtomicU32]> = (0..MAX_SLABS_PER_CLASS)
+            .map(|_| AtomicU32::new(0))
+            .collect();
+
         Self {
             class_id,
             slot_size,
             slots_per_slab: slab_size / slot_size,
             slabs: RwLock::new(Vec::new()),
+            slab_ptrs,
+            slab_states,
             free_slots: Injector::new(),
             item_count: AtomicU64::new(0),
             bytes_used: AtomicU64::new(0),
@@ -236,6 +395,20 @@ impl SlabClass {
             let mut slabs = self.slabs.write();
             let slab_id = slabs.len() as u32;
 
+            // Check we haven't exceeded the lock-free array capacity
+            assert!(
+                (slab_id as usize) < MAX_SLABS_PER_CLASS,
+                "exceeded maximum slabs per class ({})",
+                MAX_SLABS_PER_CLASS
+            );
+
+            // Store the pointer in the lock-free array BEFORE adding to slabs Vec.
+            // This ensures the pointer is visible to readers before the slab_id is used.
+            self.slab_ptrs[slab_id as usize].store(data, Ordering::Release);
+
+            // Set state to Live so readers can acquire references
+            packed_state::set_live(&self.slab_states[slab_id as usize]);
+
             // Create the slab with class_id and slab_id for tracking
             let slab = Slab::new(data, slab_size, self.class_id, slab_id);
             slabs.push(slab);
@@ -269,6 +442,67 @@ impl SlabClass {
         self.free_slots.push(packed);
     }
 
+    /// Try to acquire a reference to a slab for reading.
+    ///
+    /// Returns `true` if the slab is readable and ref_count was incremented.
+    /// Returns `false` if the slab is not readable (unallocated or draining).
+    ///
+    /// Caller must call `release_slab()` when done reading.
+    #[inline]
+    pub fn acquire_slab(&self, slab_id: u32) -> bool {
+        if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
+            return false;
+        }
+        packed_state::try_acquire(&self.slab_states[slab_id as usize])
+    }
+
+    /// Release a reference to a slab after reading.
+    ///
+    /// Must be called after a successful `acquire_slab()`.
+    #[inline]
+    pub fn release_slab(&self, slab_id: u32) {
+        debug_assert!((slab_id as usize) < MAX_SLABS_PER_CLASS);
+        packed_state::release(&self.slab_states[slab_id as usize]);
+    }
+
+    /// Get raw value reference pointers for zero-copy reads.
+    ///
+    /// Returns `(ref_count_ptr, value_ptr, value_len)` if successful.
+    /// The ref_count has already been incremented; caller must decrement on drop
+    /// (typically by constructing a `ValueRef`).
+    ///
+    /// Returns `None` if the slab is not readable (draining or unallocated).
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the slot contains a valid item.
+    #[inline]
+    pub unsafe fn get_value_ref_raw(
+        &self,
+        slab_id: u32,
+        slot_index: u16,
+    ) -> Option<(*const AtomicU32, *const u8, usize)> {
+        if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
+            return None;
+        }
+
+        // Acquire slab reference (increments ref_count if Live)
+        if !packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
+            return None;
+        }
+
+        // Get value pointer and length
+        let header = self.header(slab_id, slot_index);
+        let value_ptr = header.value_ptr();
+        let value_len = header.value_len();
+
+        // Return pointer to the packed state (ref_count is in low 24 bits)
+        // ValueRef::drop will call fetch_sub(1), which decrements only the ref_count
+        let ref_count_ptr = &self.slab_states[slab_id as usize] as *const AtomicU32;
+
+        Some((ref_count_ptr, value_ptr, value_len))
+    }
+
     /// Get a slab by ID.
     pub fn get_slab(&self, slab_id: u32) -> Option<SlabRef<'_>> {
         let slabs = self.slabs.read();
@@ -286,28 +520,31 @@ impl SlabClass {
 
     /// Get the pointer to a slot (without reference counting).
     ///
+    /// This is lock-free on the hot path - uses the atomic slab pointer array.
+    ///
     /// # Safety
     ///
     /// Caller must ensure proper synchronization and that the slab exists.
+    #[inline]
     pub unsafe fn slot_ptr(&self, slab_id: u32, slot_index: u16) -> *mut u8 {
-        // SAFETY: Caller ensures slab exists
-        unsafe {
-            let slabs = self.slabs.read();
-            slabs[slab_id as usize].slot_ptr(slot_index, self.slot_size)
-        }
+        // Lock-free read from the atomic pointer array
+        let slab_ptr = self.slab_ptrs[slab_id as usize].load(Ordering::Acquire);
+        debug_assert!(!slab_ptr.is_null(), "slab {} not initialized", slab_id);
+        slab_ptr.add(slot_index as usize * self.slot_size)
     }
 
     /// Get the item header at a specific location.
     ///
+    /// This is lock-free on the hot path.
+    ///
     /// # Safety
     ///
     /// Caller must ensure the slot contains a valid item.
+    #[inline]
     pub unsafe fn header(&self, slab_id: u32, slot_index: u16) -> &SlabItemHeader {
         // SAFETY: Caller ensures slot contains valid item
-        unsafe {
-            let ptr = self.slot_ptr(slab_id, slot_index);
-            SlabItemHeader::from_ptr(ptr)
-        }
+        let ptr = self.slot_ptr(slab_id, slot_index);
+        SlabItemHeader::from_ptr(ptr)
     }
 
     /// Increment the item count.
@@ -326,7 +563,7 @@ impl SlabClass {
     /// The callback should remove the item from the hashtable.
     ///
     /// Returns the slab's data pointer so it can be returned to the global free pool,
-    /// or `None` if the slab doesn't exist.
+    /// or `None` if the slab doesn't exist or is already being drained.
     ///
     /// # Safety
     ///
@@ -336,21 +573,46 @@ impl SlabClass {
     where
         F: FnMut(&[u8], u8, u32, u16),
     {
-        let slabs = self.slabs.read();
+        if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
+            return None;
+        }
 
-        let slab = slabs.get(slab_id as usize)?;
-        let slab_ptr = slab.data();
+        // Phase 1: Transition to Draining state (blocks new readers)
+        let state_atom = &self.slab_states[slab_id as usize];
+        if !packed_state::try_start_drain(state_atom) {
+            // Slab is not Live (already draining or unallocated)
+            return None;
+        }
 
-        // Iterate through all slots in the slab
+        // Phase 2: Wait for all readers to finish
+        // This is a spin-wait, but readers should be fast (just copying data)
+        let mut spin_count = 0;
+        while !packed_state::is_drain_complete(state_atom) {
+            spin_count += 1;
+            if spin_count > 1000 {
+                // Yield to avoid burning CPU
+                std::thread::yield_now();
+                spin_count = 0;
+            }
+            std::hint::spin_loop();
+        }
+
+        // Phase 3: Get slab pointer (lock-free)
+        let slab_ptr = self.slab_ptrs[slab_id as usize].load(Ordering::Acquire);
+        if slab_ptr.is_null() {
+            // Should not happen if state machine is correct
+            return None;
+        }
+
+        // Phase 4: Process each slot without holding the slabs lock.
+        // Safe because we've drained all readers.
         for slot_index in 0..self.slots_per_slab {
             let slot_index = slot_index as u16;
 
-            // SAFETY: We're iterating valid slot indices
+            // SAFETY: slot_index is valid, slab memory is stable, no concurrent readers
             unsafe {
-                // Use the slab directly instead of self.header() to avoid
-                // re-acquiring the read lock (which would deadlock with
-                // parking_lot's fair RwLock when a writer is waiting)
-                let header = slab.header(slot_index, self.slot_size);
+                let slot_ptr = slab_ptr.add(slot_index as usize * self.slot_size);
+                let header = SlabItemHeader::from_ptr(slot_ptr);
 
                 // Skip deleted/empty slots
                 if header.is_deleted() {
@@ -372,11 +634,14 @@ impl SlabClass {
             }
         }
 
-        // Return all slots to free list
+        // Phase 5: Return all slots to free list
         for slot_index in 0..self.slots_per_slab {
             let packed = pack_slot_ref(slab_id, slot_index as u16);
             self.free_slots.push(packed);
         }
+
+        // Phase 6: Reset to Live state for reuse
+        packed_state::reset_to_live(state_atom);
 
         Some(slab_ptr)
     }
