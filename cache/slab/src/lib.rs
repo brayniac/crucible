@@ -83,8 +83,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cache_core::{
-    Cache, CacheError, CacheResult, DiskLayer, DiskLayerBuilder, Hashtable, MultiChoiceHashtable,
-    OwnedGuard, ValueRef,
+    Cache, CacheError, CacheResult, DiskLayer, DiskLayerBuilder, Hashtable, ItemGuard, Layer,
+    MultiChoiceHashtable, OwnedGuard, ValueRef,
 };
 
 pub use cache_core::HugepageSize;
@@ -94,6 +94,7 @@ pub use reservation::SlabReservation;
 
 use allocator::SlabAllocator;
 use location::SlabLocation;
+use verifier::SlabTieredVerifier;
 
 /// Memcached-style slab allocator cache.
 ///
@@ -113,12 +114,142 @@ pub struct SlabCache {
     enable_ghosts: bool,
     /// Optional disk tier for extended capacity.
     disk_layer: Option<DiskLayer>,
+    /// Pool ID for RAM storage (default 0).
+    ram_pool_id: u8,
+    /// Pool ID for disk storage (default 2).
+    disk_pool_id: u8,
+    /// Frequency threshold for promoting items from disk to RAM.
+    promotion_threshold: u8,
 }
 
 impl SlabCache {
     /// Create a new builder for SlabCache.
     pub fn builder() -> SlabCacheBuilder {
         SlabCacheBuilder::new()
+    }
+
+    /// Create a tiered verifier that can verify keys in both RAM and disk.
+    fn tiered_verifier(&self) -> SlabTieredVerifier<'_> {
+        if let Some(ref disk_layer) = self.disk_layer {
+            SlabTieredVerifier::with_disk(
+                &self.allocator,
+                self.ram_pool_id,
+                disk_layer.pool(),
+                self.disk_pool_id,
+            )
+        } else {
+            SlabTieredVerifier::new(&self.allocator, self.ram_pool_id)
+        }
+    }
+
+    /// Read an item from the disk tier.
+    ///
+    /// Returns the value if found and not expired.
+    fn get_from_disk(&self, key: &[u8], location: cache_core::Location) -> Option<Vec<u8>> {
+        let disk_layer = self.disk_layer.as_ref()?;
+        let item_loc = cache_core::ItemLocation::from_location(location);
+
+        let guard = disk_layer.get_item(item_loc, key)?;
+        Some(guard.value().to_vec())
+    }
+
+    /// Promote an item from disk to RAM.
+    ///
+    /// Writes the item to RAM storage and updates the hashtable to point
+    /// to the new RAM location.
+    fn promote_to_ram(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Duration,
+        old_location: cache_core::Location,
+    ) -> bool {
+        // Calculate item size
+        let item_size = HEADER_SIZE + key.len() + value.len();
+
+        // Select class
+        let class_id = match self.allocator.select_class(item_size) {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Allocate slot (may evict other items)
+        let (slab_id, slot_index) = match self
+            .allocator
+            .allocate_with_eviction(class_id, &*self.hashtable)
+        {
+            Some(ids) => ids,
+            None => return false,
+        };
+
+        // Write item
+        unsafe {
+            self.allocator
+                .write_item(class_id, slab_id, slot_index, key, value, ttl);
+        }
+
+        // Update hashtable with new RAM location
+        let new_location =
+            SlabLocation::with_pool(self.ram_pool_id, class_id, slab_id, slot_index).to_location();
+
+        if self
+            .hashtable
+            .cas_location(key, old_location, new_location, true)
+        {
+            // Mark old disk location as deleted
+            if let Some(ref disk_layer) = self.disk_layer {
+                disk_layer.mark_deleted(cache_core::ItemLocation::from_location(old_location));
+            }
+            true
+        } else {
+            // CAS failed, clean up allocated slot
+            unsafe {
+                let loc = SlabLocation::with_pool(self.ram_pool_id, class_id, slab_id, slot_index);
+                let header = self.allocator.header(loc);
+                if let Some(class) = self.allocator.class(class_id) {
+                    class.sub_bytes(header.item_size());
+                    class.remove_item();
+                }
+                header.mark_deleted();
+            }
+            self.allocator.deallocate(class_id, slab_id, slot_index);
+            false
+        }
+    }
+
+    /// Demote an item to the disk tier.
+    ///
+    /// Writes the item to disk storage and updates the hashtable.
+    /// Returns true if demotion succeeded.
+    fn demote_to_disk(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Duration,
+        old_location: cache_core::Location,
+    ) -> bool {
+        let disk_layer = match self.disk_layer.as_ref() {
+            Some(layer) => layer,
+            None => return false,
+        };
+
+        // Write to disk layer
+        let disk_loc = match disk_layer.write_item(key, value, &[], ttl) {
+            Ok(loc) => loc,
+            Err(_) => return false,
+        };
+
+        // Update hashtable with disk location
+        if self
+            .hashtable
+            .cas_location(key, old_location, disk_loc.to_location(), true)
+        {
+            true
+        } else {
+            // CAS failed, mark disk item as deleted
+            disk_layer.mark_deleted(disk_loc);
+            false
+        }
     }
 
     /// Store an item only if the key doesn't exist (ADD semantics).
@@ -324,30 +455,56 @@ impl SlabCache {
 
     /// Retrieve an item's value from the cache.
     pub fn get_item(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
 
-        if let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) {
-            let slab_loc = SlabLocation::from_location(location);
+        if let Some((location, freq)) = self.hashtable.lookup(key, &verifier) {
+            // Check which pool the item is in
+            let pool_id = SlabLocation::pool_id_from_location(location);
 
-            // Acquire slab reference to prevent eviction during read
-            if !self.allocator.acquire_slab(slab_loc) {
-                // Slab is being evicted, treat as miss
-                return None;
+            if pool_id == self.ram_pool_id {
+                // Item is in RAM
+                let slab_loc = SlabLocation::from_location(location);
+
+                // Acquire slab reference to prevent eviction during read
+                if !self.allocator.acquire_slab(slab_loc) {
+                    // Slab is being evicted, treat as miss
+                    return None;
+                }
+
+                // Touch slab for LRA tracking
+                self.allocator.touch_slab(slab_loc);
+
+                // Copy value while holding slab reference
+                let value = unsafe {
+                    let header = self.allocator.header(slab_loc);
+                    header.value().to_vec()
+                };
+
+                // Release slab reference
+                self.allocator.release_slab(slab_loc);
+
+                return Some(value);
+            } else if pool_id == self.disk_pool_id {
+                // Item is on disk
+                let value = self.get_from_disk(key, location)?;
+
+                // Optionally promote to RAM if accessed frequently
+                if freq >= self.promotion_threshold {
+                    // Get TTL from disk item
+                    let ttl = self
+                        .disk_layer
+                        .as_ref()
+                        .and_then(|l| {
+                            use cache_core::Layer;
+                            l.item_ttl(cache_core::ItemLocation::from_location(location))
+                        })
+                        .unwrap_or(self.default_ttl);
+
+                    let _ = self.promote_to_ram(key, &value, ttl, location);
+                }
+
+                return Some(value);
             }
-
-            // Touch slab for LRA tracking
-            self.allocator.touch_slab(slab_loc);
-
-            // Copy value while holding slab reference
-            let value = unsafe {
-                let header = self.allocator.header(slab_loc);
-                header.value().to_vec()
-            };
-
-            // Release slab reference
-            self.allocator.release_slab(slab_loc);
-
-            return Some(value);
         }
 
         // Lookup failed - try to clean up expired item if present
@@ -869,6 +1026,8 @@ impl DiskTierConfig {
 pub struct SlabCacheBuilder {
     config: SlabCacheConfig,
     disk_tier: Option<DiskTierConfig>,
+    ram_pool_id: u8,
+    disk_pool_id: u8,
 }
 
 impl Default for SlabCacheBuilder {
@@ -876,6 +1035,8 @@ impl Default for SlabCacheBuilder {
         Self {
             config: SlabCacheConfig::default(),
             disk_tier: None,
+            ram_pool_id: 0,
+            disk_pool_id: 2,
         }
     }
 }
@@ -886,7 +1047,25 @@ impl SlabCacheBuilder {
         Self {
             config: SlabCacheConfig::default(),
             disk_tier: None,
+            ram_pool_id: 0,
+            disk_pool_id: 2,
         }
+    }
+
+    /// Set the RAM pool ID (default 0).
+    ///
+    /// This identifies the RAM storage tier in location encodings.
+    pub fn ram_pool_id(mut self, id: u8) -> Self {
+        self.ram_pool_id = id;
+        self
+    }
+
+    /// Set the disk pool ID (default 2).
+    ///
+    /// This identifies the disk storage tier in location encodings.
+    pub fn disk_pool_id(mut self, id: u8) -> Self {
+        self.disk_pool_id = id;
+        self
     }
 
     /// Set the total heap size in bytes.
@@ -986,20 +1165,20 @@ impl SlabCacheBuilder {
         let hashtable = Arc::new(MultiChoiceHashtable::new(self.config.hashtable_power));
 
         // Build disk layer if configured
-        let disk_layer = match self.disk_tier {
+        let (disk_layer, promotion_threshold) = match self.disk_tier {
             Some(config) => {
                 let layer = DiskLayerBuilder::new()
                     .layer_id(1)
-                    .pool_id(2)
+                    .pool_id(self.disk_pool_id)
                     .segment_size(8 * 1024 * 1024) // 8MB segments
                     .path(&config.path)
                     .size(config.size)
                     .sync_mode(config.sync_mode)
                     .recover_on_startup(config.recover_on_startup)
                     .build()?;
-                Some(layer)
+                (Some(layer), config.promotion_threshold)
             }
-            None => None,
+            None => (None, 2),
         };
 
         Ok(SlabCache {
@@ -1008,6 +1187,9 @@ impl SlabCacheBuilder {
             default_ttl: self.config.default_ttl,
             enable_ghosts: self.config.enable_ghosts,
             disk_layer,
+            ram_pool_id: self.ram_pool_id,
+            disk_pool_id: self.disk_pool_id,
+            promotion_threshold,
         })
     }
 }

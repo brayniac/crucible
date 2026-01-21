@@ -1,4 +1,5 @@
 use metriken_exposition::{ParquetOptions, ParquetSchema, Snapshot, SnapshotterBuilder};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
@@ -276,8 +277,17 @@ async fn run_parquet_recorder(
         // Create file and writer
         let file = File::create(&path).map_err(|e| io::Error::other(e.to_string()))?;
 
+        let metadata = HashMap::from([
+            ("source".to_string(), env!("CARGO_PKG_NAME").to_string()),
+            ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+            (
+                "sampling_interval_ms".to_string(),
+                interval.as_millis().to_string(),
+            ),
+        ]);
+
         let mut writer = schema
-            .finalize(file, ParquetOptions::new(), None)
+            .finalize(file, ParquetOptions::new(), Some(metadata))
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Second pass: write data

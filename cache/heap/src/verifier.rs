@@ -1,8 +1,13 @@
 //! KeyVerifier implementation for HeapCache.
 //!
 //! Verifies that a key at a location matches the expected key.
+//!
+//! This module provides two verifiers:
+//! - `HeapCacheVerifier`: RAM-only verification using slot storage
+//! - `HeapTieredVerifier`: Multi-tier verification supporting both RAM and disk
 
-use cache_core::{KeyVerifier, Location};
+use cache_core::disk::FilePool;
+use cache_core::{ItemLocation, KeyVerifier, Location, RamPool, SegmentKeyVerify};
 
 use crate::location::SlotLocation;
 use crate::storage::SlotStorage;
@@ -44,6 +49,103 @@ impl KeyVerifier for HeapCacheVerifier<'_> {
         slot.release_read();
 
         key_matches
+    }
+}
+
+/// Tiered verifier that supports both RAM (heap slots) and disk storage.
+///
+/// This verifier dispatches to the appropriate storage backend based on
+/// the pool_id encoded in the location:
+/// - RAM pool (pool_id = ram_pool_id): Uses SlotLocation encoding
+/// - Disk pool (pool_id = disk_pool_id): Uses ItemLocation encoding
+pub struct HeapTieredVerifier<'a> {
+    storage: &'a SlotStorage,
+    ram_pool_id: u8,
+    disk_pool: Option<&'a FilePool>,
+    disk_pool_id: u8,
+}
+
+impl<'a> HeapTieredVerifier<'a> {
+    /// Create a new tiered verifier with only RAM storage.
+    pub fn new(storage: &'a SlotStorage, ram_pool_id: u8) -> Self {
+        Self {
+            storage,
+            ram_pool_id,
+            disk_pool: None,
+            disk_pool_id: 2,
+        }
+    }
+
+    /// Create a new tiered verifier with both RAM and disk storage.
+    pub fn with_disk(
+        storage: &'a SlotStorage,
+        ram_pool_id: u8,
+        disk_pool: &'a FilePool,
+        disk_pool_id: u8,
+    ) -> Self {
+        Self {
+            storage,
+            ram_pool_id,
+            disk_pool: Some(disk_pool),
+            disk_pool_id,
+        }
+    }
+
+    /// Verify a key in RAM storage.
+    fn verify_ram(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+        let slot_loc = SlotLocation::from_location(location);
+        let slot = match self.storage.get(slot_loc.slot_index()) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Get the entry (handles reader counting internally)
+        // Allow expired entries during verification to avoid race conditions
+        let entry = match slot.get_with_flags(slot_loc.generation(), true, allow_deleted) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let key_matches = entry.key() == key;
+        slot.release_read();
+        key_matches
+    }
+
+    /// Verify a key in disk storage.
+    fn verify_disk(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+        let disk_pool = match self.disk_pool {
+            Some(pool) => pool,
+            None => return false,
+        };
+
+        let item_loc = ItemLocation::from_location(location);
+        let segment = match disk_pool.get(item_loc.segment_id()) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+    }
+}
+
+impl KeyVerifier for HeapTieredVerifier<'_> {
+    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+        // Don't verify ghost entries
+        if location.is_ghost() {
+            return false;
+        }
+
+        // Extract pool_id from the location (top 2 bits)
+        let pool_id = SlotLocation::pool_id_from_location(location);
+
+        if pool_id == self.ram_pool_id {
+            self.verify_ram(key, location, allow_deleted)
+        } else if pool_id == self.disk_pool_id {
+            self.verify_disk(key, location, allow_deleted)
+        } else {
+            // Unknown pool
+            false
+        }
     }
 }
 

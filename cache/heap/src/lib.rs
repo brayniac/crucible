@@ -88,15 +88,15 @@ use sync::{Arc, AtomicU32, AtomicU64, Ordering};
 use std::sync::atomic::AtomicUsize;
 
 use cache_core::{
-    Cache, CacheError, CacheResult, DEFAULT_TTL, DiskLayer, DiskLayerBuilder, Hashtable,
-    MultiChoiceHashtable, OwnedGuard, ValueRef,
+    Cache, CacheError, CacheResult, DEFAULT_TTL, DiskLayer, DiskLayerBuilder, Hashtable, ItemGuard,
+    Layer, MultiChoiceHashtable, OwnedGuard, ValueRef,
 };
 use std::path::PathBuf;
 
 use entry::HeapEntry;
 use location::SlotLocation;
 use storage::SlotStorage;
-use verifier::HeapCacheVerifier;
+use verifier::{HeapCacheVerifier, HeapTieredVerifier};
 
 /// Number of random slots to sample when selecting an eviction victim.
 const EVICTION_SAMPLES: usize = 5;
@@ -169,12 +169,151 @@ pub struct HeapCache {
 
     /// Optional disk tier for extended capacity.
     disk_layer: Option<DiskLayer>,
+    /// Pool ID for RAM storage (default 0).
+    ram_pool_id: u8,
+    /// Pool ID for disk storage (default 2).
+    disk_pool_id: u8,
+    /// Frequency threshold for promoting items from disk to RAM.
+    promotion_threshold: u8,
 }
 
 impl HeapCache {
     /// Create a new builder for HeapCache.
     pub fn builder() -> HeapCacheBuilder {
         HeapCacheBuilder::new()
+    }
+
+    /// Create a tiered verifier that can verify keys in both RAM and disk.
+    fn tiered_verifier(&self) -> HeapTieredVerifier<'_> {
+        if let Some(ref disk_layer) = self.disk_layer {
+            HeapTieredVerifier::with_disk(
+                &self.storage,
+                self.ram_pool_id,
+                disk_layer.pool(),
+                self.disk_pool_id,
+            )
+        } else {
+            HeapTieredVerifier::new(&self.storage, self.ram_pool_id)
+        }
+    }
+
+    /// Read an item from the disk tier.
+    ///
+    /// Returns the value if found and not expired.
+    fn get_from_disk(&self, key: &[u8], location: cache_core::Location) -> Option<Vec<u8>> {
+        let disk_layer = self.disk_layer.as_ref()?;
+        let item_loc = cache_core::ItemLocation::from_location(location);
+
+        let guard = disk_layer.get_item(item_loc, key)?;
+        Some(guard.value().to_vec())
+    }
+
+    /// Promote an item from disk to RAM.
+    ///
+    /// Writes the item to RAM storage and updates the hashtable to point
+    /// to the new RAM location.
+    fn promote_to_ram(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Duration,
+        old_location: cache_core::Location,
+    ) -> bool {
+        // Calculate item size for memory tracking
+        let item_size = entry::item_size(key.len(), value.len());
+
+        // Check memory and evict if necessary
+        if self.ensure_memory_available(item_size).is_err() {
+            return false;
+        }
+
+        // Get a unique CAS token
+        let cas_token = self.cas_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Allocate the heap entry
+        let entry = match HeapEntry::allocate(key, value, ttl, cas_token) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        // Try to allocate a slot
+        let slot_loc = match self.storage.allocate() {
+            Some(loc) => loc,
+            None => {
+                if !self.evict_one() {
+                    unsafe { HeapEntry::free(entry) };
+                    return false;
+                }
+                match self.storage.allocate() {
+                    Some(loc) => loc,
+                    None => {
+                        unsafe { HeapEntry::free(entry) };
+                        return false;
+                    }
+                }
+            }
+        };
+
+        // Store the entry in the slot
+        let slot = self.storage.get(slot_loc.slot_index()).unwrap();
+        let generation = slot.store(entry);
+
+        // Update slot location with actual generation
+        let slot_loc = SlotLocation::with_pool(self.ram_pool_id, slot_loc.slot_index(), generation);
+
+        // Update hashtable with new RAM location
+        if self
+            .hashtable
+            .cas_location(key, old_location, slot_loc.to_location(), true)
+        {
+            // Track new bytes
+            self.bytes_used.fetch_add(item_size, Ordering::Relaxed);
+
+            // Mark old disk location as deleted
+            if let Some(ref disk_layer) = self.disk_layer {
+                disk_layer.mark_deleted(cache_core::ItemLocation::from_location(old_location));
+            }
+            true
+        } else {
+            // CAS failed, clean up allocated slot
+            self.storage.deallocate(slot_loc);
+            false
+        }
+    }
+
+    /// Demote an item to the disk tier.
+    ///
+    /// Writes the item to disk storage and updates the hashtable.
+    /// Returns true if demotion succeeded.
+    fn demote_to_disk(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Duration,
+        old_location: cache_core::Location,
+    ) -> bool {
+        let disk_layer = match self.disk_layer.as_ref() {
+            Some(layer) => layer,
+            None => return false,
+        };
+
+        // Write to disk layer
+        let disk_loc = match disk_layer.write_item(key, value, &[], ttl) {
+            Ok(loc) => loc,
+            Err(_) => return false,
+        };
+
+        // Update hashtable with disk location
+        if self
+            .hashtable
+            .cas_location(key, old_location, disk_loc.to_location(), true)
+        {
+            true
+        } else {
+            // CAS failed, mark disk item as deleted
+            disk_layer.mark_deleted(disk_loc);
+            false
+        }
     }
 
     /// Calculate the estimated actual memory usage including fragmentation.
@@ -527,17 +666,45 @@ impl HeapCache {
 
     /// Retrieve an item's value from the cache.
     fn get_item(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let verifier = HeapCacheVerifier::new(&self.storage);
-        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let verifier = self.tiered_verifier();
+        let (location, freq) = self.hashtable.lookup(key, &verifier)?;
 
-        let slot_loc = SlotLocation::from_location(location);
-        let slot = self.storage.get(slot_loc.slot_index())?;
+        // Check which pool the item is in
+        let pool_id = SlotLocation::pool_id_from_location(location);
 
-        let entry = slot.get(slot_loc.generation(), false)?;
-        let value = entry.value().to_vec();
-        slot.release_read();
+        if pool_id == self.ram_pool_id {
+            // Item is in RAM
+            let slot_loc = SlotLocation::from_location(location);
+            let slot = self.storage.get(slot_loc.slot_index())?;
 
-        Some(value)
+            let entry = slot.get(slot_loc.generation(), false)?;
+            let value = entry.value().to_vec();
+            slot.release_read();
+
+            return Some(value);
+        } else if pool_id == self.disk_pool_id {
+            // Item is on disk
+            let value = self.get_from_disk(key, location)?;
+
+            // Optionally promote to RAM if accessed frequently
+            if freq >= self.promotion_threshold {
+                // Get TTL from disk item
+                let ttl = self
+                    .disk_layer
+                    .as_ref()
+                    .and_then(|l| {
+                        use cache_core::Layer;
+                        l.item_ttl(cache_core::ItemLocation::from_location(location))
+                    })
+                    .unwrap_or(self.default_ttl);
+
+                let _ = self.promote_to_ram(key, &value, ttl, location);
+            }
+
+            return Some(value);
+        }
+
+        None
     }
 
     /// Access an item without copying.
@@ -1053,6 +1220,8 @@ pub struct HeapCacheBuilder {
     small_queue_percent: u8,
     demotion_threshold: u8,
     disk_tier: Option<DiskTierConfig>,
+    ram_pool_id: u8,
+    disk_pool_id: u8,
 }
 
 impl Default for HeapCacheBuilder {
@@ -1073,7 +1242,25 @@ impl HeapCacheBuilder {
             small_queue_percent: DEFAULT_SMALL_QUEUE_PERCENT,
             demotion_threshold: DEFAULT_DEMOTION_THRESHOLD,
             disk_tier: None,
+            ram_pool_id: 0,
+            disk_pool_id: 2,
         }
+    }
+
+    /// Set the RAM pool ID (default 0).
+    ///
+    /// This identifies the RAM storage tier in location encodings.
+    pub fn ram_pool_id(mut self, id: u8) -> Self {
+        self.ram_pool_id = id;
+        self
+    }
+
+    /// Set the disk pool ID (default 2).
+    ///
+    /// This identifies the disk storage tier in location encodings.
+    pub fn disk_pool_id(mut self, id: u8) -> Self {
+        self.disk_pool_id = id;
+        self
     }
 
     /// Set the memory limit in bytes.
@@ -1167,20 +1354,20 @@ impl HeapCacheBuilder {
         };
 
         // Build disk layer if configured
-        let disk_layer = match self.disk_tier {
+        let (disk_layer, promotion_threshold) = match self.disk_tier {
             Some(config) => {
                 let layer = DiskLayerBuilder::new()
                     .layer_id(1)
-                    .pool_id(2)
+                    .pool_id(self.disk_pool_id)
                     .segment_size(8 * 1024 * 1024) // 8MB segments
                     .path(&config.path)
                     .size(config.size)
                     .sync_mode(config.sync_mode)
                     .recover_on_startup(config.recover_on_startup)
                     .build()?;
-                Some(layer)
+                (Some(layer), config.promotion_threshold)
             }
-            None => None,
+            None => (None, 2),
         };
 
         Ok(HeapCache {
@@ -1195,6 +1382,9 @@ impl HeapCacheBuilder {
             fragmentation_ratio: AtomicU32::new(self.initial_fragmentation_ratio),
             ops_counter: AtomicU64::new(0),
             disk_layer,
+            ram_pool_id: self.ram_pool_id,
+            disk_pool_id: self.disk_pool_id,
+            promotion_threshold,
         })
     }
 }
