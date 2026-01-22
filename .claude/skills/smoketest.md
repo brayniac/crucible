@@ -36,20 +36,15 @@ Run the cache server with the benchmark tool to detect issues.
    ```
    These basic commands should work. If they fail, the server has a fundamental issue.
 
-6. **Run the benchmark** (Linux recommended, may have issues on macOS):
+6. **Run the benchmark**:
    ```bash
    ./target/release/crucible-benchmark benchmark/config/quick-test.toml --format verbose
    ```
    Capture the output and check for:
-   - Connection errors
+   - Connection errors (should be 0)
    - Timeout errors
    - Unexpected latency spikes (p99.9 > 100ms suggests issues)
    - Hit rate (should be > 0 for this test since we do sets before gets)
-
-   **macOS Alternative**: If crucible-benchmark has connection issues on macOS, use redis-benchmark:
-   ```bash
-   redis-benchmark -p 6379 -t set,get -n 10000 -c 10 -q
-   ```
 
 7. **Stop the server**:
    ```bash
@@ -83,7 +78,7 @@ The smoketest passes if:
 ## Platform Notes
 
 - **Linux**: Full support with io_uring or mio backends. Use crucible-benchmark.
-- **macOS**: mio backend only. crucible-benchmark may have connection issues; use redis-benchmark as alternative.
+- **macOS**: mio backend only. crucible-benchmark works correctly.
 
 ## Optional: Test Different Backends
 

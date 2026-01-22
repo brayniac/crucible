@@ -221,21 +221,36 @@ impl IoDriver for MioDriver {
 
         let conn_id = ConnId::with_generation(slot, generation);
 
+        // Check if the socket is actually connected by trying getpeername().
+        // For non-blocking connect that's still in progress (EINPROGRESS),
+        // getpeername will fail with ENOTCONN. We need to wait for the
+        // writable event from poll() before marking the connection as writable.
+        let is_connected = unsafe {
+            let mut addr: libc::sockaddr_storage = mem::zeroed();
+            let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            libc::getpeername(
+                mio_stream.as_raw_fd(),
+                &mut addr as *mut _ as *mut libc::sockaddr,
+                &mut len,
+            ) == 0
+        };
+
         entry.insert(MioConnection {
             stream: mio_stream,
-            // Set writable: true because with edge-triggered mode, the non-blocking
-            // connect may have already completed before we registered with poll.
-            // Queue a SendReady completion to ensure the client tries to send immediately.
             readable: false,
-            writable: true,
+            // Only mark writable if the socket is actually connected.
+            // If connect is still in progress, wait for the poll writable event.
+            writable: is_connected,
             recv_state: ConnectionRecvState::default(),
             generation,
         });
 
-        // Queue a SendReady completion so the client tries to send immediately.
-        // This handles the edge-triggered case where connect completed before registration.
-        self.pending_completions
-            .push(Completion::new(CompletionKind::SendReady { conn_id }));
+        // Only queue SendReady if the socket is already connected.
+        // Otherwise, wait for the poll writable event.
+        if is_connected {
+            self.pending_completions
+                .push(Completion::new(CompletionKind::SendReady { conn_id }));
+        }
 
         Ok(conn_id)
     }
