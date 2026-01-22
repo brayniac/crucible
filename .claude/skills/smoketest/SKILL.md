@@ -1,4 +1,7 @@
-# Smoketest Skill
+---
+name: smoketest
+description: Run the cache server with the benchmark tool to detect issues
+---
 
 Run the cache server with the benchmark tool to detect issues.
 

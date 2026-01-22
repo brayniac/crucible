@@ -237,7 +237,10 @@ async fn run_parquet_recorder(
     shared: Arc<SharedState>,
     stop_notify: Arc<Notify>,
 ) -> io::Result<()> {
-    let snapshotter = SnapshotterBuilder::new().build();
+    let snapshotter = SnapshotterBuilder::new()
+        .metadata("source".to_string(), "crucible-benchmark".to_string())
+        .metadata("version".to_string(), env!("CARGO_PKG_VERSION").to_string())
+        .build();
 
     // Collect snapshots during the run
     let mut snapshots: Vec<Snapshot> = Vec::new();
@@ -277,14 +280,10 @@ async fn run_parquet_recorder(
         // Create file and writer
         let file = File::create(&path).map_err(|e| io::Error::other(e.to_string()))?;
 
-        let metadata = HashMap::from([
-            ("source".to_string(), "crucible-benchmark".to_string()),
-            ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
-            (
-                "sampling_interval_ms".to_string(),
-                interval.as_millis().to_string(),
-            ),
-        ]);
+        let metadata = HashMap::from([(
+            "sampling_interval_ms".to_string(),
+            interval.as_millis().to_string(),
+        )]);
 
         let mut writer = schema
             .finalize(file, ParquetOptions::new(), Some(metadata))
