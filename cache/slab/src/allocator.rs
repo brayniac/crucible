@@ -146,6 +146,17 @@ impl SlabAllocator {
         }
     }
 
+    /// Release a slab reference acquired during allocation.
+    ///
+    /// Must be called after a successful `allocate()` once the write is complete.
+    /// This decrements the slab's ref_count, allowing eviction to proceed.
+    #[inline]
+    pub fn release_write_ref(&self, class_id: u8, slab_id: u32) {
+        if let Some(class) = self.classes.get(class_id as usize) {
+            class.release_slab(slab_id);
+        }
+    }
+
     /// Maximum attempts to allocate with eviction before giving up.
     /// This handles the case where multiple threads are racing to evict
     /// and allocate. If our eviction attempt fails (another thread was
@@ -544,15 +555,16 @@ impl SlabAllocator {
     /// Finalize a two-phase write operation.
     ///
     /// Called after the value has been written to the pointer returned by
-    /// `begin_write_item`. Updates statistics (bytes_used, item_count).
+    /// `begin_write_item`. Updates statistics (bytes_used, item_count) and
+    /// releases the write ref acquired during allocation.
     ///
     /// # Arguments
     /// * `location` - The location returned by `begin_write_item`
     /// * `item_size` - The item_size returned by `begin_write_item`
     pub fn finalize_write_item(&self, location: SlabLocation, item_size: usize) {
-        let (class_id, _slab_id, _slot_index) = location.unpack();
+        let (class_id, slab_id, _slot_index) = location.unpack();
         if let Some(class) = self.classes.get(class_id as usize) {
-            class.finalize_write_item(item_size);
+            class.finalize_write_item(slab_id, item_size);
         }
     }
 

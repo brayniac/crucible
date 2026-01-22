@@ -173,7 +173,7 @@ impl SlabCache {
             None => return false,
         };
 
-        // Allocate slot (may evict other items)
+        // Allocate slot (may evict other items). This acquires a write ref on the slab.
         let (slab_id, slot_index) = match self
             .allocator
             .allocate_with_eviction(class_id, &*self.hashtable)
@@ -196,12 +196,18 @@ impl SlabCache {
             .hashtable
             .cas_location(key, old_location, new_location, true)
         {
+            // Release write ref - write is complete and item is visible in hashtable
+            self.allocator.release_write_ref(class_id, slab_id);
+
             // Mark old disk location as deleted
             if let Some(ref disk_layer) = self.disk_layer {
                 disk_layer.mark_deleted(cache_core::ItemLocation::from_location(old_location));
             }
             true
         } else {
+            // Release write ref before cleanup
+            self.allocator.release_write_ref(class_id, slab_id);
+
             // CAS failed, clean up allocated slot
             unsafe {
                 let loc = SlabLocation::with_pool(self.ram_pool_id, class_id, slab_id, slot_index);
@@ -274,7 +280,7 @@ impl SlabCache {
             .select_class(item_size)
             .ok_or(CacheError::ValueTooLong)?;
 
-        // Allocate slot (may evict)
+        // Allocate slot (may evict). This acquires a write ref on the slab.
         let (slab_id, slot_index) = self
             .allocator
             .allocate_with_eviction(class_id, &*self.hashtable)
@@ -291,8 +297,15 @@ impl SlabCache {
         let verifier = self.allocator.verifier();
 
         match self.hashtable.insert_if_absent(key, location, &verifier) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Release write ref - write is complete and item is visible in hashtable
+                self.allocator.release_write_ref(class_id, slab_id);
+                Ok(())
+            }
             Err(e) => {
+                // Release write ref before cleanup
+                self.allocator.release_write_ref(class_id, slab_id);
+
                 // Failed to insert, clean up the allocated slot
                 let loc = SlabLocation::new(class_id, slab_id, slot_index);
                 unsafe {
@@ -331,7 +344,7 @@ impl SlabCache {
             .select_class(item_size)
             .ok_or(CacheError::ValueTooLong)?;
 
-        // Allocate slot (may evict)
+        // Allocate slot (may evict). This acquires a write ref on the slab.
         let (slab_id, slot_index) = self
             .allocator
             .allocate_with_eviction(class_id, &*self.hashtable)
@@ -349,6 +362,9 @@ impl SlabCache {
 
         match self.hashtable.update_if_present(key, location, &verifier) {
             Ok(old_loc) => {
+                // Release write ref - write is complete and item is visible in hashtable
+                self.allocator.release_write_ref(class_id, slab_id);
+
                 // Deallocate old slot
                 let old = SlabLocation::from_location(old_loc);
                 let (old_class, old_slab, old_slot) = old.unpack();
@@ -366,6 +382,9 @@ impl SlabCache {
                 Ok(())
             }
             Err(e) => {
+                // Release write ref before cleanup
+                self.allocator.release_write_ref(class_id, slab_id);
+
                 // Failed to update, clean up the allocated slot
                 let loc = SlabLocation::new(class_id, slab_id, slot_index);
                 unsafe {
@@ -398,7 +417,7 @@ impl SlabCache {
             .select_class(item_size)
             .ok_or(CacheError::ValueTooLong)?;
 
-        // Allocate slot (may evict)
+        // Allocate slot (may evict). This acquires a write ref on the slab.
         let (slab_id, slot_index) = self
             .allocator
             .allocate_with_eviction(class_id, &*self.hashtable)
@@ -416,6 +435,9 @@ impl SlabCache {
 
         match self.hashtable.insert(key, location, &verifier) {
             Ok(Some(old_loc)) => {
+                // Release write ref - write is complete and item is visible in hashtable
+                self.allocator.release_write_ref(class_id, slab_id);
+
                 // Deallocate old slot
                 let old = SlabLocation::from_location(old_loc);
                 let (old_class, old_slab, old_slot) = old.unpack();
@@ -432,9 +454,13 @@ impl SlabCache {
                 self.allocator.deallocate(old_class, old_slab, old_slot);
             }
             Ok(None) => {
-                // New entry, nothing to deallocate
+                // Release write ref - write is complete and item is visible in hashtable
+                self.allocator.release_write_ref(class_id, slab_id);
             }
             Err(e) => {
+                // Release write ref before cleanup
+                self.allocator.release_write_ref(class_id, slab_id);
+
                 // Hashtable insert failed, clean up the allocated slot
                 let loc = SlabLocation::new(class_id, slab_id, slot_index);
                 unsafe {

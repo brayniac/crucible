@@ -505,9 +505,11 @@ impl SlabClass {
         }
     }
 
-    /// Try to allocate a slot from the free list.
+    /// Try to allocate a slot from the free list for writing.
     ///
     /// Returns `Some((slab_id, slot_index))` if successful, `None` if no free slots.
+    /// **The slab's ref_count is incremented** to prevent eviction during the write.
+    /// Caller MUST call `release_slab(slab_id)` when the write is complete.
     ///
     /// This method filters out slots from evicted slabs. When a slab is evicted,
     /// its state becomes Unallocated, but the free_slots queue may still contain
@@ -518,17 +520,14 @@ impl SlabClass {
                 crossbeam_deque::Steal::Success(packed) => {
                     let (slab_id, slot_index) = unpack_slot_ref(packed);
 
-                    // Check if the slab is still Live (not evicted).
-                    // This is necessary because eviction sets the slab state to
-                    // Unallocated but cannot efficiently drain all matching entries
-                    // from the lock-free free_slots queue.
-                    let state_packed = self.slab_states[slab_id as usize].load(Ordering::Acquire);
-                    let (state, _) = packed_state::unpack(state_packed);
-
-                    if state == SlabState::Live {
+                    // Try to acquire a reference to the slab atomically.
+                    // This both checks that the slab is Live AND increments ref_count,
+                    // preventing eviction from proceeding while we write to the slot.
+                    // If the slab is not Live (evicted or draining), try_acquire fails.
+                    if packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
                         return Some((slab_id, slot_index));
                     }
-                    // Slab was evicted, discard this slot and try again
+                    // Slab is not Live (evicted or draining), discard and try again
                     continue;
                 }
                 crossbeam_deque::Steal::Empty => return None,
@@ -850,17 +849,24 @@ impl SlabClass {
     /// Finalize a two-phase write operation.
     ///
     /// Called after the value has been written to the pointer returned by
-    /// `begin_write_item`. Updates statistics (bytes_used, item_count).
-    pub fn finalize_write_item(&self, item_size: usize) {
+    /// `begin_write_item`. Updates statistics (bytes_used, item_count) and
+    /// releases the write ref acquired during allocation.
+    pub fn finalize_write_item(&self, slab_id: u32, item_size: usize) {
         self.add_bytes(item_size);
         self.add_item();
+        // Release the write ref acquired during begin_write_item -> allocate()
+        self.release_slab(slab_id);
     }
 
     /// Cancel a two-phase write operation.
     ///
     /// Called if the write cannot be completed (e.g., connection closed).
-    /// Marks the item as deleted and returns the slot to the free list.
+    /// Marks the item as deleted, returns the slot to the free list, and
+    /// releases the write ref acquired during allocation.
     pub fn cancel_write_item(&self, slab_id: u32, slot_index: u16) {
+        // Release the write ref acquired during begin_write_item -> allocate()
+        self.release_slab(slab_id);
+
         // Mark as deleted
         unsafe {
             let slot_ptr = self.slot_ptr(slab_id, slot_index);
