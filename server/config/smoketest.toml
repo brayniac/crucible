@@ -1,0 +1,31 @@
+# Crucible Server - Smoketest Configuration
+#
+# Minimal configuration for quick smoke testing.
+# Uses small heap and few workers for fast startup.
+
+runtime = "native"
+
+[workers]
+threads = 2
+
+[cache]
+backend = "segment"
+policy = "s3fifo"
+heap_size = "64MB"
+segment_size = "1MB"
+max_value_size = "64KB"
+hashtable_power = 14
+
+[[listener]]
+protocol = "resp"
+address = "127.0.0.1:6379"
+
+[metrics]
+address = "127.0.0.1:9090"
+
+[uring]
+sqpoll = false
+buffer_count = 1024
+buffer_size = "4KB"
+sq_depth = 512
+recv_mode = "multishot"
