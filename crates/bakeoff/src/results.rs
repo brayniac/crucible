@@ -413,11 +413,32 @@ fn fetch_experiment_metrics(_experiment_id: &str, jobs: &[JobData]) -> Benchmark
 fn parse_benchmark_metrics(logs: &LogsFile) -> BenchmarkMetrics {
     let mut metrics = BenchmarkMetrics::default();
     let mut saw_latency_header = false;
+    let mut saw_valkey_latency_header = false;
 
     for event in &logs.events {
         if let Some(text) = &event.text {
-            // crucible-benchmark format
-            if text.contains("throughput:") && text.contains("req/s") {
+            let trimmed = text.trim();
+
+            // New crucible-benchmark format: "throughput   13.6M req/s, 0.00% errors"
+            if trimmed.starts_with("throughput") && trimmed.contains("req/s") {
+                if let Some(val) = extract_throughput_with_suffix(trimmed) {
+                    metrics.throughput = Some(val);
+                }
+            }
+            // New crucible-benchmark latency table header: "latency         p50     p90     p99   p99.9  p99.99     max"
+            else if trimmed.starts_with("latency")
+                && trimmed.contains("p50")
+                && trimmed.contains("p99")
+            {
+                saw_latency_header = true;
+            }
+            // New crucible-benchmark latency data line: "GET          19.0ms  20.7ms  34.1ms  36.4ms  39.1ms   253ms"
+            else if saw_latency_header && trimmed.starts_with("GET") {
+                parse_latency_table_row(trimmed, &mut metrics);
+                saw_latency_header = false;
+            }
+            // Legacy crucible-benchmark format (kept for backwards compatibility)
+            else if text.contains("throughput:") && text.contains("req/s") {
                 // Format: "throughput: 773993.23 req/s"
                 if let Some(val) = extract_float_before(text, "req/s") {
                     metrics.throughput = Some(val);
@@ -459,10 +480,10 @@ fn parse_benchmark_metrics(logs: &LogsFile) -> BenchmarkMetrics {
             }
             // valkey-benchmark latency summary table header (verbose mode)
             else if text.contains("latency summary (msec):") {
-                saw_latency_header = true;
-            } else if saw_latency_header && text.trim().starts_with("avg") {
+                saw_valkey_latency_header = true;
+            } else if saw_valkey_latency_header && text.trim().starts_with("avg") {
                 // This is the column header line, skip it but stay in latency mode
-            } else if saw_latency_header {
+            } else if saw_valkey_latency_header {
                 // Try to parse the values line: "0.167     0.016     0.159     0.287     0.343     2.527"
                 let parts: Vec<&str> = text.split_whitespace().collect();
                 if parts.len() >= 6 {
@@ -474,12 +495,73 @@ fn parse_benchmark_metrics(logs: &LogsFile) -> BenchmarkMetrics {
                         metrics.p99_us = Some(p99_ms * 1000.0);
                     }
                 }
-                saw_latency_header = false;
+                saw_valkey_latency_header = false;
             }
         }
     }
 
     metrics
+}
+
+/// Extract throughput value with M/K suffix (e.g., "13.6M req/s" -> 13600000.0)
+fn extract_throughput_with_suffix(text: &str) -> Option<f64> {
+    // Find the value before "req/s"
+    let idx = text.find("req/s")?;
+    let before = text[..idx].trim();
+    let parts: Vec<&str> = before.split_whitespace().collect();
+    let val_str = parts.last()?;
+
+    // Check for M (million) or K (thousand) suffix
+    if val_str.ends_with('M') {
+        let num_str = &val_str[..val_str.len() - 1];
+        num_str.parse::<f64>().ok().map(|v| v * 1_000_000.0)
+    } else if val_str.ends_with('K') {
+        let num_str = &val_str[..val_str.len() - 1];
+        num_str.parse::<f64>().ok().map(|v| v * 1_000.0)
+    } else {
+        val_str.parse::<f64>().ok()
+    }
+}
+
+/// Parse latency values from the new table format
+/// Format: "GET          19.0ms  20.7ms  34.1ms  36.4ms  39.1ms   253ms"
+/// Columns: command, p50, p90, p99, p99.9, p99.99, max
+fn parse_latency_table_row(text: &str, metrics: &mut BenchmarkMetrics) {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    // Expected: ["GET", "19.0ms", "20.7ms", "34.1ms", "36.4ms", "39.1ms", "253ms"]
+    if parts.len() >= 5 {
+        // p50 is at index 1
+        if let Some(val) = parse_latency_value(parts[1]) {
+            metrics.p50_us = Some(val);
+        }
+        // p99 is at index 3
+        if let Some(val) = parse_latency_value(parts[3]) {
+            metrics.p99_us = Some(val);
+        }
+        // p99.9 is at index 4
+        if let Some(val) = parse_latency_value(parts[4]) {
+            metrics.p999_us = Some(val);
+        }
+    }
+}
+
+/// Parse a latency value with unit suffix (e.g., "19.0ms" -> 19000.0 us, "500us" -> 500.0)
+fn parse_latency_value(val_str: &str) -> Option<f64> {
+    if val_str.ends_with("ms") {
+        let num_str = &val_str[..val_str.len() - 2];
+        num_str.parse::<f64>().ok().map(|v| v * 1000.0) // convert ms to us
+    } else if val_str.ends_with("us") || val_str.ends_with("µs") {
+        let suffix_len = if val_str.ends_with("µs") { 2 } else { 2 };
+        let num_str = &val_str[..val_str.len() - suffix_len];
+        num_str.parse::<f64>().ok()
+    } else if val_str.ends_with('s') && !val_str.ends_with("ms") && !val_str.ends_with("us") {
+        // Plain seconds
+        let num_str = &val_str[..val_str.len() - 1];
+        num_str.parse::<f64>().ok().map(|v| v * 1_000_000.0) // convert s to us
+    } else {
+        // Assume us if no unit
+        val_str.parse::<f64>().ok()
+    }
 }
 
 /// Extract a float value that appears before a given suffix.

@@ -437,12 +437,19 @@ impl SlabClass {
 
     /// Get slab timestamps for LRA/LRC selection.
     ///
-    /// Returns (slab_id, created_at, last_accessed) for each slab.
+    /// Returns (slab_id, created_at, last_accessed) for each Live slab.
+    /// Evicted slabs (state != Live) are filtered out.
     pub fn slab_timestamps(&self) -> Vec<(u32, u32, u32)> {
         let slabs = self.slabs.read();
         slabs
             .iter()
             .enumerate()
+            .filter(|(id, _)| {
+                // Only include slabs that are still Live (not evicted)
+                let state_packed = self.slab_states[*id].load(Ordering::Acquire);
+                let (state, _) = packed_state::unpack(state_packed);
+                state == SlabState::Live
+            })
             .map(|(id, slab)| (id as u32, slab.created_at(), slab.last_accessed()))
             .collect()
     }

@@ -277,7 +277,7 @@ impl SweepConfig {
     /// Full sweep configuration for server comparison suite.
     pub fn full() -> Self {
         Self {
-            connections: vec![1, 2, 4, 8, 16, 32, 64, 256, 512, 1024, 2048],
+            connections: vec![16, 32, 64, 256, 512, 1024, 2048],
             pipeline_depths: vec![1, 8, 16, 32, 64, 128],
         }
     }

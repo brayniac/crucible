@@ -146,6 +146,13 @@ impl SlabAllocator {
         }
     }
 
+    /// Maximum attempts to allocate with eviction before giving up.
+    /// This handles the case where multiple threads are racing to evict
+    /// and allocate. If our eviction attempt fails (another thread was
+    /// already evicting), we should retry allocation since that thread
+    /// may have freed space.
+    const MAX_EVICTION_ATTEMPTS: usize = 8;
+
     /// Allocate a slot with eviction if needed.
     ///
     /// Tries to allocate a slot. If no free slots or slabs are available,
@@ -172,13 +179,23 @@ impl SlabAllocator {
             return None;
         }
 
-        // Try slab-level eviction
+        // Try slab-level eviction with retries.
+        // We may need to retry because:
+        // 1. Another thread may be evicting the same slab (our eviction fails)
+        // 2. Another thread may have grabbed the freed slab before us
+        // 3. Our allocation may fail due to stale free_slots entries from evicted slabs
         if self.eviction_strategy.has_slab_eviction() {
-            if self.try_slab_eviction(hashtable) {
-                // Slab evicted - try allocation again
+            for _ in 0..Self::MAX_EVICTION_ATTEMPTS {
+                // Try eviction (may fail if another thread is evicting)
+                let _ = self.try_slab_eviction(hashtable);
+
+                // Always try allocation - another thread's eviction may have succeeded
                 if let Some(slot) = self.allocate(class_id) {
                     return Some(slot);
                 }
+
+                // Yield to let other threads make progress
+                std::thread::yield_now();
             }
         }
 
