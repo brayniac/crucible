@@ -55,7 +55,21 @@ ratelimit = "0.10"
 ctrlc = { version = "3", features = ["termination"] }
 
 # Async runtime for admin server
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+
+# Viewer dependencies
+arrow = "56"
+parquet = "56"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip"] }
+tower-livereload = "0.9"
+histogram = "0.11"
+include_dir = "0.7"
+open = "5"
+ringlog = "0.7"
+http = "1"
+promql-parser = "0.4"
 
 [features]
 default = ["io_uring"]

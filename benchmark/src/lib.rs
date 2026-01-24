@@ -5,6 +5,7 @@ pub mod config;
 pub mod metrics;
 pub mod output;
 pub mod protocol;
+pub mod viewer;
 pub mod worker;
 
 pub use admin::{AdminHandle, AdminServer};
