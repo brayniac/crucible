@@ -3,17 +3,15 @@ use benchmark::metrics;
 use benchmark::viewer;
 use benchmark::worker::Phase;
 use benchmark::{
-    AdminServer, ColorMode, IoWorker, IoWorkerConfig, LatencyStats, OutputFormat, OutputFormatter,
-    Results, Sample, SharedState, create_formatter, parse_cpu_list,
+    AdminServer, IoWorker, IoWorkerConfig, LatencyStats, OutputFormatter, Results, Sample,
+    SharedState, create_formatter, parse_cpu_list,
 };
 
 use chrono::Utc;
-use io_driver::{IoEngine, RecvMode};
-
 use clap::{Parser, Subcommand};
+use io_driver::IoEngine;
 use metriken::{AtomicHistogram, histogram::Histogram};
 use ratelimit::Ratelimiter;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,128 +31,19 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Path to configuration file (for backwards compatibility, use `run` subcommand)
+    /// Path to configuration file
     #[arg(value_name = "CONFIG")]
     config: Option<PathBuf>,
-
-    /// Override number of threads
-    #[arg(short, long)]
-    threads: Option<usize>,
-
-    /// Override target rate limit (requests/second)
-    #[arg(short, long)]
-    rate: Option<u64>,
-
-    /// Override total connections
-    #[arg(long)]
-    connections: Option<usize>,
-
-    /// Listen address for Prometheus metrics (e.g., 127.0.0.1:9090)
-    #[arg(long)]
-    prometheus: Option<SocketAddr>,
 
     /// Path to write Parquet output file
     #[arg(long)]
     parquet: Option<PathBuf>,
-
-    /// CPU list for worker thread pinning (e.g., "0-3,8-11,13")
-    #[arg(long)]
-    cpu_list: Option<String>,
-
-    /// I/O engine selection (auto, mio, uring)
-    #[arg(long, value_parser = parse_io_engine)]
-    io_engine: Option<IoEngine>,
-
-    /// Recv mode for io_uring (multishot/multi-shot, singleshot/single-shot)
-    #[arg(long, value_parser = parse_recv_mode)]
-    recv_mode: Option<RecvMode>,
-
-    /// Output format (clean, json, verbose, quiet)
-    #[arg(long, value_parser = parse_output_format)]
-    format: Option<OutputFormat>,
-
-    /// Color mode (auto, always, never)
-    #[arg(long, value_parser = parse_color_mode)]
-    color: Option<ColorMode>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run benchmark
-    Run(RunArgs),
-
     /// View benchmark results in a web dashboard
     View(viewer::ViewArgs),
-}
-
-/// Arguments for the run subcommand (benchmark mode)
-#[derive(Parser, Debug)]
-struct RunArgs {
-    /// Path to configuration file
-    config: PathBuf,
-
-    /// Override number of threads
-    #[arg(short, long)]
-    threads: Option<usize>,
-
-    /// Override target rate limit (requests/second)
-    #[arg(short, long)]
-    rate: Option<u64>,
-
-    /// Override total connections
-    #[arg(long)]
-    connections: Option<usize>,
-
-    /// Listen address for Prometheus metrics (e.g., 127.0.0.1:9090)
-    #[arg(long)]
-    prometheus: Option<SocketAddr>,
-
-    /// Path to write Parquet output file
-    #[arg(long)]
-    parquet: Option<PathBuf>,
-
-    /// CPU list for worker thread pinning (e.g., "0-3,8-11,13")
-    #[arg(long)]
-    cpu_list: Option<String>,
-
-    /// I/O engine selection (auto, mio, uring)
-    #[arg(long, value_parser = parse_io_engine)]
-    io_engine: Option<IoEngine>,
-
-    /// Recv mode for io_uring (multishot/multi-shot, singleshot/single-shot)
-    #[arg(long, value_parser = parse_recv_mode)]
-    recv_mode: Option<RecvMode>,
-
-    /// Output format (clean, json, verbose, quiet)
-    #[arg(long, value_parser = parse_output_format)]
-    format: Option<OutputFormat>,
-
-    /// Color mode (auto, always, never)
-    #[arg(long, value_parser = parse_color_mode)]
-    color: Option<ColorMode>,
-}
-
-fn parse_io_engine(s: &str) -> Result<IoEngine, String> {
-    s.parse()
-}
-
-fn parse_recv_mode(s: &str) -> Result<RecvMode, String> {
-    match s.to_lowercase().as_str() {
-        "multishot" | "multi-shot" | "multi" => Ok(RecvMode::Multishot),
-        "singleshot" | "single-shot" | "single" => Ok(RecvMode::SingleShot),
-        _ => Err(format!(
-            "invalid recv_mode '{}', expected: multishot, multi-shot, singleshot, single-shot",
-            s
-        )),
-    }
-}
-
-fn parse_output_format(s: &str) -> Result<OutputFormat, String> {
-    s.parse()
-}
-
-fn parse_color_mode(s: &str) -> Result<ColorMode, String> {
-    s.parse()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -166,29 +55,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             viewer::run(args.into());
             Ok(())
         }
-        Some(Command::Run(args)) => {
-            init_tracing();
-            run_with_args(args)
-        }
         None => {
-            // No subcommand provided - check if config was provided at top level
-            // This handles backwards compatibility for `crucible-benchmark config.toml`
-            if let Some(config) = cli.config {
+            // Run benchmark if config was provided
+            if let Some(ref config) = cli.config {
                 init_tracing();
-                let args = RunArgs {
-                    config,
-                    threads: cli.threads,
-                    rate: cli.rate,
-                    connections: cli.connections,
-                    prometheus: cli.prometheus,
-                    parquet: cli.parquet,
-                    cpu_list: cli.cpu_list,
-                    io_engine: cli.io_engine,
-                    recv_mode: cli.recv_mode,
-                    format: cli.format,
-                    color: cli.color,
-                };
-                run_with_args(args)
+                run_benchmark_cli(config, &cli)
             } else {
                 // Show help
                 Cli::parse_from(["crucible-benchmark", "--help"]);
@@ -207,40 +78,13 @@ fn init_tracing() {
         .init();
 }
 
-fn run_with_args(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_benchmark_cli(config_path: &PathBuf, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
-    let mut config = Config::load(&args.config)?;
+    let mut config = Config::load(config_path)?;
 
     // Apply CLI overrides
-    if let Some(threads) = args.threads {
-        config.general.threads = threads;
-    }
-    if let Some(rate) = args.rate {
-        config.workload.rate_limit = Some(rate);
-    }
-    if let Some(connections) = args.connections {
-        config.connection.connections = connections;
-    }
-    if let Some(ref prometheus) = args.prometheus {
-        config.admin.listen = Some(*prometheus);
-    }
-    if let Some(ref parquet) = args.parquet {
+    if let Some(ref parquet) = cli.parquet {
         config.admin.parquet = Some(parquet.clone());
-    }
-    if let Some(ref cpu_list) = args.cpu_list {
-        config.general.cpu_list = Some(cpu_list.clone());
-    }
-    if let Some(io_engine) = args.io_engine {
-        config.general.io_engine = io_engine;
-    }
-    if let Some(recv_mode) = args.recv_mode {
-        config.general.recv_mode = recv_mode;
-    }
-    if let Some(format) = args.format {
-        config.admin.format = format;
-    }
-    if let Some(color) = args.color {
-        config.admin.color = color;
     }
 
     // Parse CPU list if configured
