@@ -30,3 +30,8 @@ loom = { workspace = true, features = ["checkpoint"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "hashtable"
+harness = false
