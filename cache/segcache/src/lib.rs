@@ -63,11 +63,12 @@ pub use cache_core::{
 /// Eviction policy for the segmented cache.
 ///
 /// This determines the overall cache architecture and eviction strategy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum EvictionPolicy {
     /// Random segment selection within TTL buckets (default).
     ///
     /// Simple and efficient, good for general-purpose caching.
+    #[default]
     Random,
 
     /// Strict FIFO segment eviction.
@@ -99,12 +100,6 @@ pub enum EvictionPolicy {
         /// Frequency threshold for promotion (default: 1).
         demotion_threshold: u8,
     },
-}
-
-impl Default for EvictionPolicy {
-    fn default() -> Self {
-        Self::Random
-    }
 }
 
 /// Segment-based cache with single-tier architecture.
@@ -491,7 +486,7 @@ impl SegCacheBuilder {
             EvictionPolicy::Random => EvictionStrategy::Random,
             EvictionPolicy::Fifo => EvictionStrategy::Fifo,
             EvictionPolicy::Cte => EvictionStrategy::Cte,
-            EvictionPolicy::Merge(config) => EvictionStrategy::Merge(config.clone()),
+            EvictionPolicy::Merge(config) => EvictionStrategy::Merge(*config),
             EvictionPolicy::S3Fifo { .. } => unreachable!(),
         };
 

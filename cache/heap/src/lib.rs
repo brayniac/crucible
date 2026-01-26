@@ -285,6 +285,7 @@ impl HeapCache {
     ///
     /// Writes the item to disk storage and updates the hashtable.
     /// Returns true if demotion succeeded.
+    #[allow(dead_code)]
     fn demote_to_disk(
         &self,
         key: &[u8],
@@ -328,7 +329,7 @@ impl HeapCache {
     #[inline]
     fn maybe_calibrate(&self) {
         let ops = self.ops_counter.fetch_add(1, Ordering::Relaxed);
-        if ops % CALIBRATION_INTERVAL == 0 {
+        if ops.is_multiple_of(CALIBRATION_INTERVAL) {
             self.calibrate_fragmentation();
         }
     }
@@ -654,12 +655,12 @@ impl HeapCache {
     /// Deallocate a slot and track the freed bytes.
     fn deallocate_and_track(&self, slot_loc: SlotLocation) {
         // Get the entry size before deallocating
-        if let Some(slot) = self.storage.get(slot_loc.slot_index()) {
-            if let Some(entry) = slot.get_with_flags(slot_loc.generation(), true, true) {
-                let size = entry.total_size();
-                slot.release_read();
-                self.bytes_used.fetch_sub(size, Ordering::Relaxed);
-            }
+        if let Some(slot) = self.storage.get(slot_loc.slot_index())
+            && let Some(entry) = slot.get_with_flags(slot_loc.generation(), true, true)
+        {
+            let size = entry.total_size();
+            slot.release_read();
+            self.bytes_used.fetch_sub(size, Ordering::Relaxed);
         }
         self.storage.deallocate(slot_loc);
     }
@@ -833,12 +834,12 @@ impl HeapCache {
         if let (Some(_slot_idx), Some(key)) = (victim_slot_idx, victim_key) {
             let verifier = HeapCacheVerifier::new(&self.storage);
 
-            if let Some((location, _)) = self.hashtable.lookup(&key, &verifier) {
-                if self.hashtable.remove(&key, location) {
-                    let slot_loc = SlotLocation::from_location(location);
-                    self.deallocate_and_track(slot_loc);
-                    return true;
-                }
+            if let Some((location, _)) = self.hashtable.lookup(&key, &verifier)
+                && self.hashtable.remove(&key, location)
+            {
+                let slot_loc = SlotLocation::from_location(location);
+                self.deallocate_and_track(slot_loc);
+                return true;
             }
         }
 

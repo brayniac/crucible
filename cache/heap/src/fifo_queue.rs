@@ -30,18 +30,21 @@ impl QueueEntry {
     }
 
     /// Get the location from the item info (lower 44 bits).
+    #[allow(dead_code)]
     #[inline]
     pub fn location(&self) -> u64 {
         self.item_info & 0xFFF_FFFF_FFFF
     }
 
     /// Get the frequency from the item info (bits 44-51).
+    #[allow(dead_code)]
     #[inline]
     pub fn frequency(&self) -> u8 {
         ((self.item_info >> 44) & 0xFF) as u8
     }
 
     /// Get the tag from the item info (upper 12 bits).
+    #[allow(dead_code)]
     #[inline]
     pub fn tag(&self) -> u16 {
         ((self.item_info >> 52) & 0xFFF) as u16
@@ -140,6 +143,7 @@ impl FifoQueue {
     }
 
     /// Peek at the head entry without removing it.
+    #[allow(dead_code)]
     #[inline]
     pub fn peek(&self) -> Option<QueueEntry> {
         let head = self.head.load(Ordering::Acquire);
@@ -169,6 +173,7 @@ impl FifoQueue {
     }
 
     /// Check if the queue is empty.
+    #[allow(dead_code)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         let head = self.head.load(Ordering::Acquire);
@@ -177,6 +182,7 @@ impl FifoQueue {
     }
 
     /// Check if the queue is full.
+    #[allow(dead_code)]
     #[inline]
     pub fn is_full(&self) -> bool {
         let tail = self.tail.load(Ordering::Acquire);
@@ -186,6 +192,7 @@ impl FifoQueue {
     }
 
     /// Get the queue capacity.
+    #[allow(dead_code)]
     #[inline]
     pub fn capacity(&self) -> u32 {
         self.capacity - 1 // One slot is reserved to distinguish full from empty

@@ -402,10 +402,10 @@ impl FilePoolBuilder {
         let total_file_size = HEADER_SIZE + num_segments * self.segment_size;
 
         // Create parent directories if needed
-        if let Some(parent) = self.path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = self.path.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         // Open or create the file
@@ -413,6 +413,7 @@ impl FilePoolBuilder {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&self.path)?;
 
         // Check if this is an existing file we should try to recover

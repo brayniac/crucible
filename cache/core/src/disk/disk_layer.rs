@@ -247,11 +247,12 @@ impl DiskLayer {
                 && let Some(segment) = self.pool.get(head_id)
             {
                 let expire_at = segment.expire_at();
-                if expire_at > 0 && now >= expire_at {
-                    if let Ok(evicted_id) = bucket.evict_head_segment(&self.pool) {
-                        self.process_evicted_segment(evicted_id, hashtable);
-                        expired_count += 1;
-                    }
+                if expire_at > 0
+                    && now >= expire_at
+                    && let Ok(evicted_id) = bucket.evict_head_segment(&self.pool)
+                {
+                    self.process_evicted_segment(evicted_id, hashtable);
+                    expired_count += 1;
                 }
             }
         }

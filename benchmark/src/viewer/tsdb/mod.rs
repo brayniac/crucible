@@ -168,10 +168,10 @@ impl Tsdb {
                             let series = gauges.entry(labels).or_default();
 
                             for (id, value) in values.iter().enumerate() {
-                                if let Some(v) = value {
-                                    if let Some(ts) = timestamps.get(&id) {
-                                        series.insert(*ts, v as i64);
-                                    }
+                                if let Some(v) = value
+                                    && let Some(ts) = timestamps.get(&id)
+                                {
+                                    series.insert(*ts, v as i64);
                                 }
                             }
                         } else {
@@ -180,10 +180,10 @@ impl Tsdb {
                             let series = counters.entry(labels).or_default();
 
                             for (id, value) in values.iter().enumerate() {
-                                if let Some(v) = value {
-                                    if let Some(ts) = timestamps.get(&id) {
-                                        series.insert(*ts, v);
-                                    }
+                                if let Some(v) = value
+                                    && let Some(ts) = timestamps.get(&id)
+                                {
+                                    series.insert(*ts, v);
                                 }
                             }
                         }
@@ -198,10 +198,10 @@ impl Tsdb {
                             .expect("Failed to downcast");
 
                         for (id, value) in values.iter().enumerate() {
-                            if let Some(v) = value {
-                                if let Some(ts) = timestamps.get(&id) {
-                                    series.insert(*ts, v);
-                                }
+                            if let Some(v) = value
+                                && let Some(ts) = timestamps.get(&id)
+                            {
+                                series.insert(*ts, v);
                             }
                         }
                     }
@@ -228,22 +228,22 @@ impl Tsdb {
                             };
 
                             for (id, value) in list_array.iter().enumerate() {
-                                if let Some(list_value) = value {
-                                    if let Some(ts) = timestamps.get(&id) {
-                                        let data = list_value
-                                            .as_any()
-                                            .downcast_ref::<UInt64Array>()
-                                            .expect("Failed to downcast to UInt64Array");
+                                if let Some(list_value) = value
+                                    && let Some(ts) = timestamps.get(&id)
+                                {
+                                    let data = list_value
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .expect("Failed to downcast to UInt64Array");
 
-                                        let buckets: Vec<u64> = data.iter().flatten().collect();
+                                    let buckets: Vec<u64> = data.iter().flatten().collect();
 
-                                        if let Ok(h) = Histogram::from_buckets(
-                                            grouping_power,
-                                            max_value_power,
-                                            buckets,
-                                        ) {
-                                            series.insert(*ts, h);
-                                        }
+                                    if let Ok(h) = Histogram::from_buckets(
+                                        grouping_power,
+                                        max_value_power,
+                                        buckets,
+                                    ) {
+                                        series.insert(*ts, h);
                                     }
                                 }
                             }

@@ -93,6 +93,7 @@ impl SlotLocation {
     }
 
     /// Get the pool ID (2 bits).
+    #[allow(dead_code)]
     #[inline]
     pub fn pool_id(&self) -> u8 {
         self.pool_id

@@ -189,21 +189,21 @@ fn create_segment(
     }
 
     // Configure disk tier if enabled
-    if let Some(ref disk_config) = config.cache.disk {
-        if disk_config.enabled {
-            let sync_mode = match disk_config.sync_mode {
-                server::config::DiskSyncMode::Sync => SyncMode::Sync,
-                server::config::DiskSyncMode::Async => SyncMode::Async,
-                server::config::DiskSyncMode::None => SyncMode::None,
-            };
+    if let Some(ref disk_config) = config.cache.disk
+        && disk_config.enabled
+    {
+        let sync_mode = match disk_config.sync_mode {
+            server::config::DiskSyncMode::Sync => SyncMode::Sync,
+            server::config::DiskSyncMode::Async => SyncMode::Async,
+            server::config::DiskSyncMode::None => SyncMode::None,
+        };
 
-            let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
-                .promotion_threshold(disk_config.promotion_threshold)
-                .sync_mode(sync_mode)
-                .recover_on_startup(disk_config.recover_on_startup);
+        let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+            .promotion_threshold(disk_config.promotion_threshold)
+            .sync_mode(sync_mode)
+            .recover_on_startup(disk_config.recover_on_startup);
 
-            builder = builder.disk_tier(disk_tier);
-        }
+        builder = builder.disk_tier(disk_tier);
     }
 
     let cache = builder.build()?;
@@ -244,21 +244,21 @@ fn create_slab(
     }
 
     // Configure disk tier if enabled
-    if let Some(ref disk_config) = config.cache.disk {
-        if disk_config.enabled {
-            let sync_mode = match disk_config.sync_mode {
-                server::config::DiskSyncMode::Sync => SyncMode::Sync,
-                server::config::DiskSyncMode::Async => SyncMode::Async,
-                server::config::DiskSyncMode::None => SyncMode::None,
-            };
+    if let Some(ref disk_config) = config.cache.disk
+        && disk_config.enabled
+    {
+        let sync_mode = match disk_config.sync_mode {
+            server::config::DiskSyncMode::Sync => SyncMode::Sync,
+            server::config::DiskSyncMode::Async => SyncMode::Async,
+            server::config::DiskSyncMode::None => SyncMode::None,
+        };
 
-            let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
-                .promotion_threshold(disk_config.promotion_threshold)
-                .sync_mode(sync_mode)
-                .recover_on_startup(disk_config.recover_on_startup);
+        let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+            .promotion_threshold(disk_config.promotion_threshold)
+            .sync_mode(sync_mode)
+            .recover_on_startup(disk_config.recover_on_startup);
 
-            builder = builder.disk_tier(disk_tier);
-        }
+        builder = builder.disk_tier(disk_tier);
     }
 
     let cache = builder.build()?;
@@ -284,21 +284,21 @@ fn create_heap(
         .eviction_policy(heap_policy);
 
     // Configure disk tier if enabled
-    if let Some(ref disk_config) = config.cache.disk {
-        if disk_config.enabled {
-            let sync_mode = match disk_config.sync_mode {
-                server::config::DiskSyncMode::Sync => SyncMode::Sync,
-                server::config::DiskSyncMode::Async => SyncMode::Async,
-                server::config::DiskSyncMode::None => SyncMode::None,
-            };
+    if let Some(ref disk_config) = config.cache.disk
+        && disk_config.enabled
+    {
+        let sync_mode = match disk_config.sync_mode {
+            server::config::DiskSyncMode::Sync => SyncMode::Sync,
+            server::config::DiskSyncMode::Async => SyncMode::Async,
+            server::config::DiskSyncMode::None => SyncMode::None,
+        };
 
-            let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
-                .promotion_threshold(disk_config.promotion_threshold)
-                .sync_mode(sync_mode)
-                .recover_on_startup(disk_config.recover_on_startup);
+        let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+            .promotion_threshold(disk_config.promotion_threshold)
+            .sync_mode(sync_mode)
+            .recover_on_startup(disk_config.recover_on_startup);
 
-            builder = builder.disk_tier(disk_tier);
-        }
+        builder = builder.disk_tier(disk_tier);
     }
 
     let cache = builder.build()?;

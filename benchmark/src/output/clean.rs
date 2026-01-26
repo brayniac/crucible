@@ -155,7 +155,7 @@ impl OutputFormatter for CleanFormatter {
     fn print_sample(&self, sample: &Sample) {
         // Reprint header periodically for readability
         let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % HEADER_REPEAT_INTERVAL == 0 {
+        if count > 0 && count.is_multiple_of(HEADER_REPEAT_INTERVAL) {
             println!(
                 "─────────┼───────┼───────┼──────┼────────┼────────┼────────┼────────┼────────┼───────"
             );

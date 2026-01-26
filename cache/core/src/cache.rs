@@ -1132,36 +1132,30 @@ impl<H: Hashtable> TieredCache<H> {
         };
 
         // If we have a disk layer and this isn't the disk layer, use demotion
-        if let Some(disk_idx) = disk_layer_idx {
-            if layer_idx != disk_idx {
-                if let Some(disk_layer) = self.layers.get(disk_idx) {
-                    let hashtable = self.hashtable.as_ref();
+        if let Some(disk_idx) = disk_layer_idx
+            && layer_idx != disk_idx
+            && let Some(disk_layer) = self.layers.get(disk_idx)
+        {
+            let hashtable = self.hashtable.as_ref();
 
-                    // Create demoter callback that writes to disk and updates hashtable
-                    let demoter = |key: &[u8],
-                                   value: &[u8],
-                                   optional: &[u8],
-                                   ttl: Duration,
-                                   old_location: Location| {
-                        // Write item to disk layer
-                        if let Ok(new_location) = disk_layer.write_item(key, value, optional, ttl) {
-                            // Atomically update hashtable to point to disk location
-                            // preserve_freq=true to keep the frequency counter
-                            hashtable.cas_location(
-                                key,
-                                old_location,
-                                new_location.to_location(),
-                                true,
-                            );
-                        } else {
-                            // Disk write failed, just remove from hashtable
-                            hashtable.remove(key, old_location);
-                        }
-                    };
-
-                    return layer.evict_with_demoter(hashtable, demoter);
+            // Create demoter callback that writes to disk and updates hashtable
+            let demoter = |key: &[u8],
+                           value: &[u8],
+                           optional: &[u8],
+                           ttl: Duration,
+                           old_location: Location| {
+                // Write item to disk layer
+                if let Ok(new_location) = disk_layer.write_item(key, value, optional, ttl) {
+                    // Atomically update hashtable to point to disk location
+                    // preserve_freq=true to keep the frequency counter
+                    hashtable.cas_location(key, old_location, new_location.to_location(), true);
+                } else {
+                    // Disk write failed, just remove from hashtable
+                    hashtable.remove(key, old_location);
                 }
-            }
+            };
+
+            return layer.evict_with_demoter(hashtable, demoter);
         }
 
         // No disk layer or this is the disk layer - use regular eviction
@@ -1197,22 +1191,22 @@ impl<H: Hashtable> TieredCache<H> {
         let mut pools: [Option<(PoolRef<'_>, bool)>; 4] = [None; 4];
 
         for (pool_id, layer_idx) in self.pool_map.iter().enumerate() {
-            if let Some(idx) = layer_idx {
-                if let Some(layer) = self.layers.get(*idx) {
-                    match layer {
-                        CacheLayer::Fifo(l) => {
-                            let pool = l.pool();
-                            pools[pool_id] = Some((PoolRef::Memory(pool), pool.is_per_item_ttl()));
-                        }
-                        CacheLayer::Ttl(l) => {
-                            let pool = l.pool();
-                            pools[pool_id] = Some((PoolRef::Memory(pool), pool.is_per_item_ttl()));
-                        }
-                        CacheLayer::Disk(l) => {
-                            let pool = l.pool();
-                            // Disk pools always use segment-level TTL
-                            pools[pool_id] = Some((PoolRef::Disk(pool), false));
-                        }
+            if let Some(idx) = layer_idx
+                && let Some(layer) = self.layers.get(*idx)
+            {
+                match layer {
+                    CacheLayer::Fifo(l) => {
+                        let pool = l.pool();
+                        pools[pool_id] = Some((PoolRef::Memory(pool), pool.is_per_item_ttl()));
+                    }
+                    CacheLayer::Ttl(l) => {
+                        let pool = l.pool();
+                        pools[pool_id] = Some((PoolRef::Memory(pool), pool.is_per_item_ttl()));
+                    }
+                    CacheLayer::Disk(l) => {
+                        let pool = l.pool();
+                        // Disk pools always use segment-level TTL
+                        pools[pool_id] = Some((PoolRef::Disk(pool), false));
                     }
                 }
             }

@@ -92,10 +92,8 @@ impl<'a> SetHeader<'a> {
     pub fn ttl(&self) -> Option<Duration> {
         if let Some(secs) = self.ex {
             Some(Duration::from_secs(secs))
-        } else if let Some(ms) = self.px {
-            Some(Duration::from_millis(ms))
         } else {
-            None
+            self.px.map(Duration::from_millis)
         }
     }
 }

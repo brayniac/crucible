@@ -486,12 +486,11 @@ impl TtlLayer {
                 // If segment is mostly empty after pruning, reclaim it
                 if retained == 0 {
                     // All items pruned, can reclaim the segment
-                    if let Some((_, bucket)) = self.buckets.select_bucket_for_eviction() {
-                        if bucket.head() == Some(*segment_id) {
-                            if let Ok(evicted_id) = bucket.evict_head_segment(&self.pool) {
-                                self.process_evicted_segment(evicted_id, hashtable);
-                            }
-                        }
+                    if let Some((_, bucket)) = self.buckets.select_bucket_for_eviction()
+                        && bucket.head() == Some(*segment_id)
+                        && let Ok(evicted_id) = bucket.evict_head_segment(&self.pool)
+                    {
+                        self.process_evicted_segment(evicted_id, hashtable);
                     }
                 }
             }

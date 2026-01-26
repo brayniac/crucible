@@ -79,6 +79,7 @@ pub fn format_latency_padded(us: f64, width: usize) -> String {
 /// - >= 100%: no decimals (e.g., "100")
 /// - >= 10%: 1 decimal (e.g., "95.2")
 /// - < 10%: 2 decimals (e.g., "9.99", "0.01")
+///
 /// Note: Values that round to 100 are shown without decimals.
 pub fn format_pct(value: f64) -> String {
     if value >= 99.95 {

@@ -512,11 +512,9 @@ fn extract_throughput_with_suffix(text: &str) -> Option<f64> {
     let val_str = parts.last()?;
 
     // Check for M (million) or K (thousand) suffix
-    if val_str.ends_with('M') {
-        let num_str = &val_str[..val_str.len() - 1];
+    if let Some(num_str) = val_str.strip_suffix('M') {
         num_str.parse::<f64>().ok().map(|v| v * 1_000_000.0)
-    } else if val_str.ends_with('K') {
-        let num_str = &val_str[..val_str.len() - 1];
+    } else if let Some(num_str) = val_str.strip_suffix('K') {
         num_str.parse::<f64>().ok().map(|v| v * 1_000.0)
     } else {
         val_str.parse::<f64>().ok()
@@ -547,11 +545,10 @@ fn parse_latency_table_row(text: &str, metrics: &mut BenchmarkMetrics) {
 
 /// Parse a latency value with unit suffix (e.g., "19.0ms" -> 19000.0 us, "500us" -> 500.0)
 fn parse_latency_value(val_str: &str) -> Option<f64> {
-    if val_str.ends_with("ms") {
-        let num_str = &val_str[..val_str.len() - 2];
+    if let Some(num_str) = val_str.strip_suffix("ms") {
         num_str.parse::<f64>().ok().map(|v| v * 1000.0) // convert ms to us
     } else if val_str.ends_with("us") || val_str.ends_with("µs") {
-        let suffix_len = if val_str.ends_with("µs") { 2 } else { 2 };
+        let suffix_len = if val_str.ends_with("µs") { 3 } else { 2 };
         let num_str = &val_str[..val_str.len() - suffix_len];
         num_str.parse::<f64>().ok()
     } else if val_str.ends_with('s') && !val_str.ends_with("ms") && !val_str.ends_with("us") {

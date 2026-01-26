@@ -425,29 +425,28 @@ fn run_worker<C: Cache>(
 
         // Check for new connections from the acceptor (non-blocking)
         // Only accept new connections if we're not shutting down
-        while !shutting_down {
-            let Ok((raw_fd, _addr)) = fd_receiver.try_recv() else {
-                break;
-            };
-            match driver.register_fd(raw_fd) {
-                Ok(conn_id) => {
-                    CONNECTIONS_ACCEPTED.increment();
-                    CONNECTIONS_ACTIVE.increment();
-                    stats.inc_channel_receive();
+        if !shutting_down {
+            while let Ok((raw_fd, _addr)) = fd_receiver.try_recv() {
+                match driver.register_fd(raw_fd) {
+                    Ok(conn_id) => {
+                        CONNECTIONS_ACCEPTED.increment();
+                        CONNECTIONS_ACTIVE.increment();
+                        stats.inc_channel_receive();
 
-                    let idx = conn_id.slot();
-                    if idx >= connections.len() {
-                        connections.resize_with(idx + 1, || None);
+                        let idx = conn_id.slot();
+                        if idx >= connections.len() {
+                            connections.resize_with(idx + 1, || None);
+                        }
+
+                        // All connections use the same simple Connection type now
+                        connections[idx] = Some(Connection::with_options(
+                            config.max_value_size,
+                            config.allow_flush,
+                        ));
                     }
-
-                    // All connections use the same simple Connection type now
-                    connections[idx] = Some(Connection::with_options(
-                        config.max_value_size,
-                        config.allow_flush,
-                    ));
-                }
-                Err(_) => {
-                    // Failed to register, fd is already closed by driver
+                    Err(_) => {
+                        // Failed to register, fd is already closed by driver
+                    }
                 }
             }
         }

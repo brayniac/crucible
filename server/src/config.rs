@@ -843,14 +843,14 @@ impl Config {
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Validate backend + policy combination
-        if let Some(policy) = self.cache.policy {
-            if !self.cache.backend.is_valid_policy(policy) {
-                return Err(format!(
-                    "eviction policy {:?} is not valid for backend {:?}",
-                    policy, self.cache.backend
-                )
-                .into());
-            }
+        if let Some(policy) = self.cache.policy
+            && !self.cache.backend.is_valid_policy(policy)
+        {
+            return Err(format!(
+                "eviction policy {:?} is not valid for backend {:?}",
+                policy, self.cache.backend
+            )
+            .into());
         }
 
         if self.cache.heap_size < self.cache.segment_size {

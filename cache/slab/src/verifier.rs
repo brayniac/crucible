@@ -93,24 +93,24 @@ impl KeyVerifier for SlabVerifier<'_> {
         let slab_loc = SlabLocation::from_location(location);
         let (class_id, slab_id, slot_index) = slab_loc.unpack();
 
-        if let Some(class) = self.allocator.class(class_id) {
-            if (slab_id as usize) < class.slab_count() {
-                // SAFETY: slab_id and slot_index are validated above
-                unsafe {
-                    let ptr = class.slot_ptr(slab_id, slot_index);
-                    // Prefetch the header and likely the key
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        std::arch::x86_64::_mm_prefetch(
-                            ptr as *const i8,
-                            std::arch::x86_64::_MM_HINT_T0,
-                        );
-                    }
-                    // Note: ARM prefetch requires nightly, so we skip it for now
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        let _ = ptr; // suppress unused warning
-                    }
+        if let Some(class) = self.allocator.class(class_id)
+            && (slab_id as usize) < class.slab_count()
+        {
+            // SAFETY: slab_id and slot_index are validated above
+            unsafe {
+                let ptr = class.slot_ptr(slab_id, slot_index);
+                // Prefetch the header and likely the key
+                #[cfg(target_arch = "x86_64")]
+                {
+                    std::arch::x86_64::_mm_prefetch(
+                        ptr as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+                // Note: ARM prefetch requires nightly, so we skip it for now
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    let _ = ptr; // suppress unused warning
                 }
             }
         }
@@ -160,6 +160,7 @@ impl<'a> SlabTieredVerifier<'a> {
     }
 
     /// Create a verifier that allows expired items.
+    #[allow(dead_code)]
     pub fn allowing_expired(mut self) -> Self {
         self.allow_expired = true;
         self
@@ -249,21 +250,21 @@ impl KeyVerifier for SlabTieredVerifier<'_> {
             let slab_loc = SlabLocation::from_location(location);
             let (class_id, slab_id, slot_index) = slab_loc.unpack();
 
-            if let Some(class) = self.allocator.class(class_id) {
-                if (slab_id as usize) < class.slab_count() {
-                    unsafe {
-                        let ptr = class.slot_ptr(slab_id, slot_index);
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            std::arch::x86_64::_mm_prefetch(
-                                ptr as *const i8,
-                                std::arch::x86_64::_MM_HINT_T0,
-                            );
-                        }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            let _ = ptr;
-                        }
+            if let Some(class) = self.allocator.class(class_id)
+                && (slab_id as usize) < class.slab_count()
+            {
+                unsafe {
+                    let ptr = class.slot_ptr(slab_id, slot_index);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        std::arch::x86_64::_mm_prefetch(
+                            ptr as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        let _ = ptr;
                     }
                 }
             }

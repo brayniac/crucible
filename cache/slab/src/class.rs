@@ -78,6 +78,7 @@ impl SlabState {
     }
 
     /// Check if the slab is readable (allows get operations).
+    #[allow(dead_code)]
     #[inline]
     pub fn is_readable(self) -> bool {
         matches!(self, SlabState::Live)
@@ -180,6 +181,7 @@ mod packed_state {
     }
 
     /// Get current ref_count.
+    #[allow(dead_code)]
     #[inline]
     pub fn ref_count(atom: &AtomicU32) -> u32 {
         let (_, ref_count) = unpack(atom.load(Ordering::Acquire));
@@ -207,6 +209,7 @@ mod packed_state {
     }
 
     /// Reset to Live state with zero ref_count (for reuse after eviction).
+    #[allow(dead_code)]
     #[inline]
     pub fn reset_to_live(atom: &AtomicU32) {
         atom.store(pack(SlabState::Live, 0), Ordering::Release);
@@ -226,6 +229,7 @@ mod packed_state {
 }
 
 /// A single slab of memory divided into fixed-size slots.
+#[allow(dead_code)]
 pub struct Slab {
     /// Pointer to the slab memory.
     data: *mut u8,
@@ -243,6 +247,7 @@ pub struct Slab {
     slab_id: u32,
 }
 
+#[allow(dead_code)]
 impl Slab {
     /// Create a new slab from allocated memory.
     ///
@@ -402,6 +407,7 @@ impl SlabClass {
     }
 
     /// Get the class ID.
+    #[allow(dead_code)]
     #[inline]
     pub fn class_id(&self) -> u8 {
         self.class_id
@@ -414,6 +420,7 @@ impl SlabClass {
     }
 
     /// Get the number of slots per slab.
+    #[allow(dead_code)]
     #[inline]
     pub fn slots_per_slab(&self) -> usize {
         self.slots_per_slab
@@ -582,28 +589,31 @@ impl SlabClass {
         slab_id: u32,
         slot_index: u16,
     ) -> Option<(*const AtomicU32, *const u8, usize)> {
-        if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
-            return None;
+        unsafe {
+            if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
+                return None;
+            }
+
+            // Acquire slab reference (increments ref_count if Live)
+            if !packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
+                return None;
+            }
+
+            // Get value pointer and length
+            let header = self.header(slab_id, slot_index);
+            let value_ptr = header.value_ptr();
+            let value_len = header.value_len();
+
+            // Return pointer to the packed state (ref_count is in low 24 bits)
+            // ValueRef::drop will call fetch_sub(1), which decrements only the ref_count
+            let ref_count_ptr = &self.slab_states[slab_id as usize] as *const AtomicU32;
+
+            Some((ref_count_ptr, value_ptr, value_len))
         }
-
-        // Acquire slab reference (increments ref_count if Live)
-        if !packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
-            return None;
-        }
-
-        // Get value pointer and length
-        let header = self.header(slab_id, slot_index);
-        let value_ptr = header.value_ptr();
-        let value_len = header.value_len();
-
-        // Return pointer to the packed state (ref_count is in low 24 bits)
-        // ValueRef::drop will call fetch_sub(1), which decrements only the ref_count
-        let ref_count_ptr = &self.slab_states[slab_id as usize] as *const AtomicU32;
-
-        Some((ref_count_ptr, value_ptr, value_len))
     }
 
     /// Get a slab by ID.
+    #[allow(dead_code)]
     pub fn get_slab(&self, slab_id: u32) -> Option<SlabRef<'_>> {
         let slabs = self.slabs.read();
         if (slab_id as usize) < slabs.len() {
@@ -627,10 +637,12 @@ impl SlabClass {
     /// Caller must ensure proper synchronization and that the slab exists.
     #[inline]
     pub unsafe fn slot_ptr(&self, slab_id: u32, slot_index: u16) -> *mut u8 {
-        // Lock-free read from the atomic pointer array
-        let slab_ptr = self.slab_ptrs[slab_id as usize].load(Ordering::Acquire);
-        debug_assert!(!slab_ptr.is_null(), "slab {} not initialized", slab_id);
-        slab_ptr.add(slot_index as usize * self.slot_size)
+        unsafe {
+            // Lock-free read from the atomic pointer array
+            let slab_ptr = self.slab_ptrs[slab_id as usize].load(Ordering::Acquire);
+            debug_assert!(!slab_ptr.is_null(), "slab {} not initialized", slab_id);
+            slab_ptr.add(slot_index as usize * self.slot_size)
+        }
     }
 
     /// Get the item header at a specific location.
@@ -642,9 +654,11 @@ impl SlabClass {
     /// Caller must ensure the slot contains a valid item.
     #[inline]
     pub unsafe fn header(&self, slab_id: u32, slot_index: u16) -> &SlabItemHeader {
-        // SAFETY: Caller ensures slot contains valid item
-        let ptr = self.slot_ptr(slab_id, slot_index);
-        SlabItemHeader::from_ptr(ptr)
+        unsafe {
+            // SAFETY: Caller ensures slot contains valid item
+            let ptr = self.slot_ptr(slab_id, slot_index);
+            SlabItemHeader::from_ptr(ptr)
+        }
     }
 
     /// Increment the item count.
@@ -772,12 +786,14 @@ impl SlabClass {
     }
 
     /// Get the data pointer for a slab (for returning to global pool).
+    #[allow(dead_code)]
     pub fn slab_data_ptr(&self, slab_id: u32) -> Option<*mut u8> {
         let slabs = self.slabs.read();
         slabs.get(slab_id as usize).map(|s| s.data())
     }
 
     /// Check if the class has any items.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.item_count.load(Ordering::Relaxed) == 0
     }
@@ -793,6 +809,7 @@ impl SlabClass {
     }
 
     /// Get the max item size for this class (slot size - header).
+    #[allow(dead_code)]
     pub fn max_item_size(&self) -> usize {
         self.slot_size.saturating_sub(HEADER_SIZE)
     }
@@ -911,6 +928,7 @@ pub struct SlabRef<'a> {
     slab_id: u32,
 }
 
+#[allow(dead_code)]
 impl<'a> SlabRef<'a> {
     /// Get the slab ID.
     #[inline]

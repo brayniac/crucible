@@ -111,6 +111,7 @@ pub struct SlabCache {
     /// Default TTL for items.
     default_ttl: Duration,
     /// Enable ghost entries.
+    #[allow(dead_code)]
     enable_ghosts: bool,
     /// Optional disk tier for extended capacity.
     disk_layer: Option<DiskLayer>,
@@ -227,6 +228,7 @@ impl SlabCache {
     ///
     /// Writes the item to disk storage and updates the hashtable.
     /// Returns true if demotion succeeded.
+    #[allow(dead_code)]
     fn demote_to_disk(
         &self,
         key: &[u8],

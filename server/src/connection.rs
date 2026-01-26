@@ -321,7 +321,7 @@ impl Connection {
     fn process_resp_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
         loop {
             // Check for empty buffer (use len() to avoid holding borrow)
-            if buf.len() == 0 {
+            if buf.is_empty() {
                 break;
             }
 
@@ -556,7 +556,7 @@ impl Connection {
     fn process_memcache_ascii_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
         loop {
             // Check for empty buffer
-            if buf.len() == 0 {
+            if buf.is_empty() {
                 break;
             }
 
@@ -795,7 +795,7 @@ impl Connection {
     fn process_memcache_binary_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
         loop {
             // Check for empty buffer
-            if buf.len() == 0 {
+            if buf.is_empty() {
                 break;
             }
 

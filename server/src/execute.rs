@@ -105,10 +105,8 @@ pub fn execute_resp<C: Cache>(
             // Handle TTL: EX (seconds) or PX (milliseconds)
             let ttl = if let Some(secs) = ex {
                 Some(Duration::from_secs(*secs))
-            } else if let Some(ms) = px {
-                Some(Duration::from_millis(*ms))
             } else {
-                None
+                px.as_ref().map(|ms| Duration::from_millis(*ms))
             };
 
             // Determine operation type based on NX/XX flags

@@ -2290,7 +2290,7 @@ impl SegmentPrune for SliceSegment<'_> {
 
             if freq <= threshold {
                 // Collect item for demotion
-                let ttl_secs = if expire_at > now { expire_at - now } else { 0 };
+                let ttl_secs = expire_at.saturating_sub(now);
                 items_to_demote.push((key.to_vec(), value.to_vec(), optional.to_vec(), ttl_secs));
 
                 // Mark as deleted

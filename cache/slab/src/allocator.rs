@@ -324,36 +324,34 @@ impl SlabAllocator {
 
         // Try strategies in order from highest to lowest bit
         // SLAB_LRC (8)
-        if strategy.contains(EvictionStrategy::SLAB_LRC) {
-            if let Some((class_id, slab_id)) = self.find_lrc_slab() {
-                if self.evict_slab(class_id, slab_id, hashtable) {
-                    return true;
-                }
-            }
+        if strategy.contains(EvictionStrategy::SLAB_LRC)
+            && let Some((class_id, slab_id)) = self.find_lrc_slab()
+            && self.evict_slab(class_id, slab_id, hashtable)
+        {
+            return true;
         }
 
         // SLAB_LRA (4)
-        if strategy.contains(EvictionStrategy::SLAB_LRA) {
-            if let Some((class_id, slab_id)) = self.find_lra_slab() {
-                if self.evict_slab(class_id, slab_id, hashtable) {
-                    return true;
-                }
-            }
+        if strategy.contains(EvictionStrategy::SLAB_LRA)
+            && let Some((class_id, slab_id)) = self.find_lra_slab()
+            && self.evict_slab(class_id, slab_id, hashtable)
+        {
+            return true;
         }
 
         // RANDOM (2)
-        if strategy.contains(EvictionStrategy::RANDOM) {
-            if let Some((class_id, slab_id)) = self.find_random_slab() {
-                if self.evict_slab(class_id, slab_id, hashtable) {
-                    return true;
-                }
-            }
+        if strategy.contains(EvictionStrategy::RANDOM)
+            && let Some((class_id, slab_id)) = self.find_random_slab()
+            && self.evict_slab(class_id, slab_id, hashtable)
+        {
+            return true;
         }
 
         false
     }
 
     /// Get the eviction strategy.
+    #[allow(dead_code)]
     pub fn eviction_strategy(&self) -> EvictionStrategy {
         self.eviction_strategy
     }
@@ -415,6 +413,7 @@ impl SlabAllocator {
     /// # Safety
     ///
     /// The location must be valid.
+    #[allow(dead_code)]
     #[inline]
     pub unsafe fn slot_ptr(&self, location: SlabLocation) -> *mut u8 {
         // SAFETY: Caller ensures location is valid
@@ -473,10 +472,12 @@ impl SlabAllocator {
         &self,
         location: SlabLocation,
     ) -> Option<(*const AtomicU32, *const u8, usize)> {
-        let (class_id, slab_id, slot_index) = location.unpack();
-        self.classes
-            .get(class_id as usize)?
-            .get_value_ref_raw(slab_id, slot_index)
+        unsafe {
+            let (class_id, slab_id, slot_index) = location.unpack();
+            self.classes
+                .get(class_id as usize)?
+                .get_value_ref_raw(slab_id, slot_index)
+        }
     }
 
     /// Begin a two-phase write operation for zero-copy receive.
@@ -593,11 +594,13 @@ impl SlabAllocator {
     }
 
     /// Get the slab size.
+    #[allow(dead_code)]
     pub fn slab_size(&self) -> usize {
         self.slab_size
     }
 
     /// Get the number of slab classes.
+    #[allow(dead_code)]
     pub fn num_classes(&self) -> usize {
         self.classes.len()
     }

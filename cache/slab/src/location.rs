@@ -20,6 +20,7 @@ pub const MAX_CLASS_ID: u8 = 63;
 pub const MAX_SLAB_ID: u32 = (1 << 20) - 1;
 
 /// Maximum slot index (16 bits = 0-65535).
+#[allow(dead_code)]
 pub const MAX_SLOT_INDEX: u16 = u16::MAX;
 
 /// Slab location encoding.
@@ -109,7 +110,7 @@ impl SlabLocation {
 
     /// Convert to the opaque Location type for hashtable storage.
     #[inline]
-    pub fn to_location(&self) -> Location {
+    pub fn to_location(self) -> Location {
         let raw = ((self.pool_id as u64) << 42)
             | ((self.class_id as u64) << 36)
             | ((self.slab_id as u64) << 16)

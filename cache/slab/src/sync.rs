@@ -11,6 +11,7 @@ pub use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 pub use loom::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Spin loop hint - yields to other threads in loom.
+#[allow(dead_code)]
 #[cfg(not(feature = "loom"))]
 #[inline]
 pub fn spin_loop() {

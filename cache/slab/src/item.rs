@@ -44,6 +44,7 @@ pub const OPTIONAL_SIZE: usize = 4;
 
 // Flag bits in expire_and_flags (high 4 bits of u32)
 const FLAG_DELETED: u32 = 1 << 28;
+#[allow(dead_code)]
 const FLAG_NUMERIC: u32 = 1 << 29;
 const FLAG_HAS_CAS: u32 = 1 << 30;
 const FLAG_HAS_OPTIONAL: u32 = 1 << 31;
@@ -83,6 +84,7 @@ pub struct SlabItemHeader {
 // Compile-time assertion for header size
 const _: () = assert!(std::mem::size_of::<SlabItemHeader>() == HEADER_SIZE);
 
+#[allow(dead_code)]
 impl SlabItemHeader {
     /// Initialize a new header at the given memory location.
     ///
@@ -500,13 +502,13 @@ impl SlabItemHeader {
 #[inline]
 pub fn pack_slot_ref(slab_id: u32, slot_index: u16) -> u32 {
     debug_assert!(slab_id <= 0xFFFF, "slab_id too large for slot ref");
-    ((slab_id as u32) << 16) | (slot_index as u32)
+    (slab_id << 16) | (slot_index as u32)
 }
 
 /// Unpack a u32 slot reference into (slab_id, slot_index).
 #[inline]
 pub fn unpack_slot_ref(packed: u32) -> (u32, u16) {
-    ((packed >> 16) as u32, (packed & 0xFFFF) as u16)
+    ((packed >> 16), (packed & 0xFFFF) as u16)
 }
 
 #[cfg(test)]

@@ -434,15 +434,15 @@ impl MultiChoiceHashtable {
             if verifier.verify(key, location, false) {
                 // Update frequency (best effort)
                 let freq = Hashbucket::freq(packed);
-                if freq < 127 {
-                    if let Some(new_packed) = Hashbucket::try_update_freq(packed, freq) {
-                        let _ = bucket.items[slot_index].compare_exchange(
-                            packed,
-                            new_packed,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        );
-                    }
+                if freq < 127
+                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
+                {
+                    let _ = bucket.items[slot_index].compare_exchange(
+                        packed,
+                        new_packed,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    );
                 }
 
                 return Some((location, freq));

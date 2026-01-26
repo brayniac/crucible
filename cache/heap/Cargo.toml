@@ -10,6 +10,7 @@ description = "Heap-allocated cache using system allocator with MultiChoiceHasht
 [features]
 default = []
 loom = ["cache-core/loom", "dep:loom"]
+jemalloc = []
 
 [dependencies]
 cache-core = { workspace = true }

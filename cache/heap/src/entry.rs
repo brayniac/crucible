@@ -47,6 +47,7 @@ pub fn item_size(key_len: usize, value_len: usize) -> usize {
 const FLAG_DELETED: u32 = 1 << 0;
 
 /// Flag indicating the value is stored as a numeric (8-byte little-endian u64).
+#[allow(dead_code)]
 const FLAG_NUMERIC: u32 = 1 << 1;
 
 /// Get current time as seconds since Unix epoch.
@@ -54,7 +55,7 @@ const FLAG_NUMERIC: u32 = 1 << 1;
 fn current_time_secs() -> u32 {
     clocksource::coarse::UnixInstant::now()
         .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-        .as_secs() as u32
+        .as_secs()
 }
 
 /// A heap-allocated cache entry.
@@ -174,12 +175,14 @@ impl HeapEntry {
     }
 
     /// Get the key length.
+    #[allow(dead_code)]
     #[inline]
     pub fn key_len(&self) -> usize {
         self.key_len as usize
     }
 
     /// Get the value length.
+    #[allow(dead_code)]
     #[inline]
     pub fn value_len(&self) -> usize {
         self.value_len as usize
@@ -203,6 +206,7 @@ impl HeapEntry {
     }
 
     /// Get the remaining TTL.
+    #[allow(dead_code)]
     #[inline]
     pub fn remaining_ttl(&self) -> Option<Duration> {
         let expire_at = self.expire_at;
@@ -224,24 +228,28 @@ impl HeapEntry {
     }
 
     /// Mark the entry as deleted.
+    #[allow(dead_code)]
     #[inline]
     pub fn mark_deleted(&self) {
         self.flags.fetch_or(FLAG_DELETED, Ordering::Release);
     }
 
     /// Check if the value is stored as a numeric.
+    #[allow(dead_code)]
     #[inline]
     pub fn is_numeric(&self) -> bool {
         self.flags.load(Ordering::Acquire) & FLAG_NUMERIC != 0
     }
 
     /// Set the numeric flag.
+    #[allow(dead_code)]
     #[inline]
     pub fn set_numeric(&self) {
         self.flags.fetch_or(FLAG_NUMERIC, Ordering::Release);
     }
 
     /// Clear the numeric flag.
+    #[allow(dead_code)]
     #[inline]
     pub fn clear_numeric(&self) {
         self.flags.fetch_and(!FLAG_NUMERIC, Ordering::Release);
@@ -254,6 +262,7 @@ impl HeapEntry {
     }
 
     /// Increment and return the new CAS token.
+    #[allow(dead_code)]
     #[inline]
     pub fn increment_cas_token(&self) -> u64 {
         self.cas_token.fetch_add(1, Ordering::AcqRel) + 1
@@ -262,6 +271,7 @@ impl HeapEntry {
     /// Compare-and-swap the CAS token.
     ///
     /// Returns `true` if the current token matched and was updated.
+    #[allow(dead_code)]
     #[inline]
     pub fn cas_token_matches(&self, expected: u64) -> bool {
         self.cas_token.load(Ordering::Acquire) == expected

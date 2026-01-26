@@ -463,31 +463,30 @@ impl QueryEngine {
                     if let Some(collection) = self.tsdb.histograms(metric_name, Labels::default()) {
                         let summed_series = collection.sum();
 
-                        if let Some(percentile_series) = summed_series.percentiles(&[quantile]) {
-                            if let Some(series) = percentile_series.first() {
-                                let start_ns = (start * 1e9) as u64;
-                                let end_ns = (end * 1e9) as u64;
+                        if let Some(percentile_series) = summed_series.percentiles(&[quantile])
+                            && let Some(series) = percentile_series.first()
+                        {
+                            let start_ns = (start * 1e9) as u64;
+                            let end_ns = (end * 1e9) as u64;
 
-                                let values: Vec<(f64, f64)> = series
-                                    .inner
-                                    .range(start_ns..=end_ns)
-                                    .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                                    .collect();
+                            let values: Vec<(f64, f64)> = series
+                                .inner
+                                .range(start_ns..=end_ns)
+                                .map(|(ts, val)| (*ts as f64 / 1e9, *val))
+                                .collect();
 
-                                if !values.is_empty() {
-                                    let mut metric_labels = HashMap::new();
-                                    metric_labels
-                                        .insert("__name__".to_string(), metric_name.to_string());
-                                    metric_labels
-                                        .insert("quantile".to_string(), quantile.to_string());
+                            if !values.is_empty() {
+                                let mut metric_labels = HashMap::new();
+                                metric_labels
+                                    .insert("__name__".to_string(), metric_name.to_string());
+                                metric_labels.insert("quantile".to_string(), quantile.to_string());
 
-                                    return Ok(QueryResult::Matrix {
-                                        result: vec![MatrixSample {
-                                            metric: metric_labels,
-                                            values,
-                                        }],
-                                    });
-                                }
+                                return Ok(QueryResult::Matrix {
+                                    result: vec![MatrixSample {
+                                        metric: metric_labels,
+                                        values,
+                                    }],
+                                });
                             }
                         }
 

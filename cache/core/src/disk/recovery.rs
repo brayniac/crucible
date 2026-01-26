@@ -76,6 +76,7 @@ impl WarmStats {
 /// * `segment` - The segment to scan
 /// * `now` - Current timestamp (seconds since epoch)
 /// * `segment_expire_at` - Segment-level expiration time
+#[allow(dead_code)]
 pub fn recover_segment(
     segment: &FileSegment<'_>,
     now: u32,
@@ -144,6 +145,7 @@ pub fn recover_segment(
 ///
 /// # Returns
 /// Warm-up statistics
+#[allow(dead_code)]
 pub fn warm_from_pool<H: Hashtable>(pool: &FilePool, hashtable: &H, now: u32) -> WarmStats {
     let mut stats = WarmStats::new();
 
@@ -219,6 +221,7 @@ pub fn warm_from_pool<H: Hashtable>(pool: &FilePool, hashtable: &H, now: u32) ->
 ///
 /// During warm-up, we don't need to verify keys since we're rebuilding
 /// the index from the authoritative disk data.
+#[allow(dead_code)]
 struct DummyVerifier;
 
 impl crate::hashtable::KeyVerifier for DummyVerifier {

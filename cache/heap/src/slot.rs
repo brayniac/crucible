@@ -222,6 +222,7 @@ impl Slot {
     /// # Safety
     ///
     /// Caller must ensure proper synchronization (e.g., reader count increment).
+    #[allow(dead_code)]
     #[inline]
     pub unsafe fn entry_ptr(&self) -> Option<NonNull<HeapEntry>> {
         let ptr = self.entry_ptr.load(Ordering::Acquire);
