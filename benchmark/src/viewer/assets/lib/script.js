@@ -1,5 +1,17 @@
 import { ChartsState, Chart } from './charts/chart.js';
 
+// Global charts state for zoom synchronization
+let chartsState = new ChartsState();
+
+// Top navigation bar component
+const TopNav = {
+    view() {
+        return m('div#topnav', [
+            m('div.logo', 'CRUCIBLE'),
+        ]);
+    },
+};
+
 // Sidebar component
 const Sidebar = {
     view({ attrs }) {
@@ -11,9 +23,26 @@ const Sidebar = {
             (s) => s.name === 'Query Explorer',
         );
 
+        // Find Overview section
+        const overviewSection = regularSections.find((s) => s.name === 'Overview');
+        const dashboardSections = regularSections.filter((s) => s.name !== 'Overview');
+
         return m('div#sidebar', [
-            // Regular dashboard sections
-            regularSections.map((section) =>
+            // Overview section first (if exists)
+            overviewSection && m(
+                m.route.Link,
+                {
+                    class: attrs.activeSection === overviewSection ? 'selected' : '',
+                    href: overviewSection.route,
+                },
+                overviewSection.name,
+            ),
+
+            // Dashboard sections label
+            dashboardSections.length > 0 && m('div.sidebar-label', 'Dashboards'),
+
+            // Dashboard sections
+            dashboardSections.map((section) =>
                 m(
                     m.route.Link,
                     {
@@ -37,7 +66,7 @@ const Sidebar = {
                                 : 'query-explorer-link',
                         href: queryExplorer.route,
                     },
-                    [m('span.arrow', '>'), ' ', queryExplorer.name],
+                    [m('span.arrow', '→'), ' ', queryExplorer.name],
                 ),
             ],
         ]);
@@ -53,22 +82,26 @@ const Main = {
         const intervalMs = interval ? Math.round(interval * 1000) : null;
         const intervalStr = intervalMs ? `${intervalMs}ms sampling` : '';
 
-        return m('div.app-container', [
-            m(Sidebar, {
-                activeSection,
-                sections,
-            }),
-            m('main', [
-                m('header', [
-                    m('div.header-left', [
-                        m('div.filename', filename || 'benchmark.parquet'),
-                        m('div.metadata-line', [
-                            source || 'crucible-benchmark',
-                            version && [m('span.separator', '\u00B7'), version],
-                            intervalStr && [m('span.separator', '\u00B7'), intervalStr],
-                        ]),
+        return m('div', [
+            m(TopNav),
+            m('header', [
+                m('div.file-info', [
+                    m('div.filename', filename || 'benchmark.parquet'),
+                    m('div.metadata', [
+                        m('span', source || 'Crucible Benchmark'),
+                        version && m('span', version),
+                        intervalStr && m('span', intervalStr),
                     ]),
                 ]),
+                m('div.header-actions', [
+                    m('button', { onclick: () => chartsState.resetZoom() }, 'RESET ZOOM'),
+                ]),
+            ]),
+            m('main', [
+                m(Sidebar, {
+                    activeSection,
+                    sections,
+                }),
                 m(SectionContent, {
                     section: activeSection,
                     groups,
@@ -618,8 +651,7 @@ const Group = {
     },
 };
 
-// Application state management
-const chartsState = new ChartsState();
+// Application state management (chartsState is defined at the top of the file)
 
 const sectionResponseCache = {};
 

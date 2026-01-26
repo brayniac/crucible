@@ -3,6 +3,61 @@ import {
 } from './util/units.js';
 import { formatDateTime } from './util/utils.js';
 
+// Color constants matching the CSS design tokens
+export const COLORS = {
+    // Foreground hierarchy
+    fg: '#e6edf3',
+    fgSecondary: '#8b949e',
+    fgMuted: '#484f58',
+    fgSubtle: '#30363d',
+
+    // Accent colors
+    accent: '#58a6ff',
+    accentEmphasis: '#79c0ff',
+    accentMuted: 'rgba(56, 139, 253, 0.4)',
+    accentSubtle: 'rgba(56, 139, 253, 0.15)',
+    accentGlow: 'rgba(56, 139, 253, 0.25)',
+
+    // Backgrounds
+    bgVoid: '#05080d',
+    bgCard: '#0d1117',
+    bgTertiary: '#161b22',
+    bgElevated: '#1c2128',
+
+    // Borders
+    borderSubtle: 'rgba(48, 54, 61, 0.4)',
+    borderDefault: 'rgba(48, 54, 61, 0.7)',
+
+    // Grid lines - very subtle for clean charts
+    gridLine: 'rgba(48, 54, 61, 0.5)',
+
+    // Chart series colors - curated palette
+    chartBlue: '#58a6ff',
+    chartCyan: '#39d5ff',
+    chartTeal: '#2dd4bf',
+    chartGreen: '#3fb950',
+    chartLime: '#a3e635',
+    chartYellow: '#fbbf24',
+    chartOrange: '#f97316',
+    chartRed: '#f85149',
+    chartPink: '#f472b6',
+    chartPurple: '#a78bfa',
+};
+
+// Default chart color palette for multi-series charts
+export const CHART_PALETTE = [
+    COLORS.chartBlue,
+    COLORS.chartCyan,
+    COLORS.chartTeal,
+    COLORS.chartGreen,
+    COLORS.chartLime,
+    COLORS.chartYellow,
+    COLORS.chartOrange,
+    COLORS.chartRed,
+    COLORS.chartPink,
+    COLORS.chartPurple,
+];
+
 /**
  * Creates a placeholder option for charts with no data
  * @param {string} title - The title of the chart
@@ -12,12 +67,13 @@ export function getNoDataOption(title) {
     return {
         title: {
             text: title,
-            left: 10,
-            top: 8,
+            left: '16',
+            top: '12',
             textStyle: {
-                color: '#c9d1d9',
-                fontSize: 14,
-                fontWeight: 500,
+                color: COLORS.fg,
+                fontSize: 13,
+                fontWeight: 600,
+                fontFamily: '"JetBrains Mono", "SF Mono", monospace',
             },
         },
         graphic: {
@@ -25,10 +81,10 @@ export function getNoDataOption(title) {
             left: 'center',
             top: 'middle',
             style: {
-                text: 'No data',
-                fontSize: 13,
-                fill: '#6e7681',
-                font: 'normal 13px -apple-system, BlinkMacSystemFont, sans-serif',
+                text: 'No data available',
+                fontSize: 12,
+                fill: COLORS.fgMuted,
+                font: 'normal 12px "Inter", -apple-system, sans-serif',
             },
         },
         xAxis: {
@@ -38,9 +94,9 @@ export function getNoDataOption(title) {
             show: false,
         },
         grid: {
-            left: '12%',
-            right: '3%',
-            top: '40',
+            left: '60',
+            right: '24',
+            top: '50',
             bottom: '35',
         },
     };
@@ -54,36 +110,42 @@ export function getNoDataOption(title) {
 export function getTooltipFormatter(valueFormatter) {
     return (paramsArray) => {
         // Sort the params array alphabetically by series name
+        // Special handling: 'id' should come first in the sort if present
         const sortedParams = [...paramsArray].sort((a, b) => {
             const aName = a.seriesName;
             const bName = b.seriesName;
 
+            // Extract id values if present (format is like "id=0, state=user")
             const aHasId = aName.startsWith('id=');
             const bHasId = bName.startsWith('id=');
 
             if (aHasId && bHasId) {
+                // Both have ids, compare the full string naturally
                 return aName.localeCompare(bName, undefined, { numeric: true });
             } else if (aHasId) {
+                // a has id, b doesn't - a comes first
                 return -1;
             } else if (bHasId) {
+                // b has id, a doesn't - b comes first
                 return 1;
             } else {
+                // Neither has id, normal alphabetical sort
                 return aName.localeCompare(bName, undefined, { numeric: true });
             }
         });
 
         const result =
-            `<div>
-                <div>
+            `<div style="font-family: 'Inter', -apple-system, sans-serif;">
+                <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: ${COLORS.fgSecondary}; margin-bottom: 8px;">
                     ${formatDateTime(paramsArray[0].value[0])}
                 </div>
-                <div style="margin-top: 5px;">
-                    ${sortedParams.map(p => `<div>
-                        ${p.marker}
-                        <span style="margin-left: 2px;">
-                            ${p.seriesName}
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    ${sortedParams.map(p => `<div style="display: flex; justify-content: space-between; align-items: center; gap: 16px;">
+                        <span style="display: flex; align-items: center; gap: 6px;">
+                            ${p.marker}
+                            <span style="color: ${COLORS.fgSecondary}; font-size: 12px;">${p.seriesName}</span>
                         </span>
-                        <span style="float: right; margin-left: 20px; font-weight: bold;">
+                        <span style="font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 12px; color: ${COLORS.fg};">
                             ${valueFormatter(p.value[1])}
                         </span>
                     </div>`).join('')}
@@ -101,9 +163,9 @@ export function getBaseOption(title, interval = null) {
 
     return {
         grid: {
-            left: '12%',
-            right: '3%',
-            top: '40',
+            left: '60',
+            right: '24',
+            top: '50',
             bottom: '35',
             containLabel: false,
         },
@@ -111,14 +173,13 @@ export function getBaseOption(title, interval = null) {
             type: 'time',
             min: 'dataMin',
             max: 'dataMax',
-            splitNumber: 4,
-            axisLine: {
-                lineStyle: {
-                    color: '#30363d'
-                }
-            },
+            splitNumber: 5,
+            axisLine: { show: false },
+            axisTick: { show: false },
             axisLabel: {
-                color: '#8b949e',
+                color: COLORS.fgSecondary,
+                fontSize: 10,
+                fontFamily: '"JetBrains Mono", "SF Mono", monospace',
                 formatter: {
                     year: '{yyyy}',
                     month: '{MMM}',
@@ -130,6 +191,13 @@ export function getBaseOption(title, interval = null) {
                     none: '{hh}:{mm}:{ss}.{SSS}'
                 }
             },
+            splitLine: {
+                show: true,
+                lineStyle: {
+                    color: COLORS.gridLine,
+                    type: 'dashed',
+                }
+            },
         },
         tooltip: {
             trigger: 'axis',
@@ -137,15 +205,26 @@ export function getBaseOption(title, interval = null) {
                 type: 'line',
                 snap: true,
                 animation: false,
+                lineStyle: {
+                    color: COLORS.accent,
+                    opacity: 0.5,
+                },
                 label: {
-                    backgroundColor: '#21262d'
+                    backgroundColor: COLORS.bgTertiary,
+                    color: COLORS.fg,
+                    fontFamily: '"JetBrains Mono", monospace',
+                    fontSize: 10,
                 }
             },
             textStyle: {
-                color: '#c9d1d9'
+                color: COLORS.fg,
+                fontFamily: '"Inter", -apple-system, sans-serif',
             },
-            backgroundColor: 'rgba(22, 27, 34, 0.95)',
-            borderColor: '#30363d',
+            backgroundColor: 'rgba(13, 17, 23, 0.95)',
+            borderColor: COLORS.borderDefault,
+            borderRadius: 8,
+            padding: [12, 16],
+            extraCssText: 'box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);',
         },
         // Invisible toolbox for drag-to-zoom
         toolbox: {
@@ -175,16 +254,18 @@ export function getBaseOption(title, interval = null) {
         }],
         title: {
             text: title,
-            left: 10,
-            top: 8,
+            left: '16',
+            top: '12',
             textStyle: {
-                color: '#c9d1d9',
-                fontSize: 14,
-                fontWeight: 500
+                color: COLORS.fg,
+                fontSize: 13,
+                fontWeight: 600,
+                fontFamily: '"JetBrains Mono", "SF Mono", monospace',
             }
         },
         textStyle: {
-            color: '#c9d1d9'
+            color: COLORS.fg,
+            fontFamily: '"Inter", -apple-system, sans-serif',
         },
         darkMode: true,
         backgroundColor: 'transparent'
@@ -198,13 +279,12 @@ export function getBaseYAxisOption(logScale, minValue, maxValue, unitSystem) {
         scale: true,
         min: minValue,
         max: maxValue,
-        axisLine: {
-            lineStyle: {
-                color: '#30363d'
-            }
-        },
+        axisLine: { show: false },
+        axisTick: { show: false },
         axisLabel: {
-            color: '#8b949e',
+            color: COLORS.fgSecondary,
+            fontSize: 10,
+            fontFamily: '"JetBrains Mono", "SF Mono", monospace',
             margin: 12,
             formatter: unitSystem ?
                 createAxisLabelFormatter(unitSystem) :
@@ -220,7 +300,8 @@ export function getBaseYAxisOption(logScale, minValue, maxValue, unitSystem) {
         },
         splitLine: {
             lineStyle: {
-                color: 'rgba(48, 54, 61, 0.6)'
+                color: COLORS.gridLine,
+                type: 'dashed',
             }
         }
     };
