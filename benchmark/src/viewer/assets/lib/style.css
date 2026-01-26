@@ -5,16 +5,19 @@
 }
 
 :root {
-    --bg: #0d1117;
-    --bg-secondary: #161b22;
-    --bg-tertiary: #21262d;
-    --bg-chart: #0d1117;
-    --border-color: #30363d;
-    --fg: #c9d1d9;
-    --fg-secondary: #8b949e;
-    --fg-muted: #6e7681;
-    --accent: #58a6ff;
-    --accent-emphasis: #1f6feb;
+    /* Dark theme - matching Rezolus viewer style */
+    --bg: #0a0e17;
+    --bg-secondary: #0f1318;
+    --bg-tertiary: #1a1f2a;
+    --bg-card: #121820;
+    --bg-chart: #0a0e17;
+    --border-color: #1e2530;
+    --fg: #e4e8ef;
+    --fg-secondary: #6b7280;
+    --fg-muted: #4a5568;
+    --accent: #3b82f6;
+    --accent-emphasis: #2563eb;
+    --accent-dim: rgba(59, 130, 246, 0.15);
     --chart-line: #00d4ff;
     --chart-line-alt: #7ee787;
     --sidebar-width: 160px;
@@ -177,11 +180,42 @@ header .header-btn:hover {
     flex: 1;
 }
 
+/* Section header row with zoom instructions and toggle */
+.section-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
 /* Zoom instructions */
 .zoom-instructions {
     color: var(--fg-muted);
     font-size: 12px;
-    margin-bottom: 1rem;
+}
+
+/* Heatmap mode toggle button */
+.heatmap-mode-toggle {
+    padding: 0.4rem 0.75rem;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--fg-secondary);
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.heatmap-mode-toggle:hover:not(:disabled) {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.heatmap-mode-toggle:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* Breadcrumb / Section title */

@@ -253,6 +253,8 @@ impl MultiChoiceHashtable {
     ///
     /// Returns a bitmask where bit N is set if items[N] has a matching tag
     /// and is not empty/ghost. Scans all 8 slots using 4 × 128-bit loads.
+    ///
+    /// Compatible with Apple Silicon and AWS Graviton (ARMv8+).
     #[cfg(target_arch = "aarch64")]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
@@ -262,7 +264,6 @@ impl MultiChoiceHashtable {
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
 
         // SAFETY: Bucket is 64-byte aligned, items start at offset 0.
-        // We use inline assembly for aligned 128-bit loads to avoid read_unaligned overhead.
         unsafe {
             let items_ptr = bucket.items.as_ptr() as *const u64;
 
@@ -337,38 +338,26 @@ impl MultiChoiceHashtable {
                 vandq_u32(nonzero_6_7, nonghost_6_7),
             );
 
-            // Extract results from each pair
+            // Branchless bitmask extraction using arithmetic.
+            // Each valid result has all bits set (0xFFFFFFFF) or zero in each 32-bit lane.
+            // We extract the sign bit (bit 31) from each 32-bit lane and pack them.
             let v0_1 = vreinterpretq_u64_u32(valid_0_1);
             let v2_3 = vreinterpretq_u64_u32(valid_2_3);
             let v4_5 = vreinterpretq_u64_u32(valid_4_5);
             let v6_7 = vreinterpretq_u64_u32(valid_6_7);
 
-            let bit0 = if vgetq_lane_u64(v0_1, 0) != 0 { 1u8 } else { 0 };
-            let bit1 = if vgetq_lane_u64(v0_1, 1) != 0 { 2u8 } else { 0 };
-            let bit2 = if vgetq_lane_u64(v2_3, 0) != 0 { 4u8 } else { 0 };
-            let bit3 = if vgetq_lane_u64(v2_3, 1) != 0 { 8u8 } else { 0 };
-            let bit4 = if vgetq_lane_u64(v4_5, 0) != 0 {
-                16u8
-            } else {
-                0
-            };
-            let bit5 = if vgetq_lane_u64(v4_5, 1) != 0 {
-                32u8
-            } else {
-                0
-            };
-            let bit6 = if vgetq_lane_u64(v6_7, 0) != 0 {
-                64u8
-            } else {
-                0
-            };
-            let bit7 = if vgetq_lane_u64(v6_7, 1) != 0 {
-                128u8
-            } else {
-                0
-            };
+            // Shift right by 63 to get 0 or 1, then extract and combine
+            // Using arithmetic: (x >> 63) gives 0 or 1
+            let r0 = (vgetq_lane_u64(v0_1, 0) >> 63) as u8;
+            let r1 = ((vgetq_lane_u64(v0_1, 1) >> 63) << 1) as u8;
+            let r2 = ((vgetq_lane_u64(v2_3, 0) >> 63) << 2) as u8;
+            let r3 = ((vgetq_lane_u64(v2_3, 1) >> 63) << 3) as u8;
+            let r4 = ((vgetq_lane_u64(v4_5, 0) >> 63) << 4) as u8;
+            let r5 = ((vgetq_lane_u64(v4_5, 1) >> 63) << 5) as u8;
+            let r6 = ((vgetq_lane_u64(v6_7, 0) >> 63) << 6) as u8;
+            let r7 = ((vgetq_lane_u64(v6_7, 1) >> 63) << 7) as u8;
 
-            bit0 | bit1 | bit2 | bit3 | bit4 | bit5 | bit6 | bit7
+            r0 | r1 | r2 | r3 | r4 | r5 | r6 | r7
         }
     }
 

@@ -74,6 +74,7 @@ tokio = "1"
 toml = "0.8"
 webpki-roots = "0.26"
 tracing = "0.1"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
 io-driver = { path = "io/driver" }

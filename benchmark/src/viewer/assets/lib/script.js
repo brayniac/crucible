@@ -464,18 +464,109 @@ const QueryExplorer = {
     },
 };
 
+// Section-level heatmap mode state
+// Key: section route, Value: { enabled: boolean, heatmapData: Map<chartId, data>, loading: boolean }
+const sectionHeatmapState = new Map();
+
+// Helper function to check if a section has histogram charts
+const sectionHasHistogramCharts = (groups) => {
+    if (!groups) return false;
+    return groups.some(group =>
+        group.plots && group.plots.some(plot =>
+            plot.promql_query && plot.promql_query.includes('histogram_percentiles')
+        )
+    );
+};
+
+// Fetch heatmap data for all histogram charts in a section
+const fetchSectionHeatmapData = async (sectionRoute, groups) => {
+    const state = sectionHeatmapState.get(sectionRoute) || { enabled: false, heatmapData: new Map(), loading: false };
+    state.loading = true;
+    sectionHeatmapState.set(sectionRoute, state);
+    m.redraw();
+
+    const heatmapData = new Map();
+
+    for (const group of groups || []) {
+        for (const plot of group.plots || []) {
+            if (plot.promql_query && plot.promql_query.includes('histogram_percentiles')) {
+                // Convert histogram_percentiles query to histogram_heatmap query
+                const match = plot.promql_query.match(/histogram_percentiles\s*\(\s*\[[^\]]*\]\s*,\s*(.+)\)$/);
+                if (!match) continue;
+
+                const metricSelector = match[1].trim();
+                const heatmapQuery = `histogram_heatmap(${metricSelector})`;
+
+                try {
+                    const result = await executePromQLRangeQuery(heatmapQuery);
+
+                    if (result.status === 'success' && result.data && result.data.resultType === 'histogram_heatmap') {
+                        const heatmapResult = result.data.result;
+                        console.log('[fetchHeatmap] timestamps range:',
+                            heatmapResult.timestamps[0], 'to',
+                            heatmapResult.timestamps[heatmapResult.timestamps.length - 1],
+                            '(', heatmapResult.timestamps.length, 'points)');
+                        console.log('[fetchHeatmap] data points:', heatmapResult.data.length);
+                        heatmapData.set(plot.opts.id, {
+                            time_data: heatmapResult.timestamps,
+                            bucket_bounds: heatmapResult.bucket_bounds,
+                            data: heatmapResult.data.map(([timeIdx, bucketIdx, count]) => [timeIdx, bucketIdx, count]),
+                            min_value: heatmapResult.min_value,
+                            max_value: heatmapResult.max_value,
+                        });
+                    }
+                } catch (error) {
+                    console.error('Failed to fetch histogram heatmap:', error);
+                }
+            }
+        }
+    }
+
+    state.heatmapData = heatmapData;
+    state.loading = false;
+    sectionHeatmapState.set(sectionRoute, state);
+    m.redraw();
+};
+
 const SectionContent = {
     view({ attrs }) {
         if (attrs.section.name === 'Query Explorer') {
             return m('div#section-content', [m(QueryExplorer)]);
         }
 
+        const sectionRoute = attrs.section.route;
+        const hasHistogramCharts = sectionHasHistogramCharts(attrs.groups);
+        const heatmapState = sectionHeatmapState.get(sectionRoute) || { enabled: false, heatmapData: new Map(), loading: false };
+
+        // Toggle handler for heatmap mode
+        const toggleHeatmapMode = async () => {
+            const newEnabled = !heatmapState.enabled;
+            const newState = { ...heatmapState, enabled: newEnabled };
+            sectionHeatmapState.set(sectionRoute, newState);
+
+            if (newEnabled && heatmapState.heatmapData.size === 0) {
+                // Fetch heatmap data for all histogram charts
+                await fetchSectionHeatmapData(sectionRoute, attrs.groups);
+            } else {
+                m.redraw();
+            }
+        };
+
+        // Heatmap toggle button (shown when section has histogram charts)
+        const heatmapToggle = hasHistogramCharts ? m('button.heatmap-mode-toggle', {
+            onclick: toggleHeatmapMode,
+            disabled: heatmapState.loading,
+        }, heatmapState.loading ? 'Loading...' : (heatmapState.enabled ? 'Show Percentiles' : 'Show Heatmaps')) : null;
+
         return m('div#section-content', [
-            m('div.zoom-instructions', 'Drag to zoom \u00B7 Scroll to zoom \u00B7 Double-click to reset'),
+            m('div.section-header-row', [
+                m('div.zoom-instructions', 'Drag to zoom \u00B7 Scroll to zoom \u00B7 Double-click to reset'),
+                heatmapToggle,
+            ]),
             m('div.section-title', attrs.section.name),
             m(
                 'div#groups',
-                attrs.groups.map((group) => m(Group, group)),
+                attrs.groups.map((group) => m(Group, { ...group, sectionRoute })),
             ),
         ]);
     },
@@ -484,6 +575,10 @@ const SectionContent = {
 // Group component
 const Group = {
     view({ attrs }) {
+        const sectionRoute = attrs.sectionRoute;
+        const heatmapState = sectionHeatmapState.get(sectionRoute);
+        const isHeatmapMode = heatmapState?.enabled && !heatmapState?.loading;
+
         return m(
             'div.group',
             {
@@ -493,7 +588,30 @@ const Group = {
                 m('h2', `${attrs.name}`),
                 m(
                     'div.charts',
-                    attrs.plots.map((spec) => m(Chart, { spec, chartsState })),
+                    attrs.plots.map((spec) => {
+                        // Check if this is a histogram chart and we're in heatmap mode
+                        const isHistogramChart = spec.promql_query && spec.promql_query.includes('histogram_percentiles');
+
+                        if (isHistogramChart && isHeatmapMode && heatmapState?.heatmapData?.has(spec.opts.id)) {
+                            // Create heatmap spec from the fetched data
+                            const heatmapData = heatmapState.heatmapData.get(spec.opts.id);
+                            const heatmapSpec = {
+                                ...spec,
+                                opts: {
+                                    ...spec.opts,
+                                    style: 'histogram_heatmap',
+                                },
+                                time_data: heatmapData.time_data,
+                                bucket_bounds: heatmapData.bucket_bounds,
+                                data: heatmapData.data,
+                                min_value: heatmapData.min_value,
+                                max_value: heatmapData.max_value,
+                            };
+                            return m(Chart, { spec: heatmapSpec, chartsState });
+                        }
+
+                        return m(Chart, { spec, chartsState });
+                    }),
                 ),
             ],
         );

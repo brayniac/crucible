@@ -8,6 +8,9 @@ import {
     configureHeatmap
 } from './heatmap.js';
 import {
+    configureHistogramHeatmap
+} from './histogram_heatmap.js';
+import {
     configureMultiSeriesChart
 } from './multi.js';
 import globalColorMapper from './util/colormap.js';
@@ -92,8 +95,19 @@ export class Chart {
         const oldSpec = this.spec;
         this.spec = vnode.attrs.spec;
 
-        if (this.echart && oldSpec.data !== this.spec.data) {
+        // Check if chart style changed (e.g., scatter -> histogram_heatmap)
+        const styleChanged = oldSpec.opts?.style !== this.spec.opts?.style;
+
+        if (this.echart && (oldSpec.data !== this.spec.data || styleChanged)) {
+            // Reconfigure the chart (zoom state will be included in configuration)
             this.configureChartByType();
+
+            // Re-enable drag-to-zoom after reconfiguration
+            this.echart.dispatchAction({
+                type: 'takeGlobalCursor',
+                key: 'dataZoomSelect',
+                dataZoomSelectActive: true,
+            });
         }
     }
 
@@ -250,6 +264,8 @@ export class Chart {
             configureLineChart(this, this.spec, this.chartsState);
         } else if (opts.style === 'heatmap') {
             configureHeatmap(this, this.spec, this.chartsState);
+        } else if (opts.style === 'histogram_heatmap') {
+            configureHistogramHeatmap(this, this.spec, this.chartsState);
         } else if (opts.style === 'scatter') {
             configureScatterChart(this, this.spec, this.chartsState);
         } else if (opts.style === 'multi') {
