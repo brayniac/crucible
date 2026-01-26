@@ -32,6 +32,14 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
+    /// Shutdown configuration
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
     /// I/O engine selection for native runtime: "auto", "mio", or "uring"
     #[serde(default)]
     pub io_engine: IoEngine,
@@ -478,6 +486,111 @@ impl Default for MetricsConfig {
             address: default_metrics_address(),
         }
     }
+}
+
+/// Shutdown configuration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShutdownConfig {
+    /// Timeout in seconds for draining active connections during shutdown.
+    /// After this timeout, remaining connections will be forcefully closed.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            drain_timeout_secs: default_drain_timeout_secs(),
+        }
+    }
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    30
+}
+
+/// Logging configuration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// Log level: "error", "warn", "info", "debug", or "trace"
+    #[serde(default = "default_log_level")]
+    pub level: LogLevel,
+
+    /// Log format: "pretty", "json", or "compact"
+    #[serde(default = "default_log_format")]
+    pub format: LogFormat,
+
+    /// Include timestamps in log output
+    #[serde(default = "default_true")]
+    pub timestamps: bool,
+
+    /// Include thread names in log output
+    #[serde(default)]
+    pub thread_names: bool,
+
+    /// Include module target in log output
+    #[serde(default = "default_true")]
+    pub target: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+            timestamps: true,
+            thread_names: false,
+            target: true,
+        }
+    }
+}
+
+/// Log level selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    /// Convert to tracing level filter string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
+/// Log format selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable, colorized output
+    #[default]
+    Pretty,
+    /// JSON-formatted output for log aggregation
+    Json,
+    /// Compact single-line output
+    Compact,
+}
+
+fn default_log_level() -> LogLevel {
+    LogLevel::Info
+}
+
+fn default_log_format() -> LogFormat {
+    LogFormat::Pretty
 }
 
 /// Recv mode for io_uring connections.

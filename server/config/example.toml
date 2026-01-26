@@ -10,6 +10,25 @@
 # Runtime selection: "native" (io_uring/mio) or "tokio"
 runtime = "native"
 
+# Shutdown configuration
+[shutdown]
+# Timeout in seconds for draining connections during graceful shutdown
+drain_timeout_secs = 30
+
+# Logging configuration
+[logging]
+# Log level: "error", "warn", "info", "debug", "trace"
+# Can be overridden with RUST_LOG environment variable
+level = "info"
+# Log format: "pretty" (human-readable), "json", or "compact"
+format = "pretty"
+# Include timestamps
+timestamps = true
+# Include thread names (useful for debugging multi-threaded issues)
+thread_names = false
+# Include module target in log output
+target = true
+
 [workers]
 # Number of worker threads (default: number of CPUs)
 threads = 4

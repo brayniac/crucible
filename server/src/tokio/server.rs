@@ -8,9 +8,11 @@ use cache_core::Cache;
 use io_driver::RecvBuf;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tracing::{debug, error, info, warn};
 
 /// Read buffer size for socket reads.
 const READ_BUF_SIZE: usize = 64 * 1024;
@@ -80,9 +82,18 @@ impl RecvBuf for SimpleRecvBuf {
 }
 
 /// Run the tokio runtime server.
+///
+/// # Arguments
+///
+/// * `config` - Server configuration
+/// * `cache` - Cache implementation
+/// * `shutdown` - Shared shutdown flag (set to true when shutdown is requested)
+/// * `drain_timeout` - Maximum time to wait for connections to drain during shutdown
 pub fn run<C: Cache + 'static>(
     config: &Config,
     cache: C,
+    shutdown: Arc<AtomicBool>,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cache = Arc::new(cache);
     let num_workers = config.threads();
@@ -124,6 +135,8 @@ pub fn run<C: Cache + 'static>(
             max_value_size,
             zero_copy_mode,
             allow_flush,
+            shutdown,
+            drain_timeout,
         )
         .await
     })
@@ -135,6 +148,8 @@ async fn run_async<C: Cache + 'static>(
     max_value_size: usize,
     zero_copy_mode: ZeroCopyMode,
     allow_flush: bool,
+    shutdown: Arc<AtomicBool>,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Bind all listeners
     let mut listeners = Vec::with_capacity(addresses.len());
@@ -143,22 +158,66 @@ async fn run_async<C: Cache + 'static>(
         listeners.push(listener);
     }
 
+    // Create a channel to notify accept loops of shutdown
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     // Spawn accept loops for each listener
     let mut handles = Vec::with_capacity(listeners.len());
     for listener in listeners {
         let cache = cache.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
-            accept_loop(listener, cache, max_value_size, zero_copy_mode, allow_flush).await
+            accept_loop(
+                listener,
+                cache,
+                max_value_size,
+                zero_copy_mode,
+                allow_flush,
+                shutdown_rx,
+            )
+            .await
         });
         handles.push(handle);
     }
 
-    // Wait for all accept loops (they run forever unless error)
-    for handle in handles {
-        if let Err(e) = handle.await {
-            eprintln!("Accept loop error: {}", e);
-        }
+    // Wait for shutdown signal
+    while !shutdown.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    info!("Shutdown signal received, draining connections...");
+
+    // Signal accept loops to stop accepting new connections
+    let _ = shutdown_tx.send(());
+
+    // Wait for connections to drain with timeout
+    let drain_start = std::time::Instant::now();
+    while drain_start.elapsed() < drain_timeout {
+        let active = CONNECTIONS_ACTIVE.value();
+        if active == 0 {
+            break;
+        }
+        debug!(
+            active_connections = active,
+            "Waiting for connections to drain"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let active_conns = CONNECTIONS_ACTIVE.value();
+    if active_conns > 0 {
+        warn!(
+            active_connections = active_conns,
+            "Drain timeout reached, {} connections still active", active_conns
+        );
+    }
+
+    // Wait for accept loops to finish
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    info!("Server shutdown complete");
 
     Ok(())
 }
@@ -169,32 +228,41 @@ async fn accept_loop<C: Cache + 'static>(
     max_value_size: usize,
     zero_copy_mode: ZeroCopyMode,
     allow_flush: bool,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                CONNECTIONS_ACCEPTED.increment();
-                CONNECTIONS_ACTIVE.increment();
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _addr)) => {
+                        CONNECTIONS_ACCEPTED.increment();
+                        CONNECTIONS_ACTIVE.increment();
 
-                let cache = cache.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(
-                        stream,
-                        cache,
-                        max_value_size,
-                        zero_copy_mode,
-                        allow_flush,
-                    )
-                    .await
-                        && !is_connection_reset(&e)
-                    {
-                        eprintln!("Connection error: {}", e);
+                        let cache = cache.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(
+                                stream,
+                                cache,
+                                max_value_size,
+                                zero_copy_mode,
+                                allow_flush,
+                            )
+                            .await
+                                && !is_connection_reset(&e)
+                            {
+                                debug!(error = %e, "Connection error");
+                            }
+                            CONNECTIONS_ACTIVE.decrement();
+                        });
                     }
-                    CONNECTIONS_ACTIVE.decrement();
-                });
+                    Err(e) => {
+                        error!(error = %e, "Accept error");
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("Accept error: {}", e);
+            _ = shutdown_rx.recv() => {
+                debug!("Accept loop received shutdown signal");
+                break;
             }
         }
     }

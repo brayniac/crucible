@@ -1,9 +1,12 @@
 //! Crucible cache server binary.
 
 use clap::Parser;
+use server::admin::{self, AdminConfig};
 use server::banner::{BannerConfig, print_banner};
 use server::config::{CacheBackend, Config, EvictionPolicy, HugepageConfig, Runtime};
+use server::{logging, signal};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "crucible-server")]
@@ -39,13 +42,22 @@ fn main() {
         }
     };
 
-    if let Err(e) = run(config) {
-        eprintln!("Server error: {}", e);
+    // Initialize logging first
+    logging::init(&config.logging);
+
+    // Install signal handler for graceful shutdown
+    let shutdown = signal::install_signal_handler();
+
+    if let Err(e) = run(config, shutdown) {
+        tracing::error!(error = %e, "Server error");
         std::process::exit(1);
     }
 }
 
-fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run(
+    config: Config,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Print banner
     let listeners: Vec<_> = config
         .listener
@@ -93,32 +105,46 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         numa_node,
     });
 
-    // Create cache based on backend + policy selection
+    // Start admin server for health checks and metrics
+    let admin_handle = admin::start(AdminConfig {
+        address: config.metrics.address,
+        shutdown: shutdown.clone(),
+    })?;
 
-    match config.cache.backend {
+    // Create cache based on backend + policy selection
+    let drain_timeout = Duration::from_secs(config.shutdown.drain_timeout_secs);
+
+    let result = match config.cache.backend {
         CacheBackend::Segment => {
             let cache = create_segment(&config, policy)?;
-            run_with_cache(config, cache)
+            run_with_cache(config, cache, shutdown, drain_timeout)
         }
         CacheBackend::Slab => {
             let cache = create_slab(&config, policy)?;
-            run_with_cache(config, cache)
+            run_with_cache(config, cache, shutdown, drain_timeout)
         }
         CacheBackend::Heap => {
             let cache = create_heap(&config, policy)?;
-            run_with_cache(config, cache)
+            run_with_cache(config, cache, shutdown, drain_timeout)
         }
-    }
+    };
+
+    // Shutdown admin server
+    admin_handle.shutdown();
+
+    result
 }
 
 fn run_with_cache<C: cache_core::Cache + 'static>(
     config: Config,
     cache: C,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match config.runtime {
-        Runtime::Native => server::native::run(&config, cache),
+        Runtime::Native => server::native::run(&config, cache, shutdown, drain_timeout),
         #[cfg(feature = "tokio-runtime")]
-        Runtime::Tokio => server::tokio::run(&config, cache),
+        Runtime::Tokio => server::tokio::run(&config, cache, shutdown, drain_timeout),
         #[cfg(not(feature = "tokio-runtime"))]
         Runtime::Tokio => Err("tokio runtime not compiled in".into()),
     }
@@ -286,6 +312,23 @@ fn print_default_config() {
 # Runtime selection: "native" (io_uring/mio) or "tokio"
 runtime = "native"
 
+[shutdown]
+# Timeout in seconds for draining connections during graceful shutdown
+drain_timeout_secs = 30
+
+[logging]
+# Log level: "error", "warn", "info", "debug", "trace"
+# Can be overridden with RUST_LOG environment variable
+level = "info"
+# Log format: "pretty" (human-readable), "json", or "compact"
+format = "pretty"
+# Include timestamps
+timestamps = true
+# Include thread names
+thread_names = false
+# Include module target
+target = true
+
 [workers]
 # Number of worker threads (default: number of CPUs)
 # threads = 8
@@ -348,7 +391,7 @@ address = "0.0.0.0:11211"
 # key = "/path/to/key.pem"
 
 [metrics]
-# Prometheus metrics endpoint
+# Admin server with health checks (/health, /ready) and Prometheus metrics (/metrics)
 address = "0.0.0.0:9090"
 
 # io_uring specific settings (native runtime on Linux only)

@@ -9,7 +9,7 @@ description = "High-performance cache server with multiple protocols and runtime
 
 [features]
 default = ["tokio-runtime","io_uring"]
-tokio-runtime = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+tokio-runtime = ["tokio/rt-multi-thread", "tokio/io-util", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 io_uring = ["io-driver/io_uring"]
 # Enables magic bytes and checksum validation for item headers. Useful for
 # debugging corruption issues but adds overhead to every read operation.
@@ -51,8 +51,20 @@ clap = { workspace = true, features = ["derive"] }
 metrics = { workspace = true }
 metriken = { workspace = true }
 
-# Tokio runtime (optional)
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "io-util", "sync"] }
+# Signal handling
+ctrlc = { version = "3", features = ["termination"] }
+
+# Structured logging
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Admin server (health + metrics endpoints)
+axum = "0.8"
+
+# Tokio runtime - always required for admin server, optional features for cache server runtime
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
+
+# Additional tokio features for tokio-runtime cache server (optional)
 hyper = { workspace = true, optional = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, optional = true, features = ["tokio"] }
 http-body-util = { workspace = true, optional = true }

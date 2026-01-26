@@ -211,13 +211,17 @@ fn start_test_server_full(
             .build()
             .unwrap();
 
+        // Shutdown flag (won't be set in tests, server runs until thread is dropped)
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let drain_timeout = Duration::from_secs(5);
+
         // Run server (blocks forever, thread killed on test exit)
         match runtime.as_str() {
             "tokio" => {
-                let _ = server::tokio::run(&config, cache);
+                let _ = server::tokio::run(&config, cache, shutdown, drain_timeout);
             }
             _ => {
-                let _ = server::native::run(&config, cache);
+                let _ = server::native::run(&config, cache, shutdown, drain_timeout);
             }
         }
     })

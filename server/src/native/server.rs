@@ -14,6 +14,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
 /// Set the current thread's name (visible in ps, htop, etc).
 /// Name is truncated to 15 chars (Linux limit).
@@ -55,9 +56,18 @@ struct AcceptorConfig {
 }
 
 /// Run the native runtime server.
+///
+/// # Arguments
+///
+/// * `config` - Server configuration
+/// * `cache` - Cache implementation
+/// * `shutdown` - Shared shutdown flag (set to true when shutdown is requested)
+/// * `drain_timeout` - Maximum time to wait for connections to drain during shutdown
 pub fn run<C: Cache + 'static>(
     config: &Config,
     cache: C,
+    shutdown: Arc<AtomicBool>,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cache = Arc::new(cache);
     let num_workers = config.threads();
@@ -96,9 +106,6 @@ pub fn run<C: Cache + 'static>(
     let worker_stats: Arc<Vec<WorkerStats>> =
         Arc::new((0..num_workers).map(|_| WorkerStats::new()).collect());
 
-    // Shutdown flag for diagnostics and acceptor threads
-    let shutdown = Arc::new(AtomicBool::new(false));
-
     // Create channels for fd distribution (one per worker)
     // Using crossbeam for bounded channels with good performance
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_workers)
@@ -130,6 +137,7 @@ pub fn run<C: Cache + 'static>(
         let cache = cache.clone();
         let worker_config = worker_config.clone();
         let stats = worker_stats.clone();
+        let worker_shutdown = shutdown.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", worker_id))
@@ -139,10 +147,15 @@ pub fn run<C: Cache + 'static>(
                     let _ = set_cpu_affinity(cpu);
                 }
 
-                if let Err(e) =
-                    run_worker(worker_id, worker_config, cache, &stats[worker_id], receiver)
-                {
-                    eprintln!("Worker {} error: {}", worker_id, e);
+                if let Err(e) = run_worker(
+                    worker_id,
+                    worker_config,
+                    cache,
+                    &stats[worker_id],
+                    receiver,
+                    worker_shutdown,
+                ) {
+                    error!(worker_id, error = %e, "Worker error");
                 }
             })
             .expect("failed to spawn worker thread");
@@ -163,7 +176,7 @@ pub fn run<C: Cache + 'static>(
                     let _ = set_cpu_affinity(cpu);
                 }
                 if let Err(e) = run_acceptor(acceptor_config, senders, shutdown_flag) {
-                    eprintln!("Acceptor error: {}", e);
+                    error!(error = %e, "Acceptor error");
                 }
             })
             .expect("failed to spawn acceptor thread");
@@ -171,16 +184,55 @@ pub fn run<C: Cache + 'static>(
         handles.push(handle);
     }
 
-    // Wait for all threads
+    // Wait for shutdown signal (the main binary sets this via signal handler)
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    info!("Shutdown signal received, draining connections...");
+
+    // Wait for workers to drain with timeout
+    let drain_start = Instant::now();
+    let mut workers_stopped = vec![false; handles.len()];
+
+    while drain_start.elapsed() < drain_timeout {
+        let mut all_stopped = true;
+        for (i, handle) in handles.iter().enumerate() {
+            if !workers_stopped[i] && handle.is_finished() {
+                workers_stopped[i] = true;
+                debug!(worker_id = i, "Worker stopped");
+            }
+            if !workers_stopped[i] {
+                all_stopped = false;
+            }
+        }
+
+        if all_stopped {
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let active_conns = CONNECTIONS_ACTIVE.value();
+    if active_conns > 0 {
+        warn!(
+            active_connections = active_conns,
+            "Drain timeout reached, {} connections still active", active_conns
+        );
+    }
+
+    // Join all threads (they should exit soon after shutdown flag is set)
     for handle in handles {
         let _ = handle.join();
     }
 
     // Shutdown diagnostics thread
-    shutdown.store(true, Ordering::SeqCst);
     if let Some(handle) = diagnostics_handle {
         let _ = handle.join();
     }
+
+    info!("Server shutdown complete");
 
     Ok(())
 }
@@ -191,7 +243,7 @@ fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
     let mut last_report = Instant::now();
     let report_interval = Duration::from_secs(10);
 
-    eprintln!("[diagnostics] Worker diagnostics enabled, reporting every 10s");
+    debug!("Worker diagnostics enabled, reporting every 10s");
 
     while !shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(1));
@@ -328,7 +380,7 @@ fn run_acceptor(
                     // by ignoring (connection will be closed when dropped)
                 }
                 CompletionKind::ListenerError { error, .. } => {
-                    eprintln!("Acceptor listener error: {}", error);
+                    error!(error = %error, "Acceptor listener error");
                 }
                 _ => {}
             }
@@ -344,6 +396,7 @@ fn run_worker<C: Cache>(
     cache: Arc<C>,
     stats: &WorkerStats,
     fd_receiver: crossbeam_channel::Receiver<(RawFd, SocketAddr)>,
+    shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Set this thread's shard ID for metrics to avoid false sharing
     metrics::set_thread_shard(worker_id);
@@ -367,8 +420,15 @@ fn run_worker<C: Cache>(
     let mut connections: Vec<Option<Connection>> = Vec::with_capacity(4096);
 
     loop {
+        // Check for shutdown signal
+        let shutting_down = shutdown.load(Ordering::Relaxed);
+
         // Check for new connections from the acceptor (non-blocking)
-        while let Ok((raw_fd, _addr)) = fd_receiver.try_recv() {
+        // Only accept new connections if we're not shutting down
+        while !shutting_down {
+            let Ok((raw_fd, _addr)) = fd_receiver.try_recv() else {
+                break;
+            };
             match driver.register_fd(raw_fd) {
                 Ok(conn_id) => {
                     CONNECTIONS_ACCEPTED.increment();
@@ -848,7 +908,7 @@ fn run_worker<C: Cache>(
                 }
 
                 CompletionKind::ListenerError { error, .. } => {
-                    eprintln!("Listener error: {}", error);
+                    error!(error = %error, "Listener error");
                 }
 
                 // AcceptRaw is only used by the acceptor thread, not workers
@@ -865,7 +925,18 @@ fn run_worker<C: Cache>(
                 | CompletionKind::UdpError { .. } => {}
             }
         }
+
+        // Check if we should exit (shutdown requested and no active connections)
+        if shutting_down {
+            let active = connections.iter().filter(|c| c.is_some()).count();
+            if active == 0 {
+                debug!(worker_id, "Worker exiting, no active connections");
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
 
 #[inline]
