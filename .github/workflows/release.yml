@@ -1,36 +1,82 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
-  build-deb:
-    name: Build ${{ matrix.binary }} (${{ matrix.arch }})
+  build-deb-amd64:
+    name: Build .deb (${{ matrix.package }}, amd64)
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch:
-          - amd64
-          - arm64
-        binary:
-          - crucible-server
-          - crucible-benchmark
+        package: [crucible-server, crucible-benchmark]
         include:
-          - arch: amd64
-            target: x86_64-unknown-linux-gnu
-          - arch: arm64
-            target: aarch64-unknown-linux-gnu
+          - package: crucible-server
+            crate: server
+          - package: crucible-benchmark
+            crate: benchmark
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-amd64
+          save-if: ${{ matrix.package == 'crucible-server' }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build release binary
+        run: cargo build --release -p ${{ matrix.crate }}
+
+      - name: Build .deb package
+        run: |
+          cargo deb --no-build -p ${{ matrix.crate }}
+          DEB_FILE=$(find target/debian -name '${{ matrix.package }}*.deb' | head -1)
+          echo "DEB_FILE=$DEB_FILE" >> $GITHUB_ENV
+          echo "Built: $DEB_FILE"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.package }}-amd64
+          path: ${{ env.DEB_FILE }}
+          retention-days: 7
+
+  build-deb-arm64:
+    name: Build .deb (${{ matrix.package }}, arm64)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [crucible-server, crucible-benchmark]
+        include:
+          - package: crucible-server
+            crate: server
+          - package: crucible-benchmark
+            crate: benchmark
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-arm64
+          save-if: ${{ matrix.package == 'crucible-server' }}
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -38,111 +84,212 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb
 
-      - name: Build with cross
-        run: cross build --release --target ${{ matrix.target }} --bin ${{ matrix.binary }}
+      - name: Build release binary with cross
+        run: cross build --release -p ${{ matrix.crate }} --target aarch64-unknown-linux-gnu
 
-      - name: Determine package directory
-        id: pkg
+      - name: Build .deb package
         run: |
-          if [[ "${{ matrix.binary }}" == "crucible-server" ]]; then
-            echo "dir=server" >> $GITHUB_OUTPUT
-          else
-            echo "dir=benchmark" >> $GITHUB_OUTPUT
-          fi
+          cargo deb --no-build --no-strip -p ${{ matrix.crate }} --target aarch64-unknown-linux-gnu
+          DEB_FILE=$(find target/aarch64-unknown-linux-gnu/debian -name '${{ matrix.package }}*.deb' | head -1)
+          echo "DEB_FILE=$DEB_FILE" >> $GITHUB_ENV
+          echo "Built: $DEB_FILE"
 
-      - name: Build deb package
-        run: |
-          cargo deb --no-build --target ${{ matrix.target }} \
-            -p ${{ steps.pkg.outputs.dir }} \
-            --deb-version "${{ github.ref_name }}"
-
-      - name: Upload artifact
+      - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.binary }}_${{ matrix.arch }}
-          path: target/${{ matrix.target }}/debian/*.deb
+          name: deb-${{ matrix.package }}-arm64
+          path: ${{ env.DEB_FILE }}
+          retention-days: 7
 
-  publish:
-    name: Publish to APT repository
-    needs: build-deb
+  build-rpm-amd64:
+    name: Build .rpm (${{ matrix.package }}, amd64)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [crucible-server, crucible-benchmark]
+        include:
+          - package: crucible-server
+            crate: server
+          - package: crucible-benchmark
+            crate: benchmark
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-rpm-amd64
+          save-if: ${{ matrix.package == 'crucible-server' }}
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Build release binary
+        run: cargo build --release -p ${{ matrix.crate }}
+
+      - name: Build .rpm package
+        run: |
+          cargo generate-rpm -p ${{ matrix.crate }}
+          RPM_FILE=$(find target/generate-rpm -name '${{ matrix.package }}*.rpm' | head -1)
+          echo "RPM_FILE=$RPM_FILE" >> $GITHUB_ENV
+          echo "Built: $RPM_FILE"
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.package }}-amd64
+          path: ${{ env.RPM_FILE }}
+          retention-days: 7
+
+  build-rpm-arm64:
+    name: Build .rpm (${{ matrix.package }}, arm64)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [crucible-server, crucible-benchmark]
+        include:
+          - package: crucible-server
+            crate: server
+          - package: crucible-benchmark
+            crate: benchmark
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-rpm-arm64
+          save-if: ${{ matrix.package == 'crucible-server' }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Build release binary with cross
+        run: cross build --release -p ${{ matrix.crate }} --target aarch64-unknown-linux-gnu
+
+      - name: Build .rpm package
+        run: |
+          cargo generate-rpm -p ${{ matrix.crate }} --target aarch64-unknown-linux-gnu
+          RPM_FILE=$(find target/aarch64-unknown-linux-gnu/generate-rpm -name '${{ matrix.package }}*.rpm' | head -1)
+          echo "RPM_FILE=$RPM_FILE" >> $GITHUB_ENV
+          echo "Built: $RPM_FILE"
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.package }}-arm64
+          path: ${{ env.RPM_FILE }}
+          retention-days: 7
+
+  sign-and-publish:
+    name: Sign and Publish
+    needs: [build-deb-amd64, build-deb-arm64, build-rpm-amd64, build-rpm-arm64]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - uses: actions/checkout@v4
+
+      - name: Download .deb artifacts
         uses: actions/download-artifact@v4
         with:
-          path: debs
+          path: debs/
+          pattern: deb-*
           merge-multiple: true
 
-      - name: List packages
-        run: find debs -name "*.deb" -type f
+      - name: Download .rpm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: rpms/
+          pattern: rpm-*
+          merge-multiple: true
 
-      - name: Upload to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+      - name: List downloaded artifacts
         run: |
-          for deb in debs/*.deb; do
-            aws s3 cp "$deb" "s3://${{ secrets.S3_BUCKET }}/${{ secrets.S3_PATH }}/pool/"
-          done
+          echo "=== DEBs ==="
+          ls -la debs/
+          echo "=== RPMs ==="
+          ls -la rpms/
 
       - name: Import GPG key
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          # Trust the key
-          KEY_ID=$(gpg --list-secret-keys --keyid-format long | grep sec | head -1 | awk '{print $2}' | cut -d'/' -f2)
-          echo "${KEY_ID}:6:" | gpg --import-ownertrust
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG | grep sec | head -1 | awk '{print $2}' | cut -d'/' -f2)
+          echo "GPG_KEY_ID=$GPG_KEY_ID" >> $GITHUB_ENV
+          echo "Using GPG key: $GPG_KEY_ID"
 
-      - name: Update APT repository index
+      - name: Sign .deb packages
+        run: |
+          for deb in debs/*.deb; do
+            echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 \
+              --default-key ${{ env.GPG_KEY_ID }} \
+              --detach-sign --armor "$deb"
+            echo "Signed: $deb"
+          done
+
+      - name: Sign .rpm packages
+        run: |
+          for rpm in rpms/*.rpm; do
+            echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 \
+              --default-key ${{ env.GPG_KEY_ID }} \
+              --detach-sign --armor "$rpm"
+            echo "Signed: $rpm"
+          done
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install repository tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils createrepo-c
+
+      - name: Publish to S3 APT repository
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET: ${{ vars.S3_BUCKET_APT }}
+          GPG_KEY_ID: ${{ env.GPG_KEY_ID }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          # Download existing pool
-          aws s3 sync "s3://${{ secrets.S3_BUCKET }}/${{ secrets.S3_PATH }}/" repo/ || mkdir -p repo/pool
+          chmod +x scripts/publish-apt.sh
+          ./scripts/publish-apt.sh
 
-          cd repo
-          mkdir -p pool dists/stable/main/binary-amd64 dists/stable/main/binary-arm64
+      - name: Publish to S3 YUM repository
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET_YUM }}
+          GPG_KEY_ID: ${{ env.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          chmod +x scripts/publish-yum.sh
+          ./scripts/publish-yum.sh
 
-          # Generate Packages files filtered by architecture
-          dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages
-          dpkg-scanpackages --arch arm64 pool > dists/stable/main/binary-arm64/Packages
-
-          gzip -kf dists/stable/main/binary-amd64/Packages
-          gzip -kf dists/stable/main/binary-arm64/Packages
-
-          # Generate Release file
-          cd dists/stable
-          cat > Release << 'EOF'
-          Origin: Crucible
-          Label: Crucible
-          Suite: stable
-          Codename: stable
-          Architectures: amd64 arm64
-          Components: main
-          Description: Crucible APT repository
-          EOF
-          # Remove leading whitespace from Release file
-          sed -i 's/^          //' Release
-
-          # Add checksums
-          apt-ftparchive release . >> Release
-
-          # Sign the Release file
-          rm -f Release.gpg InRelease
-          if [ -n "$GPG_PASSPHRASE" ]; then
-            echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 -abs -o Release.gpg Release
-            echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --clearsign -o InRelease Release
-          else
-            gpg --batch --yes -abs -o Release.gpg Release
-            gpg --batch --yes --clearsign -o InRelease Release
+      - name: Invalidate CloudFront caches
+        run: |
+          if [ -n "${{ vars.CLOUDFRONT_DISTRIBUTION_ID_APT }}" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_APT }} \
+              --paths "/*"
+          fi
+          if [ -n "${{ vars.CLOUDFRONT_DISTRIBUTION_ID_YUM }}" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_YUM }} \
+              --paths "/*"
           fi
 
-          cd ../..
-
-          # Upload updated repo
-          aws s3 sync . "s3://${{ secrets.S3_BUCKET }}/${{ secrets.S3_PATH }}/"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            debs/*.deb
+            debs/*.deb.asc
+            rpms/*.rpm
+            rpms/*.rpm.asc
+          generate_release_notes: true

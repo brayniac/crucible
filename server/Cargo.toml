@@ -86,3 +86,10 @@ assets = [
     ["target/release/crucible-server", "usr/bin/", "755"],
     ["config/example.toml", "etc/crucible/server.toml.example", "644"],
 ]
+
+[package.metadata.generate-rpm]
+name = "crucible-server"
+assets = [
+    { source = "target/release/crucible-server", dest = "/usr/bin/crucible-server", mode = "0755" },
+    { source = "server/config/example.toml", dest = "/etc/crucible/server.toml.example", mode = "0644", config = true },
+]
