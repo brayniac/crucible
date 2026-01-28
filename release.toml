@@ -39,9 +39,6 @@ allow-branch = ["main"]
 # Consolidate commits: one commit for version bump across all crates
 consolidate-commits = true
 
-# Don't run cargo publish (redundant with publish=false, but explicit)
-no-verify = false
-
 # What to do before release
 pre-release-replacements = []
 
