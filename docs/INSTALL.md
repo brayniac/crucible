@@ -27,7 +27,7 @@ sudo apt install crucible-server
 sudo apt install crucible-benchmark
 ```
 
-## RHEL / CentOS / Fedora (YUM/DNF)
+## RHEL / CentOS / Fedora / Amazon Linux 2023 (YUM/DNF)
 
 ### Add the repository
 

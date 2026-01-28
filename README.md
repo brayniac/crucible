@@ -74,7 +74,7 @@ curl -fsSL https://apt.thermitesolutions.com/gpg-key.asc | sudo gpg --dearmor -o
 echo "deb [signed-by=/usr/share/keyrings/crucible-archive-keyring.gpg] https://apt.thermitesolutions.com stable main" | sudo tee /etc/apt/sources.list.d/crucible.list
 sudo apt update && sudo apt install crucible-server crucible-benchmark
 
-# RHEL/CentOS/Fedora
+# RHEL/CentOS/Fedora/Amazon Linux 2023
 sudo tee /etc/yum.repos.d/crucible.repo << 'EOF'
 [crucible]
 name=Crucible Repository
