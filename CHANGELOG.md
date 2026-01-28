@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.2] - 2026-01-28
+
+### Fixed
+- Release workflow now correctly uses repository variables for AWS_REGION
+- Tag-release workflow uses PAT to trigger release workflow
+
 ## [0.2.1] - 2026-01-28
 
 ### Fixed
