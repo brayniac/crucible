@@ -30,7 +30,7 @@ const RESP_CRLF: &[u8] = b"\r\n";
 /// This struct holds the header and value reference for a GET response.
 /// The value reference points directly into cache segment memory, avoiding copies.
 ///
-/// Size: 64 bytes (fits in SmallBox<S8> inline storage)
+/// Size: 64 bytes (fits in `SmallBox<S8>` inline storage)
 /// - header: 32 bytes
 /// - header_len: 1 byte + 7 padding
 /// - value_ref: 24 bytes

@@ -551,9 +551,8 @@ mod loom_tests {
             let r2 = t2.join().unwrap();
 
             // At most one should succeed with slot 0
-            match (r1, r2) {
-                (Some(a), Some(b)) => assert_ne!(a, b, "both got same slot"),
-                _ => {} // One or both failed, which is fine
+            if let (Some(a), Some(b)) = (r1, r2) {
+                assert_ne!(a, b, "both got same slot");
             }
         });
     }

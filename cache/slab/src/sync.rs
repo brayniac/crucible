@@ -18,6 +18,7 @@ pub fn spin_loop() {
     std::hint::spin_loop();
 }
 
+#[allow(dead_code)]
 #[cfg(feature = "loom")]
 #[inline]
 pub fn spin_loop() {

@@ -392,7 +392,7 @@ fn run_parameterized_test(config: TestConfig) {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Use more worker threads for higher connection counts
-    let worker_threads = std::cmp::min(4, std::cmp::max(1, config.connections / 64));
+    let worker_threads = (config.connections / 64).clamp(1, 4);
 
     // Start server
     let _server_handle = start_test_server_full(
@@ -423,7 +423,6 @@ fn run_parameterized_test(config: TestConfig) {
     // Spawn connection workers
     let mut handles = Vec::new();
     for worker_id in 0..config.connections {
-        let addr = addr;
         let config = config.clone();
         let success_count = Arc::clone(&success_count);
         let running = Arc::clone(&running);

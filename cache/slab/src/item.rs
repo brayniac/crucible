@@ -674,7 +674,7 @@ mod tests {
             assert!(ttl.is_some());
             // Should be close to 3600 seconds (allow for some time passing)
             let secs = ttl.unwrap().as_secs();
-            assert!(secs >= 3590 && secs <= 3600);
+            assert!((3590..=3600).contains(&secs));
         }
     }
 }

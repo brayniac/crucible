@@ -194,7 +194,7 @@ impl MultiChoiceHashtable {
     ///
     /// Returns a bitmask where bit N is set if items[N] has a matching tag
     /// and is not empty/ghost. Scans all 8 slots using 2 × 256-bit loads.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(feature = "loom")))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::x86_64::*;
@@ -255,7 +255,7 @@ impl MultiChoiceHashtable {
     /// and is not empty/ghost. Scans all 8 slots using 4 × 128-bit loads.
     ///
     /// Compatible with Apple Silicon and AWS Graviton (ARMv8+).
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "loom")))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::aarch64::*;
@@ -365,10 +365,13 @@ impl MultiChoiceHashtable {
     ///
     /// Returns a bitmask where bit N is set if items[N] has a matching tag
     /// and is not empty/ghost. Scans all 8 slots.
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_feature = "avx2"),
-        target_arch = "aarch64"
-    )))]
+    #[cfg(any(
+        feature = "loom",
+        not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            target_arch = "aarch64"
+        ))
+    ))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;

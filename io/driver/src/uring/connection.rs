@@ -39,8 +39,8 @@ pub enum SendBuffers {
     /// Single contiguous buffer (from frag_buf freeze or owned).
     Single(Bytes),
     /// Multiple buffers for scatter-gather sends.
-    /// The iovecs and msghdr are stored inline to avoid allocation.
-    Vectored(VectoredSend),
+    /// Boxed to reduce enum size since VectoredSend is much larger than Bytes.
+    Vectored(Box<VectoredSend>),
 }
 
 /// State for a vectored (scatter-gather) send operation.
@@ -328,19 +328,13 @@ impl UringConnection {
         let total_len = vectored.total_len();
 
         self.send_slots[slot as usize] = Some(InFlightSend {
-            buffers: SendBuffers::Vectored(vectored),
+            buffers: SendBuffers::Vectored(Box::new(vectored)),
             pos: 0,
             notifs_pending: 1,
         });
         self.sends_in_flight += 1;
 
         Some((slot, msghdr_ptr, total_len))
-    }
-
-    /// Get the send slot for updating on completion.
-    #[inline]
-    pub fn get_send_slot_mut(&mut self, slot: u8) -> Option<&mut InFlightSend> {
-        self.send_slots.get_mut(slot as usize)?.as_mut()
     }
 
     /// Increment notifs_pending for a slot (e.g., for partial send continuation).
@@ -435,17 +429,5 @@ impl UringConnection {
     #[inline]
     pub fn all_sends_complete(&self) -> bool {
         self.sends_in_flight == 0 && self.frag_buf.is_empty()
-    }
-
-    /// Check if we can accept more send operations.
-    #[inline]
-    pub fn can_send(&self) -> bool {
-        self.free_slots != 0
-    }
-
-    /// Get the number of sends in flight.
-    #[inline]
-    pub fn sends_in_flight(&self) -> u32 {
-        self.sends_in_flight
     }
 }

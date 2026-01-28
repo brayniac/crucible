@@ -269,7 +269,7 @@ fn test_large_value() {
     println!(
         "Large value test: {} bytes in {} chunks",
         cmd.len(),
-        (cmd.len() + 32 * 1024 - 1) / (32 * 1024)
+        cmd.len().div_ceil(32 * 1024)
     );
 
     // Assemble and parse

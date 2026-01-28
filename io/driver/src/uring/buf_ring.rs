@@ -146,18 +146,6 @@ impl BufRing {
         self.add_buffer(buf_id);
         self.commit();
     }
-
-    /// Return multiple buffers to the ring with a single commit.
-    ///
-    /// More efficient than calling `return_buffer` multiple times as it
-    /// only performs one atomic operation.
-    #[inline]
-    pub fn return_buffers(&mut self, buf_ids: impl IntoIterator<Item = u16>) {
-        for buf_id in buf_ids {
-            self.add_buffer(buf_id);
-        }
-        self.commit();
-    }
 }
 
 impl Drop for BufRing {

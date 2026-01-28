@@ -318,7 +318,7 @@ mod tests {
         for i in 1..classes.len() {
             let ratio = classes[i] as f64 / classes[i - 1] as f64;
             assert!(
-                ratio >= 1.1 && ratio <= 1.5,
+                (1.1..=1.5).contains(&ratio),
                 "ratio {} at index {}",
                 ratio,
                 i

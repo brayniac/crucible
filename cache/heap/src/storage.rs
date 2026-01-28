@@ -317,12 +317,9 @@ mod loom_tests {
             let r2 = t2.join().unwrap();
 
             // Both should get valid slots or None, no panic
-            match (r1, r2) {
-                (Some(loc1), Some(loc2)) => {
-                    // Different slots must be allocated
-                    assert_ne!(loc1.slot_index(), loc2.slot_index());
-                }
-                _ => {} // One or both got None, which is fine
+            if let (Some(loc1), Some(loc2)) = (r1, r2) {
+                // Different slots must be allocated
+                assert_ne!(loc1.slot_index(), loc2.slot_index());
             }
         });
     }

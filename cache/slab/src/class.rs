@@ -1095,10 +1095,10 @@ mod loom_tests {
             let s2 = state.clone();
 
             // Thread 1: acquire
-            let t1 = thread::spawn(move || packed_state::try_acquire(&*s1));
+            let t1 = thread::spawn(move || packed_state::try_acquire(&s1));
 
             // Thread 2: acquire
-            let t2 = thread::spawn(move || packed_state::try_acquire(&*s2));
+            let t2 = thread::spawn(move || packed_state::try_acquire(&s2));
 
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();
@@ -1128,11 +1128,11 @@ mod loom_tests {
 
             // Thread 1: release existing ref
             let t1 = thread::spawn(move || {
-                packed_state::release(&*s1);
+                packed_state::release(&s1);
             });
 
             // Thread 2: acquire new ref
-            let t2 = thread::spawn(move || packed_state::try_acquire(&*s2));
+            let t2 = thread::spawn(move || packed_state::try_acquire(&s2));
 
             t1.join().unwrap();
             let acquired = t2.join().unwrap();
@@ -1160,13 +1160,13 @@ mod loom_tests {
             let s2 = state.clone();
 
             // Thread 1: start drain
-            let t1 = thread::spawn(move || packed_state::try_start_drain(&*s1));
+            let t1 = thread::spawn(move || packed_state::try_start_drain(&s1));
 
             // Thread 2: try to acquire
-            let t2 = thread::spawn(move || packed_state::try_acquire(&*s2));
+            let t2 = thread::spawn(move || packed_state::try_acquire(&s2));
 
             let drain_started = t1.join().unwrap();
-            let acquired = t2.join().unwrap();
+            let _acquired = t2.join().unwrap();
 
             // Drain should succeed
             assert!(drain_started, "Drain should start");
@@ -1204,13 +1204,13 @@ mod loom_tests {
             let s3 = state.clone();
 
             // Thread 1: start drain
-            let t1 = thread::spawn(move || packed_state::try_start_drain(&*s1));
+            let t1 = thread::spawn(move || packed_state::try_start_drain(&s1));
 
             // Thread 2: release
-            let t2 = thread::spawn(move || packed_state::release(&*s2));
+            let t2 = thread::spawn(move || packed_state::release(&s2));
 
             // Thread 3: release
-            let t3 = thread::spawn(move || packed_state::release(&*s3));
+            let t3 = thread::spawn(move || packed_state::release(&s3));
 
             let drain_started = t1.join().unwrap();
             t2.join().unwrap();
@@ -1225,7 +1225,7 @@ mod loom_tests {
 
             // Now try_lock should succeed
             assert!(
-                packed_state::try_lock(&*state),
+                packed_state::try_lock(&state),
                 "Lock should succeed after drain complete"
             );
         });
@@ -1244,10 +1244,10 @@ mod loom_tests {
             let s2 = state.clone();
 
             // Thread 1: try to lock (should fail - refs > 0)
-            let t1 = thread::spawn(move || packed_state::try_lock(&*s1));
+            let t1 = thread::spawn(move || packed_state::try_lock(&s1));
 
             // Thread 2: release the ref
-            let t2 = thread::spawn(move || packed_state::release(&*s2));
+            let t2 = thread::spawn(move || packed_state::release(&s2));
 
             let lock1 = t1.join().unwrap();
             t2.join().unwrap();
@@ -1284,10 +1284,10 @@ mod loom_tests {
             let s2 = state.clone();
 
             // Thread 1: abort drain
-            let t1 = thread::spawn(move || packed_state::abort_drain(&*s1));
+            let t1 = thread::spawn(move || packed_state::abort_drain(&s1));
 
             // Thread 2: release
-            let t2 = thread::spawn(move || packed_state::release(&*s2));
+            let t2 = thread::spawn(move || packed_state::release(&s2));
 
             let aborted = t1.join().unwrap();
             t2.join().unwrap();
@@ -1316,11 +1316,11 @@ mod loom_tests {
 
             // Thread 1 (reader): release ref
             let t1 = thread::spawn(move || {
-                packed_state::release(&*s1);
+                packed_state::release(&s1);
             });
 
             // Thread 2 (evictor): try to lock (may fail if release hasn't happened)
-            let t2 = thread::spawn(move || packed_state::try_lock(&*s2));
+            let t2 = thread::spawn(move || packed_state::try_lock(&s2));
 
             t1.join().unwrap();
             let lock_result = t2.join().unwrap();
@@ -1335,7 +1335,7 @@ mod loom_tests {
                 assert_eq!(final_state, SlabState::Draining);
                 assert_eq!(ref_count, 0);
                 // Second try should succeed
-                assert!(packed_state::try_lock(&*state));
+                assert!(packed_state::try_lock(&state));
             }
         });
     }
@@ -1352,8 +1352,8 @@ mod loom_tests {
             let s2 = state.clone();
 
             // Two threads try to start drain
-            let t1 = thread::spawn(move || packed_state::try_start_drain(&*s1));
-            let t2 = thread::spawn(move || packed_state::try_start_drain(&*s2));
+            let t1 = thread::spawn(move || packed_state::try_start_drain(&s1));
+            let t2 = thread::spawn(move || packed_state::try_start_drain(&s2));
 
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();

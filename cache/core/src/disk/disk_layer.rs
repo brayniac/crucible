@@ -605,7 +605,7 @@ impl Default for DiskLayerBuilder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use crate::item::ItemGuard;

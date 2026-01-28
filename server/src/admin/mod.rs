@@ -233,8 +233,6 @@ fn generate_prometheus_output() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_prometheus_name_sanitization() {
         let name = "foo.bar-baz";

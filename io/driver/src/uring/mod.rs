@@ -556,7 +556,9 @@ impl UringDriver {
             }
             OP_ZC_SENDMSG => {
                 // Zero-copy sendmsg completion from send_owned
-                let (conn_id, _generation, slab_idx, _) = decode_zc_sendmsg(user_data);
+                // Note: send_owned uses pending_zc_sends slab, NOT connection send_slots,
+                // so we must NOT call handle_send which manages send_slots.
+                let (conn_id, generation, slab_idx, _) = decode_zc_sendmsg(user_data);
 
                 // Remove and drop the PendingZcSend, releasing the BoxedZeroCopy
                 // which in turn releases the ItemRef or other held resources
@@ -564,8 +566,26 @@ impl UringDriver {
                     let _ = self.pending_zc_sends.remove(slab_idx);
                 }
 
-                // Emit completion notification
-                self.handle_send(conn_id, slab_idx, result, flags);
+                // Emit completion - check connection still exists and isn't closing
+                if let Some(conn) = self.connections.get(conn_id) {
+                    if conn.generation == generation && !conn.closing {
+                        let full_conn_id = ConnId::with_generation(conn_id, generation);
+                        if result > 0 {
+                            self.pending_completions.push(Completion::new(
+                                CompletionKind::SendReady {
+                                    conn_id: full_conn_id,
+                                },
+                            ));
+                        } else if result < 0 {
+                            self.pending_completions
+                                .push(Completion::new(CompletionKind::Error {
+                                    conn_id: full_conn_id,
+                                    error: io::Error::from_raw_os_error(-result),
+                                }));
+                        }
+                        // result == 0 means connection closed, handled by recv path
+                    }
+                }
             }
             OP_DIRECT_RECV => {
                 // Zero-copy recv directly into user memory (e.g., segment)
