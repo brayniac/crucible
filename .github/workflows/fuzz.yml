@@ -1,64 +1,51 @@
 name: Fuzz Testing
 
 on:
-  # Run nightly at 2 AM UTC
-  schedule:
-    - cron: '0 2 * * *'
-  # Allow manual triggering
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual triggering with custom settings
   workflow_dispatch:
     inputs:
       duration:
         description: 'Duration per target (seconds)'
         required: false
-        default: '300'
+        default: '60'
       jobs:
         description: 'Parallel fuzz jobs'
         required: false
-        default: '16'
+        default: '2'
 
 env:
   CARGO_TERM_COLOR: always
-  # Default duration for scheduled runs (5 minutes per target)
-  DEFAULT_DURATION: 300
-  DEFAULT_JOBS: 16
+  # Default duration for scheduled runs (60 seconds per target)
+  DEFAULT_DURATION: 60
+  DEFAULT_JOBS: 2
 
 jobs:
   fuzz:
-    runs-on: self-hosted
-    timeout-minutes: 720  # 12 hours max
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust
-        run: |
-          source ~/.cargo/env
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
 
-          # Ensure nightly is installed
-          rustup install nightly
-          rustup default nightly
-
-          # Show versions
-          rustc --version
-          cargo --version
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-fuzz
-        run: |
-          source ~/.cargo/env
-          cargo install cargo-fuzz --locked || true
-          cargo fuzz --version
+        run: cargo install cargo-fuzz --locked
 
       - name: Build xtask
-        run: |
-          source ~/.cargo/env
-          cargo build -p xtask --release
+        run: cargo build -p xtask --release
 
       - name: Discover fuzz targets
         id: discover
         run: |
-          source ~/.cargo/env
-
           # List all fuzz targets for visibility
           echo "Discovered fuzz targets:"
           find . -path '*/fuzz/fuzz_targets/*.rs' -type f | \
@@ -73,8 +60,6 @@ jobs:
 
       - name: Run fuzz tests
         run: |
-          source ~/.cargo/env
-
           # Use workflow inputs if provided, otherwise defaults
           DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
           JOBS="${{ github.event.inputs.jobs || env.DEFAULT_JOBS }}"
@@ -88,19 +73,18 @@ jobs:
             --duration "$DURATION" \
             --jobs "$JOBS"
 
-      - name: Minimize and collect crash artifacts
+      - name: Collect crash artifacts
         if: failure()
         run: |
-          source ~/.cargo/env
-
-          echo "Collecting and minimizing crash artifacts..."
+          echo "Collecting crash artifacts..."
           mkdir -p crash-artifacts
 
           # Find all fuzz directories with crash artifacts
-          for fuzz_dir in $(find . -type d -path '*/fuzz' -exec test -d {}/artifacts \; -print); do
+          for fuzz_dir in $(find . -type d -path '*/fuzz' -exec test -d {}/artifacts \; -print 2>/dev/null || true); do
             echo "Processing $fuzz_dir..."
 
             for artifact_dir in "$fuzz_dir"/artifacts/*/; do
+              [ -d "$artifact_dir" ] || continue
               target_name=$(basename "$artifact_dir")
 
               for crash_file in "$artifact_dir"crash-* "$artifact_dir"oom-* "$artifact_dir"timeout-*; do
@@ -112,20 +96,6 @@ jobs:
                 # Copy original
                 mkdir -p "crash-artifacts/$target_name"
                 cp "$crash_file" "crash-artifacts/$target_name/$crash_name"
-
-                # Try to minimize (with timeout)
-                echo "  Minimizing $crash_name..."
-                cd "$fuzz_dir"
-                timeout 60 cargo +nightly fuzz tmin "$target_name" "artifacts/$target_name/$crash_name" \
-                  -- -max_total_time=30 2>/dev/null || true
-
-                # Check if minimized version exists
-                if [ -f "artifacts/$target_name/${crash_name}-minimized" ]; then
-                  cp "artifacts/$target_name/${crash_name}-minimized" \
-                     "$GITHUB_WORKSPACE/crash-artifacts/$target_name/${crash_name}-minimized"
-                  echo "  Minimized to: ${crash_name}-minimized"
-                fi
-                cd "$GITHUB_WORKSPACE"
               done
             done
           done
@@ -143,7 +113,7 @@ jobs:
 
           echo ""
           echo "Total crash artifacts:"
-          find crash-artifacts -type f | wc -l
+          find crash-artifacts -type f 2>/dev/null | wc -l || echo "0"
 
       - name: Upload crash artifacts
         if: failure()

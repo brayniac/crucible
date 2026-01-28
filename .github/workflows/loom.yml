@@ -1,10 +1,11 @@
 name: Loom Concurrency Testing
 
 on:
-  # Run nightly at 3 AM UTC (after fuzz tests)
-  schedule:
-    - cron: '0 3 * * *'
-  # Allow manual triggering
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual triggering with custom settings
   workflow_dispatch:
     inputs:
       max_preemptions:
@@ -19,39 +20,27 @@ env:
 
 jobs:
   loom:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 120  # 2 hours max
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust
-        run: |
-          source ~/.cargo/env
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-          # Use stable for loom tests
-          rustup default stable
-          rustup update stable
-
-          # Show versions
-          rustc --version
-          cargo --version
+      - uses: Swatinem/rust-cache@v2
 
       - name: Run loom tests
         env:
           LOOM_MAX_PREEMPTIONS: ${{ github.event.inputs.max_preemptions || env.DEFAULT_MAX_PREEMPTIONS }}
         run: |
-          source ~/.cargo/env
-
           echo "Running loom concurrency tests:"
           echo "  Max preemptions: $LOOM_MAX_PREEMPTIONS"
           echo ""
 
-          # Run loom tests for cache-core (17 tests across 3 modules)
-          # - arc_cache: 6 tests (slot storage, free list, reader counting)
-          # - hashtable_impl: 6 tests (concurrent insert, lookup, CAS)
-          # - slice_segment: 5 tests (state transitions, ref counting, write offset)
+          # Run loom tests for cache-core
           cargo test -p cache-core --features loom --release -- --nocapture
 
       - name: Summary
