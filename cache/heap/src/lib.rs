@@ -378,7 +378,8 @@ impl HeapCache {
     }
 
     /// Read RSS from /proc/self/statm on Linux.
-    #[cfg(target_os = "linux")]
+    /// Only used when jemalloc is not available.
+    #[cfg(all(target_os = "linux", not(feature = "jemalloc")))]
     fn read_proc_statm_rss() -> Option<usize> {
         use std::fs;
         let statm = fs::read_to_string("/proc/self/statm").ok()?;
