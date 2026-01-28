@@ -28,9 +28,6 @@ members = [
 	# Development Tasks
 	"xtask",
 
-	# Experiment Driver
-	"crates/bakeoff",
-
 	# Metrics
 	"metrics",
 
