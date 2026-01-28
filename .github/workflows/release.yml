@@ -248,14 +248,14 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Install repository tools
         run: sudo apt-get update && sudo apt-get install -y apt-utils createrepo-c
 
       - name: Publish to S3 APT repository
         env:
-          S3_BUCKET: ${{ vars.S3_BUCKET_APT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET_APT }}
           GPG_KEY_ID: ${{ env.GPG_KEY_ID }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
@@ -264,7 +264,7 @@ jobs:
 
       - name: Publish to S3 YUM repository
         env:
-          S3_BUCKET: ${{ vars.S3_BUCKET_YUM }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET_YUM }}
           GPG_KEY_ID: ${{ env.GPG_KEY_ID }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
@@ -273,14 +273,14 @@ jobs:
 
       - name: Invalidate CloudFront caches
         run: |
-          if [ -n "${{ vars.CLOUDFRONT_DISTRIBUTION_ID_APT }}" ]; then
+          if [ -n "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_APT }}" ]; then
             aws cloudfront create-invalidation \
-              --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_APT }} \
+              --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_APT }} \
               --paths "/*"
           fi
-          if [ -n "${{ vars.CLOUDFRONT_DISTRIBUTION_ID_YUM }}" ]; then
+          if [ -n "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_YUM }}" ]; then
             aws cloudfront create-invalidation \
-              --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_YUM }} \
+              --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_YUM }} \
               --paths "/*"
           fi
 
