@@ -60,9 +60,33 @@ See [docs/design.md](docs/design.md#development-philosophy) for our full philoso
 
 ## Requirements
 
-- **Rust**: 1.85+ (Edition 2024)
 - **Linux**: Kernel 6.0+ for full io_uring features (falls back to mio on older kernels)
 - **macOS**: Supported via mio backend
+- **Rust**: 1.85+ (Edition 2024) - only required for building from source
+
+## Installation
+
+Pre-built packages are available for Debian/Ubuntu and RHEL/CentOS/Fedora:
+
+```bash
+# Debian/Ubuntu
+curl -fsSL https://apt.thermitesolutions.com/gpg-key.asc | sudo gpg --dearmor -o /usr/share/keyrings/crucible-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/crucible-archive-keyring.gpg] https://apt.thermitesolutions.com stable main" | sudo tee /etc/apt/sources.list.d/crucible.list
+sudo apt update && sudo apt install crucible-server crucible-benchmark
+
+# RHEL/CentOS/Fedora
+sudo tee /etc/yum.repos.d/crucible.repo << 'EOF'
+[crucible]
+name=Crucible Repository
+baseurl=https://yum.thermitesolutions.com
+enabled=1
+gpgcheck=1
+gpgkey=https://yum.thermitesolutions.com/gpg-key.asc
+EOF
+sudo dnf install crucible-server crucible-benchmark
+```
+
+See [docs/INSTALL.md](docs/INSTALL.md) for detailed installation instructions.
 
 ## Quick Start
 

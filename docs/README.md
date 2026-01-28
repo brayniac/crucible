@@ -4,23 +4,24 @@ Welcome to the Crucible documentation. Crucible is a high-performance cache serv
 
 ## Getting Started
 
-1. **[Quick Start](../README.md)** - Build and run Crucible in 5 minutes
-2. **[Configuration](configuration.md)** - Server and benchmark configuration reference
-3. **[Operations](operations.md)** - Running in production, performance tuning
+1. **[Installation](INSTALL.md)** - Install from APT/YUM repositories or build from source
+2. **[Quick Start](../README.md)** - Build and run Crucible in 5 minutes
+3. **[Configuration](configuration.md)** - Server and benchmark configuration reference
+4. **[Operations](operations.md)** - Running in production, performance tuning
 
 ## Understanding Crucible
 
-4. **[Design Philosophy](design.md)** - Why we built things the way we did
-5. **[Architecture](architecture.md)** - How the components fit together
+5. **[Design Philosophy](design.md)** - Why we built things the way we did
+6. **[Architecture](architecture.md)** - How the components fit together
 
 ## Development
 
-6. **[Development Guide](development.md)** - Testing, profiling, and contributing
+7. **[Development Guide](development.md)** - Testing, profiling, and contributing
 
 ## Deep Dives
 
-7. **[I/O Driver Architecture](../io/driver/ARCHITECTURE.md)** - Buffer management and copy semantics
-8. **[Benchmark Guide](../benchmark/README.md)** - Load testing and performance measurement
+8. **[I/O Driver Architecture](../io/driver/ARCHITECTURE.md)** - Buffer management and copy semantics
+9. **[Benchmark Guide](../benchmark/README.md)** - Load testing and performance measurement
 
 ## Quick Reference
 
