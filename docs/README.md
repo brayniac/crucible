@@ -13,10 +13,14 @@ Welcome to the Crucible documentation. Crucible is a high-performance cache serv
 4. **[Design Philosophy](design.md)** - Why we built things the way we did
 5. **[Architecture](architecture.md)** - How the components fit together
 
+## Development
+
+6. **[Development Guide](development.md)** - Testing, profiling, and contributing
+
 ## Deep Dives
 
-6. **[I/O Driver Architecture](../io/driver/ARCHITECTURE.md)** - Buffer management and copy semantics
-7. **[Benchmark Guide](../benchmark/README.md)** - Load testing and performance measurement
+7. **[I/O Driver Architecture](../io/driver/ARCHITECTURE.md)** - Buffer management and copy semantics
+8. **[Benchmark Guide](../benchmark/README.md)** - Load testing and performance measurement
 
 ## Quick Reference
 
@@ -39,13 +43,12 @@ Welcome to the Crucible documentation. Crucible is a high-performance cache serv
 # Run benchmark
 ./target/release/crucible-benchmark benchmark/config/redis.toml
 
-# Override settings
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --threads 4 --connections 32 --rate 100000
-
 # Output to parquet
 ./target/release/crucible-benchmark benchmark/config/redis.toml \
     --parquet results.parquet
+
+# View results in web dashboard
+./target/release/crucible-benchmark view results.parquet
 ```
 
 ### Supported Protocols

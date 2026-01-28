@@ -44,6 +44,20 @@ Crucible is built for **latency-sensitive deployments where microseconds matter*
 
 See [docs/design.md](docs/design.md) for detailed rationale.
 
+## Development Approach
+
+Crucible was developed using AI-assisted coding, guided by years of experience building high-performance cache systems. The architectural decisions come from domain expertise; AI accelerated the implementation.
+
+We pair rapid development with rigorous verification for both correctness and performance:
+
+- **Rust's compiler** catches memory safety and data race bugs at compile time
+- **Fuzz testing** on all protocol parsers and data encoding
+- **Loom testing** for exhaustive concurrency verification of lock-free structures
+- **Benchmarking and profiling** to validate performance and identify bottlenecks
+- **Validation mode** with runtime assertions for development builds
+
+See [docs/design.md](docs/design.md#development-philosophy) for our full philosophy on AI-assisted development.
+
 ## Requirements
 
 - **Rust**: 1.85+ (Edition 2024)
@@ -333,6 +347,7 @@ For best performance on Linux:
 - [Architecture](docs/architecture.md) - Component details and data flow
 - [Configuration Reference](docs/configuration.md) - Complete config options
 - [Operations Guide](docs/operations.md) - Production deployment and tuning
+- [Development Guide](docs/development.md) - Testing, profiling, and contributing
 - [I/O Driver Architecture](io/driver/ARCHITECTURE.md) - Buffer management and copy semantics
 - [Benchmark Guide](benchmark/README.md) - Load testing and performance measurement
 

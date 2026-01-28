@@ -395,3 +395,60 @@ The benchmark tool uses the same principles as the server:
 This ensures benchmark results reflect actual server performance, not measurement overhead.
 
 **Note:** The benchmark tool only supports the native io-driver, not Tokio. This was a deliberate choice to minimize measurement artifacts, but it does mean you can't directly compare "Tokio benchmark vs native benchmark" scenarios. For comparing server runtimes, use the same benchmark binary against both `runtime = "native"` and `runtime = "tokio"` server configurations.
+
+## Development Philosophy
+
+### AI-Assisted Development
+
+Crucible was developed using AI-assisted coding, guided by years of experience building high-performance cache systems. The architectural decisions in this document come from domain expertise; AI accelerated the implementation.
+
+We believe in transparency about this because it affects how you should think about the codebase:
+
+- **Domain-driven design**: Architecture based on experience with production cache systems
+- **Rapid iteration**: AI assistance enabled exploring implementation alternatives quickly
+- **Consistent patterns**: Code follows consistent idioms across the codebase
+- **Documentation**: Much of the documentation was AI-generated and human-reviewed
+
+We don't view AI assistance as a shortcut—it's a tool that requires careful oversight. The key is pairing rapid development with rigorous verification for both correctness and performance.
+
+### Why Rust
+
+Rust wasn't chosen for performance alone (though that matters for a cache server). It was chosen because the compiler catches entire classes of bugs at compile time:
+
+- **Memory safety**: No use-after-free, double-free, or buffer overflows
+- **Data race prevention**: The type system prevents concurrent mutable access
+- **Null safety**: `Option<T>` forces explicit handling of missing values
+- **Error handling**: `Result<T, E>` makes error paths visible and explicit
+
+For a systems project developed with AI assistance, these guarantees are invaluable. The compiler acts as a second reviewer, catching mistakes that might slip through in C or C++.
+
+### Testing Strategy
+
+We compensate for rapid development with multiple layers of testing:
+
+**Unit and Integration Tests**
+- Standard `cargo test` coverage across all crates
+- Integration tests that spin up real server instances
+
+**Fuzz Testing**
+- Protocol parsers (RESP, Memcache, HTTP/2, gRPC) are fuzz tested
+- Cache header encoding/decoding is fuzz tested
+- Helps find edge cases in parsing untrusted input
+
+**Loom Concurrency Testing**
+- The lock-free hashtable and cache layers use [loom](https://github.com/tokio-rs/loom)
+- Loom exhaustively explores thread interleavings
+- Catches subtle race conditions that random testing might miss
+
+**Validation Mode**
+- Debug builds can enable `validation` feature
+- Adds runtime assertions, magic bytes, and checksums
+- Catches corruption issues during development
+
+**Benchmarking and Profiling**
+- The benchmark tool uses the same io-driver as the server for accurate measurements
+- Flamegraph generation identifies hot paths and optimization opportunities
+- Performance regressions are caught by comparing benchmark runs
+- Profiling guided decisions like buffer sizes, batch depths, and data structure choices
+
+See [development.md](development.md) for instructions on running these tests.
