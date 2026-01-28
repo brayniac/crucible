@@ -215,6 +215,7 @@ mod tests {
         let mut pool = RecvBufferPool::new(1, 64);
 
         let (id, ptr, len) = pool.alloc(1, 1).unwrap();
+        assert_eq!(len, 64); // Verify we got the expected buffer size
 
         // Write to buffer through raw pointer (simulating kernel write)
         unsafe {
