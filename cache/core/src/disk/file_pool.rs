@@ -109,7 +109,7 @@ impl FilePoolHeader {
 
 /// A pool of segments backed by a memory-mapped file.
 ///
-/// FilePool provides the same interface as [`MemoryPool`] but stores
+/// FilePool provides the same interface as [`crate::MemoryPool`] but stores
 /// segments in a file on disk. This enables cache sizes larger than
 /// available RAM.
 ///

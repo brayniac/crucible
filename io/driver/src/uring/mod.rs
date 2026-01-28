@@ -573,11 +573,10 @@ impl UringDriver {
                 {
                     let full_conn_id = ConnId::with_generation(conn_id, generation);
                     if result > 0 {
-                        self.pending_completions.push(Completion::new(
-                            CompletionKind::SendReady {
+                        self.pending_completions
+                            .push(Completion::new(CompletionKind::SendReady {
                                 conn_id: full_conn_id,
-                            },
-                        ));
+                            }));
                     } else if result < 0 {
                         self.pending_completions
                             .push(Completion::new(CompletionKind::Error {

@@ -658,7 +658,7 @@ impl<H: Hashtable> TieredCache<H> {
 
     /// Get a zero-copy reference to a cached value.
     ///
-    /// Returns a [`ValueRef`] that holds a reference to the value directly
+    /// Returns a [`crate::ValueRef`] that holds a reference to the value directly
     /// in cache memory. The segment's ref_count is incremented to prevent
     /// eviction while the reference is held.
     ///

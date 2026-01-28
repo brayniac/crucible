@@ -15,7 +15,7 @@ use std::ops::{Deref, DerefMut};
 /// # Variants
 ///
 /// - `User`: Standard user-allocated buffer (owned Vec)
-/// - `Pooled`: Buffer from a [`BufferPool`] - must be returned via pool ID
+/// - `Pooled`: Buffer from a [`crate::BufferPool`] - must be returned via pool ID
 /// - `Provided`: Buffer from io_uring provided ring - kernel-selected
 /// - `Registered`: Reference to pre-registered fixed buffer (zero-copy send)
 ///
