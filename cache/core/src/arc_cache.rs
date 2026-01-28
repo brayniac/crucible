@@ -342,13 +342,28 @@ impl<K, V> Drop for Slot<K, V> {
 /// For extreme throughput, consider sharding into multiple free lists.
 struct SlotStorage<K, V> {
     slots: Vec<Slot<K, V>>,
-    /// Head of the free list. Stores slot index, or EMPTY_FREE_LIST if empty.
-    free_head: AtomicU32,
+    /// Head of the free list. Stores (version, index) packed into u64.
+    /// The version counter prevents ABA problems in the lock-free stack.
+    free_head: AtomicU64,
     /// Number of currently occupied slots (for eviction sampling).
     occupied_count: AtomicU32,
 }
 
 const EMPTY_FREE_LIST: u32 = u32::MAX;
+
+/// Pack a version and index into a single u64 for ABA-safe CAS operations.
+#[inline]
+fn pack_free_head(version: u32, index: u32) -> u64 {
+    ((version as u64) << 32) | (index as u64)
+}
+
+/// Unpack a u64 into (version, index).
+#[inline]
+fn unpack_free_head(packed: u64) -> (u32, u32) {
+    let version = (packed >> 32) as u32;
+    let index = packed as u32;
+    (version, index)
+}
 
 impl<K, V> SlotStorage<K, V> {
     fn new(capacity: usize) -> Self {
@@ -374,7 +389,7 @@ impl<K, V> SlotStorage<K, V> {
 
         Self {
             slots,
-            free_head: AtomicU32::new(0),
+            free_head: AtomicU64::new(pack_free_head(0, 0)),
             occupied_count: AtomicU32::new(0),
         }
     }
@@ -385,10 +400,13 @@ impl<K, V> SlotStorage<K, V> {
     ///
     /// # Thread Safety
     ///
-    /// Uses compare-and-swap on the free list head. May retry under contention.
+    /// Uses compare-and-swap on the free list head with a version counter
+    /// to prevent ABA problems.
     fn allocate(&self) -> Option<SlotLocation> {
         loop {
-            let head = self.free_head.load(Ordering::Acquire);
+            let packed = self.free_head.load(Ordering::Acquire);
+            let (version, head) = unpack_free_head(packed);
+
             if head == EMPTY_FREE_LIST {
                 return None; // No free slots
             }
@@ -396,10 +414,13 @@ impl<K, V> SlotStorage<K, V> {
             let slot = &self.slots[head as usize];
             let next = slot.get_next_free();
 
+            // Pack the new head with incremented version to prevent ABA
+            let new_packed = pack_free_head(version.wrapping_add(1), next);
+
             // Try to CAS the head to the next free slot
             match self.free_head.compare_exchange_weak(
-                head,
-                next,
+                packed,
+                new_packed,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -423,7 +444,8 @@ impl<K, V> SlotStorage<K, V> {
     ///
     /// # Thread Safety
     ///
-    /// Clears the slot (waiting for readers) then pushes to the free list.
+    /// Clears the slot (waiting for readers) then pushes to the free list
+    /// using versioned CAS to prevent ABA problems.
     fn deallocate(&self, loc: SlotLocation) {
         let idx = loc.slot_index();
         if idx as usize >= self.slots.len() {
@@ -440,12 +462,17 @@ impl<K, V> SlotStorage<K, V> {
 
         // Push onto free list (lock-free stack push)
         loop {
-            let head = self.free_head.load(Ordering::Acquire);
+            let packed = self.free_head.load(Ordering::Acquire);
+            let (version, head) = unpack_free_head(packed);
+
             slot.set_next_free(head);
 
+            // Pack new head with incremented version to prevent ABA
+            let new_packed = pack_free_head(version.wrapping_add(1), idx);
+
             match self.free_head.compare_exchange_weak(
-                head,
-                idx,
+                packed,
+                new_packed,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -1350,6 +1377,227 @@ mod loom_tests {
             assert!(r1.is_some() || r2.is_some());
             if let (Some(v1), Some(v2)) = (r1, r2) {
                 assert_ne!(v1, v2);
+            }
+        });
+    }
+
+    /// Test three-way allocation contention.
+    ///
+    /// Three threads compete to allocate from a pool with 3 slots.
+    /// This tests CAS retry loops under higher contention.
+    ///
+    /// Uses bounded preemption to keep state space tractable.
+    #[test]
+    fn test_three_way_allocation_contention() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let storage: LoomArc<SlotStorage<Vec<u8>, u32>> = LoomArc::new(SlotStorage::new(3));
+
+            let storage1 = storage.clone();
+            let storage2 = storage.clone();
+            let storage3 = storage.clone();
+
+            let t1 = thread::spawn(move || storage1.allocate());
+            let t2 = thread::spawn(move || storage2.allocate());
+            let t3 = thread::spawn(move || storage3.allocate());
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+            let r3 = t3.join().unwrap();
+
+            // All three should succeed (we have 3 slots)
+            assert!(r1.is_some(), "First allocation should succeed");
+            assert!(r2.is_some(), "Second allocation should succeed");
+            assert!(r3.is_some(), "Third allocation should succeed");
+
+            // All should be different slots
+            let slots: Vec<_> = [r1, r2, r3]
+                .into_iter()
+                .map(|r| r.unwrap().slot_index())
+                .collect();
+            assert_ne!(slots[0], slots[1]);
+            assert_ne!(slots[0], slots[2]);
+            assert_ne!(slots[1], slots[2]);
+        });
+    }
+
+    /// Test three-way allocate/deallocate cycling.
+    ///
+    /// Three threads each allocate and deallocate, testing the free list
+    /// under sustained contention from multiple actors.
+    ///
+    /// Uses bounded preemption to keep state space tractable.
+    #[test]
+    fn test_three_way_allocate_deallocate_cycle() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let storage: LoomArc<SlotStorage<Vec<u8>, u32>> = LoomArc::new(SlotStorage::new(2));
+
+            let storage1 = storage.clone();
+            let storage2 = storage.clone();
+            let storage3 = storage.clone();
+
+            let t1 = thread::spawn(move || {
+                if let Some(loc) = storage1.allocate() {
+                    storage1.deallocate(loc);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            let t2 = thread::spawn(move || {
+                if let Some(loc) = storage2.allocate() {
+                    storage2.deallocate(loc);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            let t3 = thread::spawn(move || {
+                if let Some(loc) = storage3.allocate() {
+                    storage3.deallocate(loc);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            let _ = t1.join().unwrap();
+            let _ = t2.join().unwrap();
+            let _ = t3.join().unwrap();
+
+            // After all complete, both slots should be available
+            // (Fixed by using versioned pointer in free_head to prevent ABA)
+            let loc1 = storage.allocate();
+            let loc2 = storage.allocate();
+            assert!(loc1.is_some(), "First slot should be available");
+            assert!(loc2.is_some(), "Second slot should be available");
+        });
+    }
+
+    /// Test two readers and one writer pattern.
+    ///
+    /// Two readers increment/decrement reader count while a writer
+    /// waits for readers to clear. This is the core pattern for safe
+    /// slot clearing.
+    ///
+    /// Uses bounded preemption to keep state space tractable.
+    #[test]
+    fn test_two_readers_one_writer() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let readers = LoomArc::new(AtomicU32::new(0));
+            let cleared = LoomArc::new(AtomicU32::new(0));
+
+            let readers1 = readers.clone();
+            let cleared1 = cleared.clone();
+            let readers2 = readers.clone();
+            let cleared2 = cleared.clone();
+            let readers3 = readers.clone();
+            let cleared3 = cleared.clone();
+
+            // Reader 1
+            let t1 = thread::spawn(move || {
+                readers1.fetch_add(1, Ordering::Acquire);
+                let saw_cleared = cleared1.load(Ordering::Acquire) > 0;
+                readers1.fetch_sub(1, Ordering::Release);
+                saw_cleared
+            });
+
+            // Reader 2
+            let t2 = thread::spawn(move || {
+                readers2.fetch_add(1, Ordering::Acquire);
+                let saw_cleared = cleared2.load(Ordering::Acquire) > 0;
+                readers2.fetch_sub(1, Ordering::Release);
+                saw_cleared
+            });
+
+            // Writer - sets cleared flag and waits for readers
+            let t3 = thread::spawn(move || {
+                cleared3.store(1, Ordering::Release);
+                while readers3.load(Ordering::Acquire) > 0 {
+                    loom::thread::yield_now();
+                }
+            });
+
+            let _ = t1.join().unwrap();
+            let _ = t2.join().unwrap();
+            t3.join().unwrap();
+
+            // After writer completes, all readers must have finished
+            assert_eq!(readers.load(Ordering::Acquire), 0);
+        });
+    }
+
+    /// Test three-way free list CAS contention.
+    ///
+    /// Three threads try to pop from a lock-free stack simultaneously.
+    ///
+    /// Uses bounded preemption to keep state space tractable.
+    #[test]
+    fn test_three_way_free_list_cas() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let head = LoomArc::new(AtomicU32::new(0));
+            // 4 slots: 0 -> 1 -> 2 -> 3 -> EMPTY
+            let next_ptrs = LoomArc::new([
+                AtomicU32::new(1),
+                AtomicU32::new(2),
+                AtomicU32::new(3),
+                AtomicU32::new(u32::MAX),
+            ]);
+
+            let try_pop = |head: &AtomicU32, next: &[AtomicU32; 4]| -> Option<u32> {
+                let current = head.load(Ordering::Acquire);
+                if current == u32::MAX {
+                    return None;
+                }
+                let next_val = next[current as usize].load(Ordering::Acquire);
+                if head
+                    .compare_exchange(current, next_val, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    Some(current)
+                } else {
+                    None
+                }
+            };
+
+            let head1 = head.clone();
+            let next1 = next_ptrs.clone();
+            let head2 = head.clone();
+            let next2 = next_ptrs.clone();
+            let head3 = head.clone();
+            let next3 = next_ptrs.clone();
+
+            let t1 = thread::spawn(move || try_pop(&head1, &next1));
+            let t2 = thread::spawn(move || try_pop(&head2, &next2));
+            let t3 = thread::spawn(move || try_pop(&head3, &next3));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+            let r3 = t3.join().unwrap();
+
+            // Collect successful pops
+            let successes: Vec<_> = [r1, r2, r3].into_iter().flatten().collect();
+
+            // At least one should succeed
+            assert!(!successes.is_empty(), "At least one pop should succeed");
+
+            // All successful pops should have different values
+            for i in 0..successes.len() {
+                for j in (i + 1)..successes.len() {
+                    assert_ne!(
+                        successes[i], successes[j],
+                        "No two threads should pop the same slot"
+                    );
+                }
             }
         });
     }
