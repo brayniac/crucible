@@ -3,153 +3,188 @@ name: Fuzz Testing
 on:
   push:
     branches: [main]
-    paths:
-      - 'cache/core/**'
-      - 'protocol/**'
-      - 'io/grpc/**'
-      - 'io/http2/**'
-      - '.github/workflows/fuzz.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'cache/core/**'
-      - 'protocol/**'
-      - 'io/grpc/**'
-      - 'io/http2/**'
-      - '.github/workflows/fuzz.yml'
-  # Allow manual triggering with custom settings
   workflow_dispatch:
     inputs:
       duration:
         description: 'Duration per target (seconds)'
         required: false
         default: '60'
-      jobs:
-        description: 'Parallel fuzz jobs'
-        required: false
-        default: '2'
 
 env:
   CARGO_TERM_COLOR: always
-  # Default duration for scheduled runs (60 seconds per target)
   DEFAULT_DURATION: 60
-  DEFAULT_JOBS: 2
 
 jobs:
-  fuzz:
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours max
-
+    outputs:
+      cache-core: ${{ steps.filter.outputs.cache-core }}
+      protocol-resp: ${{ steps.filter.outputs.protocol-resp }}
+      protocol-memcache: ${{ steps.filter.outputs.protocol-memcache }}
+      protocol-momento: ${{ steps.filter.outputs.protocol-momento }}
+      protocol-ping: ${{ steps.filter.outputs.protocol-ping }}
+      io-grpc: ${{ steps.filter.outputs.io-grpc }}
+      io-http2: ${{ steps.filter.outputs.io-http2 }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-
-      - name: Build xtask
-        run: cargo build -p xtask --release
-
-      - name: Discover fuzz targets
-        id: discover
-        run: |
-          # List all fuzz targets for visibility
-          echo "Discovered fuzz targets:"
-          find . -path '*/fuzz/fuzz_targets/*.rs' -type f | \
-            sed 's|.*/fuzz/fuzz_targets/||; s|\.rs$||' | \
-            sort | \
-            while read target; do echo "  - $target"; done
-
-          # Count targets
-          TARGET_COUNT=$(find . -path '*/fuzz/fuzz_targets/*.rs' -type f | wc -l)
-          echo "Total: $TARGET_COUNT targets"
-          echo "target_count=$TARGET_COUNT" >> $GITHUB_OUTPUT
-
-      - name: Run fuzz tests
-        run: |
-          # Use workflow inputs if provided, otherwise defaults
-          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
-          JOBS="${{ github.event.inputs.jobs || env.DEFAULT_JOBS }}"
-
-          echo "Running fuzz tests:"
-          echo "  Duration per target: ${DURATION}s"
-          echo "  Parallel jobs: ${JOBS}"
-          echo ""
-
-          ./target/release/xtask fuzz-all \
-            --duration "$DURATION" \
-            --jobs "$JOBS"
-
-      - name: Collect crash artifacts
-        if: failure()
-        run: |
-          echo "Collecting crash artifacts..."
-          mkdir -p crash-artifacts
-
-          # Find all fuzz directories with crash artifacts
-          for fuzz_dir in $(find . -type d -path '*/fuzz' -exec test -d {}/artifacts \; -print 2>/dev/null || true); do
-            echo "Processing $fuzz_dir..."
-
-            for artifact_dir in "$fuzz_dir"/artifacts/*/; do
-              [ -d "$artifact_dir" ] || continue
-              target_name=$(basename "$artifact_dir")
-
-              for crash_file in "$artifact_dir"crash-* "$artifact_dir"oom-* "$artifact_dir"timeout-*; do
-                [ -f "$crash_file" ] || continue
-
-                crash_name=$(basename "$crash_file")
-                echo "  Found: $target_name/$crash_name"
-
-                # Copy original
-                mkdir -p "crash-artifacts/$target_name"
-                cp "$crash_file" "crash-artifacts/$target_name/$crash_name"
-              done
-            done
-          done
-
-          # Show hex dump of crash inputs for quick analysis
-          echo ""
-          echo "=== Crash Input Analysis ==="
-          for f in crash-artifacts/*/*; do
-            [ -f "$f" ] || continue
-            echo ""
-            echo "--- $f ---"
-            xxd "$f" | head -20
-            echo "Size: $(wc -c < "$f") bytes"
-          done
-
-          echo ""
-          echo "Total crash artifacts:"
-          find crash-artifacts -type f 2>/dev/null | wc -l || echo "0"
-
-      - name: Upload crash artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
         with:
-          name: fuzz-crash-artifacts-${{ github.run_id }}
-          path: crash-artifacts/
-          retention-days: 30
-          if-no-files-found: ignore
+          filters: |
+            cache-core:
+              - 'cache/core/**'
+            protocol-resp:
+              - 'protocol/resp/**'
+            protocol-memcache:
+              - 'protocol/memcache/**'
+            protocol-momento:
+              - 'protocol/momento/**'
+            protocol-ping:
+              - 'protocol/ping/**'
+            io-grpc:
+              - 'io/grpc/**'
+            io-http2:
+              - 'io/http2/**'
 
-      - name: Summary
-        if: always()
+  fuzz-cache-core:
+    name: Fuzz cache-core
+    needs: changes
+    if: needs.changes.outputs.cache-core == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzz tests
+        working-directory: cache/core/fuzz
         run: |
-          echo "## Fuzz Testing Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
+          for target in fuzz_basic_header fuzz_ttl_header; do
+            echo "Fuzzing $target for ${DURATION}s..."
+            cargo +nightly fuzz run $target -- -max_total_time=$DURATION
+          done
 
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "All fuzz targets passed." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Some fuzz targets failed. Check artifacts for crash details." >> $GITHUB_STEP_SUMMARY
-          fi
+  fuzz-protocol-resp:
+    name: Fuzz protocol-resp
+    needs: changes
+    if: needs.changes.outputs.protocol-resp == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzz tests
+        working-directory: protocol/resp/fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
+          for target in fuzz_value_parse fuzz_command_parse; do
+            echo "Fuzzing $target for ${DURATION}s..."
+            cargo +nightly fuzz run $target -- -max_total_time=$DURATION
+          done
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Duration per target: ${{ github.event.inputs.duration || env.DEFAULT_DURATION }}s" >> $GITHUB_STEP_SUMMARY
-          echo "- Parallel jobs: ${{ github.event.inputs.jobs || env.DEFAULT_JOBS }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Targets: ${{ steps.discover.outputs.target_count }}" >> $GITHUB_STEP_SUMMARY
+  fuzz-protocol-memcache:
+    name: Fuzz protocol-memcache
+    needs: changes
+    if: needs.changes.outputs.protocol-memcache == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzz tests
+        working-directory: protocol/memcache/fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
+          for target in fuzz_ascii_command fuzz_ascii_response fuzz_binary_command fuzz_binary_response; do
+            echo "Fuzzing $target for ${DURATION}s..."
+            cargo +nightly fuzz run $target -- -max_total_time=$DURATION
+          done
+
+  fuzz-protocol-momento:
+    name: Fuzz protocol-momento
+    needs: changes
+    if: needs.changes.outputs.protocol-momento == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzz tests
+        working-directory: protocol/momento/fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
+          for target in fuzz_proto_decode fuzz_get_response fuzz_set_request; do
+            echo "Fuzzing $target for ${DURATION}s..."
+            cargo +nightly fuzz run $target -- -max_total_time=$DURATION
+          done
+
+  fuzz-protocol-ping:
+    name: Fuzz protocol-ping
+    needs: changes
+    if: needs.changes.outputs.protocol-ping == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzz tests
+        working-directory: protocol/ping/fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
+          for target in fuzz_response; do
+            echo "Fuzzing $target for ${DURATION}s..."
+            cargo +nightly fuzz run $target -- -max_total_time=$DURATION
+          done
+
+  fuzz-io-grpc:
+    name: Fuzz io-grpc
+    needs: changes
+    if: needs.changes.outputs.io-grpc == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzz tests
+        working-directory: io/grpc/fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
+          for target in fuzz_decode_message fuzz_message_decoder; do
+            echo "Fuzzing $target for ${DURATION}s..."
+            cargo +nightly fuzz run $target -- -max_total_time=$DURATION
+          done
+
+  fuzz-io-http2:
+    name: Fuzz io-http2
+    needs: changes
+    if: needs.changes.outputs.io-http2 == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run fuzz tests
+        working-directory: io/http2/fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration || env.DEFAULT_DURATION }}"
+          for target in fuzz_frame_decode fuzz_hpack_decode; do
+            echo "Fuzzing $target for ${DURATION}s..."
+            cargo +nightly fuzz run $target -- -max_total_time=$DURATION
+          done
