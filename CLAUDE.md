@@ -11,6 +11,51 @@ Crucible is a high-performance cache server and benchmarking toolkit written in 
 - **Cache Libraries** - Multiple cache implementations (Segcache, Slab, Heap)
 - **I/O Framework** (`io-driver`) - Unified I/O abstraction with io_uring and mio backends
 
+## Design Philosophy
+
+Crucible is built for **performance-critical deployments where microseconds matter**. The architecture reflects deliberate trade-offs that prioritize latency predictability and throughput over developer convenience.
+
+### Why We Built Our Own I/O Driver (Not Tokio)
+
+Tokio is an excellent general-purpose async runtime, but it abstracts away platform-specific capabilities that are essential for cache server performance:
+
+1. **Completion-based model vs async/await**: Our `io-driver` uses explicit `poll()` → `drain_completions()` loops instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight loop with predictable behavior.
+
+2. **Direct access to io_uring features**: Tokio's abstractions hide advanced io_uring capabilities that we need:
+   - **Multishot recv/accept**: Single submission, multiple completions without re-submission overhead
+   - **Ring-provided buffers**: Kernel manages buffer pool with zero-copy semantics
+   - **SendZc**: Kernel DMAs directly from user buffers—true zero-copy send
+   - **SQPOLL mode**: Kernel thread polls submission queue, eliminating syscalls entirely
+
+3. **Explicit buffer lifecycle management**: Zero-copy I/O requires precise control over when buffers can be released. Async/await complicates lifetime management across await points. Our completion model lets us hold buffer ownership until the kernel signals completion.
+
+4. **Thread-per-core with CPU pinning**: Workers are pinned to specific cores, keeping hot data in CPU cache. Tokio's work-stealing scheduler moves tasks between threads, invalidating caches and adding unpredictable latency.
+
+### Why The Benchmark Tool Doesn't Use Tokio
+
+The benchmark needs to measure latency accurately without introducing measurement artifacts:
+
+- **Precise timing**: Direct `Instant::now()` calls at exact points in the event loop, not filtered through async task scheduling
+- **CPU pinning**: Threads pinned to cores for reproducible results across runs
+- **Same I/O advantages**: Uses `io-driver` to leverage io_uring on Linux, matching the server's I/O characteristics
+- **Dual timestamp modes**: Supports both userspace timing and kernel SO_TIMESTAMPING for sub-microsecond accuracy
+
+The admin/metrics server within the benchmark *does* use Tokio—it's isolated on a separate thread where convenience matters more than latency.
+
+### Native vs Tokio Runtime
+
+The server supports both runtimes via configuration:
+
+| Aspect | Native (default) | Tokio |
+|--------|------------------|-------|
+| Threading | Explicit thread-per-core | Work-stealing pool |
+| I/O | io_uring (Linux 6.0+) / mio | Tokio reactor (epoll/kqueue) |
+| CPU pinning | Direct, per-worker | Optional callback |
+| Latency | Predictable, low variance | Higher variance from scheduler |
+| Use case | Production, performance-critical | Development, portability |
+
+**Choose native** when performance matters. **Choose Tokio** for portability or when integrating with async ecosystems.
+
 ## Build Commands
 
 ```bash
@@ -40,10 +85,10 @@ cargo fmt
 # Lint with clippy
 cargo clippy
 
-# Run all fuzz tests (requires nightly)
-cargo xtask fuzz-all --duration 60
+# Run all fuzz tests (requires nightly, parallel execution)
+cargo xtask fuzz-all --duration 60 --jobs 4
 
-# Generate flamegraph
+# Generate flamegraph (Linux only, requires perf and inferno)
 cargo xtask flamegraph --duration 10 --output profile.svg
 ```
 
@@ -54,11 +99,13 @@ cargo xtask flamegraph --duration 10 --output profile.svg
 ./target/release/crucible-server server/config/example.toml
 
 # Run benchmark against a server
-./target/release/crucible-benchmark benchmark/config/example.toml
+./target/release/crucible-benchmark benchmark/config/redis.toml
 
-# Override benchmark settings via CLI
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --threads 4 --connections 32 --rate 100000
+# Save benchmark results to parquet
+./target/release/crucible-benchmark benchmark/config/redis.toml --parquet results.parquet
+
+# View results in web dashboard
+./target/release/crucible-benchmark view results.parquet
 ```
 
 ## Architecture
@@ -87,9 +134,38 @@ crucible/
   metrics/      # Metrics infrastructure
 ```
 
+### I/O Driver Design
+
+The `io-driver` crate provides a unified completion-based I/O abstraction:
+
+```rust
+// The core event loop pattern used throughout Crucible
+loop {
+    driver.poll(Some(Duration::from_millis(1)))?;
+    for completion in driver.drain_completions() {
+        match completion.kind {
+            CompletionKind::Recv { conn_id, .. } => { /* process recv */ }
+            CompletionKind::SendReady { conn_id } => { /* send response */ }
+            // ...
+        }
+    }
+}
+```
+
+**Backend selection** (automatic):
+- **Linux 6.0+**: io_uring with multishot recv/accept, SendZc, ring-provided buffers
+- **Other platforms**: mio (epoll on Linux, kqueue on macOS)
+
+**Copy semantics** (why this matters for performance):
+- io_uring single-shot recv + SendZc: **0 copies** (kernel writes to user buffer, DMAs response directly)
+- io_uring multishot recv + SendZc: **1 copy** (ring buffer → coalesce buffer)
+- mio fallback: **2 copies** (standard read/write syscalls)
+
+See `io/driver/ARCHITECTURE.md` for detailed buffer management documentation.
+
 ### Cache Architecture (cache-core)
 
-The cache uses a tiered layer architecture:
+The cache uses a tiered S3-FIFO architecture with a shared lock-free hashtable:
 
 ```
 +---------------------------+
@@ -110,29 +186,13 @@ The cache uses a tiered layer architecture:
       +-------------+
 ```
 
-**Key Components:**
+**Key components:**
 - `TieredCache` - Orchestrates layers with shared hashtable
-- `FifoLayer` / `TtlLayer` - Layer implementations with different eviction strategies
 - `Segment` - Fixed-size memory regions storing items sequentially
 - `MemoryPool` - Segment allocation with optional hugepage support
-- `MultiChoiceHashtable` - Lock-free hashtable with ghost entries for "second chance"
+- `MultiChoiceHashtable` - Lock-free hashtable with ghost entries for "second chance" admission
 
-**Eviction Strategies:** FIFO, Random, CTE (closest to expiration), Merge
-
-### I/O Driver Architecture (io-driver)
-
-Unified async I/O abstraction with automatic backend selection:
-- **Linux 6.0+**: io_uring with multishot recv/accept, SendZc, ring-provided buffers
-- **Other platforms**: mio (epoll on Linux, kqueue on macOS)
-
-The driver provides a completion-based event loop: `poll()` -> `drain_completions()` -> process events.
-
-### Server Runtime Options
-
-- **Native** (default): Thread-per-core with io_uring/mio, CPU pinning support
-- **Tokio**: Async runtime with work-stealing scheduler (feature flag: `tokio-runtime`)
-
-## Concurrency Model
+### Concurrency Model
 
 - All public types are `Send + Sync`
 - Hashtable uses lock-free CAS operations
@@ -144,41 +204,34 @@ The driver provides a completion-based event loop: `poll()` -> `drain_completion
 
 Server config files (`server/config/`):
 - `example.toml` - General-purpose configuration
-- `redis.toml` - Redis migration configuration (RESP protocol on port 6379)
-- `memcached.toml` - Memcached migration configuration (port 11211)
+- `redis.toml` - Redis migration (RESP protocol on port 6379)
+- `memcached.toml` - Memcached migration (port 11211)
 - `heap.toml` - Heap backend (no segment fragmentation)
 - `slab.toml` - Slab allocator with slab-level eviction
 
-Cache configuration uses separate **backend** (storage) and **policy** (eviction) settings:
+Cache configuration separates **backend** (storage) from **policy** (eviction):
 
 ```toml
 [cache]
-backend = "segment"  # Storage type: segment, slab, heap
+backend = "segment"  # Storage: segment, slab, heap
 policy = "s3fifo"    # Eviction policy (depends on backend)
 ```
-
-**Backends (storage type):**
-- `segment` - Fixed-size segments, sequential item storage (default)
-- `slab` - Memcached-style slab allocator with size classes
-- `heap` - System allocator, per-item allocation
 
 **Eviction policies by backend:**
 - `segment`: s3fifo (default), fifo, random, cte, merge
 - `slab`: lra (default), lrc, random, none
 - `heap`: s3fifo (default), lfu
 
-Other configuration options:
-- Runtime selection (native/tokio)
-- Protocol listeners (resp/memcache) with optional TLS
-- io_uring settings (sqpoll, buffer pools, recv mode)
-
-Benchmark config (`benchmark/config/example.toml`):
-- Target endpoints and protocol
-- Connection pool settings (pool_size, pipeline_depth)
-- Workload (keyspace, command distribution, value sizes)
-
 ## Platform Support
 
-- **Linux**: Full support including io_uring (kernel 6.0+), NUMA binding
-- **macOS**: mio backend only
+- **Linux 6.0+**: Full support with io_uring, CPU pinning, NUMA binding, hugepages
+- **Linux < 6.0**: mio backend (epoll), still supports CPU pinning
+- **macOS**: mio backend only (kqueue)
 - **Architectures**: x86_64 and ARM64
+
+## Testing
+
+- `/smoketest` - Quick end-to-end validation (starts server, runs benchmark, checks results)
+- Fuzz tests require nightly: `rustup run nightly cargo fuzz`
+- Loom tests (`--features loom`) verify lock-free concurrency but run slowly
+- Protocol fuzz targets in `protocol/*/fuzz/`

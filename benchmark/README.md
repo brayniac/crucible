@@ -20,6 +20,8 @@ cargo build --release -p benchmark
 
 ## Command Line Interface
 
+The benchmark is primarily configured via TOML files. CLI options are minimal:
+
 ```
 crucible-benchmark <CONFIG> [OPTIONS]
 
@@ -27,44 +29,75 @@ Arguments:
   <CONFIG>  Path to TOML configuration file
 
 Options:
-  --threads <N>         Override worker thread count
-  --connections <N>     Override total connection count
-  --rate <N>            Override rate limit (requests/second)
-  --format <FORMAT>     Output format: clean, json, verbose, quiet
-  --color <MODE>        Color mode: auto, always, never
-  --prometheus <ADDR>   Enable Prometheus metrics endpoint
-  --parquet <PATH>      Write metrics to Parquet file
-  --cpu_list <LIST>     CPU pinning (e.g., "0-3,8-11")
-  --io_engine <ENGINE>  I/O engine: auto, mio, uring
-  --recv_mode <MODE>    Recv mode: multishot, singleshot
+  --parquet <PATH>      Override Parquet output path from config
   -h, --help            Print help
+
+Subcommands:
+  view                  View benchmark results in a web dashboard
 ```
 
 ### Examples
 
 ```bash
-# Override settings via CLI
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --threads 8 \
-    --connections 64 \
-    --rate 100000
+# Run benchmark with config file
+./target/release/crucible-benchmark benchmark/config/redis.toml
 
-# Export metrics to Parquet for analysis
+# Override parquet output path
 ./target/release/crucible-benchmark benchmark/config/redis.toml \
     --parquet results.parquet
-
-# Machine-readable JSON output
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --format json > results.jsonl
-
-# Pin to specific CPUs for consistent results
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --cpu_list "0-3"
-
-# Enable Prometheus metrics endpoint
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --prometheus 127.0.0.1:9090
 ```
+
+## Results Viewer
+
+The `view` subcommand launches an interactive web dashboard for analyzing benchmark results. It automatically opens in your browser.
+
+```
+crucible-benchmark view <INPUT> [OPTIONS]
+
+Arguments:
+  <INPUT>               Path to benchmark parquet file
+
+Options:
+  --server <PATH>       Path to server-side Rezolus parquet file
+  --client <PATH>       Path to client-side Rezolus parquet file
+  --listen <ADDR>       Listen address [default: 127.0.0.1:0]
+  -v, --verbose         Increase verbosity
+```
+
+### Dashboard Sections
+
+| Section | Description |
+|---------|-------------|
+| **Overview** | Summary of benchmark run with key metrics |
+| **Throughput** | Requests per second over time |
+| **Latency** | Latency percentiles (p50, p99, p999, etc.) over time |
+| **Cache** | Hit rate and cache behavior |
+| **Connections** | Connection pool statistics |
+| **Server Metrics** | System telemetry from server (requires `--server`) |
+| **Client Metrics** | System telemetry from client (requires `--client`) |
+
+### Correlating with Rezolus
+
+For deeper analysis, you can correlate benchmark results with system-level telemetry from [Rezolus](https://github.com/brayniac/rezolus). Run Rezolus in record mode on the server and/or client during the benchmark:
+
+```bash
+# On the server machine
+rezolus record http://localhost:4241 server-rezolus.parquet &
+
+# On the client machine
+rezolus record http://localhost:4241 client-rezolus.parquet &
+
+# Run benchmark
+./target/release/crucible-benchmark benchmark/config/redis.toml \
+    --parquet benchmark.parquet
+
+# View with all data sources
+./target/release/crucible-benchmark view benchmark.parquet \
+    --server server-rezolus.parquet \
+    --client client-rezolus.parquet
+```
+
+This lets you correlate cache performance with CPU utilization, network statistics, scheduler behavior, and other system metrics.
 
 ## Configuration Reference
 

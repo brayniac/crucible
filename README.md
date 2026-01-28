@@ -12,27 +12,42 @@ Crucible provides:
 ## Features
 
 ### Cache Server
-- Multiple storage backends: Segment (default), Slab, Heap
-- Pluggable eviction policies: S3-FIFO, FIFO, LRU variants, Random, CTE
-- Protocol support: RESP2/RESP3 (Redis-compatible), Memcache ASCII
-- Dual runtime backends: Native (io_uring/mio) or Tokio
-- io_uring optimizations: multishot recv/accept, zero-copy send, ring-provided buffers
-- Thread-per-core architecture with CPU pinning and NUMA-aware allocation
-- Hugepage support (2MB/1GB) for reduced TLB pressure
-- Prometheus metrics exposition
+- **Multiple storage backends**: Segment (default), Slab, Heap
+- **RAM → Disk tiering**: Extend cache capacity beyond RAM (segment and slab backends)
+- **Pluggable eviction policies**: S3-FIFO, FIFO, LRU variants, Random, CTE, Merge
+- **TTL-aware storage**: Segment backend groups items by expiration for efficient proactive expiration
+- **Protocol support**: RESP2/RESP3 (Redis-compatible), Memcache ASCII
+- **Custom I/O driver**: Completion-based io_uring/mio abstraction (not Tokio) for predictable latency
+- **Zero-copy I/O**: io_uring multishot recv, SendZc, ring-provided buffers
+- **Zero allocations on hot path**: Pre-allocated buffer pools and segment storage (segment backend)
+- **Thread-per-core architecture**: CPU pinning, NUMA-aware allocation, no work-stealing
+- **Hugepage support**: 2MB/1GB pages for reduced TLB pressure
+- **Prometheus metrics**: Separate control plane for metrics exposition
 
 ### Benchmark Tool
-- Multi-threaded load generation with io_uring or mio backends
+- Multi-threaded load generation with the same io-driver as the server
 - Configurable workloads: key distribution (uniform/zipf), command mix, value sizes
 - Request pipelining for maximum throughput
 - High-resolution latency histograms (p50, p90, p99, p99.9, p99.99)
+- Precise timing without async runtime overhead
 - Parquet output for post-hoc analysis
-- Multiple output formats (clean, verbose, JSON, quiet)
+- **Web dashboard viewer**: Interactive analysis of benchmark results with optional Rezolus telemetry correlation
+
+## Design
+
+Crucible is built for **latency-sensitive deployments where microseconds matter**. Key design decisions:
+
+- **Completion-based I/O** instead of async/await—eliminates task scheduler overhead
+- **Custom io-driver** instead of Tokio—direct access to io_uring features (multishot, SendZc, ring buffers)
+- **Thread-per-core** with CPU pinning—no work-stealing, predictable cache locality
+- **Pre-allocated everything**—buffer pools and segment storage avoid malloc on hot path
+
+See [docs/design.md](docs/design.md) for detailed rationale.
 
 ## Requirements
 
-- **Rust**: Edition 2024 (nightly recommended for best performance)
-- **Linux**: Kernel 6.0+ for io_uring features (falls back to mio on older kernels)
+- **Rust**: 1.85+ (Edition 2024)
+- **Linux**: Kernel 6.0+ for full io_uring features (falls back to mio on older kernels)
 - **macOS**: Supported via mio backend
 
 ## Quick Start
@@ -65,40 +80,40 @@ cargo build --release -p server --features validation
 
 ### Cache Design
 
-Crucible uses a tiered cache architecture with a shared lock-free hashtable:
+All storage backends share a **lock-free hashtable** with optional tiering:
 
 ```
-┌─────────────────────────────────────┐
-│           Hashtable                 │  Lock-free multi-choice hashtable
-│  key → (location, freq, ghost bit)  │  with ghost entries for "second chance"
-└─────────────────┬───────────────────┘
-                  │
-         ┌────────┴────────┐
-         ▼                 ▼
-┌─────────────────┐ ┌─────────────────┐
-│    Layer 0      │ │    Layer 1      │
-│  (FIFO Queue)   │ │  (TTL Buckets)  │
-│                 │ │                 │
-│  New items      │ │  Hot items      │
-│  enter here     │ │  promoted here  │
-└────────┬────────┘ └─────────────────┘
-         │
-         └─→ Eviction: items with freq > threshold
-             are demoted to Layer 1
+┌───────────────────────────────────────┐
+│              Hashtable                │
+│  key → (location, frequency, ghost)   │
+└──────┬─────────────┬─────────────┬────┘
+       │             │             │
+       ▼             ▼             ▼
+┌ ─ ─ ─ ─ ─ ─ ┐ ┌─────────────┐ ┌ ─ ─ ─ ─ ─ ─ ┐
+  Layer 0:      │  Layer 1:   │    Layer 2:
+│ Admission   │ │  Main Cache │ │   Disk      │
+  (optional)    │  (RAM)      │   (optional)
+│ S3-FIFO     │ │  seg/slab/  │ │ seg/slab    │
+  only          │  heap       │   only
+└ ─ ─ ─ ─ ─ ─ ┘ └─────────────┘ └ ─ ─ ─ ─ ─ ─ ┘
+       │            ▲    │          ▲    │
+       └── admit ───┘    │          │    │
+                    ▲    └─ demote ─┘    │
+                    └────── promote ─────┘
 ```
 
 **Key features:**
-- Ghost entries track recently-evicted keys for admission filtering
-- Frequency counter prevents scan-resistant pollution
-- Items start in FIFO layer, hot items promoted to TTL layer
+- Lock-free multi-choice hashing with atomic CAS operations
+- Ghost entries track recently-evicted keys for smarter re-admission
+- Per-key frequency counter enables scan-resistant policies
 
 ### Storage Backends
 
-| Backend | Description | Best For |
-|---------|-------------|----------|
-| `segment` | Fixed-size segments with sequential item storage | General purpose, good hit rates with S3-FIFO |
-| `slab` | Memcached-style slab allocator with size classes | Memcached migration, high churn workloads |
-| `heap` | System allocator, per-item allocation | Variable-size items, no fragmentation concerns |
+| Backend | Description | Disk Tiering | Best For |
+|---------|-------------|--------------|----------|
+| `segment` | Fixed-size segments, TTL-aware organization | Yes | General purpose, TTL-heavy workloads |
+| `slab` | Memcached-style slab allocator with size classes | Yes | Memcached migration, in-place updates |
+| `heap` | System allocator, per-item allocation | No | Variable-size items, future data structures |
 
 ### Eviction Policies
 
@@ -108,21 +123,23 @@ Crucible uses a tiered cache architecture with a shared lock-free hashtable:
 | `slab` | `lra` (default), `lrc`, `random`, `none` |
 | `heap` | `s3fifo` (default), `lfu` |
 
-- **s3fifo**: Admission-filtered FIFO with frequency counter
+- **s3fifo**: Admission-filtered FIFO with frequency tracking—scan resistant, high hit rates
 - **fifo**: Simple first-in-first-out
 - **lra/lrc**: Least recently accessed/created (slab only)
 - **lfu**: Least frequently used
 - **cte**: Closest to expiration
 - **random**: Random eviction
-- **merge**: Merge eviction strategy
+- **merge**: Frequency-aware pruning—retains high-value items, evicts low-value ones (segment only)
 
 ### I/O Driver
 
-Unified async I/O abstraction with automatic backend selection:
-- **Linux 6.0+**: io_uring with multishot recv/accept, SendZc, ring-provided buffers
-- **Other platforms**: mio (epoll on Linux, kqueue on macOS)
+We built a custom completion-based I/O driver instead of using Tokio. This gives us:
+- **Direct io_uring access**: Multishot recv/accept, SendZc, ring-provided buffers, SQPOLL
+- **Predictable latency**: No async task scheduler overhead or work-stealing
+- **Zero-copy potential**: 0 copies with single-shot recv + SendZc on Linux 6.0+
+- **Graceful fallback**: mio backend (epoll/kqueue) on older kernels and macOS
 
-See [io/driver/ARCHITECTURE.md](io/driver/ARCHITECTURE.md) for detailed copy/allocation analysis.
+See [io/driver/ARCHITECTURE.md](io/driver/ARCHITECTURE.md) for buffer management details and [docs/design.md](docs/design.md) for design rationale.
 
 ## Protocol Support
 
@@ -229,20 +246,20 @@ recv_mode = "multishot"  # or "singleshot"
 # Run benchmark against a Redis-compatible server
 ./target/release/crucible-benchmark benchmark/config/redis.toml
 
-# Override settings via CLI
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --threads 4 \
-    --connections 32 \
-    --rate 100000
-
 # Output to Parquet for analysis
 ./target/release/crucible-benchmark benchmark/config/redis.toml \
     --parquet results.parquet
 
-# JSON output format
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --format json
+# View results in web dashboard (opens browser automatically)
+./target/release/crucible-benchmark view results.parquet
+
+# Correlate with Rezolus system telemetry
+./target/release/crucible-benchmark view results.parquet \
+    --server server-rezolus.parquet \
+    --client client-rezolus.parquet
 ```
+
+The viewer provides interactive dashboards for throughput, latency percentiles, cache hit rates, and connection statistics. When combined with [Rezolus](https://github.com/brayniac/rezolus) parquet files, you can correlate benchmark performance with CPU, network, and scheduler metrics.
 
 Available benchmark configurations:
 - `redis.toml` - Redis RESP protocol
@@ -309,6 +326,15 @@ For best performance on Linux:
 3. **NUMA awareness**: Set `numa_node` to bind cache memory to the local NUMA node
 4. **io_uring tuning**: Adjust `buffer_count`, `buffer_size`, and `sq_depth` in `[uring]` section
 5. **Disable SMT**: For latency-sensitive workloads, consider pinning to physical cores only
+
+## Documentation
+
+- [Design Philosophy](docs/design.md) - Why we built things the way we did
+- [Architecture](docs/architecture.md) - Component details and data flow
+- [Configuration Reference](docs/configuration.md) - Complete config options
+- [Operations Guide](docs/operations.md) - Production deployment and tuning
+- [I/O Driver Architecture](io/driver/ARCHITECTURE.md) - Buffer management and copy semantics
+- [Benchmark Guide](benchmark/README.md) - Load testing and performance measurement
 
 ## License
 
