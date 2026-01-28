@@ -3,8 +3,20 @@ name: Fuzz Testing
 on:
   push:
     branches: [main]
+    paths:
+      - 'cache/core/**'
+      - 'protocol/**'
+      - 'io/grpc/**'
+      - 'io/http2/**'
+      - '.github/workflows/fuzz.yml'
   pull_request:
     branches: [main]
+    paths:
+      - 'cache/core/**'
+      - 'protocol/**'
+      - 'io/grpc/**'
+      - 'io/http2/**'
+      - '.github/workflows/fuzz.yml'
   # Allow manual triggering with custom settings
   workflow_dispatch:
     inputs:
