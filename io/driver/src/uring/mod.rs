@@ -567,24 +567,25 @@ impl UringDriver {
                 }
 
                 // Emit completion - check connection still exists and isn't closing
-                if let Some(conn) = self.connections.get(conn_id) {
-                    if conn.generation == generation && !conn.closing {
-                        let full_conn_id = ConnId::with_generation(conn_id, generation);
-                        if result > 0 {
-                            self.pending_completions.push(Completion::new(
-                                CompletionKind::SendReady {
-                                    conn_id: full_conn_id,
-                                },
-                            ));
-                        } else if result < 0 {
-                            self.pending_completions
-                                .push(Completion::new(CompletionKind::Error {
-                                    conn_id: full_conn_id,
-                                    error: io::Error::from_raw_os_error(-result),
-                                }));
-                        }
-                        // result == 0 means connection closed, handled by recv path
+                if let Some(conn) = self.connections.get(conn_id)
+                    && conn.generation == generation
+                    && !conn.closing
+                {
+                    let full_conn_id = ConnId::with_generation(conn_id, generation);
+                    if result > 0 {
+                        self.pending_completions.push(Completion::new(
+                            CompletionKind::SendReady {
+                                conn_id: full_conn_id,
+                            },
+                        ));
+                    } else if result < 0 {
+                        self.pending_completions
+                            .push(Completion::new(CompletionKind::Error {
+                                conn_id: full_conn_id,
+                                error: io::Error::from_raw_os_error(-result),
+                            }));
                     }
+                    // result == 0 means connection closed, handled by recv path
                 }
             }
             OP_DIRECT_RECV => {
@@ -2502,7 +2503,7 @@ impl IoDriver for UringDriver {
     }
 
     fn send_owned(&mut self, id: ConnId, buffer: BoxedZeroCopy) -> io::Result<usize> {
-        let conn_id = id.as_usize();
+        let conn_id = id.slot();
 
         // Get connection info
         let conn = self
