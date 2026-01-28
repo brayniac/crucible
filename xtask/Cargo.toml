@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# Exclude from cargo-release (internal dev tool)
+[package.metadata.release]
+release = false
+
 [dependencies]
 clap = { workspace = true, features = ["derive"] }

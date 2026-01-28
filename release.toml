@@ -1,0 +1,50 @@
+# cargo-release configuration
+# https://github.com/crate-ci/cargo-release
+#
+# Usage:
+#   cargo release patch    # 0.1.0 -> 0.1.1
+#   cargo release minor    # 0.1.0 -> 0.2.0
+#   cargo release major    # 0.1.0 -> 1.0.0
+#   cargo release 0.2.0    # explicit version
+#
+# Dry run (recommended first):
+#   cargo release patch --dry-run
+#
+# This will:
+#   1. Bump versions in all Cargo.toml files
+#   2. Update Cargo.lock
+#   3. Create a commit "release: vX.Y.Z"
+#   4. Create a git tag "vX.Y.Z"
+#   5. Push commit and tag to origin
+#
+# The GitHub release workflow will then build and publish artifacts.
+
+# Don't publish to crates.io (yet)
+publish = false
+
+# Create git tags
+tag = true
+tag-prefix = "v"
+tag-name = "{{prefix}}{{version}}"
+
+# Push commits and tags to remote
+push = true
+
+# Commit message format
+pre-release-commit-message = "release: {{version}}"
+
+# Allow releasing from main branch only
+allow-branch = ["main"]
+
+# Consolidate commits: one commit for version bump across all crates
+consolidate-commits = true
+
+# Don't run cargo publish (redundant with publish=false, but explicit)
+no-verify = false
+
+# What to do before release
+pre-release-replacements = []
+
+# Sign commits and tags (disabled by default, enable if you have GPG set up)
+sign-commit = false
+sign-tag = false
