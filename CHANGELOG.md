@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.5] - 2026-01-29
+
+### Fixed
+- Slab verifier segfault when accessing evicted slabs during concurrent operations
+- Slab `slab_count` now accurately reflects live slabs (decremented on eviction)
+
 ## [0.2.4] - 2026-01-29
 
 ### Added
