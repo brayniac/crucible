@@ -1,5 +1,9 @@
 //! Crucible cache server binary.
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser;
 use server::admin::{self, AdminConfig};
 use server::banner::{BannerConfig, print_banner};
@@ -275,6 +279,7 @@ fn create_heap(
     let heap_policy = match policy {
         EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
         EvictionPolicy::Lfu => HeapEvictionPolicy::Lfu,
+        EvictionPolicy::Random => HeapEvictionPolicy::Random,
         _ => unreachable!("invalid policy for heap backend"),
     };
 

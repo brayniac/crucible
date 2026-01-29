@@ -96,6 +96,7 @@ jobs:
           - segment-merge
           - heap-s3fifo
           - heap-lfu
+          - heap-random
           - slab-lra
           - slab-lrc
           - slab-random

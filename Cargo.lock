@@ -450,7 +450,6 @@ dependencies = [
  "protocol-resp",
  "rand 0.9.2",
  "rand_xoshiro",
- "ratelimit",
  "ringlog",
  "serde",
  "serde_json",
@@ -1094,6 +1093,7 @@ dependencies = [
  "cache-core",
  "clocksource",
  "loom",
+ "tikv-jemalloc-ctl",
 ]
 
 [[package]]
@@ -2201,17 +2201,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ratelimit"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36ea961700fd7260e7fa3701c8287d901b2172c51f9c1421fa0f21d7f7e184b7"
-dependencies = [
- "clocksource",
- "parking_lot",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "rayon"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2585,6 +2574,7 @@ dependencies = [
  "serde",
  "slab",
  "slab-cache",
+ "tikv-jemallocator",
  "tokio",
  "toml",
  "tracing",
@@ -2797,6 +2787,37 @@ dependencies = [
  "byteorder",
  "integer-encoding",
  "ordered-float",
+]
+
+[[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

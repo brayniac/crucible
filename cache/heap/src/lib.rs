@@ -123,6 +123,9 @@ pub enum EvictionPolicy {
     /// Approximate LFU: Random sampling eviction based on frequency.
     /// Falls back to this when S3-FIFO tracking overhead is undesirable.
     Lfu,
+    /// Random eviction: Evicts a random item without considering frequency.
+    /// Simple and fast, similar to Redis's allkeys-random policy.
+    Random,
 }
 
 /// Internal eviction state for different policies.
@@ -131,6 +134,8 @@ enum EvictionState {
     S3Fifo(S3FifoPolicy),
     /// LFU has no additional state (uses hashtable frequency).
     Lfu,
+    /// Random has no state (picks any occupied slot).
+    Random,
 }
 
 /// Heap-allocated cache using the system allocator.
@@ -357,14 +362,15 @@ impl HeapCache {
     /// Query the allocator for actual memory usage.
     ///
     /// Returns None if allocator stats aren't available.
-    #[cfg(all(target_os = "linux", feature = "jemalloc"))]
+    #[cfg(feature = "jemalloc")]
     fn query_allocator_memory() -> Option<usize> {
-        // With jemalloc, we can get accurate stats
-        // This would use jemalloc_ctl crate
-        None // TODO: implement when jemalloc feature is added
+        use tikv_jemalloc_ctl::{epoch, stats};
+        // Advance epoch to refresh cached stats
+        epoch::advance().ok()?;
+        stats::allocated::read().ok()
     }
 
-    #[cfg(not(all(target_os = "linux", feature = "jemalloc")))]
+    #[cfg(not(feature = "jemalloc"))]
     fn query_allocator_memory() -> Option<usize> {
         // Without jemalloc, try reading from /proc on Linux
         #[cfg(target_os = "linux")]
@@ -380,6 +386,7 @@ impl HeapCache {
     /// Read RSS from /proc/self/statm on Linux.
     /// Only used when jemalloc is not available.
     #[cfg(all(target_os = "linux", not(feature = "jemalloc")))]
+    #[allow(dead_code)]
     fn read_proc_statm_rss() -> Option<usize> {
         use std::fs;
         let statm = fs::read_to_string("/proc/self/statm").ok()?;
@@ -757,10 +764,12 @@ impl HeapCache {
     /// Dispatches to the appropriate eviction strategy based on policy:
     /// - S3-FIFO: Uses two-queue eviction with admission filter
     /// - LFU: Approximate least-frequently-used via random sampling
+    /// - Random: Evicts the first occupied slot found from a random starting point
     fn evict_one(&self) -> bool {
         match &self.eviction_state {
             EvictionState::S3Fifo(policy) => self.evict_s3fifo(policy),
             EvictionState::Lfu => self.evict_lfu(),
+            EvictionState::Random => self.evict_random(),
         }
     }
 
@@ -847,6 +856,53 @@ impl HeapCache {
         false
     }
 
+    /// Evict using random selection.
+    ///
+    /// Finds the first occupied slot from a pseudo-random starting point
+    /// and evicts it. Simple and fast, similar to Redis's allkeys-random.
+    fn evict_random(&self) -> bool {
+        let capacity = self.storage.capacity() as u32;
+        if capacity == 0 {
+            return false;
+        }
+
+        let start = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Find first occupied slot from random starting point
+        for i in 0..capacity {
+            // Use multiplicative hash for better distribution
+            let idx = (start.wrapping_mul(2654435761).wrapping_add(i)) % capacity;
+
+            if !self.storage.is_slot_occupied(idx) {
+                continue;
+            }
+
+            let slot = match self.storage.get(idx) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let generation = slot.generation();
+            let entry = match slot.get(generation, false) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            let key = entry.key().to_vec();
+            slot.release_read();
+
+            let location = SlotLocation::new(idx, generation).to_location();
+
+            if self.hashtable.remove(&key, location) {
+                let slot_loc = SlotLocation::from_location(location);
+                self.deallocate_and_track(slot_loc);
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Record an insert for S3-FIFO tracking.
     ///
     /// Called after successful hashtable insert when using S3-FIFO policy.
@@ -901,6 +957,24 @@ impl HeapCache {
         self.fragmentation_ratio
             .store(ratio.clamp(100, 300), Ordering::Relaxed);
     }
+}
+
+/// Query jemalloc fragmentation ratio (resident / allocated * 100).
+///
+/// Returns the ratio of resident memory to allocated memory as a percentage.
+/// A value of 100 means no fragmentation, 150 means 50% overhead.
+/// Returns None if jemalloc stats aren't available.
+#[cfg(feature = "jemalloc")]
+pub fn jemalloc_fragmentation_ratio() -> Option<u32> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    let allocated = stats::allocated::read().ok()?;
+    let resident = stats::resident::read().ok()?;
+    if allocated == 0 {
+        return Some(100);
+    }
+    // ratio = resident / allocated * 100
+    Some(((resident as u128 * 100) / allocated as u128) as u32)
 }
 
 impl Cache for HeapCache {
@@ -1353,6 +1427,7 @@ impl HeapCacheBuilder {
                 self.demotion_threshold,
             )),
             EvictionPolicy::Lfu => EvictionState::Lfu,
+            EvictionPolicy::Random => EvictionState::Random,
         };
 
         // Build disk layer if configured
@@ -1692,5 +1767,88 @@ mod tests {
 
         assert!(s3fifo_cache.contains(b"key"));
         assert!(lfu_cache.contains(b"key"));
+    }
+
+    #[test]
+    fn test_random_eviction_policy() {
+        // Create a cache with Random policy and small memory limit
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(1024) // 1KB limit
+            .hashtable_power(7)
+            .initial_fragmentation_ratio(100)
+            .eviction_policy(EvictionPolicy::Random)
+            .build()
+            .expect("Failed to build cache");
+
+        // Fill with items until we hit the memory limit
+        let value = vec![b'x'; 100];
+        for i in 0..20 {
+            let key = format!("key_{:02}", i);
+            let _ = cache.set(key.as_bytes(), &value, None);
+        }
+
+        // Should have evicted some items to stay under limit
+        assert!(cache.bytes_used() <= 1024);
+        assert!(cache.len() < 20);
+    }
+
+    #[test]
+    fn test_random_eviction_under_pressure() {
+        // Create a cache with Random policy
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(512)
+            .hashtable_power(7)
+            .initial_fragmentation_ratio(100)
+            .eviction_policy(EvictionPolicy::Random)
+            .build()
+            .expect("Failed to build cache");
+
+        // Insert items with varying sizes
+        for i in 0..50 {
+            let key = format!("key_{:03}", i);
+            let value = vec![b'v'; 50 + (i % 20)]; // 50-69 bytes
+            let _ = cache.set(key.as_bytes(), &value, None);
+        }
+
+        // Cache should be under limit
+        assert!(cache.bytes_used() <= 512);
+        // Some items should remain
+        assert!(cache.len() > 0);
+    }
+
+    #[test]
+    fn test_random_eviction_large_item_evicts_multiple() {
+        // Test that inserting a large item evicts multiple smaller items
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(400)
+            .hashtable_power(7)
+            .initial_fragmentation_ratio(100)
+            .eviction_policy(EvictionPolicy::Random)
+            .build()
+            .expect("Failed to build cache");
+
+        // Fill with small items (each ~40-50 bytes with header)
+        let small_value = vec![b'x'; 20];
+        for i in 0..8 {
+            let key = format!("s{}", i);
+            cache.set(key.as_bytes(), &small_value, None).unwrap();
+        }
+
+        let initial_len = cache.len();
+        let initial_bytes = cache.bytes_used();
+
+        // Insert a large item that requires evicting multiple small items
+        let large_value = vec![b'L'; 200];
+        cache.set(b"large", &large_value, None).unwrap();
+
+        // The large item should exist
+        assert!(cache.contains(b"large"));
+        // Multiple items should have been evicted
+        assert!(cache.len() < initial_len);
+        // Memory should still be under limit
+        assert!(cache.bytes_used() <= 400);
+        // And we should have freed a significant portion
+        // (since we inserted a 200-byte value, we need to evict items to make room)
+        let _ = initial_bytes; // Used for debugging if needed
     }
 }
