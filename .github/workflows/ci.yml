@@ -82,6 +82,65 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p cache-core --features loom
 
+  smoketest:
+    name: Smoketest (${{ matrix.config }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - segment-s3fifo
+          - segment-fifo
+          - segment-random
+          - segment-cte
+          - segment-merge
+          - heap-s3fifo
+          - heap-lfu
+          - slab-lra
+          - slab-lrc
+          - slab-random
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release -p server -p benchmark
+      - name: Run smoketest
+        run: |
+          set -euo pipefail
+
+          CONFIG="server/config/smoketest/${{ matrix.config }}.toml"
+          echo "Testing configuration: $CONFIG"
+
+          # Start server
+          ./target/release/crucible-server "$CONFIG" &
+          SERVER_PID=$!
+          sleep 2
+
+          # Verify server started
+          if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "ERROR: Server failed to start"
+            exit 1
+          fi
+
+          # Run eviction test benchmark
+          ./target/release/crucible-benchmark benchmark/config/eviction-test.toml || {
+            echo "ERROR: Benchmark failed"
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+          }
+
+          # Check server is still running (didn't crash)
+          if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "ERROR: Server crashed during benchmark"
+            exit 1
+          fi
+
+          # Clean shutdown
+          kill $SERVER_PID
+          wait $SERVER_PID 2>/dev/null || true
+          echo "PASS: ${{ matrix.config }}"
+
   fuzz-smoke:
     name: Fuzz (smoke)
     runs-on: ubuntu-latest

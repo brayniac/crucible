@@ -1,0 +1,18 @@
+# Smoketest: heap backend with s3fifo eviction
+runtime = "native"
+
+[workers]
+threads = 2
+
+[cache]
+backend = "heap"
+policy = "s3fifo"
+heap_size = "32MB"
+hashtable_power = 14
+
+[[listener]]
+protocol = "resp"
+address = "127.0.0.1:6379"
+
+[metrics]
+address = "127.0.0.1:9090"

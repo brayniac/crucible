@@ -1,0 +1,19 @@
+# Smoketest: segment backend with merge eviction
+runtime = "native"
+
+[workers]
+threads = 2
+
+[cache]
+backend = "segment"
+policy = "merge"
+heap_size = "32MB"
+segment_size = "1MB"
+hashtable_power = 14
+
+[[listener]]
+protocol = "resp"
+address = "127.0.0.1:6379"
+
+[metrics]
+address = "127.0.0.1:9090"
