@@ -257,14 +257,15 @@ impl SlabAllocator {
 
     /// Find a random slab across all classes.
     ///
-    /// Returns `(class_id, slab_id)` of a random slab, or `None` if no slabs exist.
+    /// Returns `(class_id, slab_id)` of a random Live slab, or `None` if no slabs exist.
+    /// Only considers slabs in Live state (filters out evicted/zombie slabs).
     pub fn find_random_slab(&self) -> Option<(u8, u32)> {
-        // Collect all (class_id, slab_id) pairs
+        // Collect all (class_id, slab_id) pairs for Live slabs only
         let mut slabs = Vec::new();
         for (class_id, class) in self.classes.iter().enumerate() {
-            let count = class.slab_count();
-            for slab_id in 0..count {
-                slabs.push((class_id as u8, slab_id as u32));
+            // slab_timestamps() only returns Live slabs (filters by state)
+            for (slab_id, _created_at, _last_accessed) in class.slab_timestamps() {
+                slabs.push((class_id as u8, slab_id));
             }
         }
 

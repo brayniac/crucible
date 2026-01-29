@@ -86,6 +86,28 @@ const _: () = assert!(std::mem::size_of::<SlabItemHeader>() == HEADER_SIZE);
 
 #[allow(dead_code)]
 impl SlabItemHeader {
+    /// Initialize a slot as deleted/empty.
+    ///
+    /// This is used when creating a new slab to ensure all slots have valid
+    /// headers before any eviction attempts. Without this, evict_slab() could
+    /// read uninitialized memory from slots that were never allocated.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `ptr` points to valid, writable memory
+    /// of at least `HEADER_SIZE` bytes.
+    #[inline]
+    pub unsafe fn init_deleted(ptr: *mut u8) {
+        // SAFETY: Caller ensures ptr is valid and points to HEADER_SIZE bytes
+        unsafe {
+            let header = &mut *(ptr as *mut SlabItemHeader);
+            // Zero out kv_lens (no key, no value)
+            header.kv_lens = 0;
+            // Set only the deleted flag, no expiration
+            header.expire_and_flags = AtomicU32::new(FLAG_DELETED);
+        }
+    }
+
     /// Initialize a new header at the given memory location.
     ///
     /// # Safety

@@ -491,6 +491,14 @@ impl SlabClass {
                 MAX_SLABS_PER_CLASS
             );
 
+            // Initialize all slot headers as deleted BEFORE making the slab visible.
+            // This ensures evict_slab() won't read uninitialized memory if it runs
+            // before all slots have been allocated and written to.
+            for slot_index in 0..self.slots_per_slab {
+                let slot_ptr = data.add(slot_index * self.slot_size);
+                SlabItemHeader::init_deleted(slot_ptr);
+            }
+
             // Store the pointer in the lock-free array BEFORE adding to slabs Vec.
             // This ensures the pointer is visible to readers before the slab_id is used.
             self.slab_ptrs[slab_id as usize].store(data, Ordering::Release);
