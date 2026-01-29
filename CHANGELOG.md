@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.4] - 2026-01-29
+
+### Added
+- Benchmark saturation search mode for automatic SLO-compliant throughput discovery
+- Heap cache backend now supports jemalloc allocator
+- Random eviction policy for heap cache backend
+- Comprehensive smoketests for all backend/policy combinations
+
+### Changed
+- Slab cache uses atomic counter instead of RwLock for slab_count (performance improvement)
+
 ## [0.2.3] - 2026-01-29
 
 ### Fixed
