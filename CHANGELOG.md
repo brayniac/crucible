@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.3] - 2026-01-29
+
+### Fixed
+- Slab eviction (LRC, LRA, Random) segfault when evicting slabs with uninitialized slots
+- Slab random eviction failing due to including evicted/zombie slabs in selection
+
 ## [0.2.2] - 2026-01-28
 
 ### Fixed
