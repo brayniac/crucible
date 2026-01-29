@@ -15,6 +15,18 @@ fn get_available_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Wait for the server to be ready by polling the port.
+fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 /// Start a test server and return the shutdown flag.
 fn start_test_server(cache_port: u16) -> (thread::JoinHandle<()>, Arc<AtomicBool>) {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -116,9 +128,12 @@ fn test_ping() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
-    thread::sleep(Duration::from_millis(200));
-
     let addr: SocketAddr = format!("127.0.0.1:{}", cache_port).parse().unwrap();
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start within timeout"
+    );
+
     let mut conn = TcpStream::connect(addr).expect("Failed to connect");
     conn.set_nodelay(true).unwrap();
 
@@ -136,9 +151,12 @@ fn test_set_get() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
-    thread::sleep(Duration::from_millis(200));
-
     let addr: SocketAddr = format!("127.0.0.1:{}", cache_port).parse().unwrap();
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start within timeout"
+    );
+
     let mut conn = TcpStream::connect(addr).expect("Failed to connect");
     conn.set_nodelay(true).unwrap();
 
@@ -160,9 +178,12 @@ fn test_get_nonexistent() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
-    thread::sleep(Duration::from_millis(200));
-
     let addr: SocketAddr = format!("127.0.0.1:{}", cache_port).parse().unwrap();
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start within timeout"
+    );
+
     let mut conn = TcpStream::connect(addr).expect("Failed to connect");
     conn.set_nodelay(true).unwrap();
 
@@ -179,9 +200,12 @@ fn test_del() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
-    thread::sleep(Duration::from_millis(200));
-
     let addr: SocketAddr = format!("127.0.0.1:{}", cache_port).parse().unwrap();
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start within timeout"
+    );
+
     let mut conn = TcpStream::connect(addr).expect("Failed to connect");
     conn.set_nodelay(true).unwrap();
 
@@ -207,9 +231,11 @@ fn test_concurrent_connections() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
-    thread::sleep(Duration::from_millis(200));
-
     let addr: SocketAddr = format!("127.0.0.1:{}", cache_port).parse().unwrap();
+    assert!(
+        wait_for_server(addr, Duration::from_secs(5)),
+        "Server failed to start within timeout"
+    );
 
     // Open multiple connections
     let mut connections: Vec<TcpStream> = (0..10)
