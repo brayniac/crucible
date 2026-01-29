@@ -95,6 +95,20 @@ impl SlabAllocator {
         self.classes.get(class_id as usize)
     }
 
+    /// Check if a slab is in Live state (readable).
+    ///
+    /// This is a quick check for the verifier to avoid reading from evicted
+    /// slabs. Note that this check is racy - use `acquire_slab()` for safe
+    /// access that prevents eviction during the read.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn is_slab_live(&self, class_id: u8, slab_id: u32) -> bool {
+        self.classes
+            .get(class_id as usize)
+            .map(|c| c.is_slab_live(slab_id))
+            .unwrap_or(false)
+    }
+
     /// Allocate a slot for an item.
     ///
     /// Returns `Some((slab_id, slot_index))` if successful.

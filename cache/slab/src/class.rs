@@ -435,6 +435,24 @@ impl SlabClass {
         self.slab_count.load(Ordering::Relaxed) as usize
     }
 
+    /// Check if a slab is in Live state (readable).
+    ///
+    /// This is a quick check that doesn't acquire a reference. Use this
+    /// before calling methods that access slab data (like `header()` or
+    /// `slot_ptr()`) to avoid reading from evicted slabs.
+    ///
+    /// Note: This check is racy - the slab could be evicted immediately after
+    /// this returns true. For safe access, use `acquire_slab()` instead.
+    #[inline]
+    pub fn is_slab_live(&self, slab_id: u32) -> bool {
+        if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
+            return false;
+        }
+        let state_packed = self.slab_states[slab_id as usize].load(Ordering::Acquire);
+        let (state, _) = packed_state::unpack(state_packed);
+        state == SlabState::Live
+    }
+
     /// Touch a slab to update its last_accessed timestamp.
     ///
     /// Call this when accessing an item in the slab.
@@ -796,6 +814,9 @@ impl SlabClass {
         // that may be reused by a different class.
         self.slab_ptrs[slab_id as usize].store(std::ptr::null_mut(), Ordering::Release);
         packed_state::set_unallocated(state_atom);
+
+        // Decrement slab count since this slab is leaving the class
+        self.slab_count.fetch_sub(1, Ordering::Release);
 
         Some(slab_ptr)
     }

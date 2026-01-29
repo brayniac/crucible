@@ -60,8 +60,11 @@ impl KeyVerifier for SlabVerifier<'_> {
             None => return false,
         };
 
-        // Check if slab exists
-        if slab_id as usize >= class.slab_count() {
+        // Check if slab is live (not evicted).
+        // This is crucial: slab_count() returns the total slabs ever added,
+        // not the currently live slabs. An evicted slab would pass the
+        // slab_count() check but have a null pointer, causing a segfault.
+        if !class.is_slab_live(slab_id) {
             return false;
         }
 
@@ -93,10 +96,11 @@ impl KeyVerifier for SlabVerifier<'_> {
         let slab_loc = SlabLocation::from_location(location);
         let (class_id, slab_id, slot_index) = slab_loc.unpack();
 
+        // Check if slab is live before accessing its memory
         if let Some(class) = self.allocator.class(class_id)
-            && (slab_id as usize) < class.slab_count()
+            && class.is_slab_live(slab_id)
         {
-            // SAFETY: slab_id and slot_index are validated above
+            // SAFETY: slab is live, so the pointer is valid
             unsafe {
                 let ptr = class.slot_ptr(slab_id, slot_index);
                 // Prefetch the header and likely the key
@@ -177,8 +181,11 @@ impl<'a> SlabTieredVerifier<'a> {
             None => return false,
         };
 
-        // Check if slab exists
-        if slab_id as usize >= class.slab_count() {
+        // Check if slab is live (not evicted).
+        // This is crucial: slab_count() returns the total slabs ever added,
+        // not the currently live slabs. An evicted slab would pass the
+        // slab_count() check but have a null pointer, causing a segfault.
+        if !class.is_slab_live(slab_id) {
             return false;
         }
 
@@ -250,8 +257,9 @@ impl KeyVerifier for SlabTieredVerifier<'_> {
             let slab_loc = SlabLocation::from_location(location);
             let (class_id, slab_id, slot_index) = slab_loc.unpack();
 
+            // Check if slab is live before accessing its memory
             if let Some(class) = self.allocator.class(class_id)
-                && (slab_id as usize) < class.slab_count()
+                && class.is_slab_live(slab_id)
             {
                 unsafe {
                     let ptr = class.slot_ptr(slab_id, slot_index);
