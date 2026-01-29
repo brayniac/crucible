@@ -374,6 +374,8 @@ pub struct SlabClass {
     slab_states: Box<[AtomicU32]>,
     /// Free slot stack: packed as (slab_id << 16 | slot_index).
     free_slots: Injector<u32>,
+    /// Number of allocated slabs (atomic for lock-free reads).
+    slab_count: AtomicU32,
     /// Number of items in this class.
     item_count: AtomicU64,
     /// Total bytes used by items in this class.
@@ -401,6 +403,7 @@ impl SlabClass {
             slab_ptrs,
             slab_states,
             free_slots: Injector::new(),
+            slab_count: AtomicU32::new(0),
             item_count: AtomicU64::new(0),
             bytes_used: AtomicU64::new(0),
         }
@@ -427,8 +430,9 @@ impl SlabClass {
     }
 
     /// Get the number of allocated slabs.
+    #[inline]
     pub fn slab_count(&self) -> usize {
-        self.slabs.read().len()
+        self.slab_count.load(Ordering::Relaxed) as usize
     }
 
     /// Touch a slab to update its last_accessed timestamp.
@@ -509,6 +513,9 @@ impl SlabClass {
             // Create the slab with class_id and slab_id for tracking
             let slab = Slab::new(data, slab_size, self.class_id, slab_id);
             slabs.push(slab);
+
+            // Update the atomic slab count
+            self.slab_count.fetch_add(1, Ordering::Release);
 
             // Add all slots to the free list
             for slot_index in 0..self.slots_per_slab {
@@ -923,6 +930,7 @@ impl SlabClass {
         slabs.clear();
 
         // Reset counters
+        self.slab_count.store(0, Ordering::Release);
         self.item_count.store(0, Ordering::Release);
         self.bytes_used.store(0, Ordering::Release);
 

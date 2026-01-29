@@ -18,3 +18,10 @@ clocksource = { workspace = true }
 crossbeam-deque = { workspace = true }
 parking_lot = { workspace = true }
 loom = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "slab"
+harness = false
