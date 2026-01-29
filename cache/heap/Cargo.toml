@@ -10,9 +10,10 @@ description = "Heap-allocated cache using system allocator with MultiChoiceHasht
 [features]
 default = []
 loom = ["cache-core/loom", "dep:loom"]
-jemalloc = []
+jemalloc = ["dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 cache-core = { workspace = true }
 clocksource = { workspace = true }
 loom = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }

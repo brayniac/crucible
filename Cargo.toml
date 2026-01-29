@@ -90,6 +90,10 @@ metrics = { path = "metrics" }
 # Platform-specific (Linux io_uring)
 io-uring = "0.7"
 
+# Jemalloc allocator
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

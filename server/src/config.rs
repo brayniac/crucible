@@ -345,7 +345,10 @@ impl CacheBackend {
                     | EvictionPolicy::Merge
             ),
             CacheBackend::Heap => {
-                matches!(policy, EvictionPolicy::S3Fifo | EvictionPolicy::Lfu)
+                matches!(
+                    policy,
+                    EvictionPolicy::S3Fifo | EvictionPolicy::Lfu | EvictionPolicy::Random
+                )
             }
             CacheBackend::Slab => matches!(
                 policy,
@@ -362,7 +365,7 @@ impl CacheBackend {
 ///
 /// Not all policies are valid for all backends:
 /// - Segment: s3fifo, fifo, random, cte, merge
-/// - Heap: s3fifo, lfu
+/// - Heap: s3fifo, lfu, random
 /// - Slab: lra, lrc, random, none
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
