@@ -82,16 +82,65 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p cache-core --features loom
 
-  fuzz-smoke:
-    name: Fuzz (smoke)
+  smoketest:
+    name: Smoketest (${{ matrix.config }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - segment-s3fifo
+          - segment-fifo
+          - segment-random
+          - segment-cte
+          - segment-merge
+          - heap-s3fifo
+          - heap-lfu
+          - slab-lra
+          - slab-lrc
+          - slab-random
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-      - name: Build xtask
-        run: cargo build -p xtask --release
-      - name: Run smoke fuzz tests
-        run: ./target/release/xtask fuzz-all --duration 10
+      - name: Build debug binaries with validation
+        run: cargo build -p server -p benchmark --features server/validation
+      - name: Run smoketest
+        env:
+          # Enable debug assertions in dependencies
+          RUST_BACKTRACE: 1
+        run: |
+          set -euo pipefail
+
+          CONFIG="server/config/smoketest/${{ matrix.config }}.toml"
+          echo "Testing configuration: $CONFIG"
+          echo "Using debug build with validation feature (checksums + assertions)"
+
+          # Start server (debug build)
+          ./target/debug/crucible-server "$CONFIG" &
+          SERVER_PID=$!
+          sleep 3  # Debug builds start slower
+
+          # Verify server started
+          if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "ERROR: Server failed to start"
+            exit 1
+          fi
+
+          # Run eviction test benchmark (debug build)
+          ./target/debug/crucible-benchmark benchmark/config/eviction-test.toml || {
+            echo "ERROR: Benchmark failed"
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+          }
+
+          # Check server is still running (didn't crash)
+          if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "ERROR: Server crashed during benchmark"
+            exit 1
+          fi
+
+          # Clean shutdown
+          kill $SERVER_PID
+          wait $SERVER_PID 2>/dev/null || true
+          echo "PASS: ${{ matrix.config }}"
