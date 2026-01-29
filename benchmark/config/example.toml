@@ -36,3 +36,13 @@ mode = "userspace"  # or "software" for SO_TIMESTAMPING (Linux only)
 # listen = "127.0.0.1:9090"  # Prometheus metrics endpoint
 # parquet = "metrics.parquet"  # Write metrics to parquet file at end of run
 # parquet_interval = "1s"  # Snapshot interval for parquet recording
+
+# Saturation search: automatically find max throughput that meets SLO
+# Uncomment to enable saturation search mode
+# [workload.saturation_search]
+# slo = { p999 = "1ms" }  # Latency SLO thresholds (any of: p50, p99, p999)
+# start_rate = 1000       # Starting request rate (req/s)
+# step_multiplier = 1.05  # Increase rate by 5% each step
+# sample_window = "5s"    # Duration to sample at each rate level
+# stop_after_failures = 3 # Stop after N consecutive SLO violations
+# max_rate = 100000000    # Absolute maximum rate to try

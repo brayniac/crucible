@@ -48,9 +48,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = { workspace = true }
 rand_xoshiro = "0.7"
 
-# Rate limiting
-ratelimit = "0.10"
-
 # Signal handling
 ctrlc = { version = "3", features = ["termination"] }
 

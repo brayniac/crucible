@@ -7,12 +7,12 @@
 use crate::client::{MomentoSession, RequestResult, RequestType, Session};
 use crate::config::{Config, Protocol as CacheProtocol};
 use crate::metrics;
+use crate::ratelimit::DynamicRateLimiter;
 
 use io_driver::{CompletionKind, ConnId, Driver, IoDriver, RecvBuf};
 
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
-use ratelimit::Ratelimiter;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -111,7 +111,7 @@ pub struct IoWorkerConfig {
     pub id: usize,
     pub config: Config,
     pub shared: Arc<SharedState>,
-    pub ratelimiter: Option<Arc<Ratelimiter>>,
+    pub ratelimiter: Option<Arc<DynamicRateLimiter>>,
     pub warmup: bool,
 }
 
@@ -139,7 +139,7 @@ pub struct IoWorker {
     results: Vec<RequestResult>,
 
     /// Rate limiting
-    ratelimiter: Option<Arc<Ratelimiter>>,
+    ratelimiter: Option<Arc<DynamicRateLimiter>>,
 
     /// Whether we're in warmup mode (don't record metrics)
     warmup: bool,
@@ -380,7 +380,7 @@ impl IoWorker {
             while session.can_send() {
                 // Check rate limiter
                 if let Some(ref rl) = self.ratelimiter
-                    && rl.try_wait().is_err()
+                    && !rl.try_acquire()
                 {
                     break;
                 }
@@ -472,7 +472,7 @@ impl IoWorker {
             while session.can_send() {
                 // Check rate limiter
                 if let Some(ref rl) = self.ratelimiter
-                    && rl.try_wait().is_err()
+                    && !rl.try_acquire()
                 {
                     return Ok(());
                 }

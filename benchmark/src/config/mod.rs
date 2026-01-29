@@ -176,6 +176,72 @@ pub struct Workload {
     pub commands: Commands,
     #[serde(default)]
     pub values: Values,
+    #[serde(default)]
+    pub saturation_search: Option<SaturationSearch>,
+}
+
+/// Configuration for saturation search mode.
+///
+/// When enabled, the benchmark will start at `start_rate` and geometrically
+/// increase the rate by `step_multiplier` after each `sample_window`. The
+/// search stops when the SLO is violated for `stop_after_failures` consecutive
+/// steps, and reports the last compliant rate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SaturationSearch {
+    /// SLO thresholds that must be met.
+    pub slo: SloThresholds,
+    /// Starting request rate (requests per second).
+    #[serde(default = "default_start_rate")]
+    pub start_rate: u64,
+    /// Multiplier for each rate step (e.g., 1.05 = 5% increase).
+    #[serde(default = "default_step_multiplier")]
+    pub step_multiplier: f64,
+    /// Duration to sample at each rate level.
+    #[serde(default = "default_sample_window", with = "humantime_serde")]
+    pub sample_window: Duration,
+    /// Number of consecutive SLO failures before stopping.
+    #[serde(default = "default_stop_after_failures")]
+    pub stop_after_failures: u32,
+    /// Maximum rate to try (absolute ceiling).
+    #[serde(default = "default_max_rate")]
+    pub max_rate: u64,
+}
+
+/// SLO thresholds for latency percentiles.
+///
+/// At least one threshold must be specified. All specified thresholds
+/// must be met for the SLO to pass.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SloThresholds {
+    /// Maximum acceptable p50 latency.
+    #[serde(default, with = "humantime_serde_option")]
+    pub p50: Option<Duration>,
+    /// Maximum acceptable p99 latency.
+    #[serde(default, with = "humantime_serde_option")]
+    pub p99: Option<Duration>,
+    /// Maximum acceptable p99.9 latency.
+    #[serde(default, with = "humantime_serde_option")]
+    pub p999: Option<Duration>,
+}
+
+fn default_start_rate() -> u64 {
+    1000
+}
+
+fn default_step_multiplier() -> f64 {
+    1.05
+}
+
+fn default_sample_window() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_stop_after_failures() -> u32 {
+    3
+}
+
+fn default_max_rate() -> u64 {
+    100_000_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -501,6 +567,48 @@ mod humantime_serde {
 
     fn humantime_parse(s: &str) -> Result<Duration, String> {
         // Simple parser for durations like "60s", "10m", "1h"
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty duration".to_string());
+        }
+
+        let (num, suffix) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+
+        let value: u64 = num.parse().map_err(|e| format!("invalid number: {e}"))?;
+
+        let multiplier = match suffix.trim() {
+            "s" | "sec" | "secs" => 1,
+            "m" | "min" | "mins" => 60,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
+            "ms" => return Ok(Duration::from_millis(value)),
+            "us" => return Ok(Duration::from_micros(value)),
+            "ns" => return Ok(Duration::from_nanos(value)),
+            "" => 1, // default to seconds
+            other => return Err(format!("unknown time unit: {other}")),
+        };
+
+        Ok(Duration::from_secs(value * multiplier))
+    }
+}
+
+mod humantime_serde_option {
+    use serde::{Deserialize, Deserializer};
+    use std::time::Duration;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s: Option<String> = Option::deserialize(deserializer)?;
+        match s {
+            Some(s) => humantime_parse(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+
+    fn humantime_parse(s: &str) -> Result<Duration, String> {
         let s = s.trim();
         if s.is_empty() {
             return Err("empty duration".to_string());

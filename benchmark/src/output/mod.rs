@@ -126,6 +126,32 @@ pub struct Results {
     pub conns_total: u64,
 }
 
+/// A single step in saturation search.
+#[derive(Debug, Clone)]
+pub struct SaturationStep {
+    /// Target request rate for this step.
+    pub target_rate: u64,
+    /// Actual achieved request rate.
+    pub achieved_rate: f64,
+    /// p50 latency in microseconds.
+    pub p50_us: f64,
+    /// p99 latency in microseconds.
+    pub p99_us: f64,
+    /// p99.9 latency in microseconds.
+    pub p999_us: f64,
+    /// Whether SLO was met for this step.
+    pub slo_passed: bool,
+}
+
+/// Results from saturation search.
+#[derive(Debug, Clone)]
+pub struct SaturationResults {
+    /// Maximum rate that met SLO, if any.
+    pub max_compliant_rate: Option<u64>,
+    /// All steps taken during the search.
+    pub steps: Vec<SaturationStep>,
+}
+
 /// Trait for output formatters.
 pub trait OutputFormatter: Send + Sync {
     /// Print the configuration summary at startup.
@@ -145,6 +171,15 @@ pub trait OutputFormatter: Send + Sync {
 
     /// Print the final results.
     fn print_results(&self, results: &Results);
+
+    /// Print the saturation search header (for formats that use one).
+    fn print_saturation_header(&self) {}
+
+    /// Print a saturation search step result.
+    fn print_saturation_step(&self, _step: &SaturationStep) {}
+
+    /// Print the final saturation search results.
+    fn print_saturation_results(&self, _results: &SaturationResults) {}
 }
 
 /// Create a formatter based on the output format and color mode.

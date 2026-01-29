@@ -2,7 +2,7 @@
 
 pub use metrics::set_thread_shard;
 use metrics::{Counter, CounterGroup};
-use metriken::{AtomicHistogram, metric};
+use metriken::{AtomicHistogram, Gauge, metric};
 
 // Counter groups
 static REQUEST: CounterGroup = CounterGroup::new();
@@ -127,6 +127,13 @@ pub static DISCONNECTS_ERROR_EVENT: Counter =
 )]
 pub static DISCONNECTS_CONNECT_FAILED: Counter =
     Counter::new(&CONNECTION, connection::DISCONNECT_CONNECT_FAILED);
+
+// Target rate gauge (for saturation search)
+#[metric(
+    name = "target_rate",
+    description = "Current target request rate (requests per second)"
+)]
+pub static TARGET_RATE: Gauge = Gauge::new();
 
 // Latency histograms (kept as metriken AtomicHistogram)
 #[metric(

@@ -3,7 +3,9 @@
 use super::format::{
     format_bandwidth_bps, format_count, format_latency_padded, format_pct, format_rate_padded,
 };
-use super::{ColorMode, LatencyStats, OutputFormatter, Results, Sample};
+use super::{
+    ColorMode, LatencyStats, OutputFormatter, Results, Sample, SaturationResults, SaturationStep,
+};
 use crate::config::Config;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,5 +277,42 @@ impl OutputFormatter for CleanFormatter {
             format!("{} active, 0 failed", results.conns_active)
         };
         println!("connections  {}", conn_str);
+    }
+
+    fn print_saturation_header(&self) {
+        // No separate header - each step is self-describing
+    }
+
+    fn print_saturation_step(&self, step: &SaturationStep) {
+        use super::format::format_rate;
+
+        let target = format_rate(step.target_rate as f64);
+        let achieved = format_rate(step.achieved_rate);
+        let p999 = format_latency_padded(step.p999_us, 0);
+
+        let slo_str = if step.slo_passed { "PASS" } else { "FAIL" };
+        let slo_colored = self.maybe_red(slo_str, !step.slo_passed);
+
+        // Print as a distinct line that stands out from the regular sample table
+        println!(
+            "──── step: {} target, {} achieved, p99.9={} ──── {}",
+            target, achieved, p999, slo_colored
+        );
+        let _ = io::stdout().flush();
+    }
+
+    fn print_saturation_results(&self, results: &SaturationResults) {
+        println!();
+        println!("────────────────────────────────────────────────────────");
+
+        match results.max_compliant_rate {
+            Some(rate) => {
+                println!("MAX COMPLIANT THROUGHPUT: {} req/s", format_count(rate));
+            }
+            None => {
+                let msg = "MAX COMPLIANT THROUGHPUT: none (SLO never met)";
+                println!("{}", self.red(msg));
+            }
+        }
     }
 }

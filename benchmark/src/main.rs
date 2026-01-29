@@ -1,5 +1,7 @@
 use benchmark::config::Config;
 use benchmark::metrics;
+use benchmark::ratelimit::DynamicRateLimiter;
+use benchmark::saturation::SaturationSearchState;
 use benchmark::viewer;
 use benchmark::worker::Phase;
 use benchmark::{
@@ -11,7 +13,6 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use io_driver::IoEngine;
 use metriken::{AtomicHistogram, histogram::Histogram};
-use ratelimit::Ratelimiter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,15 +137,19 @@ fn run_benchmark(
     // Shared state
     let shared = Arc::new(SharedState::new());
 
-    // Create shared rate limiter if configured
-    let ratelimiter = config.workload.rate_limit.map(|rate| {
-        Arc::new(
-            Ratelimiter::builder(rate, Duration::from_secs(1))
-                .max_tokens(rate)
-                .build()
-                .expect("failed to create rate limiter"),
-        )
-    });
+    // Create shared rate limiter
+    // Priority: saturation_search.start_rate > rate_limit > unlimited (0)
+    let initial_rate = if let Some(ref sat) = config.workload.saturation_search {
+        sat.start_rate
+    } else {
+        config.workload.rate_limit.unwrap_or(0)
+    };
+
+    let ratelimiter = if initial_rate > 0 || config.workload.saturation_search.is_some() {
+        Some(Arc::new(DynamicRateLimiter::new(initial_rate)))
+    } else {
+        None
+    };
 
     // Start admin server if configured
     let _admin_handle = if config.admin.listen.is_some() || config.admin.parquet.is_some() {
@@ -217,6 +222,9 @@ fn run_benchmark(
 
     let mut actual_duration = duration;
 
+    // Saturation search state (initialized after warmup if configured)
+    let mut saturation_state: Option<SaturationSearchState> = None;
+
     loop {
         thread::sleep(Duration::from_millis(100));
 
@@ -254,6 +262,16 @@ fn run_benchmark(
             last_hits = metrics::CACHE_HITS.value();
             last_misses = metrics::CACHE_MISSES.value();
             last_histogram = metrics::RESPONSE_LATENCY.load();
+
+            // Initialize saturation search if configured
+            if let Some(ref sat_config) = config.workload.saturation_search
+                && let Some(ref rl) = ratelimiter
+            {
+                saturation_state = Some(SaturationSearchState::new(
+                    sat_config.clone(),
+                    Arc::clone(rl),
+                ));
+            }
         }
 
         // Skip reporting during warmup
@@ -338,6 +356,11 @@ fn run_benchmark(
             };
 
             formatter.print_sample(&sample);
+
+            // Check saturation search progress
+            if let Some(ref mut state) = saturation_state {
+                state.check_and_advance(&*formatter);
+            }
 
             last_report = Instant::now();
         }
@@ -439,6 +462,11 @@ fn run_benchmark(
 
     formatter.print_results(&results);
 
+    // Print saturation search results if configured
+    if let Some(state) = saturation_state {
+        formatter.print_saturation_results(&state.results());
+    }
+
     drop(_admin_handle);
 
     Ok(())
@@ -448,7 +476,7 @@ fn run_worker(
     id: usize,
     config: Config,
     shared: Arc<SharedState>,
-    ratelimiter: Option<Arc<Ratelimiter>>,
+    ratelimiter: Option<Arc<DynamicRateLimiter>>,
 ) {
     // Set this thread's shard ID for metrics to avoid false sharing
     metrics::set_thread_shard(id);
