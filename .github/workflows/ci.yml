@@ -103,19 +103,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binaries
-        run: cargo build --release -p server -p benchmark
+      - name: Build debug binaries with validation
+        run: cargo build -p server -p benchmark --features server/validation
       - name: Run smoketest
+        env:
+          # Enable debug assertions in dependencies
+          RUST_BACKTRACE: 1
         run: |
           set -euo pipefail
 
           CONFIG="server/config/smoketest/${{ matrix.config }}.toml"
           echo "Testing configuration: $CONFIG"
+          echo "Using debug build with validation feature (checksums + assertions)"
 
-          # Start server
-          ./target/release/crucible-server "$CONFIG" &
+          # Start server (debug build)
+          ./target/debug/crucible-server "$CONFIG" &
           SERVER_PID=$!
-          sleep 2
+          sleep 3  # Debug builds start slower
 
           # Verify server started
           if ! kill -0 $SERVER_PID 2>/dev/null; then
@@ -123,8 +127,8 @@ jobs:
             exit 1
           fi
 
-          # Run eviction test benchmark
-          ./target/release/crucible-benchmark benchmark/config/eviction-test.toml || {
+          # Run eviction test benchmark (debug build)
+          ./target/debug/crucible-benchmark benchmark/config/eviction-test.toml || {
             echo "ERROR: Benchmark failed"
             kill $SERVER_PID 2>/dev/null || true
             exit 1

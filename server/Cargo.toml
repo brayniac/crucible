@@ -13,7 +13,7 @@ tokio-runtime = ["tokio/rt-multi-thread", "tokio/io-util", "dep:hyper", "dep:hyp
 io_uring = ["io-driver/io_uring"]
 # Enables magic bytes and checksum validation for item headers. Useful for
 # debugging corruption issues but adds overhead to every read operation.
-validation = ["segcache/validation"]
+validation = ["segcache/validation", "slab-cache/validation"]
 
 [dependencies]
 # Cache core trait
