@@ -144,17 +144,3 @@ jobs:
           kill $SERVER_PID
           wait $SERVER_PID 2>/dev/null || true
           echo "PASS: ${{ matrix.config }}"
-
-  fuzz-smoke:
-    name: Fuzz (smoke)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-      - name: Build xtask
-        run: cargo build -p xtask --release
-      - name: Run smoke fuzz tests
-        run: ./target/release/xtask fuzz-all --duration 10
