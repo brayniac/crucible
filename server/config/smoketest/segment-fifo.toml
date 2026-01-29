@@ -9,6 +9,7 @@ backend = "segment"
 policy = "fifo"
 heap_size = "32MB"
 segment_size = "1MB"
+max_value_size = "64KB"
 hashtable_power = 14
 
 [[listener]]
