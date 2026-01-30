@@ -54,6 +54,11 @@ stop_after_failures = 3
 # Maximum rate to try (absolute ceiling)
 max_rate = 100000000
 
+# Minimum ratio of achieved/target throughput (0.0-1.0)
+# When achieved throughput falls below this fraction of the target,
+# the step fails regardless of latency (detects saturation)
+min_throughput_ratio = 0.9
+
 [timestamps]
 enabled = true
 mode = "userspace"

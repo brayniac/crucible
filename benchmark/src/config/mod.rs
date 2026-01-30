@@ -205,6 +205,14 @@ pub struct SaturationSearch {
     /// Maximum rate to try (absolute ceiling).
     #[serde(default = "default_max_rate")]
     pub max_rate: u64,
+    /// Minimum ratio of achieved/target throughput (0.0-1.0).
+    ///
+    /// When the achieved throughput falls below this fraction of the target,
+    /// the step is considered a failure regardless of latency. This detects
+    /// saturation where the system cannot keep up with the target rate.
+    /// Default is 0.9 (90%).
+    #[serde(default = "default_min_throughput_ratio")]
+    pub min_throughput_ratio: f64,
 }
 
 /// SLO thresholds for latency percentiles.
@@ -242,6 +250,10 @@ fn default_stop_after_failures() -> u32 {
 
 fn default_max_rate() -> u64 {
     100_000_000
+}
+
+fn default_min_throughput_ratio() -> f64 {
+    0.9
 }
 
 #[derive(Debug, Clone, Deserialize)]

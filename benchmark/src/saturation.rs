@@ -112,8 +112,12 @@ impl SaturationSearchState {
             _ => (0.0, 0.0, 0.0),
         };
 
-        // Check SLO compliance
-        let slo_passed = self.check_slo(p50, p99, p999);
+        // Check throughput ratio (detect saturation)
+        let throughput_ratio = achieved_rate / self.current_rate as f64;
+        let throughput_ok = throughput_ratio >= self.config.min_throughput_ratio;
+
+        // Check SLO compliance (latency + throughput)
+        let slo_passed = throughput_ok && self.check_slo(p50, p99, p999);
 
         // Record step
         let step = SaturationStep {
@@ -239,6 +243,7 @@ mod tests {
             sample_window: Duration::from_secs(5),
             stop_after_failures: 3,
             max_rate: 100_000_000,
+            min_throughput_ratio: 0.9,
         };
 
         let rl = Arc::new(DynamicRateLimiter::new(1000));
