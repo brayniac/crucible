@@ -76,6 +76,12 @@ impl Credential {
 
         // Check for explicit endpoint
         if let Ok(endpoint) = std::env::var("MOMENTO_ENDPOINT") {
+            // Add "cache." prefix if not already present
+            let endpoint = if endpoint.starts_with("cache.") {
+                endpoint
+            } else {
+                format!("cache.{}", endpoint)
+            };
             return Ok(Self {
                 token,
                 endpoint,
@@ -146,18 +152,32 @@ impl Credential {
         self.sni_host.as_deref().unwrap_or_else(|| self.host())
     }
 
-    /// Get the port, defaulting to 443.
+    /// Get the port based on wire format.
+    ///
+    /// If an explicit port is specified in the endpoint, that port is used.
+    /// Otherwise, defaults to:
+    /// - Port 443 for gRPC (HTTP/2 over TLS)
+    /// - Port 9004 for Protosocket (TLS without HTTP/2)
     pub fn port(&self) -> u16 {
-        self.endpoint
-            .split(':')
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(443)
+        // Check for explicit port in endpoint
+        if let Some(port_str) = self.endpoint.split(':').nth(1) {
+            if let Ok(port) = port_str.parse() {
+                return port;
+            }
+        }
+
+        // Default port based on wire format
+        match self.wire_format {
+            WireFormat::Grpc => 443,
+            WireFormat::Protosocket => 9004,
+        }
     }
 
     /// Extract endpoint from a Momento token.
     ///
     /// Momento tokens are JWT-like with base64-encoded JSON payloads.
+    /// The token contains the base endpoint (e.g., "cell-4-us-west-2-1.prod.a.momentohq.com")
+    /// which needs the "cache." prefix added to form the cache endpoint.
     fn extract_endpoint(token: &str) -> Option<String> {
         // Split by '.' to get JWT parts
         let parts: Vec<&str> = token.split('.').collect();
@@ -175,9 +195,17 @@ impl Credential {
         let json = String::from_utf8(decoded).ok()?;
 
         // Try various field names Momento has used
-        Self::extract_json_field(&json, "c") // Legacy: 'c' field contains cache endpoint
+        let base_endpoint = Self::extract_json_field(&json, "c") // Legacy: 'c' field contains cache endpoint
             .or_else(|| Self::extract_json_field(&json, "endpoint"))
-            .or_else(|| Self::extract_json_field(&json, "cp")) // Control plane, derive cache from it
+            .or_else(|| Self::extract_json_field(&json, "cp"))?; // Control plane, derive cache from it
+
+        // Prepend "cache." prefix if not already present
+        // The token contains the base cell endpoint, cache API needs "cache." prefix
+        if base_endpoint.starts_with("cache.") {
+            Some(base_endpoint)
+        } else {
+            Some(format!("cache.{}", base_endpoint))
+        }
     }
 
     /// Debug: dump the JWT payload for inspection.
@@ -291,9 +319,18 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_default_port() {
+    fn test_credential_default_port_grpc() {
         let cred = Credential::with_endpoint("token", "cache.example.com");
+        // Default wire format is gRPC, which uses port 443
         assert_eq!(cred.port(), 443);
+    }
+
+    #[test]
+    fn test_credential_default_port_protosocket() {
+        let cred = Credential::with_endpoint("token", "cache.example.com")
+            .with_wire_format(WireFormat::Protosocket);
+        // Protosocket uses port 9004
+        assert_eq!(cred.port(), 9004);
     }
 
     #[test]
@@ -304,10 +341,18 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_invalid_port() {
+    fn test_credential_invalid_port_grpc() {
         let cred = Credential::with_endpoint("token", "cache.example.com:notaport");
-        // Should fall back to 443
+        // Invalid port should fall back to wire format default (gRPC = 443)
         assert_eq!(cred.port(), 443);
+    }
+
+    #[test]
+    fn test_credential_invalid_port_protosocket() {
+        let cred = Credential::with_endpoint("token", "cache.example.com:notaport")
+            .with_wire_format(WireFormat::Protosocket);
+        // Invalid port should fall back to wire format default (protosocket = 9004)
+        assert_eq!(cred.port(), 9004);
     }
 
     #[test]
@@ -322,24 +367,37 @@ mod tests {
     #[test]
     fn test_credential_from_token_with_jwt() {
         // Create a fake JWT-like token with endpoint in payload
-        // Payload: {"c":"cache.test.com"} encoded as base64url
-        let payload = r#"{"c":"cache.test.example.com"}"#;
+        // Payload: {"c":"cell-test.example.com"} encoded as base64url
+        // The "cache." prefix is added automatically
+        let payload = r#"{"c":"cell-test.example.com"}"#;
         let encoded_payload = base64url_encode(payload.as_bytes());
         let token = format!("header.{}.signature", encoded_payload);
 
         let cred = Credential::from_token(&token).unwrap();
-        assert_eq!(cred.endpoint(), "cache.test.example.com");
+        assert_eq!(cred.endpoint(), "cache.cell-test.example.com");
+    }
+
+    #[test]
+    fn test_credential_from_token_with_cache_prefix() {
+        // If the endpoint already has "cache." prefix, don't double it
+        let payload = r#"{"c":"cache.already-prefixed.example.com"}"#;
+        let encoded_payload = base64url_encode(payload.as_bytes());
+        let token = format!("header.{}.signature", encoded_payload);
+
+        let cred = Credential::from_token(&token).unwrap();
+        assert_eq!(cred.endpoint(), "cache.already-prefixed.example.com");
     }
 
     #[test]
     fn test_credential_from_token_with_endpoint_field() {
         // Payload with "endpoint" field instead of "c"
-        let payload = r#"{"endpoint":"cache.endpoint.example.com"}"#;
+        // The "cache." prefix is added automatically
+        let payload = r#"{"endpoint":"cell-endpoint.example.com"}"#;
         let encoded_payload = base64url_encode(payload.as_bytes());
         let token = format!("header.{}.signature", encoded_payload);
 
         let cred = Credential::from_token(&token).unwrap();
-        assert_eq!(cred.endpoint(), "cache.endpoint.example.com");
+        assert_eq!(cred.endpoint(), "cache.cell-endpoint.example.com");
     }
 
     #[test]
@@ -561,15 +619,55 @@ mod tests {
 
         // SAFETY: This test runs with --test-threads=1 to avoid data races
         unsafe {
-            // Set test values
+            // Set test values - endpoint without cache. prefix
             std::env::set_var("MOMENTO_API_KEY", "test-token");
-            std::env::set_var("MOMENTO_ENDPOINT", "test.example.com");
+            std::env::set_var("MOMENTO_ENDPOINT", "cell-test.example.com");
             std::env::remove_var("MOMENTO_REGION");
         }
 
         let cred = Credential::from_env().expect("from_env should succeed");
         assert_eq!(cred.token(), "test-token");
-        assert_eq!(cred.host(), "test.example.com");
+        // Should add cache. prefix
+        assert_eq!(cred.host(), "cache.cell-test.example.com");
+
+        // SAFETY: Restore original values
+        unsafe {
+            if let Some(val) = orig_key {
+                std::env::set_var("MOMENTO_API_KEY", val);
+            } else {
+                std::env::remove_var("MOMENTO_API_KEY");
+            }
+            if let Some(val) = orig_endpoint {
+                std::env::set_var("MOMENTO_ENDPOINT", val);
+            } else {
+                std::env::remove_var("MOMENTO_ENDPOINT");
+            }
+            if let Some(val) = orig_region {
+                std::env::set_var("MOMENTO_REGION", val);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_with_cache_prefixed_endpoint() {
+        // Save original values
+        let orig_key = std::env::var("MOMENTO_API_KEY").ok();
+        let orig_endpoint = std::env::var("MOMENTO_ENDPOINT").ok();
+        let orig_region = std::env::var("MOMENTO_REGION").ok();
+
+        // SAFETY: This test runs with --test-threads=1 to avoid data races
+        unsafe {
+            // Set test values - endpoint already has cache. prefix
+            std::env::set_var("MOMENTO_API_KEY", "test-token");
+            std::env::set_var("MOMENTO_ENDPOINT", "cache.already-prefixed.example.com");
+            std::env::remove_var("MOMENTO_REGION");
+        }
+
+        let cred = Credential::from_env().expect("from_env should succeed");
+        assert_eq!(cred.token(), "test-token");
+        // Should not double the prefix
+        assert_eq!(cred.host(), "cache.already-prefixed.example.com");
 
         // SAFETY: Restore original values
         unsafe {
