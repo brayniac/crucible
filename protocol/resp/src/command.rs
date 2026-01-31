@@ -116,9 +116,9 @@ pub enum Command<'a> {
         key: &'a [u8],
         values: Vec<&'a [u8]>,
     },
-    /// LPOP key [count] - Pop from left of list
+    /// LPOP key `[count]` - Pop from left of list
     LPop { key: &'a [u8], count: Option<usize> },
-    /// RPOP key [count] - Pop from right of list
+    /// RPOP key `[count]` - Pop from right of list
     RPop { key: &'a [u8], count: Option<usize> },
     /// LRANGE key start stop - Get range of elements
     LRange {
@@ -177,9 +177,9 @@ pub enum Command<'a> {
     },
     /// SCARD key - Get set cardinality
     SCard { key: &'a [u8] },
-    /// SPOP key [count] - Remove and return random member(s)
+    /// SPOP key `[count]` - Remove and return random member(s)
     SPop { key: &'a [u8], count: Option<usize> },
-    /// SRANDMEMBER key [count] - Get random member(s) without removal
+    /// SRANDMEMBER key `[count]` - Get random member(s) without removal
     SRandMember { key: &'a [u8], count: Option<i64> },
 
     // ========================================================================
