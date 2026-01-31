@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.6] - 2026-01-30
+
+### Fixed
+- Benchmark saturation search now detects system saturation when achieved throughput falls below target rate (adds `min_throughput_ratio` parameter, default 90%)
+
 ## [0.2.5] - 2026-01-29
 
 ### Fixed
