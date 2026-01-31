@@ -7,11 +7,13 @@ use super::{ConnectionState, RequestResult, RequestType};
 use crate::config::{Config, MomentoWireFormat};
 
 use io_driver::{TlsConfig, TlsTransport, Transport, TransportState};
-use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential, WireFormat};
+use protocol_momento::{
+    CacheClient, CacheValue, CompletedOp, Credential, EndpointsFetcher, WireFormat,
+};
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 /// Default fallback address when credential endpoint cannot be parsed.
@@ -53,6 +55,10 @@ pub struct MomentoSession {
     recv_buf: Vec<u8>,
     /// Error message if connection failed.
     error: Option<String>,
+    /// Private endpoint addresses (if using private endpoints).
+    private_addresses: Vec<SocketAddr>,
+    /// Index for round-robin address selection.
+    address_index: usize,
 }
 
 impl MomentoSession {
@@ -78,6 +84,35 @@ impl MomentoSession {
         // Apply wire format to credential
         let credential = credential.with_wire_format(wire_format);
 
+        // Fetch private endpoints if configured
+        let private_addresses = if config.momento.use_private_endpoints {
+            let fetcher = EndpointsFetcher::new(&credential, true);
+            let addresses = fetcher.fetch().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to fetch private endpoints: {}", e),
+                )
+            })?;
+
+            // Get AZ from config or environment variable
+            let az_filter: Option<String> = config
+                .momento
+                .availability_zone
+                .clone()
+                .or_else(|| std::env::var("MOMENTO_AZ").ok());
+
+            let addrs = addresses.for_az(az_filter.as_deref());
+            if addrs.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no private endpoints available",
+                ));
+            }
+            addrs
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             stream: None,
             tls_transport: None,
@@ -92,6 +127,8 @@ impl MomentoSession {
             wire_format,
             recv_buf: vec![0u8; 16384],
             error: None,
+            private_addresses,
+            address_index: 0,
         })
     }
 
@@ -105,12 +142,26 @@ impl MomentoSession {
 
     /// Connect to the Momento server.
     pub fn connect(&mut self) -> io::Result<()> {
-        let host = self.credential.host();
-        let port = self.credential.port();
-        let addr = format!("{}:{}", host, port);
+        // Determine connection address
+        let (addr, tls_host) = if !self.private_addresses.is_empty() {
+            // Use private endpoint address (round-robin)
+            let addr = self.private_addresses[self.address_index % self.private_addresses.len()];
+            self.address_index = self.address_index.wrapping_add(1);
+            // Use credential host for TLS SNI (certificate verification)
+            (addr, self.credential.tls_host().to_string())
+        } else {
+            // Use credential endpoint (DNS resolution)
+            let host = self.credential.host();
+            let port = self.credential.port();
+            let addr_str = format!("{}:{}", host, port);
+            let addr = addr_str.to_socket_addrs()?.next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "could not resolve endpoint")
+            })?;
+            (addr, host.to_string())
+        };
 
         // Connect TCP
-        let stream = TcpStream::connect(&addr)?;
+        let stream = TcpStream::connect(addr)?;
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
         self.stream = Some(stream);
@@ -121,7 +172,7 @@ impl MomentoSession {
             WireFormat::Grpc => TlsConfig::http2()?,
             WireFormat::Protosocket => TlsConfig::new()?,
         };
-        let transport = TlsTransport::new(&tls_config, host)?;
+        let transport = TlsTransport::new(&tls_config, &tls_host)?;
         self.tls_transport = Some(transport);
 
         self.state = ConnectionState::Connecting;

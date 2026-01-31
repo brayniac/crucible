@@ -152,6 +152,17 @@ impl Credential {
         self.sni_host.as_deref().unwrap_or_else(|| self.host())
     }
 
+    /// Get the HTTP API endpoint for fetching addresses.
+    ///
+    /// The HTTP API endpoint is derived from the cache endpoint by adding
+    /// the `api.` prefix. For example:
+    /// - Cache endpoint: `cache.cell-4-us-west-2-1.prod.a.momentohq.com`
+    /// - HTTP endpoint: `api.cache.cell-4-us-west-2-1.prod.a.momentohq.com`
+    pub fn http_endpoint(&self) -> String {
+        let host = self.host();
+        format!("api.{}", host)
+    }
+
     /// Get the port based on wire format.
     ///
     /// If an explicit port is specified in the endpoint, that port is used.
@@ -295,6 +306,22 @@ mod tests {
         assert_eq!(cred.host(), "cache.example.com");
         assert_eq!(cred.port(), 443);
         assert_eq!(cred.wire_format(), WireFormat::Grpc); // Default
+    }
+
+    #[test]
+    fn test_credential_http_endpoint() {
+        let cred =
+            Credential::with_endpoint("token", "cache.cell-4-us-west-2-1.prod.a.momentohq.com");
+        assert_eq!(
+            cred.http_endpoint(),
+            "api.cache.cell-4-us-west-2-1.prod.a.momentohq.com"
+        );
+    }
+
+    #[test]
+    fn test_credential_http_endpoint_with_port() {
+        let cred = Credential::with_endpoint("token", "cache.example.com:443");
+        assert_eq!(cred.http_endpoint(), "api.cache.example.com");
     }
 
     #[test]

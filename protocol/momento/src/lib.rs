@@ -41,6 +41,7 @@
 
 mod client;
 mod credential;
+mod endpoints;
 mod error;
 pub mod proto;
 mod server;
@@ -48,6 +49,7 @@ pub mod transport;
 
 pub use client::{CacheClient, CacheValue, CompletedOp, PendingDelete, PendingGet, PendingSet};
 pub use credential::Credential;
+pub use endpoints::{Addresses, EndpointsFetcher};
 pub use error::{Error, Result};
 pub use server::{CacheRequest, CacheResponse, CacheServer, CacheServerBuilder, CacheServerEvent};
 

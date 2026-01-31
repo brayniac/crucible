@@ -48,8 +48,14 @@ cache_name = "default-cache"
 # TTL for SET operations in seconds
 ttl_seconds = 3600
 # Optional: override MOMENTO_ENDPOINT env var
-#endpoint = "api.cache.cell-4-us-west-2-1.prod.a.momentohq.com"
+#endpoint = "cache.cell-4-us-west-2-1.prod.a.momentohq.com"
+# Wire format: "grpc" (default) or "protosocket"
 #wire_format = "protosocket"
+# Use private endpoints (VPC endpoints) instead of public endpoints
+#use_private_endpoints = true
+# Availability zone for filtering private endpoints (e.g., "usw2-az1")
+# Can also be set via MOMENTO_AZ environment variable
+#availability_zone = "usw2-az1"
 
 [timestamps]
 enabled = true

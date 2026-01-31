@@ -433,6 +433,15 @@ pub struct Momento {
     /// Wire format (grpc or protosocket).
     #[serde(default)]
     pub wire_format: MomentoWireFormat,
+    /// Use private endpoints (VPC endpoints) instead of public endpoints.
+    /// When enabled, fetches endpoint addresses from Momento's HTTP API.
+    #[serde(default)]
+    pub use_private_endpoints: bool,
+    /// Availability zone ID for filtering private endpoints (e.g., "usw2-az1").
+    /// Can also be set via MOMENTO_AZ environment variable.
+    /// If not specified, uses all available endpoints.
+    #[serde(default)]
+    pub availability_zone: Option<String>,
 }
 
 impl Default for Momento {
@@ -442,6 +451,8 @@ impl Default for Momento {
             endpoint: None,
             ttl_seconds: default_momento_ttl(),
             wire_format: MomentoWireFormat::default(),
+            use_private_endpoints: false,
+            availability_zone: None,
         }
     }
 }
