@@ -1,6 +1,6 @@
 use super::AppState;
 use super::plot::*;
-use super::tsdb::*;
+use metriken_query::tsdb::*;
 use std::sync::Arc;
 
 mod cache;

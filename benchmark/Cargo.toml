@@ -21,6 +21,7 @@ protocol-momento = { workspace = true }
 metrics = { workspace = true }
 metriken = { workspace = true }
 metriken-exposition = { version = "0.12", features = ["parquet"] }
+metriken-query = { version = "0.1", features = ["http"] }
 
 # Configuration
 toml = { workspace = true }
@@ -66,7 +67,6 @@ include_dir = "0.7"
 open = "5"
 ringlog = "0.7"
 http = "1"
-promql-parser = "0.4"
 
 [features]
 default = ["io_uring"]

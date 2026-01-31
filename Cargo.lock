@@ -441,9 +441,9 @@ dependencies = [
  "metrics",
  "metriken",
  "metriken-exposition",
+ "metriken-query",
  "open",
  "parquet",
- "promql-parser",
  "protocol-memcache",
  "protocol-momento",
  "protocol-ping",
@@ -1669,6 +1669,22 @@ dependencies = [
  "parquet",
  "rmp-serde",
  "serde",
+]
+
+[[package]]
+name = "metriken-query"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3989ee00ec5d62b5991d9cfc0594f4c164fe4b829cbb8f64216af88972a171c"
+dependencies = [
+ "arrow",
+ "axum",
+ "histogram",
+ "parquet",
+ "promql-parser",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

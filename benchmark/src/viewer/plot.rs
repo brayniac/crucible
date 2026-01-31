@@ -1,4 +1,4 @@
-use super::tsdb::*;
+use metriken_query::tsdb::*;
 use serde::Serialize;
 use std::sync::Arc;
 

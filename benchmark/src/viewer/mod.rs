@@ -20,11 +20,8 @@ static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/viewer/assets");
 
 mod dashboard;
 mod plot;
-pub mod promql;
-pub mod tsdb;
 
-use promql::QueryEngine;
-use tsdb::*;
+use metriken_query::{QueryEngine, Tsdb};
 
 #[derive(Parser, Debug)]
 #[command(name = "view")]
@@ -191,7 +188,7 @@ fn app(livereload: LiveReloadLayer, state: AppState) -> Router {
         .route("/about", get(about))
         .route("/data/{path}", get(data))
         .with_state(state.clone())
-        .merge(promql::routes(state.query_engine.clone()));
+        .merge(metriken_query::promql::routes(state.query_engine.clone()));
 
     let router = router
         .route("/", get(index))
