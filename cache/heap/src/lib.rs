@@ -193,6 +193,8 @@ pub struct HeapCache {
     disk_pool_id: u8,
     /// Frequency threshold for promoting items from disk to RAM.
     promotion_threshold: u8,
+    /// Whether data structures (hash, list, set) are enabled.
+    data_structures_enabled: bool,
 }
 
 impl HeapCache {
@@ -1087,6 +1089,11 @@ impl HeapCache {
         self.bytes_limit
     }
 
+    /// Check if data structures (hash, list, set) are enabled.
+    pub fn data_structures_enabled(&self) -> bool {
+        self.data_structures_enabled
+    }
+
     /// Get the tracked bytes used (not including fragmentation estimate).
     pub fn bytes_used(&self) -> usize {
         self.bytes_used.load(Ordering::Relaxed)
@@ -1582,6 +1589,9 @@ impl HashCache for HeapCache {
         value: &[u8],
         ttl: Option<Duration>,
     ) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         let ttl = ttl.unwrap_or(self.default_ttl);
         let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
 
@@ -1607,6 +1617,9 @@ impl HashCache for HeapCache {
         fields: &[(&[u8], &[u8])],
         ttl: Option<Duration>,
     ) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         let ttl = ttl.unwrap_or(self.default_ttl);
         let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
 
@@ -1632,6 +1645,9 @@ impl HashCache for HeapCache {
     }
 
     fn hget(&self, key: &[u8], field: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => Ok(self.hash_storage.hget(idx, generation, field)),
             None => Ok(None),
@@ -1639,6 +1655,9 @@ impl HashCache for HeapCache {
     }
 
     fn hmget(&self, key: &[u8], fields: &[&[u8]]) -> CacheResult<Vec<Option<Vec<u8>>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => {
                 let results: Vec<Option<Vec<u8>>> = fields
@@ -1652,6 +1671,9 @@ impl HashCache for HeapCache {
     }
 
     fn hgetall(&self, key: &[u8]) -> CacheResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => Ok(self
                 .hash_storage
@@ -1662,6 +1684,9 @@ impl HashCache for HeapCache {
     }
 
     fn hdel(&self, key: &[u8], fields: &[&[u8]]) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => {
                 let (deleted, bytes_freed) = self
@@ -1683,6 +1708,9 @@ impl HashCache for HeapCache {
     }
 
     fn hexists(&self, key: &[u8], field: &[u8]) -> CacheResult<bool> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => Ok(self
                 .hash_storage
@@ -1693,6 +1721,9 @@ impl HashCache for HeapCache {
     }
 
     fn hlen(&self, key: &[u8]) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => Ok(self.hash_storage.hlen(idx, generation).unwrap_or(0)),
             None => Ok(0),
@@ -1700,6 +1731,9 @@ impl HashCache for HeapCache {
     }
 
     fn hkeys(&self, key: &[u8]) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => {
                 Ok(self.hash_storage.hkeys(idx, generation).unwrap_or_default())
@@ -1709,6 +1743,9 @@ impl HashCache for HeapCache {
     }
 
     fn hvals(&self, key: &[u8]) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Hash)? {
             Some((idx, generation)) => {
                 Ok(self.hash_storage.hvals(idx, generation).unwrap_or_default())
@@ -1724,6 +1761,9 @@ impl HashCache for HeapCache {
         value: &[u8],
         ttl: Option<Duration>,
     ) -> CacheResult<bool> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         let ttl = ttl.unwrap_or(self.default_ttl);
         let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
 
@@ -1745,6 +1785,9 @@ impl HashCache for HeapCache {
     }
 
     fn hincrby(&self, key: &[u8], field: &[u8], delta: i64) -> CacheResult<i64> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         let ttl = self.default_ttl;
         let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
 
@@ -1783,6 +1826,9 @@ impl HashCache for HeapCache {
 
 impl ListCache for HeapCache {
     fn lpush(&self, key: &[u8], values: &[&[u8]], ttl: Option<Duration>) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         let ttl = ttl.unwrap_or(self.default_ttl);
         let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::List, ttl)?;
 
@@ -1796,6 +1842,9 @@ impl ListCache for HeapCache {
     }
 
     fn rpush(&self, key: &[u8], values: &[&[u8]], ttl: Option<Duration>) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         let ttl = ttl.unwrap_or(self.default_ttl);
         let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::List, ttl)?;
 
@@ -1809,6 +1858,9 @@ impl ListCache for HeapCache {
     }
 
     fn lpop(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => {
                 let result = self.list_storage.lpop(idx, generation);
@@ -1826,6 +1878,9 @@ impl ListCache for HeapCache {
     }
 
     fn rpop(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => {
                 let result = self.list_storage.rpop(idx, generation);
@@ -1843,6 +1898,9 @@ impl ListCache for HeapCache {
     }
 
     fn lpop_count(&self, key: &[u8], count: usize) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => {
                 let (result, bytes_freed) = self
@@ -1863,6 +1921,9 @@ impl ListCache for HeapCache {
     }
 
     fn rpop_count(&self, key: &[u8], count: usize) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => {
                 let (result, bytes_freed) = self
@@ -1883,6 +1944,9 @@ impl ListCache for HeapCache {
     }
 
     fn lrange(&self, key: &[u8], start: i64, stop: i64) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => Ok(self
                 .list_storage
@@ -1893,6 +1957,9 @@ impl ListCache for HeapCache {
     }
 
     fn llen(&self, key: &[u8]) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => Ok(self.list_storage.llen(idx, generation).unwrap_or(0)),
             None => Ok(0),
@@ -1900,6 +1967,9 @@ impl ListCache for HeapCache {
     }
 
     fn lindex(&self, key: &[u8], index: i64) -> CacheResult<Option<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => Ok(self.list_storage.lindex(idx, generation, index)),
             None => Ok(None),
@@ -1907,6 +1977,9 @@ impl ListCache for HeapCache {
     }
 
     fn lset(&self, key: &[u8], index: i64, value: &[u8]) -> CacheResult<()> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => {
                 match self.list_storage.lset(idx, generation, index, value) {
@@ -1920,6 +1993,9 @@ impl ListCache for HeapCache {
     }
 
     fn ltrim(&self, key: &[u8], start: i64, stop: i64) -> CacheResult<()> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => {
                 self.list_storage.ltrim(idx, generation, start, stop);
@@ -1934,6 +2010,9 @@ impl ListCache for HeapCache {
     }
 
     fn lpushx(&self, key: &[u8], values: &[&[u8]]) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => match self.list_storage.lpush(idx, generation, values) {
                 Some((len, bytes_added)) => {
@@ -1947,6 +2026,9 @@ impl ListCache for HeapCache {
     }
 
     fn rpushx(&self, key: &[u8], values: &[&[u8]]) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::List)? {
             Some((idx, generation)) => match self.list_storage.rpush(idx, generation, values) {
                 Some((len, bytes_added)) => {
@@ -1962,6 +2044,9 @@ impl ListCache for HeapCache {
 
 impl SetCache for HeapCache {
     fn sadd(&self, key: &[u8], members: &[&[u8]], ttl: Option<Duration>) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         let ttl = ttl.unwrap_or(self.default_ttl);
         let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Set, ttl)?;
 
@@ -1977,6 +2062,9 @@ impl SetCache for HeapCache {
     }
 
     fn srem(&self, key: &[u8], members: &[&[u8]]) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => {
                 let (removed, bytes_freed) = self
@@ -1997,6 +2085,9 @@ impl SetCache for HeapCache {
     }
 
     fn smembers(&self, key: &[u8]) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => Ok(self
                 .set_storage
@@ -2007,6 +2098,9 @@ impl SetCache for HeapCache {
     }
 
     fn sismember(&self, key: &[u8], member: &[u8]) -> CacheResult<bool> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => Ok(self
                 .set_storage
@@ -2017,6 +2111,9 @@ impl SetCache for HeapCache {
     }
 
     fn smismember(&self, key: &[u8], members: &[&[u8]]) -> CacheResult<Vec<bool>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => Ok(self
                 .set_storage
@@ -2027,6 +2124,9 @@ impl SetCache for HeapCache {
     }
 
     fn scard(&self, key: &[u8]) -> CacheResult<usize> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => Ok(self.set_storage.scard(idx, generation).unwrap_or(0)),
             None => Ok(0),
@@ -2034,6 +2134,9 @@ impl SetCache for HeapCache {
     }
 
     fn spop(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => {
                 let result = self.set_storage.spop(idx, generation);
@@ -2051,6 +2154,9 @@ impl SetCache for HeapCache {
     }
 
     fn spop_count(&self, key: &[u8], count: usize) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => {
                 let (result, bytes_freed) = self
@@ -2071,6 +2177,9 @@ impl SetCache for HeapCache {
     }
 
     fn srandmember(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => Ok(self.set_storage.srandmember(idx, generation)),
             None => Ok(None),
@@ -2078,6 +2187,9 @@ impl SetCache for HeapCache {
     }
 
     fn srandmember_count(&self, key: &[u8], count: i64) -> CacheResult<Vec<Vec<u8>>> {
+        if !self.data_structures_enabled {
+            return Err(CacheError::Unsupported);
+        }
         match self.lookup_typed(key, ValueType::Set)? {
             Some((idx, generation)) => {
                 let members = self
@@ -2173,6 +2285,7 @@ pub struct HeapCacheBuilder {
     disk_tier: Option<DiskTierConfig>,
     ram_pool_id: u8,
     disk_pool_id: u8,
+    data_structures: bool,
 }
 
 impl Default for HeapCacheBuilder {
@@ -2195,6 +2308,7 @@ impl HeapCacheBuilder {
             disk_tier: None,
             ram_pool_id: 0,
             disk_pool_id: 2,
+            data_structures: false, // Disabled by default for mixed protocol compatibility
         }
     }
 
@@ -2273,6 +2387,16 @@ impl HeapCacheBuilder {
         self
     }
 
+    /// Enable Redis-compatible data structures (hash, list, set).
+    ///
+    /// When enabled, the cache supports HSET/HGET, LPUSH/LPOP, SADD/SREM
+    /// and other data structure commands. Disabled by default for
+    /// compatibility with mixed RESP/Memcache protocol deployments.
+    pub fn data_structures(mut self, enabled: bool) -> Self {
+        self.data_structures = enabled;
+        self
+    }
+
     /// Enable disk tier with the given configuration.
     ///
     /// When enabled, items evicted from RAM are demoted to disk storage
@@ -2322,9 +2446,13 @@ impl HeapCacheBuilder {
             None => (None, 2),
         };
 
-        // Complex type storage uses a portion of the slot capacity
-        // This is a heuristic - can be tuned via builder in future
-        let complex_type_capacity = slot_capacity / 4;
+        // Complex type storage capacity - only allocate when enabled
+        // Use minimal capacity (1) when disabled to avoid changing storage assertions
+        let complex_type_capacity = if self.data_structures {
+            slot_capacity / 4
+        } else {
+            1 // Minimal allocation when disabled
+        };
 
         Ok(HeapCache {
             hashtable: Arc::new(MultiChoiceHashtable::new(self.hashtable_power)),
@@ -2344,6 +2472,7 @@ impl HeapCacheBuilder {
             ram_pool_id: self.ram_pool_id,
             disk_pool_id: self.disk_pool_id,
             promotion_threshold,
+            data_structures_enabled: self.data_structures,
         })
     }
 }
@@ -2357,6 +2486,7 @@ mod tests {
             .memory_limit(1024 * 1024) // 1MB
             .hashtable_power(10) // 2^10 = 1024 slots
             .initial_fragmentation_ratio(100) // No fragmentation for predictable tests
+            .data_structures(true) // Enable hash/list/set support
             .build()
             .expect("Failed to create test cache")
     }
@@ -3050,5 +3180,56 @@ mod tests {
 
         // Non-existent
         assert_eq!(cache.key_type(b"nonexistent"), None);
+    }
+
+    #[test]
+    fn test_data_structures_disabled() {
+        // Create cache with data structures disabled
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(1024 * 1024)
+            .hashtable_power(10)
+            .data_structures(false)
+            .build()
+            .expect("Failed to create cache");
+
+        // String operations should still work
+        cache.set(b"key", b"value", None).unwrap();
+        assert!(cache.get(b"key").is_some());
+
+        // Hash operations should return Unsupported
+        assert!(matches!(
+            cache.hset(b"hash", b"f", b"v", None),
+            Err(CacheError::Unsupported)
+        ));
+        assert!(matches!(
+            cache.hget(b"hash", b"f"),
+            Err(CacheError::Unsupported)
+        ));
+
+        // List operations should return Unsupported
+        assert!(matches!(
+            cache.lpush(b"list", &[b"v"], None),
+            Err(CacheError::Unsupported)
+        ));
+        assert!(matches!(cache.lpop(b"list"), Err(CacheError::Unsupported)));
+
+        // Set operations should return Unsupported
+        assert!(matches!(
+            cache.sadd(b"set", &[b"m"], None),
+            Err(CacheError::Unsupported)
+        ));
+        assert!(matches!(
+            cache.smembers(b"set"),
+            Err(CacheError::Unsupported)
+        ));
+
+        // Check the getter
+        assert!(!cache.data_structures_enabled());
+    }
+
+    #[test]
+    fn test_data_structures_enabled_getter() {
+        let cache = create_test_cache();
+        assert!(cache.data_structures_enabled());
     }
 }
