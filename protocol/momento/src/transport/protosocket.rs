@@ -189,6 +189,12 @@ impl<T: Transport> ProtosocketTransport<T> {
                             Some(v) => Ok(CacheValue::Hit(v)),
                             None => Ok(CacheValue::Miss),
                         },
+                        // Momento returns NotFound error for cache misses in protosocket
+                        CacheResponseResult::Error(ref err)
+                            if err.code == crate::proto::StatusCode::NotFound =>
+                        {
+                            Ok(CacheValue::Miss)
+                        }
                         CacheResponseResult::Error(err) => Err(Error::Protocol(format!(
                             "{}: {}",
                             err.code as u32, err.message
@@ -646,7 +652,8 @@ mod tests {
     }
 
     #[test]
-    fn test_protosocket_transport_error_response() {
+    fn test_protosocket_transport_get_notfound_as_miss() {
+        // Momento's protosocket returns NotFound error for cache misses
         let transport = PlainTransport::new();
         let mut ps = ProtosocketTransport::new(transport, "token".to_string());
 
@@ -659,12 +666,44 @@ mod tests {
         let request_id = ps.get("cache", b"key").unwrap();
         ps.advance_send(ps.pending_send().len());
 
-        // Simulate error response
+        // Simulate NotFound error (which should be treated as cache miss)
         let error_response =
             CacheResponse::error(request_id.value(), StatusCode::NotFound, "key not found");
         let _ = ps.on_recv(&error_response.encode_length_delimited());
 
-        // Poll for result
+        // Poll for result - should be a successful miss, not an error
+        let results = ps.poll();
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            TransportResult::Get { result, .. } => {
+                assert!(result.is_ok());
+                assert!(result.as_ref().unwrap().is_miss());
+            }
+            _ => panic!("expected Get"),
+        }
+    }
+
+    #[test]
+    fn test_protosocket_transport_get_other_error() {
+        // Other errors (not NotFound) should still be errors
+        let transport = PlainTransport::new();
+        let mut ps = ProtosocketTransport::new(transport, "token".to_string());
+
+        // Auth flow
+        let _ = ps.on_transport_ready();
+        let _ = ps.on_recv(&CacheResponse::authenticate(1).encode_length_delimited());
+        ps.advance_send(ps.pending_send().len());
+
+        // Send get
+        let request_id = ps.get("cache", b"key").unwrap();
+        ps.advance_send(ps.pending_send().len());
+
+        // Simulate a real error (not NotFound)
+        let error_response =
+            CacheResponse::error(request_id.value(), StatusCode::Internal, "server error");
+        let _ = ps.on_recv(&error_response.encode_length_delimited());
+
+        // Poll for result - should be an error
         let results = ps.poll();
         assert_eq!(results.len(), 1);
         match &results[0] {
