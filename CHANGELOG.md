@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.8] - 2026-01-31
+
+### Fixed
+- Momento protosocket now correctly handles cache misses (NotFound error treated as miss, not error)
+- Rustdoc warnings for unescaped brackets in RESP command doc comments
+
 ## [0.2.7] - 2026-01-31
 
 ### Added
