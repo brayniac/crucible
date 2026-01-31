@@ -520,7 +520,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         }
         RespCommand::HMGet { key, fields } => {
             GETS.increment();
-            let field_refs: Vec<&[u8]> = fields.iter().copied().collect();
+            let field_refs: Vec<&[u8]> = fields.to_vec();
             match cache.hmget(key, &field_refs) {
                 Ok(values) => {
                     write_buf.extend_from_slice(b"*");
@@ -585,7 +585,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         }
         RespCommand::HDel { key, fields } => {
             DELETES.increment();
-            let field_refs: Vec<&[u8]> = fields.iter().copied().collect();
+            let field_refs: Vec<&[u8]> = fields.to_vec();
             match cache.hdel(key, &field_refs) {
                 Ok(count) => {
                     write_buf.extend_from_slice(b":");
@@ -722,7 +722,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         // ====================================================================
         RespCommand::LPush { key, values } => {
             SETS.increment();
-            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            let val_refs: Vec<&[u8]> = values.to_vec();
             match cache.lpush(key, &val_refs, None) {
                 Ok(len) => {
                     write_buf.extend_from_slice(b":");
@@ -742,7 +742,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         }
         RespCommand::RPush { key, values } => {
             SETS.increment();
-            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            let val_refs: Vec<&[u8]> = values.to_vec();
             match cache.rpush(key, &val_refs, None) {
                 Ok(len) => {
                     write_buf.extend_from_slice(b":");
@@ -979,7 +979,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         },
         RespCommand::LPushX { key, values } => {
             SETS.increment();
-            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            let val_refs: Vec<&[u8]> = values.to_vec();
             match cache.lpushx(key, &val_refs) {
                 Ok(len) => {
                     write_buf.extend_from_slice(b":");
@@ -999,7 +999,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         }
         RespCommand::RPushX { key, values } => {
             SETS.increment();
-            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            let val_refs: Vec<&[u8]> = values.to_vec();
             match cache.rpushx(key, &val_refs) {
                 Ok(len) => {
                     write_buf.extend_from_slice(b":");
@@ -1023,7 +1023,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         // ====================================================================
         RespCommand::SAdd { key, members } => {
             SETS.increment();
-            let member_refs: Vec<&[u8]> = members.iter().copied().collect();
+            let member_refs: Vec<&[u8]> = members.to_vec();
             match cache.sadd(key, &member_refs, None) {
                 Ok(count) => {
                     write_buf.extend_from_slice(b":");
@@ -1043,7 +1043,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
         }
         RespCommand::SRem { key, members } => {
             DELETES.increment();
-            let member_refs: Vec<&[u8]> = members.iter().copied().collect();
+            let member_refs: Vec<&[u8]> = members.to_vec();
             match cache.srem(key, &member_refs) {
                 Ok(count) => {
                     write_buf.extend_from_slice(b":");
@@ -1101,7 +1101,7 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
             }
         },
         RespCommand::SMisMember { key, members } => {
-            let member_refs: Vec<&[u8]> = members.iter().copied().collect();
+            let member_refs: Vec<&[u8]> = members.to_vec();
             match cache.smismember(key, &member_refs) {
                 Ok(results) => {
                     write_buf.extend_from_slice(b"*");

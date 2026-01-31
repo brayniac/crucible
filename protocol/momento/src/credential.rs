@@ -171,10 +171,10 @@ impl Credential {
     /// - Port 9004 for Protosocket (TLS without HTTP/2)
     pub fn port(&self) -> u16 {
         // Check for explicit port in endpoint
-        if let Some(port_str) = self.endpoint.split(':').nth(1) {
-            if let Ok(port) = port_str.parse() {
-                return port;
-            }
+        if let Some(port_str) = self.endpoint.split(':').nth(1)
+            && let Ok(port) = port_str.parse()
+        {
+            return port;
         }
 
         // Default port based on wire format

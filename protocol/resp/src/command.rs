@@ -620,7 +620,7 @@ impl<'a> Command<'a> {
             }
 
             _ if cmd_str.eq_ignore_ascii_case("lpop") => {
-                if count < 2 || count > 3 {
+                if !(2..=3).contains(&count) {
                     return Err(ParseError::WrongArity(
                         "LPOP requires 1 or 2 arguments".to_string(),
                     ));
@@ -645,7 +645,7 @@ impl<'a> Command<'a> {
             }
 
             _ if cmd_str.eq_ignore_ascii_case("rpop") => {
-                if count < 2 || count > 3 {
+                if !(2..=3).contains(&count) {
                     return Err(ParseError::WrongArity(
                         "RPOP requires 1 or 2 arguments".to_string(),
                     ));
@@ -861,7 +861,7 @@ impl<'a> Command<'a> {
             }
 
             _ if cmd_str.eq_ignore_ascii_case("spop") => {
-                if count < 2 || count > 3 {
+                if !(2..=3).contains(&count) {
                     return Err(ParseError::WrongArity(
                         "SPOP requires 1 or 2 arguments".to_string(),
                     ));
@@ -886,7 +886,7 @@ impl<'a> Command<'a> {
             }
 
             _ if cmd_str.eq_ignore_ascii_case("srandmember") => {
-                if count < 2 || count > 3 {
+                if !(2..=3).contains(&count) {
                     return Err(ParseError::WrongArity(
                         "SRANDMEMBER requires 1 or 2 arguments".to_string(),
                     ));

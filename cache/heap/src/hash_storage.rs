@@ -59,10 +59,13 @@ struct HashSlotData {
     cas_token: u64,
 }
 
+/// Type alias for hash field storage (field -> value).
+type HashFieldVec = SmallVec<[(Box<[u8]>, Box<[u8]>); SMALL_HASH_THRESHOLD]>;
+
 /// Hash fields storage - either small (SmallVec) or large (HashMap).
 enum HashFields {
     /// Small hash with up to 8 fields inline.
-    Small(SmallVec<[(Box<[u8]>, Box<[u8]>); SMALL_HASH_THRESHOLD]>),
+    Small(Box<HashFieldVec>),
     /// Large hash using HashMap for O(1) lookup.
     Large(HashMap<Box<[u8]>, Box<[u8]>>),
 }
@@ -70,7 +73,7 @@ enum HashFields {
 impl HashFields {
     /// Create a new empty hash fields storage.
     fn new() -> Self {
-        HashFields::Small(SmallVec::new())
+        HashFields::Small(Box::new(SmallVec::new()))
     }
 
     /// Get a field value.
@@ -100,8 +103,7 @@ impl HashFields {
                     true
                 } else {
                     // Upgrade to large
-                    let mut map: HashMap<Box<[u8]>, Box<[u8]>> =
-                        vec.drain(..).map(|(f, v)| (f, v)).collect();
+                    let mut map: HashMap<Box<[u8]>, Box<[u8]>> = vec.drain(..).collect();
                     map.insert(field.into(), value.into());
                     *self = HashFields::Large(map);
                     true
@@ -361,7 +363,7 @@ impl HashStorage {
         cas_token: u64,
     ) -> Option<u16> {
         let slot = self.get(idx)?;
-        let expire_at = ttl.map(|d| expire_timestamp(d)).unwrap_or(0);
+        let expire_at = ttl.map(expire_timestamp).unwrap_or(0);
 
         let data = HashSlotData {
             key: key.into(),
@@ -629,7 +631,7 @@ fn unpack_head(packed: u64) -> (u32, u32) {
 fn expire_timestamp(ttl: Duration) -> u32 {
     use clocksource::coarse::UnixInstant;
     let now = UnixInstant::now();
-    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs() as u32;
+    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs();
     now_secs.saturating_add(ttl.as_secs() as u32)
 }
 
@@ -637,7 +639,7 @@ fn expire_timestamp(ttl: Duration) -> u32 {
 fn is_expired(expire_at: u32) -> bool {
     use clocksource::coarse::UnixInstant;
     let now = UnixInstant::now();
-    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs() as u32;
+    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs();
     now_secs >= expire_at
 }
 

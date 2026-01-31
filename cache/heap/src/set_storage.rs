@@ -59,10 +59,13 @@ struct SetSlotData {
     cas_token: u64,
 }
 
+/// Type alias for set member storage.
+type SetMemberVec = SmallVec<[Box<[u8]>; SMALL_SET_THRESHOLD]>;
+
 /// Set members storage - either small (sorted SmallVec) or large (HashSet).
 enum SetMembers {
     /// Small set with up to 16 members inline, sorted for binary search.
-    Small(SmallVec<[Box<[u8]>; SMALL_SET_THRESHOLD]>),
+    Small(Box<SetMemberVec>),
     /// Large set using HashSet for O(1) lookup.
     Large(HashSet<Box<[u8]>>),
 }
@@ -70,7 +73,7 @@ enum SetMembers {
 impl SetMembers {
     /// Create a new empty set members storage.
     fn new() -> Self {
-        SetMembers::Small(SmallVec::new())
+        SetMembers::Small(Box::new(SmallVec::new()))
     }
 
     /// Add a member. Returns true if the member was newly added.
@@ -366,7 +369,7 @@ impl SetStorage {
         cas_token: u64,
     ) -> Option<u16> {
         let slot = self.get(idx)?;
-        let expire_at = ttl.map(|d| expire_timestamp(d)).unwrap_or(0);
+        let expire_at = ttl.map(expire_timestamp).unwrap_or(0);
 
         let data = SetSlotData {
             key: key.into(),
@@ -654,7 +657,7 @@ fn unpack_head(packed: u64) -> (u32, u32) {
 fn expire_timestamp(ttl: Duration) -> u32 {
     use clocksource::coarse::UnixInstant;
     let now = UnixInstant::now();
-    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs() as u32;
+    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs();
     now_secs.saturating_add(ttl.as_secs() as u32)
 }
 
@@ -662,7 +665,7 @@ fn expire_timestamp(ttl: Duration) -> u32 {
 fn is_expired(expire_at: u32) -> bool {
     use clocksource::coarse::UnixInstant;
     let now = UnixInstant::now();
-    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs() as u32;
+    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs();
     now_secs >= expire_at
 }
 

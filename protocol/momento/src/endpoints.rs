@@ -54,12 +54,11 @@ impl Addresses {
     /// If `az_id` is provided, returns only addresses in that zone.
     /// If no addresses exist for that zone (or az_id is None), returns all addresses.
     pub fn for_az(&self, az_id: Option<&str>) -> Vec<SocketAddr> {
-        if let Some(az) = az_id {
-            if let Some(addrs) = self.azs.get(az) {
-                if !addrs.is_empty() {
-                    return addrs.clone();
-                }
-            }
+        if let Some(az) = az_id
+            && let Some(addrs) = self.azs.get(az)
+            && !addrs.is_empty()
+        {
+            return addrs.clone();
         }
         // Return all addresses from all AZs
         self.azs.values().flatten().copied().collect()
@@ -364,7 +363,7 @@ impl EndpointsFetcher {
                         }
                     }
                     ConnectionEvent::Error(e) => {
-                        return Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", e)));
+                        return Err(io::Error::other(format!("{:?}", e)));
                     }
                     _ => {}
                 }
@@ -386,13 +385,10 @@ impl EndpointsFetcher {
             .unwrap_or(b"0");
 
         if status != b"200" {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "HTTP {} from endpoints API",
-                    String::from_utf8_lossy(status)
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "HTTP {} from endpoints API",
+                String::from_utf8_lossy(status)
+            )));
         }
 
         // Parse JSON response

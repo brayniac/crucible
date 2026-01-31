@@ -88,10 +88,7 @@ impl MomentoSession {
         let private_addresses = if config.momento.use_private_endpoints {
             let fetcher = EndpointsFetcher::new(&credential, true);
             let addresses = fetcher.fetch().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to fetch private endpoints: {}", e),
-                )
+                io::Error::other(format!("failed to fetch private endpoints: {}", e))
             })?;
 
             // Get AZ from config or environment variable

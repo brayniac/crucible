@@ -229,7 +229,7 @@ impl ListStorage {
         cas_token: u64,
     ) -> Option<u16> {
         let slot = self.get(idx)?;
-        let expire_at = ttl.map(|d| expire_timestamp(d)).unwrap_or(0);
+        let expire_at = ttl.map(expire_timestamp).unwrap_or(0);
 
         let data = ListSlotData {
             key: key.into(),
@@ -630,7 +630,7 @@ fn unpack_head(packed: u64) -> (u32, u32) {
 fn expire_timestamp(ttl: Duration) -> u32 {
     use clocksource::coarse::UnixInstant;
     let now = UnixInstant::now();
-    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs() as u32;
+    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs();
     now_secs.saturating_add(ttl.as_secs() as u32)
 }
 
@@ -638,7 +638,7 @@ fn expire_timestamp(ttl: Duration) -> u32 {
 fn is_expired(expire_at: u32) -> bool {
     use clocksource::coarse::UnixInstant;
     let now = UnixInstant::now();
-    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs() as u32;
+    let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs();
     now_secs >= expire_at
 }
 
