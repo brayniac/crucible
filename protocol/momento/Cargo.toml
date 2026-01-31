@@ -1,6 +1,6 @@
 [package]
 name = "protocol-momento"
-version = "0.2.7-alpha.0"
+version = "0.2.7"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true

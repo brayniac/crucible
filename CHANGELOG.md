@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.7] - 2026-01-31
+
+### Added
+- Momento private endpoints support for VPC connectivity
+- Heap cache backend now supports Redis-compatible data structures (hashes, lists, sets)
+- Configurable toggle for heap cache data structures
+
+### Changed
+- Viewer now uses metriken-query crate for TSDB and PromQL support
+
+### Fixed
+- Momento protosocket port and endpoint prefix configuration
+- Various clippy warnings for Rust 1.92
+
 ## [0.2.6] - 2026-01-30
 
 ### Fixed
