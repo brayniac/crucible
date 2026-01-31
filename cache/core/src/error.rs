@@ -63,6 +63,10 @@ pub enum CacheError {
 
     /// Operation would cause numeric overflow.
     Overflow,
+
+    /// Wrong type: operation attempted on incompatible data type.
+    /// E.g., running HSET on a string key.
+    WrongType,
 }
 
 impl fmt::Display for CacheError {
@@ -87,6 +91,12 @@ impl fmt::Display for CacheError {
             Self::Unsupported => write!(f, "operation not supported"),
             Self::NotNumeric => write!(f, "value is not numeric"),
             Self::Overflow => write!(f, "numeric overflow"),
+            Self::WrongType => {
+                write!(
+                    f,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value"
+                )
+            }
         }
     }
 }

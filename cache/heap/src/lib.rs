@@ -66,13 +66,17 @@
 
 mod entry;
 mod fifo_queue;
+mod hash_storage;
+mod list_storage;
 mod location;
 mod s3fifo_policy;
+mod set_storage;
 mod slot;
 mod storage;
 mod sync;
 mod verifier;
 
+pub use location::ValueType;
 pub use s3fifo_policy::S3FifoPolicy;
 
 // Re-export from cache-core for disk tier configuration
@@ -88,15 +92,18 @@ use sync::{Arc, AtomicU32, AtomicU64, Ordering};
 use std::sync::atomic::AtomicUsize;
 
 use cache_core::{
-    Cache, CacheError, CacheResult, DEFAULT_TTL, DiskLayer, DiskLayerBuilder, Hashtable, ItemGuard,
-    Layer, MultiChoiceHashtable, OwnedGuard, ValueRef,
+    Cache, CacheError, CacheResult, DEFAULT_TTL, DiskLayer, DiskLayerBuilder, HashCache, Hashtable,
+    ItemGuard, Layer, ListCache, MultiChoiceHashtable, OwnedGuard, SetCache, ValueRef,
 };
 use std::path::PathBuf;
 
 use entry::HeapEntry;
-use location::SlotLocation;
+use hash_storage::HashStorage;
+use list_storage::ListStorage;
+use location::{SlotLocation, TypedLocation};
+use set_storage::SetStorage;
 use storage::SlotStorage;
-use verifier::{HeapCacheVerifier, HeapTieredVerifier};
+use verifier::{HeapCacheVerifier, HeapTieredVerifier, MultiTypeVerifier};
 
 /// Number of random slots to sample when selecting an eviction victim.
 const EVICTION_SAMPLES: usize = 5;
@@ -150,8 +157,14 @@ enum EvictionState {
 pub struct HeapCache {
     /// The hashtable for key lookups.
     hashtable: Arc<MultiChoiceHashtable>,
-    /// Storage for slots containing heap-allocated entries.
+    /// Storage for slots containing heap-allocated string entries.
     storage: SlotStorage,
+    /// Storage for hash data structures.
+    hash_storage: HashStorage,
+    /// Storage for list data structures.
+    list_storage: ListStorage,
+    /// Storage for set data structures.
+    set_storage: SetStorage,
     /// Default TTL for items.
     default_ttl: Duration,
     /// Counter for pseudo-random eviction sampling.
@@ -778,8 +791,9 @@ impl HeapCache {
         // S3FifoPolicy::evict returns the Location to free
         // We don't create ghosts for heap cache (would need more state)
         if let Some(location) = policy.evict(self.hashtable.as_ref(), false) {
-            let slot_loc = SlotLocation::from_location(location);
-            self.deallocate_and_track(slot_loc);
+            // Use TypedLocation to handle all value types
+            let typed_loc = TypedLocation::from_location(location);
+            self.deallocate_typed_slot(typed_loc);
             return true;
         }
         false
@@ -787,51 +801,73 @@ impl HeapCache {
 
     /// Evict using approximate LFU via random sampling.
     ///
-    /// Samples EVICTION_SAMPLES random occupied slots and evicts the one
-    /// with the lowest frequency.
+    /// Samples EVICTION_SAMPLES random occupied slots across all storage types
+    /// and evicts the one with the lowest frequency.
     fn evict_lfu(&self) -> bool {
-        let capacity = self.storage.capacity() as u32;
-        if capacity == 0 {
+        let start = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Get occupancy counts for all storage types
+        let string_occupied = self.storage.occupied();
+        let hash_occupied = self.hash_storage.occupied();
+        let list_occupied = self.list_storage.occupied();
+        let set_occupied = self.set_storage.occupied();
+        let total_occupied = string_occupied + hash_occupied + list_occupied + set_occupied;
+
+        if total_occupied == 0 {
             return false;
         }
 
-        let start = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
-
-        let mut victim_slot_idx: Option<u32> = None;
         let mut victim_key: Option<Vec<u8>> = None;
+        let mut victim_type: Option<ValueType> = None;
         let mut victim_freq: u8 = u8::MAX;
         let mut samples_tried = 0;
 
-        for i in 0..(capacity.min(EVICTION_SAMPLES as u32 * 4)) {
-            let idx = (start.wrapping_mul(2654435761).wrapping_add(i)) % capacity;
+        // Sample across all storage types
+        for i in 0..(total_occupied.min(EVICTION_SAMPLES as u32 * 4)) {
+            let sample_idx = (start.wrapping_mul(2654435761).wrapping_add(i)) % total_occupied;
 
-            if !self.storage.is_slot_occupied(idx) {
-                continue;
-            }
-
-            let slot = match self.storage.get(idx) {
-                Some(s) => s,
-                None => continue,
+            // Determine which storage type this sample falls into
+            let (key, value_type) = if sample_idx < string_occupied {
+                // Sample from string storage
+                if let Some((k, _)) = self.sample_string_slot(start, i) {
+                    (k, ValueType::String)
+                } else {
+                    continue;
+                }
+            } else if sample_idx < string_occupied + hash_occupied {
+                // Sample from hash storage
+                if let Some((k, _)) = self.sample_hash_slot(start, i) {
+                    (k, ValueType::Hash)
+                } else {
+                    continue;
+                }
+            } else if sample_idx < string_occupied + hash_occupied + list_occupied {
+                // Sample from list storage
+                if let Some((k, _)) = self.sample_list_slot(start, i) {
+                    (k, ValueType::List)
+                } else {
+                    continue;
+                }
+            } else {
+                // Sample from set storage
+                if let Some((k, _)) = self.sample_set_slot(start, i) {
+                    (k, ValueType::Set)
+                } else {
+                    continue;
+                }
             };
 
-            let generation = slot.generation();
-            let entry = match slot.get(generation, false) {
-                Some(e) => e,
-                None => continue,
-            };
-
-            let key = entry.key().to_vec();
-            slot.release_read();
-
-            let location = SlotLocation::new(idx, generation).to_location();
+            // Look up frequency in hashtable
+            let verifier = self.multi_type_verifier();
             let freq = self
                 .hashtable
-                .get_item_frequency(&key, location)
+                .lookup(&key, &verifier)
+                .map(|(loc, _)| self.hashtable.get_item_frequency(&key, loc).unwrap_or(0))
                 .unwrap_or(0);
 
-            if victim_slot_idx.is_none() || freq < victim_freq {
-                victim_slot_idx = Some(idx);
+            if victim_key.is_none() || freq < victim_freq {
                 victim_key = Some(key);
+                victim_type = Some(value_type);
                 victim_freq = freq;
             }
 
@@ -841,14 +877,14 @@ impl HeapCache {
             }
         }
 
-        if let (Some(_slot_idx), Some(key)) = (victim_slot_idx, victim_key) {
-            let verifier = HeapCacheVerifier::new(&self.storage);
+        if let (Some(key), Some(_vtype)) = (victim_key, victim_type) {
+            let verifier = self.multi_type_verifier();
 
             if let Some((location, _)) = self.hashtable.lookup(&key, &verifier)
                 && self.hashtable.remove(&key, location)
             {
-                let slot_loc = SlotLocation::from_location(location);
-                self.deallocate_and_track(slot_loc);
+                let typed_loc = TypedLocation::from_location(location);
+                self.deallocate_typed_slot(typed_loc);
                 return true;
             }
         }
@@ -859,48 +895,136 @@ impl HeapCache {
     /// Evict using random selection.
     ///
     /// Finds the first occupied slot from a pseudo-random starting point
-    /// and evicts it. Simple and fast, similar to Redis's allkeys-random.
+    /// across all storage types and evicts it.
     fn evict_random(&self) -> bool {
-        let capacity = self.storage.capacity() as u32;
-        if capacity == 0 {
+        let start = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Get occupancy counts for all storage types
+        let string_occupied = self.storage.occupied();
+        let hash_occupied = self.hash_storage.occupied();
+        let list_occupied = self.list_storage.occupied();
+        let set_occupied = self.set_storage.occupied();
+        let total_occupied = string_occupied + hash_occupied + list_occupied + set_occupied;
+
+        if total_occupied == 0 {
             return false;
         }
 
-        let start = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
+        // Try to find an occupied slot across all storage types
+        for i in 0..total_occupied {
+            let sample_idx = (start.wrapping_mul(2654435761).wrapping_add(i)) % total_occupied;
 
-        // Find first occupied slot from random starting point
-        for i in 0..capacity {
-            // Use multiplicative hash for better distribution
-            let idx = (start.wrapping_mul(2654435761).wrapping_add(i)) % capacity;
-
-            if !self.storage.is_slot_occupied(idx) {
-                continue;
-            }
-
-            let slot = match self.storage.get(idx) {
-                Some(s) => s,
-                None => continue,
+            // Determine which storage type this sample falls into
+            let key = if sample_idx < string_occupied {
+                self.sample_string_slot(start, i).map(|(k, _)| k)
+            } else if sample_idx < string_occupied + hash_occupied {
+                self.sample_hash_slot(start, i).map(|(k, _)| k)
+            } else if sample_idx < string_occupied + hash_occupied + list_occupied {
+                self.sample_list_slot(start, i).map(|(k, _)| k)
+            } else {
+                self.sample_set_slot(start, i).map(|(k, _)| k)
             };
 
-            let generation = slot.generation();
-            let entry = match slot.get(generation, false) {
-                Some(e) => e,
-                None => continue,
-            };
+            if let Some(key) = key {
+                let verifier = self.multi_type_verifier();
 
-            let key = entry.key().to_vec();
-            slot.release_read();
-
-            let location = SlotLocation::new(idx, generation).to_location();
-
-            if self.hashtable.remove(&key, location) {
-                let slot_loc = SlotLocation::from_location(location);
-                self.deallocate_and_track(slot_loc);
-                return true;
+                if let Some((location, _)) = self.hashtable.lookup(&key, &verifier)
+                    && self.hashtable.remove(&key, location)
+                {
+                    let typed_loc = TypedLocation::from_location(location);
+                    self.deallocate_typed_slot(typed_loc);
+                    return true;
+                }
             }
         }
 
         false
+    }
+
+    /// Sample a random occupied slot from string storage.
+    fn sample_string_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
+        let capacity = self.storage.capacity() as u32;
+        if capacity == 0 {
+            return None;
+        }
+
+        for j in 0..capacity {
+            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+            if !self.storage.is_slot_occupied(idx) {
+                continue;
+            }
+
+            let slot = self.storage.get(idx)?;
+            let generation = slot.generation();
+            let entry = slot.get(generation, false)?;
+            let key = entry.key().to_vec();
+            slot.release_read();
+            return Some((key, generation));
+        }
+        None
+    }
+
+    /// Sample a random occupied slot from hash storage.
+    fn sample_hash_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
+        let capacity = self.hash_storage.capacity() as u32;
+        if capacity == 0 {
+            return None;
+        }
+
+        for j in 0..capacity {
+            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+            if !self.hash_storage.is_slot_occupied(idx) {
+                continue;
+            }
+
+            let slot = self.hash_storage.get(idx)?;
+            let generation = slot.generation();
+            let key = self.hash_storage.get_key(idx, generation)?;
+            return Some((key, generation));
+        }
+        None
+    }
+
+    /// Sample a random occupied slot from list storage.
+    fn sample_list_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
+        let capacity = self.list_storage.capacity() as u32;
+        if capacity == 0 {
+            return None;
+        }
+
+        for j in 0..capacity {
+            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+            if !self.list_storage.is_slot_occupied(idx) {
+                continue;
+            }
+
+            let slot = self.list_storage.get(idx)?;
+            let generation = slot.generation();
+            let key = self.list_storage.get_key(idx, generation)?;
+            return Some((key, generation));
+        }
+        None
+    }
+
+    /// Sample a random occupied slot from set storage.
+    fn sample_set_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
+        let capacity = self.set_storage.capacity() as u32;
+        if capacity == 0 {
+            return None;
+        }
+
+        for j in 0..capacity {
+            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+            if !self.set_storage.is_slot_occupied(idx) {
+                continue;
+            }
+
+            let slot = self.set_storage.get(idx)?;
+            let generation = slot.generation();
+            let key = self.set_storage.get_key(idx, generation)?;
+            return Some((key, generation));
+        }
+        None
     }
 
     /// Record an insert for S3-FIFO tracking.
@@ -908,7 +1032,7 @@ impl HeapCache {
     /// Called after successful hashtable insert when using S3-FIFO policy.
     fn maybe_record_insert(&self, key: &[u8]) {
         if let EvictionState::S3Fifo(policy) = &self.eviction_state {
-            let verifier = HeapCacheVerifier::new(&self.storage);
+            let verifier = self.multi_type_verifier();
             if let Some((bucket_index, item_info)) =
                 self.hashtable.lookup_for_tracking(key, &verifier)
             {
@@ -917,9 +1041,12 @@ impl HeapCache {
         }
     }
 
-    /// Get the current number of entries.
+    /// Get the current number of entries across all storage types.
     pub fn len(&self) -> usize {
         self.storage.occupied() as usize
+            + self.hash_storage.occupied() as usize
+            + self.list_storage.occupied() as usize
+            + self.set_storage.occupied() as usize
     }
 
     /// Check if the cache is empty.
@@ -927,9 +1054,32 @@ impl HeapCache {
         self.len() == 0
     }
 
-    /// Get the slot capacity.
+    /// Get the total slot capacity across all storage types.
     pub fn capacity(&self) -> usize {
         self.storage.capacity()
+            + self.hash_storage.capacity()
+            + self.list_storage.capacity()
+            + self.set_storage.capacity()
+    }
+
+    /// Get the number of string entries.
+    pub fn string_count(&self) -> usize {
+        self.storage.occupied() as usize
+    }
+
+    /// Get the number of hash entries.
+    pub fn hash_count(&self) -> usize {
+        self.hash_storage.occupied() as usize
+    }
+
+    /// Get the number of list entries.
+    pub fn list_count(&self) -> usize {
+        self.list_storage.occupied() as usize
+    }
+
+    /// Get the number of set entries.
+    pub fn set_count(&self) -> usize {
+        self.set_storage.occupied() as usize
     }
 
     /// Get the memory limit in bytes.
@@ -956,6 +1106,191 @@ impl HeapCache {
     pub fn set_fragmentation_ratio(&self, ratio: u32) {
         self.fragmentation_ratio
             .store(ratio.clamp(100, 300), Ordering::Relaxed);
+    }
+
+    /// Create a multi-type verifier for all storage types.
+    fn multi_type_verifier(&self) -> MultiTypeVerifier<'_> {
+        MultiTypeVerifier::new(
+            &self.storage,
+            &self.hash_storage,
+            &self.list_storage,
+            &self.set_storage,
+        )
+    }
+
+    /// Get the type of a key if it exists.
+    ///
+    /// Returns `None` if the key doesn't exist.
+    pub fn key_type(&self, key: &[u8]) -> Option<ValueType> {
+        let verifier = self.multi_type_verifier();
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        Some(TypedLocation::type_from_location(location))
+    }
+
+    /// Lookup a key and verify it matches the expected type.
+    ///
+    /// Returns the slot index and generation if the key exists and matches the type.
+    /// Returns `WrongType` error if the key exists but has a different type.
+    /// Returns `None` (as Ok) if the key doesn't exist.
+    fn lookup_typed(
+        &self,
+        key: &[u8],
+        expected_type: ValueType,
+    ) -> CacheResult<Option<(u32, u16)>> {
+        let verifier = self.multi_type_verifier();
+        match self.hashtable.lookup(key, &verifier) {
+            Some((location, _freq)) => {
+                let typed_loc = TypedLocation::from_location(location);
+                if typed_loc.value_type() != expected_type {
+                    Err(CacheError::WrongType)
+                } else {
+                    Ok(Some((typed_loc.slot_index(), typed_loc.generation())))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Create or get a typed slot for a key.
+    ///
+    /// If the key exists with the correct type, returns its location.
+    /// If the key doesn't exist, allocates a new slot and inserts it.
+    /// If the key exists with wrong type, returns WrongType error.
+    fn get_or_create_typed(
+        &self,
+        key: &[u8],
+        value_type: ValueType,
+        ttl: Duration,
+    ) -> CacheResult<(u32, u16, bool)> {
+        // Check if key already exists
+        let verifier = self.multi_type_verifier();
+        if let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) {
+            let typed_loc = TypedLocation::from_location(location);
+            if typed_loc.value_type() != value_type {
+                return Err(CacheError::WrongType);
+            }
+            return Ok((typed_loc.slot_index(), typed_loc.generation(), false));
+        }
+
+        // Allocate a new slot based on type
+        let (idx, generation) = match value_type {
+            ValueType::Hash => self
+                .hash_storage
+                .allocate()
+                .ok_or(CacheError::OutOfMemory)?,
+            ValueType::List => self
+                .list_storage
+                .allocate()
+                .ok_or(CacheError::OutOfMemory)?,
+            ValueType::Set => self.set_storage.allocate().ok_or(CacheError::OutOfMemory)?,
+            ValueType::String => {
+                // String uses regular storage, handle separately
+                return Err(CacheError::WrongType);
+            }
+        };
+
+        // Initialize the slot
+        let cas_token = self.cas_counter.fetch_add(1, Ordering::Relaxed);
+        match value_type {
+            ValueType::Hash => self.hash_storage.init_slot(idx, key, Some(ttl), cas_token),
+            ValueType::List => self.list_storage.init_slot(idx, key, Some(ttl), cas_token),
+            ValueType::Set => self.set_storage.init_slot(idx, key, Some(ttl), cas_token),
+            ValueType::String => unreachable!(),
+        };
+
+        // Track base size for new key (key + metadata overhead)
+        // Base size: key length + 16 bytes for metadata (expire_at, cas_token)
+        let base_size = key.len() + 16;
+        self.bytes_used.fetch_add(base_size, Ordering::Relaxed);
+
+        // Insert into hashtable
+        let typed_loc = TypedLocation::with_type(value_type, idx, generation);
+        let verifier = self.multi_type_verifier();
+
+        match self
+            .hashtable
+            .insert(key, typed_loc.to_location(), &verifier)
+        {
+            Ok(old_location) => {
+                // Clean up any old entry if we replaced something
+                if let Some(old_loc) = old_location {
+                    let old_typed = TypedLocation::from_location(old_loc);
+                    self.deallocate_typed_slot(old_typed);
+                }
+                Ok((idx, generation, true))
+            }
+            Err(e) => {
+                // Rollback: deallocate the slot we just created
+                match value_type {
+                    ValueType::Hash => self.hash_storage.deallocate(idx),
+                    ValueType::List => self.list_storage.deallocate(idx),
+                    ValueType::Set => self.set_storage.deallocate(idx),
+                    ValueType::String => unreachable!(),
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Deallocate a typed slot.
+    fn deallocate_typed_slot(&self, typed_loc: TypedLocation) {
+        match typed_loc.value_type() {
+            ValueType::String => {
+                let slot_loc = SlotLocation::new(typed_loc.slot_index(), typed_loc.generation());
+                self.deallocate_and_track(slot_loc);
+            }
+            ValueType::Hash => {
+                // Track bytes before deallocation
+                if let Some(size) = self
+                    .hash_storage
+                    .size_bytes(typed_loc.slot_index(), typed_loc.generation())
+                {
+                    self.bytes_used.fetch_sub(size, Ordering::Relaxed);
+                }
+                self.hash_storage.deallocate(typed_loc.slot_index());
+            }
+            ValueType::List => {
+                if let Some(size) = self
+                    .list_storage
+                    .size_bytes(typed_loc.slot_index(), typed_loc.generation())
+                {
+                    self.bytes_used.fetch_sub(size, Ordering::Relaxed);
+                }
+                self.list_storage.deallocate(typed_loc.slot_index());
+            }
+            ValueType::Set => {
+                if let Some(size) = self
+                    .set_storage
+                    .size_bytes(typed_loc.slot_index(), typed_loc.generation())
+                {
+                    self.bytes_used.fetch_sub(size, Ordering::Relaxed);
+                }
+                self.set_storage.deallocate(typed_loc.slot_index());
+            }
+        }
+    }
+
+    /// Delete a typed key from the cache.
+    ///
+    /// Returns true if the key was deleted.
+    fn delete_typed(&self, key: &[u8], expected_type: ValueType) -> CacheResult<bool> {
+        let verifier = self.multi_type_verifier();
+        let (location, _freq) = match self.hashtable.lookup(key, &verifier) {
+            Some(result) => result,
+            None => return Ok(false),
+        };
+
+        let typed_loc = TypedLocation::from_location(location);
+        if typed_loc.value_type() != expected_type {
+            return Err(CacheError::WrongType);
+        }
+
+        if !self.hashtable.remove(key, location) {
+            return Ok(false);
+        }
+
+        self.deallocate_typed_slot(typed_loc);
+        Ok(true)
     }
 }
 
@@ -1239,6 +1574,546 @@ impl Cache for HeapCache {
     }
 }
 
+impl HashCache for HeapCache {
+    fn hset(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> CacheResult<usize> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
+
+        match self.hash_storage.hset(idx, generation, field, value) {
+            Some((created, bytes_delta)) => {
+                // Track bytes change
+                if bytes_delta > 0 {
+                    self.bytes_used
+                        .fetch_add(bytes_delta as usize, Ordering::Relaxed);
+                } else if bytes_delta < 0 {
+                    self.bytes_used
+                        .fetch_sub((-bytes_delta) as usize, Ordering::Relaxed);
+                }
+                Ok(created)
+            }
+            None => Err(CacheError::KeyNotFound), // Generation mismatch
+        }
+    }
+
+    fn hmset(
+        &self,
+        key: &[u8],
+        fields: &[(&[u8], &[u8])],
+        ttl: Option<Duration>,
+    ) -> CacheResult<usize> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
+
+        let mut new_count = 0;
+        let mut total_bytes_delta: isize = 0;
+        for (field, value) in fields {
+            if let Some((created, bytes_delta)) =
+                self.hash_storage.hset(idx, generation, field, value)
+            {
+                new_count += created;
+                total_bytes_delta += bytes_delta;
+            }
+        }
+        // Track bytes change
+        if total_bytes_delta > 0 {
+            self.bytes_used
+                .fetch_add(total_bytes_delta as usize, Ordering::Relaxed);
+        } else if total_bytes_delta < 0 {
+            self.bytes_used
+                .fetch_sub((-total_bytes_delta) as usize, Ordering::Relaxed);
+        }
+        Ok(new_count)
+    }
+
+    fn hget(&self, key: &[u8], field: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => Ok(self.hash_storage.hget(idx, generation, field)),
+            None => Ok(None),
+        }
+    }
+
+    fn hmget(&self, key: &[u8], fields: &[&[u8]]) -> CacheResult<Vec<Option<Vec<u8>>>> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => {
+                let results: Vec<Option<Vec<u8>>> = fields
+                    .iter()
+                    .map(|f| self.hash_storage.hget(idx, generation, f))
+                    .collect();
+                Ok(results)
+            }
+            None => Ok(fields.iter().map(|_| None).collect()),
+        }
+    }
+
+    fn hgetall(&self, key: &[u8]) -> CacheResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => Ok(self
+                .hash_storage
+                .hgetall(idx, generation)
+                .unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn hdel(&self, key: &[u8], fields: &[&[u8]]) -> CacheResult<usize> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => {
+                let (deleted, bytes_freed) = self
+                    .hash_storage
+                    .hdel(idx, generation, fields)
+                    .unwrap_or((0, 0));
+                // Track bytes freed
+                if bytes_freed > 0 {
+                    self.bytes_used.fetch_sub(bytes_freed, Ordering::Relaxed);
+                }
+                // If hash is now empty, delete the key
+                if let Some(true) = self.hash_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::Hash);
+                }
+                Ok(deleted)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn hexists(&self, key: &[u8], field: &[u8]) -> CacheResult<bool> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => Ok(self
+                .hash_storage
+                .hexists(idx, generation, field)
+                .unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    fn hlen(&self, key: &[u8]) -> CacheResult<usize> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => Ok(self.hash_storage.hlen(idx, generation).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    fn hkeys(&self, key: &[u8]) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => {
+                Ok(self.hash_storage.hkeys(idx, generation).unwrap_or_default())
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn hvals(&self, key: &[u8]) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Hash)? {
+            Some((idx, generation)) => {
+                Ok(self.hash_storage.hvals(idx, generation).unwrap_or_default())
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn hsetnx(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> CacheResult<bool> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
+
+        // Check if field exists first
+        if let Some(true) = self.hash_storage.hexists(idx, generation, field) {
+            return Ok(false);
+        }
+
+        match self.hash_storage.hset(idx, generation, field, value) {
+            Some((created, bytes_delta)) => {
+                if bytes_delta > 0 {
+                    self.bytes_used
+                        .fetch_add(bytes_delta as usize, Ordering::Relaxed);
+                }
+                Ok(created > 0)
+            }
+            None => Err(CacheError::KeyNotFound),
+        }
+    }
+
+    fn hincrby(&self, key: &[u8], field: &[u8], delta: i64) -> CacheResult<i64> {
+        let ttl = self.default_ttl;
+        let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Hash, ttl)?;
+
+        // Get current value
+        let current = match self.hash_storage.hget(idx, generation, field) {
+            Some(data) => {
+                let s = std::str::from_utf8(&data).map_err(|_| CacheError::NotNumeric)?;
+                s.trim()
+                    .parse::<i64>()
+                    .map_err(|_| CacheError::NotNumeric)?
+            }
+            None => 0,
+        };
+
+        let new_value = current.checked_add(delta).ok_or(CacheError::Overflow)?;
+        let value_str = new_value.to_string();
+
+        match self
+            .hash_storage
+            .hset(idx, generation, field, value_str.as_bytes())
+        {
+            Some((_, bytes_delta)) => {
+                if bytes_delta > 0 {
+                    self.bytes_used
+                        .fetch_add(bytes_delta as usize, Ordering::Relaxed);
+                } else if bytes_delta < 0 {
+                    self.bytes_used
+                        .fetch_sub((-bytes_delta) as usize, Ordering::Relaxed);
+                }
+                Ok(new_value)
+            }
+            None => Err(CacheError::KeyNotFound),
+        }
+    }
+}
+
+impl ListCache for HeapCache {
+    fn lpush(&self, key: &[u8], values: &[&[u8]], ttl: Option<Duration>) -> CacheResult<usize> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::List, ttl)?;
+
+        match self.list_storage.lpush(idx, generation, values) {
+            Some((len, bytes_added)) => {
+                self.bytes_used.fetch_add(bytes_added, Ordering::Relaxed);
+                Ok(len)
+            }
+            None => Err(CacheError::KeyNotFound),
+        }
+    }
+
+    fn rpush(&self, key: &[u8], values: &[&[u8]], ttl: Option<Duration>) -> CacheResult<usize> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::List, ttl)?;
+
+        match self.list_storage.rpush(idx, generation, values) {
+            Some((len, bytes_added)) => {
+                self.bytes_used.fetch_add(bytes_added, Ordering::Relaxed);
+                Ok(len)
+            }
+            None => Err(CacheError::KeyNotFound),
+        }
+    }
+
+    fn lpop(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => {
+                let result = self.list_storage.lpop(idx, generation);
+                if let Some((_, bytes_freed)) = &result {
+                    self.bytes_used.fetch_sub(*bytes_freed, Ordering::Relaxed);
+                }
+                // If list is now empty, delete the key
+                if let Some(true) = self.list_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::List);
+                }
+                Ok(result.map(|(v, _)| v))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn rpop(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => {
+                let result = self.list_storage.rpop(idx, generation);
+                if let Some((_, bytes_freed)) = &result {
+                    self.bytes_used.fetch_sub(*bytes_freed, Ordering::Relaxed);
+                }
+                // If list is now empty, delete the key
+                if let Some(true) = self.list_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::List);
+                }
+                Ok(result.map(|(v, _)| v))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn lpop_count(&self, key: &[u8], count: usize) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => {
+                let (result, bytes_freed) = self
+                    .list_storage
+                    .lpop_count(idx, generation, count)
+                    .unwrap_or_default();
+                if bytes_freed > 0 {
+                    self.bytes_used.fetch_sub(bytes_freed, Ordering::Relaxed);
+                }
+                // If list is now empty, delete the key
+                if let Some(true) = self.list_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::List);
+                }
+                Ok(result)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn rpop_count(&self, key: &[u8], count: usize) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => {
+                let (result, bytes_freed) = self
+                    .list_storage
+                    .rpop_count(idx, generation, count)
+                    .unwrap_or_default();
+                if bytes_freed > 0 {
+                    self.bytes_used.fetch_sub(bytes_freed, Ordering::Relaxed);
+                }
+                // If list is now empty, delete the key
+                if let Some(true) = self.list_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::List);
+                }
+                Ok(result)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn lrange(&self, key: &[u8], start: i64, stop: i64) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => Ok(self
+                .list_storage
+                .lrange(idx, generation, start, stop)
+                .unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn llen(&self, key: &[u8]) -> CacheResult<usize> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => Ok(self.list_storage.llen(idx, generation).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    fn lindex(&self, key: &[u8], index: i64) -> CacheResult<Option<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => Ok(self.list_storage.lindex(idx, generation, index)),
+            None => Ok(None),
+        }
+    }
+
+    fn lset(&self, key: &[u8], index: i64, value: &[u8]) -> CacheResult<()> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => {
+                match self.list_storage.lset(idx, generation, index, value) {
+                    Some(true) => Ok(()),
+                    Some(false) => Err(CacheError::InvalidOffset),
+                    None => Err(CacheError::KeyNotFound),
+                }
+            }
+            None => Err(CacheError::KeyNotFound),
+        }
+    }
+
+    fn ltrim(&self, key: &[u8], start: i64, stop: i64) -> CacheResult<()> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => {
+                self.list_storage.ltrim(idx, generation, start, stop);
+                // If list is now empty, delete the key
+                if let Some(true) = self.list_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::List);
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn lpushx(&self, key: &[u8], values: &[&[u8]]) -> CacheResult<usize> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => match self.list_storage.lpush(idx, generation, values) {
+                Some((len, bytes_added)) => {
+                    self.bytes_used.fetch_add(bytes_added, Ordering::Relaxed);
+                    Ok(len)
+                }
+                None => Ok(0),
+            },
+            None => Ok(0),
+        }
+    }
+
+    fn rpushx(&self, key: &[u8], values: &[&[u8]]) -> CacheResult<usize> {
+        match self.lookup_typed(key, ValueType::List)? {
+            Some((idx, generation)) => match self.list_storage.rpush(idx, generation, values) {
+                Some((len, bytes_added)) => {
+                    self.bytes_used.fetch_add(bytes_added, Ordering::Relaxed);
+                    Ok(len)
+                }
+                None => Ok(0),
+            },
+            None => Ok(0),
+        }
+    }
+}
+
+impl SetCache for HeapCache {
+    fn sadd(&self, key: &[u8], members: &[&[u8]], ttl: Option<Duration>) -> CacheResult<usize> {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let (idx, generation, _created) = self.get_or_create_typed(key, ValueType::Set, ttl)?;
+
+        match self.set_storage.sadd(idx, generation, members) {
+            Some((added, bytes_added)) => {
+                if bytes_added > 0 {
+                    self.bytes_used.fetch_add(bytes_added, Ordering::Relaxed);
+                }
+                Ok(added)
+            }
+            None => Err(CacheError::KeyNotFound),
+        }
+    }
+
+    fn srem(&self, key: &[u8], members: &[&[u8]]) -> CacheResult<usize> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => {
+                let (removed, bytes_freed) = self
+                    .set_storage
+                    .srem(idx, generation, members)
+                    .unwrap_or((0, 0));
+                if bytes_freed > 0 {
+                    self.bytes_used.fetch_sub(bytes_freed, Ordering::Relaxed);
+                }
+                // If set is now empty, delete the key
+                if let Some(true) = self.set_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::Set);
+                }
+                Ok(removed)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn smembers(&self, key: &[u8]) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => Ok(self
+                .set_storage
+                .smembers(idx, generation)
+                .unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn sismember(&self, key: &[u8], member: &[u8]) -> CacheResult<bool> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => Ok(self
+                .set_storage
+                .sismember(idx, generation, member)
+                .unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    fn smismember(&self, key: &[u8], members: &[&[u8]]) -> CacheResult<Vec<bool>> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => Ok(self
+                .set_storage
+                .smismember(idx, generation, members)
+                .unwrap_or_else(|| members.iter().map(|_| false).collect())),
+            None => Ok(members.iter().map(|_| false).collect()),
+        }
+    }
+
+    fn scard(&self, key: &[u8]) -> CacheResult<usize> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => Ok(self.set_storage.scard(idx, generation).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    fn spop(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => {
+                let result = self.set_storage.spop(idx, generation);
+                if let Some((_, bytes_freed)) = &result {
+                    self.bytes_used.fetch_sub(*bytes_freed, Ordering::Relaxed);
+                }
+                // If set is now empty, delete the key
+                if let Some(true) = self.set_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::Set);
+                }
+                Ok(result.map(|(v, _)| v))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn spop_count(&self, key: &[u8], count: usize) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => {
+                let (result, bytes_freed) = self
+                    .set_storage
+                    .spop_count(idx, generation, count)
+                    .unwrap_or_default();
+                if bytes_freed > 0 {
+                    self.bytes_used.fetch_sub(bytes_freed, Ordering::Relaxed);
+                }
+                // If set is now empty, delete the key
+                if let Some(true) = self.set_storage.is_empty(idx, generation) {
+                    let _ = self.delete_typed(key, ValueType::Set);
+                }
+                Ok(result)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn srandmember(&self, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => Ok(self.set_storage.srandmember(idx, generation)),
+            None => Ok(None),
+        }
+    }
+
+    fn srandmember_count(&self, key: &[u8], count: i64) -> CacheResult<Vec<Vec<u8>>> {
+        match self.lookup_typed(key, ValueType::Set)? {
+            Some((idx, generation)) => {
+                let members = self
+                    .set_storage
+                    .smembers(idx, generation)
+                    .unwrap_or_default();
+                if members.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                if count >= 0 {
+                    // Positive count: return up to count distinct members
+                    let count = (count as usize).min(members.len());
+                    Ok(members.into_iter().take(count).collect())
+                } else {
+                    // Negative count: return abs(count) members, may have duplicates
+                    use std::time::SystemTime;
+                    let seed = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    let count = (-count) as usize;
+                    let mut result = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let idx = ((seed.wrapping_mul(2654435761).wrapping_add(i as u64))
+                            % members.len() as u64) as usize;
+                        result.push(members[idx].clone());
+                    }
+                    Ok(result)
+                }
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
 /// Configuration for the disk tier.
 #[derive(Debug, Clone)]
 pub struct DiskTierConfig {
@@ -1447,9 +2322,16 @@ impl HeapCacheBuilder {
             None => (None, 2),
         };
 
+        // Complex type storage uses a portion of the slot capacity
+        // This is a heuristic - can be tuned via builder in future
+        let complex_type_capacity = slot_capacity / 4;
+
         Ok(HeapCache {
             hashtable: Arc::new(MultiChoiceHashtable::new(self.hashtable_power)),
             storage: SlotStorage::new(slot_capacity),
+            hash_storage: HashStorage::new(complex_type_capacity),
+            list_storage: ListStorage::new(complex_type_capacity),
+            set_storage: SetStorage::new(complex_type_capacity),
             default_ttl: self.default_ttl,
             eviction_counter: AtomicU32::new(0),
             cas_counter: AtomicU64::new(1),
@@ -1482,7 +2364,10 @@ mod tests {
     #[test]
     fn test_cache_creation() {
         let cache = create_test_cache();
-        assert_eq!(cache.capacity(), 8192); // 2^10 * 8 (8 items per bucket)
+        // String capacity: 2^10 * 8 (8 items per bucket) = 8192
+        // Complex type capacity: 8192/4 = 2048 each for hash, list, set
+        // Total: 8192 + 2048*3 = 14336
+        assert_eq!(cache.capacity(), 14336);
         assert!(cache.is_empty());
         assert_eq!(cache.bytes_used(), 0);
     }
@@ -1850,5 +2735,320 @@ mod tests {
         // And we should have freed a significant portion
         // (since we inserted a 200-byte value, we need to evict items to make room)
         let _ = initial_bytes; // Used for debugging if needed
+    }
+
+    // Hash tests
+
+    #[test]
+    fn test_hash_basic_operations() {
+        let cache = create_test_cache();
+
+        // hset
+        assert_eq!(
+            cache.hset(b"myhash", b"field1", b"value1", None).unwrap(),
+            1
+        );
+        assert_eq!(
+            cache.hset(b"myhash", b"field1", b"value2", None).unwrap(),
+            0
+        ); // update
+
+        // hget
+        assert_eq!(
+            cache.hget(b"myhash", b"field1").unwrap(),
+            Some(b"value2".to_vec())
+        );
+        assert_eq!(cache.hget(b"myhash", b"nonexistent").unwrap(), None);
+
+        // hexists
+        assert!(cache.hexists(b"myhash", b"field1").unwrap());
+        assert!(!cache.hexists(b"myhash", b"nonexistent").unwrap());
+
+        // hlen
+        assert_eq!(cache.hlen(b"myhash").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_hash_multiple_fields() {
+        let cache = create_test_cache();
+
+        // hmset
+        let fields = vec![
+            (&b"f1"[..], &b"v1"[..]),
+            (&b"f2"[..], &b"v2"[..]),
+            (&b"f3"[..], &b"v3"[..]),
+        ];
+        assert_eq!(cache.hmset(b"myhash", &fields, None).unwrap(), 3);
+
+        // hmget
+        let result = cache.hmget(b"myhash", &[b"f1", b"f2", b"f4"]).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some(b"v1".to_vec()));
+        assert_eq!(result[1], Some(b"v2".to_vec()));
+        assert_eq!(result[2], None); // f4 doesn't exist
+
+        // hgetall
+        let all = cache.hgetall(b"myhash").unwrap();
+        assert_eq!(all.len(), 3);
+
+        // hkeys & hvals
+        let keys = cache.hkeys(b"myhash").unwrap();
+        assert_eq!(keys.len(), 3);
+        let vals = cache.hvals(b"myhash").unwrap();
+        assert_eq!(vals.len(), 3);
+    }
+
+    #[test]
+    fn test_hash_delete() {
+        let cache = create_test_cache();
+
+        cache.hset(b"myhash", b"f1", b"v1", None).unwrap();
+        cache.hset(b"myhash", b"f2", b"v2", None).unwrap();
+
+        // Delete one field
+        assert_eq!(cache.hdel(b"myhash", &[b"f1"]).unwrap(), 1);
+        assert_eq!(cache.hlen(b"myhash").unwrap(), 1);
+
+        // Delete last field - should auto-delete key
+        assert_eq!(cache.hdel(b"myhash", &[b"f2"]).unwrap(), 1);
+        assert_eq!(cache.hlen(b"myhash").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_hash_hincrby() {
+        let cache = create_test_cache();
+
+        // Increment non-existent field
+        assert_eq!(cache.hincrby(b"myhash", b"counter", 5).unwrap(), 5);
+        assert_eq!(cache.hincrby(b"myhash", b"counter", 3).unwrap(), 8);
+        assert_eq!(cache.hincrby(b"myhash", b"counter", -2).unwrap(), 6);
+    }
+
+    #[test]
+    fn test_hash_hsetnx() {
+        let cache = create_test_cache();
+
+        // First set should work
+        assert!(cache.hsetnx(b"myhash", b"field1", b"value1", None).unwrap());
+        // Second set should fail
+        assert!(!cache.hsetnx(b"myhash", b"field1", b"value2", None).unwrap());
+        // Value should be unchanged
+        assert_eq!(
+            cache.hget(b"myhash", b"field1").unwrap(),
+            Some(b"value1".to_vec())
+        );
+    }
+
+    // List tests
+
+    #[test]
+    fn test_list_basic_operations() {
+        let cache = create_test_cache();
+
+        // lpush - elements are inserted at head in order given
+        // lpush([a, b]) means: push b to front, then push a to front -> [a, b]
+        assert_eq!(cache.lpush(b"mylist", &[b"a", b"b"], None).unwrap(), 2);
+        assert_eq!(cache.llen(b"mylist").unwrap(), 2);
+
+        // rpush
+        assert_eq!(cache.rpush(b"mylist", &[b"c"], None).unwrap(), 3);
+
+        // lrange
+        let range = cache.lrange(b"mylist", 0, -1).unwrap();
+        assert_eq!(range.len(), 3);
+        // After lpush([a, b]), list is [a, b]. After rpush([c]), list is [a, b, c]
+        assert_eq!(range[0], b"a");
+        assert_eq!(range[1], b"b");
+        assert_eq!(range[2], b"c");
+
+        // lindex
+        assert_eq!(cache.lindex(b"mylist", 0).unwrap(), Some(b"a".to_vec()));
+        assert_eq!(cache.lindex(b"mylist", -1).unwrap(), Some(b"c".to_vec()));
+    }
+
+    #[test]
+    fn test_list_pop_operations() {
+        let cache = create_test_cache();
+
+        cache.rpush(b"mylist", &[b"a", b"b", b"c"], None).unwrap();
+
+        // lpop
+        assert_eq!(cache.lpop(b"mylist").unwrap(), Some(b"a".to_vec()));
+        // rpop
+        assert_eq!(cache.rpop(b"mylist").unwrap(), Some(b"c".to_vec()));
+
+        // Only "b" should remain
+        assert_eq!(cache.llen(b"mylist").unwrap(), 1);
+
+        // Pop last element - key should be deleted
+        assert_eq!(cache.lpop(b"mylist").unwrap(), Some(b"b".to_vec()));
+        assert_eq!(cache.llen(b"mylist").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_list_lset_ltrim() {
+        let cache = create_test_cache();
+
+        cache
+            .rpush(b"mylist", &[b"a", b"b", b"c", b"d"], None)
+            .unwrap();
+
+        // lset
+        cache.lset(b"mylist", 1, b"B").unwrap();
+        assert_eq!(cache.lindex(b"mylist", 1).unwrap(), Some(b"B".to_vec()));
+
+        // ltrim
+        cache.ltrim(b"mylist", 1, 2).unwrap();
+        let range = cache.lrange(b"mylist", 0, -1).unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0], b"B");
+        assert_eq!(range[1], b"c");
+    }
+
+    #[test]
+    fn test_list_pushx() {
+        let cache = create_test_cache();
+
+        // lpushx on non-existent key should return 0
+        assert_eq!(cache.lpushx(b"mylist", &[b"a"]).unwrap(), 0);
+        assert_eq!(cache.llen(b"mylist").unwrap(), 0);
+
+        // Create the list
+        cache.rpush(b"mylist", &[b"x"], None).unwrap();
+
+        // Now lpushx should work
+        assert_eq!(cache.lpushx(b"mylist", &[b"a"]).unwrap(), 2);
+        assert_eq!(cache.rpushx(b"mylist", &[b"z"]).unwrap(), 3);
+    }
+
+    // Set tests
+
+    #[test]
+    fn test_set_basic_operations() {
+        let cache = create_test_cache();
+
+        // sadd
+        assert_eq!(cache.sadd(b"myset", &[b"a", b"b", b"c"], None).unwrap(), 3);
+        assert_eq!(cache.sadd(b"myset", &[b"a", b"d"], None).unwrap(), 1); // a is duplicate
+
+        // scard
+        assert_eq!(cache.scard(b"myset").unwrap(), 4);
+
+        // sismember
+        assert!(cache.sismember(b"myset", b"a").unwrap());
+        assert!(!cache.sismember(b"myset", b"z").unwrap());
+
+        // smismember
+        let result = cache.smismember(b"myset", &[b"a", b"z"]).unwrap();
+        assert_eq!(result, vec![true, false]);
+    }
+
+    #[test]
+    fn test_set_smembers() {
+        let cache = create_test_cache();
+
+        cache.sadd(b"myset", &[b"a", b"b", b"c"], None).unwrap();
+
+        let members = cache.smembers(b"myset").unwrap();
+        assert_eq!(members.len(), 3);
+        // Members may be in any order, but should contain a, b, c
+        assert!(members.contains(&b"a".to_vec()));
+        assert!(members.contains(&b"b".to_vec()));
+        assert!(members.contains(&b"c".to_vec()));
+    }
+
+    #[test]
+    fn test_set_remove() {
+        let cache = create_test_cache();
+
+        cache.sadd(b"myset", &[b"a", b"b", b"c"], None).unwrap();
+
+        // srem
+        assert_eq!(cache.srem(b"myset", &[b"a", b"nonexistent"]).unwrap(), 1);
+        assert_eq!(cache.scard(b"myset").unwrap(), 2);
+
+        // Remove remaining - key should be deleted
+        assert_eq!(cache.srem(b"myset", &[b"b", b"c"]).unwrap(), 2);
+        assert_eq!(cache.scard(b"myset").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_set_spop() {
+        let cache = create_test_cache();
+
+        cache.sadd(b"myset", &[b"a", b"b", b"c"], None).unwrap();
+
+        // spop returns a random member
+        let popped = cache.spop(b"myset").unwrap();
+        assert!(popped.is_some());
+        assert_eq!(cache.scard(b"myset").unwrap(), 2);
+
+        // spop_count
+        let popped_vec = cache.spop_count(b"myset", 2).unwrap();
+        assert_eq!(popped_vec.len(), 2);
+        assert_eq!(cache.scard(b"myset").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_set_srandmember() {
+        let cache = create_test_cache();
+
+        cache.sadd(b"myset", &[b"a", b"b", b"c"], None).unwrap();
+
+        // srandmember doesn't remove
+        let member = cache.srandmember(b"myset").unwrap();
+        assert!(member.is_some());
+        assert_eq!(cache.scard(b"myset").unwrap(), 3); // still 3
+
+        // srandmember_count
+        let members = cache.srandmember_count(b"myset", 2).unwrap();
+        assert!(members.len() <= 2);
+        assert_eq!(cache.scard(b"myset").unwrap(), 3); // still 3
+    }
+
+    // Type safety tests
+
+    #[test]
+    fn test_wrong_type_error() {
+        let cache = create_test_cache();
+
+        // Create a string key
+        cache.set(b"mykey", b"value", None).unwrap();
+
+        // Try to use it as a hash - should fail with WrongType
+        let result = cache.hget(b"mykey", b"field");
+        assert!(matches!(result, Err(CacheError::WrongType)));
+
+        // Try to use it as a list
+        let result = cache.lpush(b"mykey", &[b"value"], None);
+        assert!(matches!(result, Err(CacheError::WrongType)));
+
+        // Try to use it as a set
+        let result = cache.sadd(b"mykey", &[b"member"], None);
+        assert!(matches!(result, Err(CacheError::WrongType)));
+    }
+
+    #[test]
+    fn test_key_type() {
+        let cache = create_test_cache();
+
+        // String
+        cache.set(b"str", b"value", None).unwrap();
+        assert_eq!(cache.key_type(b"str"), Some(ValueType::String));
+
+        // Hash
+        cache.hset(b"hash", b"f", b"v", None).unwrap();
+        assert_eq!(cache.key_type(b"hash"), Some(ValueType::Hash));
+
+        // List
+        cache.rpush(b"list", &[b"x"], None).unwrap();
+        assert_eq!(cache.key_type(b"list"), Some(ValueType::List));
+
+        // Set
+        cache.sadd(b"set", &[b"x"], None).unwrap();
+        assert_eq!(cache.key_type(b"set"), Some(ValueType::Set));
+
+        // Non-existent
+        assert_eq!(cache.key_type(b"nonexistent"), None);
     }
 }

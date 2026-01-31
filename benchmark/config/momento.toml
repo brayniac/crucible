@@ -48,7 +48,8 @@ cache_name = "default-cache"
 # TTL for SET operations in seconds
 ttl_seconds = 3600
 # Optional: override MOMENTO_ENDPOINT env var
-# endpoint = "cache.cell-4-us-west-2-1.prod.a.momentohq.com"
+#endpoint = "api.cache.cell-4-us-west-2-1.prod.a.momentohq.com"
+#wire_format = "protosocket"
 
 [timestamps]
 enabled = true

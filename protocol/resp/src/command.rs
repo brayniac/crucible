@@ -59,6 +59,134 @@ pub enum Command<'a> {
         /// Client name
         client_name: Option<&'a [u8]>,
     },
+
+    // ========================================================================
+    // Hash Commands
+    // ========================================================================
+    /// HSET key field value [field value ...] - Set field(s) in a hash
+    HSet {
+        key: &'a [u8],
+        fields: Vec<(&'a [u8], &'a [u8])>,
+    },
+    /// HGET key field - Get a field from a hash
+    HGet { key: &'a [u8], field: &'a [u8] },
+    /// HMGET key field [field ...] - Get multiple fields from a hash
+    HMGet {
+        key: &'a [u8],
+        fields: Vec<&'a [u8]>,
+    },
+    /// HGETALL key - Get all fields and values from a hash
+    HGetAll { key: &'a [u8] },
+    /// HDEL key field [field ...] - Delete field(s) from a hash
+    HDel {
+        key: &'a [u8],
+        fields: Vec<&'a [u8]>,
+    },
+    /// HEXISTS key field - Check if field exists in a hash
+    HExists { key: &'a [u8], field: &'a [u8] },
+    /// HLEN key - Get the number of fields in a hash
+    HLen { key: &'a [u8] },
+    /// HKEYS key - Get all field names in a hash
+    HKeys { key: &'a [u8] },
+    /// HVALS key - Get all values in a hash
+    HVals { key: &'a [u8] },
+    /// HSETNX key field value - Set field only if it doesn't exist
+    HSetNx {
+        key: &'a [u8],
+        field: &'a [u8],
+        value: &'a [u8],
+    },
+    /// HINCRBY key field increment - Increment hash field by integer
+    HIncrBy {
+        key: &'a [u8],
+        field: &'a [u8],
+        delta: i64,
+    },
+
+    // ========================================================================
+    // List Commands
+    // ========================================================================
+    /// LPUSH key element [element ...] - Push to left of list
+    LPush {
+        key: &'a [u8],
+        values: Vec<&'a [u8]>,
+    },
+    /// RPUSH key element [element ...] - Push to right of list
+    RPush {
+        key: &'a [u8],
+        values: Vec<&'a [u8]>,
+    },
+    /// LPOP key [count] - Pop from left of list
+    LPop { key: &'a [u8], count: Option<usize> },
+    /// RPOP key [count] - Pop from right of list
+    RPop { key: &'a [u8], count: Option<usize> },
+    /// LRANGE key start stop - Get range of elements
+    LRange {
+        key: &'a [u8],
+        start: i64,
+        stop: i64,
+    },
+    /// LLEN key - Get list length
+    LLen { key: &'a [u8] },
+    /// LINDEX key index - Get element by index
+    LIndex { key: &'a [u8], index: i64 },
+    /// LSET key index element - Set element by index
+    LSet {
+        key: &'a [u8],
+        index: i64,
+        value: &'a [u8],
+    },
+    /// LTRIM key start stop - Trim list to range
+    LTrim {
+        key: &'a [u8],
+        start: i64,
+        stop: i64,
+    },
+    /// LPUSHX key element [element ...] - Push to left only if list exists
+    LPushX {
+        key: &'a [u8],
+        values: Vec<&'a [u8]>,
+    },
+    /// RPUSHX key element [element ...] - Push to right only if list exists
+    RPushX {
+        key: &'a [u8],
+        values: Vec<&'a [u8]>,
+    },
+
+    // ========================================================================
+    // Set Commands
+    // ========================================================================
+    /// SADD key member [member ...] - Add members to set
+    SAdd {
+        key: &'a [u8],
+        members: Vec<&'a [u8]>,
+    },
+    /// SREM key member [member ...] - Remove members from set
+    SRem {
+        key: &'a [u8],
+        members: Vec<&'a [u8]>,
+    },
+    /// SMEMBERS key - Get all members of set
+    SMembers { key: &'a [u8] },
+    /// SISMEMBER key member - Check if member exists in set
+    SIsMember { key: &'a [u8], member: &'a [u8] },
+    /// SMISMEMBER key member [member ...] - Check multiple members
+    SMisMember {
+        key: &'a [u8],
+        members: Vec<&'a [u8]>,
+    },
+    /// SCARD key - Get set cardinality
+    SCard { key: &'a [u8] },
+    /// SPOP key [count] - Remove and return random member(s)
+    SPop { key: &'a [u8], count: Option<usize> },
+    /// SRANDMEMBER key [count] - Get random member(s) without removal
+    SRandMember { key: &'a [u8], count: Option<i64> },
+
+    // ========================================================================
+    // Type Command
+    // ========================================================================
+    /// TYPE key - Get the type of key
+    Type { key: &'a [u8] },
 }
 
 impl<'a> Command<'a> {
@@ -322,6 +450,479 @@ impl<'a> Command<'a> {
                 Command::Append { key, value }
             }
 
+            // ================================================================
+            // Hash Commands
+            // ================================================================
+            _ if cmd_str.eq_ignore_ascii_case("hset") => {
+                if count < 4 || (count - 2) % 2 != 0 {
+                    return Err(ParseError::WrongArity(
+                        "HSET requires key and field-value pairs".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut fields = Vec::with_capacity((count - 2) / 2);
+                for _ in 0..((count - 2) / 2) {
+                    let field = cursor.read_bulk_string()?;
+                    let value = cursor.read_bulk_string()?;
+                    fields.push((field, value));
+                }
+                Command::HSet { key, fields }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hget") => {
+                if count != 3 {
+                    return Err(ParseError::WrongArity(
+                        "HGET requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let field = cursor.read_bulk_string()?;
+                Command::HGet { key, field }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hmget") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "HMGET requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut fields = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    fields.push(cursor.read_bulk_string()?);
+                }
+                Command::HMGet { key, fields }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hgetall") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "HGETALL requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::HGetAll { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hdel") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "HDEL requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut fields = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    fields.push(cursor.read_bulk_string()?);
+                }
+                Command::HDel { key, fields }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hexists") => {
+                if count != 3 {
+                    return Err(ParseError::WrongArity(
+                        "HEXISTS requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let field = cursor.read_bulk_string()?;
+                Command::HExists { key, field }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hlen") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "HLEN requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::HLen { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hkeys") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "HKEYS requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::HKeys { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hvals") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "HVALS requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::HVals { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hsetnx") => {
+                if count != 4 {
+                    return Err(ParseError::WrongArity(
+                        "HSETNX requires exactly 3 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let field = cursor.read_bulk_string()?;
+                let value = cursor.read_bulk_string()?;
+                Command::HSetNx { key, field, value }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("hincrby") => {
+                if count != 4 {
+                    return Err(ParseError::WrongArity(
+                        "HINCRBY requires exactly 3 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let field = cursor.read_bulk_string()?;
+                let delta_bytes = cursor.read_bulk_string()?;
+                let delta_str = std::str::from_utf8(delta_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in increment".to_string()))?;
+                let delta = delta_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid increment value".to_string()))?;
+                Command::HIncrBy { key, field, delta }
+            }
+
+            // ================================================================
+            // List Commands
+            // ================================================================
+            _ if cmd_str.eq_ignore_ascii_case("lpush") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "LPUSH requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut values = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    values.push(cursor.read_bulk_string()?);
+                }
+                Command::LPush { key, values }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("rpush") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "RPUSH requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut values = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    values.push(cursor.read_bulk_string()?);
+                }
+                Command::RPush { key, values }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("lpop") => {
+                if count < 2 || count > 3 {
+                    return Err(ParseError::WrongArity(
+                        "LPOP requires 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let count_opt = if count == 3 {
+                    let count_bytes = cursor.read_bulk_string()?;
+                    let count_str = std::str::from_utf8(count_bytes)
+                        .map_err(|_| ParseError::Protocol("invalid UTF-8 in count".to_string()))?;
+                    Some(
+                        count_str
+                            .parse::<usize>()
+                            .map_err(|_| ParseError::Protocol("invalid count value".to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Command::LPop {
+                    key,
+                    count: count_opt,
+                }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("rpop") => {
+                if count < 2 || count > 3 {
+                    return Err(ParseError::WrongArity(
+                        "RPOP requires 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let count_opt = if count == 3 {
+                    let count_bytes = cursor.read_bulk_string()?;
+                    let count_str = std::str::from_utf8(count_bytes)
+                        .map_err(|_| ParseError::Protocol("invalid UTF-8 in count".to_string()))?;
+                    Some(
+                        count_str
+                            .parse::<usize>()
+                            .map_err(|_| ParseError::Protocol("invalid count value".to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Command::RPop {
+                    key,
+                    count: count_opt,
+                }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("lrange") => {
+                if count != 4 {
+                    return Err(ParseError::WrongArity(
+                        "LRANGE requires exactly 3 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let start_bytes = cursor.read_bulk_string()?;
+                let stop_bytes = cursor.read_bulk_string()?;
+                let start_str = std::str::from_utf8(start_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in start".to_string()))?;
+                let stop_str = std::str::from_utf8(stop_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in stop".to_string()))?;
+                let start = start_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid start value".to_string()))?;
+                let stop = stop_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid stop value".to_string()))?;
+                Command::LRange { key, start, stop }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("llen") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "LLEN requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::LLen { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("lindex") => {
+                if count != 3 {
+                    return Err(ParseError::WrongArity(
+                        "LINDEX requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let index_bytes = cursor.read_bulk_string()?;
+                let index_str = std::str::from_utf8(index_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in index".to_string()))?;
+                let index = index_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid index value".to_string()))?;
+                Command::LIndex { key, index }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("lset") => {
+                if count != 4 {
+                    return Err(ParseError::WrongArity(
+                        "LSET requires exactly 3 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let index_bytes = cursor.read_bulk_string()?;
+                let value = cursor.read_bulk_string()?;
+                let index_str = std::str::from_utf8(index_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in index".to_string()))?;
+                let index = index_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid index value".to_string()))?;
+                Command::LSet { key, index, value }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("ltrim") => {
+                if count != 4 {
+                    return Err(ParseError::WrongArity(
+                        "LTRIM requires exactly 3 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let start_bytes = cursor.read_bulk_string()?;
+                let stop_bytes = cursor.read_bulk_string()?;
+                let start_str = std::str::from_utf8(start_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in start".to_string()))?;
+                let stop_str = std::str::from_utf8(stop_bytes)
+                    .map_err(|_| ParseError::Protocol("invalid UTF-8 in stop".to_string()))?;
+                let start = start_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid start value".to_string()))?;
+                let stop = stop_str
+                    .parse::<i64>()
+                    .map_err(|_| ParseError::Protocol("invalid stop value".to_string()))?;
+                Command::LTrim { key, start, stop }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("lpushx") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "LPUSHX requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut values = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    values.push(cursor.read_bulk_string()?);
+                }
+                Command::LPushX { key, values }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("rpushx") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "RPUSHX requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut values = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    values.push(cursor.read_bulk_string()?);
+                }
+                Command::RPushX { key, values }
+            }
+
+            // ================================================================
+            // Set Commands
+            // ================================================================
+            _ if cmd_str.eq_ignore_ascii_case("sadd") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "SADD requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut members = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    members.push(cursor.read_bulk_string()?);
+                }
+                Command::SAdd { key, members }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("srem") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "SREM requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut members = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    members.push(cursor.read_bulk_string()?);
+                }
+                Command::SRem { key, members }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("smembers") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "SMEMBERS requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::SMembers { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("sismember") => {
+                if count != 3 {
+                    return Err(ParseError::WrongArity(
+                        "SISMEMBER requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let member = cursor.read_bulk_string()?;
+                Command::SIsMember { key, member }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("smismember") => {
+                if count < 3 {
+                    return Err(ParseError::WrongArity(
+                        "SMISMEMBER requires at least 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let mut members = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    members.push(cursor.read_bulk_string()?);
+                }
+                Command::SMisMember { key, members }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("scard") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "SCARD requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::SCard { key }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("spop") => {
+                if count < 2 || count > 3 {
+                    return Err(ParseError::WrongArity(
+                        "SPOP requires 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let count_opt = if count == 3 {
+                    let count_bytes = cursor.read_bulk_string()?;
+                    let count_str = std::str::from_utf8(count_bytes)
+                        .map_err(|_| ParseError::Protocol("invalid UTF-8 in count".to_string()))?;
+                    Some(
+                        count_str
+                            .parse::<usize>()
+                            .map_err(|_| ParseError::Protocol("invalid count value".to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Command::SPop {
+                    key,
+                    count: count_opt,
+                }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("srandmember") => {
+                if count < 2 || count > 3 {
+                    return Err(ParseError::WrongArity(
+                        "SRANDMEMBER requires 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                let count_opt = if count == 3 {
+                    let count_bytes = cursor.read_bulk_string()?;
+                    let count_str = std::str::from_utf8(count_bytes)
+                        .map_err(|_| ParseError::Protocol("invalid UTF-8 in count".to_string()))?;
+                    Some(
+                        count_str
+                            .parse::<i64>()
+                            .map_err(|_| ParseError::Protocol("invalid count value".to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Command::SRandMember {
+                    key,
+                    count: count_opt,
+                }
+            }
+
+            // ================================================================
+            // Type Command
+            // ================================================================
+            _ if cmd_str.eq_ignore_ascii_case("type") => {
+                if count != 2 {
+                    return Err(ParseError::WrongArity(
+                        "TYPE requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let key = cursor.read_bulk_string()?;
+                Command::Type { key }
+            }
+
             #[cfg(feature = "resp3")]
             _ if cmd_str.eq_ignore_ascii_case("hello") => {
                 let mut proto_version = None;
@@ -407,6 +1008,41 @@ impl<'a> Command<'a> {
             Command::IncrBy { .. } => "INCRBY",
             Command::DecrBy { .. } => "DECRBY",
             Command::Append { .. } => "APPEND",
+            // Hash commands
+            Command::HSet { .. } => "HSET",
+            Command::HGet { .. } => "HGET",
+            Command::HMGet { .. } => "HMGET",
+            Command::HGetAll { .. } => "HGETALL",
+            Command::HDel { .. } => "HDEL",
+            Command::HExists { .. } => "HEXISTS",
+            Command::HLen { .. } => "HLEN",
+            Command::HKeys { .. } => "HKEYS",
+            Command::HVals { .. } => "HVALS",
+            Command::HSetNx { .. } => "HSETNX",
+            Command::HIncrBy { .. } => "HINCRBY",
+            // List commands
+            Command::LPush { .. } => "LPUSH",
+            Command::RPush { .. } => "RPUSH",
+            Command::LPop { .. } => "LPOP",
+            Command::RPop { .. } => "RPOP",
+            Command::LRange { .. } => "LRANGE",
+            Command::LLen { .. } => "LLEN",
+            Command::LIndex { .. } => "LINDEX",
+            Command::LSet { .. } => "LSET",
+            Command::LTrim { .. } => "LTRIM",
+            Command::LPushX { .. } => "LPUSHX",
+            Command::RPushX { .. } => "RPUSHX",
+            // Set commands
+            Command::SAdd { .. } => "SADD",
+            Command::SRem { .. } => "SREM",
+            Command::SMembers { .. } => "SMEMBERS",
+            Command::SIsMember { .. } => "SISMEMBER",
+            Command::SMisMember { .. } => "SMISMEMBER",
+            Command::SCard { .. } => "SCARD",
+            Command::SPop { .. } => "SPOP",
+            Command::SRandMember { .. } => "SRANDMEMBER",
+            // Type command
+            Command::Type { .. } => "TYPE",
             #[cfg(feature = "resp3")]
             Command::Hello { .. } => "HELLO",
         }

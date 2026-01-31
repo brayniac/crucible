@@ -1093,6 +1093,8 @@ dependencies = [
  "cache-core",
  "clocksource",
  "loom",
+ "parking_lot",
+ "smallvec",
  "tikv-jemalloc-ctl",
 ]
 

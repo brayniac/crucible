@@ -64,6 +64,7 @@ rustls = { version = "0.23", default-features = false }
 ryu = "1.0"
 serde = "1"
 slab = "0.4"
+smallvec = "1.13"
 socket2 = "0.5"
 thiserror = "2"
 wide = "1.1"

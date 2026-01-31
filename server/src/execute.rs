@@ -1,7 +1,7 @@
 //! Command execution - bridges protocol commands to cache operations.
 
 use bytes::BytesMut;
-use cache_core::Cache;
+use cache_core::{Cache, HashCache, ListCache, SetCache};
 use protocol_memcache::Command as MemcacheCommand;
 use protocol_memcache::binary::{BinaryCommand, BinaryResponse, Opcode};
 use protocol_resp::Command as RespCommand;
@@ -365,6 +365,58 @@ pub fn execute_resp<C: Cache>(
                 }
             }
         }
+        // Hash commands - currently only supported on caches that implement HashCache
+        // For now, return error for unsupported backends
+        RespCommand::HSet { .. }
+        | RespCommand::HGet { .. }
+        | RespCommand::HMGet { .. }
+        | RespCommand::HGetAll { .. }
+        | RespCommand::HDel { .. }
+        | RespCommand::HExists { .. }
+        | RespCommand::HLen { .. }
+        | RespCommand::HKeys { .. }
+        | RespCommand::HVals { .. }
+        | RespCommand::HSetNx { .. }
+        | RespCommand::HIncrBy { .. } => {
+            write_buf.extend_from_slice(b"-ERR hash commands require heap backend\r\n");
+        }
+
+        // List commands - currently only supported on caches that implement ListCache
+        RespCommand::LPush { .. }
+        | RespCommand::RPush { .. }
+        | RespCommand::LPop { .. }
+        | RespCommand::RPop { .. }
+        | RespCommand::LRange { .. }
+        | RespCommand::LLen { .. }
+        | RespCommand::LIndex { .. }
+        | RespCommand::LSet { .. }
+        | RespCommand::LTrim { .. }
+        | RespCommand::LPushX { .. }
+        | RespCommand::RPushX { .. } => {
+            write_buf.extend_from_slice(b"-ERR list commands require heap backend\r\n");
+        }
+
+        // Set commands - currently only supported on caches that implement SetCache
+        RespCommand::SAdd { .. }
+        | RespCommand::SRem { .. }
+        | RespCommand::SMembers { .. }
+        | RespCommand::SIsMember { .. }
+        | RespCommand::SMisMember { .. }
+        | RespCommand::SCard { .. }
+        | RespCommand::SPop { .. }
+        | RespCommand::SRandMember { .. } => {
+            write_buf.extend_from_slice(b"-ERR set commands require heap backend\r\n");
+        }
+
+        // Type command - returns none for generic caches
+        RespCommand::Type { key } => {
+            if cache.contains(key) {
+                write_buf.extend_from_slice(b"+string\r\n");
+            } else {
+                write_buf.extend_from_slice(b"+none\r\n");
+            }
+        }
+
         RespCommand::Hello { proto_version, .. } => {
             let requested_version = proto_version.unwrap_or(2);
             let actual_version = if requested_version >= 3 { 3 } else { 2 };
@@ -397,6 +449,809 @@ pub fn execute_resp<C: Cache>(
             write_buf.extend_from_slice(b"$6\r\nmaster\r\n");
             write_buf.extend_from_slice(b"$7\r\nmodules\r\n");
             write_buf.extend_from_slice(b"*0\r\n");
+        }
+    }
+}
+
+/// Execute data structure commands (hash, list, set) for the heap backend.
+///
+/// This function handles commands that require the HashCache, ListCache, or SetCache traits.
+/// It's called from execute_resp_heap when the heap backend is in use.
+#[inline]
+pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>(
+    cmd: &RespCommand<'_>,
+    cache: &C,
+    write_buf: &mut BytesMut,
+    version: &RespVersion,
+) {
+    match cmd {
+        // ====================================================================
+        // Hash Commands
+        // ====================================================================
+        RespCommand::HSet { key, fields } => {
+            SETS.increment();
+            let field_refs: Vec<(&[u8], &[u8])> = fields.iter().map(|(f, v)| (*f, *v)).collect();
+            match cache.hmset(key, &field_refs, None) {
+                Ok(count) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(count).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::HGet { key, field } => {
+            GETS.increment();
+            match cache.hget(key, field) {
+                Ok(Some(value)) => {
+                    HITS.increment();
+                    write_buf.extend_from_slice(b"$");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(value.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    write_buf.extend_from_slice(&value);
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Ok(None) => {
+                    MISSES.increment();
+                    if *version == RespVersion::Resp3 {
+                        write_buf.extend_from_slice(b"_\r\n");
+                    } else {
+                        write_buf.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::HMGet { key, fields } => {
+            GETS.increment();
+            let field_refs: Vec<&[u8]> = fields.iter().copied().collect();
+            match cache.hmget(key, &field_refs) {
+                Ok(values) => {
+                    write_buf.extend_from_slice(b"*");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(values.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    for value in values {
+                        if let Some(v) = value {
+                            write_buf.extend_from_slice(b"$");
+                            write_buf.extend_from_slice(buf.format(v.len()).as_bytes());
+                            write_buf.extend_from_slice(b"\r\n");
+                            write_buf.extend_from_slice(&v);
+                            write_buf.extend_from_slice(b"\r\n");
+                        } else if *version == RespVersion::Resp3 {
+                            write_buf.extend_from_slice(b"_\r\n");
+                        } else {
+                            write_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::HGetAll { key } => {
+            GETS.increment();
+            match cache.hgetall(key) {
+                Ok(pairs) => {
+                    // Return as flat array: field1, value1, field2, value2, ...
+                    write_buf.extend_from_slice(b"*");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(pairs.len() * 2).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    for (field, value) in pairs {
+                        write_buf.extend_from_slice(b"$");
+                        write_buf.extend_from_slice(buf.format(field.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&field);
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(b"$");
+                        write_buf.extend_from_slice(buf.format(value.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&value);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::HDel { key, fields } => {
+            DELETES.increment();
+            let field_refs: Vec<&[u8]> = fields.iter().copied().collect();
+            match cache.hdel(key, &field_refs) {
+                Ok(count) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(count).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::HExists { key, field } => match cache.hexists(key, field) {
+            Ok(exists) => {
+                write_buf.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::HLen { key } => match cache.hlen(key) {
+            Ok(len) => {
+                write_buf.extend_from_slice(b":");
+                let mut buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(buf.format(len).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::HKeys { key } => match cache.hkeys(key) {
+            Ok(keys) => {
+                write_buf.extend_from_slice(b"*");
+                let mut buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(buf.format(keys.len()).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+                for k in keys {
+                    write_buf.extend_from_slice(b"$");
+                    write_buf.extend_from_slice(buf.format(k.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    write_buf.extend_from_slice(&k);
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::HVals { key } => match cache.hvals(key) {
+            Ok(vals) => {
+                write_buf.extend_from_slice(b"*");
+                let mut buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(buf.format(vals.len()).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+                for v in vals {
+                    write_buf.extend_from_slice(b"$");
+                    write_buf.extend_from_slice(buf.format(v.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    write_buf.extend_from_slice(&v);
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::HSetNx { key, field, value } => {
+            SETS.increment();
+            match cache.hsetnx(key, field, value, None) {
+                Ok(set) => {
+                    write_buf.extend_from_slice(if set { b":1\r\n" } else { b":0\r\n" });
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::HIncrBy { key, field, delta } => match cache.hincrby(key, field, *delta) {
+            Ok(new_val) => {
+                write_buf.extend_from_slice(b":");
+                let mut buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(buf.format(new_val).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(cache_core::CacheError::NotNumeric) => {
+                write_buf.extend_from_slice(b"-ERR hash value is not an integer\r\n");
+            }
+            Err(cache_core::CacheError::Overflow) => {
+                write_buf.extend_from_slice(b"-ERR increment or decrement would overflow\r\n");
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+
+        // ====================================================================
+        // List Commands
+        // ====================================================================
+        RespCommand::LPush { key, values } => {
+            SETS.increment();
+            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            match cache.lpush(key, &val_refs, None) {
+                Ok(len) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(len).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::RPush { key, values } => {
+            SETS.increment();
+            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            match cache.rpush(key, &val_refs, None) {
+                Ok(len) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(len).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::LPop { key, count } => {
+            GETS.increment();
+            match count {
+                Some(n) => match cache.lpop_count(key, *n) {
+                    Ok(values) => {
+                        write_buf.extend_from_slice(b"*");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(values.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        for v in values {
+                            write_buf.extend_from_slice(b"$");
+                            write_buf.extend_from_slice(buf.format(v.len()).as_bytes());
+                            write_buf.extend_from_slice(b"\r\n");
+                            write_buf.extend_from_slice(&v);
+                            write_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+                None => match cache.lpop(key) {
+                    Ok(Some(value)) => {
+                        HITS.increment();
+                        write_buf.extend_from_slice(b"$");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(value.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&value);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                    Ok(None) => {
+                        MISSES.increment();
+                        if *version == RespVersion::Resp3 {
+                            write_buf.extend_from_slice(b"_\r\n");
+                        } else {
+                            write_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+            }
+        }
+        RespCommand::RPop { key, count } => {
+            GETS.increment();
+            match count {
+                Some(n) => match cache.rpop_count(key, *n) {
+                    Ok(values) => {
+                        write_buf.extend_from_slice(b"*");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(values.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        for v in values {
+                            write_buf.extend_from_slice(b"$");
+                            write_buf.extend_from_slice(buf.format(v.len()).as_bytes());
+                            write_buf.extend_from_slice(b"\r\n");
+                            write_buf.extend_from_slice(&v);
+                            write_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+                None => match cache.rpop(key) {
+                    Ok(Some(value)) => {
+                        HITS.increment();
+                        write_buf.extend_from_slice(b"$");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(value.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&value);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                    Ok(None) => {
+                        MISSES.increment();
+                        if *version == RespVersion::Resp3 {
+                            write_buf.extend_from_slice(b"_\r\n");
+                        } else {
+                            write_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+            }
+        }
+        RespCommand::LRange { key, start, stop } => {
+            GETS.increment();
+            match cache.lrange(key, *start, *stop) {
+                Ok(values) => {
+                    write_buf.extend_from_slice(b"*");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(values.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    for v in values {
+                        write_buf.extend_from_slice(b"$");
+                        write_buf.extend_from_slice(buf.format(v.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&v);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::LLen { key } => match cache.llen(key) {
+            Ok(len) => {
+                write_buf.extend_from_slice(b":");
+                let mut buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(buf.format(len).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::LIndex { key, index } => {
+            GETS.increment();
+            match cache.lindex(key, *index) {
+                Ok(Some(value)) => {
+                    HITS.increment();
+                    write_buf.extend_from_slice(b"$");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(value.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    write_buf.extend_from_slice(&value);
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Ok(None) => {
+                    MISSES.increment();
+                    if *version == RespVersion::Resp3 {
+                        write_buf.extend_from_slice(b"_\r\n");
+                    } else {
+                        write_buf.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::LSet { key, index, value } => {
+            SETS.increment();
+            match cache.lset(key, *index, value) {
+                Ok(()) => {
+                    write_buf.extend_from_slice(b"+OK\r\n");
+                }
+                Err(cache_core::CacheError::KeyNotFound) => {
+                    write_buf.extend_from_slice(b"-ERR no such key\r\n");
+                }
+                Err(cache_core::CacheError::InvalidOffset) => {
+                    write_buf.extend_from_slice(b"-ERR index out of range\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::LTrim { key, start, stop } => match cache.ltrim(key, *start, *stop) {
+            Ok(()) => {
+                write_buf.extend_from_slice(b"+OK\r\n");
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::LPushX { key, values } => {
+            SETS.increment();
+            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            match cache.lpushx(key, &val_refs) {
+                Ok(len) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(len).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::RPushX { key, values } => {
+            SETS.increment();
+            let val_refs: Vec<&[u8]> = values.iter().copied().collect();
+            match cache.rpushx(key, &val_refs) {
+                Ok(len) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(len).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+
+        // ====================================================================
+        // Set Commands
+        // ====================================================================
+        RespCommand::SAdd { key, members } => {
+            SETS.increment();
+            let member_refs: Vec<&[u8]> = members.iter().copied().collect();
+            match cache.sadd(key, &member_refs, None) {
+                Ok(count) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(count).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::SRem { key, members } => {
+            DELETES.increment();
+            let member_refs: Vec<&[u8]> = members.iter().copied().collect();
+            match cache.srem(key, &member_refs) {
+                Ok(count) => {
+                    write_buf.extend_from_slice(b":");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(count).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::SMembers { key } => {
+            GETS.increment();
+            match cache.smembers(key) {
+                Ok(members) => {
+                    write_buf.extend_from_slice(b"*");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(members.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    for m in members {
+                        write_buf.extend_from_slice(b"$");
+                        write_buf.extend_from_slice(buf.format(m.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&m);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::SIsMember { key, member } => match cache.sismember(key, member) {
+            Ok(exists) => {
+                write_buf.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::SMisMember { key, members } => {
+            let member_refs: Vec<&[u8]> = members.iter().copied().collect();
+            match cache.smismember(key, &member_refs) {
+                Ok(results) => {
+                    write_buf.extend_from_slice(b"*");
+                    let mut buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(buf.format(results.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    for exists in results {
+                        write_buf.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
+                    }
+                }
+                Err(cache_core::CacheError::WrongType) => {
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Err(_) => {
+                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                }
+            }
+        }
+        RespCommand::SCard { key } => match cache.scard(key) {
+            Ok(count) => {
+                write_buf.extend_from_slice(b":");
+                let mut buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(buf.format(count).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+            }
+            Err(cache_core::CacheError::WrongType) => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            Err(_) => {
+                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+            }
+        },
+        RespCommand::SPop { key, count } => {
+            GETS.increment();
+            match count {
+                Some(n) => match cache.spop_count(key, *n) {
+                    Ok(members) => {
+                        write_buf.extend_from_slice(b"*");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(members.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        for m in members {
+                            write_buf.extend_from_slice(b"$");
+                            write_buf.extend_from_slice(buf.format(m.len()).as_bytes());
+                            write_buf.extend_from_slice(b"\r\n");
+                            write_buf.extend_from_slice(&m);
+                            write_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+                None => match cache.spop(key) {
+                    Ok(Some(member)) => {
+                        HITS.increment();
+                        write_buf.extend_from_slice(b"$");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(member.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&member);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                    Ok(None) => {
+                        MISSES.increment();
+                        if *version == RespVersion::Resp3 {
+                            write_buf.extend_from_slice(b"_\r\n");
+                        } else {
+                            write_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+            }
+        }
+        RespCommand::SRandMember { key, count } => {
+            GETS.increment();
+            match count {
+                Some(n) => match cache.srandmember_count(key, *n) {
+                    Ok(members) => {
+                        write_buf.extend_from_slice(b"*");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(members.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        for m in members {
+                            write_buf.extend_from_slice(b"$");
+                            write_buf.extend_from_slice(buf.format(m.len()).as_bytes());
+                            write_buf.extend_from_slice(b"\r\n");
+                            write_buf.extend_from_slice(&m);
+                            write_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+                None => match cache.srandmember(key) {
+                    Ok(Some(member)) => {
+                        HITS.increment();
+                        write_buf.extend_from_slice(b"$");
+                        let mut buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(buf.format(member.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&member);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                    Ok(None) => {
+                        MISSES.increment();
+                        if *version == RespVersion::Resp3 {
+                            write_buf.extend_from_slice(b"_\r\n");
+                        } else {
+                            write_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    Err(cache_core::CacheError::WrongType) => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                    Err(_) => {
+                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    }
+                },
+            }
+        }
+
+        // Other commands should not reach here
+        _ => {
+            write_buf.extend_from_slice(b"-ERR unknown command\r\n");
         }
     }
 }

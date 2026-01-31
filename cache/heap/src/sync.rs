@@ -5,10 +5,13 @@
 //! atomics in production.
 
 #[cfg(not(feature = "loom"))]
-pub use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+pub use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
 
 #[cfg(feature = "loom")]
 pub use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+// Loom doesn't have AtomicU16, so use std directly when needed for non-synchronization purposes
+#[cfg(feature = "loom")]
+pub use std::sync::atomic::AtomicU16;
 
 #[cfg(not(feature = "loom"))]
 pub use std::sync::Arc;
