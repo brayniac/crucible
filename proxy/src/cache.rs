@@ -55,12 +55,18 @@ impl SharedCache {
         }
     }
 
-    /// Get a cached value by key.
+    /// Access a cached value without copying (zero-copy).
     ///
-    /// Returns the raw RESP response bytes if cached.
+    /// Calls the provided function with the cached RESP response bytes.
+    /// Returns `Some(R)` if the key exists, `None` otherwise.
     #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.inner.as_ref()?.get(key)
+    pub fn with_value<F, R>(&self, key: &[u8], f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        self.inner
+            .as_ref()?
+            .with_item(key, |guard| f(guard.value()))
     }
 
     /// Cache a value with the default TTL.
@@ -117,6 +123,11 @@ mod tests {
         }
     }
 
+    /// Helper to get a value from cache as Vec<u8> for testing.
+    fn get_value(cache: &SharedCache, key: &[u8]) -> Option<Vec<u8>> {
+        cache.with_value(key, |v| v.to_vec())
+    }
+
     #[test]
     fn test_cache_disabled() {
         let config = CacheConfig {
@@ -126,7 +137,7 @@ mod tests {
         let cache = SharedCache::new(&config);
 
         assert!(!cache.is_enabled());
-        assert!(cache.get(b"key").is_none());
+        assert!(get_value(&cache, b"key").is_none());
 
         // These should be no-ops
         cache.set(b"key", b"value");
@@ -139,10 +150,10 @@ mod tests {
         let cache = SharedCache::new(&test_config());
 
         assert!(cache.is_enabled());
-        assert!(cache.get(b"key").is_none());
+        assert!(get_value(&cache, b"key").is_none());
 
         cache.set(b"key", b"value");
-        let value = cache.get(b"key");
+        let value = get_value(&cache, b"key");
         assert_eq!(value, Some(b"value".to_vec()));
     }
 
@@ -151,10 +162,10 @@ mod tests {
         let cache = SharedCache::new(&test_config());
 
         cache.set(b"key", b"value");
-        assert!(cache.get(b"key").is_some());
+        assert!(get_value(&cache, b"key").is_some());
 
         cache.delete(b"key");
-        assert!(cache.get(b"key").is_none());
+        assert!(get_value(&cache, b"key").is_none());
     }
 
     #[test]
@@ -162,10 +173,10 @@ mod tests {
         let cache = SharedCache::new(&test_config());
 
         cache.set(b"key", b"value1");
-        assert_eq!(cache.get(b"key"), Some(b"value1".to_vec()));
+        assert_eq!(get_value(&cache, b"key"), Some(b"value1".to_vec()));
 
         cache.set(b"key", b"value2");
-        assert_eq!(cache.get(b"key"), Some(b"value2".to_vec()));
+        assert_eq!(get_value(&cache, b"key"), Some(b"value2".to_vec()));
     }
 
     #[test]
@@ -193,7 +204,7 @@ mod tests {
             assert!(cache.is_enabled());
 
             cache.set(b"key", b"value");
-            assert_eq!(cache.get(b"key"), Some(b"value".to_vec()));
+            assert_eq!(get_value(&cache, b"key"), Some(b"value".to_vec()));
         }
     }
 }

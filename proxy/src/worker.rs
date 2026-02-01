@@ -359,7 +359,7 @@ fn handle_client_recv(
     backend_pool: &mut BackendPool,
     pending_requests: &mut AHashMap<u64, ConnId>,
     conn_id: ConnId,
-    cache: &SharedCache,
+    cache: &Arc<SharedCache>,
 ) {
     let idx = conn_id.slot();
     let mut should_close = false;
@@ -396,11 +396,24 @@ fn handle_client_recv(
                     trace!(conn_id = ?conn_id, command = ?cmd, "Parsed command");
 
                     // Forward to backend or handle locally
-                    if let Some(response) =
-                        forward_to_backend(backend_pool, pending_requests, conn_id, &cmd, cache)
-                    {
-                        // Immediate response (e.g., PING or cache hit)
-                        client.queue_response(&response);
+                    let result =
+                        forward_to_backend(backend_pool, pending_requests, conn_id, &cmd, cache);
+
+                    // Handle result after cmd borrow is released
+                    match result {
+                        ForwardResult::Pong => {
+                            client.queue_response(b"+PONG\r\n");
+                        }
+                        ForwardResult::CacheHit { key } => {
+                            // Zero-copy send from cache
+                            cache.with_value(&key, |data| {
+                                client.queue_response(data);
+                            });
+                        }
+                        ForwardResult::Forwarded => {}
+                        ForwardResult::Error(err) => {
+                            client.queue_response(err);
+                        }
                     }
 
                     client.consume_parsed(consumed);
@@ -446,24 +459,40 @@ fn handle_client_recv(
     }
 }
 
+/// Result of forwarding a command.
+enum ForwardResult {
+    /// Return PONG response.
+    Pong,
+    /// Cache hit - use with_value to send zero-copy.
+    CacheHit { key: bytes::Bytes },
+    /// Command was forwarded to backend (response pending).
+    Forwarded,
+    /// Error occurred (error response needs to be sent).
+    Error(&'static [u8]),
+}
+
 /// Forward a command to the backend.
 fn forward_to_backend(
     pool: &mut BackendPool,
     pending_requests: &mut AHashMap<u64, ConnId>,
     client_id: ConnId,
     cmd: &Command<'_>,
-    cache: &SharedCache,
-) -> Option<Vec<u8>> {
+    cache: &Arc<SharedCache>,
+) -> ForwardResult {
     // Handle PING locally
     if matches!(cmd, Command::Ping) {
-        return Some(b"+PONG\r\n".to_vec());
+        return ForwardResult::Pong;
     }
 
-    // Check cache for GET commands
+    // Check cache for GET commands (zero-copy path)
     if let Command::Get { key } = cmd {
-        if let Some(cached_response) = cache.get(key) {
+        // Check if key is in cache - if so, return CacheHit
+        // The caller will use with_value for zero-copy send
+        if cache.with_value(key, |_| ()).is_some() {
             CACHE_HITS.increment();
-            return Some(cached_response);
+            return ForwardResult::CacheHit {
+                key: bytes::Bytes::copy_from_slice(key),
+            };
         }
         CACHE_MISSES.increment();
     }
@@ -493,10 +522,9 @@ fn forward_to_backend(
     if pool.queue_request(request, &request_buf).is_some() {
         pending_requests.insert(request_id, client_id);
         BACKEND_REQUESTS.increment();
-        None
+        ForwardResult::Forwarded
     } else {
-        // No backend connection available
-        Some(b"-ERR backend unavailable\r\n".to_vec())
+        ForwardResult::Error(b"-ERR backend unavailable\r\n")
     }
 }
 
@@ -537,6 +565,20 @@ fn extract_key(cmd: &Command<'_>) -> Option<bytes::Bytes> {
     }
 }
 
+/// Response to send to a client after backend recv.
+enum ResponseToSend {
+    /// Response is cached - use with_value for zero-copy send
+    Cached {
+        client_id: ConnId,
+        key: bytes::Bytes,
+    },
+    /// Response not cached - must use copied bytes
+    Raw {
+        client_id: ConnId,
+        response: Vec<u8>,
+    },
+}
+
 /// Handle data received from a backend.
 fn handle_backend_recv(
     driver: &mut Box<dyn IoDriver>,
@@ -544,10 +586,10 @@ fn handle_backend_recv(
     pool: &mut BackendPool,
     pending_requests: &mut AHashMap<u64, ConnId>,
     conn_id: ConnId,
-    cache: &SharedCache,
+    cache: &Arc<SharedCache>,
 ) {
     let mut should_close = false;
-    let mut responses_to_send: Vec<(ConnId, Vec<u8>, Option<bytes::Bytes>, bool)> = Vec::new();
+    let mut responses_to_send: Vec<ResponseToSend> = Vec::new();
 
     // Access received data
     let result = driver.with_recv_buf(conn_id, &mut |buf| {
@@ -563,8 +605,8 @@ fn handle_backend_recv(
         // Copy data to backend's recv buffer
         let data = buf.as_slice();
         backend.append_recv(data);
-        let consumed = data.len();
-        buf.consume(consumed);
+        let consumed_from_buf = data.len();
+        buf.consume(consumed_from_buf);
 
         // Parse responses
         loop {
@@ -574,23 +616,63 @@ fn handle_backend_recv(
             }
 
             match Value::parse(recv_data) {
-                Ok((value, consumed)) => {
+                Ok((_value, consumed)) => {
                     BACKEND_RESPONSES.increment();
 
-                    // Get the request this response is for
-                    if let Some(request) = backend.complete_request() {
-                        pending_requests.remove(&request.request_id);
+                    // Peek at the request to get metadata BEFORE modifying backend state
+                    // This avoids the borrow conflict
+                    let request_info = backend.oldest_request().map(|req| {
+                        (
+                            req.request_id,
+                            req.client_id,
+                            req.cacheable,
+                            req.key.clone(),
+                        )
+                    });
 
-                        // Encode response
-                        let mut response_buf = Vec::with_capacity(consumed);
-                        value.encode(&mut response_buf);
+                    if let Some((request_id, client_id, cacheable, key)) = request_info {
+                        let response_bytes = &recv_data[..consumed];
 
-                        responses_to_send.push((
-                            request.client_id,
-                            response_buf,
-                            request.key,
-                            request.cacheable,
-                        ));
+                        // For cacheable GET requests with non-nil responses:
+                        // cache first, then we'll use with_value for zero-copy send
+                        if cacheable {
+                            if let Some(ref k) = key {
+                                // Only cache non-nil responses
+                                // Nil is "$-1\r\n" in RESP2 or "_\r\n" in RESP3
+                                if !response_bytes.starts_with(b"$-1\r\n")
+                                    && !response_bytes.starts_with(b"_\r\n")
+                                {
+                                    // Cache the response (no allocation in hot path)
+                                    cache.set(k, response_bytes);
+                                    responses_to_send.push(ResponseToSend::Cached {
+                                        client_id,
+                                        key: k.clone(),
+                                    });
+                                } else {
+                                    // Nil response - copy (small: 5 bytes)
+                                    responses_to_send.push(ResponseToSend::Raw {
+                                        client_id,
+                                        response: response_bytes.to_vec(),
+                                    });
+                                }
+                            } else {
+                                // Cacheable but no key? Copy response
+                                responses_to_send.push(ResponseToSend::Raw {
+                                    client_id,
+                                    response: response_bytes.to_vec(),
+                                });
+                            }
+                        } else {
+                            // Non-cacheable response - copy (usually small: +OK\r\n)
+                            responses_to_send.push(ResponseToSend::Raw {
+                                client_id,
+                                response: response_bytes.to_vec(),
+                            });
+                        }
+
+                        // Now we can mutate backend state
+                        backend.complete_request();
+                        pending_requests.remove(&request_id);
                     }
 
                     backend.consume_response(consumed);
@@ -620,22 +702,29 @@ fn handle_backend_recv(
         return;
     }
 
-    // Send responses to clients and cache cacheable responses
-    for (client_id, response, key, cacheable) in responses_to_send {
-        // Cache the response if this was a cacheable GET request
-        // Only cache successful responses (not errors like $-1\r\n for nil)
-        if cacheable && let Some(ref k) = key {
-            // Only cache non-nil responses
-            // Nil is "$-1\r\n" in RESP2 or "_\r\n" in RESP3
-            if !response.starts_with(b"$-1\r\n") && !response.starts_with(b"_\r\n") {
-                cache.set(k, &response);
+    // Send responses to clients
+    for response in responses_to_send {
+        match response {
+            ResponseToSend::Cached { client_id, key } => {
+                // Zero-copy send from cache
+                let idx = client_id.slot();
+                if let Some(Some(client)) = clients.get_mut(idx) {
+                    cache.with_value(&key, |cached_response| {
+                        client.queue_response(cached_response);
+                    });
+                    drain_client_sends(driver, client, client_id);
+                }
             }
-        }
-
-        let idx = client_id.slot();
-        if let Some(Some(client)) = clients.get_mut(idx) {
-            client.queue_response(&response);
-            drain_client_sends(driver, client, client_id);
+            ResponseToSend::Raw {
+                client_id,
+                response,
+            } => {
+                let idx = client_id.slot();
+                if let Some(Some(client)) = clients.get_mut(idx) {
+                    client.queue_response(&response);
+                    drain_client_sends(driver, client, client_id);
+                }
+            }
         }
     }
 }
