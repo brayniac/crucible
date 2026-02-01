@@ -15,6 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.9] - 2026-01-31
+
+### Changed
+- Viewer overview dashboard now shows key metrics in a single flat section (throughput, hit rate, latency, error rate, bandwidth)
+- Bandwidth metrics now display in Mbps instead of MB/s
+- Latency dashboard shows all operation types in one group
+- PromQL queries use 10s windows for better responsiveness with short benchmark runs
+
+### Fixed
+- Viewer now correctly shows parquet source metadata (was showing "unknown")
+- Time axes now synchronized across all charts using global min/max time range
+- Histogram heatmaps now respect global time range
+
 ## [0.2.8] - 2026-01-31
 
 ### Fixed

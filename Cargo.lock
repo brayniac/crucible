@@ -424,7 +424,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "benchmark"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "arrow",
  "axum",
@@ -535,7 +535,7 @@ checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
 name = "cache-core"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "ahash",
  "bytes",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "grpc"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "bytes",
  "http2",
@@ -1088,7 +1088,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "heap-cache"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "http2"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "bytes",
  "io-driver",
@@ -1271,7 +1271,7 @@ checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
 name = "io-driver"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "metriken",
 ]
@@ -1673,9 +1673,9 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd91b9607c0d70d49d3747aa440380cc5bb4a84a3e9757463aea4e2d3c4e4b0d"
+checksum = "ccbf8b5b21c023c081c6ba0759e6e7798c83d45e0f8635143bec088343a98c97"
 dependencies = [
  "arrow",
  "axum",
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-memcache"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "itoa",
  "memchr",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-momento"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "bytes",
  "grpc",
@@ -2135,14 +2135,14 @@ dependencies = [
 
 [[package]]
 name = "protocol-ping"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "thiserror 2.0.17",
 ]
 
 [[package]]
 name = "protocol-resp"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "itoa",
  "memchr",
@@ -2446,7 +2446,7 @@ checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "segcache"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "axum",
  "bytes",
@@ -2640,7 +2640,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slab-cache"
-version = "0.2.9-alpha.0"
+version = "0.2.9"
 dependencies = [
  "cache-core",
  "clocksource",
