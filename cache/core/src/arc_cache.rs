@@ -684,6 +684,127 @@ where
         Some(entry)
     }
 
+    /// Get a value by key, or insert the provided value if not present.
+    ///
+    /// Uses atomic `insert_if_absent` semantics: exactly one thread will succeed
+    /// in inserting for a given key, and all threads will receive the same value.
+    ///
+    /// If the key exists, returns the existing value (the provided value is dropped).
+    /// If the key does not exist, inserts the provided value and returns it.
+    ///
+    /// For lazy initialization where the value is expensive to compute,
+    /// use [`get_or_insert_with`](Self::get_or_insert_with) instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError::OutOfMemory` if insertion is needed but no slots
+    /// are available and eviction fails.
+    pub fn get_or_insert(&self, key: K, value: V) -> CacheResult<Arc<V>>
+    where
+        V: Clone,
+    {
+        self.get_or_insert_inner(key, value)
+    }
+
+    /// Get a value by key, or insert it using a closure if not present.
+    ///
+    /// Uses atomic `insert_if_absent` semantics: exactly one thread will succeed
+    /// in inserting for a given key, and all threads will receive the same value.
+    ///
+    /// If the key exists, returns the existing value (the closure is not called).
+    /// If the key does not exist, calls the closure to compute the value,
+    /// inserts it, and returns the new value.
+    ///
+    /// # Race Conditions
+    ///
+    /// If multiple threads race to insert the same key, the closure may be called
+    /// by multiple threads, but only one value will be stored. Threads that lose
+    /// the race will have their computed value discarded and will receive the
+    /// winner's value instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError::OutOfMemory` if insertion is needed but no slots
+    /// are available and eviction fails.
+    pub fn get_or_insert_with<F>(&self, key: K, f: F) -> CacheResult<Arc<V>>
+    where
+        F: FnOnce() -> V,
+        V: Clone,
+    {
+        // Fast path: check if already in cache
+        if let Some(value) = self.get(&key) {
+            return Ok(value);
+        }
+
+        // Slow path: compute value and try atomic insert
+        let value = f();
+        self.get_or_insert_inner(key, value)
+    }
+
+    /// Internal implementation for get_or_insert operations.
+    ///
+    /// Uses `insert_if_absent` for atomic semantics - only one thread will
+    /// succeed in inserting for a given key.
+    fn get_or_insert_inner(&self, key: K, value: V) -> CacheResult<Arc<V>>
+    where
+        V: Clone,
+    {
+        // Fast path: check if already in cache
+        if let Some(existing) = self.get(&key) {
+            return Ok(existing);
+        }
+
+        let key_bytes_owned = key.clone();
+        let key_bytes = key_bytes_owned.as_ref();
+
+        // Allocate a slot, evicting if necessary
+        let slot_loc = match self.storage.allocate() {
+            Some(loc) => loc,
+            None => {
+                if !self.evict_one() {
+                    return Err(CacheError::OutOfMemory);
+                }
+                self.storage.allocate().ok_or(CacheError::OutOfMemory)?
+            }
+        };
+
+        let slot = self.storage.get(slot_loc.slot_index()).unwrap();
+
+        // Store the entry in the slot
+        let entry = Arc::new(Entry {
+            key,
+            value: value.clone(),
+        });
+        let generation = slot.store(entry);
+        let slot_loc = SlotLocation::new(slot_loc.slot_index(), generation);
+
+        let verifier = ArcCacheVerifier {
+            storage: &self.storage,
+        };
+
+        // Try atomic insert - only succeeds if key doesn't exist
+        match self
+            .hashtable
+            .insert_if_absent(key_bytes, slot_loc.to_location(), &verifier)
+        {
+            Ok(()) => {
+                // We won the race - return our value
+                Ok(Arc::new(value))
+            }
+            Err(CacheError::KeyExists) => {
+                // Another thread inserted first - deallocate our slot
+                self.storage.deallocate(slot_loc);
+                // Return the existing value
+                self.get(&key_bytes_owned).ok_or(CacheError::OutOfMemory)
+            }
+            Err(e) => {
+                // Insert failed for another reason (e.g., hashtable full)
+                self.storage.deallocate(slot_loc);
+                Err(e)
+            }
+        }
+    }
+
     /// Insert a key-value pair.
     ///
     /// If the key already exists, the old value is replaced.
@@ -1095,6 +1216,191 @@ mod tests {
         cache.remove(&b"k2".to_vec());
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_arc_cache_get_or_insert_miss() {
+        let cache: ArcCache<Vec<u8>, String> = ArcCache::new(100);
+
+        // Key doesn't exist, should insert
+        let value = cache
+            .get_or_insert(b"key1".to_vec(), "value1".to_string())
+            .unwrap();
+        assert_eq!(&*value, "value1");
+
+        // Verify it was inserted
+        assert!(cache.contains(&b"key1".to_vec()));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_arc_cache_get_or_insert_hit() {
+        let cache: ArcCache<Vec<u8>, String> = ArcCache::new(100);
+
+        // Pre-insert a value
+        cache
+            .insert(b"key1".to_vec(), "original".to_string())
+            .unwrap();
+
+        // get_or_insert should return existing value, not insert new one
+        let value = cache
+            .get_or_insert(b"key1".to_vec(), "new_value".to_string())
+            .unwrap();
+        assert_eq!(&*value, "original");
+
+        // Verify the original value is still there
+        let retrieved = cache.get(&b"key1".to_vec()).unwrap();
+        assert_eq!(&*retrieved, "original");
+    }
+
+    #[test]
+    fn test_arc_cache_get_or_insert_with_miss() {
+        let cache: ArcCache<Vec<u8>, String> = ArcCache::new(100);
+
+        let call_count = std::cell::Cell::new(0);
+
+        // Key doesn't exist, closure should be called
+        let value = cache
+            .get_or_insert_with(b"key1".to_vec(), || {
+                call_count.set(call_count.get() + 1);
+                "computed_value".to_string()
+            })
+            .unwrap();
+
+        assert_eq!(&*value, "computed_value");
+        assert_eq!(call_count.get(), 1);
+
+        // Verify it was inserted
+        assert!(cache.contains(&b"key1".to_vec()));
+    }
+
+    #[test]
+    fn test_arc_cache_get_or_insert_with_hit() {
+        let cache: ArcCache<Vec<u8>, String> = ArcCache::new(100);
+
+        // Pre-insert a value
+        cache
+            .insert(b"key1".to_vec(), "original".to_string())
+            .unwrap();
+
+        let call_count = std::cell::Cell::new(0);
+
+        // Key exists, closure should NOT be called
+        let value = cache
+            .get_or_insert_with(b"key1".to_vec(), || {
+                call_count.set(call_count.get() + 1);
+                "should_not_be_used".to_string()
+            })
+            .unwrap();
+
+        assert_eq!(&*value, "original");
+        assert_eq!(call_count.get(), 0); // Closure was not called
+    }
+
+    #[test]
+    fn test_arc_cache_get_or_insert_eviction() {
+        let cache: ArcCache<Vec<u8>, u32> = ArcCache::new(3);
+
+        // Fill the cache
+        cache.get_or_insert(b"k1".to_vec(), 1).unwrap();
+        cache.get_or_insert(b"k2".to_vec(), 2).unwrap();
+        cache.get_or_insert(b"k3".to_vec(), 3).unwrap();
+
+        assert_eq!(cache.len(), 3);
+
+        // Insert another via get_or_insert - should trigger eviction
+        let value = cache.get_or_insert(b"k4".to_vec(), 4).unwrap();
+        assert_eq!(*value, 4);
+
+        // Still at capacity
+        assert_eq!(cache.len(), 3);
+
+        // New key should exist
+        assert!(cache.contains(&b"k4".to_vec()));
+    }
+
+    #[test]
+    fn test_arc_cache_get_or_insert_concurrent() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let cache: StdArc<ArcCache<Vec<u8>, u64>> = StdArc::new(ArcCache::new(100));
+        let num_threads = 8;
+        let key = b"shared_key".to_vec();
+
+        // Each thread will try to insert a different value for the same key
+        // Due to atomic semantics, exactly one should win and all should see that value
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let cache = StdArc::clone(&cache);
+                let key = key.clone();
+                thread::spawn(move || {
+                    let value = cache.get_or_insert(key, i as u64).unwrap();
+                    *value
+                })
+            })
+            .collect();
+
+        let results: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // All threads should have received the same value (the winner's value)
+        let first = results[0];
+        for result in &results {
+            assert_eq!(*result, first, "all threads should see the same value");
+        }
+
+        // The cache should contain exactly one entry
+        assert_eq!(cache.len(), 1);
+
+        // The cached value should match what all threads saw
+        let cached = cache.get(&key).unwrap();
+        assert_eq!(*cached, first);
+    }
+
+    #[test]
+    fn test_arc_cache_get_or_insert_with_concurrent() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::thread;
+
+        let cache: StdArc<ArcCache<Vec<u8>, u64>> = StdArc::new(ArcCache::new(100));
+        let call_count = StdArc::new(AtomicU32::new(0));
+        let num_threads = 8;
+        let key = b"shared_key".to_vec();
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let cache = StdArc::clone(&cache);
+                let call_count = StdArc::clone(&call_count);
+                let key = key.clone();
+                thread::spawn(move || {
+                    let value = cache
+                        .get_or_insert_with(key, || {
+                            call_count.fetch_add(1, Ordering::SeqCst);
+                            i as u64
+                        })
+                        .unwrap();
+                    *value
+                })
+            })
+            .collect();
+
+        let results: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // All threads should have received the same value
+        let first = results[0];
+        for result in &results {
+            assert_eq!(*result, first, "all threads should see the same value");
+        }
+
+        // The closure may be called multiple times due to races between
+        // the initial get() check and the insert_if_absent(), but only
+        // one value will be stored
+        assert_eq!(cache.len(), 1);
+
+        // The cached value should match what all threads saw
+        let cached = cache.get(&key).unwrap();
+        assert_eq!(*cached, first);
     }
 }
 
