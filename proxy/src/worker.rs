@@ -178,8 +178,11 @@ fn run_worker(
     cache: Arc<SharedCache>,
 ) -> io::Result<()> {
     // Initialize I/O driver
+    let io_engine = config.io_engine();
+    info!(worker_id, ?io_engine, "Starting worker with I/O engine");
+
     let mut driver = Driver::builder()
-        .engine(config.io_engine())
+        .engine(io_engine)
         .buffer_size(config.uring.buffer_size)
         .buffer_count(config.uring.buffer_count)
         .sq_depth(config.uring.sq_depth)
