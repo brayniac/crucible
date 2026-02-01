@@ -28,6 +28,7 @@ crossbeam-channel = { workspace = true }
 slab = { workspace = true }
 libc = { workspace = true }
 ahash = { workspace = true }
+socket2 = "0.5"
 
 # Configuration
 serde = { workspace = true, features = ["derive"] }

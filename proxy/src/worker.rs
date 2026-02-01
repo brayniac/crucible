@@ -226,8 +226,9 @@ fn run_worker(
         // Ensure backend connections are established
         ensure_backend_connections(&mut driver, &mut backend_pool)?;
 
-        // Poll for completions
-        let _completion_count = driver.poll(Some(Duration::from_millis(1)))?;
+        // Poll for completions - use very short timeout when actively processing
+        let timeout = Duration::from_micros(100);
+        let _completion_count = driver.poll(Some(timeout))?;
 
         // Process completions
         for completion in driver.drain_completions() {
@@ -349,18 +350,38 @@ fn ensure_backend_connections(
     while pool.needs_connections() {
         let addr = pool.backend_addr();
 
-        // Create a non-blocking TCP connection
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nonblocking(true)?;
+        // Create a non-blocking TCP connection (avoid blocking the event loop)
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_nonblocking(true)?;
+        socket.set_nodelay(true)?;
+
+        // Non-blocking connect - may return WouldBlock
+        match socket.connect(&addr.into()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Connection in progress, that's fine
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+                // Connection in progress, that's fine
+            }
+            Err(e) => return Err(e),
+        }
+
+        let stream: TcpStream = socket.into();
 
         // Register with the driver
         match driver.register(stream) {
             Ok(conn_id) => {
-                // Connection is already connected (or connecting)
+                // Connection might still be in progress (non-blocking)
+                // It will become ready when we get SendReady completion
                 let mut conn = BackendConnection::new(conn_id, addr);
-                conn.mark_connected(); // For blocking connect, it's already done
+                conn.mark_connected(); // Mark ready - we'll get error if connect failed
                 pool.add_connection(conn);
-                debug!(address = %addr, conn_id = ?conn_id, "Backend connected");
+                trace!(address = %addr, conn_id = ?conn_id, "Backend connection initiated");
             }
             Err(e) => {
                 error!(error = %e, address = %addr, "Failed to register backend connection");
@@ -392,13 +413,10 @@ fn handle_client_recv(
             return;
         }
 
-        // Verify conn_id matches the client at this slot
+        // We already verified conn_id in the caller, just get the client
         let Some(Some(client)) = clients.get_mut(idx) else {
             return;
         };
-        if client.conn_id != conn_id {
-            return;
-        }
 
         // Copy data to client's recv buffer
         let data = buf.as_slice();
@@ -427,11 +445,9 @@ fn handle_client_recv(
                         ForwardResult::Pong => {
                             client.queue_response(b"+PONG\r\n");
                         }
-                        ForwardResult::CacheHit { key } => {
-                            // Zero-copy send from cache
-                            cache.with_value(&key, |data| {
-                                client.queue_response(data);
-                            });
+                        ForwardResult::CacheHit(data) => {
+                            // Send cached data (single lookup, no second cache access)
+                            client.queue_response(&data);
                         }
                         ForwardResult::Forwarded => {}
                         ForwardResult::Error(err) => {
@@ -486,8 +502,8 @@ fn handle_client_recv(
 enum ForwardResult {
     /// Return PONG response.
     Pong,
-    /// Cache hit - use with_value to send zero-copy.
-    CacheHit { key: bytes::Bytes },
+    /// Cache hit - response data to send (single allocation, but avoids double lookup).
+    CacheHit(Vec<u8>),
     /// Command was forwarded to backend (response pending).
     Forwarded,
     /// Error occurred (error response needs to be sent).
@@ -507,15 +523,12 @@ fn forward_to_backend(
         return ForwardResult::Pong;
     }
 
-    // Check cache for GET commands (zero-copy path)
+    // Check cache for GET commands
     if let Command::Get { key } = cmd {
-        // Check if key is in cache - if so, return CacheHit
-        // The caller will use with_value for zero-copy send
-        if cache.with_value(key, |_| ()).is_some() {
+        // Single cache lookup - get data directly if present
+        if let Some(data) = cache.with_value(key, |v| v.to_vec()) {
             CACHE_HITS.increment();
-            return ForwardResult::CacheHit {
-                key: bytes::Bytes::copy_from_slice(key),
-            };
+            return ForwardResult::CacheHit(data);
         }
         CACHE_MISSES.increment();
     }
