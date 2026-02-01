@@ -1,7 +1,7 @@
 //! Worker thread implementation.
 
 use crate::backend::{BackendConnection, BackendPool, InFlightRequest};
-use crate::cache::WorkerCache;
+use crate::cache::SharedCache;
 use crate::client::{ClientConnection, ClientState};
 use crate::config::Config;
 use crate::metrics::{
@@ -35,6 +35,18 @@ pub fn run(config: &Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn std
         "Starting proxy"
     );
 
+    // Create shared cache (thread-safe, lock-free)
+    let cache = Arc::new(SharedCache::new(&config.cache));
+    if cache.is_enabled() {
+        info!(
+            heap_size = config.cache.heap_size,
+            segment_size = config.cache.segment_size,
+            ttl_ms = config.cache.ttl_ms,
+            eviction = ?config.cache.eviction,
+            "Shared cache enabled"
+        );
+    }
+
     // Create channels for fd distribution
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_workers)
         .map(|_| crossbeam_channel::bounded::<(RawFd, SocketAddr)>(1024))
@@ -45,6 +57,7 @@ pub fn run(config: &Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn std
     for (worker_id, receiver) in receivers.into_iter().enumerate() {
         let worker_config = config.clone();
         let worker_shutdown = shutdown.clone();
+        let worker_cache = cache.clone();
         let cpu_id = cpu_affinity
             .as_ref()
             .map(|cpus| cpus[worker_id % cpus.len()]);
@@ -56,7 +69,13 @@ pub fn run(config: &Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn std
                     set_cpu_affinity(cpu);
                 }
 
-                if let Err(e) = run_worker(worker_id, worker_config, receiver, worker_shutdown) {
+                if let Err(e) = run_worker(
+                    worker_id,
+                    worker_config,
+                    receiver,
+                    worker_shutdown,
+                    worker_cache,
+                ) {
                     error!(worker_id, error = %e, "Worker error");
                 }
             })
@@ -156,6 +175,7 @@ fn run_worker(
     config: Config,
     receiver: crossbeam_channel::Receiver<(RawFd, SocketAddr)>,
     shutdown: Arc<AtomicBool>,
+    cache: Arc<SharedCache>,
 ) -> io::Result<()> {
     // Initialize I/O driver
     let mut driver = Driver::builder()
@@ -173,19 +193,6 @@ fn run_worker(
         .copied()
         .expect("at least one backend node required");
     let mut backend_pool = BackendPool::new(backend_addr, config.backend.pool_size);
-
-    // Initialize per-worker cache (allocation-free after init)
-    let cache = WorkerCache::new(&config.cache);
-    if cache.is_enabled() {
-        info!(
-            worker_id,
-            heap_size = config.cache.heap_size,
-            segment_size = config.cache.segment_size,
-            ttl_ms = config.cache.ttl_ms,
-            eviction = ?config.cache.eviction,
-            "Worker cache enabled"
-        );
-    }
 
     // Client connections indexed by ConnId slot
     let mut clients: Vec<Option<ClientConnection>> = Vec::with_capacity(4096);
@@ -352,7 +359,7 @@ fn handle_client_recv(
     backend_pool: &mut BackendPool,
     pending_requests: &mut AHashMap<u64, ConnId>,
     conn_id: ConnId,
-    cache: &WorkerCache,
+    cache: &SharedCache,
 ) {
     let idx = conn_id.slot();
     let mut should_close = false;
@@ -445,7 +452,7 @@ fn forward_to_backend(
     pending_requests: &mut AHashMap<u64, ConnId>,
     client_id: ConnId,
     cmd: &Command<'_>,
-    cache: &WorkerCache,
+    cache: &SharedCache,
 ) -> Option<Vec<u8>> {
     // Handle PING locally
     if matches!(cmd, Command::Ping) {
@@ -537,7 +544,7 @@ fn handle_backend_recv(
     pool: &mut BackendPool,
     pending_requests: &mut AHashMap<u64, ConnId>,
     conn_id: ConnId,
-    cache: &WorkerCache,
+    cache: &SharedCache,
 ) {
     let mut should_close = false;
     let mut responses_to_send: Vec<(ConnId, Vec<u8>, Option<bytes::Bytes>, bool)> = Vec::new();

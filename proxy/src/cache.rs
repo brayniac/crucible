@@ -1,21 +1,25 @@
-//! Per-worker local cache using SegCache (allocation-free hot path).
+//! Shared cache using SegCache (allocation-free, lock-free).
 //!
-//! Each worker thread gets its own cache instance to avoid cross-thread
-//! contention. The cache uses pre-allocated segments, so after initialization
-//! there are no allocations on the hot path.
+//! A single cache instance is shared across all worker threads. SegCache uses
+//! lock-free data structures internally, so concurrent access from multiple
+//! threads is safe and efficient. The cache uses pre-allocated segments, so
+//! after initialization there are no allocations on the hot path.
 
 use crate::config::{CacheConfig, EvictionPolicy};
 use segcache::{EvictionPolicy as SegEviction, MergeConfig, SegCache, SegCacheBuilder};
 use std::time::Duration;
 
-/// Per-worker cache using SegCache (allocation-free).
-pub struct WorkerCache {
+/// Shared cache using SegCache (allocation-free, lock-free).
+///
+/// This cache is designed to be wrapped in `Arc` and shared across all worker
+/// threads. All operations are thread-safe without explicit locking.
+pub struct SharedCache {
     inner: Option<SegCache>,
     default_ttl: Duration,
 }
 
-impl WorkerCache {
-    /// Create a new worker cache from configuration.
+impl SharedCache {
+    /// Create a new shared cache from configuration.
     ///
     /// If caching is disabled, returns a no-op cache.
     pub fn new(config: &CacheConfig) -> Self {
@@ -119,7 +123,7 @@ mod tests {
             enabled: false,
             ..test_config()
         };
-        let cache = WorkerCache::new(&config);
+        let cache = SharedCache::new(&config);
 
         assert!(!cache.is_enabled());
         assert!(cache.get(b"key").is_none());
@@ -132,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_cache_set_get() {
-        let cache = WorkerCache::new(&test_config());
+        let cache = SharedCache::new(&test_config());
 
         assert!(cache.is_enabled());
         assert!(cache.get(b"key").is_none());
@@ -144,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_cache_delete() {
-        let cache = WorkerCache::new(&test_config());
+        let cache = SharedCache::new(&test_config());
 
         cache.set(b"key", b"value");
         assert!(cache.get(b"key").is_some());
@@ -155,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_cache_overwrite() {
-        let cache = WorkerCache::new(&test_config());
+        let cache = SharedCache::new(&test_config());
 
         cache.set(b"key", b"value1");
         assert_eq!(cache.get(b"key"), Some(b"value1".to_vec()));
@@ -185,7 +189,7 @@ mod tests {
                 heap_size,
                 ..test_config()
             };
-            let cache = WorkerCache::new(&config);
+            let cache = SharedCache::new(&config);
             assert!(cache.is_enabled());
 
             cache.set(b"key", b"value");
