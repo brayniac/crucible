@@ -612,12 +612,14 @@ fn handle_backend_recv(
     cache: &Arc<SharedCache>,
 ) {
     let mut should_close = false;
+    let mut close_reason = "";
     let mut responses_to_send: Vec<ResponseToSend> = Vec::new();
 
     // Access received data
     let result = driver.with_recv_buf(conn_id, &mut |buf| {
         if buf.is_empty() {
             should_close = true;
+            close_reason = "recv empty (peer closed)";
             return;
         }
 
@@ -660,10 +662,11 @@ fn handle_backend_recv(
                         // cache first, then we'll use with_value for zero-copy send
                         if cacheable {
                             if let Some(ref k) = key {
-                                // Only cache non-nil responses
-                                // Nil is "$-1\r\n" in RESP2 or "_\r\n" in RESP3
+                                // Only cache successful bulk string responses
+                                // Don't cache: nil ($-1 or _), errors (-), MOVED/ASK redirects
                                 if !response_bytes.starts_with(b"$-1\r\n")
                                     && !response_bytes.starts_with(b"_\r\n")
+                                    && !response_bytes.starts_with(b"-")
                                 {
                                     // Cache the response (no allocation in hot path)
                                     cache.set(k, response_bytes);
@@ -704,22 +707,47 @@ fn handle_backend_recv(
                     break;
                 }
                 Err(e) => {
-                    error!(conn_id = ?conn_id, error = ?e, "Backend response parse error");
+                    // Log some context about the unparseable data
+                    let preview_len = recv_data.len().min(64);
+                    let preview = String::from_utf8_lossy(&recv_data[..preview_len]);
+                    error!(
+                        conn_id = ?conn_id,
+                        error = ?e,
+                        data_preview = %preview,
+                        data_len = recv_data.len(),
+                        "Backend response parse error"
+                    );
                     should_close = true;
+                    close_reason = "parse error";
                     break;
                 }
             }
         }
     });
 
-    if let Err(e) = result
-        && e.kind() == io::ErrorKind::UnexpectedEof
-    {
-        should_close = true;
+    if let Err(e) = result {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            should_close = true;
+            close_reason = "unexpected eof";
+        } else {
+            error!(conn_id = ?conn_id, error = %e, "Backend recv error");
+            should_close = true;
+            close_reason = "recv error";
+        }
     }
 
     if should_close {
-        warn!(conn_id = ?conn_id, "Backend connection closed");
+        // Get in-flight count before removing
+        let in_flight = pool
+            .get_connection(conn_id)
+            .map(|c| c.in_flight.len())
+            .unwrap_or(0);
+        warn!(
+            conn_id = ?conn_id,
+            reason = close_reason,
+            in_flight_requests = in_flight,
+            "Backend connection closed"
+        );
         pool.remove_connection(conn_id);
         let _ = driver.close(conn_id);
         return;
