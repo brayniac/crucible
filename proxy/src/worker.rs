@@ -197,6 +197,16 @@ fn run_worker(
         .expect("at least one backend node required");
     let mut backend_pool = BackendPool::new(backend_addr, config.backend.pool_size);
 
+    // Establish backend connections BEFORE accepting any clients
+    // This ensures we have backends ready when clients connect
+    info!(worker_id, address = %backend_addr, pool_size = config.backend.pool_size, "Connecting to backend");
+    ensure_backend_connections(&mut driver, &mut backend_pool)?;
+    info!(
+        worker_id,
+        connected = backend_pool.connection_count(),
+        "Backend connections established"
+    );
+
     // Client connections indexed by ConnId slot
     let mut clients: Vec<Option<ClientConnection>> = Vec::with_capacity(4096);
 
@@ -292,9 +302,26 @@ fn run_worker(
                             let _ = driver.close(conn_id);
                             CLIENT_CONNECTIONS.decrement();
                         }
-                    } else if backend_pool.remove_connection(conn_id).is_some() {
+                    } else if let Some(backend) = backend_pool.remove_connection(conn_id) {
                         let _ = driver.close(conn_id);
-                        warn!(conn_id = ?conn_id, "Backend connection closed");
+                        let in_flight_count = backend.in_flight.len();
+                        warn!(
+                            conn_id = ?conn_id,
+                            in_flight = in_flight_count,
+                            "Backend connection closed"
+                        );
+
+                        // Send error responses to clients with in-flight requests
+                        for request in backend.in_flight {
+                            pending_requests.remove(&request.request_id);
+                            if let Some(Some(client)) = clients.get_mut(request.client_id.slot()) {
+                                if client.conn_id == request.client_id {
+                                    // Send RESP error
+                                    let error_response = b"-ERR backend disconnected\r\n";
+                                    let _ = driver.send(request.client_id, error_response);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -312,9 +339,26 @@ fn run_worker(
                             let _ = driver.close(conn_id);
                             CLIENT_CONNECTIONS.decrement();
                         }
-                    } else if backend_pool.remove_connection(conn_id).is_some() {
-                        error!(conn_id = ?conn_id, error = %error, "Backend error");
+                    } else if let Some(backend) = backend_pool.remove_connection(conn_id) {
+                        let in_flight_count = backend.in_flight.len();
+                        error!(
+                            conn_id = ?conn_id,
+                            error = %error,
+                            in_flight = in_flight_count,
+                            "Backend error"
+                        );
                         let _ = driver.close(conn_id);
+
+                        // Send error responses to clients with in-flight requests
+                        for request in backend.in_flight {
+                            pending_requests.remove(&request.request_id);
+                            if let Some(Some(client)) = clients.get_mut(request.client_id.slot()) {
+                                if client.conn_id == request.client_id {
+                                    let error_response = b"-ERR backend error\r\n";
+                                    let _ = driver.send(request.client_id, error_response);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -353,38 +397,19 @@ fn ensure_backend_connections(
     while pool.needs_connections() {
         let addr = pool.backend_addr();
 
-        // Create a non-blocking TCP connection (avoid blocking the event loop)
-        let socket = socket2::Socket::new(
-            socket2::Domain::for_address(addr),
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        socket.set_nonblocking(true)?;
-        socket.set_nodelay(true)?;
-
-        // Non-blocking connect - may return WouldBlock
-        match socket.connect(&addr.into()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Connection in progress, that's fine
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
-                // Connection in progress, that's fine
-            }
-            Err(e) => return Err(e),
-        }
-
-        let stream: TcpStream = socket.into();
+        // Use blocking connect to ensure connection is established before use
+        // This is simpler and more reliable than non-blocking connect
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        stream.set_nonblocking(true)?;
 
         // Register with the driver
         match driver.register(stream) {
             Ok(conn_id) => {
-                // Connection might still be in progress (non-blocking)
-                // It will become ready when we get SendReady completion
                 let mut conn = BackendConnection::new(conn_id, addr);
-                conn.mark_connected(); // Mark ready - we'll get error if connect failed
+                conn.mark_connected();
                 pool.add_connection(conn);
-                trace!(address = %addr, conn_id = ?conn_id, "Backend connection initiated");
+                debug!(address = %addr, conn_id = ?conn_id, "Backend connected");
             }
             Err(e) => {
                 error!(error = %e, address = %addr, "Failed to register backend connection");
