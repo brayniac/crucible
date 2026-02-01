@@ -27,11 +27,16 @@ export class ChartsState {
     interval = null;
     // Total time range in seconds
     timeRange = null;
+    // Global min/max time in seconds (for consistent x-axis across all charts)
+    minTime = null;
+    maxTime = null;
 
     // Set the interval and time range from view data
     setTimeInfo(interval, minTime, maxTime) {
         this.interval = interval;
         this.timeRange = maxTime - minTime;
+        this.minTime = minTime;
+        this.maxTime = maxTime;
     }
 
     // Calculate the minimum zoom percentage (5x the sampling interval)

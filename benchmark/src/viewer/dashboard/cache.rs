@@ -13,12 +13,12 @@ pub fn generate(
 
     rates.plot_promql(
         PlotOpts::line("Hit Rate", "hit-rate", Unit::Rate),
-        "irate(cache_hits[5m])".to_string(),
+        "irate(cache_hits[10s])".to_string(),
     );
 
     rates.plot_promql(
         PlotOpts::line("Miss Rate", "miss-rate", Unit::Rate),
-        "irate(cache_misses[5m])".to_string(),
+        "irate(cache_misses[10s])".to_string(),
     );
 
     view.group(rates);
@@ -28,17 +28,17 @@ pub fn generate(
 
     ops.plot_promql(
         PlotOpts::line("GET/sec", "get-rate", Unit::Rate),
-        "irate(get_count[5m])".to_string(),
+        "irate(get_count[10s])".to_string(),
     );
 
     ops.plot_promql(
         PlotOpts::line("SET/sec", "set-rate", Unit::Rate),
-        "irate(set_count[5m])".to_string(),
+        "irate(set_count[10s])".to_string(),
     );
 
     ops.plot_promql(
         PlotOpts::line("DELETE/sec", "delete-rate", Unit::Rate),
-        "irate(delete_count[5m])".to_string(),
+        "irate(delete_count[10s])".to_string(),
     );
 
     view.group(ops);

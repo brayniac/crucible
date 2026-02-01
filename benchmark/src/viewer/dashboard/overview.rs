@@ -8,38 +8,46 @@ pub fn generate(
 ) -> View {
     let mut view = View::new(data, sections);
 
-    // Responses group - throughput and hit rate in one row
-    let mut responses = Group::new("Responses", "responses");
+    // Key metrics - single flat section
+    let mut metrics = Group::new("Key Metrics", "key-metrics");
 
-    // Response rate
-    responses.plot_promql(
-        PlotOpts::line("Responses/sec", "responses-rate", Unit::Rate),
-        "irate(responses_received[5m])".to_string(),
+    // Throughput
+    metrics.plot_promql(
+        PlotOpts::line("Throughput", "throughput", Unit::Rate),
+        "irate(responses_received[10s])".to_string(),
     );
 
-    // Cache hit rate as percentage (0-1 range)
-    responses.plot_promql(
+    // Hit rate
+    metrics.plot_promql(
         PlotOpts::line("Hit Rate", "hit-rate", Unit::Percentage),
-        "irate(cache_hits[5m]) / (irate(cache_hits[5m]) + irate(cache_misses[5m]))".to_string(),
+        "irate(cache_hits[10s]) / (irate(cache_hits[10s]) + irate(cache_misses[10s]))".to_string(),
     );
 
-    view.group(responses);
-
-    // Latency overview group
-    let mut latency = Group::new("Response Latency", "latency");
-
-    // Response latency percentiles
-    latency.plot_promql(
-        PlotOpts::scatter(
-            "Response Latency Percentiles",
-            "response-latency-pct",
-            Unit::Time,
-        )
-        .with_log_scale(true),
+    // Latency percentiles
+    metrics.plot_promql(
+        PlotOpts::scatter("Latency", "latency", Unit::Time).with_log_scale(true),
         "histogram_percentiles([0.5, 0.9, 0.99, 0.999, 0.9999], response_latency)".to_string(),
     );
 
-    view.group(latency);
+    // Error rate
+    metrics.plot_promql(
+        PlotOpts::line("Error Rate", "error-rate", Unit::Percentage),
+        "irate(request_errors[10s]) / irate(requests_sent[10s])".to_string(),
+    );
+
+    // Bandwidth TX (convert bytes to bits)
+    metrics.plot_promql(
+        PlotOpts::line("TX Bandwidth", "bandwidth-tx", Unit::Bitrate),
+        "irate(bytes_tx[10s]) * 8".to_string(),
+    );
+
+    // Bandwidth RX (convert bytes to bits)
+    metrics.plot_promql(
+        PlotOpts::line("RX Bandwidth", "bandwidth-rx", Unit::Bitrate),
+        "irate(bytes_rx[10s]) * 8".to_string(),
+    );
+
+    view.group(metrics);
 
     view
 }

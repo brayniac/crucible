@@ -1,11 +1,14 @@
-use metriken_exposition::{ParquetOptions, ParquetSchema, Snapshot, SnapshotterBuilder};
+use metriken_exposition::{
+    Counter as SnapCounter, Gauge as SnapGauge, Histogram as SnapHistogram, ParquetOptions,
+    ParquetSchema, Snapshot, SnapshotV2,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -231,17 +234,101 @@ fn generate_prometheus_output() -> String {
     output
 }
 
+/// Create a snapshot with the `metric` key added to each metric's metadata.
+/// This matches the format expected by metriken-query.
+fn create_snapshot() -> Snapshot {
+    let start = Instant::now();
+    let timestamp = SystemTime::now();
+
+    let mut counters = Vec::new();
+    let mut gauges = Vec::new();
+    let mut histograms = Vec::new();
+
+    for metric in metriken::metrics().iter() {
+        let value = metric.value();
+        if value.is_none() {
+            continue;
+        }
+
+        let name = metric.name();
+
+        // Build metadata with `metric` key first (like rezolus does)
+        let mut metadata: HashMap<String, String> =
+            [("metric".to_string(), name.to_string())].into();
+
+        // Add any existing metadata from the metric (excluding description)
+        for (k, v) in metric.metadata().iter() {
+            metadata.insert(k.to_string(), v.to_string());
+        }
+
+        match value {
+            Some(metriken::Value::Counter(v)) => {
+                counters.push(SnapCounter {
+                    name: name.to_string(),
+                    value: v,
+                    metadata,
+                });
+            }
+            Some(metriken::Value::Gauge(v)) => {
+                gauges.push(SnapGauge {
+                    name: name.to_string(),
+                    value: v,
+                    metadata,
+                });
+            }
+            Some(metriken::Value::Other(other)) => {
+                let histogram = if let Some(h) = other.downcast_ref::<metriken::AtomicHistogram>() {
+                    h.load()
+                } else if let Some(h) = other.downcast_ref::<metriken::RwLockHistogram>() {
+                    h.load()
+                } else {
+                    None
+                };
+
+                if let Some(h) = histogram {
+                    // Add histogram config to metadata
+                    metadata.insert(
+                        "grouping_power".to_string(),
+                        h.config().grouping_power().to_string(),
+                    );
+                    metadata.insert(
+                        "max_value_power".to_string(),
+                        h.config().max_value_power().to_string(),
+                    );
+
+                    histograms.push(SnapHistogram {
+                        name: name.to_string(),
+                        value: h,
+                        metadata,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let duration = start.elapsed();
+
+    Snapshot::V2(SnapshotV2 {
+        systemtime: timestamp,
+        duration,
+        metadata: [
+            ("source".to_string(), "crucible-benchmark".to_string()),
+            ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        ]
+        .into(),
+        counters,
+        gauges,
+        histograms,
+    })
+}
+
 async fn run_parquet_recorder(
     path: PathBuf,
     interval: Duration,
     shared: Arc<SharedState>,
     stop_notify: Arc<Notify>,
 ) -> io::Result<()> {
-    let snapshotter = SnapshotterBuilder::new()
-        .metadata("source".to_string(), "crucible-benchmark".to_string())
-        .metadata("version".to_string(), env!("CARGO_PKG_VERSION").to_string())
-        .build();
-
     // Collect snapshots during the run
     let mut snapshots: Vec<Snapshot> = Vec::new();
 
@@ -250,8 +337,7 @@ async fn run_parquet_recorder(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                let snapshot = snapshotter.snapshot();
-                snapshots.push(snapshot);
+                snapshots.push(create_snapshot());
             }
             _ = stop_notify.notified() => {
                 break;
@@ -267,7 +353,7 @@ async fn run_parquet_recorder(
     }
 
     // Final snapshot
-    snapshots.push(snapshotter.snapshot());
+    snapshots.push(create_snapshot());
 
     // Write all snapshots to parquet
     if !snapshots.is_empty() {
@@ -280,10 +366,14 @@ async fn run_parquet_recorder(
         // Create file and writer
         let file = File::create(&path).map_err(|e| io::Error::other(e.to_string()))?;
 
-        let metadata = HashMap::from([(
-            "sampling_interval_ms".to_string(),
-            interval.as_millis().to_string(),
-        )]);
+        let metadata = HashMap::from([
+            (
+                "sampling_interval_ms".to_string(),
+                interval.as_millis().to_string(),
+            ),
+            ("source".to_string(), "crucible-benchmark".to_string()),
+            ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        ]);
 
         let mut writer = schema
             .finalize(file, ParquetOptions::new(), Some(metadata))

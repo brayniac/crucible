@@ -13,12 +13,12 @@ pub fn generate(
 
     requests.plot_promql(
         PlotOpts::line("Responses/sec", "responses-received", Unit::Rate),
-        "irate(responses_received[5m])".to_string(),
+        "irate(responses_received[10s])".to_string(),
     );
 
     requests.plot_promql(
         PlotOpts::line("Error Rate", "error-rate", Unit::Percentage),
-        "irate(request_errors[5m]) / irate(requests_sent[5m])".to_string(),
+        "irate(request_errors[10s]) / irate(requests_sent[10s])".to_string(),
     );
 
     view.group(requests);
@@ -28,12 +28,12 @@ pub fn generate(
 
     bytes.plot_promql(
         PlotOpts::line("TX Bytes/sec", "bytes-tx", Unit::Datarate),
-        "irate(bytes_tx[5m])".to_string(),
+        "irate(bytes_tx[10s])".to_string(),
     );
 
     bytes.plot_promql(
         PlotOpts::line("RX Bytes/sec", "bytes-rx", Unit::Datarate),
-        "irate(bytes_rx[5m])".to_string(),
+        "irate(bytes_rx[10s])".to_string(),
     );
 
     view.group(bytes);
@@ -43,17 +43,17 @@ pub fn generate(
 
     ops.plot_promql(
         PlotOpts::line("GET/sec", "get-rate", Unit::Rate),
-        "irate(get_count[5m])".to_string(),
+        "irate(get_count[10s])".to_string(),
     );
 
     ops.plot_promql(
         PlotOpts::line("SET/sec", "set-rate", Unit::Rate),
-        "irate(set_count[5m])".to_string(),
+        "irate(set_count[10s])".to_string(),
     );
 
     ops.plot_promql(
         PlotOpts::line("DELETE/sec", "delete-rate", Unit::Rate),
-        "irate(delete_count[5m])".to_string(),
+        "irate(delete_count[10s])".to_string(),
     );
 
     view.group(ops);

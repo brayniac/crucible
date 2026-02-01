@@ -18,7 +18,7 @@ pub fn generate(
 
     connections.plot_promql(
         PlotOpts::line("Connection Failures/sec", "connections-failed", Unit::Rate),
-        "irate(connections_failed[5m])".to_string(),
+        "irate(connections_failed[10s])".to_string(),
     );
 
     view.group(connections);
@@ -28,32 +28,32 @@ pub fn generate(
 
     disconnects.plot_promql(
         PlotOpts::line("EOF", "disconnect-eof", Unit::Rate),
-        "irate(disconnects_eof[5m])".to_string(),
+        "irate(disconnects_eof[10s])".to_string(),
     );
 
     disconnects.plot_promql(
         PlotOpts::line("Recv Error", "disconnect-recv-error", Unit::Rate),
-        "irate(disconnects_recv_error[5m])".to_string(),
+        "irate(disconnects_recv_error[10s])".to_string(),
     );
 
     disconnects.plot_promql(
         PlotOpts::line("Send Error", "disconnect-send-error", Unit::Rate),
-        "irate(disconnects_send_error[5m])".to_string(),
+        "irate(disconnects_send_error[10s])".to_string(),
     );
 
     disconnects.plot_promql(
         PlotOpts::line("Closed Event", "disconnect-closed-event", Unit::Rate),
-        "irate(disconnects_closed_event[5m])".to_string(),
+        "irate(disconnects_closed_event[10s])".to_string(),
     );
 
     disconnects.plot_promql(
         PlotOpts::line("Error Event", "disconnect-error-event", Unit::Rate),
-        "irate(disconnects_error_event[5m])".to_string(),
+        "irate(disconnects_error_event[10s])".to_string(),
     );
 
     disconnects.plot_promql(
         PlotOpts::line("Connect Failed", "disconnect-connect-failed", Unit::Rate),
-        "irate(disconnects_connect_failed[5m])".to_string(),
+        "irate(disconnects_connect_failed[10s])".to_string(),
     );
 
     view.group(disconnects);

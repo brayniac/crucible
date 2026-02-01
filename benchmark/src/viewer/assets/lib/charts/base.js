@@ -156,10 +156,15 @@ export function getTooltipFormatter(valueFormatter) {
     }
 }
 
-export function getBaseOption(title, interval = null) {
+export function getBaseOption(title, chartsState = null) {
     // Calculate minimum zoom span (5x sampling interval in milliseconds)
     // If interval is provided in seconds, convert to ms
+    const interval = chartsState ? chartsState.interval : null;
     const minValueSpan = interval ? interval * 5 * 1000 : undefined;
+
+    // Use global time range if available (in milliseconds for echarts)
+    const xMin = chartsState && chartsState.minTime != null ? chartsState.minTime * 1000 : 'dataMin';
+    const xMax = chartsState && chartsState.maxTime != null ? chartsState.maxTime * 1000 : 'dataMax';
 
     return {
         grid: {
@@ -171,8 +176,8 @@ export function getBaseOption(title, interval = null) {
         },
         xAxis: {
             type: 'time',
-            min: 'dataMin',
-            max: 'dataMax',
+            min: xMin,
+            max: xMax,
             splitNumber: 5,
             axisLine: { show: false },
             axisTick: { show: false },

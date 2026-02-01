@@ -81,7 +81,8 @@ export function configureHistogramHeatmap(chart) {
         return;
     }
 
-    const baseOption = getBaseOption(opts.title);
+    // Pass chartsState for global time range and interval
+    const baseOption = getBaseOption(opts.title, chart.chartsState);
 
     // Find the range of buckets that actually have data
     let minBucketIdx = Infinity;
@@ -283,32 +284,10 @@ export function configureHistogramHeatmap(chart) {
             filterMode: 'none',
         }],
         xAxis: {
-            type: 'time',
-            min: 'dataMin',
-            max: 'dataMax',
-            // Match the splitNumber from base.js for consistent label spacing
-            splitNumber: 5,
-            axisLine: { show: false },
-            axisTick: { show: false },
-            axisLabel: {
-                color: '#6b7280',
-                fontSize: 11,
-                // Use the same formatter as base.js for consistent time formatting
-                formatter: {
-                    year: '{yyyy}',
-                    month: '{MMM}',
-                    day: '{d}',
-                    hour: '{HH}:{mm}',
-                    minute: '{HH}:{mm}',
-                    second: '{HH}:{mm}:{ss}',
-                    millisecond: '{hh}:{mm}:{ss}.{SSS}',
-                    none: '{hh}:{mm}:{ss}.{SSS}'
-                }
-            },
-            splitLine: {
-                show: true,
-                lineStyle: { color: 'rgba(30, 37, 48, 0.8)' }
-            },
+            ...baseOption.xAxis,
+            // Override min/max if not set by baseOption (use global time range)
+            min: baseOption.xAxis.min !== 'dataMin' ? baseOption.xAxis.min : 'dataMin',
+            max: baseOption.xAxis.max !== 'dataMax' ? baseOption.xAxis.max : 'dataMax',
         },
         yAxis: {
             type: 'log',

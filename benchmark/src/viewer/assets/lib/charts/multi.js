@@ -24,9 +24,8 @@ export function configureMultiSeriesChart(chart) {
         return;
     }
 
-    // Get interval from chartsState for minimum zoom calculation
-    const interval = chart.chartsState ? chart.chartsState.interval : null;
-    const baseOption = getBaseOption(opts.title, interval);
+    // Pass chartsState for global time range and interval
+    const baseOption = getBaseOption(opts.title, chart.chartsState);
 
     // For multi-series charts, the first row contains timestamps, subsequent rows are series data
     const timeData = data[0];

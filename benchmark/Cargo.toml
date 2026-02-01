@@ -21,7 +21,7 @@ protocol-momento = { workspace = true }
 metrics = { workspace = true }
 metriken = { workspace = true }
 metriken-exposition = { version = "0.12", features = ["parquet"] }
-metriken-query = { version = "0.1", features = ["http"] }
+metriken-query = { version = "0.1.2", features = ["http"] }
 
 # Configuration
 toml = { workspace = true }

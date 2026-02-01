@@ -23,9 +23,8 @@ export function configureScatterChart(chart) {
         return;
     }
 
-    // Get interval from chartsState for minimum zoom calculation
-    const interval = chart.chartsState ? chart.chartsState.interval : null;
-    const baseOption = getBaseOption(opts.title, interval);
+    // Pass chartsState for global time range and interval
+    const baseOption = getBaseOption(opts.title, chart.chartsState);
 
     const format = opts.format || {};
     const unitSystem = format.unit_system;

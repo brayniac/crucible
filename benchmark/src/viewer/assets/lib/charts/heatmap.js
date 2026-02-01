@@ -27,9 +27,8 @@ export function configureHeatmap(chart) {
         return;
     }
 
-    // Get interval from chartsState for minimum zoom calculation
-    const interval = chart.chartsState ? chart.chartsState.interval : null;
-    const baseOption = getBaseOption(opts.title, interval);
+    // Pass chartsState for global time range and interval
+    const baseOption = getBaseOption(opts.title, chart.chartsState);
 
     // Extract all unique Y indices
     const yIndices = new Set();
