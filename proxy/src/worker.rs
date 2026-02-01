@@ -236,7 +236,12 @@ fn run_worker(
                     let idx = conn_id.slot();
 
                     // Determine if this is a client or backend connection
-                    if clients.get(idx).is_some_and(|c| c.is_some()) {
+                    // IMPORTANT: Must verify conn_id matches, not just the slot index
+                    let is_client = clients
+                        .get(idx)
+                        .is_some_and(|c| c.as_ref().is_some_and(|c| c.conn_id == conn_id));
+
+                    if is_client {
                         handle_client_recv(
                             &mut driver,
                             &mut clients,
@@ -260,9 +265,11 @@ fn run_worker(
                 CompletionKind::SendReady { conn_id } => {
                     let idx = conn_id.slot();
 
-                    // Drain pending sends
+                    // Drain pending sends - verify conn_id matches
                     if let Some(Some(client)) = clients.get_mut(idx) {
-                        drain_client_sends(&mut driver, client, conn_id);
+                        if client.conn_id == conn_id {
+                            drain_client_sends(&mut driver, client, conn_id);
+                        }
                     } else if let Some(backend) = backend_pool.get_connection_mut(conn_id) {
                         drain_backend_sends(&mut driver, backend, conn_id);
                     }
@@ -270,8 +277,14 @@ fn run_worker(
 
                 CompletionKind::Closed { conn_id } => {
                     let idx = conn_id.slot();
-                    if let Some(slot) = clients.get_mut(idx) {
-                        if slot.take().is_some() {
+                    // Verify conn_id matches before closing
+                    let is_client = clients
+                        .get(idx)
+                        .is_some_and(|c| c.as_ref().is_some_and(|c| c.conn_id == conn_id));
+
+                    if is_client {
+                        if let Some(slot) = clients.get_mut(idx) {
+                            slot.take();
                             let _ = driver.close(conn_id);
                             CLIENT_CONNECTIONS.decrement();
                         }
@@ -283,8 +296,14 @@ fn run_worker(
 
                 CompletionKind::Error { conn_id, error } => {
                     let idx = conn_id.slot();
-                    if let Some(slot) = clients.get_mut(idx) {
-                        if slot.take().is_some() {
+                    // Verify conn_id matches before handling error
+                    let is_client = clients
+                        .get(idx)
+                        .is_some_and(|c| c.as_ref().is_some_and(|c| c.conn_id == conn_id));
+
+                    if is_client {
+                        if let Some(slot) = clients.get_mut(idx) {
+                            slot.take();
                             debug!(conn_id = ?conn_id, error = %error, "Client error");
                             let _ = driver.close(conn_id);
                             CLIENT_CONNECTIONS.decrement();
@@ -373,9 +392,13 @@ fn handle_client_recv(
             return;
         }
 
+        // Verify conn_id matches the client at this slot
         let Some(Some(client)) = clients.get_mut(idx) else {
             return;
         };
+        if client.conn_id != conn_id {
+            return;
+        }
 
         // Copy data to client's recv buffer
         let data = buf.as_slice();
@@ -790,12 +813,14 @@ fn close_client(
     reason: &str,
 ) {
     let idx = conn_id.slot();
-    if let Some(slot) = clients.get_mut(idx)
-        && slot.take().is_some()
-    {
-        debug!(conn_id = ?conn_id, reason, "Closing client");
-        let _ = driver.close(conn_id);
-        CLIENT_CONNECTIONS.decrement();
+    // Verify conn_id matches before closing
+    if let Some(slot) = clients.get_mut(idx) {
+        if slot.as_ref().is_some_and(|c| c.conn_id == conn_id) {
+            slot.take();
+            debug!(conn_id = ?conn_id, reason, "Closing client");
+            let _ = driver.close(conn_id);
+            CLIENT_CONNECTIONS.decrement();
+        }
     }
 }
 
