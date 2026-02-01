@@ -200,7 +200,8 @@ fn run_worker(
     // Establish backend connections BEFORE accepting any clients
     // This ensures we have backends ready when clients connect
     info!(worker_id, address = %backend_addr, pool_size = config.backend.pool_size, "Connecting to backend");
-    ensure_backend_connections(&mut driver, &mut backend_pool)?;
+    initiate_backend_connections(&mut driver, &mut backend_pool)?;
+    wait_for_backend_connections(&mut driver, &mut backend_pool)?;
     info!(
         worker_id,
         connected = backend_pool.connection_count(),
@@ -236,8 +237,8 @@ fn run_worker(
             }
         }
 
-        // Ensure backend connections are established
-        ensure_backend_connections(&mut driver, &mut backend_pool)?;
+        // Initiate any needed backend connections (non-blocking)
+        initiate_backend_connections(&mut driver, &mut backend_pool)?;
 
         // Poll for completions - use very short timeout when actively processing
         let timeout = Duration::from_micros(100);
@@ -285,6 +286,11 @@ fn run_worker(
                             drain_client_sends(&mut driver, client, conn_id);
                         }
                     } else if let Some(backend) = backend_pool.get_connection_mut(conn_id) {
+                        // If backend was connecting, mark it as connected now
+                        if matches!(backend.state, crate::backend::BackendState::Connecting) {
+                            backend.mark_connected();
+                            debug!(conn_id = ?conn_id, address = %backend.addr, "Backend connected (runtime)");
+                        }
                         drain_backend_sends(&mut driver, backend, conn_id);
                     }
                 }
@@ -389,34 +395,107 @@ fn run_worker(
     Ok(())
 }
 
-/// Ensure we have enough backend connections.
-fn ensure_backend_connections(
+/// Initiate backend connections (non-blocking).
+/// Connections start in Connecting state and become Connected on SendReady.
+fn initiate_backend_connections(
     driver: &mut Box<dyn IoDriver>,
     pool: &mut BackendPool,
 ) -> io::Result<()> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
     while pool.needs_connections() {
         let addr = pool.backend_addr();
 
-        // Use blocking connect to ensure connection is established before use
-        // This is simpler and more reliable than non-blocking connect
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        stream.set_nonblocking(true)?;
+        // Create non-blocking socket
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_nonblocking(true)?;
+        socket.set_nodelay(true)?;
 
-        // Register with the driver
+        // Non-blocking connect - returns EINPROGRESS
+        match socket.connect(&addr.into()) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) => {
+                error!(error = %e, address = %addr, "Backend connect failed");
+                return Err(e);
+            }
+        }
+
+        let stream: TcpStream = socket.into();
+
+        // Register with the driver - connection still in progress
         match driver.register(stream) {
             Ok(conn_id) => {
-                let mut conn = BackendConnection::new(conn_id, addr);
-                conn.mark_connected();
+                // Connection is in Connecting state until SendReady
+                let conn = BackendConnection::new(conn_id, addr);
                 pool.add_connection(conn);
-                debug!(address = %addr, conn_id = ?conn_id, "Backend connected");
+                trace!(address = %addr, conn_id = ?conn_id, "Backend connection initiated");
             }
             Err(e) => {
                 error!(error = %e, address = %addr, "Failed to register backend connection");
-                break;
+                return Err(e);
             }
         }
     }
+    Ok(())
+}
+
+/// Wait for all backend connections to be established.
+/// Polls the driver until all connections receive SendReady.
+fn wait_for_backend_connections(
+    driver: &mut Box<dyn IoDriver>,
+    pool: &mut BackendPool,
+) -> io::Result<()> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+
+    while pool
+        .connections()
+        .any(|c| matches!(c.state, crate::backend::BackendState::Connecting))
+    {
+        if start.elapsed() > timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Backend connection timeout",
+            ));
+        }
+
+        driver.poll(Some(Duration::from_millis(100)))?;
+
+        for completion in driver.drain_completions() {
+            match completion.kind {
+                CompletionKind::SendReady { conn_id } => {
+                    // Connection established
+                    if let Some(conn) = pool.get_connection_mut(conn_id) {
+                        conn.mark_connected();
+                        debug!(conn_id = ?conn_id, address = %conn.addr, "Backend connected");
+                    }
+                }
+                CompletionKind::Error { conn_id, error } => {
+                    if pool.get_connection(conn_id).is_some() {
+                        error!(conn_id = ?conn_id, error = %error, "Backend connection failed");
+                        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, error));
+                    }
+                }
+                CompletionKind::Closed { conn_id } => {
+                    if pool.get_connection(conn_id).is_some() {
+                        error!(conn_id = ?conn_id, "Backend connection closed during connect");
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "Backend closed during connect",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     Ok(())
 }
 
