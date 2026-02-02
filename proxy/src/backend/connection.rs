@@ -94,11 +94,18 @@ impl BackendConnection {
         !matches!(self.state, BackendState::Failed | BackendState::Connecting)
     }
 
-    /// Queue a request to send.
-    pub fn queue_request(&mut self, request: InFlightRequest, data: &[u8]) {
-        self.send_buf.extend_from_slice(data);
+    /// Queue a request after data has already been encoded into send_buf.
+    /// Use this with `send_buf_mut()` for zero-allocation encoding.
+    #[inline]
+    pub fn queue_request_encoded(&mut self, request: InFlightRequest) {
         self.in_flight.push_back(request);
         self.state = BackendState::Sending { bytes_sent: 0 };
+    }
+
+    /// Get mutable access to send buffer for direct encoding.
+    #[inline]
+    pub fn send_buf_mut(&mut self) -> &mut BytesMut {
+        &mut self.send_buf
     }
 
     /// Append received data.

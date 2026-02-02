@@ -696,13 +696,16 @@ fn forward_to_backend(
         _ => {}
     }
 
-    // Encode command for backend
-    let mut request_buf = Vec::with_capacity(256);
-    encode_command(cmd, &mut request_buf);
+    // Get a connection first, then encode directly into its buffer (zero allocation)
+    let Some(conn) = pool.get_usable_connection() else {
+        return ForwardResult::Error(b"-ERR backend unavailable\r\n");
+    };
 
-    // Get a connection and queue the request
+    // Encode command directly into connection's send buffer
+    encode_command(cmd, conn.send_buf_mut());
+
+    // Queue the request metadata
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-
     let request = InFlightRequest {
         client_id,
         request_id,
@@ -710,32 +713,34 @@ fn forward_to_backend(
         cacheable: matches!(cmd, Command::Get { .. }),
     };
 
-    if pool.queue_request(request, &request_buf).is_some() {
-        pending_requests.insert(request_id, client_id);
-        BACKEND_REQUESTS.increment();
-        ForwardResult::Forwarded
-    } else {
-        ForwardResult::Error(b"-ERR backend unavailable\r\n")
-    }
+    let conn_id = conn.conn_id;
+    conn.queue_request_encoded(request);
+    pending_requests.insert(request_id, client_id);
+    BACKEND_REQUESTS.increment();
+
+    // Return the connection ID so caller knows which backend was used
+    // (useful for future cluster support)
+    let _ = conn_id;
+    ForwardResult::Forwarded
 }
 
-/// Encode a RESP command.
-fn encode_command(cmd: &Command<'_>, buf: &mut Vec<u8>) {
+/// Encode a RESP command directly into a BytesMut buffer (zero-copy path).
+fn encode_command(cmd: &Command<'_>, buf: &mut bytes::BytesMut) {
     match cmd {
         Command::Get { key } => {
             buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$");
-            buf.extend_from_slice(key.len().to_string().as_bytes());
+            write_usize(buf, key.len());
             buf.extend_from_slice(b"\r\n");
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
         }
         Command::Set { key, value, .. } => {
             buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
-            buf.extend_from_slice(key.len().to_string().as_bytes());
+            write_usize(buf, key.len());
             buf.extend_from_slice(b"\r\n");
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n$");
-            buf.extend_from_slice(value.len().to_string().as_bytes());
+            write_usize(buf, value.len());
             buf.extend_from_slice(b"\r\n");
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
@@ -746,6 +751,24 @@ fn encode_command(cmd: &Command<'_>, buf: &mut Vec<u8>) {
             buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
         }
     }
+}
+
+/// Write a usize as decimal digits directly to buffer (avoids String allocation).
+#[inline]
+fn write_usize(buf: &mut bytes::BytesMut, mut n: usize) {
+    if n == 0 {
+        buf.extend_from_slice(b"0");
+        return;
+    }
+    // Max digits for usize is 20 (for u64::MAX)
+    let mut digits = [0u8; 20];
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    buf.extend_from_slice(&digits[i..]);
 }
 
 /// Extract the key from a command (for caching).

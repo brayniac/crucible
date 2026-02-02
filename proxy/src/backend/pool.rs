@@ -1,6 +1,6 @@
 //! Backend connection pool.
 
-use super::connection::{BackendConnection, InFlightRequest};
+use super::connection::BackendConnection;
 use ahash::AHashMap;
 use io_driver::ConnId;
 use std::net::SocketAddr;
@@ -110,18 +110,6 @@ impl BackendPool {
     pub fn mark_connected(&mut self, conn_id: ConnId) {
         if let Some(conn) = self.connections.get_mut(&conn_id) {
             conn.mark_connected();
-        }
-    }
-
-    /// Queue a request on an available connection.
-    /// Returns None if no connection is available.
-    pub fn queue_request(&mut self, request: InFlightRequest, data: &[u8]) -> Option<ConnId> {
-        if let Some(conn) = self.get_usable_connection() {
-            let conn_id = conn.conn_id;
-            conn.queue_request(request, data);
-            Some(conn_id)
-        } else {
-            None
         }
     }
 }
