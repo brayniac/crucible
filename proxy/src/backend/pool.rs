@@ -75,25 +75,30 @@ impl BackendPool {
         self.connections.values_mut().find(|c| c.is_idle())
     }
 
-    /// Get a usable connection (idle preferred, or one with capacity for pipelining).
+    /// Get a usable connection with least in-flight requests (load balancing).
     pub fn get_usable_connection(&mut self) -> Option<&mut BackendConnection> {
-        // First try to find an idle connection, then any usable one
-        // We need to do this in a single pass to satisfy the borrow checker
-        let mut idle_id = None;
-        let mut usable_id = None;
+        // Find the usable connection with the fewest in-flight requests
+        // This distributes load evenly across all backend connections
+        let mut best_id = None;
+        let mut best_in_flight = usize::MAX;
 
         for (conn_id, conn) in &self.connections {
-            if conn.is_idle() {
-                idle_id = Some(*conn_id);
-                break;
-            } else if usable_id.is_none() && conn.is_usable() {
-                usable_id = Some(*conn_id);
+            if !conn.is_usable() {
+                continue;
+            }
+            let in_flight = conn.in_flight.len();
+            // Prefer idle (0 in-flight), then least loaded
+            if in_flight < best_in_flight {
+                best_in_flight = in_flight;
+                best_id = Some(*conn_id);
+                // Short-circuit if we find an idle connection
+                if in_flight == 0 {
+                    break;
+                }
             }
         }
 
-        idle_id
-            .or(usable_id)
-            .and_then(|id| self.connections.get_mut(&id))
+        best_id.and_then(|id| self.connections.get_mut(&id))
     }
 
     /// Iterate over all connections.
