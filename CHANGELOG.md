@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.11] - 2026-02-02
+
+### Fixed
+- Heap cache index out of bounds panic under high concurrency (free list link validation)
+- Protocol desync with io_uring singleshot mode (connection generation validation)
+- Benchmark buffer too small panic with large values (dynamic buffer growth)
+
 ## [0.2.10] - 2026-02-02
 
 ### Added
