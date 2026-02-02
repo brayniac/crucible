@@ -337,7 +337,10 @@ async fn run_parquet_recorder(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                snapshots.push(create_snapshot());
+                // Only collect snapshots during the running phase (skip warmup)
+                if shared.phase().is_recording() {
+                    snapshots.push(create_snapshot());
+                }
             }
             _ = stop_notify.notified() => {
                 break;
