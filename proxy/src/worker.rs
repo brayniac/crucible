@@ -182,13 +182,20 @@ fn run_worker(
 
     // Initialize I/O driver
     let io_engine = config.io_engine();
-    info!(worker_id, ?io_engine, "Starting worker with I/O engine");
+    let sqpoll = config.uring.sqpoll;
+    info!(
+        worker_id,
+        ?io_engine,
+        sqpoll,
+        "Starting worker with I/O engine"
+    );
 
     let mut driver = Driver::builder()
         .engine(io_engine)
         .buffer_size(config.uring.buffer_size)
         .buffer_count(config.uring.buffer_count)
         .sq_depth(config.uring.sq_depth)
+        .sqpoll(config.uring.sqpoll)
         .build()?;
 
     // Initialize backend pool

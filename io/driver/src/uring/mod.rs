@@ -2198,10 +2198,8 @@ impl IoDriver for UringDriver {
             }
         }
 
-        // Submit pending operations
-        self.ring.submit()?;
-
-        // Wait for completions
+        // Submit pending operations and wait for completions
+        // Note: submit_and_wait/submit_with_args both submit AND wait in a single syscall
         if let Some(t) = timeout {
             let ts = io_uring::types::Timespec::new()
                 .sec(t.as_secs())
