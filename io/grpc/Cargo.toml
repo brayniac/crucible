@@ -1,6 +1,6 @@
 [package]
 name = "grpc"
-version = "0.2.11-alpha.0"
+version = "0.2.11"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
