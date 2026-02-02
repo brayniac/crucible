@@ -200,7 +200,13 @@ fn run_worker(
     // Establish backend connections BEFORE accepting any clients
     // This ensures we have backends ready when clients connect
     info!(worker_id, address = %backend_addr, pool_size = config.backend.pool_size, "Connecting to backend");
-    initiate_backend_connections(&mut driver, &mut backend_pool)?;
+    let initiated = initiate_backend_connections(&mut driver, &mut backend_pool);
+    if initiated == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "Failed to initiate any backend connections",
+        ));
+    }
     wait_for_backend_connections(&mut driver, &mut backend_pool)?;
     info!(
         worker_id,
@@ -251,7 +257,8 @@ fn run_worker(
         }
 
         // Initiate any needed backend connections (non-blocking)
-        initiate_backend_connections(&mut driver, &mut backend_pool)?;
+        // This doesn't fail the worker - it will retry on next iteration
+        let _ = initiate_backend_connections(&mut driver, &mut backend_pool);
 
         // Poll for completions - use very short timeout when actively processing
         let timeout = Duration::from_micros(100);
@@ -410,11 +417,11 @@ fn run_worker(
 
 /// Initiate backend connections (non-blocking).
 /// Connections start in Connecting state and become Connected on SendReady.
-fn initiate_backend_connections(
-    driver: &mut Box<dyn IoDriver>,
-    pool: &mut BackendPool,
-) -> io::Result<()> {
+/// Returns the number of connections initiated.
+fn initiate_backend_connections(driver: &mut Box<dyn IoDriver>, pool: &mut BackendPool) -> usize {
     use socket2::{Domain, Protocol, Socket, Type};
+
+    let mut initiated = 0;
 
     while pool.needs_connections() {
         let addr = pool.backend_addr();
@@ -425,17 +432,31 @@ fn initiate_backend_connections(
         } else {
             Domain::IPV6
         };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_nonblocking(true)?;
-        socket.set_nodelay(true)?;
+
+        let socket = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, address = %addr, "Failed to create socket");
+                break; // Try again next iteration
+            }
+        };
+
+        if let Err(e) = socket.set_nonblocking(true) {
+            warn!(error = %e, "Failed to set nonblocking");
+            break;
+        }
+        if let Err(e) = socket.set_nodelay(true) {
+            warn!(error = %e, "Failed to set nodelay");
+            break;
+        }
 
         // Non-blocking connect - returns EINPROGRESS
         match socket.connect(&addr.into()) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
             Err(e) => {
-                error!(error = %e, address = %addr, "Backend connect failed");
-                return Err(e);
+                warn!(error = %e, address = %addr, "Backend connect failed, will retry");
+                break; // Don't crash, just try again next iteration
             }
         }
 
@@ -448,14 +469,16 @@ fn initiate_backend_connections(
                 let conn = BackendConnection::new(conn_id, addr);
                 pool.add_connection(conn);
                 trace!(address = %addr, conn_id = ?conn_id, "Backend connection initiated");
+                initiated += 1;
             }
             Err(e) => {
-                error!(error = %e, address = %addr, "Failed to register backend connection");
-                return Err(e);
+                warn!(error = %e, address = %addr, "Failed to register backend connection");
+                break;
             }
         }
     }
-    Ok(())
+
+    initiated
 }
 
 /// Wait for all backend connections to be established.
