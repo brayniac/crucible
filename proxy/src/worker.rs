@@ -549,10 +549,11 @@ fn handle_client_recv(
     let mut close_reason = None;
 
     // Access received data via with_recv_buf
+    // Note: Empty buffer does NOT mean EOF - it just means no new data.
+    // EOF is signaled by with_recv_buf returning UnexpectedEof error.
     let result = driver.with_recv_buf(conn_id, &mut |buf| {
+        // If no new data, just return - not an error
         if buf.is_empty() {
-            should_close = true;
-            close_reason = Some("client closed");
             return;
         }
 
@@ -615,15 +616,16 @@ fn handle_client_recv(
         }
     });
 
-    // Handle EOF
+    // Handle EOF - client closed the connection
     if let Err(e) = result
         && e.kind() == io::ErrorKind::UnexpectedEof
     {
         should_close = true;
+        close_reason = Some("eof");
     }
 
     if should_close {
-        close_client(driver, clients, conn_id, close_reason.unwrap_or("error"));
+        close_client(driver, clients, conn_id, close_reason.unwrap_or("unknown"));
         return;
     }
 
@@ -709,7 +711,6 @@ fn forward_to_backend(
 
 /// Encode a RESP command.
 fn encode_command(cmd: &Command<'_>, buf: &mut Vec<u8>) {
-    let start = buf.len();
     match cmd {
         Command::Get { key } => {
             buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$");
@@ -735,15 +736,6 @@ fn encode_command(cmd: &Command<'_>, buf: &mut Vec<u8>) {
             buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
         }
     }
-
-    // Log first few commands for debugging
-    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let logged = LOGGED.fetch_add(1, Ordering::Relaxed);
-    if logged < 5 {
-        let encoded = &buf[start..];
-        let preview = String::from_utf8_lossy(&encoded[..encoded.len().min(100)]);
-        info!(encoded_len = encoded.len(), preview = %preview, "Encoded command");
-    }
 }
 
 /// Extract the key from a command (for caching).
@@ -755,17 +747,9 @@ fn extract_key(cmd: &Command<'_>) -> Option<bytes::Bytes> {
 }
 
 /// Response to send to a client after backend recv.
-enum ResponseToSend {
-    /// Response is cached - use with_value for zero-copy send
-    Cached {
-        client_id: ConnId,
-        key: bytes::Bytes,
-    },
-    /// Response not cached - must use copied bytes
-    Raw {
-        client_id: ConnId,
-        response: Vec<u8>,
-    },
+struct ResponseToSend {
+    client_id: ConnId,
+    response: Vec<u8>,
 }
 
 /// Handle data received from a backend.
@@ -782,10 +766,11 @@ fn handle_backend_recv(
     let mut responses_to_send: Vec<ResponseToSend> = Vec::new();
 
     // Access received data
+    // Note: Empty buffer does NOT mean EOF - it just means no new data.
+    // EOF is signaled by with_recv_buf returning UnexpectedEof error.
     let result = driver.with_recv_buf(conn_id, &mut |buf| {
+        // If no new data, just return - not an error
         if buf.is_empty() {
-            should_close = true;
-            close_reason = "recv empty (peer closed)";
             return;
         }
 
@@ -824,8 +809,7 @@ fn handle_backend_recv(
                     if let Some((request_id, client_id, cacheable, key)) = request_info {
                         let response_bytes = &recv_data[..consumed];
 
-                        // For cacheable GET requests with non-nil responses:
-                        // cache first, then we'll use with_value for zero-copy send
+                        // Cache successful GET responses for future requests
                         if cacheable {
                             if let Some(ref k) = key {
                                 // Only cache successful bulk string responses
@@ -834,33 +818,16 @@ fn handle_backend_recv(
                                     && !response_bytes.starts_with(b"_\r\n")
                                     && !response_bytes.starts_with(b"-")
                                 {
-                                    // Cache the response (no allocation in hot path)
                                     cache.set(k, response_bytes);
-                                    responses_to_send.push(ResponseToSend::Cached {
-                                        client_id,
-                                        key: k.clone(),
-                                    });
-                                } else {
-                                    // Nil response - copy (small: 5 bytes)
-                                    responses_to_send.push(ResponseToSend::Raw {
-                                        client_id,
-                                        response: response_bytes.to_vec(),
-                                    });
                                 }
-                            } else {
-                                // Cacheable but no key? Copy response
-                                responses_to_send.push(ResponseToSend::Raw {
-                                    client_id,
-                                    response: response_bytes.to_vec(),
-                                });
                             }
-                        } else {
-                            // Non-cacheable response - copy (usually small: +OK\r\n)
-                            responses_to_send.push(ResponseToSend::Raw {
-                                client_id,
-                                response: response_bytes.to_vec(),
-                            });
                         }
+
+                        // Always copy response for immediate send (responses are typically small)
+                        responses_to_send.push(ResponseToSend {
+                            client_id,
+                            response: response_bytes.to_vec(),
+                        });
 
                         // Now we can mutate backend state
                         backend.complete_request();
@@ -933,31 +900,16 @@ fn handle_backend_recv(
     }
 
     // Send responses to clients
-    for response in responses_to_send {
-        match response {
-            ResponseToSend::Cached { client_id, key } => {
-                // Zero-copy send from cache - verify conn_id matches to avoid wrong client
-                let idx = client_id.slot();
-                if let Some(Some(client)) = clients.get_mut(idx) {
-                    if client.conn_id == client_id {
-                        cache.with_value(&key, |cached_response| {
-                            client.queue_response(cached_response);
-                        });
-                        drain_client_sends(driver, client, client_id);
-                    }
-                }
-            }
-            ResponseToSend::Raw {
-                client_id,
-                response,
-            } => {
-                let idx = client_id.slot();
-                if let Some(Some(client)) = clients.get_mut(idx) {
-                    if client.conn_id == client_id {
-                        client.queue_response(&response);
-                        drain_client_sends(driver, client, client_id);
-                    }
-                }
+    for ResponseToSend {
+        client_id,
+        response,
+    } in responses_to_send
+    {
+        let idx = client_id.slot();
+        if let Some(Some(client)) = clients.get_mut(idx) {
+            if client.conn_id == client_id {
+                client.queue_response(&response);
+                drain_client_sends(driver, client, client_id);
             }
         }
     }
