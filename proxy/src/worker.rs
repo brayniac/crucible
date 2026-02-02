@@ -350,12 +350,11 @@ fn run_worker(
                         // Send error responses to clients with in-flight requests
                         for request in backend.in_flight {
                             pending_requests.remove(&request.request_id);
-                            if let Some(Some(client)) = clients.get_mut(request.client_id.slot()) {
-                                if client.conn_id == request.client_id {
-                                    // Send RESP error
-                                    let error_response = b"-ERR backend disconnected\r\n";
-                                    let _ = driver.send(request.client_id, error_response);
-                                }
+                            if let Some(Some(client)) = clients.get_mut(request.client_id.slot())
+                                && client.conn_id == request.client_id
+                            {
+                                let error_response = b"-ERR backend disconnected\r\n";
+                                let _ = driver.send(request.client_id, error_response);
                             }
                         }
                     }
@@ -388,11 +387,11 @@ fn run_worker(
                         // Send error responses to clients with in-flight requests
                         for request in backend.in_flight {
                             pending_requests.remove(&request.request_id);
-                            if let Some(Some(client)) = clients.get_mut(request.client_id.slot()) {
-                                if client.conn_id == request.client_id {
-                                    let error_response = b"-ERR backend error\r\n";
-                                    let _ = driver.send(request.client_id, error_response);
-                                }
+                            if let Some(Some(client)) = clients.get_mut(request.client_id.slot())
+                                && client.conn_id == request.client_id
+                            {
+                                let error_response = b"-ERR backend error\r\n";
+                                let _ = driver.send(request.client_id, error_response);
                             }
                         }
                     }
@@ -843,17 +842,15 @@ fn handle_backend_recv(
                         let response_bytes = &recv_data[..consumed];
 
                         // Cache successful GET responses for future requests
-                        if cacheable {
-                            if let Some(ref k) = key {
-                                // Only cache successful bulk string responses
-                                // Don't cache: nil ($-1 or _), errors (-), MOVED/ASK redirects
-                                if !response_bytes.starts_with(b"$-1\r\n")
-                                    && !response_bytes.starts_with(b"_\r\n")
-                                    && !response_bytes.starts_with(b"-")
-                                {
-                                    cache.set(k, response_bytes);
-                                }
-                            }
+                        // Only cache successful bulk string responses
+                        // Don't cache: nil ($-1 or _), errors (-), MOVED/ASK redirects
+                        if cacheable
+                            && let Some(ref k) = key
+                            && !response_bytes.starts_with(b"$-1\r\n")
+                            && !response_bytes.starts_with(b"_\r\n")
+                            && !response_bytes.starts_with(b"-")
+                        {
+                            cache.set(k, response_bytes);
                         }
 
                         // Always copy response for immediate send (responses are typically small)
@@ -939,11 +936,11 @@ fn handle_backend_recv(
     } in responses_to_send
     {
         let idx = client_id.slot();
-        if let Some(Some(client)) = clients.get_mut(idx) {
-            if client.conn_id == client_id {
-                client.queue_response(&response);
-                drain_client_sends(driver, client, client_id);
-            }
+        if let Some(Some(client)) = clients.get_mut(idx)
+            && client.conn_id == client_id
+        {
+            client.queue_response(&response);
+            drain_client_sends(driver, client, client_id);
         }
     }
 }
@@ -1010,13 +1007,13 @@ fn close_client(
 ) {
     let idx = conn_id.slot();
     // Verify conn_id matches before closing
-    if let Some(slot) = clients.get_mut(idx) {
-        if slot.as_ref().is_some_and(|c| c.conn_id == conn_id) {
-            slot.take();
-            debug!(conn_id = ?conn_id, reason, "Closing client");
-            let _ = driver.close(conn_id);
-            CLIENT_CONNECTIONS.decrement();
-        }
+    if let Some(slot) = clients.get_mut(idx)
+        && slot.as_ref().is_some_and(|c| c.conn_id == conn_id)
+    {
+        slot.take();
+        debug!(conn_id = ?conn_id, reason, "Closing client");
+        let _ = driver.close(conn_id);
+        CLIENT_CONNECTIONS.decrement();
     }
 }
 
