@@ -34,8 +34,10 @@ impl MemcacheBinaryCodec {
         let opaque = self.next_opaque;
         self.next_opaque = self.next_opaque.wrapping_add(1);
 
-        let spare = buf.spare_mut();
-        let len = BinaryRequest::encode_get(spare, key, opaque);
+        // GET: header + key
+        let needed = HEADER_SIZE + key.len();
+        Self::ensure_space(buf, needed);
+        let len = BinaryRequest::encode_get(buf.spare_mut(), key, opaque);
         buf.advance(len);
         self.pending_responses += 1;
         opaque
@@ -55,9 +57,12 @@ impl MemcacheBinaryCodec {
         let opaque = self.next_opaque;
         self.next_opaque = self.next_opaque.wrapping_add(1);
 
-        let spare = buf.spare_mut();
+        // SET: header + 8 bytes extras + key + value
+        let needed = HEADER_SIZE + 8 + key.len() + value.len();
+        Self::ensure_space(buf, needed);
         // CAS 0 means no CAS check
-        let len = BinaryRequest::encode_set(spare, key, value, flags, expiration, 0, opaque);
+        let len =
+            BinaryRequest::encode_set(buf.spare_mut(), key, value, flags, expiration, 0, opaque);
         buf.advance(len);
         self.pending_responses += 1;
         opaque
@@ -70,9 +75,11 @@ impl MemcacheBinaryCodec {
         let opaque = self.next_opaque;
         self.next_opaque = self.next_opaque.wrapping_add(1);
 
-        let spare = buf.spare_mut();
+        // DELETE: header + key
+        let needed = HEADER_SIZE + key.len();
+        Self::ensure_space(buf, needed);
         // CAS 0 means no CAS check
-        let len = BinaryRequest::encode_delete(spare, key, 0, opaque);
+        let len = BinaryRequest::encode_delete(buf.spare_mut(), key, 0, opaque);
         buf.advance(len);
         self.pending_responses += 1;
         opaque
@@ -86,8 +93,10 @@ impl MemcacheBinaryCodec {
         let opaque = self.next_opaque;
         self.next_opaque = self.next_opaque.wrapping_add(1);
 
-        let spare = buf.spare_mut();
-        let len = BinaryRequest::encode_getq(spare, key, opaque);
+        // GETQ: header + key
+        let needed = HEADER_SIZE + key.len();
+        Self::ensure_space(buf, needed);
+        let len = BinaryRequest::encode_getq(buf.spare_mut(), key, opaque);
         buf.advance(len);
         // Note: for quiet ops we don't increment pending_responses
         // since we may not get a response
@@ -102,11 +111,24 @@ impl MemcacheBinaryCodec {
         let opaque = self.next_opaque;
         self.next_opaque = self.next_opaque.wrapping_add(1);
 
-        let spare = buf.spare_mut();
-        let len = BinaryRequest::encode_noop(spare, opaque);
+        // NOOP: header only
+        Self::ensure_space(buf, HEADER_SIZE);
+        let len = BinaryRequest::encode_noop(buf.spare_mut(), opaque);
         buf.advance(len);
         self.pending_responses += 1;
         opaque
+    }
+
+    /// Ensures the buffer has at least `needed` bytes of writable space.
+    /// Compacts the buffer first, then grows if necessary.
+    #[inline]
+    fn ensure_space(buf: &mut Buffer, needed: usize) {
+        if buf.writable() < needed {
+            buf.compact();
+        }
+        if buf.writable() < needed {
+            buf.grow(needed);
+        }
     }
 
     /// Returns the number of pending responses.

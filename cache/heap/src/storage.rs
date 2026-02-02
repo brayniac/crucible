@@ -101,7 +101,18 @@ impl SlotStorage {
             }
 
             let slot = &self.slots[head as usize];
-            let next = slot.get_next_free();
+
+            // Read the next-free pointer. If the slot was concurrently allocated
+            // (another thread won the race and stored an entry), this returns None
+            // and we must retry.
+            let next = match slot.get_next_free() {
+                Some(n) => n,
+                None => {
+                    // Slot was concurrently modified, retry
+                    spin_loop();
+                    continue;
+                }
+            };
 
             // Try to CAS the head to the next free slot, incrementing version
             let new_packed = pack_head(next, version.wrapping_add(1));

@@ -295,12 +295,20 @@ impl<K, V> Slot<K, V> {
     }
 
     /// Get the next-free index from entry_ptr.
-    /// Only valid when slot is in the free list.
+    ///
+    /// Returns `Some(index)` if the slot contains a free list link,
+    /// or `None` if the slot has been concurrently modified (allocated
+    /// and had an entry stored).
     #[inline]
-    fn get_next_free(&self) -> u32 {
+    fn get_next_free(&self) -> Option<u32> {
         let val = self.entry_ptr.load(Ordering::Acquire);
+        // Free list links have low bit = 1
+        // Arc pointers and empty (0) have low bit = 0
+        if val & 1 == 0 {
+            return None; // Not a free list link - slot was concurrently modified
+        }
         // Decode: remove the low bit flag, shift back
-        ((val >> 1) & 0xFFFF_FFFF) as u32
+        Some(((val >> 1) & 0xFFFF_FFFF) as u32)
     }
 
     /// Set the next free pointer (encodes with low bit = 1).
@@ -412,7 +420,18 @@ impl<K, V> SlotStorage<K, V> {
             }
 
             let slot = &self.slots[head as usize];
-            let next = slot.get_next_free();
+
+            // Read the next-free pointer. If the slot was concurrently allocated
+            // (another thread won the race and stored an entry), this returns None
+            // and we must retry.
+            let next = match slot.get_next_free() {
+                Some(n) => n,
+                None => {
+                    // Slot was concurrently modified, retry
+                    crate::sync::spin_loop();
+                    continue;
+                }
+            };
 
             // Pack the new head with incremented version to prevent ABA
             let new_packed = pack_free_head(version.wrapping_add(1), next);

@@ -1615,6 +1615,20 @@ impl IoDriver for UringDriver {
     fn close(&mut self, id: ConnId) -> io::Result<()> {
         let conn_id = id.slot();
 
+        // Validate generation to ensure we're closing the correct connection.
+        // Without this check, a stale ConnId could close a different connection
+        // that happens to be using the same slot.
+        if let Some(conn) = self.connections.get(conn_id) {
+            if conn.generation != id.generation() {
+                // Stale close request - connection has been replaced.
+                // This is not an error, just silently ignore it.
+                return Ok(());
+            }
+        } else {
+            // Connection doesn't exist - already closed
+            return Ok(());
+        }
+
         // Check if connection exists and has in-flight sends
         let has_in_flight = self
             .connections
@@ -1734,6 +1748,14 @@ impl IoDriver for UringDriver {
             .get_mut(conn_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
+        // Validate generation to prevent sending to wrong connection
+        if conn.generation != id.generation() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "connection generation mismatch",
+            ));
+        }
+
         // Don't allow sending to closing connections
         if conn.closing {
             return Err(io::Error::new(
@@ -1763,6 +1785,14 @@ impl IoDriver for UringDriver {
             .get_mut(conn_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
+        // Validate generation to prevent sending to wrong connection
+        if conn.generation != id.generation() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "connection generation mismatch",
+            ));
+        }
+
         // Don't allow sending to closing connections
         if conn.closing {
             return Err(io::Error::new(
@@ -1791,6 +1821,14 @@ impl IoDriver for UringDriver {
             .connections
             .get_mut(conn_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Validate generation to prevent sending to wrong connection
+        if conn.generation != id.generation() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "connection generation mismatch",
+            ));
+        }
 
         // Don't allow sending to closing connections
         if conn.closing {
@@ -1862,6 +1900,14 @@ impl IoDriver for UringDriver {
                 .get_mut(id.slot())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
 
+            // Validate generation to prevent reading from wrong connection
+            if conn.generation != id.generation() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "connection generation mismatch",
+                ));
+            }
+
             let available = conn.recv_state.as_slice();
             if available.is_empty() {
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
@@ -1900,6 +1946,14 @@ impl IoDriver for UringDriver {
             .connections
             .get_mut(conn_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+        // Validate generation to prevent submitting recv to wrong connection
+        if conn.generation != id.generation() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "connection generation mismatch",
+            ));
+        }
 
         // Only one recv can be pending at a time
         if conn.single_recv_pending {
@@ -2078,6 +2132,16 @@ impl IoDriver for UringDriver {
                 .connections
                 .get_mut(id.slot())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
+
+            // Validate generation to ensure we're accessing the correct connection.
+            // Without this check, a stale ConnId could access a different connection's
+            // recv_state if the slot has been reused.
+            if conn.generation != id.generation() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "connection generation mismatch",
+                ));
+            }
 
             // Create a wrapper that implements RecvBuf using the connection's recv_state
             struct UringRecvBuf<'a> {

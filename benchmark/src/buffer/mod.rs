@@ -118,6 +118,29 @@ impl Buffer {
         self.write_pos = 0;
     }
 
+    /// Grows the buffer to ensure at least `needed` bytes of writable space.
+    ///
+    /// This allocates a new buffer with sufficient capacity, copies existing
+    /// data, and replaces the old buffer. The new capacity is the maximum of:
+    /// - Current capacity * 2 (to avoid frequent reallocations)
+    /// - Current readable data + needed bytes
+    pub fn grow(&mut self, needed: usize) {
+        let readable = self.readable();
+        let min_capacity = readable + needed;
+        let new_capacity = (self.capacity() * 2).max(min_capacity);
+
+        let mut new_data = vec![0u8; new_capacity].into_boxed_slice();
+
+        // Copy existing readable data to the start of the new buffer
+        if readable > 0 {
+            new_data[..readable].copy_from_slice(&self.data[self.read_pos..self.write_pos]);
+        }
+
+        self.data = new_data;
+        self.read_pos = 0;
+        self.write_pos = readable;
+    }
+
     /// Reads from the given reader into the buffer.
     ///
     /// Returns the number of bytes read, or an error.

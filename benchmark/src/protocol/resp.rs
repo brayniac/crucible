@@ -84,18 +84,16 @@ impl RespCodec {
     }
 
     /// Ensures the buffer has at least `needed` bytes of writable space.
-    /// Compacts the buffer if necessary.
+    /// Compacts the buffer first, then grows if necessary.
     #[inline]
     fn ensure_space(buf: &mut Buffer, needed: usize) {
         if buf.writable() < needed {
             buf.compact();
         }
-        assert!(
-            buf.writable() >= needed,
-            "buffer too small: need {} bytes but only {} available after compact",
-            needed,
-            buf.writable()
-        );
+        if buf.writable() < needed {
+            // Need to grow the buffer
+            buf.grow(needed);
+        }
     }
 
     /// Attempts to decode a response from the buffer.

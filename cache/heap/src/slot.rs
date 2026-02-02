@@ -234,12 +234,20 @@ impl Slot {
     }
 
     /// Get the next-free index from entry_ptr.
-    /// Only valid when slot is in the free list.
+    ///
+    /// Returns `Some(index)` if the slot contains a free list link,
+    /// or `None` if the slot has been concurrently modified (allocated
+    /// and had an entry stored).
     #[inline]
-    pub fn get_next_free(&self) -> u32 {
+    pub fn get_next_free(&self) -> Option<u32> {
         let val = self.entry_ptr.load(Ordering::Acquire);
+        // Free list links have low bit = 1
+        // Entry pointers and empty (0) have low bit = 0
+        if val & 1 == 0 {
+            return None; // Not a free list link - slot was concurrently modified
+        }
         // Decode: remove the low bit flag, shift back
-        ((val >> 1) & 0xFFFF_FFFF) as u32
+        Some(((val >> 1) & 0xFFFF_FFFF) as u32)
     }
 
     /// Set the next free pointer (encodes with low bit = 1).
@@ -340,10 +348,14 @@ mod tests {
         let slot = Slot::new();
 
         slot.set_next_free(12345);
-        assert_eq!(slot.get_next_free(), 12345);
+        assert_eq!(slot.get_next_free(), Some(12345));
 
         slot.set_next_free(u32::MAX);
-        assert_eq!(slot.get_next_free(), u32::MAX);
+        assert_eq!(slot.get_next_free(), Some(u32::MAX));
+
+        // After clear_for_store, get_next_free should return None
+        slot.clear_for_store();
+        assert_eq!(slot.get_next_free(), None);
     }
 }
 

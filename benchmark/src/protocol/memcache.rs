@@ -28,8 +28,11 @@ impl MemcacheCodec {
     /// Response: `VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n`
     ///       or: `END\r\n` (miss)
     pub fn encode_get(&mut self, buf: &mut Buffer, key: &[u8]) -> usize {
-        let spare = buf.spare_mut();
-        let len = Request::get(key).encode(spare);
+        // "get " + key + "\r\n" = 4 + key.len() + 2
+        let needed = 6 + key.len();
+        Self::ensure_space(buf, needed);
+        let req = Request::get(key);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         self.pending_responses += 1;
         len
@@ -44,8 +47,13 @@ impl MemcacheCodec {
             return 0;
         }
 
-        let spare = buf.spare_mut();
-        let len = Request::gets(keys).encode(spare);
+        // "get" + for each key: " " + key + "\r\n"
+        // = 3 + sum(1 + key.len()) + 2 = 5 + keys.len() + total_key_bytes
+        let total_key_bytes: usize = keys.iter().map(|k| k.len()).sum();
+        let needed = 5 + keys.len() + total_key_bytes;
+        Self::ensure_space(buf, needed);
+        let req = Request::gets(keys);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         // Multi-get still produces one response (with multiple VALUE lines)
         self.pending_responses += 1;
@@ -64,11 +72,14 @@ impl MemcacheCodec {
         flags: u32,
         exptime: u32,
     ) -> usize {
-        let spare = buf.spare_mut();
-        let len = Request::set(key, value)
-            .flags(flags)
-            .exptime(exptime)
-            .encode(spare);
+        // "set " + key + " " + flags + " " + exptime + " " + bytes + "\r\n" + value + "\r\n"
+        // Conservative: flags/exptime/bytes each max 10 digits
+        // = 4 + key.len() + 1 + 10 + 1 + 10 + 1 + 10 + 2 + value.len() + 2
+        // = 41 + key.len() + value.len()
+        let needed = 41 + key.len() + value.len();
+        Self::ensure_space(buf, needed);
+        let req = Request::set(key, value).flags(flags).exptime(exptime);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         self.pending_responses += 1;
         len
@@ -79,11 +90,26 @@ impl MemcacheCodec {
     /// Format: `delete <key>\r\n`
     /// Response: `DELETED\r\n` or `NOT_FOUND\r\n`
     pub fn encode_delete(&mut self, buf: &mut Buffer, key: &[u8]) -> usize {
-        let spare = buf.spare_mut();
-        let len = Request::delete(key).encode(spare);
+        // "delete " + key + "\r\n" = 7 + key.len() + 2
+        let needed = 9 + key.len();
+        Self::ensure_space(buf, needed);
+        let req = Request::delete(key);
+        let len = req.encode(buf.spare_mut());
         buf.advance(len);
         self.pending_responses += 1;
         len
+    }
+
+    /// Ensures the buffer has at least `needed` bytes of writable space.
+    /// Compacts the buffer first, then grows if necessary.
+    #[inline]
+    fn ensure_space(buf: &mut Buffer, needed: usize) {
+        if buf.writable() < needed {
+            buf.compact();
+        }
+        if buf.writable() < needed {
+            buf.grow(needed);
+        }
     }
 
     /// Returns the number of pending responses.
