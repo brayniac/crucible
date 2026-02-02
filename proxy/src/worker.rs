@@ -890,13 +890,15 @@ fn handle_backend_recv(
     for response in responses_to_send {
         match response {
             ResponseToSend::Cached { client_id, key } => {
-                // Zero-copy send from cache
+                // Zero-copy send from cache - verify conn_id matches to avoid wrong client
                 let idx = client_id.slot();
                 if let Some(Some(client)) = clients.get_mut(idx) {
-                    cache.with_value(&key, |cached_response| {
-                        client.queue_response(cached_response);
-                    });
-                    drain_client_sends(driver, client, client_id);
+                    if client.conn_id == client_id {
+                        cache.with_value(&key, |cached_response| {
+                            client.queue_response(cached_response);
+                        });
+                        drain_client_sends(driver, client, client_id);
+                    }
                 }
             }
             ResponseToSend::Raw {
@@ -905,8 +907,10 @@ fn handle_backend_recv(
             } => {
                 let idx = client_id.slot();
                 if let Some(Some(client)) = clients.get_mut(idx) {
-                    client.queue_response(&response);
-                    drain_client_sends(driver, client, client_id);
+                    if client.conn_id == client_id {
+                        client.queue_response(&response);
+                        drain_client_sends(driver, client, client_id);
+                    }
                 }
             }
         }
