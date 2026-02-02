@@ -2151,6 +2151,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "axum",
+ "bytes",
+ "clap",
+ "crossbeam-channel",
+ "ctrlc",
+ "io-driver",
+ "libc",
+ "metrics",
+ "metriken",
+ "num_cpus",
+ "protocol-resp",
+ "segcache",
+ "serde",
+ "slab",
+ "tikv-jemallocator",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"

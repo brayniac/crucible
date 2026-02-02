@@ -1,0 +1,61 @@
+[package]
+name = "proxy"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-performance Valkey/Redis proxy with io_uring networking"
+
+[features]
+default = ["io_uring"]
+io_uring = ["io-driver/io_uring"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+# Cache for local caching of GET responses (allocation-free segments)
+segcache = { workspace = true }
+
+# Protocol parsing
+protocol-resp = { workspace = true, features = ["resp3"] }
+
+# I/O driver (io_uring on Linux, mio fallback)
+io-driver = { workspace = true, features = ["serde"] }
+
+# Core utilities
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+slab = { workspace = true }
+libc = { workspace = true }
+ahash = { workspace = true }
+socket2 = "0.5"
+
+# Configuration
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+num_cpus = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive"] }
+
+# Metrics
+metrics = { workspace = true }
+metriken = { workspace = true }
+
+# Signal handling
+ctrlc = { version = "3", features = ["termination"] }
+
+# Structured logging
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Admin server (health + metrics endpoints)
+axum = "0.8"
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
+
+# Jemalloc allocator (optional)
+tikv-jemallocator = { workspace = true, optional = true }
+
+[[bin]]
+name = "crucible-proxy"
+path = "src/bin/proxy.rs"

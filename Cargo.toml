@@ -22,6 +22,9 @@ members = [
 	# Server
 	"server",
 
+	# Proxy
+	"proxy",
+
 	# Benchmark Tool
 	"benchmark",
 
