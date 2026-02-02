@@ -709,6 +709,7 @@ fn forward_to_backend(
 
 /// Encode a RESP command.
 fn encode_command(cmd: &Command<'_>, buf: &mut Vec<u8>) {
+    let start = buf.len();
     match cmd {
         Command::Get { key } => {
             buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$");
@@ -733,6 +734,15 @@ fn encode_command(cmd: &Command<'_>, buf: &mut Vec<u8>) {
             // For now, just send a placeholder
             buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
         }
+    }
+
+    // Log first few commands for debugging
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let logged = LOGGED.fetch_add(1, Ordering::Relaxed);
+    if logged < 5 {
+        let encoded = &buf[start..];
+        let preview = String::from_utf8_lossy(&encoded[..encoded.len().min(100)]);
+        info!(encoded_len = encoded.len(), preview = %preview, "Encoded command");
     }
 }
 
@@ -893,15 +903,28 @@ fn handle_backend_recv(
     }
 
     if should_close {
-        // Get in-flight count before removing
-        let in_flight = pool
+        // Get diagnostic info before removing
+        let (in_flight, recv_buf_preview) = pool
             .get_connection(conn_id)
-            .map(|c| c.in_flight.len())
-            .unwrap_or(0);
+            .map(|c| {
+                let preview = if c.recv_buf.is_empty() {
+                    String::from("<empty>")
+                } else {
+                    let len = c.recv_buf.len().min(128);
+                    format!(
+                        "{:?} ({}B)",
+                        String::from_utf8_lossy(&c.recv_buf[..len]),
+                        c.recv_buf.len()
+                    )
+                };
+                (c.in_flight.len(), preview)
+            })
+            .unwrap_or((0, String::from("<no connection>")));
         warn!(
             conn_id = ?conn_id,
             reason = close_reason,
             in_flight_requests = in_flight,
+            recv_buf = %recv_buf_preview,
             "Backend connection closed"
         );
         pool.remove_connection(conn_id);
