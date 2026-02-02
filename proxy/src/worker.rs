@@ -177,6 +177,9 @@ fn run_worker(
     shutdown: Arc<AtomicBool>,
     cache: Arc<SharedCache>,
 ) -> io::Result<()> {
+    // Set thread shard for sharded counters to avoid false sharing
+    metrics::set_thread_shard(worker_id);
+
     // Initialize I/O driver
     let io_engine = config.io_engine();
     info!(worker_id, ?io_engine, "Starting worker with I/O engine");
