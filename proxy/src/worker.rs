@@ -220,6 +220,19 @@ fn run_worker(
     while !shutdown.load(Ordering::Relaxed) {
         // Accept new connections from the acceptor
         while let Ok((fd, addr)) = receiver.try_recv() {
+            // Set TCP_NODELAY to disable Nagle's algorithm - critical for low latency
+            // Without this, small responses get batched causing ~2ms delays
+            unsafe {
+                let enabled: libc::c_int = 1;
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NODELAY,
+                    &enabled as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+
             match driver.register_fd(fd) {
                 Ok(conn_id) => {
                     let idx = conn_id.slot();
