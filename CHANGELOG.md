@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.10] - 2026-02-02
+
+### Added
+- `get_or_insert` and `get_or_insert_with` methods on ArcCache for atomic insertion semantics
+- New `crucible-proxy` crate: Redis-compatible caching proxy with local SegCache layer
+  - Thread-per-core architecture with io_uring support
+  - Connection pooling with least-loaded backend selection
+  - Configurable eviction policies (random, fifo, cte, merge, s3fifo)
+  - Automatic cache invalidation on write commands (SET, DEL)
+
+### Changed
+- io_uring driver removes redundant `submit()` call before `submit_and_wait()` (reduces syscalls)
+- Proxy uses sharded counters to eliminate metric contention at high throughput
+
+### Fixed
+- Benchmark parquet recorder now skips snapshots during warmup phase to avoid empty leading data
+
 ## [0.2.9] - 2026-01-31
 
 ### Changed
