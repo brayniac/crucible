@@ -1399,6 +1399,14 @@ mod tests {
                 self.offset = 0;
             }
         }
+
+        fn capacity(&self) -> usize {
+            self.data.capacity()
+        }
+
+        fn shrink_if_oversized(&mut self) {
+            // No-op for tests
+        }
     }
 
     #[test]

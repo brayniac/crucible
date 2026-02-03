@@ -565,13 +565,13 @@ fn test_mio_large_values_64m() {
 
 #[test]
 fn test_mio_concurrent_large_values_1m() {
-    run_concurrent_large_value_test("mio", None, 8, 1024 * 1024);
+    run_concurrent_large_value_test("mio", 8, 1024 * 1024);
 }
 
 #[test]
 #[ignore] // Expensive test
 fn test_mio_concurrent_large_values_4m() {
-    run_concurrent_large_value_test("mio", None, 4, 4 * 1024 * 1024);
+    run_concurrent_large_value_test("mio", 4, 4 * 1024 * 1024);
 }
 
 // =============================================================================
