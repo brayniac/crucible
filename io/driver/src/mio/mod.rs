@@ -582,6 +582,14 @@ impl IoDriver for MioDriver {
             fn consume(&mut self, n: usize) {
                 self.state.consume(n);
             }
+
+            fn capacity(&self) -> usize {
+                self.state.coalesce_capacity()
+            }
+
+            fn shrink_if_oversized(&mut self) {
+                self.state.shrink_if_oversized();
+            }
         }
 
         let mut buf = MioRecvBuf {

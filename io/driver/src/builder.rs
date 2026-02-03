@@ -25,7 +25,6 @@ pub struct DriverBuilder {
     sq_depth: u32,
     max_connections: u32,
     sqpoll: bool,
-    recv_mode: crate::types::RecvMode,
     send_mode: SendMode,
 }
 
@@ -45,7 +44,6 @@ impl DriverBuilder {
             sq_depth: 1024,         // io_uring submission queue depth
             max_connections: 8192,  // Maximum registered connections
             sqpoll: false,          // SQPOLL disabled by default
-            recv_mode: crate::types::RecvMode::default(),
             send_mode: SendMode::default(),
         }
     }
@@ -108,21 +106,7 @@ impl DriverBuilder {
 
     /// Set the recv mode for io_uring.
     ///
-    /// - `Multishot` (default): The driver automatically submits multishot recv
-    ///   operations using ring-provided buffers, producing `CompletionKind::Recv`
-    ///   events with data copied to an internal buffer.
-    ///
-    /// - `SingleShot`: The driver does not automatically start recv operations.
-    ///   The caller must manually submit recv operations using `submit_recv()`,
-    ///   which produces `CompletionKind::RecvComplete` events.
-    ///
-    /// Only applies to the io_uring backend.
-    /// Default: Multishot
-    pub fn recv_mode(mut self, mode: crate::types::RecvMode) -> Self {
-        self.recv_mode = mode;
-        self
-    }
-
+    /// **Deprecated**: The driver now uses a hybrid mode that automatically switches
     /// Set the send mode.
     ///
     /// - `Copy` (default): Copy data directly to kernel. Simple and safe.
@@ -187,7 +171,6 @@ impl DriverBuilder {
             self.buffer_count,
             self.max_connections,
             self.sqpoll,
-            self.recv_mode,
         )?))
     }
 }
@@ -206,7 +189,6 @@ mod tests {
         assert_eq!(builder.sq_depth, 1024);
         assert_eq!(builder.max_connections, 8192);
         assert!(!builder.sqpoll);
-        assert_eq!(builder.recv_mode, crate::types::RecvMode::Multishot);
         assert_eq!(builder.send_mode, SendMode::Buffered);
     }
 
@@ -256,12 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_recv_mode() {
-        let builder = DriverBuilder::new().recv_mode(crate::types::RecvMode::SingleShot);
-        assert_eq!(builder.recv_mode, crate::types::RecvMode::SingleShot);
-    }
-
-    #[test]
     fn test_builder_send_mode() {
         let builder = DriverBuilder::new().send_mode(SendMode::ZeroCopy);
         assert_eq!(builder.send_mode, SendMode::ZeroCopy);
@@ -279,7 +255,6 @@ mod tests {
             .sq_depth(128)
             .max_connections(4096)
             .sqpoll(true)
-            .recv_mode(crate::types::RecvMode::SingleShot)
             .send_mode(SendMode::ZeroCopy);
 
         assert_eq!(builder.engine, IoEngine::Mio);
@@ -288,7 +263,6 @@ mod tests {
         assert_eq!(builder.sq_depth, 128);
         assert_eq!(builder.max_connections, 4096);
         assert!(builder.sqpoll);
-        assert_eq!(builder.recv_mode, crate::types::RecvMode::SingleShot);
         assert_eq!(builder.send_mode, SendMode::ZeroCopy);
     }
 

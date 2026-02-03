@@ -416,49 +416,6 @@ impl std::str::FromStr for IoEngine {
     }
 }
 
-/// Recv mode selection for io_uring.
-///
-/// Determines how the driver handles incoming data on connections.
-///
-/// Accepts: "multishot", "multi-shot", "singleshot", "single-shot"
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
-pub enum RecvMode {
-    /// Multishot recv mode (default).
-    ///
-    /// The driver automatically submits multishot recv operations using
-    /// ring-provided buffers. Data is copied to per-connection buffers and
-    /// `CompletionKind::Recv` events are produced.
-    ///
-    /// This mode is efficient for high-throughput scenarios as the kernel
-    /// can complete multiple receives without re-submission.
-    #[default]
-    #[cfg_attr(feature = "serde", serde(alias = "multi-shot"))]
-    Multishot,
-
-    /// Single-shot recv mode.
-    ///
-    /// The driver does not automatically start recv operations. The caller
-    /// must manually submit recv operations using `submit_recv()`, which
-    /// produces `CompletionKind::RecvComplete` events with the number of
-    /// bytes received.
-    ///
-    /// This mode gives the caller more control over buffer management and
-    /// is useful when zero-copy semantics are desired.
-    #[cfg_attr(feature = "serde", serde(alias = "singleshot", alias = "single-shot"))]
-    SingleShot,
-}
-
-impl std::fmt::Display for RecvMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecvMode::Multishot => write!(f, "multishot"),
-            RecvMode::SingleShot => write!(f, "single-shot"),
-        }
-    }
-}
-
 bitflags::bitflags! {
     /// Capabilities supported by the driver backend.
     ///

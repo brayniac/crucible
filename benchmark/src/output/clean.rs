@@ -119,13 +119,8 @@ impl OutputFormatter for CleanFormatter {
         );
 
         // Engine line
-        let recv_mode = format!("{}", config.general.recv_mode);
         let engine_str = format!("{}", config.general.io_engine);
-        if engine_str.to_lowercase().contains("uring") {
-            println!("engine     {}, {}", engine_str, recv_mode);
-        } else {
-            println!("engine     {}", engine_str);
-        }
+        println!("engine     {}", engine_str);
 
         // Rate limit line (optional)
         if let Some(rate) = config.workload.rate_limit {

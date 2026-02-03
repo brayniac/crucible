@@ -386,17 +386,17 @@ buffer_size = "16KB"   # Size of each buffer
 
 # Submission queue depth
 sq_depth = 1024
-
-# Recv mode selection
-recv_mode = "multishot"  # "multishot" or "singleshot"
 ```
 
-### Recv Mode Trade-offs
+### Hybrid Recv Mode
 
-| Mode           | Copies | Syscalls           | Memory                   | Best For              |
-|----------------|--------|--------------------|--------------------------|-----------------------|
-| **multishot**  | 1      | Fewer (auto-rearm) | Lower (shared ring)      | High connection count |
-| **singleshot** | 0      | More (resubmit)    | Higher (per-recv buffer) | Latency-sensitive     |
+The driver uses a hybrid recv mode that automatically optimizes for both small requests
+and large values:
+
+- **Multishot recv** for command headers and small requests (efficient, 1 copy)
+- **Direct recv** into user memory for large values (zero-copy for large SET operations)
+
+This happens automatically - no configuration needed.
 
 ### Send Mode Options
 
@@ -442,30 +442,26 @@ pub struct Capabilities {
 | Coalesce buffer  | 16KB initial   | -      | Grows/shrinks as needed |
 | Connection state | ~100 bytes     | -      | Metadata only           |
 | BufRing          | -              | 128MB  | Multishot mode only     |
-| RecvBufferPool   | -              | 128MB  | Single-shot mode only   |
 | BufferPool       | -              | 128MB  | Application-facing      |
 
-**Total shared memory:** ~128-256MB depending on recv mode
+**Total shared memory:** ~128-256MB
 
 ## Best Practices
 
 ### For Lowest Latency
 
-1. Use single-shot recv mode (`recv_mode = "singleshot"`)
-2. Enable SendZc for responses
-3. Process and consume data immediately
-4. Avoid partial consumes that span recv boundaries
+1. Enable SendZc for responses
+2. Process and consume data immediately
+3. Avoid partial consumes that span recv boundaries
 
 ### For Highest Throughput
 
-1. Use multishot recv mode (`recv_mode = "multishot"`)
-2. Enable `sqpoll` for reduced syscall overhead
-3. Use vectored sends for multi-part responses
-4. Batch buffer returns with `commit()`
+1. Enable `sqpoll` for reduced syscall overhead
+2. Use vectored sends for multi-part responses
+3. Batch buffer returns with `commit()`
 
 ### For Memory Efficiency
 
-1. Use multishot recv (shared ring buffer)
-2. Set appropriate `buffer_count` for connection count
-3. Monitor coalesce buffer growth
-4. Use `SendMode::Threshold` for adaptive zero-copy
+1. Set appropriate `buffer_count` for connection count
+2. Monitor coalesce buffer growth
+3. Use `SendMode::Threshold` for adaptive zero-copy

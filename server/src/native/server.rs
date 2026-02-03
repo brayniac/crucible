@@ -1,13 +1,13 @@
 //! Native runtime server loop.
 
 use crate::affinity::set_cpu_affinity;
-use crate::config::{Config, RecvMode, ZeroCopyMode};
+use crate::config::Config;
 use crate::connection::Connection;
 use crate::metrics::{
     CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats, WorkerStatsSnapshot,
 };
 use cache_core::Cache;
-use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine, RecvMode as DriverRecvMode};
+use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -41,9 +41,7 @@ struct WorkerConfig {
     buffer_count: u16,
     sq_depth: u32,
     sqpoll: bool,
-    recv_mode: RecvMode,
     max_value_size: usize,
-    zero_copy_mode: ZeroCopyMode,
     allow_flush: bool,
 }
 
@@ -90,9 +88,7 @@ pub fn run<C: Cache + 'static>(
         buffer_count: config.uring.buffer_count,
         sq_depth: config.uring.sq_depth,
         sqpoll: config.uring.sqpoll,
-        recv_mode: config.uring.recv_mode,
         max_value_size: config.cache.max_value_size,
-        zero_copy_mode: config.zero_copy,
         allow_flush,
     };
 
@@ -401,19 +397,12 @@ fn run_worker<C: Cache>(
     // Set this thread's shard ID for metrics to avoid false sharing
     metrics::set_thread_shard(worker_id);
 
-    // Convert server RecvMode to driver RecvMode
-    let driver_recv_mode = match config.recv_mode {
-        RecvMode::Multishot => DriverRecvMode::Multishot,
-        RecvMode::SingleShot => DriverRecvMode::SingleShot,
-    };
-
     let mut driver = Driver::builder()
         .engine(config.io_engine)
         .buffer_size(config.buffer_size)
         .buffer_count(config.buffer_count.next_power_of_two())
         .sq_depth(config.sq_depth)
         .sqpoll(config.sqpoll)
-        .recv_mode(driver_recv_mode)
         .build()?;
 
     // Use Vec<Option<Connection>> indexed by ConnId for O(1) access.
@@ -498,8 +487,8 @@ fn run_worker<C: Cache>(
                     let mut bytes_received = 0u64;
                     let mut send_error = false;
 
-                    // Zero-copy/threshold path: batch small values, immediate send for large
-                    if config.zero_copy_mode != ZeroCopyMode::Disabled {
+                    // Zero-copy path: batch non-GET responses, immediate send for GET hits
+                    {
                         use crate::connection::ZeroCopyResponse;
 
                         // Process commands, batching small values in write_buf
@@ -522,11 +511,8 @@ fn run_worker<C: Cache>(
                                     }
 
                                     let initial_len = buf.len();
-                                    zero_copy_response = conn.process_one_zero_copy(
-                                        buf,
-                                        &*cache,
-                                        config.zero_copy_mode,
-                                    );
+                                    zero_copy_response =
+                                        conn.process_one_zero_copy(buf, &*cache);
 
                                     let consumed = initial_len - buf.len();
                                     bytes_received += consumed as u64;
@@ -621,52 +607,6 @@ fn run_worker<C: Cache>(
                                 }
                             }
                         }
-                    } else {
-                        // Non-zero-copy path: process all commands at once
-                        let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                            let initial_len = buf.len();
-
-                            if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                                // Parse and execute commands directly from driver buffer
-                                conn.process_from(buf, &*cache);
-
-                                // Track bytes consumed
-                                bytes_received = (initial_len - buf.len()) as u64;
-
-                                if conn.should_close() {
-                                    close_reason = Some(CloseReason::ProtocolClose);
-                                }
-                            }
-                        });
-
-                        // Check for EOF or other errors
-                        if let Err(e) = result {
-                            if e.kind() == io::ErrorKind::UnexpectedEof {
-                                close_reason = Some(CloseReason::ClientEof);
-                            } else if e.kind() != io::ErrorKind::NotFound {
-                                close_reason = Some(CloseReason::RecvError);
-                            }
-                        }
-
-                        // Send any pending responses
-                        while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                            if !conn.has_pending_write() {
-                                break;
-                            }
-
-                            let data = conn.pending_write_data();
-                            match driver.send(conn_id, data) {
-                                Ok(n) => {
-                                    stats.add_bytes_sent(n as u64);
-                                    conn.advance_write(n);
-                                }
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(_) => {
-                                    send_error = true;
-                                    break;
-                                }
-                            }
-                        }
                     }
 
                     stats.add_bytes_received(bytes_received);
@@ -737,8 +677,8 @@ fn run_worker<C: Cache>(
                     }
 
                     // Process buffered data using same path as Recv completions
-                    if config.zero_copy_mode != ZeroCopyMode::Disabled {
-                        // Zero-copy/threshold path: batch small values
+                    {
+                        // Zero-copy path: batch non-GET responses
                         loop {
                             let mut zero_copy_response: Option<
                                 crate::connection::ZeroCopyResponse,
@@ -758,11 +698,8 @@ fn run_worker<C: Cache>(
                                         return;
                                     }
                                     let initial_len = buf.len();
-                                    zero_copy_response = conn.process_one_zero_copy(
-                                        buf,
-                                        &*cache,
-                                        config.zero_copy_mode,
-                                    );
+                                    zero_copy_response =
+                                        conn.process_one_zero_copy(buf, &*cache);
                                     made_progress = buf.len() < initial_len;
 
                                     if conn.should_close() {
@@ -833,46 +770,6 @@ fn run_worker<C: Cache>(
                                     conn.advance_write(n);
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(_) => {
-                                    close_reason = Some(CloseReason::SendError);
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        // Non-zero-copy path
-                        let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                            if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                                conn.process_from(buf, &*cache);
-
-                                if conn.should_close() {
-                                    close_reason = Some(CloseReason::ProtocolClose);
-                                }
-                            }
-                        });
-
-                        if result.is_err() {
-                            continue;
-                        }
-
-                        // Send any new responses for non-zero-copy path
-                        loop {
-                            let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
-                            else {
-                                break;
-                            };
-
-                            if !conn.has_pending_write() {
-                                break;
-                            }
-
-                            let data = conn.pending_write_data();
-                            match driver.send(conn_id, data) {
-                                Ok(n) => {
-                                    stats.add_bytes_sent(n as u64);
-                                    conn.advance_write(n);
-                                }
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                 Err(_) => {
                                     close_reason = Some(CloseReason::SendError);
                                     break;

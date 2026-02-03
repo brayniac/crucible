@@ -222,7 +222,6 @@ pub struct UringDriver {
     cqe_scratch: Vec<io_uring::cqueue::Entry>,
     /// Scratch buffer for collecting connections needing recv re-arm (reused to avoid allocation).
     rearm_scratch: Vec<(usize, u32, u32, u8)>,
-    recv_mode: crate::types::RecvMode,
     /// Generation counter for new connections.
     ///
     /// Incremented each time a new connection is created. Used to detect
@@ -247,27 +246,22 @@ unsafe impl Send for UringDriver {}
 impl UringDriver {
     /// Create a new io_uring driver with default settings.
     pub fn new() -> io::Result<Self> {
-        Self::with_config(
-            256,
-            16384,
-            256,
-            8192,
-            false,
-            crate::types::RecvMode::default(),
-        )
+        Self::with_config(256, 16384, 256, 8192, false)
     }
 
     /// Create a new io_uring driver with custom configuration.
     ///
     /// Requires Linux 6.0+ kernel with support for multishot recv/accept,
     /// SendZc, and ring-provided buffers.
+    ///
+    /// The driver uses hybrid recv mode: multishot recv by default, with
+    /// automatic switching to direct recv for large values via `submit_recv_into`.
     pub fn with_config(
         sq_depth: u32,
         buffer_size: usize,
         buffer_count: u16,
         max_connections: u32,
         sqpoll: bool,
-        recv_mode: crate::types::RecvMode,
     ) -> io::Result<Self> {
         // Verify kernel supports required features
         if !is_supported() {
@@ -320,7 +314,6 @@ impl UringDriver {
             pending_completions: Vec::with_capacity(COMPLETION_VEC_CAPACITY),
             cqe_scratch: Vec::with_capacity(COMPLETION_VEC_CAPACITY),
             rearm_scratch: Vec::with_capacity(COMPLETION_VEC_CAPACITY),
-            recv_mode,
             next_generation: 0,
             capabilities,
             send_mode: SendMode::default(),
@@ -641,10 +634,38 @@ impl UringDriver {
         }
 
         if result < 0 {
-            // Recv error
+            // Return any buffer that was allocated (shouldn't happen for ENOBUFS)
             if let Some(buf_id) = cqueue::buffer_select(flags) {
                 self.buf_ring.return_buffer(buf_id);
             }
+
+            // ENOBUFS means the ring ran out of buffers - not a fatal error.
+            // The multishot operation is terminated, but the connection is still valid.
+            // Data remains in the socket buffer; we just need to re-arm multishot recv.
+            if -result == libc::ENOBUFS {
+                // Mark multishot as inactive and re-arm
+                let conn_info = self
+                    .connections
+                    .get_mut(conn_id)
+                    .map(|c| {
+                        c.multishot_active = false;
+                        (c.fixed_slot, c.generation)
+                    });
+
+                if let Some((fixed_slot, conn_gen)) = conn_info {
+                    if self
+                        .submit_multishot_recv(conn_id, conn_gen, fixed_slot)
+                        .is_ok()
+                        && let Some(conn) = self.connections.get_mut(conn_id)
+                    {
+                        conn.multishot_active = true;
+                    }
+                    // If re-arm fails, the poll() rearm logic will retry
+                }
+                return;
+            }
+
+            // Other errors are fatal - emit error completion
             self.pending_completions
                 .push(Completion::new(CompletionKind::Error {
                     conn_id: full_conn_id,
@@ -1508,18 +1529,13 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, generation);
         entry.insert(conn);
 
-        // Automatically start receiving data
-        let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
-            let result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
-            if result.is_ok()
-                && let Some(conn) = self.connections.get_mut(conn_id)
-            {
+        // Automatically start receiving data with multishot recv (hybrid mode default)
+        let recv_result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
+        if recv_result.is_ok() {
+            if let Some(conn) = self.connections.get_mut(conn_id) {
                 conn.multishot_active = true;
             }
-            result
-        } else {
-            self.submit_single_recv_internal(conn_id, generation, fixed_slot)
-        };
+        }
 
         if let Err(e) = recv_result {
             self.connections.try_remove(conn_id);
@@ -1578,18 +1594,13 @@ impl IoDriver for UringDriver {
         let conn = UringConnection::new(raw_fd, fixed_slot, generation);
         entry.insert(conn);
 
-        // Automatically start receiving data
-        let recv_result = if self.recv_mode == crate::types::RecvMode::Multishot {
-            let result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
-            if result.is_ok()
-                && let Some(conn) = self.connections.get_mut(conn_id)
-            {
+        // Automatically start receiving data with multishot recv (hybrid mode default)
+        let recv_result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
+        if recv_result.is_ok() {
+            if let Some(conn) = self.connections.get_mut(conn_id) {
                 conn.multishot_active = true;
             }
-            result
-        } else {
-            self.submit_single_recv_internal(conn_id, generation, fixed_slot)
-        };
+        }
 
         if let Err(e) = recv_result {
             self.connections.try_remove(conn_id);
@@ -2160,6 +2171,14 @@ impl IoDriver for UringDriver {
                 fn consume(&mut self, n: usize) {
                     self.state.consume(n);
                 }
+
+                fn capacity(&self) -> usize {
+                    self.state.coalesce_capacity()
+                }
+
+                fn shrink_if_oversized(&mut self) {
+                    self.state.shrink_if_oversized();
+                }
             }
 
             let mut buf = UringRecvBuf {
@@ -2227,11 +2246,20 @@ impl IoDriver for UringDriver {
 
         for i in 0..self.rearm_scratch.len() {
             let (conn_id, generation, fixed_slot, failures) = self.rearm_scratch[i];
-            let success = if self.recv_mode == crate::types::RecvMode::SingleShot {
+
+            // Check if this connection is using single-shot mode (e.g., via submit_recv_into)
+            let use_single = self
+                .connections
+                .get(conn_id)
+                .map(|c| c.use_single_recv)
+                .unwrap_or(false);
+
+            let success = if use_single {
+                // Single-shot mode for connections that called submit_recv_into
                 self.submit_single_recv_internal(conn_id, generation, fixed_slot)
                     .is_ok()
             } else {
-                // Multishot mode - re-arm multishot recv
+                // Default: multishot mode for efficient command header processing
                 self.submit_multishot_recv(conn_id, generation, fixed_slot)
                     .is_ok()
             };
@@ -2239,7 +2267,7 @@ impl IoDriver for UringDriver {
             if let Some(conn) = self.connections.get_mut(conn_id) {
                 if success {
                     conn.rearm_failures = 0;
-                    if self.recv_mode == crate::types::RecvMode::Multishot {
+                    if !use_single {
                         conn.multishot_active = true;
                     }
                 } else {

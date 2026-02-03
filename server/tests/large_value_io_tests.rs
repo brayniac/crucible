@@ -61,8 +61,6 @@ fn start_test_server_full(
     port: u16,
     io_engine: &str,
     runtime: &str,
-    recv_mode: Option<&str>,
-    zero_copy: Option<&str>,
     worker_threads: usize,
     heap_size_mb: usize,
     segment_size_mb: usize,
@@ -73,8 +71,6 @@ fn start_test_server_full(
         port,
         io_engine,
         runtime,
-        recv_mode,
-        zero_copy,
         worker_threads,
         heap_size_mb,
         segment_size_mb,
@@ -87,8 +83,6 @@ fn start_test_server_full_with_max_value(
     port: u16,
     io_engine: &str,
     runtime: &str,
-    recv_mode: Option<&str>,
-    zero_copy: Option<&str>,
     worker_threads: usize,
     heap_size_mb: usize,
     segment_size_mb: usize,
@@ -96,31 +90,18 @@ fn start_test_server_full_with_max_value(
 ) -> thread::JoinHandle<()> {
     let io_engine = io_engine.to_string();
     let runtime = runtime.to_string();
-    let recv_mode = recv_mode.map(|s| s.to_string());
-    let zero_copy = zero_copy.map(|s| s.to_string());
 
     thread::spawn(move || {
-        let recv_mode_config = recv_mode
-            .as_ref()
-            .map(|m| format!("recv_mode = \"{m}\""))
-            .unwrap_or_default();
-
-        let zero_copy_config = zero_copy
-            .as_ref()
-            .map(|m| format!("zero_copy = \"{m}\""))
-            .unwrap_or_default();
-
         let config_str = format!(
             r#"
             runtime = "{runtime}"
             io_engine = "{io_engine}"
-            {zero_copy_config}
 
             [workers]
             threads = {worker_threads}
 
             [uring]
-            {recv_mode_config}
+            # Hybrid recv mode is now automatic
 
             [cache]
             backend = "segment"
@@ -357,8 +338,6 @@ fn try_parse_bulk_string(data: &[u8], expected_size: usize) -> Result<Option<Vec
 struct LargeValueTestConfig {
     io_engine: &'static str,
     runtime: &'static str,
-    recv_mode: Option<&'static str>,
-    zero_copy: Option<&'static str>,
     sizes: &'static [usize],
     heap_size_mb: usize,
     segment_size_mb: usize,
@@ -370,8 +349,6 @@ impl Default for LargeValueTestConfig {
         Self {
             io_engine: "mio",
             runtime: "native",
-            recv_mode: None,
-            zero_copy: None,
             sizes: LARGE_SIZES,
             heap_size_mb: 256,
             segment_size_mb: 32,
@@ -389,23 +366,17 @@ fn run_large_value_test(config: LargeValueTestConfig) {
         port,
         config.io_engine,
         config.runtime,
-        config.recv_mode,
-        config.zero_copy,
         2, // 2 worker threads
         config.heap_size_mb,
         config.segment_size_mb,
         config.max_value_size_mb,
     );
 
-    let mode_str = config.recv_mode.unwrap_or("default");
-    let zc_str = config.zero_copy.unwrap_or("default");
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {}/{}/recv_mode={}/zero_copy={}",
+        "Server failed to start with {}/{}",
         config.runtime,
-        config.io_engine,
-        mode_str,
-        zc_str
+        config.io_engine
     );
 
     let mut stream = TcpStream::connect(addr).expect("Failed to connect");
@@ -422,15 +393,15 @@ fn run_large_value_test(config: LargeValueTestConfig) {
         let value = generate_large_value(size);
 
         println!(
-            "Testing {} with {}/{}/recv_mode={}/zero_copy={}: {} bytes",
-            key, config.runtime, config.io_engine, mode_str, zc_str, size
+            "Testing {} with {}/{}: {} bytes",
+            key, config.runtime, config.io_engine, size
         );
 
         // SET the large value
         send_large_set(&mut stream, &key, &value).unwrap_or_else(|e| {
             panic!(
                 "SET failed for {} ({} bytes) with {}/{}: {}",
-                key, size, config.io_engine, mode_str, e
+                key, size, config.runtime, config.io_engine, e
             )
         });
 
@@ -438,20 +409,18 @@ fn run_large_value_test(config: LargeValueTestConfig) {
         let retrieved = send_large_get(&mut stream, &key, size).unwrap_or_else(|e| {
             panic!(
                 "GET failed for {} ({} bytes) with {}/{}: {}",
-                key, size, config.io_engine, mode_str, e
+                key, size, config.runtime, config.io_engine, e
             )
         });
 
         // Verify data integrity
         assert!(
             verify_value(&retrieved, size),
-            "Data corruption detected for {} ({} bytes) with {}/{}/recv_mode={}/zero_copy={}",
+            "Data corruption detected for {} ({} bytes) with {}/{}",
             key,
             size,
             config.runtime,
-            config.io_engine,
-            mode_str,
-            zc_str
+            config.io_engine
         );
 
         println!("  PASSED: {} bytes verified", size);
@@ -459,12 +428,7 @@ fn run_large_value_test(config: LargeValueTestConfig) {
 }
 
 /// Run a concurrent large value test with multiple connections.
-fn run_concurrent_large_value_test(
-    io_engine: &'static str,
-    recv_mode: Option<&'static str>,
-    connections: usize,
-    value_size: usize,
-) {
+fn run_concurrent_large_value_test(io_engine: &'static str, connections: usize, value_size: usize) {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -475,19 +439,15 @@ fn run_concurrent_large_value_test(
         port,
         io_engine,
         "native",
-        recv_mode,
-        None,
         4, // More workers for concurrent load
         heap_size_mb,
         64, // 64MB segments
     );
 
-    let mode_str = recv_mode.unwrap_or("default");
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {}/recv_mode={}",
-        io_engine,
-        mode_str
+        "Server failed to start with {}",
+        io_engine
     );
 
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -555,13 +515,13 @@ fn run_concurrent_large_value_test(
 
     assert_eq!(
         err_count, 0,
-        "Concurrent test had {} errors ({} successes) with {}/recv_mode={}",
-        err_count, success_count, io_engine, mode_str
+        "Concurrent test had {} errors ({} successes) with {}",
+        err_count, success_count, io_engine
     );
     assert_eq!(
         success_count, connections,
-        "Not all connections succeeded: {} of {} with {}/recv_mode={}",
-        success_count, connections, io_engine, mode_str
+        "Not all connections succeeded: {} of {} with {}",
+        success_count, connections, io_engine
     );
 }
 
@@ -602,23 +562,6 @@ fn test_mio_large_values_64m() {
     });
 }
 
-#[test]
-fn test_mio_large_values_zerocopy_enabled() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "mio",
-        zero_copy: Some("enabled"),
-        ..Default::default()
-    });
-}
-
-#[test]
-fn test_mio_large_values_zerocopy_threshold() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "mio",
-        zero_copy: Some("threshold"),
-        ..Default::default()
-    });
-}
 
 #[test]
 fn test_mio_concurrent_large_values_1m() {
@@ -632,25 +575,23 @@ fn test_mio_concurrent_large_values_4m() {
 }
 
 // =============================================================================
-// io_uring Multishot Backend Large Value Tests (Linux only)
+// io_uring Hybrid Recv Mode Large Value Tests (Linux only)
 // =============================================================================
 
 #[test]
 #[cfg(target_os = "linux")]
-fn test_uring_multishot_large_values_256k_to_1m() {
+fn test_uring_large_values_256k_to_1m() {
     run_large_value_test(LargeValueTestConfig {
         io_engine: "uring",
-        recv_mode: Some("multishot"),
         ..Default::default()
     });
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn test_uring_multishot_large_values_4m_to_16m() {
+fn test_uring_large_values_4m_to_16m() {
     run_large_value_test(LargeValueTestConfig {
         io_engine: "uring",
-        recv_mode: Some("multishot"),
         sizes: VERY_LARGE_SIZES,
         heap_size_mb: 512,
         segment_size_mb: 64,
@@ -662,10 +603,9 @@ fn test_uring_multishot_large_values_4m_to_16m() {
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore] // Expensive test
-fn test_uring_multishot_large_values_64m() {
+fn test_uring_large_values_64m() {
     run_large_value_test(LargeValueTestConfig {
         io_engine: "uring",
-        recv_mode: Some("multishot"),
         sizes: EXTREME_SIZES,
         heap_size_mb: 1024,
         segment_size_mb: 128,
@@ -674,123 +614,18 @@ fn test_uring_multishot_large_values_64m() {
     });
 }
 
-#[test]
-#[cfg(target_os = "linux")]
-fn test_uring_multishot_large_values_zerocopy() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        recv_mode: Some("multishot"),
-        zero_copy: Some("enabled"),
-        ..Default::default()
-    });
-}
 
 #[test]
 #[cfg(target_os = "linux")]
-fn test_uring_multishot_concurrent_large_values_1m() {
-    run_concurrent_large_value_test("uring", Some("multishot"), 8, 1024 * 1024);
+fn test_uring_concurrent_large_values_1m() {
+    run_concurrent_large_value_test("uring", 8, 1024 * 1024);
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore] // Expensive test
-fn test_uring_multishot_concurrent_large_values_4m() {
-    run_concurrent_large_value_test("uring", Some("multishot"), 4, 4 * 1024 * 1024);
-}
-
-// =============================================================================
-// io_uring Singleshot Backend Large Value Tests (Linux only)
-// =============================================================================
-
-#[test]
-#[cfg(target_os = "linux")]
-fn test_uring_singleshot_large_values_256k_to_1m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        recv_mode: Some("singleshot"),
-        ..Default::default()
-    });
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn test_uring_singleshot_large_values_4m_to_16m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        recv_mode: Some("singleshot"),
-        sizes: VERY_LARGE_SIZES,
-        heap_size_mb: 512,
-        segment_size_mb: 64,
-        max_value_size_mb: 63,
-        ..Default::default()
-    });
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[ignore] // Expensive test
-fn test_uring_singleshot_large_values_64m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        recv_mode: Some("singleshot"),
-        sizes: EXTREME_SIZES,
-        heap_size_mb: 1024,
-        segment_size_mb: 128,
-        max_value_size_mb: 127,
-        ..Default::default()
-    });
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn test_uring_singleshot_large_values_zerocopy() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        recv_mode: Some("singleshot"),
-        zero_copy: Some("enabled"),
-        ..Default::default()
-    });
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn test_uring_singleshot_concurrent_large_values_1m() {
-    run_concurrent_large_value_test("uring", Some("singleshot"), 8, 1024 * 1024);
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[ignore] // Expensive test
-fn test_uring_singleshot_concurrent_large_values_4m() {
-    run_concurrent_large_value_test("uring", Some("singleshot"), 4, 4 * 1024 * 1024);
-}
-
-// =============================================================================
-// io_uring Default Mode Tests (uses kernel-preferred mode)
-// =============================================================================
-
-#[test]
-#[cfg(target_os = "linux")]
-fn test_uring_default_large_values_256k_to_1m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        recv_mode: None, // Let driver choose
-        ..Default::default()
-    });
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn test_uring_default_large_values_4m_to_16m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        recv_mode: None,
-        sizes: VERY_LARGE_SIZES,
-        heap_size_mb: 512,
-        segment_size_mb: 64,
-        max_value_size_mb: 63,
-        ..Default::default()
-    });
+fn test_uring_concurrent_large_values_4m() {
+    run_concurrent_large_value_test("uring", 4, 4 * 1024 * 1024);
 }
 
 // =============================================================================
@@ -829,7 +664,7 @@ fn test_mio_rapid_large_value_cycles() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "mio", "native", None, None, 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "mio", "native", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -869,8 +704,7 @@ fn test_uring_rapid_large_value_cycles() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle =
-        start_test_server_full(port, "uring", "native", Some("multishot"), None, 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "uring", "native", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -912,7 +746,7 @@ fn test_mio_increasing_value_sizes() {
 
     // Use larger segment/max_value to support up to 2MB values
     let _server_handle = start_test_server_full_with_max_value(
-        port, "mio", "native", None, None, 2, 256, 8, 7, // 8MB segment, 7MB max value
+        port, "mio", "native", 2, 256, 8, 7, // 8MB segment, 7MB max value
     );
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
@@ -967,7 +801,7 @@ fn test_uring_increasing_value_sizes() {
 
     // Use larger segment/max_value to support up to 2MB values
     let _server_handle = start_test_server_full_with_max_value(
-        port, "uring", "native", Some("multishot"), None, 2, 256, 8, 7, // 8MB segment, 7MB max value
+        port, "uring", "native", 2, 256, 8, 7, // 8MB segment, 7MB max value
     );
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
@@ -1020,7 +854,7 @@ fn test_mio_alternating_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "mio", "native", None, None, 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "mio", "native", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -1064,8 +898,7 @@ fn test_uring_alternating_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle =
-        start_test_server_full(port, "uring", "native", Some("multishot"), None, 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "uring", "native", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -1109,7 +942,7 @@ fn test_mio_buffer_boundary_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "mio", "native", None, None, 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "mio", "native", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -1161,8 +994,7 @@ fn test_uring_buffer_boundary_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle =
-        start_test_server_full(port, "uring", "native", Some("multishot"), None, 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "uring", "native", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 

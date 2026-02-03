@@ -89,4 +89,3 @@ sqpoll = false
 buffer_count = 4096
 buffer_size = "16KB"
 sq_depth = 2048
-recv_mode = "multishot"

@@ -1,7 +1,7 @@
 //! Tokio runtime server loop.
 
 use crate::affinity::set_cpu_affinity;
-use crate::config::{Config, ZeroCopyMode};
+use crate::config::Config;
 use crate::connection::Connection;
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE};
 use cache_core::Cache;
@@ -62,6 +62,12 @@ impl SimpleRecvBuf {
     }
 }
 
+/// Shrink threshold for recv buffer (64KB).
+const SHRINK_THRESHOLD: usize = 64 * 1024;
+
+/// Default recv buffer capacity (16KB).
+const DEFAULT_RECV_CAPACITY: usize = 16 * 1024;
+
 impl RecvBuf for SimpleRecvBuf {
     fn as_slice(&self) -> &[u8] {
         &self.data[self.offset..]
@@ -76,6 +82,34 @@ impl RecvBuf for SimpleRecvBuf {
         // Compact when all data consumed
         if self.offset >= self.data.len() {
             self.data.clear();
+            self.offset = 0;
+            // Shrink if buffer grew too large
+            if self.data.capacity() > SHRINK_THRESHOLD {
+                self.data.shrink_to(DEFAULT_RECV_CAPACITY);
+            }
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    fn shrink_if_oversized(&mut self) {
+        if self.data.capacity() <= SHRINK_THRESHOLD {
+            return;
+        }
+
+        let remaining = self.data.len() - self.offset;
+        if remaining == 0 {
+            // No data - just shrink
+            self.data = Vec::with_capacity(DEFAULT_RECV_CAPACITY);
+            self.offset = 0;
+        } else {
+            // Compact remaining data into a new smaller buffer
+            let target_capacity = remaining.max(DEFAULT_RECV_CAPACITY);
+            let mut new_buf = Vec::with_capacity(target_capacity);
+            new_buf.extend_from_slice(&self.data[self.offset..]);
+            self.data = new_buf;
             self.offset = 0;
         }
     }
@@ -125,7 +159,6 @@ pub fn run<C: Cache + 'static>(
     let runtime = builder.build()?;
 
     let max_value_size = config.cache.max_value_size;
-    let zero_copy_mode = config.zero_copy;
     // Allow flush if ANY listener allows it (since tokio runtime doesn't track per-listener)
     let allow_flush = config.listener.iter().any(|l| l.allow_flush);
     runtime.block_on(async move {
@@ -133,7 +166,6 @@ pub fn run<C: Cache + 'static>(
             listeners,
             cache,
             max_value_size,
-            zero_copy_mode,
             allow_flush,
             shutdown,
             drain_timeout,
@@ -146,7 +178,6 @@ async fn run_async<C: Cache + 'static>(
     addresses: Vec<SocketAddr>,
     cache: Arc<C>,
     max_value_size: usize,
-    zero_copy_mode: ZeroCopyMode,
     allow_flush: bool,
     shutdown: Arc<AtomicBool>,
     drain_timeout: Duration,
@@ -171,7 +202,6 @@ async fn run_async<C: Cache + 'static>(
                 listener,
                 cache,
                 max_value_size,
-                zero_copy_mode,
                 allow_flush,
                 shutdown_rx,
             )
@@ -226,7 +256,6 @@ async fn accept_loop<C: Cache + 'static>(
     listener: TcpListener,
     cache: Arc<C>,
     max_value_size: usize,
-    zero_copy_mode: ZeroCopyMode,
     allow_flush: bool,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
@@ -244,7 +273,6 @@ async fn accept_loop<C: Cache + 'static>(
                                 stream,
                                 cache,
                                 max_value_size,
-                                zero_copy_mode,
                                 allow_flush,
                             )
                             .await
@@ -272,7 +300,6 @@ async fn handle_connection<C: Cache>(
     mut stream: TcpStream,
     cache: Arc<C>,
     max_value_size: usize,
-    zero_copy_mode: ZeroCopyMode,
     allow_flush: bool,
 ) -> std::io::Result<()> {
     let mut conn = Connection::with_options(max_value_size, allow_flush);
@@ -292,58 +319,36 @@ async fn handle_connection<C: Cache>(
                 // Safety: try_read wrote n bytes to spare capacity
                 unsafe { recv_buf.advance(n) };
 
-                // Zero-copy path: process one command at a time
-                if zero_copy_mode != ZeroCopyMode::Disabled {
-                    loop {
-                        if recv_buf.is_empty() || !conn.should_read() {
-                            break;
-                        }
-
-                        let initial_len = recv_buf.len();
-                        if let Some(resp) =
-                            conn.process_one_zero_copy(&mut recv_buf, &*cache, zero_copy_mode)
-                        {
-                            // Send zero-copy response using write_vectored
-                            let slices = resp.as_io_slices();
-                            // Note: write_vectored may do a partial write, but for simplicity
-                            // we rely on the response being small enough to fit in one syscall
-                            let _n = stream.write_vectored(&slices).await?;
-                        }
-
-                        // Check if we made progress (consumed any data).
-                        // If not, command was incomplete - wait for more data.
-                        if recv_buf.len() == initial_len {
-                            break;
-                        }
-
-                        // Send any pending write_buf data (non-zero-copy responses)
-                        if conn.has_pending_write() {
-                            let data = conn.pending_write_data();
-                            stream.write_all(data).await?;
-                            conn.advance_write(data.len());
-                        }
-
-                        if conn.should_close() {
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    // Non-zero-copy path: process all commands at once
-                    conn.process_from(&mut recv_buf, &*cache);
-
-                    if conn.should_close() {
-                        // Flush any pending writes before closing
-                        if conn.has_pending_write() {
-                            let _ = stream.write_all(conn.pending_write_data()).await;
-                        }
-                        return Ok(());
+                // Process one command at a time with zero-copy responses
+                loop {
+                    if recv_buf.is_empty() || !conn.should_read() {
+                        break;
                     }
 
-                    // Write response if we have data
+                    let initial_len = recv_buf.len();
+                    if let Some(resp) = conn.process_one_zero_copy(&mut recv_buf, &*cache) {
+                        // Send zero-copy response using write_vectored
+                        let slices = resp.as_io_slices();
+                        // Note: write_vectored may do a partial write, but for simplicity
+                        // we rely on the response being small enough to fit in one syscall
+                        let _n = stream.write_vectored(&slices).await?;
+                    }
+
+                    // Check if we made progress (consumed any data).
+                    // If not, command was incomplete - wait for more data.
+                    if recv_buf.len() == initial_len {
+                        break;
+                    }
+
+                    // Send any pending write_buf data (non-zero-copy responses)
                     if conn.has_pending_write() {
                         let data = conn.pending_write_data();
                         stream.write_all(data).await?;
                         conn.advance_write(data.len());
+                    }
+
+                    if conn.should_close() {
+                        return Ok(());
                     }
                 }
             }

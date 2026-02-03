@@ -221,6 +221,41 @@ impl ConnectionRecvState {
         }
     }
 
+    /// Get the current capacity of the coalesce buffer.
+    ///
+    /// Useful for monitoring memory usage.
+    pub fn coalesce_capacity(&self) -> usize {
+        self.coalesce_buf.capacity()
+    }
+
+    /// Shrink the coalesce buffer if it exceeds the threshold.
+    ///
+    /// This is called automatically when all data is consumed, but can be
+    /// called explicitly to reclaim memory after processing large values.
+    ///
+    /// If there's unconsumed data in the coalesce buffer, it will be compacted
+    /// into a new smaller buffer. If the buffer is already at or below the
+    /// threshold, this is a no-op.
+    pub fn shrink_if_oversized(&mut self) {
+        if self.coalesce_buf.capacity() <= SHRINK_THRESHOLD {
+            return;
+        }
+
+        let remaining = self.coalesce_buf.len() - self.coalesce_offset;
+        if remaining == 0 {
+            // No data - just shrink
+            self.coalesce_buf = BytesMut::with_capacity(DEFAULT_COALESCE_CAPACITY);
+            self.coalesce_offset = 0;
+        } else {
+            // Compact remaining data into a new smaller buffer
+            let target_capacity = remaining.max(DEFAULT_COALESCE_CAPACITY);
+            let mut new_buf = BytesMut::with_capacity(target_capacity);
+            new_buf.extend_from_slice(&self.coalesce_buf[self.coalesce_offset..]);
+            self.coalesce_buf = new_buf;
+            self.coalesce_offset = 0;
+        }
+    }
+
     /// Handle new data arriving from a recv operation.
     ///
     /// If there's unconsumed data, coalesces old + new into the coalesce buffer
@@ -554,5 +589,60 @@ mod tests {
         let returns: Vec<_> = state.take_pending_returns().collect();
         assert_eq!(returns.len(), 1);
         assert_eq!(returns[0].buf_id, 42);
+    }
+
+    #[test]
+    fn test_shrink_if_oversized_empty_buffer() {
+        let mut state = ConnectionRecvState::new(1024);
+
+        // Grow the buffer beyond threshold (64KB)
+        let large_data = vec![0u8; 100_000];
+        state.append_owned(&large_data);
+
+        // Consume all data
+        state.consume(100_000);
+
+        // Buffer should already be shrunk by consume()
+        assert!(state.coalesce_capacity() <= DEFAULT_COALESCE_CAPACITY);
+    }
+
+    #[test]
+    fn test_shrink_if_oversized_with_remaining_data() {
+        let mut state = ConnectionRecvState::new(1024);
+
+        // Grow the buffer beyond threshold (64KB)
+        let large_data = vec![0u8; 100_000];
+        state.append_owned(&large_data);
+
+        // Consume most but not all data (leave 1000 bytes)
+        state.consume(99_000);
+        assert_eq!(state.available(), 1000);
+
+        // Buffer is still large
+        assert!(state.coalesce_capacity() > SHRINK_THRESHOLD);
+
+        // Explicitly shrink - should compact remaining data
+        state.shrink_if_oversized();
+
+        // Buffer should now be smaller, but still hold the remaining data
+        assert!(state.coalesce_capacity() <= SHRINK_THRESHOLD);
+        assert_eq!(state.available(), 1000);
+        assert_eq!(state.as_slice(), &[0u8; 1000]);
+    }
+
+    #[test]
+    fn test_shrink_if_oversized_no_op_when_small() {
+        let mut state = ConnectionRecvState::new(1024);
+
+        // Add some small data
+        state.append_owned(b"small data");
+
+        let capacity_before = state.coalesce_capacity();
+        state.shrink_if_oversized();
+        let capacity_after = state.coalesce_capacity();
+
+        // Should be a no-op
+        assert_eq!(capacity_before, capacity_after);
+        assert_eq!(state.as_slice(), b"small data");
     }
 }

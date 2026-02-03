@@ -47,85 +47,6 @@ pub struct Config {
     /// io_uring specific configuration (only used when io_engine = "uring" or "auto" on Linux 6.0+)
     #[serde(default)]
     pub uring: UringConfig,
-
-    /// Zero-copy mode for GET responses.
-    /// Controls whether to use scatter-gather I/O to send values directly from cache segments.
-    #[serde(default)]
-    pub zero_copy: ZeroCopyMode,
-}
-
-/// Zero-copy mode for GET responses.
-///
-/// Controls whether to use scatter-gather I/O to send cached values directly
-/// from segment memory without copying to intermediate buffers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ZeroCopyMode {
-    /// Always copy values to write buffer (current behavior).
-    /// Most compatible, no segment hold concerns.
-    #[default]
-    Disabled,
-
-    /// Always use zero-copy scatter-gather for all values.
-    /// Maximum performance but holds segment refs during I/O.
-    Enabled,
-
-    /// Use zero-copy for values >= threshold bytes (default: 1024).
-    /// Balances performance with segment hold concerns.
-    /// Small values are copied (negligible overhead), large values are zero-copy.
-    Threshold,
-}
-
-impl ZeroCopyMode {
-    /// Get the threshold size for zero-copy mode.
-    /// Returns None for Disabled/Enabled, Some(threshold) for Threshold mode.
-    pub fn threshold(&self) -> Option<usize> {
-        match self {
-            ZeroCopyMode::Disabled => None,
-            ZeroCopyMode::Enabled => Some(0), // All values
-            ZeroCopyMode::Threshold => Some(DEFAULT_ZERO_COPY_THRESHOLD),
-        }
-    }
-
-    /// Check if zero-copy should be used for a value of the given size.
-    pub fn should_use_zero_copy(&self, value_len: usize) -> bool {
-        match self {
-            ZeroCopyMode::Disabled => false,
-            ZeroCopyMode::Enabled => true,
-            ZeroCopyMode::Threshold => value_len >= DEFAULT_ZERO_COPY_THRESHOLD,
-        }
-    }
-}
-
-/// Default threshold for zero-copy mode (1KB).
-/// Values smaller than this are copied; larger values use scatter-gather.
-pub const DEFAULT_ZERO_COPY_THRESHOLD: usize = 1024;
-
-impl<'de> Deserialize<'de> for ZeroCopyMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum ZeroCopyValue {
-            Bool(bool),
-            String(String),
-        }
-
-        match ZeroCopyValue::deserialize(deserializer)? {
-            ZeroCopyValue::Bool(true) => Ok(ZeroCopyMode::Enabled),
-            ZeroCopyValue::Bool(false) => Ok(ZeroCopyMode::Disabled),
-            ZeroCopyValue::String(s) => match s.to_lowercase().as_str() {
-                "disabled" | "off" | "no" | "false" => Ok(ZeroCopyMode::Disabled),
-                "enabled" | "on" | "yes" | "true" => Ok(ZeroCopyMode::Enabled),
-                "threshold" | "auto" | "default" => Ok(ZeroCopyMode::Threshold),
-                _ => Err(serde::de::Error::custom(format!(
-                    "invalid zero_copy value: '{}' (expected 'disabled', 'enabled', or 'threshold')",
-                    s
-                ))),
-            },
-        }
-    }
 }
 
 /// Runtime selection.
@@ -596,25 +517,6 @@ fn default_log_format() -> LogFormat {
     LogFormat::Pretty
 }
 
-/// Recv mode for io_uring connections.
-///
-/// Accepts: "multishot", "multi-shot", "singleshot", "single-shot"
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RecvMode {
-    /// Multishot recv with kernel-managed buffer ring (default).
-    /// 1 copy for long messages, 0 copies for short messages.
-    /// More efficient for many small receives.
-    #[default]
-    #[serde(alias = "multi-shot")]
-    Multishot,
-    /// Single-shot recv directly into connection buffer.
-    /// 0 copies (kernel writes directly to user buffer).
-    /// May be more efficient for larger messages.
-    #[serde(alias = "singleshot", alias = "single-shot")]
-    SingleShot,
-}
-
 /// io_uring specific configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -638,10 +540,6 @@ pub struct UringConfig {
     /// Submission queue depth
     #[serde(default = "default_sq_depth")]
     pub sq_depth: u32,
-
-    /// Recv mode: "multishot"/"multi-shot" (default) or "singleshot"/"single-shot"
-    #[serde(default)]
-    pub recv_mode: RecvMode,
 }
 
 impl Default for UringConfig {
@@ -652,7 +550,6 @@ impl Default for UringConfig {
             buffer_count: default_buffer_count(),
             buffer_size: default_buffer_size(),
             sq_depth: default_sq_depth(),
-            recv_mode: RecvMode::default(),
         }
     }
 }

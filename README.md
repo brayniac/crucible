@@ -264,7 +264,6 @@ sqpoll = false
 buffer_count = 2048
 buffer_size = "16KB"
 sq_depth = 1024
-recv_mode = "multishot"  # or "singleshot"
 ```
 
 #### Pre-built Configurations

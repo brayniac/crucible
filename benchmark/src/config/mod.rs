@@ -1,5 +1,5 @@
 use crate::output::{ColorMode, OutputFormat};
-use io_driver::{IoEngine, RecvMode};
+use io_driver::IoEngine;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -37,9 +37,6 @@ pub struct General {
     /// I/O engine selection (auto, mio, uring)
     #[serde(default)]
     pub io_engine: IoEngine,
-    /// Recv mode for io_uring (multishot/multi-shot, singleshot/single-shot)
-    #[serde(default)]
-    pub recv_mode: RecvMode,
 }
 
 impl Default for General {
@@ -50,7 +47,6 @@ impl Default for General {
             threads: default_threads(),
             cpu_list: None,
             io_engine: IoEngine::default(),
-            recv_mode: RecvMode::default(),
         }
     }
 }

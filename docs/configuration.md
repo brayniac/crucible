@@ -152,22 +152,9 @@ buffer_size = "16KB"        # Size of each buffer
 
 # Submission queue depth
 sq_depth = 1024
-
-# Recv mode: "multishot" or "singleshot"
-# multishot: fewer syscalls, 1 copy
-# singleshot: more syscalls, 0 copies possible
-recv_mode = "multishot"
 ```
 
-### Zero-Copy
-
-```toml
-# Zero-copy mode for GET responses
-# "disabled": Always copy (safest)
-# "enabled": Always use scatter-gather (fastest)
-# "threshold": Use scatter-gather for values > 1KB
-zero_copy = "disabled"
-```
+The driver uses a hybrid recv mode that automatically switches between multishot recv (efficient for small requests) and direct recv (zero-copy for large values).
 
 ## Complete Server Example
 
@@ -205,9 +192,6 @@ sqpoll = false
 buffer_count = 4096
 buffer_size = "16KB"
 sq_depth = 2048
-recv_mode = "multishot"
-
-zero_copy = "threshold"
 ```
 
 ## Benchmark Configuration

@@ -94,7 +94,7 @@ pub use owned_buffer::OwnedBuffer;
 pub use recv_state::{BufferSlice, BufferSource, ConnectionRecvState, PendingReturn, ReadGuard};
 pub use types::{
     Completion, CompletionKind, ConnId, DriverCapabilities, Ecn, IoEngine, ListenerId, RecvMeta,
-    RecvMode, SendFlags, SendMeta, SendMode, UdpSocketId,
+    SendFlags, SendMeta, SendMode, UdpSocketId,
 };
 pub use zero_copy::{BoxedZeroCopy, OwnedBytes, ZeroCopySend, boxed_zc};
 

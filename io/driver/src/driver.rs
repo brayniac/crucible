@@ -30,6 +30,18 @@ pub trait RecvBuf {
 
     /// Mark `n` bytes as consumed.
     fn consume(&mut self, n: usize);
+
+    /// Get the current buffer capacity.
+    ///
+    /// Useful for monitoring memory usage in workloads with large values.
+    fn capacity(&self) -> usize;
+
+    /// Shrink the buffer if it has grown too large.
+    ///
+    /// This is called automatically when all data is consumed, but can be
+    /// called explicitly to reclaim memory after processing large values.
+    /// If there's unconsumed data, it will be compacted into a smaller buffer.
+    fn shrink_if_oversized(&mut self);
 }
 
 /// I/O driver trait - abstracts over mio and io_uring backends.

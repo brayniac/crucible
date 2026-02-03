@@ -34,7 +34,6 @@ struct ConfigOutput {
     key_size: usize,
     value_size: usize,
     engine: String,
-    recv_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ratelimit: Option<u64>,
     warmup_secs: u64,
@@ -114,7 +113,6 @@ impl OutputFormatter for JsonFormatter {
             key_size: config.workload.keyspace.length,
             value_size: config.workload.values.length,
             engine: format!("{}", config.general.io_engine),
-            recv_mode: format!("{}", config.general.recv_mode),
             ratelimit: config.workload.rate_limit,
             warmup_secs: config.general.warmup.as_secs(),
             duration_secs: config.general.duration.as_secs(),

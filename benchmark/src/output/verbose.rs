@@ -39,7 +39,6 @@ impl OutputFormatter for VerboseFormatter {
         );
         tracing::info!("value_size: {} bytes", config.workload.values.length);
         tracing::info!("io_engine: {}", config.general.io_engine);
-        tracing::info!("recv_mode: {}", config.general.recv_mode);
         if let Some(ref cpu_list) = config.general.cpu_list {
             tracing::info!("cpu_list: {}", cpu_list);
         }

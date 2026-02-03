@@ -131,11 +131,6 @@ For Linux 6.0+, tune io_uring settings based on workload:
 
 ```toml
 [uring]
-# Recv mode trade-off:
-# multishot: fewer syscalls, 1 memory copy
-# singleshot: more syscalls, 0 copies possible
-recv_mode = "multishot"
-
 # Buffer sizing
 # Rule of thumb: 2 buffers per expected connection
 buffer_count = 4096

@@ -151,7 +151,6 @@ impl IoWorker {
         // Use io-driver defaults for buffer sizing (16KB * 2048 buffers, sq_depth 1024)
         let driver = Driver::builder()
             .engine(cfg.config.general.io_engine)
-            .recv_mode(cfg.config.general.recv_mode)
             .build()?;
 
         let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);
@@ -578,6 +577,8 @@ impl IoWorker {
                                     if let Err(e) = session.poll_responses_from(buf, results, now) {
                                         tracing::debug!("protocol error: {}", e);
                                     }
+                                    // Shrink buffer if it grew large from big responses
+                                    buf.shrink_if_oversized();
                                 });
 
                         // Check for EOF or errors

@@ -74,13 +74,9 @@ fn run(
     let backend_detail: String = match config.runtime {
         Runtime::Native => {
             let base = server::native::backend_detail();
-            // Show recv_mode when using io_uring
+            // io_uring uses hybrid recv mode (multishot + direct recv for large values)
             if base == "io_uring" {
-                let mode = match config.uring.recv_mode {
-                    server::config::RecvMode::Multishot => "multishot",
-                    server::config::RecvMode::SingleShot => "single-shot",
-                };
-                format!("{}, {}", base, mode)
+                format!("{}, hybrid", base)
             } else {
                 base.to_string()
             }

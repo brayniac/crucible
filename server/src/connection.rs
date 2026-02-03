@@ -18,7 +18,6 @@ use protocol_resp::{
 use std::io::IoSlice;
 use std::time::Duration;
 
-use crate::config::ZeroCopyMode;
 use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
 use crate::metrics::PROTOCOL_ERRORS;
 
@@ -1180,14 +1179,12 @@ impl Connection {
 
     /// Process a single RESP command with zero-copy support.
     ///
-    /// Returns `Some(ZeroCopyResponse)` if the command is a GET that resulted in a hit
-    /// and zero-copy is enabled for this value size. The caller should send the response
-    /// using vectored I/O.
+    /// Returns `Some(ZeroCopyResponse)` if the command is a GET that resulted in a hit.
+    /// The caller should send the response using vectored I/O.
     ///
     /// Returns `None` if:
     /// - The command is not a GET
     /// - The GET resulted in a miss
-    /// - Zero-copy is disabled or the value is below threshold
     /// - There's no complete command in the buffer
     ///
     /// In these cases, check `has_pending_write()` for regular response data.
@@ -1196,7 +1193,6 @@ impl Connection {
         &mut self,
         buf: &mut dyn RecvBuf,
         cache: &C,
-        zero_copy_mode: ZeroCopyMode,
     ) -> Option<ZeroCopyResponse> {
         // Clear write buffer if all data has been sent
         if self.write_pos >= self.write_buf.len() {
@@ -1232,27 +1228,8 @@ impl Connection {
                     // Try to get value reference (single lookup)
                     if let Some(value_ref) = cache.get_value_ref(key) {
                         HITS.increment();
-
-                        // Check if we should use zero-copy or copy path
-                        if zero_copy_mode.should_use_zero_copy(value_ref.len()) {
-                            buf.consume(consumed);
-                            return Some(ZeroCopyResponse::new_resp_bulk_string(value_ref));
-                        }
-
-                        // Below threshold - copy from the value_ref we already have
-                        let value = value_ref.as_ref();
-                        let needed = 1 + 20 + 2 + value.len() + 2;
-                        self.write_buf.reserve(needed);
-
-                        let spare = self.write_buf.spare_capacity_mut();
-                        let buf_slice = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                spare.as_mut_ptr() as *mut u8,
-                                spare.len(),
-                            )
-                        };
-                        let written = unsafe { write_bulk_string(buf_slice, value) };
-                        unsafe { self.write_buf.set_len(self.write_buf.len() + written) };
+                        buf.consume(consumed);
+                        return Some(ZeroCopyResponse::new_resp_bulk_string(value_ref));
                     } else {
                         // Cache miss
                         MISSES.increment();
