@@ -300,4 +300,91 @@ mod tests {
 
         assert_eq!(count, 3);
     }
+
+    #[test]
+    fn test_encode_large_value() {
+        let codec = RespCodec::new();
+        // Start with a small buffer
+        let mut buf = Buffer::with_capacity(1024);
+
+        // Create a 1MB value
+        let key = b"testkey";
+        let value = vec![0xABu8; 1_000_000];
+
+        // This should trigger buffer growth
+        codec.encode_set(&mut buf, key, &value);
+
+        // Verify the encoded data is valid RESP
+        let data = buf.as_slice();
+
+        // Should start with array header for SET command
+        assert!(
+            data.starts_with(b"*3\r\n"),
+            "Expected *3\\r\\n, got first 20 bytes: {:?}",
+            &data[..20.min(data.len())]
+        );
+
+        // Verify total length matches expected
+        // *3\r\n = 4
+        // $3\r\nSET\r\n = 9
+        // $7\r\ntestkey\r\n = 13
+        // $1000000\r\n = 10
+        // <1MB>\r\n = 1000002
+        // Total = 4 + 9 + 13 + 10 + 1000002 = 1000038
+        let expected_len = 1_000_038;
+        assert_eq!(buf.readable(), expected_len);
+    }
+
+    #[test]
+    fn test_encode_multiple_large_values_with_partial_consumption() {
+        let codec = RespCodec::new();
+        let mut buf = Buffer::with_capacity(64 * 1024);
+
+        let key = b"testkey";
+        let value = vec![0xCDu8; 100_000]; // 100KB value
+
+        // Encode first SET
+        let len1 = codec.encode_set(&mut buf, key, &value);
+        assert!(len1 > 0);
+
+        // Simulate partial send - only consume half
+        let partial = buf.readable() / 2;
+        buf.consume(partial);
+
+        // Encode second SET - should still work after partial consumption
+        let len2 = codec.encode_set(&mut buf, key, &value);
+        assert!(len2 > 0);
+
+        // Verify total data in buffer
+        assert_eq!(buf.readable(), (len1 - partial) + len2);
+    }
+
+    #[test]
+    fn test_buffer_grow_preserves_data() {
+        let codec = RespCodec::new();
+        // Start with tiny buffer
+        let mut buf = Buffer::with_capacity(64);
+
+        // Encode a small request first
+        codec.encode_get(&mut buf, b"key1");
+        let first_request = buf.as_slice().to_vec();
+
+        // Now encode a large request that requires growth
+        let value = vec![0xEFu8; 10_000];
+        codec.encode_set(&mut buf, b"key2", &value);
+
+        // Verify the first request data is still intact at the beginning
+        let data = buf.as_slice();
+        assert!(
+            data.starts_with(&first_request),
+            "First request not preserved after buffer grow"
+        );
+
+        // Verify the second request follows (check bytes directly, not as UTF-8)
+        let second_request_start = &data[first_request.len()..first_request.len() + 4];
+        assert_eq!(
+            second_request_start, b"*3\r\n",
+            "Second request should start with *3\\r\\n"
+        );
+    }
 }
