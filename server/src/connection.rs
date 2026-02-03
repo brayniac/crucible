@@ -406,10 +406,22 @@ impl Connection {
                         }
                         Err(e) => {
                             // Cache error (out of memory, etc.)
-                            buf.consume(header_consumed + prefix_len);
+                            // Send error response
                             self.write_buf.extend_from_slice(b"-ERR ");
                             self.write_buf.extend_from_slice(e.to_string().as_bytes());
                             self.write_buf.extend_from_slice(b"\r\n");
+
+                            // Consume the header + prefix we've already seen
+                            buf.consume(header_consumed + prefix_len);
+
+                            // Calculate remaining bytes to drain: rest of value + CRLF
+                            let remaining_value = value_len - prefix_len;
+                            let remaining_to_drain = remaining_value + 2; // +2 for trailing CRLF
+
+                            // Transition to draining state
+                            self.streaming_state = StreamingState::Draining {
+                                remaining: remaining_to_drain,
+                            };
                         }
                     }
                 }
@@ -701,9 +713,21 @@ impl Connection {
                             };
                         }
                         Err(_e) => {
-                            buf.consume(header_consumed + prefix_len);
+                            // Send error response
                             self.write_buf
                                 .extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+
+                            // Consume the header + prefix we've already seen
+                            buf.consume(header_consumed + prefix_len);
+
+                            // Calculate remaining bytes to drain: rest of value + CRLF
+                            let remaining_value = value_len - prefix_len;
+                            let remaining_to_drain = remaining_value + 2; // +2 for trailing CRLF
+
+                            // Transition to draining state
+                            self.streaming_state = StreamingState::Draining {
+                                remaining: remaining_to_drain,
+                            };
                         }
                     }
                 }
@@ -936,7 +960,6 @@ impl Connection {
                             };
                         }
                         Err(_e) => {
-                            buf.consume(header_consumed + prefix_len);
                             // Binary protocol error response
                             use protocol_memcache::binary::{BinaryResponse, Status};
                             let start = self.write_buf.len();
@@ -951,6 +974,19 @@ impl Connection {
                                 Status::OutOfMemory,
                             );
                             self.write_buf.truncate(start + len);
+
+                            // Consume the header + prefix we've already seen
+                            buf.consume(header_consumed + prefix_len);
+
+                            // Calculate remaining bytes to drain (no CRLF for binary protocol)
+                            let remaining_to_drain = value_len - prefix_len;
+
+                            if remaining_to_drain > 0 {
+                                // Transition to draining state
+                                self.streaming_state = StreamingState::Draining {
+                                    remaining: remaining_to_drain,
+                                };
+                            }
                         }
                     }
                 }

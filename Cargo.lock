@@ -2477,6 +2477,7 @@ version = "0.2.12-alpha.0"
 dependencies = [
  "cache-core",
  "clocksource",
+ "tempfile",
 ]
 
 [[package]]
