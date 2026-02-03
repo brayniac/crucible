@@ -12,14 +12,14 @@ use std::fmt;
 ///
 /// Interprets the 44-bit `Location` as:
 /// - pool_id: 2 bits (0-3) - up to 4 storage pools
-/// - segment_id: 22 bits - up to 4M segments per pool
-/// - offset: 20 bits (stored as offset/8) - up to ~8MB per segment
+/// - segment_id: 18 bits - up to 256K segments per pool
+/// - offset: 24 bits (stored as offset/8) - up to ~128MB per segment
 ///
 /// ```text
 /// +--------+--------------+----------------+
-/// | 43..42 |    41..20    |     19..0      |
+/// | 43..42 |    41..24    |     23..0      |
 /// |  pool  |    seg_id    |    offset/8    |
-/// | 2 bits |   22 bits    |    20 bits     |
+/// | 2 bits |   18 bits    |    24 bits     |
 /// +--------+--------------+----------------+
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,10 +29,10 @@ impl ItemLocation {
     const POOL_SHIFT: u32 = 42;
     const POOL_MASK: u64 = 0b11 << 42;
 
-    const SEG_SHIFT: u32 = 20;
-    const SEG_MASK: u64 = 0x3F_FFFF << 20; // 22 bits
+    const SEG_SHIFT: u32 = 24;
+    const SEG_MASK: u64 = 0x3_FFFF << 24; // 18 bits
 
-    const OFFSET_MASK: u64 = 0xF_FFFF; // 20 bits (lowest bits)
+    const OFFSET_MASK: u64 = 0xFF_FFFF; // 24 bits (lowest bits)
 
     /// Alignment for offset encoding (offset stored as offset/8).
     pub const OFFSET_ALIGN: u32 = 8;
@@ -40,11 +40,11 @@ impl ItemLocation {
     /// Maximum pool ID (2 bits = 0-3).
     pub const MAX_POOL_ID: u8 = 3;
 
-    /// Maximum segment ID (22 bits).
-    pub const MAX_SEGMENT_ID: u32 = (1 << 22) - 1;
+    /// Maximum segment ID (18 bits).
+    pub const MAX_SEGMENT_ID: u32 = (1 << 18) - 1;
 
-    /// Maximum raw offset value (20 bits * 8 = ~8MB).
-    pub const MAX_OFFSET: u32 = ((1u32 << 20) - 1) * Self::OFFSET_ALIGN;
+    /// Maximum raw offset value (24 bits * 8 = ~128MB).
+    pub const MAX_OFFSET: u32 = ((1u32 << 24) - 1) * Self::OFFSET_ALIGN;
 
     /// Create a new item location from segment coordinates.
     ///
@@ -52,21 +52,21 @@ impl ItemLocation {
     ///
     /// Panics in debug mode if:
     /// - pool_id >= 4
-    /// - segment_id >= 2^22
+    /// - segment_id >= 2^18
     /// - offset is not 8-byte aligned
-    /// - offset/8 >= 2^20
+    /// - offset/8 >= 2^24
     #[inline]
     pub fn new(pool_id: u8, segment_id: u32, offset: u32) -> Self {
         debug_assert!(pool_id <= Self::MAX_POOL_ID, "pool_id must be 0-3");
         debug_assert!(
             segment_id <= Self::MAX_SEGMENT_ID,
-            "segment_id must fit in 22 bits"
+            "segment_id must fit in 18 bits"
         );
         debug_assert!(
             offset.is_multiple_of(Self::OFFSET_ALIGN),
             "offset must be 8-byte aligned"
         );
-        debug_assert!(offset <= Self::MAX_OFFSET, "offset/8 must fit in 20 bits");
+        debug_assert!(offset <= Self::MAX_OFFSET, "offset/8 must fit in 24 bits");
 
         let encoded_offset = (offset / Self::OFFSET_ALIGN) as u64;
         let raw = ((pool_id as u64) << Self::POOL_SHIFT)
@@ -343,16 +343,17 @@ mod tests {
     #[test]
     fn test_bit_packing() {
         // Verify bit layout matches documentation
-        let loc = ItemLocation::new(0b11, 0x3F_FFFF, 0x7FFFF8);
+        // 18-bit segment_id max = 0x3_FFFF, 24-bit offset/8 max * 8 = 0x7FF_FFF8
+        let loc = ItemLocation::new(0b11, 0x3_FFFF, 0x7FF_FFF8);
 
         // Pool bits should be at position 42-43
         assert_eq!((loc.to_location().as_raw() >> 42) & 0b11, 0b11);
 
-        // Segment bits should be at position 20-41
-        assert_eq!((loc.to_location().as_raw() >> 20) & 0x3F_FFFF, 0x3F_FFFF);
+        // Segment bits should be at position 24-41
+        assert_eq!((loc.to_location().as_raw() >> 24) & 0x3_FFFF, 0x3_FFFF);
 
-        // Offset/8 bits should be at position 0-19
-        assert_eq!(loc.to_location().as_raw() & 0xF_FFFF, 0x7FFFF8 / 8);
+        // Offset/8 bits should be at position 0-23
+        assert_eq!(loc.to_location().as_raw() & 0xFF_FFFF, 0x7FF_FFF8 / 8);
     }
 
     #[test]

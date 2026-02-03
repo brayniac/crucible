@@ -1136,9 +1136,9 @@ impl Segment for SliceSegment<'_> {
             return;
         }
 
-        // Set deleted flag (byte 4, bit 6) without key verification
+        // Set deleted flag (byte 1, bit 6) without key verification
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-        let flags_ptr = unsafe { data_ptr.add(4) };
+        let flags_ptr = unsafe { data_ptr.add(1) };
 
         #[cfg(not(feature = "loom"))]
         {
@@ -1197,9 +1197,9 @@ impl Segment for SliceSegment<'_> {
             + 7)
             & !7) as u32;
 
-        // Set deleted flag (byte 4, bit 6)
+        // Set deleted flag (byte 1, bit 6)
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-        let flags_ptr = unsafe { data_ptr.add(4) };
+        let flags_ptr = unsafe { data_ptr.add(1) };
 
         #[cfg(not(feature = "loom"))]
         let old_flags = {

@@ -19,17 +19,19 @@ use std::time::Duration;
 ///
 /// Layout with validation feature:
 /// ```text
-/// [0..4] len: [key_len (8 bits)][value_len (24 bits)]
-/// [4]    flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
-/// [5]    MAGIC0 (0xCA)
-/// [6]    MAGIC1 (0xCE)
-/// [7]    checksum
+/// [0]    key_len: u8
+/// [1]    flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
+/// [2..6] value_len: u32
+/// [6]    MAGIC0 (0xCA)
+/// [7]    MAGIC1 (0xCE)
+/// [8]    checksum
 /// ```
 ///
 /// Layout without validation:
 /// ```text
-/// [0..4] len: [key_len (8 bits)][value_len (24 bits)]
-/// [4]    flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
+/// [0]    key_len: u8
+/// [1]    flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
+/// [2..6] value_len: u32
 /// ```
 #[derive(Debug, Clone)]
 pub struct BasicHeader {
@@ -48,11 +50,11 @@ impl BasicHeader {
 
     /// Header size with validation feature.
     #[cfg(feature = "validation")]
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = 9;
 
     /// Header size without validation.
     #[cfg(not(feature = "validation"))]
-    pub const SIZE: usize = 5;
+    pub const SIZE: usize = 6;
 
     /// Maximum key length (8 bits).
     pub const MAX_KEY_LEN: usize = 0xFF;
@@ -60,8 +62,8 @@ impl BasicHeader {
     /// Maximum optional metadata length (6 bits).
     pub const MAX_OPTIONAL_LEN: usize = 0x3F;
 
-    /// Maximum value length (24 bits).
-    pub const MAX_VALUE_LEN: usize = (1 << 24) - 1;
+    /// Maximum value length (32 bits).
+    pub const MAX_VALUE_LEN: usize = u32::MAX as usize;
 
     /// Minimum valid item size for bounds checking.
     pub const MIN_ITEM_SIZE: usize = Self::SIZE;
@@ -104,8 +106,11 @@ impl BasicHeader {
         let mut checksum = 0x04_u8;
         checksum ^= key_len;
         checksum ^= optional_len;
-        // XOR all 3 bytes of value_len (24 bits)
-        checksum ^= (value_len as u8) ^ ((value_len >> 8) as u8) ^ ((value_len >> 16) as u8);
+        // XOR all 4 bytes of value_len (32 bits)
+        checksum ^= (value_len as u8)
+            ^ ((value_len >> 8) as u8)
+            ^ ((value_len >> 16) as u8)
+            ^ ((value_len >> 24) as u8);
         if is_numeric {
             checksum ^= 0x55;
         }
@@ -119,16 +124,13 @@ impl BasicHeader {
             return None;
         }
 
-        // Load first 8 bytes in one read (includes all header data)
-        // This is safe because we checked len >= SIZE (which is 8 with validation)
         let ptr = data.as_ptr();
 
-        // Read len (4 bytes) and flags (1 byte) directly
-        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
-        let flags = unsafe { *ptr.add(4) };
+        // Read key_len, flags, and value_len from new layout
+        let key_len = unsafe { *ptr };
+        let flags = unsafe { *ptr.add(1) };
+        let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
 
-        let key_len = len as u8;
-        let value_len = len >> 8;
         let optional_len = flags & 0x3F;
         let is_deleted = (flags & 0x40) != 0;
         let is_numeric = (flags & 0x80) != 0;
@@ -136,12 +138,12 @@ impl BasicHeader {
         #[cfg(feature = "validation")]
         {
             // Check magic bytes with single comparison
-            let magic = unsafe { ptr.add(5).cast::<u16>().read_unaligned() };
+            let magic = unsafe { ptr.add(6).cast::<u16>().read_unaligned() };
             if magic != u16::from_ne_bytes([Self::MAGIC0, Self::MAGIC1]) {
                 return None;
             }
 
-            let stored_checksum = unsafe { *ptr.add(7) };
+            let stored_checksum = unsafe { *ptr.add(8) };
             let computed_checksum =
                 Self::compute_checksum(key_len, optional_len, value_len, is_numeric);
             if stored_checksum != computed_checksum {
@@ -169,16 +171,18 @@ impl BasicHeader {
         debug_assert!(data.len() >= Self::SIZE);
         let ptr = data.as_ptr();
 
-        // Items are 8-byte aligned, so 4-byte read at offset 0 is aligned
-        let len = unsafe { ptr.cast::<u32>().read() };
-        let flags = unsafe { *ptr.add(4) };
+        // Items are 8-byte aligned
+        let key_len = unsafe { *ptr };
+        let flags = unsafe { *ptr.add(1) };
+        // value_len at offset 2 is NOT 4-byte aligned, must use unaligned read
+        let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
 
         Self {
-            key_len: len as u8,
+            key_len,
             optional_len: flags & 0x3F,
             is_deleted: (flags & 0x40) != 0,
             is_numeric: (flags & 0x80) != 0,
-            value_len: len >> 8,
+            value_len,
         }
     }
 
@@ -192,7 +196,6 @@ impl BasicHeader {
     pub fn to_bytes(&self, data: &mut [u8]) {
         debug_assert!(data.len() >= Self::SIZE);
 
-        let len = (self.value_len << 8) | (self.key_len as u32);
         let mut flags = self.optional_len;
 
         if self.is_deleted {
@@ -202,14 +205,15 @@ impl BasicHeader {
             flags |= 0x80;
         }
 
-        data[0..4].copy_from_slice(&len.to_ne_bytes());
-        data[4] = flags;
+        data[0] = self.key_len;
+        data[1] = flags;
+        data[2..6].copy_from_slice(&self.value_len.to_ne_bytes());
 
         #[cfg(feature = "validation")]
         {
-            data[5] = Self::MAGIC0;
-            data[6] = Self::MAGIC1;
-            data[7] = Self::compute_checksum(
+            data[6] = Self::MAGIC0;
+            data[7] = Self::MAGIC1;
+            data[8] = Self::compute_checksum(
                 self.key_len,
                 self.optional_len,
                 self.value_len,
@@ -310,19 +314,21 @@ impl BasicHeader {
 ///
 /// Layout with validation feature:
 /// ```text
-/// [0..4]  len: [key_len (8 bits)][value_len (24 bits)]
-/// [4]     flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
-/// [5..9]  expire_at: u32 (coarse seconds since epoch)
-/// [9]     MAGIC0 (0xCA)
-/// [10]    MAGIC1 (0xCE)
-/// [11]    checksum
+/// [0]     key_len: u8
+/// [1]     flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
+/// [2..6]  value_len: u32
+/// [6..10] expire_at: u32 (coarse seconds since epoch)
+/// [10]    MAGIC0 (0xCA)
+/// [11]    MAGIC1 (0xCE)
+/// [12]    checksum
 /// ```
 ///
 /// Layout without validation:
 /// ```text
-/// [0..4]  len: [key_len (8 bits)][value_len (24 bits)]
-/// [4]     flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
-/// [5..9]  expire_at: u32 (coarse seconds since epoch)
+/// [0]     key_len: u8
+/// [1]     flags: [is_numeric (1)][is_deleted (1)][optional_len (6)]
+/// [2..6]  value_len: u32
+/// [6..10] expire_at: u32 (coarse seconds since epoch)
 /// ```
 #[derive(Debug, Clone)]
 pub struct TtlHeader {
@@ -342,11 +348,11 @@ impl TtlHeader {
 
     /// Header size with validation feature.
     #[cfg(feature = "validation")]
-    pub const SIZE: usize = 12;
+    pub const SIZE: usize = 13;
 
     /// Header size without validation.
     #[cfg(not(feature = "validation"))]
-    pub const SIZE: usize = 9;
+    pub const SIZE: usize = 10;
 
     /// Maximum key length (8 bits).
     pub const MAX_KEY_LEN: usize = 0xFF;
@@ -354,8 +360,8 @@ impl TtlHeader {
     /// Maximum optional metadata length (6 bits).
     pub const MAX_OPTIONAL_LEN: usize = 0x3F;
 
-    /// Maximum value length (24 bits).
-    pub const MAX_VALUE_LEN: usize = (1 << 24) - 1;
+    /// Maximum value length (32 bits).
+    pub const MAX_VALUE_LEN: usize = u32::MAX as usize;
 
     /// Create a new TtlHeader.
     pub fn new(key_len: u8, optional_len: u8, value_len: u32, expire_at: u32) -> Self {
@@ -402,8 +408,11 @@ impl TtlHeader {
         let mut checksum = 0x04_u8;
         checksum ^= key_len;
         checksum ^= optional_len;
-        // XOR all bytes of value_len and expire_at
-        checksum ^= (value_len as u8) ^ ((value_len >> 8) as u8) ^ ((value_len >> 16) as u8);
+        // XOR all 4 bytes of value_len and expire_at
+        checksum ^= (value_len as u8)
+            ^ ((value_len >> 8) as u8)
+            ^ ((value_len >> 16) as u8)
+            ^ ((value_len >> 24) as u8);
         checksum ^= (expire_at as u8)
             ^ ((expire_at >> 8) as u8)
             ^ ((expire_at >> 16) as u8)
@@ -423,13 +432,12 @@ impl TtlHeader {
 
         let ptr = data.as_ptr();
 
-        // Read len, flags, and expire_at directly
-        let len = unsafe { ptr.cast::<u32>().read_unaligned() };
-        let flags = unsafe { *ptr.add(4) };
-        let expire_at = unsafe { ptr.add(5).cast::<u32>().read_unaligned() };
+        // Read key_len, flags, value_len, and expire_at from new layout
+        let key_len = unsafe { *ptr };
+        let flags = unsafe { *ptr.add(1) };
+        let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
+        let expire_at = unsafe { ptr.add(6).cast::<u32>().read_unaligned() };
 
-        let key_len = len as u8;
-        let value_len = len >> 8;
         let optional_len = flags & 0x3F;
         let is_deleted = (flags & 0x40) != 0;
         let is_numeric = (flags & 0x80) != 0;
@@ -437,12 +445,12 @@ impl TtlHeader {
         #[cfg(feature = "validation")]
         {
             // Check magic bytes with single comparison
-            let magic = unsafe { ptr.add(9).cast::<u16>().read_unaligned() };
+            let magic = unsafe { ptr.add(10).cast::<u16>().read_unaligned() };
             if magic != u16::from_ne_bytes([Self::MAGIC0, Self::MAGIC1]) {
                 return None;
             }
 
-            let stored_checksum = unsafe { *ptr.add(11) };
+            let stored_checksum = unsafe { *ptr.add(12) };
             let computed_checksum =
                 Self::compute_checksum(key_len, optional_len, value_len, is_numeric, expire_at);
             if stored_checksum != computed_checksum {
@@ -477,18 +485,20 @@ impl TtlHeader {
         debug_assert!(data.len() >= Self::SIZE);
         let ptr = data.as_ptr();
 
-        // Items are 8-byte aligned, so 4-byte read at offset 0 is aligned
-        let len = unsafe { ptr.cast::<u32>().read() };
-        let flags = unsafe { *ptr.add(4) };
-        // expire_at at offset 5 is NOT 4-byte aligned, must use unaligned read
-        let expire_at = unsafe { ptr.add(5).cast::<u32>().read_unaligned() };
+        // Items are 8-byte aligned
+        let key_len = unsafe { *ptr };
+        let flags = unsafe { *ptr.add(1) };
+        // value_len at offset 2 is NOT 4-byte aligned, must use unaligned read
+        let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
+        // expire_at at offset 6 is NOT 4-byte aligned, must use unaligned read
+        let expire_at = unsafe { ptr.add(6).cast::<u32>().read_unaligned() };
 
         Self {
-            key_len: len as u8,
+            key_len,
             optional_len: flags & 0x3F,
             is_deleted: (flags & 0x40) != 0,
             is_numeric: (flags & 0x80) != 0,
-            value_len: len >> 8,
+            value_len,
             expire_at,
         }
     }
@@ -497,7 +507,6 @@ impl TtlHeader {
     pub fn to_bytes(&self, data: &mut [u8]) {
         debug_assert!(data.len() >= Self::SIZE);
 
-        let len = (self.value_len << 8) | (self.key_len as u32);
         let mut flags = self.optional_len;
 
         if self.is_deleted {
@@ -507,15 +516,16 @@ impl TtlHeader {
             flags |= 0x80;
         }
 
-        data[0..4].copy_from_slice(&len.to_ne_bytes());
-        data[4] = flags;
-        data[5..9].copy_from_slice(&self.expire_at.to_ne_bytes());
+        data[0] = self.key_len;
+        data[1] = flags;
+        data[2..6].copy_from_slice(&self.value_len.to_ne_bytes());
+        data[6..10].copy_from_slice(&self.expire_at.to_ne_bytes());
 
         #[cfg(feature = "validation")]
         {
-            data[9] = Self::MAGIC0;
-            data[10] = Self::MAGIC1;
-            data[11] = Self::compute_checksum(
+            data[10] = Self::MAGIC0;
+            data[11] = Self::MAGIC1;
+            data[12] = Self::compute_checksum(
                 self.key_len,
                 self.optional_len,
                 self.value_len,
