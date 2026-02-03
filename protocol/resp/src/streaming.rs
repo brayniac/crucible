@@ -66,6 +66,23 @@ pub enum ParseProgress<'a> {
         header_consumed: usize,
     },
 
+    /// Value exceeds maximum allowed size - needs to be drained.
+    ///
+    /// The caller should:
+    /// 1. Send an error response to the client
+    /// 2. Drain `value_len + 2` bytes (value + trailing CRLF) from the connection
+    /// 3. Resume normal parsing
+    ValueTooLarge {
+        /// Total size of the value in bytes.
+        value_len: usize,
+        /// Bytes of value already in the parse buffer (to be discarded).
+        value_prefix_len: usize,
+        /// Bytes consumed from buffer so far (header only).
+        header_consumed: usize,
+        /// Maximum allowed value size.
+        max_value_size: usize,
+    },
+
     /// Fully parsed command (used for non-SET commands or small values).
     Complete(Command<'a>, usize),
 }
@@ -205,11 +222,17 @@ pub fn parse_streaming<'a>(
         Err(e) => return Err(e),
     };
 
-    // Check bulk string length limit
+    // Check bulk string length limit - return ValueTooLarge to allow draining
     if value_len > cursor.max_bulk_string_len {
-        return Err(ParseError::BulkStringTooLong {
-            len: value_len,
-            max: cursor.max_bulk_string_len,
+        let header_consumed = cursor.position();
+        let remaining_in_buffer = cursor.remaining();
+        let value_prefix_len = remaining_in_buffer.min(value_len);
+
+        return Ok(ParseProgress::ValueTooLarge {
+            value_len,
+            value_prefix_len,
+            header_consumed,
+            max_value_size: cursor.max_bulk_string_len,
         });
     }
 
@@ -624,6 +647,61 @@ mod tests {
         match result {
             ParseProgress::Incomplete => {}
             _ => panic!("expected Incomplete for sub-threshold without data"),
+        }
+    }
+
+    #[test]
+    fn test_value_too_large_yields_value_too_large() {
+        // Create options with a small max bulk string length
+        let options = ParseOptions::new().max_bulk_string_len(1024); // 1KB limit
+
+        // SET with 2KB value (above limit)
+        let header = format!("*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$2048\r\n");
+        let mut data = header.as_bytes().to_vec();
+        // Add some bytes of the value (simulating partial receive)
+        data.extend_from_slice(&[b'x'; 500]);
+
+        let result = parse_streaming(&data, &options, STREAMING_THRESHOLD).unwrap();
+
+        match result {
+            ParseProgress::ValueTooLarge {
+                value_len,
+                value_prefix_len,
+                header_consumed,
+                max_value_size,
+            } => {
+                assert_eq!(value_len, 2048);
+                assert_eq!(value_prefix_len, 500);
+                assert_eq!(max_value_size, 1024);
+                // header_consumed should be everything up to the value data
+                assert_eq!(header_consumed, header.len());
+            }
+            _ => panic!("expected ValueTooLarge, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_value_too_large_with_no_prefix() {
+        // Create options with a small max bulk string length
+        let options = ParseOptions::new().max_bulk_string_len(1024); // 1KB limit
+
+        // SET with 2KB value, but no value bytes in buffer yet
+        let header = "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$2048\r\n";
+
+        let result = parse_streaming(header.as_bytes(), &options, STREAMING_THRESHOLD).unwrap();
+
+        match result {
+            ParseProgress::ValueTooLarge {
+                value_len,
+                value_prefix_len,
+                max_value_size,
+                ..
+            } => {
+                assert_eq!(value_len, 2048);
+                assert_eq!(value_prefix_len, 0); // No value bytes in buffer
+                assert_eq!(max_value_size, 1024);
+            }
+            _ => panic!("expected ValueTooLarge, got {:?}", result),
         }
     }
 }

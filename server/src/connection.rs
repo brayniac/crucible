@@ -156,6 +156,12 @@ enum DetectedProtocol {
 enum StreamingState {
     /// Normal mode - parse complete commands
     None,
+    /// Draining an oversized value that exceeded max_value_size.
+    /// We need to consume `remaining` bytes (value + trailing CRLF) before resuming.
+    Draining {
+        /// Bytes remaining to drain (includes trailing CRLF)
+        remaining: usize,
+    },
     /// Receiving value data directly into segment memory (true zero-copy) - RESP protocol
     ReceivingSegment {
         /// Reservation for segment memory
@@ -407,6 +413,34 @@ impl Connection {
                         }
                     }
                 }
+                Ok(ParseProgress::ValueTooLarge {
+                    value_len,
+                    value_prefix_len,
+                    header_consumed,
+                    max_value_size,
+                }) => {
+                    // Send error response
+                    self.write_buf.extend_from_slice(b"-ERR value too large: ");
+                    let mut len_buf = itoa::Buffer::new();
+                    self.write_buf
+                        .extend_from_slice(len_buf.format(value_len).as_bytes());
+                    self.write_buf.extend_from_slice(b" bytes exceeds ");
+                    self.write_buf
+                        .extend_from_slice(len_buf.format(max_value_size).as_bytes());
+                    self.write_buf.extend_from_slice(b" byte limit\r\n");
+
+                    // Consume the header + prefix we've already seen
+                    buf.consume(header_consumed + value_prefix_len);
+
+                    // Calculate remaining bytes to drain: rest of value + CRLF
+                    let remaining_value = value_len - value_prefix_len;
+                    let remaining_to_drain = remaining_value + 2; // +2 for trailing CRLF
+
+                    // Transition to draining state
+                    self.streaming_state = StreamingState::Draining {
+                        remaining: remaining_to_drain,
+                    };
+                }
                 Ok(ParseProgress::Incomplete) => break,
                 Err(e) => {
                     PROTOCOL_ERRORS.increment();
@@ -438,6 +472,22 @@ impl Connection {
     fn continue_streaming_recv<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) -> bool {
         match &mut self.streaming_state {
             StreamingState::None => false,
+            StreamingState::Draining { remaining } => {
+                let data = buf.as_slice();
+                if data.len() < *remaining {
+                    // Not enough data yet - consume all and keep draining
+                    *remaining -= data.len();
+                    let len = data.len();
+                    buf.consume(len);
+                    return true;
+                }
+
+                // We have all the bytes to drain
+                let to_consume = *remaining;
+                buf.consume(to_consume);
+                self.streaming_state = StreamingState::None;
+                true
+            }
             StreamingState::ReceivingSegment {
                 reservation,
                 received,
@@ -1519,5 +1569,92 @@ mod tests {
 
         // More data should have been processed
         assert!(conn.has_pending_write());
+    }
+
+    #[test]
+    fn test_oversized_value_draining() {
+        let cache = MockCache;
+        // Create connection with small max value size (1KB)
+        let mut conn = Connection::new(1024);
+
+        // Send SET command with 2KB value (exceeds limit)
+        // Format: *3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$2048\r\n<2048 bytes of data>\r\n
+        let header = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$2048\r\n";
+        let mut data = header.to_vec();
+        data.extend_from_slice(&[b'x'; 1000]); // First chunk: 1000 bytes of value
+
+        let mut buf = TestRecvBuf::new(&data);
+        conn.process_from(&mut buf, &cache);
+
+        // Should have error response about value being too large
+        assert!(conn.has_pending_write());
+        let response = String::from_utf8_lossy(conn.pending_write_data());
+        assert!(
+            response.contains("value too large"),
+            "expected 'value too large' error, got: {}",
+            response
+        );
+
+        // Buffer should be consumed (header + 1000 bytes of value prefix)
+        assert!(buf.as_slice().is_empty());
+
+        // Now send the rest of the value + trailing CRLF
+        // Remaining: 1048 bytes of value + 2 bytes CRLF = 1050 bytes
+        let mut remaining = vec![b'x'; 1048];
+        remaining.extend_from_slice(b"\r\n");
+        buf.append(&remaining);
+        conn.process_from(&mut buf, &cache);
+
+        // All oversized data should be drained
+        assert!(buf.as_slice().is_empty());
+
+        // Clear the write buffer to test next request
+        let pending = conn.pending_write_data().len();
+        conn.advance_write(pending);
+
+        // Now send a valid GET command - should work fine
+        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        // Should have normal response (cache miss)
+        assert!(conn.has_pending_write());
+        assert_eq!(conn.pending_write_data(), b"$-1\r\n");
+        assert!(buf.as_slice().is_empty());
+    }
+
+    #[test]
+    fn test_oversized_value_draining_with_pipelined_request() {
+        let cache = MockCache;
+        // Create connection with small max value size (1KB)
+        let mut conn = Connection::new(1024);
+
+        // Send SET command with 2KB value followed by a GET command
+        // This tests that after draining, the pipelined command is processed correctly
+        let header = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$2048\r\n";
+        let mut data = header.to_vec();
+        data.extend_from_slice(&[b'x'; 2048]); // Full 2KB value
+        data.extend_from_slice(b"\r\n"); // Trailing CRLF
+        data.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"); // Pipelined GET
+
+        let mut buf = TestRecvBuf::new(&data);
+        conn.process_from(&mut buf, &cache);
+
+        // Should have error response + GET response
+        assert!(conn.has_pending_write());
+        let response = String::from_utf8_lossy(conn.pending_write_data());
+        assert!(
+            response.contains("value too large"),
+            "expected 'value too large' error, got: {}",
+            response
+        );
+        // Should also have the cache miss response for GET
+        assert!(
+            response.ends_with("$-1\r\n"),
+            "expected cache miss response, got: {}",
+            response
+        );
+
+        // All data should be consumed
+        assert!(buf.as_slice().is_empty());
     }
 }
