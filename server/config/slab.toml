@@ -6,7 +6,6 @@
 # - Large objects (up to slab_size)
 # - Need for traditional LRU eviction semantics
 
-runtime = "native"
 
 [workers]
 threads = 4

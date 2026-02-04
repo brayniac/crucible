@@ -26,8 +26,6 @@ fn start_test_server(
     let handle = thread::spawn(move || {
         let config_str = format!(
             r#"
-            runtime = "native"
-
             [workers]
             threads = 1
 

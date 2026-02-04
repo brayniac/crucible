@@ -23,7 +23,6 @@
 #   - For identical slab semantics, use backend = "slab" instead
 #   - SASL authentication is not yet supported
 
-runtime = "native"
 
 [workers]
 # Match your Memcached -t thread count

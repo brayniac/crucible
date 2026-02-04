@@ -23,7 +23,6 @@
 #   - Persistence (RDB/AOF) is not supported - this is a cache
 #   - Pub/Sub and Lua scripting are not supported
 
-runtime = "native"
 
 [workers]
 # Match your Redis instance thread count or use all CPUs

@@ -4,7 +4,6 @@
 # beyond available RAM. Items evicted from RAM are demoted to disk
 # storage instead of being discarded.
 
-runtime = "native"
 
 [workers]
 # threads = 8

@@ -1,5 +1,4 @@
 # Smoketest: segment backend with random eviction
-runtime = "native"
 
 [workers]
 threads = 2

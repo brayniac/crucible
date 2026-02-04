@@ -35,8 +35,6 @@ fn start_test_server(cache_port: u16) -> (thread::JoinHandle<()>, Arc<AtomicBool
     let handle = thread::spawn(move || {
         let config_str = format!(
             r#"
-            runtime = "native"
-
             [workers]
             threads = 2
 

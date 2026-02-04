@@ -1,5 +1,4 @@
 # Smoketest: segment backend with s3fifo eviction
-runtime = "native"
 
 [workers]
 threads = 2

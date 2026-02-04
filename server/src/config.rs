@@ -1,7 +1,6 @@
 //! Server configuration.
 //!
-//! Supports runtime selection (native vs tokio), cache backend selection,
-//! and multiple protocol listeners.
+//! Supports cache backend selection and multiple protocol listeners.
 
 use io_driver::IoEngine;
 use serde::Deserialize;
@@ -12,10 +11,6 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Runtime selection: "native" (io_uring/mio) or "tokio"
-    #[serde(default = "default_runtime")]
-    pub runtime: Runtime,
-
     /// Worker thread configuration
     #[serde(default)]
     pub workers: WorkersConfig,
@@ -40,24 +35,13 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
 
-    /// I/O engine selection for native runtime: "auto", "mio", or "uring"
+    /// I/O engine selection: "auto", "mio", or "uring"
     #[serde(default)]
     pub io_engine: IoEngine,
 
     /// io_uring specific configuration (only used when io_engine = "uring" or "auto" on Linux 6.0+)
     #[serde(default)]
     pub uring: UringConfig,
-}
-
-/// Runtime selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Runtime {
-    /// Native completion-based I/O (io_uring on Linux 6.0+, mio fallback)
-    #[default]
-    Native,
-    /// Tokio async runtime with work-stealing scheduler
-    Tokio,
 }
 
 /// Worker thread configuration.
@@ -555,10 +539,6 @@ impl Default for UringConfig {
 }
 
 // Default value functions
-
-fn default_runtime() -> Runtime {
-    Runtime::Native
-}
 
 fn default_cache_backend() -> CacheBackend {
     CacheBackend::Segment

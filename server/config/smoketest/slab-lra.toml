@@ -1,5 +1,4 @@
 # Smoketest: slab backend with lra (least recently accessed) eviction
-runtime = "native"
 
 [workers]
 threads = 2

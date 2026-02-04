@@ -7,7 +7,6 @@
 # - Uses approximate LFU eviction
 # - Has per-item allocator overhead
 
-runtime = "native"
 
 [workers]
 threads = 4

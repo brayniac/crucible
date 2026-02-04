@@ -534,49 +534,19 @@ fn run_worker<C: Cache>(
                                 break;
                             }
 
-                            // Large value: send accumulated write_buf first (preserve order),
-                            // then send zero-copy response
+                            // Queue zero-copy response for sending via write_buf.
+                            // This ensures reliable delivery by handling short writes
+                            // through the normal send path (retries on SendReady).
+                            // We can't use send_owned because it doesn't handle partial
+                            // writes - the remaining data would be lost.
                             if let Some(resp) = zero_copy_response {
-                                // Flush write_buf before sending zero-copy response
-                                while let Some(conn) =
+                                if let Some(conn) =
                                     connections.get_mut(idx).and_then(|c| c.as_mut())
                                 {
-                                    if !conn.has_pending_write() {
-                                        break;
-                                    }
-                                    let data = conn.pending_write_data();
-                                    match driver.send(conn_id, data) {
-                                        Ok(n) => {
-                                            stats.add_bytes_sent(n as u64);
-                                            conn.advance_write(n);
-                                        }
-                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                        Err(_) => {
-                                            send_error = true;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if send_error {
-                                    break;
-                                }
-
-                                // Now send zero-copy response
-                                match driver.send_owned(conn_id, io_driver::boxed_zc!(resp)) {
-                                    Ok(n) => {
-                                        stats.add_bytes_sent(n as u64);
-                                    }
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        send_error = true;
-                                        break;
-                                    }
+                                    conn.queue_zero_copy_response(resp);
                                 }
                             }
-                            // Small values accumulate in write_buf - don't send yet
+                            // All responses (small and large) now accumulate in write_buf
 
                             // Break if error, close, backpressure, or no progress
                             if send_error
@@ -712,46 +682,17 @@ fn run_worker<C: Cache>(
                                 break;
                             }
 
-                            // Large value: flush write_buf first, then send zero-copy
+                            // Queue zero-copy response for sending via write_buf.
+                            // This ensures reliable delivery by handling short writes
+                            // through the normal send path (retries on SendReady).
                             if let Some(resp) = zero_copy_response {
-                                // Flush write_buf before sending zero-copy response
-                                while let Some(conn) =
+                                if let Some(conn) =
                                     connections.get_mut(idx).and_then(|c| c.as_mut())
                                 {
-                                    if !conn.has_pending_write() {
-                                        break;
-                                    }
-                                    let data = conn.pending_write_data();
-                                    match driver.send(conn_id, data) {
-                                        Ok(n) => {
-                                            stats.add_bytes_sent(n as u64);
-                                            conn.advance_write(n);
-                                        }
-                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            close_reason = Some(CloseReason::SendError);
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if close_reason.is_some() {
-                                    break;
-                                }
-
-                                // Now send zero-copy response
-                                if let Err(e) =
-                                    driver.send_owned(conn_id, io_driver::boxed_zc!(resp))
-                                {
-                                    if e.kind() != std::io::ErrorKind::WouldBlock {
-                                        close_reason = Some(CloseReason::SendError);
-                                    }
-                                    break;
+                                    conn.queue_zero_copy_response(resp);
                                 }
                             }
-                            // Small values accumulate in write_buf - don't send yet
+                            // All responses now accumulate in write_buf
 
                             if !made_progress || close_reason.is_some() || backpressure {
                                 break;

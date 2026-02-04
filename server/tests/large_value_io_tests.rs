@@ -60,7 +60,6 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
 fn start_test_server_full(
     port: u16,
     io_engine: &str,
-    runtime: &str,
     worker_threads: usize,
     heap_size_mb: usize,
     segment_size_mb: usize,
@@ -70,7 +69,6 @@ fn start_test_server_full(
     start_test_server_full_with_max_value(
         port,
         io_engine,
-        runtime,
         worker_threads,
         heap_size_mb,
         segment_size_mb,
@@ -82,19 +80,16 @@ fn start_test_server_full(
 fn start_test_server_full_with_max_value(
     port: u16,
     io_engine: &str,
-    runtime: &str,
     worker_threads: usize,
     heap_size_mb: usize,
     segment_size_mb: usize,
     max_value_size_mb: usize,
 ) -> thread::JoinHandle<()> {
     let io_engine = io_engine.to_string();
-    let runtime = runtime.to_string();
 
     thread::spawn(move || {
         let config_str = format!(
             r#"
-            runtime = "{runtime}"
             io_engine = "{io_engine}"
 
             [workers]
@@ -130,14 +125,7 @@ fn start_test_server_full_with_max_value(
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_timeout = Duration::from_secs(5);
 
-        match runtime.as_str() {
-            "tokio" => {
-                let _ = server::tokio::run(&config, cache, shutdown, drain_timeout);
-            }
-            _ => {
-                let _ = server::native::run(&config, cache, shutdown, drain_timeout);
-            }
-        }
+        let _ = server::native::run(&config, cache, shutdown, drain_timeout);
     })
 }
 
@@ -337,7 +325,6 @@ fn try_parse_bulk_string(data: &[u8], expected_size: usize) -> Result<Option<Vec
 /// Configuration for large value tests.
 struct LargeValueTestConfig {
     io_engine: &'static str,
-    runtime: &'static str,
     sizes: &'static [usize],
     heap_size_mb: usize,
     segment_size_mb: usize,
@@ -348,7 +335,6 @@ impl Default for LargeValueTestConfig {
     fn default() -> Self {
         Self {
             io_engine: "mio",
-            runtime: "native",
             sizes: LARGE_SIZES,
             heap_size_mb: 256,
             segment_size_mb: 32,
@@ -365,7 +351,6 @@ fn run_large_value_test(config: LargeValueTestConfig) {
     let _server_handle = start_test_server_full_with_max_value(
         port,
         config.io_engine,
-        config.runtime,
         2, // 2 worker threads
         config.heap_size_mb,
         config.segment_size_mb,
@@ -374,8 +359,7 @@ fn run_large_value_test(config: LargeValueTestConfig) {
 
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {}/{}",
-        config.runtime,
+        "Server failed to start with {}",
         config.io_engine
     );
 
@@ -393,33 +377,32 @@ fn run_large_value_test(config: LargeValueTestConfig) {
         let value = generate_large_value(size);
 
         println!(
-            "Testing {} with {}/{}: {} bytes",
-            key, config.runtime, config.io_engine, size
+            "Testing {} with {}: {} bytes",
+            key, config.io_engine, size
         );
 
         // SET the large value
         send_large_set(&mut stream, &key, &value).unwrap_or_else(|e| {
             panic!(
-                "SET failed for {} ({} bytes) with {}/{}: {}",
-                key, size, config.runtime, config.io_engine, e
+                "SET failed for {} ({} bytes) with {}: {}",
+                key, size, config.io_engine, e
             )
         });
 
         // GET the large value back
         let retrieved = send_large_get(&mut stream, &key, size).unwrap_or_else(|e| {
             panic!(
-                "GET failed for {} ({} bytes) with {}/{}: {}",
-                key, size, config.runtime, config.io_engine, e
+                "GET failed for {} ({} bytes) with {}: {}",
+                key, size, config.io_engine, e
             )
         });
 
         // Verify data integrity
         assert!(
             verify_value(&retrieved, size),
-            "Data corruption detected for {} ({} bytes) with {}/{}",
+            "Data corruption detected for {} ({} bytes) with {}",
             key,
             size,
-            config.runtime,
             config.io_engine
         );
 
@@ -438,7 +421,6 @@ fn run_concurrent_large_value_test(io_engine: &'static str, connections: usize, 
     let _server_handle = start_test_server_full(
         port,
         io_engine,
-        "native",
         4, // More workers for concurrent load
         heap_size_mb,
         64, // 64MB segments
@@ -629,32 +611,6 @@ fn test_uring_concurrent_large_values_4m() {
 }
 
 // =============================================================================
-// Tokio Runtime Large Value Tests
-// =============================================================================
-
-#[test]
-fn test_tokio_large_values_256k_to_1m() {
-    run_large_value_test(LargeValueTestConfig {
-        runtime: "tokio",
-        io_engine: "mio",
-        ..Default::default()
-    });
-}
-
-#[test]
-fn test_tokio_large_values_4m_to_16m() {
-    run_large_value_test(LargeValueTestConfig {
-        runtime: "tokio",
-        io_engine: "mio",
-        sizes: VERY_LARGE_SIZES,
-        heap_size_mb: 512,
-        segment_size_mb: 64,
-        max_value_size_mb: 63,
-        ..Default::default()
-    });
-}
-
-// =============================================================================
 // Edge Case Tests
 // =============================================================================
 
@@ -664,7 +620,7 @@ fn test_mio_rapid_large_value_cycles() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "mio", "native", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "mio", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -704,7 +660,7 @@ fn test_uring_rapid_large_value_cycles() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", "native", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "uring", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -746,7 +702,7 @@ fn test_mio_increasing_value_sizes() {
 
     // Use larger segment/max_value to support up to 2MB values
     let _server_handle = start_test_server_full_with_max_value(
-        port, "mio", "native", 2, 256, 8, 7, // 8MB segment, 7MB max value
+        port, "mio", 2, 256, 8, 7, // 8MB segment, 7MB max value
     );
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
@@ -801,7 +757,7 @@ fn test_uring_increasing_value_sizes() {
 
     // Use larger segment/max_value to support up to 2MB values
     let _server_handle = start_test_server_full_with_max_value(
-        port, "uring", "native", 2, 256, 8, 7, // 8MB segment, 7MB max value
+        port, "uring", 2, 256, 8, 7, // 8MB segment, 7MB max value
     );
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
@@ -854,7 +810,7 @@ fn test_mio_alternating_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "mio", "native", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "mio", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -898,7 +854,7 @@ fn test_uring_alternating_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", "native", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "uring", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -942,7 +898,7 @@ fn test_mio_buffer_boundary_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "mio", "native", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "mio", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -994,7 +950,7 @@ fn test_uring_buffer_boundary_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", "native", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, "uring", 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 

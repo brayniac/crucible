@@ -21,8 +21,6 @@ fn start_test_server(port: u16) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let config_str = format!(
             r#"
-            runtime = "native"
-
             [workers]
             threads = 1
 

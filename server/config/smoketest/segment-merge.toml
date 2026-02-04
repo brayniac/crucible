@@ -1,5 +1,4 @@
 # Smoketest: segment backend with merge eviction
-runtime = "native"
 
 [workers]
 threads = 2

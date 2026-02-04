@@ -1,7 +1,7 @@
 //! Crucible cache server.
 //!
 //! A high-performance cache server supporting multiple protocols (RESP, Memcache, Momento)
-//! and multiple runtime backends (native io_uring/mio, tokio).
+//! with native io_uring/mio runtime.
 
 pub mod admin;
 pub mod affinity;
@@ -15,8 +15,4 @@ pub mod native;
 pub mod signal;
 pub mod workers;
 
-// Tokio runtime (behind feature flag or always available)
-#[cfg(feature = "tokio-runtime")]
-pub mod tokio;
-
-pub use config::{CacheBackend, Config, Protocol, Runtime};
+pub use config::{CacheBackend, Config, Protocol};

@@ -3,7 +3,6 @@
 # Minimal configuration for quick smoke testing.
 # Uses small heap and few workers for fast startup.
 
-runtime = "native"
 
 [workers]
 threads = 2

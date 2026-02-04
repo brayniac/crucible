@@ -7,7 +7,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::Parser;
 use server::admin::{self, AdminConfig};
 use server::banner::{BannerConfig, print_banner};
-use server::config::{CacheBackend, Config, EvictionPolicy, HugepageConfig, Runtime};
+use server::config::{CacheBackend, Config, EvictionPolicy, HugepageConfig};
 use server::{logging, signal};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -71,20 +71,14 @@ fn run(
     let cpu_affinity = config.cpu_affinity();
     let cpu_affinity_slice = cpu_affinity.as_deref();
 
-    let backend_detail: String = match config.runtime {
-        Runtime::Native => {
-            let base = server::native::backend_detail();
-            // io_uring uses hybrid recv mode (multishot + direct recv for large values)
-            if base == "io_uring" {
-                format!("{}, hybrid", base)
-            } else {
-                base.to_string()
-            }
+    let backend_detail: String = {
+        let base = server::native::backend_detail();
+        // io_uring uses hybrid recv mode (multishot + direct recv for large values)
+        if base == "io_uring" {
+            format!("{}, hybrid", base)
+        } else {
+            base.to_string()
         }
-        #[cfg(feature = "tokio-runtime")]
-        Runtime::Tokio => server::tokio::backend_detail().to_string(),
-        #[cfg(not(feature = "tokio-runtime"))]
-        Runtime::Tokio => "tokio (not compiled)".to_string(),
     };
 
     let numa_node = config.numa_node();
@@ -92,7 +86,6 @@ fn run(
 
     print_banner(&BannerConfig {
         version: env!("CARGO_PKG_VERSION"),
-        runtime: config.runtime,
         backend_detail: &backend_detail,
         cache_backend: config.cache.backend,
         eviction_policy: policy,
@@ -141,13 +134,7 @@ fn run_with_cache<C: cache_core::Cache + 'static>(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match config.runtime {
-        Runtime::Native => server::native::run(&config, cache, shutdown, drain_timeout),
-        #[cfg(feature = "tokio-runtime")]
-        Runtime::Tokio => server::tokio::run(&config, cache, shutdown, drain_timeout),
-        #[cfg(not(feature = "tokio-runtime"))]
-        Runtime::Tokio => Err("tokio runtime not compiled in".into()),
-    }
+    server::native::run(&config, cache, shutdown, drain_timeout)
 }
 
 fn create_segment(
@@ -309,9 +296,6 @@ fn create_heap(
 
 fn print_default_config() {
     let config = r#"# Crucible Server Configuration
-
-# Runtime selection: "native" (io_uring/mio) or "tokio"
-runtime = "native"
 
 [shutdown]
 # Timeout in seconds for draining connections during graceful shutdown

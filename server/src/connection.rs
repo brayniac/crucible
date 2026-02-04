@@ -115,6 +115,25 @@ impl ZeroCopyResponse {
             Bytes::from_static(RESP_CRLF),
         ]
     }
+
+    /// Serialize the entire response into the provided buffer.
+    ///
+    /// This copies the response data into write_buf for reliable sending
+    /// via the normal send path. Use this instead of send_owned when
+    /// short writes must be handled correctly (e.g., large values).
+    ///
+    /// Returns the number of bytes written to the buffer.
+    #[inline]
+    pub fn serialize_to_buf(self, buf: &mut BytesMut) -> usize {
+        let header = self.header();
+        let value = self.value();
+
+        buf.extend_from_slice(header);
+        buf.extend_from_slice(value);
+        buf.extend_from_slice(RESP_CRLF);
+
+        header.len() + value.len() + RESP_CRLF.len()
+    }
 }
 
 impl ZeroCopySend for ZeroCopyResponse {
@@ -1175,6 +1194,19 @@ impl Connection {
     #[inline]
     pub fn should_close(&self) -> bool {
         self.should_close
+    }
+
+    /// Queue a zero-copy response for sending via the normal write buffer.
+    ///
+    /// This serializes the response into write_buf, which ensures reliable
+    /// delivery even if the socket buffer is full (short writes are handled
+    /// by the normal send path that retries on SendReady).
+    ///
+    /// Use this instead of `send_owned` for large responses to avoid data loss
+    /// from unhandled short writes.
+    #[inline]
+    pub fn queue_zero_copy_response(&mut self, resp: ZeroCopyResponse) {
+        resp.serialize_to_buf(&mut self.write_buf);
     }
 
     /// Process a single RESP command with zero-copy support.

@@ -1,5 +1,4 @@
 # Smoketest: segment backend with fifo eviction
-runtime = "native"
 
 [workers]
 threads = 2

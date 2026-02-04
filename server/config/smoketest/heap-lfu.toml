@@ -1,5 +1,4 @@
 # Smoketest: heap backend with lfu eviction
-runtime = "native"
 
 [workers]
 threads = 2

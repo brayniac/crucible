@@ -7,9 +7,6 @@
 #   - heap.toml     - Heap backend (no segment fragmentation)
 #   - slab.toml     - Slab allocator with per-object LRU
 
-# Runtime selection: "native" (io_uring/mio) or "tokio"
-runtime = "native"
-
 # Shutdown configuration
 [shutdown]
 # Timeout in seconds for draining connections during graceful shutdown

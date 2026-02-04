@@ -1,6 +1,6 @@
 //! Startup banner utilities.
 
-use crate::config::{CacheBackend, EvictionPolicy, Protocol, Runtime, format_size};
+use crate::config::{CacheBackend, EvictionPolicy, Protocol, format_size};
 use std::fmt::Write;
 use std::net::SocketAddr;
 
@@ -8,8 +8,6 @@ use std::net::SocketAddr;
 pub struct BannerConfig<'a> {
     /// Version string
     pub version: &'a str,
-    /// Runtime being used
-    pub runtime: Runtime,
     /// I/O backend detail (e.g., "io_uring", "mio")
     pub backend_detail: &'a str,
     /// Cache backend (storage type)
@@ -47,11 +45,7 @@ pub fn print_banner(config: &BannerConfig) {
     writeln!(output).unwrap();
 
     // Runtime info
-    let runtime_str = match config.runtime {
-        Runtime::Native => format!("native ({})", config.backend_detail),
-        Runtime::Tokio => "tokio".to_string(),
-    };
-    writeln!(output, "Runtime:     {}", runtime_str).unwrap();
+    writeln!(output, "Runtime:     native ({})", config.backend_detail).unwrap();
 
     // Cache backend and policy
     let backend_str = match config.cache_backend {

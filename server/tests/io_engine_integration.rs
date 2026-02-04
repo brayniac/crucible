@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 /// Test configuration for parameterized tests.
 #[derive(Clone, Debug)]
 struct TestConfig {
-    runtime: &'static str,
     io_engine: &'static str,
     connections: usize,
     pipeline_depth: usize,
@@ -34,23 +33,6 @@ impl TestConfig {
         value_size: usize,
     ) -> Self {
         Self {
-            runtime: "native",
-            io_engine,
-            connections,
-            pipeline_depth,
-            value_size,
-        }
-    }
-
-    fn with_runtime(
-        runtime: &'static str,
-        io_engine: &'static str,
-        connections: usize,
-        pipeline_depth: usize,
-        value_size: usize,
-    ) -> Self {
-        Self {
-            runtime,
             io_engine,
             connections,
             pipeline_depth,
@@ -77,34 +59,12 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
     false
 }
 
-/// Start a test server with the specified I/O engine (native runtime).
+/// Start a test server with the specified I/O engine.
 fn start_test_server(port: u16, io_engine: &str, worker_threads: usize) -> thread::JoinHandle<()> {
-    start_test_server_full(port, io_engine, "native", worker_threads)
-}
-
-/// Start a test server with the specified runtime and I/O engine.
-fn start_test_server_with_runtime(
-    port: u16,
-    io_engine: &str,
-    runtime: &str,
-    worker_threads: usize,
-) -> thread::JoinHandle<()> {
-    start_test_server_full(port, io_engine, runtime, worker_threads)
-}
-
-/// Start a test server with full configuration options.
-fn start_test_server_full(
-    port: u16,
-    io_engine: &str,
-    runtime: &str,
-    worker_threads: usize,
-) -> thread::JoinHandle<()> {
     let io_engine = io_engine.to_string();
-    let runtime = runtime.to_string();
     thread::spawn(move || {
         let config_str = format!(
             r#"
-            runtime = "{runtime}"
             io_engine = "{io_engine}"
 
             [workers]
@@ -137,15 +97,7 @@ fn start_test_server_full(
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_timeout = Duration::from_secs(5);
 
-        // Run server (blocks forever, thread killed on test exit)
-        match runtime.as_str() {
-            "tokio" => {
-                let _ = server::tokio::run(&config, cache, shutdown, drain_timeout);
-            }
-            _ => {
-                let _ = server::native::run(&config, cache, shutdown, drain_timeout);
-            }
-        }
+        let _ = server::native::run(&config, cache, shutdown, drain_timeout);
     })
 }
 
@@ -317,18 +269,16 @@ fn run_parameterized_test(config: TestConfig) {
     let worker_threads = (config.connections / 64).clamp(1, 4);
 
     // Start server
-    let _server_handle = start_test_server_full(
+    let _server_handle = start_test_server(
         port,
         config.io_engine,
-        config.runtime,
         worker_threads,
     );
 
     // Wait for server to be ready
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {} runtime/{} backend",
-        config.runtime,
+        "Server failed to start with {} backend",
         config.io_engine
     );
 
@@ -462,24 +412,18 @@ fn send_get(stream: &mut TcpStream, key: &str, expected_value: &str) -> bool {
     response.contains(expected_value)
 }
 
-/// Run the basic integration test for a given I/O engine (native runtime).
+/// Run the basic integration test for a given I/O engine.
 fn run_basic_test(io_engine: &str) {
-    run_basic_test_with_runtime("native", io_engine);
-}
-
-/// Run the basic integration test for a given runtime and I/O engine.
-fn run_basic_test_with_runtime(runtime: &str, io_engine: &str) {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Start server
-    let _server_handle = start_test_server_with_runtime(port, io_engine, runtime, 1);
+    let _server_handle = start_test_server(port, io_engine, 1);
 
     // Wait for server to be ready
     assert!(
         wait_for_server(addr, Duration::from_secs(5)),
-        "Server failed to start with {} runtime/{} backend",
-        runtime,
+        "Server failed to start with {} backend",
         io_engine
     );
 
@@ -953,198 +897,4 @@ fn test_uring_deep_pipeline() {
     );
 }
 
-// =============================================================================
-// Tokio runtime backend tests
-// =============================================================================
-
-#[test]
-fn test_tokio_basic() {
-    run_basic_test_with_runtime("tokio", "mio");
-}
-
-#[test]
-fn test_tokio_1conn_p1_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 1, 1, 64));
-}
-
-#[test]
-fn test_tokio_1conn_p1_medium() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 1, 1, 1024));
-}
-
-#[test]
-fn test_tokio_1conn_p1_large() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 1, 1, 16384));
-}
-
-#[test]
-fn test_tokio_8conn_p1_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 1, 64));
-}
-
-#[test]
-fn test_tokio_8conn_p8_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 8, 64));
-}
-
-#[test]
-fn test_tokio_8conn_p64_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 64, 64));
-}
-
-#[test]
-fn test_tokio_8conn_p8_medium() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 8, 1024));
-}
-
-#[test]
-fn test_tokio_8conn_p8_large() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 8, 8, 16384));
-}
-
-#[test]
-fn test_tokio_64conn_p1_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 1, 64));
-}
-
-#[test]
-fn test_tokio_64conn_p8_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 8, 64));
-}
-
-#[test]
-fn test_tokio_64conn_p64_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 64, 64));
-}
-
-#[test]
-fn test_tokio_64conn_p8_medium() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 8, 1024));
-}
-
-#[test]
-fn test_tokio_64conn_p8_large() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 64, 8, 16384));
-}
-
-#[test]
-#[ignore] // Expensive test, run with --ignored
-fn test_tokio_256conn_p1_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 256, 1, 64));
-}
-
-#[test]
-#[ignore] // Expensive test, run with --ignored
-fn test_tokio_256conn_p8_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 256, 8, 64));
-}
-
-#[test]
-#[ignore] // Expensive test, run with --ignored
-fn test_tokio_256conn_p64_small() {
-    run_parameterized_test(TestConfig::with_runtime("tokio", "mio", 256, 64, 64));
-}
-
-#[test]
-fn test_tokio_large_objects() {
-    let port = get_available_port();
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    let _server_handle = start_test_server_with_runtime(port, "mio", "tokio", 1);
-    assert!(wait_for_server(addr, Duration::from_secs(5)));
-
-    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-
-    // Test various object sizes
-    for &size in &[64, 256, 1024, 4096, 16384, 65536] {
-        let key = format!("largekey_{}", size);
-        let value = generate_value(size);
-
-        assert!(
-            send_set(&mut stream, &key, &value),
-            "SET failed for size {}",
-            size
-        );
-        assert!(
-            send_get(&mut stream, &key, &value),
-            "GET failed for size {}",
-            size
-        );
-    }
-}
-
-#[test]
-fn test_tokio_connection_churn() {
-    let port = get_available_port();
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    let _server_handle = start_test_server_with_runtime(port, "mio", "tokio", 2);
-    assert!(wait_for_server(addr, Duration::from_secs(5)));
-
-    // Rapidly open and close connections while doing work
-    for i in 0..100 {
-        let mut stream = TcpStream::connect(addr).expect("Failed to connect");
-        stream.set_nodelay(true).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-
-        let key = format!("churn_key_{}", i);
-        let value = format!("churn_value_{}", i);
-
-        assert!(
-            send_set(&mut stream, &key, &value),
-            "SET failed on iteration {}",
-            i
-        );
-        assert!(send_ping(&mut stream), "PING failed on iteration {}", i);
-
-        // Explicit close
-        drop(stream);
-    }
-}
-
-#[test]
-fn test_tokio_deep_pipeline() {
-    let port = get_available_port();
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    let _server_handle = start_test_server_with_runtime(port, "mio", "tokio", 1);
-    assert!(wait_for_server(addr, Duration::from_secs(5)));
-
-    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-
-    // Send 256 pipelined PING commands
-    let depth = 256;
-    let ping = build_ping_command();
-    let mut pipeline = Vec::with_capacity(ping.len() * depth);
-    for _ in 0..depth {
-        pipeline.extend(&ping);
-    }
-
-    stream.write_all(&pipeline).unwrap();
-
-    let responses = read_responses(&mut stream, depth);
-    let pong_count = String::from_utf8_lossy(&responses).matches("PONG").count();
-
-    assert!(
-        pong_count >= depth,
-        "Expected {} PONGs, got {}",
-        depth,
-        pong_count
-    );
-}
 
