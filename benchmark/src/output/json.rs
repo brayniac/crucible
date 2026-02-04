@@ -169,9 +169,22 @@ impl OutputFormatter for JsonFormatter {
             0.0
         };
 
-        let throughput = (results.responses as f64 / results.duration_secs) as u64;
-        let rx_bps = ((results.bytes_rx as f64 / results.duration_secs) * 8.0) as u64;
-        let tx_bps = ((results.bytes_tx as f64 / results.duration_secs) * 8.0) as u64;
+        // Guard against division by zero
+        let throughput = if results.duration_secs > 0.0 {
+            (results.responses as f64 / results.duration_secs) as u64
+        } else {
+            0
+        };
+        let rx_bps = if results.duration_secs > 0.0 {
+            ((results.bytes_rx as f64 / results.duration_secs) * 8.0) as u64
+        } else {
+            0
+        };
+        let tx_bps = if results.duration_secs > 0.0 {
+            ((results.bytes_tx as f64 / results.duration_secs) * 8.0) as u64
+        } else {
+            0
+        };
 
         let output = ResultsOutput {
             msg_type: "result",

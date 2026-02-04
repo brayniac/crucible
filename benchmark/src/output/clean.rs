@@ -196,8 +196,12 @@ impl OutputFormatter for CleanFormatter {
             "─────────────────────────────────────────────────────────────────────────────────────"
         );
 
-        // Throughput line
-        let throughput = results.responses as f64 / results.duration_secs;
+        // Throughput line (guard against division by zero)
+        let throughput = if results.duration_secs > 0.0 {
+            results.responses as f64 / results.duration_secs
+        } else {
+            0.0
+        };
         let err_pct = if results.responses > 0 {
             (results.errors as f64 / results.responses as f64) * 100.0
         } else {
@@ -211,9 +215,17 @@ impl OutputFormatter for CleanFormatter {
             err_colored
         );
 
-        // Bandwidth line
-        let rx_bps = (results.bytes_rx as f64 / results.duration_secs) * 8.0;
-        let tx_bps = (results.bytes_tx as f64 / results.duration_secs) * 8.0;
+        // Bandwidth line (guard against division by zero)
+        let rx_bps = if results.duration_secs > 0.0 {
+            (results.bytes_rx as f64 / results.duration_secs) * 8.0
+        } else {
+            0.0
+        };
+        let tx_bps = if results.duration_secs > 0.0 {
+            (results.bytes_tx as f64 / results.duration_secs) * 8.0
+        } else {
+            0.0
+        };
         if results.bytes_rx > 0 || results.bytes_tx > 0 {
             println!(
                 "bandwidth    {} RX, {} TX",

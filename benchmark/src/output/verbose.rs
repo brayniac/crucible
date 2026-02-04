@@ -75,7 +75,12 @@ impl OutputFormatter for VerboseFormatter {
     }
 
     fn print_results(&self, results: &Results) {
-        let throughput = results.responses as f64 / results.duration_secs;
+        // Guard against division by zero
+        let throughput = if results.duration_secs > 0.0 {
+            results.responses as f64 / results.duration_secs
+        } else {
+            0.0
+        };
         let err_pct = if results.responses > 0 {
             (results.errors as f64 / results.responses as f64) * 100.0
         } else {
@@ -86,8 +91,16 @@ impl OutputFormatter for VerboseFormatter {
         } else {
             0.0
         };
-        let rx_bps = (results.bytes_rx as f64 / results.duration_secs) * 8.0;
-        let tx_bps = (results.bytes_tx as f64 / results.duration_secs) * 8.0;
+        let rx_bps = if results.duration_secs > 0.0 {
+            (results.bytes_rx as f64 / results.duration_secs) * 8.0
+        } else {
+            0.0
+        };
+        let tx_bps = if results.duration_secs > 0.0 {
+            (results.bytes_tx as f64 / results.duration_secs) * 8.0
+        } else {
+            0.0
+        };
 
         tracing::info!("=== Final Results ===");
         tracing::info!("duration: {:.0}s", results.duration_secs);

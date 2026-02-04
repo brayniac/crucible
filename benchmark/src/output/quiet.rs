@@ -42,7 +42,12 @@ impl OutputFormatter for QuietFormatter {
     }
 
     fn print_results(&self, results: &Results) {
-        let throughput = results.responses as f64 / results.duration_secs;
+        // Guard against division by zero
+        let throughput = if results.duration_secs > 0.0 {
+            results.responses as f64 / results.duration_secs
+        } else {
+            0.0
+        };
         let hit_pct = if results.hits + results.misses > 0 {
             (results.hits as f64 / (results.hits + results.misses) as f64) * 100.0
         } else {
