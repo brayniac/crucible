@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Test phase, controlled by main thread and read by workers.
@@ -27,12 +27,14 @@ use std::time::Duration;
 pub enum Phase {
     /// Initial connection phase
     Connect = 0,
+    /// Prefill phase - write each key exactly once
+    Prefill = 1,
     /// Warmup phase - run workload but don't record metrics
-    Warmup = 1,
+    Warmup = 2,
     /// Main measurement phase - record metrics
-    Running = 2,
+    Running = 3,
     /// Stop phase - workers should exit
-    Stop = 3,
+    Stop = 4,
 }
 
 impl Phase {
@@ -40,8 +42,9 @@ impl Phase {
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Phase::Connect,
-            1 => Phase::Warmup,
-            2 => Phase::Running,
+            1 => Phase::Prefill,
+            2 => Phase::Warmup,
+            3 => Phase::Running,
             _ => Phase::Stop,
         }
     }
@@ -78,12 +81,15 @@ pub enum DisconnectReason {
 pub struct SharedState {
     /// Current test phase (controlled by main thread)
     phase: AtomicU8,
+    /// Number of workers that have completed prefill
+    prefill_complete: AtomicUsize,
 }
 
 impl SharedState {
     pub fn new() -> Self {
         Self {
             phase: AtomicU8::new(Phase::Connect as u8),
+            prefill_complete: AtomicUsize::new(0),
         }
     }
 
@@ -97,6 +103,18 @@ impl SharedState {
     #[inline]
     pub fn set_phase(&self, phase: Phase) {
         self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    /// Mark this worker's prefill as complete.
+    #[inline]
+    pub fn mark_prefill_complete(&self) {
+        self.prefill_complete.fetch_add(1, Ordering::Release);
+    }
+
+    /// Get the number of workers that have completed prefill.
+    #[inline]
+    pub fn prefill_complete_count(&self) -> usize {
+        self.prefill_complete.load(Ordering::Acquire)
     }
 }
 
@@ -113,6 +131,9 @@ pub struct IoWorkerConfig {
     pub shared: Arc<SharedState>,
     pub ratelimiter: Option<Arc<DynamicRateLimiter>>,
     pub warmup: bool,
+    /// Range of key IDs this worker should prefill (start..end).
+    /// Only used when prefill is enabled.
+    pub prefill_range: Option<std::ops::Range<usize>>,
 }
 
 /// A worker using IoDriver for I/O operations.
@@ -120,6 +141,7 @@ pub struct IoWorker {
     id: usize,
     driver: Box<dyn IoDriver>,
     config: Config,
+    shared: Arc<SharedState>,
 
     /// Sessions (stable storage)
     sessions: Vec<Session>,
@@ -143,6 +165,12 @@ pub struct IoWorker {
 
     /// Whether we're in warmup mode (don't record metrics)
     warmup: bool,
+
+    /// Prefill state: next key ID to write and end of range
+    prefill_next: usize,
+    prefill_end: usize,
+    /// Whether this worker has finished prefilling
+    prefill_done: bool,
 }
 
 impl IoWorker {
@@ -162,10 +190,17 @@ impl IoWorker {
         let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);
         init_rng.fill_bytes(&mut value_buf);
 
+        // Initialize prefill range
+        let (prefill_next, prefill_end, prefill_done) = match cfg.prefill_range {
+            Some(range) => (range.start, range.end, range.start >= range.end),
+            None => (0, 0, true), // No prefill range = already done
+        };
+
         Ok(Self {
             id: cfg.id,
             driver,
             config: cfg.config,
+            shared: cfg.shared,
             sessions: Vec::new(),
             conn_id_to_idx: HashMap::new(),
             momento_sessions: Vec::new(),
@@ -175,6 +210,9 @@ impl IoWorker {
             results: Vec::with_capacity(pipeline_depth),
             ratelimiter: cfg.ratelimiter,
             warmup: cfg.warmup,
+            prefill_next,
+            prefill_end,
+            prefill_done,
         })
     }
 
@@ -446,6 +484,132 @@ impl IoWorker {
                         }
                         RequestType::Ping | RequestType::Other => {}
                     }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run a single iteration of prefill (write sequential keys).
+    /// Returns true when prefill is complete.
+    #[inline]
+    pub fn poll_once_prefill(&mut self) -> io::Result<bool> {
+        if self.prefill_done {
+            return Ok(true);
+        }
+
+        let now = std::time::Instant::now();
+
+        // Handle Momento sessions differently
+        if self.config.target.protocol == CacheProtocol::Momento {
+            return self.poll_once_prefill_momento(now);
+        }
+
+        // Try to reconnect disconnected sessions
+        self.try_reconnect();
+
+        // Drive prefill requests (sequential SET commands)
+        self.drive_prefill_requests(now)?;
+
+        // Flush send buffers
+        self.flush_sends()?;
+
+        // Poll for I/O completions
+        let count = self.driver.poll(Some(Duration::from_micros(100)))?;
+
+        if count > 0 {
+            self.process_completions()?;
+        }
+
+        // Process responses (to clear pipeline for more requests)
+        self.poll_responses(std::time::Instant::now());
+
+        // Check if prefill is done
+        if self.prefill_next >= self.prefill_end {
+            // Wait for all in-flight requests to complete
+            let in_flight: usize = self.sessions.iter().map(|s| s.in_flight_count()).sum();
+            if in_flight == 0 {
+                self.prefill_done = true;
+                self.shared.mark_prefill_complete();
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Prefill for Momento sessions.
+    #[inline]
+    fn poll_once_prefill_momento(&mut self, now: std::time::Instant) -> io::Result<bool> {
+        for session in &mut self.momento_sessions {
+            // Drive connection
+            if !session.is_connected() {
+                match session.drive() {
+                    Ok(true) => {
+                        metrics::CONNECTIONS_ACTIVE.increment();
+                    }
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::debug!("Momento connection error: {}", e);
+                        continue;
+                    }
+                }
+            }
+
+            // Send sequential SET commands
+            while session.can_send() && self.prefill_next < self.prefill_end {
+                write_key(&mut self.key_buf, self.prefill_next);
+                self.rng.fill_bytes(&mut self.value_buf);
+
+                if session.set(&self.key_buf, &self.value_buf, now).is_some() {
+                    self.prefill_next += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Poll for responses
+            self.results.clear();
+            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
+                tracing::debug!("Momento poll error: {}", e);
+            }
+        }
+
+        // Check if prefill is done
+        if self.prefill_next >= self.prefill_end {
+            let in_flight: usize = self
+                .momento_sessions
+                .iter()
+                .map(|s| s.in_flight_count())
+                .sum();
+            if in_flight == 0 {
+                self.prefill_done = true;
+                self.shared.mark_prefill_complete();
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Drive sequential SET requests for prefill.
+    #[inline]
+    fn drive_prefill_requests(&mut self, now: std::time::Instant) -> io::Result<()> {
+        // Fill each session's pipeline with sequential SET commands
+        for session in &mut self.sessions {
+            if !session.is_connected() {
+                continue;
+            }
+
+            while session.can_send() && self.prefill_next < self.prefill_end {
+                write_key(&mut self.key_buf, self.prefill_next);
+                self.rng.fill_bytes(&mut self.value_buf);
+
+                if session.set(&self.key_buf, &self.value_buf, now).is_some() {
+                    self.prefill_next += 1;
+                } else {
+                    break;
                 }
             }
         }

@@ -157,6 +157,11 @@ pub trait OutputFormatter: Send + Sync {
     /// Print the configuration summary at startup.
     fn print_config(&self, config: &Config);
 
+    /// Print the prefill phase indicator.
+    fn print_prefill(&self, key_count: usize) {
+        println!("PREFILL: writing {} keys...", key_count);
+    }
+
     /// Print the warmup phase indicator.
     fn print_warmup(&self, duration: Duration);
 

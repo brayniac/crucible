@@ -130,6 +130,11 @@ impl OutputFormatter for CleanFormatter {
         println!();
     }
 
+    fn print_prefill(&self, key_count: usize) {
+        use super::format::format_count;
+        println!("[prefill {} keys]", format_count(key_count as u64));
+    }
+
     fn print_warmup(&self, duration: Duration) {
         println!("[warmup {}s]", duration.as_secs());
     }

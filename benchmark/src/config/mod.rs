@@ -166,6 +166,11 @@ fn default_request_timeout() -> Duration {
 pub struct Workload {
     #[serde(default)]
     pub rate_limit: Option<u64>,
+    /// Prefill the cache with all keys before starting the benchmark.
+    /// When enabled, each key in the keyspace is written exactly once
+    /// before the warmup phase begins.
+    #[serde(default)]
+    pub prefill: bool,
     #[serde(default)]
     pub keyspace: Keyspace,
     #[serde(default)]

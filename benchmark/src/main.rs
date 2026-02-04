@@ -164,8 +164,38 @@ fn run_benchmark(
         None
     };
 
-    // Print warmup phase indicator
-    formatter.print_warmup(warmup);
+    // Calculate prefill ranges for each worker
+    let prefill_enabled = config.workload.prefill;
+    let key_count = config.workload.keyspace.count;
+    let prefill_ranges: Vec<Option<std::ops::Range<usize>>> = if prefill_enabled {
+        let keys_per_worker = key_count / num_threads;
+        let remainder = key_count % num_threads;
+        (0..num_threads)
+            .map(|id| {
+                let start = if id < remainder {
+                    id * (keys_per_worker + 1)
+                } else {
+                    remainder * (keys_per_worker + 1) + (id - remainder) * keys_per_worker
+                };
+                let count = if id < remainder {
+                    keys_per_worker + 1
+                } else {
+                    keys_per_worker
+                };
+                Some(start..start + count)
+            })
+            .collect()
+    } else {
+        vec![None; num_threads]
+    };
+
+    // Print prefill phase indicator if enabled
+    if prefill_enabled {
+        formatter.print_prefill(key_count);
+    } else {
+        // Print warmup phase indicator
+        formatter.print_warmup(warmup);
+    }
 
     // Channel for worker completion notifications
     let (completion_tx, completion_rx) = mpsc::channel::<usize>();
@@ -179,6 +209,7 @@ fn run_benchmark(
         let ratelimiter = ratelimiter.clone();
         let cpu_ids = cpu_ids.clone();
         let completion_tx = completion_tx.clone();
+        let prefill_range = prefill_ranges[id].clone();
 
         let handle = thread::Builder::new()
             .name(format!("worker-{}", id))
@@ -194,7 +225,7 @@ fn run_benchmark(
                         tracing::debug!("pinned worker {} to CPU {}", id, cpu_id);
                     }
                 }
-                run_worker(id, config, shared, ratelimiter);
+                run_worker(id, config, shared, ratelimiter, prefill_range);
                 // Signal completion (ignore send errors - receiver may be gone)
                 let _ = completion_tx.send(id);
             })?;
@@ -205,8 +236,12 @@ fn run_benchmark(
     // Drop our copy of the sender so the channel closes when all workers finish
     drop(completion_tx);
 
-    // Start in warmup phase
-    shared.set_phase(Phase::Warmup);
+    // Start in prefill or warmup phase
+    if prefill_enabled {
+        shared.set_phase(Phase::Prefill);
+    } else {
+        shared.set_phase(Phase::Warmup);
+    }
 
     // Main thread: reporting loop
     let start = Instant::now();
@@ -225,22 +260,44 @@ fn run_benchmark(
     // Saturation search state (initialized after warmup if configured)
     let mut saturation_state: Option<SaturationSearchState> = None;
 
+    // Track when warmup actually starts (after prefill completes)
+    let mut warmup_start: Option<Instant> = if prefill_enabled { None } else { Some(start) };
+
     loop {
         thread::sleep(Duration::from_millis(100));
 
-        let elapsed = start.elapsed();
-
-        // Check for signal or duration limit
+        // Check for signal
         if !running.load(Ordering::SeqCst) {
             shared.set_phase(Phase::Stop);
-            // Calculate actual running duration (exclude warmup)
-            if elapsed > warmup {
-                actual_duration = elapsed - warmup;
+            // Calculate actual running duration (exclude warmup and prefill)
+            if let Some(ws) = warmup_start {
+                let warmup_elapsed = ws.elapsed();
+                if warmup_elapsed > warmup {
+                    actual_duration = warmup_elapsed - warmup;
+                } else {
+                    actual_duration = Duration::ZERO;
+                }
             } else {
                 actual_duration = Duration::ZERO;
             }
             break;
         }
+
+        // Handle prefill -> warmup transition
+        if current_phase == Phase::Prefill {
+            let prefill_complete = shared.prefill_complete_count();
+            if prefill_complete >= num_threads {
+                shared.set_phase(Phase::Warmup);
+                current_phase = Phase::Warmup;
+                warmup_start = Some(Instant::now());
+                formatter.print_warmup(warmup);
+            }
+            continue;
+        }
+
+        // Calculate elapsed time since warmup started
+        let warmup_start_time = warmup_start.unwrap_or(start);
+        let elapsed = warmup_start_time.elapsed();
 
         // Check if we're done
         if elapsed >= warmup + duration {
@@ -477,6 +534,7 @@ fn run_worker(
     config: Config,
     shared: Arc<SharedState>,
     ratelimiter: Option<Arc<DynamicRateLimiter>>,
+    prefill_range: Option<std::ops::Range<usize>>,
 ) {
     // Set this thread's shard ID for metrics to avoid false sharing
     metrics::set_thread_shard(id);
@@ -487,6 +545,7 @@ fn run_worker(
         shared: Arc::clone(&shared),
         ratelimiter,
         warmup: true,
+        prefill_range,
     };
 
     let mut worker = match IoWorker::new(worker_config) {
@@ -521,6 +580,14 @@ fn run_worker(
         if phase != last_phase {
             worker.set_warmup(!phase.is_recording());
             last_phase = phase;
+        }
+
+        // Handle prefill phase
+        if phase == Phase::Prefill {
+            if let Err(e) = worker.poll_once_prefill() {
+                tracing::debug!("worker {} prefill error: {}", id, e);
+            }
+            continue;
         }
 
         if let Err(e) = worker.poll_once() {
