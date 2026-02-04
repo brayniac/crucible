@@ -200,6 +200,10 @@ impl IoWorker {
             Some(range) => {
                 let pending: std::collections::VecDeque<usize> = (range.start..range.end).collect();
                 let total = range.end - range.start;
+                eprintln!(
+                    "[worker {}] prefill initialized: {} keys (range {}..{})",
+                    cfg.id, total, range.start, range.end
+                );
                 (pending, total, total == 0)
             }
             None => (std::collections::VecDeque::new(), 0, true),
@@ -545,25 +549,12 @@ impl IoWorker {
         // Check if prefill is done: all keys have been confirmed
         if self.prefill_confirmed >= self.prefill_total {
             self.prefill_done = true;
-            tracing::info!(
-                worker_id = self.id,
-                confirmed = self.prefill_confirmed,
-                total = self.prefill_total,
-                "prefill complete"
+            eprintln!(
+                "[worker {}] prefill complete: {}/{} keys confirmed",
+                self.id, self.prefill_confirmed, self.prefill_total
             );
             self.shared.mark_prefill_complete();
             return Ok(true);
-        }
-
-        // Log progress periodically
-        if self.prefill_confirmed > 0 && self.prefill_confirmed % 100 == 0 {
-            tracing::debug!(
-                worker_id = self.id,
-                confirmed = self.prefill_confirmed,
-                total = self.prefill_total,
-                pending = self.prefill_pending.len(),
-                "prefill progress"
-            );
         }
 
         Ok(false)
