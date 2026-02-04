@@ -1012,6 +1012,7 @@ pub struct TtlLayerBuilder {
     heap_size: usize,
     numa_node: Option<u32>,
     hugepage_size: crate::hugepage::HugepageSize,
+    spare_capacity: Option<u32>,
 }
 
 impl TtlLayerBuilder {
@@ -1025,6 +1026,7 @@ impl TtlLayerBuilder {
             heap_size: 256 * 1024 * 1024, // 256MB
             numa_node: None,
             hugepage_size: crate::hugepage::HugepageSize::None,
+            spare_capacity: None, // Use pool's default
         }
     }
 
@@ -1070,6 +1072,12 @@ impl TtlLayerBuilder {
         self
     }
 
+    /// Set the spare capacity (segments reserved for compaction).
+    pub fn spare_capacity(mut self, capacity: u32) -> Self {
+        self.spare_capacity = Some(capacity);
+        self
+    }
+
     /// Build the TTL layer.
     pub fn build(self) -> Result<TtlLayer, std::io::Error> {
         let mut builder = MemoryPoolBuilder::new(self.pool_id)
@@ -1080,6 +1088,10 @@ impl TtlLayerBuilder {
 
         if let Some(node) = self.numa_node {
             builder = builder.numa_node(node);
+        }
+
+        if let Some(spare) = self.spare_capacity {
+            builder = builder.spare_capacity(spare);
         }
 
         let pool = builder.build()?;
@@ -1118,6 +1130,7 @@ mod tests {
             .segment_size(64 * 1024) // 64KB
             .heap_size(640 * 1024) // 640KB = 10 segments
             .config(LayerConfig::new().with_ghosts(true))
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer")
     }
@@ -1245,6 +1258,7 @@ mod tests {
             .config(config)
             .segment_size(64 * 1024)
             .heap_size(128 * 1024)
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Should build");
 
@@ -1471,6 +1485,7 @@ mod tests {
             .pool_id(1)
             .segment_size(1024) // Small segments for testing
             .heap_size(10 * 1024) // 10 segments
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer");
 
@@ -1498,6 +1513,7 @@ mod tests {
             .pool_id(1)
             .segment_size(1024)
             .heap_size(2 * 1024) // Only 2 segments
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer");
 
@@ -1527,6 +1543,7 @@ mod tests {
             .pool_id(1)
             .segment_size(1024) // Small segment
             .heap_size(4 * 1024)
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer");
 
@@ -1584,6 +1601,7 @@ mod tests {
             .pool_id(1)
             .segment_size(1024) // Small segment
             .heap_size(5 * 1024) // 5 segments
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer");
 

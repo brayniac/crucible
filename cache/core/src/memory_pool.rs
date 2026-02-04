@@ -3,17 +3,28 @@
 //! [`MemoryPool`] manages a collection of [`SliceSegment`]s backed by a
 //! contiguous memory region, optionally using hugepages for better TLB
 //! performance.
+//!
+//! # Two-Queue Design
+//!
+//! The pool maintains two separate free queues:
+//! - **free_queue**: For normal segment allocation
+//! - **spare_queue**: Reserved for compaction operations
+//!
+//! This separation ensures compaction always has segments available,
+//! even under high memory pressure from normal allocation.
 
 use crate::hugepage::{HugepageAllocation, HugepageSize, allocate_on_node};
 use crate::pool::RamPool;
 use crate::segment::Segment;
 use crate::slice_segment::SliceSegment;
+use crate::sync::{AtomicU32, Ordering};
 
 /// A pool of segments backed by in-memory allocation.
 ///
 /// The pool allocates a contiguous memory region at construction time
-/// and partitions it into fixed-size segments. A lock-free free list
-/// tracks available segments.
+/// and partitions it into fixed-size segments. Two lock-free free lists
+/// track available segments: one for normal allocation, one reserved
+/// for compaction.
 ///
 /// # Thread Safety
 ///
@@ -25,9 +36,19 @@ pub struct MemoryPool {
     /// Segment metadata.
     segments: Vec<SliceSegment<'static>>,
 
-    /// Lock-free free list.
-    /// Boxed for stable address - segments hold raw pointers to this.
+    /// Lock-free free list for normal allocation.
+    /// Boxed for stable address.
     free_queue: Box<crossbeam_deque::Injector<u32>>,
+
+    /// Lock-free free list reserved for compaction operations.
+    /// Boxed for stable address.
+    spare_queue: Box<crossbeam_deque::Injector<u32>>,
+
+    /// Target capacity for spare queue (typically = num_workers).
+    spare_capacity: u32,
+
+    /// Current count of segments in spare queue (for fast checking).
+    spare_count: AtomicU32,
 
     /// Pool ID (0-3).
     pool_id: u8,
@@ -42,7 +63,7 @@ pub struct MemoryPool {
 // SAFETY: MemoryPool is safe to send/share between threads because:
 // 1. heap is allocated once and never moved until Drop
 // 2. All segment access uses atomic operations
-// 3. free_queue (Injector) is already Send + Sync
+// 3. free_queue and spare_queue (Injector) are already Send + Sync
 unsafe impl Send for MemoryPool {}
 unsafe impl Sync for MemoryPool {}
 
@@ -56,6 +77,101 @@ impl MemoryPool {
     #[inline]
     pub fn is_per_item_ttl(&self) -> bool {
         self.is_per_item_ttl
+    }
+
+    /// Reserve a segment from the spare queue (for compaction operations).
+    ///
+    /// This should only be called by compaction code. The spare queue is
+    /// reserved specifically for compaction to ensure segments are always
+    /// available even under high memory pressure.
+    ///
+    /// If the spare queue is empty, falls back to the main free queue.
+    /// This ensures compaction can proceed even if spare capacity is
+    /// temporarily exhausted.
+    ///
+    /// # Returns
+    /// `Some(segment_id)` if a segment was available, `None` otherwise.
+    pub fn reserve_spare(&self) -> Option<u32> {
+        // Try spare queue first
+        match self.spare_queue.steal() {
+            crossbeam_deque::Steal::Success(segment_id) => {
+                let segment = &self.segments[segment_id as usize];
+
+                // Transition Free -> Reserved
+                if !segment.try_reserve() {
+                    // Segment not in Free state - push back and retry
+                    self.spare_queue.push(segment_id);
+                    return self.reserve_spare(); // Retry
+                }
+
+                self.spare_count.fetch_sub(1, Ordering::Relaxed);
+                return Some(segment_id);
+            }
+            crossbeam_deque::Steal::Retry => return self.reserve_spare(), // Retry
+            crossbeam_deque::Steal::Empty => {}
+        }
+
+        // Fallback: try main free queue if spare is empty
+        match self.free_queue.steal() {
+            crossbeam_deque::Steal::Success(segment_id) => {
+                let segment = &self.segments[segment_id as usize];
+
+                // Transition Free -> Reserved
+                if !segment.try_reserve() {
+                    // Segment not in Free state - push back and return None
+                    self.free_queue.push(segment_id);
+                    return None;
+                }
+
+                Some(segment_id)
+            }
+            crossbeam_deque::Steal::Empty | crossbeam_deque::Steal::Retry => None,
+        }
+    }
+
+    /// Release a segment back to the appropriate queue with automatic balancing.
+    ///
+    /// This method is called by guard Drop when a segment in AwaitingRelease
+    /// state has its last reader drop. It automatically replenishes the spare
+    /// queue if below target capacity.
+    ///
+    /// # Safety
+    /// The segment must be in a releasable state (Free or AwaitingRelease with
+    /// ref_count == 0).
+    pub fn release_segment(&self, id: u32) {
+        let id_usize = id as usize;
+
+        if id_usize >= self.segments.len() {
+            return; // Invalid ID, ignore
+        }
+
+        let segment = &self.segments[id_usize];
+
+        // Transition to Free state
+        if !segment.try_release() {
+            return; // Already free or invalid state
+        }
+
+        // Replenish spare queue if below target, else go to main queue
+        let spare_count = self.spare_count.load(Ordering::Relaxed);
+        if spare_count < self.spare_capacity {
+            self.spare_queue.push(id);
+            self.spare_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.free_queue.push(id);
+        }
+    }
+
+    /// Get the current spare queue count.
+    #[inline]
+    pub fn spare_count(&self) -> u32 {
+        self.spare_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the configured spare capacity.
+    #[inline]
+    pub fn spare_capacity(&self) -> u32 {
+        self.spare_capacity
     }
 }
 
@@ -87,6 +203,7 @@ impl RamPool for MemoryPool {
     }
 
     fn reserve(&self) -> Option<u32> {
+        // Normal allocation only uses free_queue, never spare_queue
         match self.free_queue.steal() {
             crossbeam_deque::Steal::Success(segment_id) => {
                 let segment = &self.segments[segment_id as usize];
@@ -115,29 +232,37 @@ impl RamPool for MemoryPool {
 
         // Transition to Free state
         if segment.try_release() {
-            self.free_queue.push(id);
+            // Replenish spare queue if below target, else go to main queue
+            let spare_count = self.spare_count.load(Ordering::Relaxed);
+            if spare_count < self.spare_capacity {
+                self.spare_queue.push(id);
+                self.spare_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.free_queue.push(id);
+            }
         }
         // If already Free, don't push again (would create duplicate)
     }
 
     fn free_count(&self) -> usize {
-        self.free_queue.len()
+        // Total free = free_queue + spare_queue
+        self.free_queue.len() + self.spare_queue.len()
     }
 }
 
 impl MemoryPool {
-    /// Reset all segments to Free state and rebuild the free queue.
+    /// Reset all segments to Free state and rebuild the free queues.
     ///
     /// This is used during flush operations to reset the entire pool.
-    /// All segments are reset to their initial state and added back to
-    /// the free queue.
+    /// All segments are reset to their initial state and distributed
+    /// between the free queue and spare queue.
     ///
     /// # Safety
     ///
     /// This should only be called when no concurrent operations are accessing
     /// the segments (e.g., after the hashtable has been cleared).
     pub fn reset_all(&self) {
-        // Drain the free queue first (discard all current entries)
+        // Drain both queues first (discard all current entries)
         loop {
             match self.free_queue.steal() {
                 crossbeam_deque::Steal::Empty => break,
@@ -145,11 +270,28 @@ impl MemoryPool {
                 crossbeam_deque::Steal::Success(_) => continue,
             }
         }
+        loop {
+            match self.spare_queue.steal() {
+                crossbeam_deque::Steal::Empty => break,
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Success(_) => continue,
+            }
+        }
 
-        // Reset each segment and add it back to the free queue
+        // Reset spare count
+        self.spare_count.store(0, Ordering::Relaxed);
+
+        // Reset each segment and distribute between queues
         for (id, segment) in self.segments.iter().enumerate() {
             segment.force_free();
-            self.free_queue.push(id as u32);
+
+            // First spare_capacity segments go to spare queue
+            if (id as u32) < self.spare_capacity {
+                self.spare_queue.push(id as u32);
+                self.spare_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.free_queue.push(id as u32);
+            }
         }
     }
 }
@@ -162,6 +304,7 @@ pub struct MemoryPoolBuilder {
     heap_size: usize,
     hugepage_size: HugepageSize,
     numa_node: Option<u32>,
+    spare_capacity: u32,
 }
 
 impl MemoryPoolBuilder {
@@ -177,7 +320,20 @@ impl MemoryPoolBuilder {
             heap_size: 64 * 1024 * 1024, // 64MB default
             hugepage_size: HugepageSize::None,
             numa_node: None,
+            spare_capacity: 4, // Default: 4 spare segments for compaction
         }
+    }
+
+    /// Set the spare capacity (number of segments reserved for compaction).
+    ///
+    /// The spare queue is reserved for compaction operations to ensure
+    /// segments are always available even under high memory pressure.
+    /// Recommended value: number of worker threads.
+    ///
+    /// Default: 4
+    pub fn spare_capacity(mut self, capacity: u32) -> Self {
+        self.spare_capacity = capacity;
+        self
     }
 
     /// Configure segments to use per-item TTL headers.
@@ -242,16 +398,22 @@ impl MemoryPoolBuilder {
             ));
         }
 
+        // Ensure spare_capacity doesn't exceed available segments
+        let spare_capacity = self.spare_capacity.min(num_segments as u32);
+
         let actual_size = num_segments * self.segment_size;
 
         // Allocate backing memory (optionally bound to NUMA node)
         let heap = allocate_on_node(actual_size, self.hugepage_size, self.numa_node)?;
 
-        // Create free queue first (boxed for stable address)
+        // Create both queues (boxed for stable address)
         let free_queue = Box::new(crossbeam_deque::Injector::new());
+        let spare_queue = Box::new(crossbeam_deque::Injector::new());
+
+        // Get pointer to free_queue for segments (guards will push here on release)
         let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*free_queue;
 
-        // Initialize segments with pointer to free queue
+        // Initialize segments with pointer to free_queue
         let mut segments = Vec::with_capacity(num_segments);
 
         for id in 0..num_segments {
@@ -270,13 +432,22 @@ impl MemoryPoolBuilder {
             };
 
             segments.push(segment);
-            free_queue.push(id as u32);
+
+            // Distribute segments between queues
+            if (id as u32) < spare_capacity {
+                spare_queue.push(id as u32);
+            } else {
+                free_queue.push(id as u32);
+            }
         }
 
         Ok(MemoryPool {
             heap,
             segments,
             free_queue,
+            spare_queue,
+            spare_capacity,
+            spare_count: AtomicU32::new(spare_capacity),
             pool_id: self.pool_id,
             is_per_item_ttl: self.is_per_item_ttl,
             segment_size: self.segment_size,
@@ -293,6 +464,7 @@ mod tests {
         MemoryPoolBuilder::new(0)
             .segment_size(64 * 1024) // 64KB
             .heap_size(640 * 1024) // 640KB = 10 segments
+            .spare_capacity(0) // No spare capacity for tests
             .build()
             .expect("Failed to create test pool")
     }
@@ -349,6 +521,7 @@ mod tests {
             .per_item_ttl(true)
             .segment_size(64 * 1024)
             .heap_size(128 * 1024)
+            .spare_capacity(0) // No spare capacity for tests
             .build()
             .expect("Failed to create per-item TTL pool");
 

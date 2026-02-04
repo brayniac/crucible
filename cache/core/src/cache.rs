@@ -1460,6 +1460,7 @@ mod tests {
             .pool_id(0)
             .segment_size(64 * 1024)
             .heap_size(256 * 1024)
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create FIFO layer");
 
@@ -1468,6 +1469,7 @@ mod tests {
             .pool_id(1)
             .segment_size(64 * 1024)
             .heap_size(512 * 1024)
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create TTL layer");
 
@@ -1849,6 +1851,7 @@ mod tests {
             .pool_id(0)
             .segment_size(64 * 1024)
             .heap_size(256 * 1024)
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create FIFO layer");
 
@@ -1869,6 +1872,7 @@ mod tests {
             .pool_id(0)
             .segment_size(64 * 1024)
             .heap_size(256 * 1024)
+            .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create TTL layer");
 

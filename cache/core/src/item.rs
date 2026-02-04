@@ -683,6 +683,8 @@ pub struct BasicItemGuard<'a> {
     /// Segment metadata for checking AwaitingRelease state on drop.
     metadata: &'a crate::sync::AtomicU64,
     /// Free queue pointer for releasing condemned segments.
+    /// Note: This always points to the main free_queue, not spare_queue.
+    /// Balancing to spare_queue happens through normal release() calls.
     free_queue: *const crossbeam_deque::Injector<u32>,
     /// Segment ID for pushing to free queue.
     segment_id: u32,

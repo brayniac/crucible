@@ -94,9 +94,9 @@ pub struct SliceSegment<'a> {
     /// Generation counter - incremented on reuse to prevent ABA.
     generation: AtomicU16,
 
-    /// Pointer to the pool's free queue for async release.
+    /// Pointer to the pool's main free queue for guard-based release.
     /// When a segment in AwaitingRelease state has its last reader drop,
-    /// the guard pushes segment_id to this queue.
+    /// the guard pushes the segment to this queue.
     free_queue: *const crossbeam_deque::Injector<u32>,
 
     _lifetime: std::marker::PhantomData<&'a u8>,
@@ -125,7 +125,7 @@ impl<'a> SliceSegment<'a> {
     /// - `id`: Segment ID within the pool
     /// - `data`: Pointer to segment memory
     /// - `len`: Size of segment memory in bytes
-    /// - `free_queue`: Pointer to pool's free queue for async release
+    /// - `free_queue`: Pointer to pool's main free queue for async release
     pub unsafe fn new(
         pool_id: u8,
         is_per_item_ttl: bool,

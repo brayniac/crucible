@@ -297,6 +297,7 @@ mod tests {
             .per_item_ttl(true)
             .segment_size(64 * 1024) // 64KB
             .heap_size(640 * 1024) // 640KB = 10 segments
+            .spare_capacity(0) // No spare capacity for tests
             .build()
             .expect("Failed to create test pool")
     }
