@@ -545,6 +545,12 @@ impl IoWorker {
         // Check if prefill is done: all keys have been confirmed
         if self.prefill_confirmed >= self.prefill_total {
             self.prefill_done = true;
+            tracing::debug!(
+                worker_id = self.id,
+                confirmed = self.prefill_confirmed,
+                total = self.prefill_total,
+                "prefill complete"
+            );
             self.shared.mark_prefill_complete();
             return Ok(true);
         }
@@ -609,6 +615,12 @@ impl IoWorker {
         // Check if prefill is done: all keys have been confirmed
         if self.prefill_confirmed >= self.prefill_total {
             self.prefill_done = true;
+            tracing::debug!(
+                worker_id = self.id,
+                confirmed = self.prefill_confirmed,
+                total = self.prefill_total,
+                "prefill complete (momento)"
+            );
             self.shared.mark_prefill_complete();
             return Ok(true);
         }
