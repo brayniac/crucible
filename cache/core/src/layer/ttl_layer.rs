@@ -661,7 +661,12 @@ impl TtlLayer {
         }
     }
 
-    /// Merge eviction: select oldest segments and prune low-frequency items
+    /// Merge eviction: select oldest segments and prune low-frequency items.
+    ///
+    /// Uses adaptive single-pass pruning:
+    /// - Start with threshold = 0 (conservative)
+    /// - After each segment, check retention ratio
+    /// - Increase threshold for remaining segments if retention is above target
     fn try_merge_eviction<H: Hashtable>(
         &self,
         merge_config: &crate::config::MergeConfig,
@@ -688,15 +693,21 @@ impl TtlLayer {
             return self.evict_randomfifo(hashtable);
         }
 
-        // Prune each candidate segment
         let verifier = SinglePoolVerifier { pool: &self.pool };
-        let threshold = self.config.demotion_threshold;
+
+        // Adaptive threshold: start conservative, increase if retaining too much
+        let mut threshold: u8 = 0;
+        let mut total_retained = 0u32;
+        let mut total_pruned = 0u32;
 
         for (_bucket_idx, segment_id) in candidates.iter().take(merge_config.min_segments) {
             if let Some(segment) = self.pool.get(*segment_id) {
                 // Use SegmentPrune to prune low-frequency items
                 let (retained, pruned, _bytes_retained, _bytes_pruned) =
                     segment.prune(threshold, |key| hashtable.get_frequency(key, &verifier));
+
+                total_retained += retained;
+                total_pruned += pruned;
 
                 // Remove pruned items from hashtable
                 if pruned > 0 {
@@ -743,6 +754,16 @@ impl TtlLayer {
                 // If segment is empty after pruning, reclaim it
                 if retained == 0 {
                     self.try_free_empty_segment(*segment_id);
+                }
+
+                // Adjust threshold for next segment based on running retention ratio
+                let total_items = total_retained + total_pruned;
+                if total_items > 0 && threshold < 255 {
+                    let retention_ratio = total_retained as f64 / total_items as f64;
+                    if retention_ratio > merge_config.target_ratio {
+                        // Retaining too much - be more aggressive on next segment
+                        threshold += 1;
+                    }
                 }
             }
         }
@@ -1667,5 +1688,149 @@ mod tests {
         // Segment is still in use (can't free the only segment in a bucket)
         // The segment count stays the same because we can't remove a Live segment
         assert_eq!(layer.used_segment_count(), 1);
+    }
+
+    #[test]
+    fn test_merge_eviction_preserves_freq1_items() {
+        use crate::config::{EvictionStrategy, MergeConfig};
+        use crate::hashtable_impl::MultiChoiceHashtable;
+
+        // Create layer with merge eviction enabled
+        // Use larger heap to ensure items fit without triggering eviction during writes
+        let layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(4096) // Larger segments
+            .heap_size(64 * 1024) // 16 segments - plenty of room
+            .config(
+                LayerConfig::new().with_ghosts(true).with_eviction_strategy(
+                    EvictionStrategy::Merge(
+                        MergeConfig::new()
+                            .with_target_ratio(0.5)
+                            .with_min_segments(2),
+                    ),
+                ),
+            )
+            .spare_capacity(0)
+            .build()
+            .expect("Failed to create test layer");
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+
+        // Write items and register them in the hashtable (they get freq=1)
+        let mut locations = Vec::new();
+        for i in 0..50 {
+            let key = format!("merge_key_{:04}", i);
+            let value = format!("merge_value_{:04}", i);
+            if let Ok(loc) = layer.write_item(key.as_bytes(), value.as_bytes(), b"", ttl) {
+                // Insert into hashtable so frequency tracking works
+                let _ = hashtable.insert(key.as_bytes(), loc.to_location(), &verifier);
+                locations.push((key, loc));
+            }
+        }
+
+        assert!(!locations.is_empty(), "Should have written some items");
+
+        // Count accessible items BEFORE eviction
+        let accessible_before: usize = locations
+            .iter()
+            .filter(|(key, loc)| layer.get_item(*loc, key.as_bytes()).is_some())
+            .count();
+
+        // Verify items have freq=1 after insertion
+        for (key, _loc) in &locations {
+            let freq = hashtable.get_frequency(key.as_bytes(), &verifier);
+            assert_eq!(freq, Some(1), "Items should have freq=1 after insert");
+        }
+
+        // Trigger merge eviction - this should NOT prune items with freq=1
+        // because the adaptive threshold starts at 0
+        let _ = layer.evict(&hashtable);
+
+        // Count accessible items AFTER eviction
+        let accessible_after: usize = locations
+            .iter()
+            .filter(|(key, loc)| layer.get_item(*loc, key.as_bytes()).is_some())
+            .count();
+
+        // Items with freq=1 should survive merge eviction (threshold starts at 0)
+        // The accessible count should not decrease
+        assert_eq!(
+            accessible_after, accessible_before,
+            "Items with freq=1 should survive merge eviction (threshold=0). Before: {}, After: {}",
+            accessible_before, accessible_after
+        );
+    }
+
+    #[test]
+    fn test_merge_eviction_adapts_threshold() {
+        use crate::config::{EvictionStrategy, MergeConfig};
+        use crate::hashtable_impl::MultiChoiceHashtable;
+
+        // Create layer with merge eviction and low target ratio
+        let layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(1024)
+            .heap_size(10 * 1024)
+            .config(
+                LayerConfig::new().with_ghosts(true).with_eviction_strategy(
+                    EvictionStrategy::Merge(
+                        MergeConfig::new()
+                            .with_target_ratio(0.3) // Want to keep only 30%
+                            .with_min_segments(2),
+                    ),
+                ),
+            )
+            .spare_capacity(0)
+            .build()
+            .expect("Failed to create test layer");
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+
+        // Write items and register them in hashtable
+        let mut locations = Vec::new();
+        for i in 0..100 {
+            let key = format!("adapt_key_{:04}", i);
+            let value = format!("adapt_value_{:04}", i);
+            if let Ok(loc) = layer.write_item(key.as_bytes(), value.as_bytes(), b"", ttl) {
+                let _ = hashtable.insert(key.as_bytes(), loc.to_location(), &verifier);
+                locations.push((key, loc));
+            }
+        }
+
+        // Access some items to increase their frequency
+        for (key, _) in locations.iter().take(30) {
+            // Multiple lookups to increase frequency
+            for _ in 0..5 {
+                let _ = hashtable.lookup(key.as_bytes(), &verifier);
+            }
+        }
+
+        // Verify hot items have higher frequency
+        let hot_freq = hashtable
+            .get_frequency(locations[0].0.as_bytes(), &verifier)
+            .unwrap_or(0);
+        assert!(hot_freq > 1, "Hot items should have freq > 1");
+
+        // Trigger eviction - threshold should adapt
+        let _ = layer.evict(&hashtable);
+
+        // Hot items (higher freq) should be more likely to survive
+        // Cold items (freq=1) may be pruned as threshold adapts
+        // This is a probabilistic test - just verify it doesn't crash
+        // and hot items are preserved
+        let hot_accessible = locations
+            .iter()
+            .take(30)
+            .filter(|(key, loc)| layer.get_item(*loc, key.as_bytes()).is_some())
+            .count();
+
+        // At least some hot items should survive
+        assert!(hot_accessible > 0, "Some hot items should survive eviction");
     }
 }
