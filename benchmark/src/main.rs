@@ -253,6 +253,8 @@ fn run_benchmark(
     let mut last_hits = 0u64;
     let mut last_misses = 0u64;
     let mut last_histogram: Option<Histogram> = None;
+    let mut baseline_bytes_tx = 0u64;
+    let mut baseline_bytes_rx = 0u64;
     let mut current_phase = if prefill_enabled {
         Phase::Prefill
     } else {
@@ -323,6 +325,8 @@ fn run_benchmark(
             last_hits = metrics::CACHE_HITS.value();
             last_misses = metrics::CACHE_MISSES.value();
             last_histogram = metrics::RESPONSE_LATENCY.load();
+            baseline_bytes_tx = metrics::BYTES_TX.value();
+            baseline_bytes_rx = metrics::BYTES_RX.value();
 
             // Initialize saturation search if configured
             if let Some(ref sat_config) = config.workload.saturation_search
@@ -475,8 +479,8 @@ fn run_benchmark(
     let errors = metrics::REQUEST_ERRORS.value();
     let hits = metrics::CACHE_HITS.value();
     let misses = metrics::CACHE_MISSES.value();
-    let bytes_tx = metrics::BYTES_TX.value();
-    let bytes_rx = metrics::BYTES_RX.value();
+    let bytes_tx = metrics::BYTES_TX.value() - baseline_bytes_tx;
+    let bytes_rx = metrics::BYTES_RX.value() - baseline_bytes_rx;
     let get_count = metrics::GET_COUNT.value();
     let set_count = metrics::SET_COUNT.value();
     let active = metrics::CONNECTIONS_ACTIVE.value();
