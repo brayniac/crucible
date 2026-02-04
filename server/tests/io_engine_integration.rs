@@ -269,11 +269,7 @@ fn run_parameterized_test(config: TestConfig) {
     let worker_threads = (config.connections / 64).clamp(1, 4);
 
     // Start server
-    let _server_handle = start_test_server(
-        port,
-        config.io_engine,
-        worker_threads,
-    );
+    let _server_handle = start_test_server(port, config.io_engine, worker_threads);
 
     // Wait for server to be ready
     assert!(
@@ -896,5 +892,3 @@ fn test_uring_deep_pipeline() {
         pong_count
     );
 }
-
-

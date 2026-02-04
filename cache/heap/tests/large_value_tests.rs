@@ -9,9 +9,7 @@ use std::time::Duration;
 
 /// Generate a verifiable large value with position-dependent pattern.
 fn generate_large_value(size: usize, seed: u8) -> Vec<u8> {
-    (0..size)
-        .map(|i| (i as u8).wrapping_add(seed))
-        .collect()
+    (0..size).map(|i| (i as u8).wrapping_add(seed)).collect()
 }
 
 /// Verify a value matches the expected pattern.
@@ -131,7 +129,10 @@ fn test_1000_5mb_values_with_eviction() {
                     successful_gets += 1;
                 }
             }
-            println!("Progress: {} items written, {} verified", i, successful_gets);
+            println!(
+                "Progress: {} items written, {} verified",
+                i, successful_gets
+            );
         }
     }
 

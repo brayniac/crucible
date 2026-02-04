@@ -106,6 +106,9 @@ impl TtlLayer {
         let expire_at = Self::now_secs() + ttl.as_secs() as u32;
         segment.set_expire_at(expire_at);
 
+        // Track which bucket this segment belongs to
+        segment.set_bucket_id(bucket_index as u16);
+
         // Add to bucket
         let bucket = self.buckets.get_bucket_by_index(bucket_index);
         match bucket.append_segment(segment_id, &self.pool) {
@@ -231,6 +234,65 @@ impl TtlLayer {
         // Clear segment state and release to pool
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
         self.pool.release(segment_id);
+    }
+
+    /// Try to free a segment if it has no live items.
+    ///
+    /// This is called after `mark_deleted` to eagerly reclaim segments that
+    /// become empty due to overwrites or deletes, rather than waiting for
+    /// the next eviction cycle.
+    ///
+    /// Returns `true` if the segment was freed.
+    fn try_free_empty_segment(&self, segment_id: u32) -> bool {
+        let segment = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Only proceed if segment is truly empty
+        if segment.live_items() > 0 {
+            return false;
+        }
+
+        // Segment must be Sealed to be removed (Live segments are still being written to)
+        if segment.state() != State::Sealed {
+            return false;
+        }
+
+        // Get the bucket this segment belongs to
+        let bucket_id = match segment.bucket_id() {
+            Some(id) => id as usize,
+            None => return false,
+        };
+
+        let bucket = self.buckets.get_bucket_by_index(bucket_id);
+
+        // Need at least 2 segments to remove one (keep the Live tail)
+        if bucket.segment_count() < 2 {
+            return false;
+        }
+
+        // Try to remove from chain (handles head vs non-head)
+        let removed_id = if bucket.head() == Some(segment_id) {
+            bucket.evict_head_segment(&self.pool).ok()
+        } else {
+            bucket.remove_segment(segment_id, &self.pool).ok()
+        };
+
+        if let Some(id) = removed_id {
+            // Wait for readers then release
+            if let Some(seg) = self.pool.get(id) {
+                while seg.ref_count() > 0 {
+                    std::hint::spin_loop();
+                }
+                seg.cas_metadata(State::Draining, State::Locked, None, None);
+                seg.cas_metadata(State::Locked, State::Reserved, None, None);
+            }
+            self.pool.release(id);
+            return true;
+        }
+
+        false
     }
 
     /// Process items in an evicted segment with a demotion callback.
@@ -483,15 +545,9 @@ impl TtlLayer {
                     }
                 }
 
-                // If segment is mostly empty after pruning, reclaim it
+                // If segment is empty after pruning, reclaim it
                 if retained == 0 {
-                    // All items pruned, can reclaim the segment
-                    if let Some((_, bucket)) = self.buckets.select_bucket_for_eviction()
-                        && bucket.head() == Some(*segment_id)
-                        && let Ok(evicted_id) = bucket.evict_head_segment(&self.pool)
-                    {
-                        self.process_evicted_segment(evicted_id, hashtable);
-                    }
+                    self.try_free_empty_segment(*segment_id);
                 }
             }
         }
@@ -599,6 +655,9 @@ impl Layer for TtlLayer {
                 let key_len = header.key_len() as usize;
                 if let Some(key) = segment.data_slice(key_start as u32, key_len) {
                     let _ = segment.mark_deleted(offset, key);
+
+                    // Try to free segment if now empty
+                    self.try_free_empty_segment(location.segment_id());
                 }
             }
         }
@@ -1291,5 +1350,80 @@ mod tests {
         let invalid_location = ItemLocation::new(1, 9999, 0);
         // Should not panic
         layer.mark_deleted(invalid_location);
+    }
+
+    #[test]
+    fn test_free_empty_segment_on_delete() {
+        // Create layer with small segments so we can fill and empty them
+        let layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(1024) // Small segment
+            .heap_size(5 * 1024) // 5 segments
+            .build()
+            .expect("Failed to create test layer");
+
+        let ttl = Duration::from_secs(3600);
+
+        // Write items to fill a segment, then add a second segment
+        let mut locations = Vec::new();
+        for i in 0..10 {
+            let key = format!("key_{:03}", i);
+            if let Ok(loc) = layer.write_item(key.as_bytes(), b"v", b"", ttl) {
+                locations.push((key, loc));
+            }
+        }
+
+        // Need at least 2 segments in the bucket for freeing to work
+        // Force a second segment by filling the first
+        for i in 10..100 {
+            let key = format!("key_{:03}", i);
+            if let Ok(loc) = layer.write_item(key.as_bytes(), b"value_padding", b"", ttl) {
+                locations.push((key, loc));
+            }
+        }
+
+        let initial_used = layer.used_segment_count();
+        assert!(initial_used >= 2, "Need at least 2 segments");
+
+        // Delete all items in the first segment
+        // Find items from the first segment (should all have segment_id of the first allocated)
+        let first_segment_id = locations[0].1.segment_id();
+        let items_in_first: Vec<_> = locations
+            .iter()
+            .filter(|(_, loc)| loc.segment_id() == first_segment_id)
+            .collect();
+
+        // Delete all items in first segment
+        for (_, loc) in &items_in_first {
+            layer.mark_deleted(*loc);
+        }
+
+        // The empty segment should have been freed
+        let final_used = layer.used_segment_count();
+        assert!(
+            final_used < initial_used,
+            "Expected segment to be freed: initial={}, final={}",
+            initial_used,
+            final_used
+        );
+    }
+
+    #[test]
+    fn test_single_segment_bucket_not_freed() {
+        let layer = create_test_layer();
+        let ttl = Duration::from_secs(60);
+
+        // Write a single item - creates one segment in the bucket
+        let location = layer.write_item(b"only_key", b"value", b"", ttl).unwrap();
+
+        assert_eq!(layer.used_segment_count(), 1);
+
+        // Mark deleted - segment should NOT be freed (it's the only one in bucket)
+        layer.mark_deleted(location);
+
+        // Segment is still in use (can't free the only segment in a bucket)
+        // The segment count stays the same because we can't remove a Live segment
+        assert_eq!(layer.used_segment_count(), 1);
     }
 }

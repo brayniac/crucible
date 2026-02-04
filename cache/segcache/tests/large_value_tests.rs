@@ -8,9 +8,7 @@ use std::time::Duration;
 
 /// Generate a verifiable large value with position-dependent pattern.
 fn generate_large_value(size: usize, seed: u8) -> Vec<u8> {
-    (0..size)
-        .map(|i| (i as u8).wrapping_add(seed))
-        .collect()
+    (0..size).map(|i| (i as u8).wrapping_add(seed)).collect()
 }
 
 /// Verify a value matches the expected pattern.
@@ -134,7 +132,10 @@ fn test_1000_5mb_values_with_eviction() {
                     successful_gets += 1;
                 }
             }
-            println!("Progress: {} items written, {} verified", i, successful_gets);
+            println!(
+                "Progress: {} items written, {} verified",
+                i, successful_gets
+            );
         }
     }
 
@@ -420,13 +421,13 @@ fn test_interleaved_sizes() {
     let cache = create_large_value_cache(512, 32);
 
     let sizes = [
-        64,                  // 64 bytes
-        1024,                // 1KB
-        64 * 1024,           // 64KB
-        512 * 1024,          // 512KB
-        1024 * 1024,         // 1MB
-        5 * 1024 * 1024,     // 5MB
-        10 * 1024 * 1024,    // 10MB
+        64,               // 64 bytes
+        1024,             // 1KB
+        64 * 1024,        // 64KB
+        512 * 1024,       // 512KB
+        1024 * 1024,      // 1MB
+        5 * 1024 * 1024,  // 5MB
+        10 * 1024 * 1024, // 10MB
     ];
 
     // Write items of various sizes
@@ -652,10 +653,7 @@ fn test_disk_tier_spillover_large_values() {
         found,
         num_items
     );
-    assert_eq!(
-        found, verified,
-        "All found items should verify correctly"
-    );
+    assert_eq!(found, verified, "All found items should verify correctly");
 }
 
 #[test]
@@ -693,7 +691,10 @@ fn test_disk_tier_heavy_eviction_large_values() {
         }
 
         if i > 0 && i % 50 == 0 {
-            println!("Progress: {} items written, {} successful", i, successful_sets);
+            println!(
+                "Progress: {} items written, {} successful",
+                i, successful_sets
+            );
         }
     }
 
@@ -900,10 +901,9 @@ fn test_disk_tier_rapid_cycles_large_values() {
             .set(key, &value, Duration::from_secs(3600))
             .expect(&format!("SET failed on cycle {}", cycle));
 
-        let retrieved = cache.get(key).expect(&format!(
-            "GET returned None on cycle {}",
-            cycle
-        ));
+        let retrieved = cache
+            .get(key)
+            .expect(&format!("GET returned None on cycle {}", cycle));
 
         assert!(
             verify_value(&retrieved, value_size, seed),

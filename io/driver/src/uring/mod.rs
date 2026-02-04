@@ -644,13 +644,10 @@ impl UringDriver {
             // Data remains in the socket buffer; we just need to re-arm multishot recv.
             if -result == libc::ENOBUFS {
                 // Mark multishot as inactive and re-arm
-                let conn_info = self
-                    .connections
-                    .get_mut(conn_id)
-                    .map(|c| {
-                        c.multishot_active = false;
-                        (c.fixed_slot, c.generation)
-                    });
+                let conn_info = self.connections.get_mut(conn_id).map(|c| {
+                    c.multishot_active = false;
+                    (c.fixed_slot, c.generation)
+                });
 
                 if let Some((fixed_slot, conn_gen)) = conn_info {
                     if self

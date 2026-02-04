@@ -10,8 +10,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -291,7 +291,8 @@ fn try_parse_bulk_string(data: &[u8], expected_size: usize) -> Result<Option<Vec
         None => return Ok(None), // Incomplete header
     };
 
-    let len_str = std::str::from_utf8(&data[1..len_end]).map_err(|e| format!("Invalid UTF-8 in length: {}", e))?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| format!("Invalid UTF-8 in length: {}", e))?;
 
     let declared_len: usize = len_str
         .parse()
@@ -376,10 +377,7 @@ fn run_large_value_test(config: LargeValueTestConfig) {
         let key = format!("largekey_{}", size);
         let value = generate_large_value(size);
 
-        println!(
-            "Testing {} with {}: {} bytes",
-            key, config.io_engine, size
-        );
+        println!("Testing {} with {}: {} bytes", key, config.io_engine, size);
 
         // SET the large value
         send_large_set(&mut stream, &key, &value).unwrap_or_else(|e| {
@@ -544,7 +542,6 @@ fn test_mio_large_values_64m() {
     });
 }
 
-
 #[test]
 fn test_mio_concurrent_large_values_1m() {
     run_concurrent_large_value_test("mio", 8, 1024 * 1024);
@@ -595,7 +592,6 @@ fn test_uring_large_values_64m() {
         ..Default::default()
     });
 }
-
 
 #[test]
 #[cfg(target_os = "linux")]
@@ -718,14 +714,14 @@ fn test_mio_increasing_value_sizes() {
 
     // Start small and grow
     let sizes = [
-        1024,           // 1KB
-        16 * 1024,      // 16KB (ring buffer size)
-        32 * 1024,      // 32KB
-        64 * 1024,      // 64KB (shrink threshold)
-        128 * 1024,     // 128KB
-        256 * 1024,     // 256KB
-        512 * 1024,     // 512KB
-        1024 * 1024,    // 1MB
+        1024,            // 1KB
+        16 * 1024,       // 16KB (ring buffer size)
+        32 * 1024,       // 32KB
+        64 * 1024,       // 64KB (shrink threshold)
+        128 * 1024,      // 128KB
+        256 * 1024,      // 256KB
+        512 * 1024,      // 512KB
+        1024 * 1024,     // 1MB
         2 * 1024 * 1024, // 2MB
     ];
 
@@ -913,15 +909,15 @@ fn test_mio_buffer_boundary_sizes() {
 
     // Test around 16KB boundary (ring buffer size)
     let sizes = [
-        16 * 1024 - 1,     // Just under 16KB
-        16 * 1024,         // Exactly 16KB
-        16 * 1024 + 1,     // Just over 16KB
-        32 * 1024 - 1,     // Just under 32KB (2 buffers)
-        32 * 1024,         // Exactly 32KB
-        32 * 1024 + 1,     // Just over 32KB
-        64 * 1024 - 1,     // Just under 64KB (shrink threshold)
-        64 * 1024,         // Exactly 64KB
-        64 * 1024 + 1,     // Just over 64KB
+        16 * 1024 - 1, // Just under 16KB
+        16 * 1024,     // Exactly 16KB
+        16 * 1024 + 1, // Just over 16KB
+        32 * 1024 - 1, // Just under 32KB (2 buffers)
+        32 * 1024,     // Exactly 32KB
+        32 * 1024 + 1, // Just over 32KB
+        64 * 1024 - 1, // Just under 64KB (shrink threshold)
+        64 * 1024,     // Exactly 64KB
+        64 * 1024 + 1, // Just over 64KB
     ];
 
     for &size in &sizes {

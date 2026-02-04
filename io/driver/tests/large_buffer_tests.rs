@@ -35,9 +35,7 @@ fn generate_pattern(size: usize) -> Vec<u8> {
 
 /// Verify a buffer matches the expected pattern.
 fn verify_pattern(data: &[u8]) -> bool {
-    data.iter()
-        .enumerate()
-        .all(|(i, &b)| b == (i % 256) as u8)
+    data.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8)
 }
 
 // =============================================================================

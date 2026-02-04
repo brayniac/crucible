@@ -511,8 +511,7 @@ fn run_worker<C: Cache>(
                                     }
 
                                     let initial_len = buf.len();
-                                    zero_copy_response =
-                                        conn.process_one_zero_copy(buf, &*cache);
+                                    zero_copy_response = conn.process_one_zero_copy(buf, &*cache);
 
                                     let consumed = initial_len - buf.len();
                                     bytes_received += consumed as u64;
@@ -668,8 +667,7 @@ fn run_worker<C: Cache>(
                                         return;
                                     }
                                     let initial_len = buf.len();
-                                    zero_copy_response =
-                                        conn.process_one_zero_copy(buf, &*cache);
+                                    zero_copy_response = conn.process_one_zero_copy(buf, &*cache);
                                     made_progress = buf.len() < initial_len;
 
                                     if conn.should_close() {
