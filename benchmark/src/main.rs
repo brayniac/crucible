@@ -253,7 +253,11 @@ fn run_benchmark(
     let mut last_hits = 0u64;
     let mut last_misses = 0u64;
     let mut last_histogram: Option<Histogram> = None;
-    let mut current_phase = Phase::Warmup;
+    let mut current_phase = if prefill_enabled {
+        Phase::Prefill
+    } else {
+        Phase::Warmup
+    };
 
     let mut actual_duration = duration;
 
