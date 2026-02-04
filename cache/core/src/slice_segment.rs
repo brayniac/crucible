@@ -1321,7 +1321,12 @@ impl SliceSegment<'_> {
 
         if self
             .metadata
-            .compare_exchange(current, new_meta.pack(), Ordering::Release, Ordering::Acquire)
+            .compare_exchange(
+                current,
+                new_meta.pack(),
+                Ordering::Release,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
             // Reset merge count

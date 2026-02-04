@@ -566,15 +566,9 @@ impl TtlBucket {
     {
         let _guard = self.chain_mutex.lock();
 
-        let src_a = pool
-            .get(src_a_id)
-            .ok_or(TtlBucketError::InvalidSegmentId)?;
-        let src_b = pool
-            .get(src_b_id)
-            .ok_or(TtlBucketError::InvalidSegmentId)?;
-        let spare = pool
-            .get(spare_id)
-            .ok_or(TtlBucketError::InvalidSegmentId)?;
+        let src_a = pool.get(src_a_id).ok_or(TtlBucketError::InvalidSegmentId)?;
+        let src_b = pool.get(src_b_id).ok_or(TtlBucketError::InvalidSegmentId)?;
+        let spare = pool.get(spare_id).ok_or(TtlBucketError::InvalidSegmentId)?;
 
         // Verify src_a and src_b are adjacent
         if src_a.next() != Some(src_b_id) {

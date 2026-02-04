@@ -735,7 +735,7 @@ impl<'a> ItemGuard<'a> for BasicItemGuard<'a> {
 
 impl Drop for BasicItemGuard<'_> {
     fn drop(&mut self) {
-        use crate::state::{Metadata, State, INVALID_SEGMENT_ID};
+        use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
 
         let prev_count = self.ref_count.fetch_sub(1, Ordering::Release);
 
