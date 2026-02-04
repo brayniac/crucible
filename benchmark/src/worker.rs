@@ -166,9 +166,14 @@ pub struct IoWorker {
     /// Whether we're in warmup mode (don't record metrics)
     warmup: bool,
 
-    /// Prefill state: next key ID to write and end of range
-    prefill_next: usize,
-    prefill_end: usize,
+    /// Prefill state: keys pending to be written (not yet sent or need retry)
+    prefill_pending: std::collections::VecDeque<usize>,
+    /// Prefill state: in-flight key IDs per session index (waiting for response)
+    prefill_in_flight: Vec<std::collections::VecDeque<usize>>,
+    /// Number of keys successfully confirmed during prefill
+    prefill_confirmed: usize,
+    /// Total keys to prefill (for completion check)
+    prefill_total: usize,
     /// Whether this worker has finished prefilling
     prefill_done: bool,
 }
@@ -190,10 +195,14 @@ impl IoWorker {
         let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);
         init_rng.fill_bytes(&mut value_buf);
 
-        // Initialize prefill range
-        let (prefill_next, prefill_end, prefill_done) = match cfg.prefill_range {
-            Some(range) => (range.start, range.end, range.start >= range.end),
-            None => (0, 0, true), // No prefill range = already done
+        // Initialize prefill state
+        let (prefill_pending, prefill_total, prefill_done) = match cfg.prefill_range {
+            Some(range) => {
+                let pending: std::collections::VecDeque<usize> = (range.start..range.end).collect();
+                let total = range.end - range.start;
+                (pending, total, total == 0)
+            }
+            None => (std::collections::VecDeque::new(), 0, true),
         };
 
         Ok(Self {
@@ -210,8 +219,10 @@ impl IoWorker {
             results: Vec::with_capacity(pipeline_depth),
             ratelimiter: cfg.ratelimiter,
             warmup: cfg.warmup,
-            prefill_next,
-            prefill_end,
+            prefill_pending,
+            prefill_in_flight: Vec::new(), // Will be sized when sessions are created
+            prefill_confirmed: 0,
+            prefill_total,
             prefill_done,
         })
     }
@@ -262,7 +273,11 @@ impl IoWorker {
                     metrics::CONNECTIONS_FAILED.increment();
                     // Create disconnected session for reconnection attempts
                     match Session::from_config(endpoint, &self.config) {
-                        Ok(session) => self.sessions.push(session),
+                        Ok(session) => {
+                            self.sessions.push(session);
+                            self.prefill_in_flight
+                                .push(std::collections::VecDeque::new());
+                        }
                         Err(e) => {
                             tracing::error!(
                                 "worker {} failed to create session for {}: {}",
@@ -324,6 +339,8 @@ impl IoWorker {
 
         let idx = self.sessions.len();
         self.sessions.push(session);
+        self.prefill_in_flight
+            .push(std::collections::VecDeque::new());
         self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
 
         Ok(())
@@ -525,21 +542,22 @@ impl IoWorker {
         // Process responses (to clear pipeline for more requests)
         self.poll_responses(std::time::Instant::now());
 
-        // Check if prefill is done
-        if self.prefill_next >= self.prefill_end {
-            // Wait for all in-flight requests to complete
-            let in_flight: usize = self.sessions.iter().map(|s| s.in_flight_count()).sum();
-            if in_flight == 0 {
-                self.prefill_done = true;
-                self.shared.mark_prefill_complete();
-                return Ok(true);
-            }
+        // Check if prefill is done: all keys have been confirmed
+        if self.prefill_confirmed >= self.prefill_total {
+            self.prefill_done = true;
+            self.shared.mark_prefill_complete();
+            return Ok(true);
         }
 
         Ok(false)
     }
 
     /// Prefill for Momento sessions.
+    ///
+    /// Note: Momento uses a simpler prefill approach since it handles its own
+    /// connection management. We pop keys from the pending queue but don't
+    /// track per-session in-flight state since Momento sessions handle retries
+    /// internally.
     #[inline]
     fn poll_once_prefill_momento(&mut self, now: std::time::Instant) -> io::Result<bool> {
         for session in &mut self.momento_sessions {
@@ -557,37 +575,42 @@ impl IoWorker {
                 }
             }
 
-            // Send sequential SET commands
-            while session.can_send() && self.prefill_next < self.prefill_end {
-                write_key(&mut self.key_buf, self.prefill_next);
+            // Send SET commands from pending queue
+            while session.can_send() {
+                let key_id = match self.prefill_pending.pop_front() {
+                    Some(id) => id,
+                    None => break,
+                };
+
+                write_key(&mut self.key_buf, key_id);
                 self.rng.fill_bytes(&mut self.value_buf);
 
-                if session.set(&self.key_buf, &self.value_buf, now).is_some() {
-                    self.prefill_next += 1;
-                } else {
+                if session.set(&self.key_buf, &self.value_buf, now).is_none() {
+                    // Couldn't send - put the key back
+                    self.prefill_pending.push_front(key_id);
                     break;
                 }
+                // Note: Momento handles retries internally, so we don't track in-flight
             }
 
-            // Poll for responses
+            // Poll for responses and count successful SETs
             self.results.clear();
             if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
                 tracing::debug!("Momento poll error: {}", e);
             }
+            // Count successful SET responses
+            for result in &self.results {
+                if result.request_type == RequestType::Set && result.success {
+                    self.prefill_confirmed += 1;
+                }
+            }
         }
 
-        // Check if prefill is done
-        if self.prefill_next >= self.prefill_end {
-            let in_flight: usize = self
-                .momento_sessions
-                .iter()
-                .map(|s| s.in_flight_count())
-                .sum();
-            if in_flight == 0 {
-                self.prefill_done = true;
-                self.shared.mark_prefill_complete();
-                return Ok(true);
-            }
+        // Check if prefill is done: all keys have been confirmed
+        if self.prefill_confirmed >= self.prefill_total {
+            self.prefill_done = true;
+            self.shared.mark_prefill_complete();
+            return Ok(true);
         }
 
         Ok(false)
@@ -596,19 +619,29 @@ impl IoWorker {
     /// Drive sequential SET requests for prefill.
     #[inline]
     fn drive_prefill_requests(&mut self, now: std::time::Instant) -> io::Result<()> {
-        // Fill each session's pipeline with sequential SET commands
-        for session in &mut self.sessions {
+        // Fill each session's pipeline with SET commands from the pending queue
+        for idx in 0..self.sessions.len() {
+            let session = &mut self.sessions[idx];
             if !session.is_connected() {
                 continue;
             }
 
-            while session.can_send() && self.prefill_next < self.prefill_end {
-                write_key(&mut self.key_buf, self.prefill_next);
+            while session.can_send() {
+                // Pop a key from the pending queue
+                let key_id = match self.prefill_pending.pop_front() {
+                    Some(id) => id,
+                    None => break, // No more keys to send
+                };
+
+                write_key(&mut self.key_buf, key_id);
                 self.rng.fill_bytes(&mut self.value_buf);
 
                 if session.set(&self.key_buf, &self.value_buf, now).is_some() {
-                    self.prefill_next += 1;
+                    // Track this key as in-flight for this session
+                    self.prefill_in_flight[idx].push_back(key_id);
                 } else {
+                    // Couldn't send - put the key back at the front
+                    self.prefill_pending.push_front(key_id);
                     break;
                 }
             }
@@ -754,6 +787,24 @@ impl IoWorker {
                             }
                         }
 
+                        // Handle prefill tracking: pop from in-flight and confirm
+                        if !self.prefill_done {
+                            for result in &self.results {
+                                if result.request_type == RequestType::Set {
+                                    // Pop the oldest in-flight key for this session
+                                    if let Some(_key_id) = self.prefill_in_flight[idx].pop_front() {
+                                        if result.success {
+                                            // Key confirmed successfully
+                                            self.prefill_confirmed += 1;
+                                        } else {
+                                            // SET failed - put key back in pending for retry
+                                            self.prefill_pending.push_back(_key_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Record metrics from parsed responses (outside closure)
                         if !self.warmup {
                             for result in &self.results {
@@ -849,16 +900,30 @@ impl IoWorker {
     fn poll_responses(&mut self, now: std::time::Instant) {
         if self.warmup {
             // Still need to parse responses but don't record metrics
-            for session in &mut self.sessions {
+            for idx in 0..self.sessions.len() {
                 self.results.clear();
-                let _ = session.poll_responses(&mut self.results, now);
+                let _ = self.sessions[idx].poll_responses(&mut self.results, now);
+                // Handle prefill tracking: pop from in-flight and confirm
+                if !self.prefill_done {
+                    for result in &self.results {
+                        if result.request_type == RequestType::Set {
+                            if let Some(_key_id) = self.prefill_in_flight[idx].pop_front() {
+                                if result.success {
+                                    self.prefill_confirmed += 1;
+                                } else {
+                                    self.prefill_pending.push_back(_key_id);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             return;
         }
 
-        for session in &mut self.sessions {
+        for idx in 0..self.sessions.len() {
             self.results.clear();
-            if let Err(e) = session.poll_responses(&mut self.results, now) {
+            if let Err(e) = self.sessions[idx].poll_responses(&mut self.results, now) {
                 tracing::debug!("protocol error: {}", e);
             }
 
@@ -976,6 +1041,13 @@ impl IoWorker {
             self.conn_id_to_idx.remove(&conn_id.as_usize());
         }
         session.disconnect();
+
+        // Move any in-flight prefill keys back to pending queue for retry
+        if !self.prefill_done && idx < self.prefill_in_flight.len() {
+            while let Some(key_id) = self.prefill_in_flight[idx].pop_front() {
+                self.prefill_pending.push_back(key_id);
+            }
+        }
 
         // Track connection state
         metrics::CONNECTIONS_FAILED.increment();
