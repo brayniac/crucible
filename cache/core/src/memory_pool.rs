@@ -570,4 +570,193 @@ mod tests {
         assert!(offset.is_some());
         assert_eq!(segment.live_items(), 1);
     }
+
+    // =========================================================================
+    // Spare capacity tests
+    // =========================================================================
+
+    fn create_pool_with_spare(spare_capacity: u32) -> MemoryPool {
+        MemoryPoolBuilder::new(0)
+            .segment_size(64 * 1024) // 64KB
+            .heap_size(640 * 1024) // 640KB = 10 segments
+            .spare_capacity(spare_capacity)
+            .build()
+            .expect("Failed to create test pool")
+    }
+
+    #[test]
+    fn test_spare_capacity_initial_distribution() {
+        let pool = create_pool_with_spare(3);
+
+        // Should have 3 in spare, 7 in free
+        assert_eq!(pool.spare_count(), 3);
+        assert_eq!(pool.spare_capacity(), 3);
+        assert_eq!(pool.free_count(), 10); // Total free (spare + free_queue)
+    }
+
+    #[test]
+    fn test_reserve_spare_basic() {
+        let pool = create_pool_with_spare(3);
+
+        // Reserve from spare queue
+        let id = pool.reserve_spare();
+        assert!(id.is_some());
+
+        // Spare count should decrease
+        assert_eq!(pool.spare_count(), 2);
+
+        // Segment should be in Reserved state
+        let segment = pool.get(id.unwrap()).unwrap();
+        assert_eq!(segment.state(), State::Reserved);
+    }
+
+    #[test]
+    fn test_reserve_does_not_use_spare() {
+        let pool = create_pool_with_spare(3);
+
+        // Reserve all from normal queue (should be 7 segments)
+        let mut reserved = Vec::new();
+        for _ in 0..7 {
+            let id = pool.reserve();
+            assert!(id.is_some(), "Should have segments in free_queue");
+            reserved.push(id.unwrap());
+        }
+
+        // Normal reserve should now return None (spare queue untouched)
+        assert!(pool.reserve().is_none());
+
+        // Spare queue should still have all 3 segments
+        assert_eq!(pool.spare_count(), 3);
+    }
+
+    #[test]
+    fn test_reserve_spare_fallback_to_free() {
+        let pool = create_pool_with_spare(2);
+
+        // Exhaust spare queue
+        let spare1 = pool.reserve_spare();
+        let spare2 = pool.reserve_spare();
+        assert!(spare1.is_some());
+        assert!(spare2.is_some());
+        assert_eq!(pool.spare_count(), 0);
+
+        // reserve_spare should fall back to free_queue
+        let fallback = pool.reserve_spare();
+        assert!(fallback.is_some());
+
+        // Segment should be Reserved
+        let segment = pool.get(fallback.unwrap()).unwrap();
+        assert_eq!(segment.state(), State::Reserved);
+    }
+
+    #[test]
+    fn test_release_replenishes_spare() {
+        let pool = create_pool_with_spare(3);
+
+        // Exhaust spare queue
+        let spare1 = pool.reserve_spare().unwrap();
+        let spare2 = pool.reserve_spare().unwrap();
+        let spare3 = pool.reserve_spare().unwrap();
+        assert_eq!(pool.spare_count(), 0);
+
+        // Release one - should go to spare queue (below capacity)
+        pool.release(spare1);
+        assert_eq!(pool.spare_count(), 1);
+
+        // Release another - should also go to spare
+        pool.release(spare2);
+        assert_eq!(pool.spare_count(), 2);
+
+        // Release last - should go to spare (now at capacity)
+        pool.release(spare3);
+        assert_eq!(pool.spare_count(), 3);
+    }
+
+    #[test]
+    fn test_release_to_free_when_spare_full() {
+        let pool = create_pool_with_spare(2);
+
+        // Spare is already at capacity (2)
+        assert_eq!(pool.spare_count(), 2);
+
+        // Reserve from free queue
+        let id = pool.reserve().unwrap();
+
+        // Release should go to free_queue (spare is full)
+        let free_before = pool.free_queue.len();
+        pool.release(id);
+
+        // Spare count unchanged, free_queue increased
+        assert_eq!(pool.spare_count(), 2);
+        assert_eq!(pool.free_queue.len(), free_before + 1);
+    }
+
+    #[test]
+    fn test_spare_exhaustion_then_normal_exhaustion() {
+        let pool = create_pool_with_spare(3);
+
+        // Reserve all spare (3)
+        for _ in 0..3 {
+            assert!(pool.reserve_spare().is_some());
+        }
+        assert_eq!(pool.spare_count(), 0);
+
+        // Reserve all normal (7)
+        for _ in 0..7 {
+            assert!(pool.reserve().is_some());
+        }
+
+        // Both queues exhausted
+        assert!(pool.reserve().is_none());
+        assert!(pool.reserve_spare().is_none());
+    }
+
+    #[test]
+    fn test_release_segment_method() {
+        let pool = create_pool_with_spare(2);
+
+        // Exhaust spare
+        let spare1 = pool.reserve_spare().unwrap();
+        let spare2 = pool.reserve_spare().unwrap();
+        assert_eq!(pool.spare_count(), 0);
+
+        // Use release_segment (alternative release path)
+        pool.release_segment(spare1);
+        assert_eq!(pool.spare_count(), 1);
+
+        pool.release_segment(spare2);
+        assert_eq!(pool.spare_count(), 2);
+    }
+
+    #[test]
+    fn test_reset_all_with_spare_capacity() {
+        let pool = create_pool_with_spare(4);
+
+        // Reserve some segments
+        let _id1 = pool.reserve().unwrap();
+        let _id2 = pool.reserve_spare().unwrap();
+
+        // Reset all
+        pool.reset_all();
+
+        // Should be back to initial distribution
+        assert_eq!(pool.spare_count(), 4);
+        assert_eq!(pool.free_count(), 10); // Total
+    }
+
+    #[test]
+    fn test_spare_capacity_capped_at_segment_count() {
+        // Request more spare capacity than segments available
+        let pool = MemoryPoolBuilder::new(0)
+            .segment_size(64 * 1024)
+            .heap_size(128 * 1024) // Only 2 segments
+            .spare_capacity(10) // Request 10, but only 2 exist
+            .build()
+            .expect("Failed to create pool");
+
+        // Should be capped at segment count
+        assert_eq!(pool.spare_capacity(), 2);
+        assert_eq!(pool.spare_count(), 2);
+        assert_eq!(pool.segment_count(), 2);
+    }
 }
