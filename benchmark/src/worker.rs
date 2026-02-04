@@ -130,7 +130,8 @@ pub struct IoWorkerConfig {
     pub config: Config,
     pub shared: Arc<SharedState>,
     pub ratelimiter: Option<Arc<DynamicRateLimiter>>,
-    pub warmup: bool,
+    /// Whether to record metrics (only true during Running phase)
+    pub recording: bool,
     /// Range of key IDs this worker should prefill (start..end).
     /// Only used when prefill is enabled.
     pub prefill_range: Option<std::ops::Range<usize>>,
@@ -163,8 +164,8 @@ pub struct IoWorker {
     /// Rate limiting
     ratelimiter: Option<Arc<DynamicRateLimiter>>,
 
-    /// Whether we're in warmup mode (don't record metrics)
-    warmup: bool,
+    /// Whether to record metrics (only true during Running phase)
+    recording: bool,
 
     /// Prefill state: keys pending to be written (not yet sent or need retry)
     prefill_pending: std::collections::VecDeque<usize>,
@@ -200,9 +201,12 @@ impl IoWorker {
             Some(range) => {
                 let pending: std::collections::VecDeque<usize> = (range.start..range.end).collect();
                 let total = range.end - range.start;
-                eprintln!(
-                    "[worker {}] prefill initialized: {} keys (range {}..{})",
-                    cfg.id, total, range.start, range.end
+                tracing::debug!(
+                    worker_id = cfg.id,
+                    total,
+                    start = range.start,
+                    end = range.end,
+                    "prefill initialized"
                 );
                 (pending, total, total == 0)
             }
@@ -222,7 +226,7 @@ impl IoWorker {
             value_buf,
             results: Vec::with_capacity(pipeline_depth),
             ratelimiter: cfg.ratelimiter,
-            warmup: cfg.warmup,
+            recording: cfg.recording,
             prefill_pending,
             prefill_in_flight: Vec::new(), // Will be sized when sessions are created
             prefill_confirmed: 0,
@@ -371,9 +375,9 @@ impl IoWorker {
         Ok(socket.into())
     }
 
-    /// Set warmup mode.
-    pub fn set_warmup(&mut self, warmup: bool) {
-        self.warmup = warmup;
+    /// Set whether to record metrics (only true during Running phase).
+    pub fn set_recording(&mut self, recording: bool) {
+        self.recording = recording;
     }
 
     /// Run a single iteration of the event loop.
@@ -417,7 +421,7 @@ impl IoWorker {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let delete_ratio = self.config.workload.commands.delete;
-        let warmup = self.warmup;
+        let recording = self.recording;
 
         for session in &mut self.momento_sessions {
             // Drive connection (TLS handshake, HTTP/2 setup)
@@ -457,7 +461,7 @@ impl IoWorker {
                     session.set(&self.key_buf, &self.value_buf, now).is_some()
                 };
 
-                if sent && !warmup {
+                if sent && recording {
                     metrics::REQUESTS_SENT.increment();
                 }
 
@@ -473,7 +477,7 @@ impl IoWorker {
                 tracing::debug!("Momento poll error: {}", e);
             }
 
-            if !warmup {
+            if recording {
                 for result in &self.results {
                     metrics::RESPONSES_RECEIVED.increment();
                     if result.is_error_response {
@@ -549,9 +553,11 @@ impl IoWorker {
         // Check if prefill is done: all keys have been confirmed
         if self.prefill_confirmed >= self.prefill_total {
             self.prefill_done = true;
-            eprintln!(
-                "[worker {}] prefill complete: {}/{} keys confirmed",
-                self.id, self.prefill_confirmed, self.prefill_total
+            tracing::debug!(
+                worker_id = self.id,
+                confirmed = self.prefill_confirmed,
+                total = self.prefill_total,
+                "prefill complete"
             );
             self.shared.mark_prefill_complete();
             return Ok(true);
@@ -669,7 +675,7 @@ impl IoWorker {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let delete_ratio = self.config.workload.commands.delete;
-        let warmup = self.warmup;
+        let recording = self.recording;
 
         // Pack each connection's pipeline to maximize throughput.
         // Fill each session's pipeline completely before moving to the next.
@@ -702,7 +708,7 @@ impl IoWorker {
                     session.set(&self.key_buf, &self.value_buf, now).is_some()
                 };
 
-                if sent && !warmup {
+                if sent && recording {
                     metrics::REQUESTS_SENT.increment();
                 }
 
@@ -820,7 +826,7 @@ impl IoWorker {
                         }
 
                         // Record metrics from parsed responses (outside closure)
-                        if !self.warmup {
+                        if self.recording {
                             for result in &self.results {
                                 metrics::RESPONSES_RECEIVED.increment();
                                 if result.is_error_response {
@@ -912,7 +918,7 @@ impl IoWorker {
 
     #[inline]
     fn poll_responses(&mut self, now: std::time::Instant) {
-        if self.warmup {
+        if !self.recording {
             // Still need to parse responses but don't record metrics
             for idx in 0..self.sessions.len() {
                 self.results.clear();

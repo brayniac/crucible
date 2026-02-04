@@ -548,7 +548,7 @@ fn run_worker(
         config,
         shared: Arc::clone(&shared),
         ratelimiter,
-        warmup: true,
+        recording: false,
         prefill_range,
     };
 
@@ -580,9 +580,9 @@ fn run_worker(
             break;
         }
 
-        // Update warmup state on phase transition
+        // Update recording state on phase transition
         if phase != last_phase {
-            worker.set_warmup(!phase.is_recording());
+            worker.set_recording(phase.is_recording());
             last_phase = phase;
         }
 
