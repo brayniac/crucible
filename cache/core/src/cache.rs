@@ -148,6 +148,18 @@ impl CacheLayer {
         }
     }
 
+    /// Mark an item as deleted and attempt segment compaction.
+    ///
+    /// This is like `mark_deleted` but additionally attempts to compact the
+    /// segment with its predecessor when the deletion creates enough free space.
+    pub fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H) {
+        match self {
+            CacheLayer::Fifo(layer) => layer.mark_deleted_and_compact(location, hashtable),
+            CacheLayer::Ttl(layer) => layer.mark_deleted_and_compact(location, hashtable),
+            CacheLayer::Disk(layer) => layer.mark_deleted_and_compact(location, hashtable),
+        }
+    }
+
     /// Get the remaining TTL for an item.
     pub fn item_ttl(&self, location: ItemLocation) -> Option<Duration> {
         match self {
@@ -835,8 +847,8 @@ impl<H: Hashtable> TieredCache<H> {
             return false;
         }
 
-        // Mark as deleted in the layer
-        self.mark_deleted_at(location);
+        // Mark as deleted in the layer and try to compact
+        self.mark_deleted_at_with_compact(location);
 
         true
     }
@@ -1169,6 +1181,18 @@ impl<H: Hashtable> TieredCache<H> {
             && let Some(layer) = self.layers.get(layer_idx)
         {
             layer.mark_deleted(item_loc);
+        }
+    }
+
+    /// Mark an item as deleted and attempt segment compaction.
+    ///
+    /// This is called from `delete` to allow eager segment reclamation.
+    fn mark_deleted_at_with_compact(&self, location: Location) {
+        let item_loc = ItemLocation::from_location(location);
+        if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
+            && let Some(layer) = self.layers.get(layer_idx)
+        {
+            layer.mark_deleted_and_compact(item_loc, self.hashtable.as_ref());
         }
     }
 

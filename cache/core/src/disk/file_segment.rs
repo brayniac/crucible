@@ -51,17 +51,21 @@ impl<'a> FileSegment<'a> {
     /// - `id`: Segment ID within the pool
     /// - `data`: Pointer to mmap'd segment memory
     /// - `len`: Size of segment memory in bytes
+    /// - `free_queue`: Pointer to the pool's free queue for async segment release
     pub unsafe fn new(
         pool_id: u8,
         is_per_item_ttl: bool,
         id: u32,
         data: *mut u8,
         len: usize,
+        free_queue: *const crossbeam_deque::Injector<u32>,
     ) -> Self {
         // SAFETY: Caller ensures data pointer is valid and has proper alignment.
         // The SliceSegment::new call requires the same safety guarantees.
         Self {
-            inner: unsafe { SliceSegment::new(pool_id, is_per_item_ttl, id, data, len) },
+            inner: unsafe {
+                SliceSegment::new(pool_id, is_per_item_ttl, id, data, len, free_queue)
+            },
             dirty: AtomicBool::new(false),
         }
     }
@@ -408,12 +412,17 @@ impl FileSegment<'_> {
 mod tests {
     use super::*;
 
+    /// Dummy free queue for tests - segments won't actually be released back.
+    static TEST_FREE_QUEUE: std::sync::LazyLock<crossbeam_deque::Injector<u32>> =
+        std::sync::LazyLock::new(crossbeam_deque::Injector::new);
+
     fn create_test_segment() -> (Vec<u8>, FileSegment<'static>) {
         let mut data = vec![0u8; 64 * 1024]; // 64KB
         let ptr = data.as_mut_ptr();
         let len = data.len();
 
-        let segment = unsafe { FileSegment::new(2, false, 0, ptr, len) };
+        let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*TEST_FREE_QUEUE;
+        let segment = unsafe { FileSegment::new(2, false, 0, ptr, len, free_queue_ptr) };
 
         (data, segment)
     }

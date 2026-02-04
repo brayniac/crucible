@@ -140,7 +140,8 @@ pub struct FilePool {
     segments: Vec<FileSegment<'static>>,
 
     /// Lock-free free list.
-    free_queue: crossbeam_deque::Injector<u32>,
+    /// Boxed for stable address - segments hold raw pointers to this.
+    free_queue: Box<crossbeam_deque::Injector<u32>>,
 
     /// Pool ID (0-3).
     pool_id: u8,
@@ -466,9 +467,12 @@ impl FilePoolBuilder {
             }
         }
 
-        // Initialize segments
+        // Initialize free queue first (boxed for stable address)
+        let free_queue = Box::new(crossbeam_deque::Injector::new());
+        let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*free_queue;
+
+        // Initialize segments with pointer to free queue
         let mut segments = Vec::with_capacity(num_segments);
-        let free_queue = crossbeam_deque::Injector::new();
 
         for id in 0..num_segments {
             let offset = HEADER_SIZE + id * self.segment_size;
@@ -481,6 +485,7 @@ impl FilePoolBuilder {
                     id as u32,
                     segment_ptr,
                     self.segment_size,
+                    free_queue_ptr,
                 )
             };
 

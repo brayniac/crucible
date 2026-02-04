@@ -196,4 +196,15 @@ pub trait Layer: Send + Sync {
     /// # Arguments
     /// * `location` - Item location from `begin_write_item`
     fn cancel_write_item(&self, location: ItemLocation);
+
+    /// Mark an item as deleted and attempt segment compaction.
+    ///
+    /// This is like `mark_deleted` but additionally attempts to compact the
+    /// segment with its predecessor when the deletion creates enough free space.
+    /// This eagerly reclaims fragmented space rather than waiting for eviction.
+    ///
+    /// # Arguments
+    /// * `location` - Item location
+    /// * `hashtable` - Hashtable for updating item locations during compaction
+    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H);
 }

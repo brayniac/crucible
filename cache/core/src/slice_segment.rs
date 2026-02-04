@@ -94,6 +94,11 @@ pub struct SliceSegment<'a> {
     /// Generation counter - incremented on reuse to prevent ABA.
     generation: AtomicU16,
 
+    /// Pointer to the pool's free queue for async release.
+    /// When a segment in AwaitingRelease state has its last reader drop,
+    /// the guard pushes segment_id to this queue.
+    free_queue: *const crossbeam_deque::Injector<u32>,
+
     _lifetime: std::marker::PhantomData<&'a u8>,
 }
 
@@ -120,12 +125,14 @@ impl<'a> SliceSegment<'a> {
     /// - `id`: Segment ID within the pool
     /// - `data`: Pointer to segment memory
     /// - `len`: Size of segment memory in bytes
+    /// - `free_queue`: Pointer to pool's free queue for async release
     pub unsafe fn new(
         pool_id: u8,
         is_per_item_ttl: bool,
         id: u32,
         data: *mut u8,
         len: usize,
+        free_queue: *const crossbeam_deque::Injector<u32>,
     ) -> Self {
         debug_assert!(pool_id <= 3, "pool_id {} exceeds 2-bit limit", pool_id);
         debug_assert!(len <= u32::MAX as usize, "segment too large");
@@ -157,6 +164,7 @@ impl<'a> SliceSegment<'a> {
             pool_flags,
             merge_count: AtomicU16::new(0),
             generation: AtomicU16::new(0),
+            free_queue,
             _lifetime: std::marker::PhantomData,
         }
     }
@@ -322,6 +330,9 @@ impl<'a> SliceSegment<'a> {
             &raw[key_start..key_end],
             &raw[value_start..value_end],
             &raw[optional_start..optional_end],
+            &self.metadata,
+            self.free_queue,
+            self.id,
         ))
     }
 
@@ -394,6 +405,9 @@ impl<'a> SliceSegment<'a> {
             &raw[key_start..key_end],
             &raw[value_start..value_end],
             &raw[optional_start..optional_end],
+            &self.metadata,
+            self.free_queue,
+            self.id,
         ))
     }
 
@@ -1169,7 +1183,8 @@ impl Segment for SliceSegment<'_> {
             | State::Live
             | State::Sealed
             | State::Relinking => {}
-            State::Draining | State::Locked => return Ok(false),
+            // Reject new operations on segments being cleared or awaiting release
+            State::Draining | State::Locked | State::AwaitingRelease => return Ok(false),
         }
 
         let header_size = if self.is_per_item_ttl() {
@@ -1281,6 +1296,48 @@ impl SliceSegment<'_> {
         };
         self.metadata.store(free_meta.pack(), Ordering::Release);
     }
+
+    /// Release a condemned segment to the free queue.
+    ///
+    /// Called when the last reader drops its guard on a segment in
+    /// AwaitingRelease state. Transitions to Free and pushes to the
+    /// pool's free queue.
+    ///
+    /// Returns true if the segment was released, false if it wasn't
+    /// in AwaitingRelease state.
+    pub fn release_condemned(&self) -> bool {
+        let current = self.metadata.load(Ordering::Acquire);
+        let current_meta = Metadata::unpack(current);
+
+        if current_meta.state != State::AwaitingRelease {
+            return false;
+        }
+
+        let new_meta = Metadata {
+            next: INVALID_SEGMENT_ID,
+            prev: INVALID_SEGMENT_ID,
+            state: State::Free,
+        };
+
+        if self
+            .metadata
+            .compare_exchange(current, new_meta.pack(), Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            // Reset merge count
+            self.merge_count.store(0, Ordering::Relaxed);
+
+            // Push to free queue
+            // SAFETY: free_queue pointer is valid for the lifetime of the pool,
+            // and the segment is part of the pool
+            unsafe {
+                (*self.free_queue).push(self.id);
+            }
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // Implement SegmentGuard for zero-copy access
@@ -1370,6 +1427,9 @@ impl SegmentGuard for SliceSegment<'_> {
             &raw[key_start..key_end],
             &raw[value_start..value_end],
             &raw[optional_start..optional_end],
+            &self.metadata,
+            self.free_queue,
+            self.id,
         ))
     }
 }
@@ -1379,6 +1439,10 @@ mod tests {
     use super::*;
     use crate::item::ItemGuard;
     use std::alloc::{Layout, alloc, dealloc};
+
+    /// Dummy free queue for tests - segments won't actually be released back.
+    static TEST_FREE_QUEUE: std::sync::LazyLock<crossbeam_deque::Injector<u32>> =
+        std::sync::LazyLock::new(crossbeam_deque::Injector::new);
 
     fn create_test_segment(
         pool_id: u8,
@@ -1392,7 +1456,9 @@ mod tests {
         unsafe {
             std::ptr::write_bytes(ptr, 0, size);
         }
-        let segment = unsafe { SliceSegment::new(pool_id, is_per_item_ttl, id, ptr, size) };
+        let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*TEST_FREE_QUEUE;
+        let segment =
+            unsafe { SliceSegment::new(pool_id, is_per_item_ttl, id, ptr, size, free_queue_ptr) };
         (segment, ptr, layout)
     }
 

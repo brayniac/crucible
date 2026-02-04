@@ -502,6 +502,11 @@ impl Layer for FifoLayer {
             segment.mark_deleted_at_offset(location.offset());
         }
     }
+
+    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, _hashtable: &H) {
+        // FIFO layer doesn't do compaction - just mark deleted
+        self.mark_deleted(location);
+    }
 }
 
 /// Builder for [`FifoLayer`].

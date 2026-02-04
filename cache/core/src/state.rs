@@ -82,6 +82,10 @@ pub enum State {
     Draining = 6,
     /// Being cleared, all access rejected.
     Locked = 7,
+    /// Segment is condemned (removed from chain, hashtable updated).
+    /// Data remains valid for in-flight readers. When ref_count hits 0,
+    /// the last reader's guard drop will push segment to free queue.
+    AwaitingRelease = 8,
 }
 
 impl State {
@@ -100,14 +104,21 @@ impl State {
             5 => State::Relinking,
             6 => State::Draining,
             7 => State::Locked,
+            8 => State::AwaitingRelease,
             _ => panic!("Invalid segment state value: {}", value),
         }
     }
 
     /// Check if the segment is readable (allows get operations).
+    ///
+    /// Note: AwaitingRelease is readable for in-flight readers to complete,
+    /// but new reads should not be initiated (hashtable points elsewhere).
     #[inline]
     pub fn is_readable(self) -> bool {
-        matches!(self, State::Live | State::Sealed | State::Relinking)
+        matches!(
+            self,
+            State::Live | State::Sealed | State::Relinking | State::AwaitingRelease
+        )
     }
 
     /// Check if the segment is writable (allows append operations).
@@ -218,12 +229,13 @@ mod tests {
         assert_eq!(State::from_u8(5), State::Relinking);
         assert_eq!(State::from_u8(6), State::Draining);
         assert_eq!(State::from_u8(7), State::Locked);
+        assert_eq!(State::from_u8(8), State::AwaitingRelease);
     }
 
     #[test]
     #[should_panic(expected = "Invalid segment state value")]
     fn test_state_from_u8_invalid() {
-        State::from_u8(8);
+        State::from_u8(9);
     }
 
     #[test]
@@ -231,14 +243,17 @@ mod tests {
         assert!(State::Live.is_readable());
         assert!(State::Sealed.is_readable());
         assert!(State::Relinking.is_readable());
+        assert!(State::AwaitingRelease.is_readable());
         assert!(!State::Free.is_readable());
         assert!(!State::Draining.is_readable());
 
         assert!(State::Live.is_writable());
         assert!(!State::Sealed.is_writable());
+        assert!(!State::AwaitingRelease.is_writable());
 
         assert!(State::Sealed.is_evictable());
         assert!(!State::Live.is_evictable());
+        assert!(!State::AwaitingRelease.is_evictable());
     }
 
     #[test]
@@ -311,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_all_states_pack_unpack() {
-        for state_val in 0..8u8 {
+        for state_val in 0..9u8 {
             let state = State::from_u8(state_val);
             let meta = Metadata::new(state);
             let packed = meta.pack();

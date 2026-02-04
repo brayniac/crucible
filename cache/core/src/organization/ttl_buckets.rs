@@ -536,6 +536,125 @@ impl TtlBucket {
         Ok(segment_id)
     }
 
+    /// Replace two adjacent segments with a single spare segment.
+    ///
+    /// This is used for segment compaction. The two source segments (src_a and src_b)
+    /// must be adjacent in the chain (src_a.next == src_b), and src_b must not be the tail.
+    ///
+    /// After this operation:
+    /// - src_a and src_b are transitioned to AwaitingRelease state
+    /// - spare is inserted in their place in the chain with state Sealed
+    /// - Chain pointers are updated atomically
+    ///
+    /// # Arguments
+    /// * `src_a_id` - First segment to replace (the older one, closer to head)
+    /// * `src_b_id` - Second segment to replace (src_a.next)
+    /// * `spare_id` - The spare segment to insert in their place
+    /// * `pool` - The segment pool
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err` with reason on failure.
+    pub fn replace_adjacent_segments<P: RamPool>(
+        &self,
+        src_a_id: u32,
+        src_b_id: u32,
+        spare_id: u32,
+        pool: &P,
+    ) -> Result<(), TtlBucketError>
+    where
+        P::Segment: Segment,
+    {
+        let _guard = self.chain_mutex.lock();
+
+        let src_a = pool
+            .get(src_a_id)
+            .ok_or(TtlBucketError::InvalidSegmentId)?;
+        let src_b = pool
+            .get(src_b_id)
+            .ok_or(TtlBucketError::InvalidSegmentId)?;
+        let spare = pool
+            .get(spare_id)
+            .ok_or(TtlBucketError::InvalidSegmentId)?;
+
+        // Verify src_a and src_b are adjacent
+        if src_a.next() != Some(src_b_id) {
+            return Err(TtlBucketError::InvalidState);
+        }
+
+        // Both must be in Relinking state (set by caller after copying items)
+        if src_a.state() != State::Relinking || src_b.state() != State::Relinking {
+            return Err(TtlBucketError::InvalidState);
+        }
+
+        // src_b cannot be the tail (tail is Live)
+        let tail = self.tail.load(Ordering::Acquire);
+        if src_b_id == tail {
+            return Err(TtlBucketError::InvalidState);
+        }
+
+        // Spare must be in Reserved or Sealed state
+        let spare_state = spare.state();
+        if spare_state != State::Reserved && spare_state != State::Sealed {
+            return Err(TtlBucketError::InvalidState);
+        }
+
+        // Get chain links
+        let prev_of_a = src_a.prev().unwrap_or(INVALID_SEGMENT_ID);
+        let next_of_b = src_b.next().unwrap_or(INVALID_SEGMENT_ID);
+
+        // Set up spare's chain pointers and transition to Sealed
+        if !spare.cas_metadata(spare_state, State::Sealed, Some(next_of_b), Some(prev_of_a)) {
+            return Err(TtlBucketError::StateTransitionFailed);
+        }
+
+        // Update prev segment's next pointer (or head if src_a was head)
+        let head = self.head.load(Ordering::Acquire);
+        if src_a_id == head {
+            self.head.store(spare_id, Ordering::Release);
+        } else if prev_of_a != INVALID_SEGMENT_ID {
+            if let Some(prev_segment) = pool.get(prev_of_a) {
+                prev_segment.cas_metadata(
+                    prev_segment.state(),
+                    prev_segment.state(),
+                    Some(spare_id),
+                    None,
+                );
+            }
+        }
+
+        // Update next segment's prev pointer
+        if next_of_b != INVALID_SEGMENT_ID {
+            if let Some(next_segment) = pool.get(next_of_b) {
+                next_segment.cas_metadata(
+                    next_segment.state(),
+                    next_segment.state(),
+                    None,
+                    Some(spare_id),
+                );
+            }
+        }
+
+        // Transition src_a and src_b to AwaitingRelease
+        // Clear their chain pointers
+        src_a.cas_metadata(
+            State::Relinking,
+            State::AwaitingRelease,
+            Some(INVALID_SEGMENT_ID),
+            Some(INVALID_SEGMENT_ID),
+        );
+        src_b.cas_metadata(
+            State::Relinking,
+            State::AwaitingRelease,
+            Some(INVALID_SEGMENT_ID),
+            Some(INVALID_SEGMENT_ID),
+        );
+
+        // Update segment count: removed 2, added 1 = net -1
+        self.segment_count.fetch_sub(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
     /// Walk the chain and count segments (up to max_count).
     pub fn chain_len<P: RamPool>(&self, max_count: usize, pool: &P) -> usize
     where

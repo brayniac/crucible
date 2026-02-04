@@ -672,11 +672,20 @@ pub trait ItemGuard<'a>: Send {
 ///
 /// The segment's reference count is held while this guard exists,
 /// preventing eviction or clearing of the segment.
+///
+/// When the last reader drops a guard for a segment in `AwaitingRelease` state,
+/// the segment is automatically returned to the free queue.
 pub struct BasicItemGuard<'a> {
     ref_count: &'a AtomicU32,
     key: &'a [u8],
     value: &'a [u8],
     optional: &'a [u8],
+    /// Segment metadata for checking AwaitingRelease state on drop.
+    metadata: &'a crate::sync::AtomicU64,
+    /// Free queue pointer for releasing condemned segments.
+    free_queue: *const crossbeam_deque::Injector<u32>,
+    /// Segment ID for pushing to free queue.
+    segment_id: u32,
 }
 
 impl<'a> BasicItemGuard<'a> {
@@ -686,17 +695,24 @@ impl<'a> BasicItemGuard<'a> {
     /// The caller must ensure that:
     /// - The segment's ref_count has been incremented
     /// - The slice references are valid and point into the segment's data
+    /// - The metadata, free_queue, and segment_id are valid for the segment
     pub fn new(
         ref_count: &'a AtomicU32,
         key: &'a [u8],
         value: &'a [u8],
         optional: &'a [u8],
+        metadata: &'a crate::sync::AtomicU64,
+        free_queue: *const crossbeam_deque::Injector<u32>,
+        segment_id: u32,
     ) -> Self {
         Self {
             ref_count,
             key,
             value,
             optional,
+            metadata,
+            free_queue,
+            segment_id,
         }
     }
 }
@@ -717,7 +733,42 @@ impl<'a> ItemGuard<'a> for BasicItemGuard<'a> {
 
 impl Drop for BasicItemGuard<'_> {
     fn drop(&mut self) {
-        self.ref_count.fetch_sub(1, Ordering::Release);
+        use crate::state::{Metadata, State, INVALID_SEGMENT_ID};
+
+        let prev_count = self.ref_count.fetch_sub(1, Ordering::Release);
+
+        // If we were the last reader (prev_count == 1 means new count is 0)
+        if prev_count == 1 {
+            // Check if segment is condemned and needs release
+            let packed = self.metadata.load(Ordering::Acquire);
+            let meta = Metadata::unpack(packed);
+
+            if meta.state == State::AwaitingRelease {
+                // Transition to Free and push to free queue
+                let new_meta = Metadata {
+                    next: INVALID_SEGMENT_ID,
+                    prev: INVALID_SEGMENT_ID,
+                    state: State::Free,
+                };
+
+                if self
+                    .metadata
+                    .compare_exchange(
+                        packed,
+                        new_meta.pack(),
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    // Push to free queue
+                    // SAFETY: free_queue pointer is valid for the lifetime of the pool
+                    unsafe {
+                        (*self.free_queue).push(self.segment_id);
+                    }
+                }
+            }
+        }
     }
 }
 

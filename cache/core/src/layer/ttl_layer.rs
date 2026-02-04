@@ -22,6 +22,7 @@ use crate::memory_pool::{MemoryPool, MemoryPoolBuilder};
 use crate::organization::TtlBuckets;
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentGuard, SegmentKeyVerify, SegmentPrune};
+use crate::slice_segment::SliceSegment;
 use crate::state::State;
 use std::time::Duration;
 
@@ -234,6 +235,200 @@ impl TtlLayer {
         // Clear segment state and release to pool
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
         self.pool.release(segment_id);
+    }
+
+    /// Try to compact a segment with its predecessor using a spare segment.
+    ///
+    /// If the segment (src_b) and its predecessor (src_a) can fit their combined
+    /// live items in one segment, reserves a spare segment, copies all live items
+    /// from both sources to the spare, updates the hashtable, and replaces the
+    /// two sources in the chain with the spare.
+    ///
+    /// This uses the spare segment approach (like SSD garbage collection) to avoid
+    /// trying to fill gaps in sequential segments.
+    ///
+    /// # Arguments
+    /// * `segment_id` - The segment where deletion occurred (src_b)
+    /// * `hashtable` - Hashtable for updating item locations during compaction
+    ///
+    /// # Returns
+    /// `true` if compaction occurred, `false` otherwise.
+    fn try_compact_segment<H: Hashtable>(&self, segment_id: u32, hashtable: &H) -> bool {
+        // src_b = segment where deletion occurred
+        let src_b = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Source must be Sealed (not Live - can't compact active segment)
+        if src_b.state() != State::Sealed {
+            return false;
+        }
+
+        // Get the bucket this segment belongs to
+        let bucket_id = match src_b.bucket_id() {
+            Some(id) => id as usize,
+            None => return false,
+        };
+
+        let bucket = self.buckets.get_bucket_by_index(bucket_id);
+
+        // Need at least 3 segments: head + src_a + src_b + tail (or more)
+        // Because we need src_b to have a predecessor (src_a) and src_b can't be tail
+        if bucket.segment_count() < 3 {
+            return false;
+        }
+
+        // src_b cannot be the tail (tail is Live)
+        if bucket.tail() == Some(segment_id) {
+            return false;
+        }
+
+        // Get predecessor (src_a)
+        let src_a_id = match src_b.prev() {
+            Some(id) => id,
+            None => return false,
+        };
+
+        let src_a = match self.pool.get(src_a_id) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // src_a must also be Sealed
+        if src_a.state() != State::Sealed {
+            return false;
+        }
+
+        // Check if combined live bytes fit in one segment
+        let src_a_live = src_a.live_bytes();
+        let src_b_live = src_b.live_bytes();
+        let segment_capacity = self.pool.segment_size() as u32;
+
+        // Conservative check: live_bytes doesn't include headers, so we need some margin
+        // Use 90% of capacity to account for header overhead
+        let max_combined = (segment_capacity * 9) / 10;
+        if src_a_live + src_b_live > max_combined {
+            return false;
+        }
+
+        // Try to reserve a spare segment (gracefully degrade if none available)
+        let spare_id = match self.pool.reserve() {
+            Some(id) => id,
+            None => return false,
+        };
+
+        let spare = match self.pool.get(spare_id) {
+            Some(s) => s,
+            None => {
+                self.pool.release(spare_id);
+                return false;
+            }
+        };
+
+        // Set up spare segment with the earlier expire_at (min of src_a and src_b)
+        let src_a_expire = src_a.expire_at();
+        let src_b_expire = src_b.expire_at();
+        let min_expire = src_a_expire.min(src_b_expire);
+        spare.set_expire_at(min_expire);
+
+        // Copy bucket_id to spare
+        if let Some(bucket_idx) = src_a.bucket_id() {
+            spare.set_bucket_id(bucket_idx);
+        }
+
+        // Transition src_a and src_b to Relinking (allows reads, signals modification)
+        if !src_a.cas_metadata(State::Sealed, State::Relinking, None, None) {
+            self.pool.release(spare_id);
+            return false;
+        }
+        if !src_b.cas_metadata(State::Sealed, State::Relinking, None, None) {
+            // Rollback src_a
+            src_a.cas_metadata(State::Relinking, State::Sealed, None, None);
+            self.pool.release(spare_id);
+            return false;
+        }
+
+        // Helper to copy items from a source segment to the spare
+        let copy_items = |src: &SliceSegment<'static>, src_id: u32| {
+            let header_size = BasicHeader::SIZE;
+            let mut offset = 0u32;
+            let write_offset = src.write_offset();
+
+            while offset < write_offset {
+                if let Some(data) = src.data_slice(offset, header_size) {
+                    if let Some(header) = BasicHeader::try_from_bytes(data) {
+                        let item_size = header.padded_size() as u32;
+
+                        // Skip deleted items
+                        if !header.is_deleted() {
+                            let optional_start = offset as usize + header_size;
+                            let optional_len = header.optional_len() as usize;
+                            let key_start = optional_start + optional_len;
+                            let key_len = header.key_len() as usize;
+                            let value_start = key_start + key_len;
+                            let value_len = header.value_len() as usize;
+
+                            if let (Some(key), Some(value), Some(optional)) = (
+                                src.data_slice(key_start as u32, key_len),
+                                src.data_slice(value_start as u32, value_len),
+                                src.data_slice(optional_start as u32, optional_len),
+                            ) {
+                                if let Some(new_offset) = spare.append_item(key, value, optional) {
+                                    let old_loc =
+                                        ItemLocation::new(self.pool.pool_id(), src_id, offset);
+                                    let new_loc = ItemLocation::new(
+                                        self.pool.pool_id(),
+                                        spare_id,
+                                        new_offset,
+                                    );
+
+                                    // Update hashtable (preserve frequency)
+                                    if !hashtable.cas_location(
+                                        key,
+                                        old_loc.to_location(),
+                                        new_loc.to_location(),
+                                        true,
+                                    ) {
+                                        // CAS failed, mark spare copy as deleted
+                                        spare.mark_deleted_at_offset(new_offset);
+                                    }
+                                }
+                                // If spare is full, just stop (partial copy is fine)
+                            }
+                        }
+
+                        offset += item_size;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        };
+
+        // Copy items from src_a first (older), then src_b
+        copy_items(src_a, src_a_id);
+        copy_items(src_b, segment_id);
+
+        // Replace src_a and src_b with spare in the chain
+        // This transitions src_a and src_b to AwaitingRelease
+        if bucket
+            .replace_adjacent_segments(src_a_id, segment_id, spare_id, &self.pool)
+            .is_err()
+        {
+            // Rollback: restore states and release spare
+            src_a.cas_metadata(State::Relinking, State::Sealed, None, None);
+            src_b.cas_metadata(State::Relinking, State::Sealed, None, None);
+            self.pool.release(spare_id);
+            return false;
+        }
+
+        // Compaction successful!
+        // src_a and src_b are now in AwaitingRelease state.
+        // They will be returned to the free pool when their last reader drops.
+        true
     }
 
     /// Try to free a segment if it has no live items.
@@ -775,6 +970,35 @@ impl Layer for TtlLayer {
 
         if let Some(segment) = self.pool.get(location.segment_id()) {
             segment.mark_deleted_at_offset(location.offset());
+        }
+    }
+
+    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H) {
+        if location.pool_id() != self.pool.pool_id() {
+            return;
+        }
+
+        if let Some(segment) = self.pool.get(location.segment_id()) {
+            // Mark the item as deleted (same as mark_deleted)
+            let offset = location.offset();
+            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE)
+                && let Some(header) = BasicHeader::try_from_bytes(data)
+            {
+                let key_start =
+                    offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
+                let key_len = header.key_len() as usize;
+                if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                    let _ = segment.mark_deleted(offset, key);
+
+                    // Try to free segment if now empty
+                    if self.try_free_empty_segment(location.segment_id()) {
+                        return;
+                    }
+
+                    // Try compaction with predecessor
+                    self.try_compact_segment(location.segment_id(), hashtable);
+                }
+            }
         }
     }
 }
