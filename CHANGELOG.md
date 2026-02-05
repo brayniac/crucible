@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Adaptive threshold for merge eviction policy
 - Removed manual recv_mode and zero_copy config options from io-driver
 
+### Security
+- Update `bytes` to 1.11.1 to fix integer overflow in `BytesMut::reserve` (CVE-2026-25541)
+
 ### Fixed
 - Memory pool now reserves segments for writes (prevents OutOfMemory with small heaps)
 - Server banner now shows configured I/O engine

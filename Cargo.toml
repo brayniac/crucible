@@ -45,7 +45,7 @@ repository = "https://github.com/brayniac/crucible"
 [workspace.dependencies]
 # Shared dependencies across workspace
 ahash = "0.8"
-bytes = "1.10"
+bytes = "1.11.1"
 clap = "4"
 clocksource = "0.8"
 crossbeam-channel = "0.5"
