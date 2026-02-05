@@ -9,6 +9,17 @@ use std::time::Duration;
 
 use crate::metrics::{DELETES, FLUSHES, GETS, HITS, MISSES, SET_ERRORS, SETS};
 
+// RESP error responses
+const RESP_ERR_CACHE: &[u8] = b"-ERR cache error\r\n";
+const RESP_ERR_WRONGTYPE: &[u8] =
+    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+const RESP_ERR_NOT_INTEGER: &[u8] = b"-ERR value is not an integer or out of range\r\n";
+const RESP_ERR_OVERFLOW: &[u8] = b"-ERR increment or decrement would overflow\r\n";
+
+// Memcache error responses
+const MC_SERVER_ERROR: &[u8] = b"SERVER_ERROR\r\n";
+const MC_SERVER_ERROR_OOM: &[u8] = b"SERVER_ERROR out of memory\r\n";
+
 /// RESP protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RespVersion {
@@ -222,14 +233,13 @@ pub fn execute_resp<C: Cache>(
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::NotNumeric) => {
-                    write_buf
-                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_NOT_INTEGER);
                 }
                 Err(cache_core::CacheError::Overflow) => {
-                    write_buf.extend_from_slice(b"-ERR increment or decrement would overflow\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_OVERFLOW);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -243,11 +253,10 @@ pub fn execute_resp<C: Cache>(
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::NotNumeric) => {
-                    write_buf
-                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_NOT_INTEGER);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -266,14 +275,13 @@ pub fn execute_resp<C: Cache>(
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::NotNumeric) => {
-                    write_buf
-                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_NOT_INTEGER);
                 }
                 Err(cache_core::CacheError::Overflow) => {
-                    write_buf.extend_from_slice(b"-ERR increment or decrement would overflow\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_OVERFLOW);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -292,11 +300,10 @@ pub fn execute_resp<C: Cache>(
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::NotNumeric) => {
-                    write_buf
-                        .extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_NOT_INTEGER);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -313,7 +320,7 @@ pub fn execute_resp<C: Cache>(
                         write_buf.extend_from_slice(b"\r\n");
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 }
             } else {
@@ -336,12 +343,12 @@ pub fn execute_resp<C: Cache>(
                                 write_buf.extend_from_slice(b"\r\n");
                             }
                             Err(_) => {
-                                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                                write_buf.extend_from_slice(RESP_ERR_CACHE);
                             }
                         }
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 }
             }
@@ -460,12 +467,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -490,12 +495,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     }
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -523,12 +526,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     }
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -555,12 +556,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     }
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -575,12 +574,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -589,12 +586,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 write_buf.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::HLen { key } => match cache.hlen(key) {
@@ -605,12 +600,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 write_buf.extend_from_slice(b"\r\n");
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::HKeys { key } => match cache.hkeys(key) {
@@ -628,12 +621,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 }
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::HVals { key } => match cache.hvals(key) {
@@ -651,12 +642,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 }
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::HSetNx { key, field, value } => {
@@ -666,12 +655,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(if set { b":1\r\n" } else { b":0\r\n" });
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -683,18 +670,16 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 write_buf.extend_from_slice(b"\r\n");
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(cache_core::CacheError::NotNumeric) => {
                 write_buf.extend_from_slice(b"-ERR hash value is not an integer\r\n");
             }
             Err(cache_core::CacheError::Overflow) => {
-                write_buf.extend_from_slice(b"-ERR increment or decrement would overflow\r\n");
+                write_buf.extend_from_slice(RESP_ERR_OVERFLOW);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
 
@@ -712,12 +697,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -732,12 +715,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -759,12 +740,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
                 None => match cache.lpop(key) {
@@ -786,12 +765,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
             }
@@ -814,12 +791,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
                 None => match cache.rpop(key) {
@@ -841,12 +816,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
             }
@@ -868,12 +841,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     }
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -885,12 +856,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 write_buf.extend_from_slice(b"\r\n");
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::LIndex { key, index } => {
@@ -914,12 +883,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     }
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -936,12 +903,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"-ERR index out of range\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -950,12 +915,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 write_buf.extend_from_slice(b"+OK\r\n");
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::LPushX { key, values } => {
@@ -969,12 +932,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -989,12 +950,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -1013,12 +972,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -1033,12 +990,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -1059,12 +1014,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     }
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -1073,12 +1026,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 write_buf.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::SMisMember { key, members } => {
@@ -1094,12 +1045,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                     }
                 }
                 Err(cache_core::CacheError::WrongType) => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                    write_buf.extend_from_slice(RESP_ERR_CACHE);
                 }
             }
         }
@@ -1111,12 +1060,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                 write_buf.extend_from_slice(b"\r\n");
             }
             Err(cache_core::CacheError::WrongType) => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
+                write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
             }
             Err(_) => {
-                write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                write_buf.extend_from_slice(RESP_ERR_CACHE);
             }
         },
         RespCommand::SPop { key, count } => {
@@ -1137,12 +1084,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
                 None => match cache.spop(key) {
@@ -1164,12 +1109,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
             }
@@ -1192,12 +1135,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
                 None => match cache.srandmember(key) {
@@ -1219,12 +1160,10 @@ pub fn execute_resp_data_structures<C: Cache + HashCache + ListCache + SetCache>
                         }
                     }
                     Err(cache_core::CacheError::WrongType) => {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                        write_buf.extend_from_slice(RESP_ERR_WRONGTYPE);
                     }
                     Err(_) => {
-                        write_buf.extend_from_slice(b"-ERR cache error\r\n");
+                        write_buf.extend_from_slice(RESP_ERR_CACHE);
                     }
                 },
             }
@@ -1312,7 +1251,7 @@ pub fn execute_memcache<C: Cache>(
                 }
                 Err(_) => {
                     SET_ERRORS.increment();
-                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
             false
@@ -1336,7 +1275,7 @@ pub fn execute_memcache<C: Cache>(
                 }
                 Err(_) => {
                     SET_ERRORS.increment();
-                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
             false
@@ -1360,7 +1299,7 @@ pub fn execute_memcache<C: Cache>(
                 }
                 Err(_) => {
                     SET_ERRORS.increment();
-                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
             false
@@ -1395,7 +1334,7 @@ pub fn execute_memcache<C: Cache>(
                 Err(_) => {
                     // Other error (e.g., out of memory)
                     SET_ERRORS.increment();
-                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
             false
@@ -1448,7 +1387,7 @@ pub fn execute_memcache<C: Cache>(
                         .extend_from_slice(b"CLIENT_ERROR cannot increment non-numeric value\r\n");
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR);
                 }
             }
             false
@@ -1477,7 +1416,7 @@ pub fn execute_memcache<C: Cache>(
                         .extend_from_slice(b"CLIENT_ERROR cannot decrement non-numeric value\r\n");
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR);
                 }
             }
             false
@@ -1496,7 +1435,7 @@ pub fn execute_memcache<C: Cache>(
                     }
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR);
                 }
             }
             false
@@ -1515,7 +1454,7 @@ pub fn execute_memcache<C: Cache>(
                     }
                 }
                 Err(_) => {
-                    write_buf.extend_from_slice(b"SERVER_ERROR\r\n");
+                    write_buf.extend_from_slice(MC_SERVER_ERROR);
                 }
             }
             false
