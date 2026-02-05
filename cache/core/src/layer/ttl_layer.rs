@@ -373,29 +373,25 @@ impl TtlLayer {
                                 src.data_slice(key_start as u32, key_len),
                                 src.data_slice(value_start as u32, value_len),
                                 src.data_slice(optional_start as u32, optional_len),
-                            ) {
-                                if let Some(new_offset) = spare.append_item(key, value, optional) {
-                                    let old_loc =
-                                        ItemLocation::new(self.pool.pool_id(), src_id, offset);
-                                    let new_loc = ItemLocation::new(
-                                        self.pool.pool_id(),
-                                        spare_id,
-                                        new_offset,
-                                    );
+                            ) && let Some(new_offset) = spare.append_item(key, value, optional)
+                            {
+                                let old_loc =
+                                    ItemLocation::new(self.pool.pool_id(), src_id, offset);
+                                let new_loc =
+                                    ItemLocation::new(self.pool.pool_id(), spare_id, new_offset);
 
-                                    // Update hashtable (preserve frequency)
-                                    if !hashtable.cas_location(
-                                        key,
-                                        old_loc.to_location(),
-                                        new_loc.to_location(),
-                                        true,
-                                    ) {
-                                        // CAS failed, mark spare copy as deleted
-                                        spare.mark_deleted_at_offset(new_offset);
-                                    }
+                                // Update hashtable (preserve frequency)
+                                if !hashtable.cas_location(
+                                    key,
+                                    old_loc.to_location(),
+                                    new_loc.to_location(),
+                                    true,
+                                ) {
+                                    // CAS failed, mark spare copy as deleted
+                                    spare.mark_deleted_at_offset(new_offset);
                                 }
-                                // If spare is full, just stop (partial copy is fine)
                             }
+                            // If spare is full, just stop (partial copy is fine)
                         }
 
                         offset += item_size;

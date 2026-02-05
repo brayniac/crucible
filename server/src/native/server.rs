@@ -538,12 +538,11 @@ fn run_worker<C: Cache>(
                             // through the normal send path (retries on SendReady).
                             // We can't use send_owned because it doesn't handle partial
                             // writes - the remaining data would be lost.
-                            if let Some(resp) = zero_copy_response {
-                                if let Some(conn) =
+                            if let Some(resp) = zero_copy_response
+                                && let Some(conn) =
                                     connections.get_mut(idx).and_then(|c| c.as_mut())
-                                {
-                                    conn.queue_zero_copy_response(resp);
-                                }
+                            {
+                                conn.queue_zero_copy_response(resp);
                             }
                             // All responses (small and large) now accumulate in write_buf
 
@@ -683,12 +682,11 @@ fn run_worker<C: Cache>(
                             // Queue zero-copy response for sending via write_buf.
                             // This ensures reliable delivery by handling short writes
                             // through the normal send path (retries on SendReady).
-                            if let Some(resp) = zero_copy_response {
-                                if let Some(conn) =
+                            if let Some(resp) = zero_copy_response
+                                && let Some(conn) =
                                     connections.get_mut(idx).and_then(|c| c.as_mut())
-                                {
-                                    conn.queue_zero_copy_response(resp);
-                                }
+                            {
+                                conn.queue_zero_copy_response(resp);
                             }
                             // All responses now accumulate in write_buf
 

@@ -605,27 +605,27 @@ impl TtlBucket {
         let head = self.head.load(Ordering::Acquire);
         if src_a_id == head {
             self.head.store(spare_id, Ordering::Release);
-        } else if prev_of_a != INVALID_SEGMENT_ID {
-            if let Some(prev_segment) = pool.get(prev_of_a) {
-                prev_segment.cas_metadata(
-                    prev_segment.state(),
-                    prev_segment.state(),
-                    Some(spare_id),
-                    None,
-                );
-            }
+        } else if prev_of_a != INVALID_SEGMENT_ID
+            && let Some(prev_segment) = pool.get(prev_of_a)
+        {
+            prev_segment.cas_metadata(
+                prev_segment.state(),
+                prev_segment.state(),
+                Some(spare_id),
+                None,
+            );
         }
 
         // Update next segment's prev pointer
-        if next_of_b != INVALID_SEGMENT_ID {
-            if let Some(next_segment) = pool.get(next_of_b) {
-                next_segment.cas_metadata(
-                    next_segment.state(),
-                    next_segment.state(),
-                    None,
-                    Some(spare_id),
-                );
-            }
+        if next_of_b != INVALID_SEGMENT_ID
+            && let Some(next_segment) = pool.get(next_of_b)
+        {
+            next_segment.cas_metadata(
+                next_segment.state(),
+                next_segment.state(),
+                None,
+                Some(spare_id),
+            );
         }
 
         // Transition src_a and src_b to AwaitingRelease

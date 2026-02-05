@@ -1307,44 +1307,6 @@ impl Connection {
     }
 }
 
-/// Write a RESP bulk string response directly to a buffer.
-/// Returns the number of bytes written.
-///
-/// # Safety
-/// Caller must ensure `buf` has enough capacity for the response:
-/// at least 1 + 20 + 2 + value.len() + 2 bytes.
-#[inline]
-unsafe fn write_bulk_string(buf: &mut [u8], value: &[u8]) -> usize {
-    let mut pos = 0;
-    buf[pos] = b'$';
-    pos += 1;
-
-    // Write length using itoa
-    let mut len_buf = itoa::Buffer::new();
-    let len_str = len_buf.format(value.len()).as_bytes();
-    // SAFETY: Caller guarantees buf has enough capacity
-    unsafe {
-        std::ptr::copy_nonoverlapping(len_str.as_ptr(), buf.as_mut_ptr().add(pos), len_str.len());
-    }
-    pos += len_str.len();
-
-    buf[pos] = b'\r';
-    buf[pos + 1] = b'\n';
-    pos += 2;
-
-    // SAFETY: Caller guarantees buf has enough capacity
-    unsafe {
-        std::ptr::copy_nonoverlapping(value.as_ptr(), buf.as_mut_ptr().add(pos), value.len());
-    }
-    pos += value.len();
-
-    buf[pos] = b'\r';
-    buf[pos + 1] = b'\n';
-    pos += 2;
-
-    pos
-}
-
 impl Default for Connection {
     fn default() -> Self {
         // Use 1MB as the default max value size (same as server default)

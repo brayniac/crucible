@@ -525,7 +525,6 @@ fn test_mio_large_values_4m_to_16m() {
         heap_size_mb: 512,
         segment_size_mb: 64,
         max_value_size_mb: 63, // Must be less than segment_size
-        ..Default::default()
     });
 }
 
@@ -538,7 +537,6 @@ fn test_mio_large_values_64m() {
         heap_size_mb: 1024,
         segment_size_mb: 128,
         max_value_size_mb: 127, // Must be less than segment_size
-        ..Default::default()
     });
 }
 

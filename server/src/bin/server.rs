@@ -78,7 +78,7 @@ fn run(
 
     print_banner(&BannerConfig {
         version: env!("CARGO_PKG_VERSION"),
-        backend_detail: &backend_detail,
+        backend_detail,
         cache_backend: config.cache.backend,
         eviction_policy: policy,
         workers: config.threads(),

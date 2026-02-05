@@ -656,7 +656,7 @@ mod tests {
         let options = ParseOptions::new().max_bulk_string_len(1024); // 1KB limit
 
         // SET with 2KB value (above limit)
-        let header = format!("*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$2048\r\n");
+        let header = "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$2048\r\n".to_string();
         let mut data = header.as_bytes().to_vec();
         // Add some bytes of the value (simulating partial receive)
         data.extend_from_slice(&[b'x'; 500]);

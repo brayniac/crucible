@@ -126,10 +126,10 @@ fn test_1000_5mb_values_with_eviction() {
 
         if i > 0 && i % 100 == 0 {
             let recent_key = format!("key_{:06}", i);
-            if let Some(retrieved) = cache.get_item(recent_key.as_bytes()) {
-                if verify_value(&retrieved, value_size, seed) {
-                    successful_gets += 1;
-                }
+            if let Some(retrieved) = cache.get_item(recent_key.as_bytes())
+                && verify_value(&retrieved, value_size, seed)
+            {
+                successful_gets += 1;
             }
             println!(
                 "Progress: {} items written, {} verified",
@@ -147,10 +147,10 @@ fn test_1000_5mb_values_with_eviction() {
     for i in (0..num_items).rev().take(20) {
         let key = format!("key_{:06}", i);
         let seed = (i % 256) as u8;
-        if let Some(retrieved) = cache.get_item(key.as_bytes()) {
-            if verify_value(&retrieved, value_size, seed) {
-                found += 1;
-            }
+        if let Some(retrieved) = cache.get_item(key.as_bytes())
+            && verify_value(&retrieved, value_size, seed)
+        {
+            found += 1;
         }
     }
 
@@ -206,10 +206,10 @@ fn test_500_10mb_values_with_eviction() {
     for i in (0..num_items).rev().take(10) {
         let key = format!("key_{:06}", i);
         let seed = (i % 256) as u8;
-        if let Some(retrieved) = cache.get_item(key.as_bytes()) {
-            if verify_value(&retrieved, value_size, seed) {
-                found += 1;
-            }
+        if let Some(retrieved) = cache.get_item(key.as_bytes())
+            && verify_value(&retrieved, value_size, seed)
+        {
+            found += 1;
         }
     }
 
@@ -402,10 +402,10 @@ fn test_interleaved_sizes() {
         let key = format!("interleaved_key_{:06}", i);
         let seed = (i % 256) as u8;
 
-        if let Some(retrieved) = cache.get_item(key.as_bytes()) {
-            if verify_value(&retrieved, size, seed) {
-                verified += 1;
-            }
+        if let Some(retrieved) = cache.get_item(key.as_bytes())
+            && verify_value(&retrieved, size, seed)
+        {
+            verified += 1;
         }
     }
 
@@ -476,13 +476,13 @@ fn test_slab_class_stats_with_large_values() {
     // Get class stats for various class IDs
     println!("Slab class statistics:");
     for class_id in 0..32 {
-        if let Some(stat) = cache.class_stats(class_id) {
-            if stat.slab_count > 0 {
-                println!(
-                    "  Class {}: slot_size={}, slabs={}, items={}, bytes={}",
-                    class_id, stat.slot_size, stat.slab_count, stat.item_count, stat.bytes_used
-                );
-            }
+        if let Some(stat) = cache.class_stats(class_id)
+            && stat.slab_count > 0
+        {
+            println!(
+                "  Class {}: slot_size={}, slabs={}, items={}, bytes={}",
+                class_id, stat.slot_size, stat.slab_count, stat.item_count, stat.bytes_used
+            );
         }
     }
 

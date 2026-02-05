@@ -926,13 +926,13 @@ impl IoWorker {
                 // Handle prefill tracking: pop from in-flight and confirm
                 if !self.prefill_done {
                     for result in &self.results {
-                        if result.request_type == RequestType::Set {
-                            if let Some(_key_id) = self.prefill_in_flight[idx].pop_front() {
-                                if result.success {
-                                    self.prefill_confirmed += 1;
-                                } else {
-                                    self.prefill_pending.push_back(_key_id);
-                                }
+                        if result.request_type == RequestType::Set
+                            && let Some(_key_id) = self.prefill_in_flight[idx].pop_front()
+                        {
+                            if result.success {
+                                self.prefill_confirmed += 1;
+                            } else {
+                                self.prefill_pending.push_back(_key_id);
                             }
                         }
                     }

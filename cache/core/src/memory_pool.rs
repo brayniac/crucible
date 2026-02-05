@@ -398,8 +398,13 @@ impl MemoryPoolBuilder {
             ));
         }
 
-        // Ensure spare_capacity doesn't exceed available segments
-        let spare_capacity = self.spare_capacity.min(num_segments as u32);
+        // Ensure spare_capacity doesn't consume all segments.
+        // We need at least 2 segments in free_queue for the cache to function:
+        // - 1 segment for writing (Live state)
+        // - 1 segment that can be Sealed (so eviction can work: head != tail)
+        let min_free_segments = 2;
+        let max_spare = num_segments.saturating_sub(min_free_segments) as u32;
+        let spare_capacity = self.spare_capacity.min(max_spare);
 
         let actual_size = num_segments * self.segment_size;
 
@@ -745,18 +750,39 @@ mod tests {
     }
 
     #[test]
-    fn test_spare_capacity_capped_at_segment_count() {
-        // Request more spare capacity than segments available
+    fn test_spare_capacity_capped_to_preserve_free_segments() {
+        // Request more spare capacity than available after reserving min_free_segments
         let pool = MemoryPoolBuilder::new(0)
             .segment_size(64 * 1024)
             .heap_size(128 * 1024) // Only 2 segments
-            .spare_capacity(10) // Request 10, but only 2 exist
+            .spare_capacity(10) // Request 10, but need to keep 2 free for cache operation
             .build()
             .expect("Failed to create pool");
 
-        // Should be capped at segment count
-        assert_eq!(pool.spare_capacity(), 2);
-        assert_eq!(pool.spare_count(), 2);
+        // With 2 segments total and min 2 required in free_queue, spare_capacity = 0
+        assert_eq!(pool.spare_capacity(), 0);
+        assert_eq!(pool.spare_count(), 0);
         assert_eq!(pool.segment_count(), 2);
+
+        // All segments should be in free queue
+        assert_eq!(pool.free_count(), 2);
+    }
+
+    #[test]
+    fn test_spare_capacity_with_sufficient_segments() {
+        // With enough segments, spare_capacity is honored
+        let pool = MemoryPoolBuilder::new(0)
+            .segment_size(64 * 1024)
+            .heap_size(384 * 1024) // 6 segments
+            .spare_capacity(3) // Request 3 spare
+            .build()
+            .expect("Failed to create pool");
+
+        // With 6 segments and min 2 required, can have up to 4 spare
+        // But we only requested 3
+        assert_eq!(pool.spare_capacity(), 3);
+        assert_eq!(pool.spare_count(), 3);
+        assert_eq!(pool.segment_count(), 6);
+        assert_eq!(pool.free_count(), 6); // total = spare + free_queue
     }
 }
