@@ -997,9 +997,13 @@ mod tests {
 
     #[test]
     fn test_evict_with_items() {
+        // Need enough segments for eviction to work:
+        // - min_free_segments = 3 reserved in free_queue
+        // - At least 2 segments in a bucket for eviction to succeed
+        // - So we need at least 5 segments (256KB / 32KB = 8 gives us headroom)
         let cache = SegCacheBuilder::new()
-            .heap_size(128 * 1024) // Small cache
-            .segment_size(32 * 1024) // Small segments
+            .heap_size(256 * 1024) // 8 segments with 32KB each
+            .segment_size(32 * 1024)
             .hashtable_power(8)
             .build()
             .expect("Failed to create cache");
@@ -1007,13 +1011,15 @@ mod tests {
         let ttl = Duration::from_secs(3600);
         let value = vec![b'x'; 1024];
 
-        // Fill the cache with items
-        for i in 0..50 {
+        // Fill the cache with enough items to use multiple segments
+        // Each segment holds ~31 items (32KB / 1KB)
+        // We need at least 2 segments worth to enable eviction
+        for i in 0..100 {
             let key = format!("key_{}", i);
             let _ = cache.set(key.as_bytes(), &value, ttl);
         }
 
-        // Now eviction should work
+        // Now eviction should work (bucket has 2+ segments)
         let evicted = cache.evict();
         assert!(evicted);
     }
