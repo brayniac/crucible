@@ -424,7 +424,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "benchmark"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "arrow",
  "axum",
@@ -535,7 +535,7 @@ checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
 name = "cache-core"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "ahash",
  "bytes",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "grpc"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "bytes",
  "http2",
@@ -1088,7 +1088,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "heap-cache"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "http2"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "bytes",
  "io-driver",
@@ -1271,7 +1271,7 @@ checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
 name = "io-driver"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "metriken",
 ]
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-memcache"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "itoa",
  "memchr",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-momento"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "bytes",
  "grpc",
@@ -2135,14 +2135,14 @@ dependencies = [
 
 [[package]]
 name = "protocol-ping"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "thiserror 2.0.17",
 ]
 
 [[package]]
 name = "protocol-resp"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "itoa",
  "memchr",
@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "ahash",
  "axum",
@@ -2473,7 +2473,7 @@ checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "segcache"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "axum",
  "bytes",
@@ -2665,7 +2665,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slab-cache"
-version = "0.2.12-alpha.0"
+version = "0.2.12"
 dependencies = [
  "cache-core",
  "clocksource",
