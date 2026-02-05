@@ -113,26 +113,7 @@ pub fn execute_resp<C: Cache>(
             let result = match (*nx, *xx) {
                 (true, false) => cache.add(key, value, ttl),
                 (false, true) => cache.replace(key, value, ttl),
-                _ => {
-                    // Default SET behavior (with retries)
-                    let mut last_err = None;
-                    for attempt in 0..10 {
-                        match cache.set(key, value, ttl) {
-                            Ok(()) => {
-                                write_buf.extend_from_slice(b"+OK\r\n");
-                                return;
-                            }
-                            Err(e) => {
-                                last_err = Some(e);
-                                if attempt < 9 {
-                                    let delay = Duration::from_micros(100 << attempt);
-                                    std::thread::sleep(delay);
-                                }
-                            }
-                        }
-                    }
-                    Err(last_err.unwrap_or(cache_core::CacheError::OutOfMemory))
-                }
+                _ => cache.set(key, value, ttl),
             };
 
             match result {
@@ -1325,22 +1306,15 @@ pub fn execute_memcache<C: Cache>(
                 Some(Duration::from_secs(*exptime as u64))
             };
 
-            for attempt in 0..10 {
-                match cache.set(key, data, ttl) {
-                    Ok(()) => {
-                        write_buf.extend_from_slice(b"STORED\r\n");
-                        return false;
-                    }
-                    Err(_) => {
-                        if attempt < 9 {
-                            let delay = Duration::from_micros(100 << attempt);
-                            std::thread::sleep(delay);
-                        }
-                    }
+            match cache.set(key, data, ttl) {
+                Ok(()) => {
+                    write_buf.extend_from_slice(b"STORED\r\n");
+                }
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
                 }
             }
-            SET_ERRORS.increment();
-            write_buf.extend_from_slice(b"SERVER_ERROR out of memory\r\n");
             false
         }
         MemcacheCommand::Add {
@@ -1627,23 +1601,17 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            for attempt in 0..10 {
-                match cache.set(key, value, ttl) {
-                    Ok(()) => {
-                        let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
-                        unsafe { write_buf.set_len(write_buf.len() + len) };
-                        return false;
-                    }
-                    Err(_) => {
-                        if attempt < 9 {
-                            let delay = Duration::from_micros(100 << attempt);
-                            std::thread::sleep(delay);
-                        }
-                    }
+            match cache.set(key, value, ttl) {
+                Ok(()) => {
+                    let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
+                    unsafe { write_buf.set_len(write_buf.len() + len) };
+                    return false;
+                }
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    BinaryResponse::encode_out_of_memory(buf, Opcode::Set, *opaque)
                 }
             }
-            SET_ERRORS.increment();
-            BinaryResponse::encode_out_of_memory(buf, Opcode::Set, *opaque)
         }
         BinaryCommand::SetQ {
             key,
@@ -1658,19 +1626,13 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            for attempt in 0..10 {
-                match cache.set(key, value, ttl) {
-                    Ok(()) => return false,
-                    Err(_) => {
-                        if attempt < 9 {
-                            let delay = Duration::from_micros(100 << attempt);
-                            std::thread::sleep(delay);
-                        }
-                    }
+            match cache.set(key, value, ttl) {
+                Ok(()) => return false,
+                Err(_) => {
+                    SET_ERRORS.increment();
+                    0
                 }
             }
-            SET_ERRORS.increment();
-            0
         }
         BinaryCommand::Add {
             key,
