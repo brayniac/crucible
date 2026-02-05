@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Memory pool now reserves segments for writes (prevents OutOfMemory with small heaps)
+- Memory pool `free_count()` now correctly excludes spare queue from eviction decisions
 - Server banner now shows configured I/O engine
 - Benchmark excludes prefill/warmup from bandwidth metrics
 - Benchmark division by zero in output formatters
