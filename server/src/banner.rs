@@ -44,8 +44,8 @@ pub fn print_banner(config: &BannerConfig) {
     .unwrap();
     writeln!(output).unwrap();
 
-    // Runtime info
-    writeln!(output, "Runtime:     native ({})", config.backend_detail).unwrap();
+    // I/O engine
+    writeln!(output, "I/O:         {}", config.backend_detail).unwrap();
 
     // Cache backend and policy
     let backend_str = match config.cache_backend {

@@ -4,14 +4,21 @@ mod server;
 
 pub use server::run;
 
-/// Get the backend detail string for the banner.
-pub fn backend_detail() -> &'static str {
-    // io-driver has io_uring enabled by default and handles runtime detection
-    #[cfg(target_os = "linux")]
-    {
-        if io_driver::uring_available() {
-            return "io_uring";
+use io_driver::IoEngine;
+
+/// Get the backend detail string for the banner based on the configured engine.
+pub fn backend_detail(engine: IoEngine) -> &'static str {
+    match engine {
+        IoEngine::Mio => "mio",
+        IoEngine::Uring => "io_uring",
+        IoEngine::Auto => {
+            #[cfg(target_os = "linux")]
+            {
+                if io_driver::uring_available() {
+                    return "io_uring";
+                }
+            }
+            "mio"
         }
     }
-    "mio"
 }

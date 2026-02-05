@@ -71,15 +71,7 @@ fn run(
     let cpu_affinity = config.cpu_affinity();
     let cpu_affinity_slice = cpu_affinity.as_deref();
 
-    let backend_detail: String = {
-        let base = server::native::backend_detail();
-        // io_uring uses hybrid recv mode (multishot + direct recv for large values)
-        if base == "io_uring" {
-            format!("{}, hybrid", base)
-        } else {
-            base.to_string()
-        }
-    };
+    let backend_detail = server::native::backend_detail(config.io_engine);
 
     let numa_node = config.numa_node();
     let policy = config.cache.effective_policy();
