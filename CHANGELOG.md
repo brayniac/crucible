@@ -15,6 +15,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.12] - 2026-02-05
+
+### Added
+- Prefill mode for cache warmup in benchmark tool
+- Segment compaction on item deletion with spare segment pool
+- Two-queue spare segment pool for compaction operations
+
+### Changed
+- Increased max value size to 4 GiB and segment size to 128 MiB
+- Adaptive threshold for merge eviction policy
+- Removed manual recv_mode and zero_copy config options from io-driver
+
+### Security
+- Update `bytes` to 1.11.1 to fix integer overflow in `BytesMut::reserve` (CVE-2026-25541)
+
+### Fixed
+- Memory pool now reserves segments for writes (prevents OutOfMemory with small heaps)
+- Memory pool `free_count()` now correctly excludes spare queue from eviction decisions
+- Server banner now shows configured I/O engine
+- Benchmark excludes prefill/warmup from bandwidth metrics
+- Benchmark division by zero in output formatters
+- Large value responses in server
+- Drain oversized SET values to prevent protocol desync
+
 ## [0.2.11] - 2026-02-02
 
 ### Fixed
