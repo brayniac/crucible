@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.13] - 2026-02-05
+
+### Fixed
+- Remove blocking retry loops (thread::sleep up to 51.2ms) from SET command handlers in all
+  protocols (RESP, Memcache ASCII, Memcache Binary) — fail fast on capacity errors instead of
+  stalling the worker thread
+
+### Changed
+- Extract repeated error response byte literals into module-level constants in command execution
+
 ## [0.2.12] - 2026-02-05
 
 ### Added
