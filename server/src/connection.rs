@@ -15,6 +15,7 @@ use protocol_resp::{
     Command as RespCommand, ParseError as RespParseError, ParseOptions, ParseProgress,
     STREAMING_THRESHOLD, parse_streaming,
 };
+use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::time::Duration;
 
@@ -23,6 +24,10 @@ use crate::metrics::PROTOCOL_ERRORS;
 
 /// RESP trailer constant for zero-copy responses.
 const RESP_CRLF: &[u8] = b"\r\n";
+
+/// Minimum value size for the zero-copy send queue path.
+/// Values below this threshold are copied into `write_buf` to avoid queue overhead.
+const ZERO_COPY_MIN_VALUE_SIZE: usize = 1024;
 
 /// A zero-copy GET response for vectored I/O.
 ///
@@ -114,6 +119,15 @@ impl ZeroCopyResponse {
             self.value_ref.into_bytes(),
             Bytes::from_static(RESP_CRLF),
         ]
+    }
+
+    /// Consume the response and return header bytes and the value ref separately.
+    ///
+    /// Used by the zero-copy send queue path to avoid copying the value.
+    #[inline]
+    pub fn into_parts(self) -> (Bytes, ValueRef) {
+        let header = Bytes::copy_from_slice(&self.header[..self.header_len as usize]);
+        (header, self.value_ref)
     }
 
     /// Serialize the entire response into the provided buffer.
@@ -244,6 +258,13 @@ enum StreamingState {
 pub struct Connection {
     write_buf: BytesMut,
     write_pos: usize,
+    /// Ordered queue of owned send buffers for zero-copy GET responses.
+    /// Drained before `write_buf` in the send path.
+    send_queue: VecDeque<Bytes>,
+    /// Byte progress into the front entry of `send_queue`.
+    send_offset: usize,
+    /// Total unsent bytes across all `send_queue` entries (for backpressure).
+    send_queue_bytes: usize,
     protocol: DetectedProtocol,
     should_close: bool,
     resp_version: RespVersion,
@@ -268,6 +289,9 @@ impl Connection {
         Self {
             write_buf: BytesMut::with_capacity(65536),
             write_pos: 0,
+            send_queue: VecDeque::new(),
+            send_offset: 0,
+            send_queue_bytes: 0,
             protocol: DetectedProtocol::Unknown,
             should_close: false,
             resp_version: RespVersion::default(),
@@ -289,10 +313,10 @@ impl Connection {
         self.pending_write_len() <= Self::MAX_PENDING_WRITE
     }
 
-    /// Get the amount of pending write data.
+    /// Get the amount of pending write data (send queue + write buffer).
     #[inline]
     pub fn pending_write_len(&self) -> usize {
-        self.write_buf.len().saturating_sub(self.write_pos)
+        self.send_queue_bytes + self.write_buf.len().saturating_sub(self.write_pos)
     }
 
     /// Detect protocol from the first byte of data.
@@ -321,8 +345,8 @@ impl Connection {
     /// buffer without copying into a connection-owned buffer.
     #[inline]
     pub fn process_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
-        // Clear write buffer if all data has been sent
-        if self.write_pos >= self.write_buf.len() {
+        // Clear write buffer if all data has been sent and queue is empty
+        if self.send_queue.is_empty() && self.write_pos >= self.write_buf.len() {
             self.write_buf.clear();
             self.write_pos = 0;
         }
@@ -1178,17 +1202,55 @@ impl Connection {
 
     #[inline]
     pub fn has_pending_write(&self) -> bool {
-        self.write_pos < self.write_buf.len()
+        !self.send_queue.is_empty() || self.write_pos < self.write_buf.len()
     }
 
     #[inline]
     pub fn pending_write_data(&self) -> &[u8] {
-        &self.write_buf[self.write_pos..]
+        if let Some(front) = self.send_queue.front() {
+            &front[self.send_offset..]
+        } else {
+            &self.write_buf[self.write_pos..]
+        }
     }
 
     #[inline]
     pub fn advance_write(&mut self, n: usize) {
-        self.write_pos += n;
+        if self.send_queue.is_empty() {
+            // No queue entries — advance through write_buf directly
+            self.write_pos += n;
+            if self.write_pos >= self.write_buf.len() {
+                self.write_buf.clear();
+                self.write_pos = 0;
+            }
+            return;
+        }
+
+        // Advance through send queue entries
+        let mut remaining = n;
+        while remaining > 0 {
+            if let Some(front) = self.send_queue.front() {
+                let avail = front.len() - self.send_offset;
+                if remaining < avail {
+                    self.send_offset += remaining;
+                    self.send_queue_bytes -= remaining;
+                    return;
+                }
+                // Completed this queue entry
+                remaining -= avail;
+                self.send_queue_bytes -= avail;
+                self.send_offset = 0;
+                self.send_queue.pop_front();
+            } else {
+                // Queue exhausted, advance through write_buf
+                self.write_pos += remaining;
+                if self.write_pos >= self.write_buf.len() {
+                    self.write_buf.clear();
+                    self.write_pos = 0;
+                }
+                return;
+            }
+        }
     }
 
     #[inline]
@@ -1196,17 +1258,63 @@ impl Connection {
         self.should_close
     }
 
-    /// Queue a zero-copy response for sending via the normal write buffer.
+    /// Flush unsent `write_buf` contents into the send queue as a frozen `Bytes` entry.
     ///
-    /// This serializes the response into write_buf, which ensures reliable
-    /// delivery even if the socket buffer is full (short writes are handled
-    /// by the normal send path that retries on SendReady).
+    /// This is called before pushing a zero-copy value into the queue to preserve
+    /// pipeline ordering: all preceding small responses (already in `write_buf`)
+    /// must be sent before the zero-copy value.
+    #[inline]
+    fn flush_write_buf_to_queue(&mut self) {
+        // Discard the already-sent prefix
+        if self.write_pos > 0 {
+            let _ = self.write_buf.split_to(self.write_pos);
+            self.write_pos = 0;
+        }
+
+        // Freeze remaining unsent data into a queue entry
+        if !self.write_buf.is_empty() {
+            let frozen = self.write_buf.split().freeze();
+            self.send_queue_bytes += frozen.len();
+            self.send_queue.push_back(frozen);
+            // write_buf is now empty (split() leaves it with 0 len but keeps capacity)
+        }
+    }
+
+    /// Queue a zero-copy response for sending.
     ///
-    /// Use this instead of `send_owned` for large responses to avoid data loss
-    /// from unhandled short writes.
+    /// For large values (>= ZERO_COPY_MIN_VALUE_SIZE), the value `Bytes` from
+    /// segment memory goes into the send queue without copying. The RESP header
+    /// and any preceding responses in `write_buf` are flushed to the queue first
+    /// to preserve pipeline ordering.
+    ///
+    /// For small values, the response is serialized into `write_buf` as before,
+    /// avoiding queue overhead.
     #[inline]
     pub fn queue_zero_copy_response(&mut self, resp: ZeroCopyResponse) {
-        resp.serialize_to_buf(&mut self.write_buf);
+        if resp.value_ref.len() < ZERO_COPY_MIN_VALUE_SIZE {
+            // Small value: copy into write_buf (avoids queue overhead)
+            resp.serialize_to_buf(&mut self.write_buf);
+            return;
+        }
+
+        // Large value: zero-copy path
+        // Consume the response to get header bytes and value ref separately
+        let (header_bytes, value_ref) = resp.into_parts();
+
+        // 1. Write the RESP header into write_buf
+        self.write_buf.extend_from_slice(&header_bytes);
+
+        // 2. Flush all unsent write_buf data (including the header) to the queue
+        self.flush_write_buf_to_queue();
+
+        // 3. Push the value directly into the queue (zero-copy — just takes ownership)
+        let value_bytes = value_ref.into_bytes();
+        self.send_queue_bytes += value_bytes.len();
+        self.send_queue.push_back(value_bytes);
+
+        // 4. Write the RESP trailer into the fresh write_buf
+        //    (it will merge with subsequent small responses)
+        self.write_buf.extend_from_slice(RESP_CRLF);
     }
 
     /// Process a single RESP command with zero-copy support.
@@ -1226,8 +1334,8 @@ impl Connection {
         buf: &mut dyn RecvBuf,
         cache: &C,
     ) -> Option<ZeroCopyResponse> {
-        // Clear write buffer if all data has been sent
-        if self.write_pos >= self.write_buf.len() {
+        // Clear write buffer if all data has been sent and queue is empty
+        if self.send_queue.is_empty() && self.write_pos >= self.write_buf.len() {
             self.write_buf.clear();
             self.write_pos = 0;
         }
@@ -1671,5 +1779,292 @@ mod tests {
 
         // All data should be consumed
         assert!(buf.as_slice().is_empty());
+    }
+
+    // --- Zero-copy send queue tests ---
+
+    /// A mock cache that returns a configurable value for any GET.
+    /// Uses a leaked Box for the ref_count so the ValueRef is always valid.
+    struct MockCacheWithValue {
+        value: Vec<u8>,
+        ref_count: &'static std::sync::atomic::AtomicU32,
+    }
+
+    impl MockCacheWithValue {
+        fn new(value: Vec<u8>) -> Self {
+            let ref_count = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(1_000_000)));
+            Self { value, ref_count }
+        }
+    }
+
+    impl Cache for MockCacheWithValue {
+        fn get(&self, _key: &[u8]) -> Option<cache_core::OwnedGuard> {
+            Some(cache_core::OwnedGuard::new(self.value.clone()))
+        }
+
+        fn with_value<F, R>(&self, _key: &[u8], f: F) -> Option<R>
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            Some(f(&self.value))
+        }
+
+        fn get_value_ref(&self, _key: &[u8]) -> Option<cache_core::ValueRef> {
+            // Increment ref_count for each ValueRef created
+            self.ref_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(unsafe {
+                cache_core::ValueRef::new(
+                    self.ref_count as *const std::sync::atomic::AtomicU32,
+                    self.value.as_ptr(),
+                    self.value.len(),
+                )
+            })
+        }
+
+        fn set(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), cache_core::CacheError> {
+            Ok(())
+        }
+
+        fn delete(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn contains(&self, _key: &[u8]) -> bool {
+            true
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Helper to drain all pending data from a connection into a Vec.
+    fn drain_all_pending(conn: &mut Connection) -> Vec<u8> {
+        let mut result = Vec::new();
+        while conn.has_pending_write() {
+            let data = conn.pending_write_data();
+            result.extend_from_slice(data);
+            let len = data.len();
+            conn.advance_write(len);
+        }
+        result
+    }
+
+    #[test]
+    fn test_zero_copy_queue_large_value() {
+        // Value >= ZERO_COPY_MIN_VALUE_SIZE should use the send queue
+        let value = vec![b'x'; 2048];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        // Send a GET request
+        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+
+        // Use process_one_zero_copy which returns ZeroCopyResponse for hits
+        let resp = conn.process_one_zero_copy(&mut buf, &cache);
+        assert!(resp.is_some(), "should return ZeroCopyResponse for hit");
+
+        // Queue the response
+        conn.queue_zero_copy_response(resp.unwrap());
+
+        // Verify the send queue is used (not empty)
+        assert!(
+            !conn.send_queue.is_empty(),
+            "large value should use send queue"
+        );
+
+        // Drain all data and verify correctness
+        let output = drain_all_pending(&mut conn);
+
+        // Expected: $2048\r\n<2048 bytes>\r\n
+        let expected_header = format!("$2048\r\n");
+        assert!(
+            output.starts_with(expected_header.as_bytes()),
+            "output should start with RESP header"
+        );
+        assert_eq!(
+            &output[expected_header.len()..expected_header.len() + 2048],
+            &value[..],
+            "output should contain the value"
+        );
+        assert!(
+            output.ends_with(b"\r\n"),
+            "output should end with CRLF trailer"
+        );
+        assert_eq!(output.len(), expected_header.len() + 2048 + 2);
+    }
+
+    #[test]
+    fn test_zero_copy_queue_small_value_bypasses_queue() {
+        // Value < ZERO_COPY_MIN_VALUE_SIZE should go directly into write_buf
+        let value = vec![b'y'; 512];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        let resp = conn.process_one_zero_copy(&mut buf, &cache);
+        assert!(resp.is_some());
+
+        conn.queue_zero_copy_response(resp.unwrap());
+
+        // Send queue should be empty for small values
+        assert!(
+            conn.send_queue.is_empty(),
+            "small value should NOT use send queue"
+        );
+
+        // But data should be in write_buf
+        assert!(conn.has_pending_write());
+
+        let output = drain_all_pending(&mut conn);
+        let expected_header = format!("$512\r\n");
+        assert!(output.starts_with(expected_header.as_bytes()));
+        assert_eq!(
+            &output[expected_header.len()..expected_header.len() + 512],
+            &value[..]
+        );
+        assert!(output.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn test_zero_copy_interleaved_small_and_large() {
+        // Pipeline: small GET miss, large GET hit, small GET miss
+        // Tests that pipeline ordering is preserved through the send queue
+        let value = vec![b'z'; 4096];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        // First: a PING command (writes +PONG\r\n to write_buf)
+        let mut buf = TestRecvBuf::new(b"*1\r\n$4\r\nPING\r\n");
+        conn.process_from(&mut buf, &cache);
+        assert_eq!(conn.pending_write_data(), b"+PONG\r\n");
+
+        // Second: a GET that hits (large value, goes to queue)
+        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        let resp = conn.process_one_zero_copy(&mut buf, &cache);
+        assert!(resp.is_some());
+        conn.queue_zero_copy_response(resp.unwrap());
+
+        // Third: another PING (writes to write_buf after the queue entry)
+        let mut buf = TestRecvBuf::new(b"*1\r\n$4\r\nPING\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        // Drain everything and check ordering:
+        // 1. +PONG\r\n (flushed to queue before large value)
+        // 2. $4096\r\n (header, also flushed to queue)
+        // 3. <4096 bytes> (zero-copy value in queue)
+        // 4. \r\n+PONG\r\n (trailer + second PONG in write_buf)
+        let output = drain_all_pending(&mut conn);
+
+        let expected_prefix = b"+PONG\r\n$4096\r\n";
+        assert!(
+            output.starts_with(expected_prefix),
+            "output should start with first PONG + RESP header, got: {:?}",
+            String::from_utf8_lossy(&output[..std::cmp::min(30, output.len())])
+        );
+
+        let value_start = expected_prefix.len();
+        let value_end = value_start + 4096;
+        assert_eq!(
+            &output[value_start..value_end],
+            &value[..],
+            "value should follow header"
+        );
+
+        let trailer_and_pong = b"\r\n+PONG\r\n";
+        assert!(
+            output.ends_with(trailer_and_pong),
+            "output should end with trailer + second PONG, got: {:?}",
+            String::from_utf8_lossy(&output[output.len().saturating_sub(20)..])
+        );
+
+        assert_eq!(
+            output.len(),
+            expected_prefix.len() + 4096 + trailer_and_pong.len()
+        );
+    }
+
+    #[test]
+    fn test_zero_copy_partial_write_through_queue() {
+        // Test partial writes that span queue entries
+        let value = vec![b'A'; 2048];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        let resp = conn.process_one_zero_copy(&mut buf, &cache);
+        conn.queue_zero_copy_response(resp.unwrap());
+
+        // Total expected: header + value + trailer
+        let total_len = conn.pending_write_len();
+        assert!(total_len > 2048);
+
+        // Simulate partial writes: send 10 bytes at a time
+        let mut sent = Vec::new();
+        while conn.has_pending_write() {
+            let data = conn.pending_write_data();
+            let chunk_size = std::cmp::min(10, data.len());
+            sent.extend_from_slice(&data[..chunk_size]);
+            conn.advance_write(chunk_size);
+        }
+
+        // Verify the assembled output is correct
+        assert_eq!(sent.len(), total_len);
+        let expected_header = b"$2048\r\n";
+        assert!(sent.starts_with(expected_header));
+        assert_eq!(
+            &sent[expected_header.len()..expected_header.len() + 2048],
+            &value[..]
+        );
+        assert!(sent.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn test_zero_copy_backpressure_includes_queue_bytes() {
+        // Verify that pending_write_len includes send_queue_bytes for backpressure
+        let value = vec![b'B'; 4096];
+        let cache = MockCacheWithValue::new(value);
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        let resp = conn.process_one_zero_copy(&mut buf, &cache);
+        conn.queue_zero_copy_response(resp.unwrap());
+
+        // pending_write_len should include the queue bytes
+        let pending = conn.pending_write_len();
+        assert!(
+            pending >= 4096,
+            "pending_write_len {} should include value size 4096",
+            pending
+        );
+
+        // should_read should respect the total pending
+        // With 4096 bytes it should still be readable (under 256KB threshold)
+        assert!(conn.should_read());
+    }
+
+    #[test]
+    fn test_zero_copy_queue_empty_after_drain() {
+        let value = vec![b'C'; 2048];
+        let cache = MockCacheWithValue::new(value);
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        let resp = conn.process_one_zero_copy(&mut buf, &cache);
+        conn.queue_zero_copy_response(resp.unwrap());
+
+        assert!(!conn.send_queue.is_empty());
+
+        // Drain everything
+        drain_all_pending(&mut conn);
+
+        // Queue and write_buf should be clean
+        assert!(conn.send_queue.is_empty());
+        assert_eq!(conn.send_queue_bytes, 0);
+        assert!(!conn.has_pending_write());
     }
 }
