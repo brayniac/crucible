@@ -66,7 +66,7 @@
 mod config;
 mod error;
 mod location;
-mod sync;
+pub mod sync;
 
 // Segment-specific location interpretation
 mod item_location;

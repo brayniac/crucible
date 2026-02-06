@@ -1787,12 +1787,12 @@ mod tests {
     /// Uses a leaked Box for the ref_count so the ValueRef is always valid.
     struct MockCacheWithValue {
         value: Vec<u8>,
-        ref_count: &'static std::sync::atomic::AtomicU32,
+        ref_count: &'static cache_core::sync::AtomicU32,
     }
 
     impl MockCacheWithValue {
         fn new(value: Vec<u8>) -> Self {
-            let ref_count = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(1_000_000)));
+            let ref_count = Box::leak(Box::new(cache_core::sync::AtomicU32::new(1_000_000)));
             Self { value, ref_count }
         }
     }
@@ -1812,10 +1812,10 @@ mod tests {
         fn get_value_ref(&self, _key: &[u8]) -> Option<cache_core::ValueRef> {
             // Increment ref_count for each ValueRef created
             self.ref_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, cache_core::sync::Ordering::Relaxed);
             Some(unsafe {
                 cache_core::ValueRef::new(
-                    self.ref_count as *const std::sync::atomic::AtomicU32,
+                    self.ref_count as *const cache_core::sync::AtomicU32,
                     self.value.as_ptr(),
                     self.value.len(),
                 )
@@ -1881,7 +1881,7 @@ mod tests {
         let output = drain_all_pending(&mut conn);
 
         // Expected: $2048\r\n<2048 bytes>\r\n
-        let expected_header = format!("$2048\r\n");
+        let expected_header = "$2048\r\n".to_string();
         assert!(
             output.starts_with(expected_header.as_bytes()),
             "output should start with RESP header"
@@ -1921,7 +1921,7 @@ mod tests {
         assert!(conn.has_pending_write());
 
         let output = drain_all_pending(&mut conn);
-        let expected_header = format!("$512\r\n");
+        let expected_header = "$512\r\n".to_string();
         assert!(output.starts_with(expected_header.as_bytes()));
         assert_eq!(
             &output[expected_header.len()..expected_header.len() + 512],
