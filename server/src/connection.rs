@@ -1203,6 +1203,29 @@ impl Connection {
         }
     }
 
+    /// Collect all pending write data as owned `Bytes` for vectored send.
+    ///
+    /// Returns cloned `Bytes` for send queue entries (cheap Arc increment)
+    /// and copies the write_buf tail. The `Connection` retains its own
+    /// state so `advance_write()` can track progress on partial sends.
+    pub fn collect_pending_writes(&self) -> Vec<Bytes> {
+        let mut bufs = Vec::with_capacity(self.send_queue.len() + 1);
+
+        for (i, entry) in self.send_queue.iter().enumerate() {
+            if i == 0 && self.send_offset > 0 {
+                bufs.push(entry.slice(self.send_offset..));
+            } else {
+                bufs.push(entry.clone());
+            }
+        }
+
+        if self.write_pos < self.write_buf.len() {
+            bufs.push(Bytes::copy_from_slice(&self.write_buf[self.write_pos..]));
+        }
+
+        bufs
+    }
+
     #[inline]
     pub fn advance_write(&mut self, n: usize) {
         if self.send_queue.is_empty() {

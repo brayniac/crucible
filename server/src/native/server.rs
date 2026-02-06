@@ -511,24 +511,11 @@ fn run_worker<C: Cache>(
                             }
                         }
 
-                        // Send all accumulated response data
-                        while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                            if !conn.has_pending_write() {
-                                break;
-                            }
-
-                            let data = conn.pending_write_data();
-                            match driver.send(conn_id, data) {
-                                Ok(n) => {
-                                    stats.add_bytes_sent(n as u64);
-                                    conn.advance_write(n);
-                                }
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(_) => {
-                                    send_error = true;
-                                    break;
-                                }
-                            }
+                        // Send all accumulated response data using vectored I/O
+                        if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
+                            && send_pending(&mut driver, conn, conn_id, stats).is_err()
+                        {
+                            send_error = true;
                         }
                     }
 
@@ -559,28 +546,11 @@ fn run_worker<C: Cache>(
                     let idx = conn_id.slot();
                     let mut close_reason: Option<CloseReason> = None;
 
-                    // Drain pending write data
-                    loop {
-                        let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) else {
-                            break;
-                        };
-
-                        if !conn.has_pending_write() {
-                            break;
-                        }
-
-                        let data = conn.pending_write_data();
-                        match driver.send(conn_id, data) {
-                            Ok(n) => {
-                                stats.add_bytes_sent(n as u64);
-                                conn.advance_write(n);
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(_) => {
-                                close_reason = Some(CloseReason::SendError);
-                                break;
-                            }
-                        }
+                    // Drain pending write data using vectored I/O
+                    if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
+                        && send_pending(&mut driver, conn, conn_id, stats).is_err()
+                    {
+                        close_reason = Some(CloseReason::SendError);
                     }
 
                     if let Some(reason) = close_reason {
@@ -615,23 +585,11 @@ fn run_worker<C: Cache>(
                             // fall through to close handling below
                         }
 
-                        // Send all accumulated response data
-                        while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
-                            if !conn.has_pending_write() {
-                                break;
-                            }
-                            let data = conn.pending_write_data();
-                            match driver.send(conn_id, data) {
-                                Ok(n) => {
-                                    stats.add_bytes_sent(n as u64);
-                                    conn.advance_write(n);
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(_) => {
-                                    close_reason = Some(CloseReason::SendError);
-                                    break;
-                                }
-                            }
+                        // Send all accumulated response data using vectored I/O
+                        if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut())
+                            && send_pending(&mut driver, conn, conn_id, stats).is_err()
+                        {
+                            close_reason = Some(CloseReason::SendError);
                         }
                     }
 
@@ -689,6 +647,30 @@ fn run_worker<C: Cache>(
         }
     }
 
+    Ok(())
+}
+
+/// Send all pending data for a connection using vectored I/O.
+///
+/// Returns `Ok(())` on success or WouldBlock, `Err(())` on send error.
+#[inline]
+fn send_pending(
+    driver: &mut Box<dyn IoDriver>,
+    conn: &mut Connection,
+    conn_id: ConnId,
+    stats: &WorkerStats,
+) -> Result<(), ()> {
+    while conn.has_pending_write() {
+        let bufs = conn.collect_pending_writes();
+        match driver.send_vectored_owned(conn_id, bufs) {
+            Ok(n) => {
+                stats.add_bytes_sent(n as u64);
+                conn.advance_write(n);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(_) => return Err(()),
+        }
+    }
     Ok(())
 }
 
