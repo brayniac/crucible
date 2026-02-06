@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.14] - 2026-02-06
+
+### Added
+- Zero-copy send queue for large GET responses: values >= 1KB are sent directly from cache
+  segment memory without copying into the write buffer, reducing memory bandwidth for large values
+- Export `cache_core::sync` module for downstream crate compatibility with loom feature
+
+### Fixed
+- Collapse nested if statements in io-driver for clippy 1.93 compatibility
+
 ## [0.2.13] - 2026-02-05
 
 ### Fixed
