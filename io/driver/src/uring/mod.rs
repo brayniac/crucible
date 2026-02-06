@@ -649,16 +649,15 @@ impl UringDriver {
                     (c.fixed_slot, c.generation)
                 });
 
-                if let Some((fixed_slot, conn_gen)) = conn_info {
-                    if self
+                if let Some((fixed_slot, conn_gen)) = conn_info
+                    && self
                         .submit_multishot_recv(conn_id, conn_gen, fixed_slot)
                         .is_ok()
-                        && let Some(conn) = self.connections.get_mut(conn_id)
-                    {
-                        conn.multishot_active = true;
-                    }
-                    // If re-arm fails, the poll() rearm logic will retry
+                    && let Some(conn) = self.connections.get_mut(conn_id)
+                {
+                    conn.multishot_active = true;
                 }
+                // If re-arm fails, the poll() rearm logic will retry
                 return;
             }
 
@@ -1512,10 +1511,10 @@ impl IoDriver for UringDriver {
 
         // Automatically start receiving data with multishot recv (hybrid mode default)
         let recv_result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
-        if recv_result.is_ok() {
-            if let Some(conn) = self.connections.get_mut(conn_id) {
-                conn.multishot_active = true;
-            }
+        if recv_result.is_ok()
+            && let Some(conn) = self.connections.get_mut(conn_id)
+        {
+            conn.multishot_active = true;
         }
 
         if let Err(e) = recv_result {
@@ -1577,10 +1576,10 @@ impl IoDriver for UringDriver {
 
         // Automatically start receiving data with multishot recv (hybrid mode default)
         let recv_result = self.submit_multishot_recv(conn_id, generation, fixed_slot);
-        if recv_result.is_ok() {
-            if let Some(conn) = self.connections.get_mut(conn_id) {
-                conn.multishot_active = true;
-            }
+        if recv_result.is_ok()
+            && let Some(conn) = self.connections.get_mut(conn_id)
+        {
+            conn.multishot_active = true;
         }
 
         if let Err(e) = recv_result {
