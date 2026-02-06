@@ -487,76 +487,31 @@ fn run_worker<C: Cache>(
                     let mut bytes_received = 0u64;
                     let mut send_error = false;
 
-                    // Zero-copy path: batch non-GET responses, immediate send for GET hits
+                    // Process all commands in one call; process_from handles
+                    // zero-copy GET responses internally via the send queue.
                     {
-                        use crate::connection::ZeroCopyResponse;
+                        let result = driver.with_recv_buf(conn_id, &mut |buf| {
+                            if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                                let initial_len = buf.len();
+                                conn.process_from(buf, &*cache);
+                                bytes_received += (initial_len - buf.len()) as u64;
 
-                        // Process commands, batching small values in write_buf
-                        loop {
-                            let mut zero_copy_response: Option<ZeroCopyResponse> = None;
-                            let mut made_progress = false;
-                            let mut backpressure = false;
-
-                            let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                                if buf.is_empty() {
-                                    return;
+                                if conn.should_close() {
+                                    close_reason = Some(CloseReason::ProtocolClose);
                                 }
-
-                                if let Some(conn) =
-                                    connections.get_mut(idx).and_then(|c| c.as_mut())
-                                {
-                                    if !conn.should_read() {
-                                        backpressure = true;
-                                        return;
-                                    }
-
-                                    let initial_len = buf.len();
-                                    zero_copy_response = conn.process_one_zero_copy(buf, &*cache);
-
-                                    let consumed = initial_len - buf.len();
-                                    bytes_received += consumed as u64;
-                                    made_progress = consumed > 0;
-
-                                    if conn.should_close() {
-                                        close_reason = Some(CloseReason::ProtocolClose);
-                                    }
-                                }
-                            });
-
-                            // Check for EOF or other errors
-                            if let Err(e) = result {
-                                if e.kind() == io::ErrorKind::UnexpectedEof {
-                                    close_reason = Some(CloseReason::ClientEof);
-                                } else if e.kind() != io::ErrorKind::NotFound {
-                                    close_reason = Some(CloseReason::RecvError);
-                                }
-                                break;
                             }
+                        });
 
-                            // Queue zero-copy response for sending via write_buf.
-                            // This ensures reliable delivery by handling short writes
-                            // through the normal send path (retries on SendReady).
-                            // We can't use send_owned because it doesn't handle partial
-                            // writes - the remaining data would be lost.
-                            if let Some(resp) = zero_copy_response
-                                && let Some(conn) =
-                                    connections.get_mut(idx).and_then(|c| c.as_mut())
-                            {
-                                conn.queue_zero_copy_response(resp);
-                            }
-                            // All responses (small and large) now accumulate in write_buf
-
-                            // Break if error, close, backpressure, or no progress
-                            if send_error
-                                || close_reason.is_some()
-                                || backpressure
-                                || !made_progress
-                            {
-                                break;
+                        // Check for EOF or other errors
+                        if let Err(e) = result {
+                            if e.kind() == io::ErrorKind::UnexpectedEof {
+                                close_reason = Some(CloseReason::ClientEof);
+                            } else if e.kind() != io::ErrorKind::NotFound {
+                                close_reason = Some(CloseReason::RecvError);
                             }
                         }
 
-                        // Send all accumulated write_buf data (batched small values)
+                        // Send all accumulated response data
                         while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
                             if !conn.has_pending_write() {
                                 break;
@@ -646,56 +601,21 @@ fn run_worker<C: Cache>(
 
                     // Process buffered data using same path as Recv completions
                     {
-                        // Zero-copy path: batch non-GET responses
-                        loop {
-                            let mut zero_copy_response: Option<
-                                crate::connection::ZeroCopyResponse,
-                            > = None;
-                            let mut made_progress = false;
-                            let mut backpressure = false;
+                        let result = driver.with_recv_buf(conn_id, &mut |buf| {
+                            if let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
+                                conn.process_from(buf, &*cache);
 
-                            let result = driver.with_recv_buf(conn_id, &mut |buf| {
-                                if buf.is_empty() {
-                                    return;
+                                if conn.should_close() {
+                                    close_reason = Some(CloseReason::ProtocolClose);
                                 }
-                                if let Some(conn) =
-                                    connections.get_mut(idx).and_then(|c| c.as_mut())
-                                {
-                                    if !conn.should_read() {
-                                        backpressure = true;
-                                        return;
-                                    }
-                                    let initial_len = buf.len();
-                                    zero_copy_response = conn.process_one_zero_copy(buf, &*cache);
-                                    made_progress = buf.len() < initial_len;
-
-                                    if conn.should_close() {
-                                        close_reason = Some(CloseReason::ProtocolClose);
-                                    }
-                                }
-                            });
-
-                            if result.is_err() || close_reason.is_some() {
-                                break;
                             }
+                        });
 
-                            // Queue zero-copy response for sending via write_buf.
-                            // This ensures reliable delivery by handling short writes
-                            // through the normal send path (retries on SendReady).
-                            if let Some(resp) = zero_copy_response
-                                && let Some(conn) =
-                                    connections.get_mut(idx).and_then(|c| c.as_mut())
-                            {
-                                conn.queue_zero_copy_response(resp);
-                            }
-                            // All responses now accumulate in write_buf
-
-                            if !made_progress || close_reason.is_some() || backpressure {
-                                break;
-                            }
+                        if result.is_err() || close_reason.is_some() {
+                            // fall through to close handling below
                         }
 
-                        // Send all accumulated write_buf data (batched small values)
+                        // Send all accumulated response data
                         while let Some(conn) = connections.get_mut(idx).and_then(|c| c.as_mut()) {
                             if !conn.has_pending_write() {
                                 break;

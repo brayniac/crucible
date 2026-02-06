@@ -2,7 +2,7 @@
 
 use bytes::{Bytes, BytesMut};
 use cache_core::{Cache, CacheError, SegmentReservation, SetReservation, ValueRef};
-use io_driver::{RecvBuf, ZeroCopySend};
+use io_driver::RecvBuf;
 use protocol_memcache::binary::{
     BINARY_STREAMING_THRESHOLD, BinaryParseProgress, REQUEST_MAGIC, parse_binary_streaming,
 };
@@ -12,11 +12,9 @@ use protocol_memcache::{
     parse_streaming as parse_memcache_streaming,
 };
 use protocol_resp::{
-    Command as RespCommand, ParseError as RespParseError, ParseOptions, ParseProgress,
-    STREAMING_THRESHOLD, parse_streaming,
+    Command as RespCommand, ParseOptions, ParseProgress, STREAMING_THRESHOLD, parse_streaming,
 };
 use std::collections::VecDeque;
-use std::io::IoSlice;
 use std::time::Duration;
 
 use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
@@ -38,7 +36,7 @@ const ZERO_COPY_MIN_VALUE_SIZE: usize = 1024;
 /// - header: 32 bytes
 /// - header_len: 1 byte + 7 padding
 /// - value_ref: 24 bytes
-pub struct ZeroCopyResponse {
+struct ZeroCopyResponse {
     /// RESP header: `$<len>\r\n` (max ~25 bytes)
     header: [u8; 32],
     /// Length of valid header data (max 25)
@@ -50,7 +48,7 @@ pub struct ZeroCopyResponse {
 impl ZeroCopyResponse {
     /// Create a new zero-copy response for a RESP bulk string.
     #[inline]
-    pub fn new_resp_bulk_string(value_ref: ValueRef) -> Self {
+    fn new_resp_bulk_string(value_ref: ValueRef) -> Self {
         let mut header = [0u8; 32];
         let mut pos = 0;
 
@@ -76,56 +74,11 @@ impl ZeroCopyResponse {
         }
     }
 
-    /// Get the header bytes.
-    #[inline]
-    pub fn header(&self) -> &[u8] {
-        &self.header[..self.header_len as usize]
-    }
-
-    /// Get the value reference.
-    #[inline]
-    pub fn value(&self) -> &[u8] {
-        self.value_ref.as_slice()
-    }
-
-    /// Get total response length.
-    #[inline]
-    pub fn total_len(&self) -> usize {
-        self.header_len as usize + self.value_ref.len() + RESP_CRLF.len()
-    }
-
-    /// Create IoSlices for vectored I/O.
-    #[inline]
-    pub fn as_io_slices(&self) -> [IoSlice<'_>; 3] {
-        [
-            IoSlice::new(self.header()),
-            IoSlice::new(self.value()),
-            IoSlice::new(RESP_CRLF),
-        ]
-    }
-
-    /// Convert to owned Bytes for true zero-copy scatter-gather I/O.
-    ///
-    /// This method takes ownership of the response and returns a Vec of owned Bytes:
-    /// - Header: small copy (~25 bytes)
-    /// - Value: zero-copy from segment memory (ValueRef wrapped in Bytes)
-    /// - Trailer: static reference
-    ///
-    /// The segment ref count is held in the value Bytes until it's dropped.
-    #[inline]
-    pub fn into_owned_bytes(self) -> Vec<Bytes> {
-        vec![
-            Bytes::copy_from_slice(&self.header[..self.header_len as usize]),
-            self.value_ref.into_bytes(),
-            Bytes::from_static(RESP_CRLF),
-        ]
-    }
-
     /// Consume the response and return header bytes and the value ref separately.
     ///
     /// Used by the zero-copy send queue path to avoid copying the value.
     #[inline]
-    pub fn into_parts(self) -> (Bytes, ValueRef) {
+    fn into_parts(self) -> (Bytes, ValueRef) {
         let header = Bytes::copy_from_slice(&self.header[..self.header_len as usize]);
         (header, self.value_ref)
     }
@@ -133,41 +86,20 @@ impl ZeroCopyResponse {
     /// Serialize the entire response into the provided buffer.
     ///
     /// This copies the response data into write_buf for reliable sending
-    /// via the normal send path. Use this instead of send_owned when
-    /// short writes must be handled correctly (e.g., large values).
+    /// via the normal send path. Used for small values where queue overhead
+    /// isn't worthwhile.
     ///
     /// Returns the number of bytes written to the buffer.
     #[inline]
-    pub fn serialize_to_buf(self, buf: &mut BytesMut) -> usize {
-        let header = self.header();
-        let value = self.value();
+    fn serialize_to_buf(self, buf: &mut BytesMut) -> usize {
+        let header = &self.header[..self.header_len as usize];
+        let value = self.value_ref.as_slice();
 
         buf.extend_from_slice(header);
         buf.extend_from_slice(value);
         buf.extend_from_slice(RESP_CRLF);
 
         header.len() + value.len() + RESP_CRLF.len()
-    }
-}
-
-impl ZeroCopySend for ZeroCopyResponse {
-    #[inline]
-    fn io_slices(&self) -> Vec<IoSlice<'_>> {
-        vec![
-            IoSlice::new(self.header()),
-            IoSlice::new(self.value()),
-            IoSlice::new(RESP_CRLF),
-        ]
-    }
-
-    #[inline]
-    fn total_len(&self) -> usize {
-        self.header_len as usize + self.value_ref.len() + RESP_CRLF.len()
-    }
-
-    #[inline]
-    fn slice_count(&self) -> usize {
-        3
     }
 }
 
@@ -390,6 +322,30 @@ impl Connection {
             let data = buf.as_slice();
             match parse_streaming(data, &self.resp_parse_options, STREAMING_THRESHOLD) {
                 Ok(ParseProgress::Complete(cmd, consumed)) => {
+                    // Intercept GET for zero-copy path
+                    if let RespCommand::Get { key } = cmd {
+                        use crate::metrics::{GETS, HITS, MISSES};
+                        GETS.increment();
+
+                        if let Some(value_ref) = cache.get_value_ref(key) {
+                            HITS.increment();
+                            buf.consume(consumed);
+                            self.queue_zero_copy_response(ZeroCopyResponse::new_resp_bulk_string(
+                                value_ref,
+                            ));
+                            continue;
+                        }
+
+                        MISSES.increment();
+                        if self.resp_version == RespVersion::Resp3 {
+                            self.write_buf.extend_from_slice(b"_\r\n");
+                        } else {
+                            self.write_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                        buf.consume(consumed);
+                        continue;
+                    }
+
                     execute_resp(
                         &cmd,
                         cache,
@@ -1290,7 +1246,7 @@ impl Connection {
     /// For small values, the response is serialized into `write_buf` as before,
     /// avoiding queue overhead.
     #[inline]
-    pub fn queue_zero_copy_response(&mut self, resp: ZeroCopyResponse) {
+    fn queue_zero_copy_response(&mut self, resp: ZeroCopyResponse) {
         if resp.value_ref.len() < ZERO_COPY_MIN_VALUE_SIZE {
             // Small value: copy into write_buf (avoids queue overhead)
             resp.serialize_to_buf(&mut self.write_buf);
@@ -1315,103 +1271,6 @@ impl Connection {
         // 4. Write the RESP trailer into the fresh write_buf
         //    (it will merge with subsequent small responses)
         self.write_buf.extend_from_slice(RESP_CRLF);
-    }
-
-    /// Process a single RESP command with zero-copy support.
-    ///
-    /// Returns `Some(ZeroCopyResponse)` if the command is a GET that resulted in a hit.
-    /// The caller should send the response using vectored I/O.
-    ///
-    /// Returns `None` if:
-    /// - The command is not a GET
-    /// - The GET resulted in a miss
-    /// - There's no complete command in the buffer
-    ///
-    /// In these cases, check `has_pending_write()` for regular response data.
-    #[inline]
-    pub fn process_one_zero_copy<C: Cache>(
-        &mut self,
-        buf: &mut dyn RecvBuf,
-        cache: &C,
-    ) -> Option<ZeroCopyResponse> {
-        // Clear write buffer if all data has been sent and queue is empty
-        if self.send_queue.is_empty() && self.write_pos >= self.write_buf.len() {
-            self.write_buf.clear();
-            self.write_pos = 0;
-        }
-
-        // Detect protocol from first byte
-        let data = buf.as_slice();
-        if data.is_empty() {
-            return None;
-        }
-
-        if self.protocol == DetectedProtocol::Unknown {
-            self.detect_protocol(data[0]);
-        }
-
-        // Only RESP protocol supports zero-copy GET for now
-        if self.protocol != DetectedProtocol::Resp {
-            // Process normally for other protocols
-            self.process_from(buf, cache);
-            return None;
-        }
-
-        // Try to parse a RESP command
-        match RespCommand::parse_with_options(data, &self.resp_parse_options) {
-            Ok((cmd, consumed)) => {
-                // Check if it's a GET command
-                if let RespCommand::Get { key } = cmd {
-                    use crate::metrics::{GETS, HITS, MISSES};
-                    GETS.increment();
-
-                    // Try to get value reference (single lookup)
-                    if let Some(value_ref) = cache.get_value_ref(key) {
-                        HITS.increment();
-                        buf.consume(consumed);
-                        return Some(ZeroCopyResponse::new_resp_bulk_string(value_ref));
-                    } else {
-                        // Cache miss
-                        MISSES.increment();
-                        if self.resp_version == RespVersion::Resp3 {
-                            self.write_buf.extend_from_slice(b"_\r\n");
-                        } else {
-                            self.write_buf.extend_from_slice(b"$-1\r\n");
-                        }
-                    }
-                    buf.consume(consumed);
-                } else {
-                    // Not a GET - execute normally
-                    execute_resp(
-                        &cmd,
-                        cache,
-                        &mut self.write_buf,
-                        &mut self.resp_version,
-                        self.allow_flush,
-                    );
-                    buf.consume(consumed);
-                }
-                None
-            }
-            Err(RespParseError::Incomplete) => None,
-            Err(e) => {
-                PROTOCOL_ERRORS.increment();
-                let msg = e.to_string();
-                if msg.contains("expected array") {
-                    self.write_buf.extend_from_slice(
-                        b"-ERR Protocol error: expected Redis RESP protocol\r\n",
-                    );
-                } else {
-                    self.write_buf.extend_from_slice(b"-ERR ");
-                    self.write_buf.extend_from_slice(msg.as_bytes());
-                    self.write_buf.extend_from_slice(b"\r\n");
-                }
-                // Consume all remaining data on error
-                let len = buf.len();
-                buf.consume(len);
-                None
-            }
-        }
     }
 }
 
@@ -1861,15 +1720,9 @@ mod tests {
         let cache = MockCacheWithValue::new(value.clone());
         let mut conn = Connection::default();
 
-        // Send a GET request
+        // process_from now handles zero-copy internally
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-
-        // Use process_one_zero_copy which returns ZeroCopyResponse for hits
-        let resp = conn.process_one_zero_copy(&mut buf, &cache);
-        assert!(resp.is_some(), "should return ZeroCopyResponse for hit");
-
-        // Queue the response
-        conn.queue_zero_copy_response(resp.unwrap());
+        conn.process_from(&mut buf, &cache);
 
         // Verify the send queue is used (not empty)
         assert!(
@@ -1881,9 +1734,9 @@ mod tests {
         let output = drain_all_pending(&mut conn);
 
         // Expected: $2048\r\n<2048 bytes>\r\n
-        let expected_header = "$2048\r\n".to_string();
+        let expected_header = b"$2048\r\n";
         assert!(
-            output.starts_with(expected_header.as_bytes()),
+            output.starts_with(expected_header),
             "output should start with RESP header"
         );
         assert_eq!(
@@ -1906,10 +1759,7 @@ mod tests {
         let mut conn = Connection::default();
 
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-        let resp = conn.process_one_zero_copy(&mut buf, &cache);
-        assert!(resp.is_some());
-
-        conn.queue_zero_copy_response(resp.unwrap());
+        conn.process_from(&mut buf, &cache);
 
         // Send queue should be empty for small values
         assert!(
@@ -1921,8 +1771,8 @@ mod tests {
         assert!(conn.has_pending_write());
 
         let output = drain_all_pending(&mut conn);
-        let expected_header = "$512\r\n".to_string();
-        assert!(output.starts_with(expected_header.as_bytes()));
+        let expected_header = b"$512\r\n";
+        assert!(output.starts_with(expected_header));
         assert_eq!(
             &output[expected_header.len()..expected_header.len() + 512],
             &value[..]
@@ -1932,25 +1782,18 @@ mod tests {
 
     #[test]
     fn test_zero_copy_interleaved_small_and_large() {
-        // Pipeline: small GET miss, large GET hit, small GET miss
+        // Pipeline: PING, large GET hit, PING — all in one buffer
         // Tests that pipeline ordering is preserved through the send queue
         let value = vec![b'z'; 4096];
         let cache = MockCacheWithValue::new(value.clone());
         let mut conn = Connection::default();
 
-        // First: a PING command (writes +PONG\r\n to write_buf)
-        let mut buf = TestRecvBuf::new(b"*1\r\n$4\r\nPING\r\n");
-        conn.process_from(&mut buf, &cache);
-        assert_eq!(conn.pending_write_data(), b"+PONG\r\n");
-
-        // Second: a GET that hits (large value, goes to queue)
-        let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-        let resp = conn.process_one_zero_copy(&mut buf, &cache);
-        assert!(resp.is_some());
-        conn.queue_zero_copy_response(resp.unwrap());
-
-        // Third: another PING (writes to write_buf after the queue entry)
-        let mut buf = TestRecvBuf::new(b"*1\r\n$4\r\nPING\r\n");
+        // All three commands in a single pipeline batch
+        let mut buf = TestRecvBuf::new(
+            b"*1\r\n$4\r\nPING\r\n\
+              *2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n\
+              *1\r\n$4\r\nPING\r\n",
+        );
         conn.process_from(&mut buf, &cache);
 
         // Drain everything and check ordering:
@@ -1996,8 +1839,7 @@ mod tests {
         let mut conn = Connection::default();
 
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-        let resp = conn.process_one_zero_copy(&mut buf, &cache);
-        conn.queue_zero_copy_response(resp.unwrap());
+        conn.process_from(&mut buf, &cache);
 
         // Total expected: header + value + trailer
         let total_len = conn.pending_write_len();
@@ -2031,8 +1873,7 @@ mod tests {
         let mut conn = Connection::default();
 
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-        let resp = conn.process_one_zero_copy(&mut buf, &cache);
-        conn.queue_zero_copy_response(resp.unwrap());
+        conn.process_from(&mut buf, &cache);
 
         // pending_write_len should include the queue bytes
         let pending = conn.pending_write_len();
@@ -2054,8 +1895,7 @@ mod tests {
         let mut conn = Connection::default();
 
         let mut buf = TestRecvBuf::new(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-        let resp = conn.process_one_zero_copy(&mut buf, &cache);
-        conn.queue_zero_copy_response(resp.unwrap());
+        conn.process_from(&mut buf, &cache);
 
         assert!(!conn.send_queue.is_empty());
 

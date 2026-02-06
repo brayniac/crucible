@@ -178,14 +178,78 @@ fn read_responses(stream: &mut TcpStream, expected_count: usize) -> Vec<u8> {
 }
 
 /// Count complete RESP responses in a buffer.
+///
+/// Properly parses response boundaries so that bulk strings are only counted
+/// once the full `$<len>\r\n<len bytes>\r\n` has arrived.
 fn count_resp_responses(data: &[u8]) -> usize {
-    let s = String::from_utf8_lossy(data);
-    // Simple counting: each +OK\r\n, $N\r\n...\r\n, +PONG\r\n is a response
-    // This is approximate but works for our test patterns
-    let ok_count = s.matches("+OK\r\n").count();
-    let pong_count = s.matches("+PONG\r\n").count();
-    let bulk_count = s.matches("$").count(); // Bulk string responses from GET
-    ok_count + pong_count + bulk_count
+    let mut count = 0;
+    let mut pos = 0;
+
+    while pos < data.len() {
+        match data[pos] {
+            // Simple string (+), error (-), integer (:) — delimited by \r\n
+            b'+' | b'-' | b':' => {
+                if let Some(end) = find_crlf(data, pos) {
+                    count += 1;
+                    pos = end + 2;
+                } else {
+                    break; // incomplete
+                }
+            }
+            // Bulk string: $<len>\r\n<len bytes>\r\n  or  $-1\r\n (null)
+            b'$' => {
+                if let Some(header_end) = find_crlf(data, pos) {
+                    let len_bytes = &data[pos + 1..header_end];
+                    // Parse the length (could be -1 for null bulk string)
+                    if let Ok(s) = std::str::from_utf8(len_bytes) {
+                        if let Ok(len) = s.parse::<i64>() {
+                            if len < 0 {
+                                // Null bulk string ($-1\r\n)
+                                count += 1;
+                                pos = header_end + 2;
+                            } else {
+                                // Need header_end + 2 (past header CRLF) + len + 2 (trailing CRLF)
+                                let body_end = header_end + 2 + len as usize + 2;
+                                if body_end <= data.len() {
+                                    count += 1;
+                                    pos = body_end;
+                                } else {
+                                    break; // incomplete body
+                                }
+                            }
+                        } else {
+                            break; // parse error
+                        }
+                    } else {
+                        break; // not valid utf-8
+                    }
+                } else {
+                    break; // incomplete header
+                }
+            }
+            _ => break, // unknown type byte
+        }
+    }
+
+    count
+}
+
+/// Find the position of the next `\r\n` starting at `from`.
+/// Returns the index of `\r` (so the CRLF occupies positions `ret` and `ret+1`).
+fn find_crlf(data: &[u8], from: usize) -> Option<usize> {
+    if data.len() < from + 2 {
+        return None;
+    }
+    data[from..data.len() - 1]
+        .iter()
+        .position(|&b| b == b'\r')
+        .and_then(|i| {
+            if data[from + i + 1] == b'\n' {
+                Some(from + i)
+            } else {
+                None
+            }
+        })
 }
 
 /// Run a connection worker that performs SET/GET operations.
