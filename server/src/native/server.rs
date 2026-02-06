@@ -440,7 +440,7 @@ fn run_worker<C: Cache>(
             }
         }
 
-        let completions_count = driver.poll(Some(Duration::from_millis(1)))?;
+        let completions_count = driver.poll(Some(Duration::from_micros(100)))?;
         stats.inc_poll();
         if completions_count == 0 {
             stats.inc_empty_poll();

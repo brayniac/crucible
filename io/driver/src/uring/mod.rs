@@ -661,7 +661,12 @@ impl UringDriver {
                 return;
             }
 
-            // Other errors are fatal - emit error completion
+            // Other errors are fatal - emit error completion.
+            // The multishot operation is terminated by the kernel on error,
+            // so mark it inactive (poll() re-arm or connection close will handle it).
+            if let Some(conn) = self.connections.get_mut(conn_id) {
+                conn.multishot_active = false;
+            }
             self.pending_completions
                 .push(Completion::new(CompletionKind::Error {
                     conn_id: full_conn_id,
@@ -692,10 +697,10 @@ impl UringDriver {
         self.buf_ring.return_buffer(buf_id);
 
         // Check if kernel will deliver more completions for this multishot operation.
-        // NOTE: The has_more flag can be misleading over network connections.
-        // The kernel may set has_more=true (promising more completions) but then
-        // block waiting for network data that won't arrive (causing deadlock).
-        // We always mark multishot_active=false and re-arm in poll() to be safe.
+        // When has_more is true, the multishot SQE is still alive in the kernel and
+        // will produce additional CQEs as data arrives. We must NOT re-arm while the
+        // old operation is active, or we accumulate idle multishot operations in the
+        // kernel, causing O(N) overhead per recv event and gradual throughput degradation.
         let has_more = cqueue::more(flags);
 
         self.pending_completions.push(Completion::with_more(
@@ -705,12 +710,13 @@ impl UringDriver {
             has_more,
         ));
 
-        // Always mark multishot as inactive after receiving data.
-        // The poll() re-arm logic will re-submit if needed.
-        // This is less efficient than trusting has_more, but more reliable
-        // for network connections where has_more can cause deadlocks.
-        if let Some(conn) = self.connections.get_mut(conn_id) {
-            conn.multishot_active = false;
+        // Only deactivate multishot when the kernel signals no more completions.
+        // When !has_more, the multishot operation has terminated and must be re-armed
+        // (handled by the poll() re-arm logic).
+        if !has_more {
+            if let Some(conn) = self.connections.get_mut(conn_id) {
+                conn.multishot_active = false;
+            }
         }
     }
 
@@ -2205,7 +2211,7 @@ impl IoDriver for UringDriver {
 
         // Re-arm recv for connections that need it
         // This handles both single-shot mode (no pending recv) and multishot mode
-        // (multishot deactivated after receiving data - we always deactivate for reliability)
+        // (multishot deactivated when kernel signals !has_more, or on ENOBUFS)
         // Skip connections with direct_recv_pending or tcp_recvmsg_pending - they manage their own recv
         // Reuse scratch buffer to avoid allocation
         self.rearm_scratch.clear();
@@ -2213,7 +2219,8 @@ impl IoDriver for UringDriver {
             self.connections
                 .iter()
                 .filter(|(_, c)| {
-                    !c.single_recv_pending
+                    !c.closing
+                        && !c.single_recv_pending
                         && !c.multishot_active
                         && !c.direct_recv_pending
                         && !c.tcp_recvmsg_pending
