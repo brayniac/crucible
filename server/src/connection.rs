@@ -20,88 +20,9 @@ use std::time::Duration;
 use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
 use crate::metrics::PROTOCOL_ERRORS;
 
-/// RESP trailer constant for zero-copy responses.
-const RESP_CRLF: &[u8] = b"\r\n";
-
 /// Minimum value size for the zero-copy send queue path.
 /// Values below this threshold are copied into `write_buf` to avoid queue overhead.
 const ZERO_COPY_MIN_VALUE_SIZE: usize = 1024;
-
-/// A zero-copy GET response for vectored I/O.
-///
-/// This struct holds the header and value reference for a GET response.
-/// The value reference points directly into cache segment memory, avoiding copies.
-///
-/// Size: 64 bytes (fits in `SmallBox<S8>` inline storage)
-/// - header: 32 bytes
-/// - header_len: 1 byte + 7 padding
-/// - value_ref: 24 bytes
-struct ZeroCopyResponse {
-    /// RESP header: `$<len>\r\n` (max ~25 bytes)
-    header: [u8; 32],
-    /// Length of valid header data (max 25)
-    header_len: u8,
-    /// Reference to value in cache segment memory
-    value_ref: ValueRef,
-}
-
-impl ZeroCopyResponse {
-    /// Create a new zero-copy response for a RESP bulk string.
-    #[inline]
-    fn new_resp_bulk_string(value_ref: ValueRef) -> Self {
-        let mut header = [0u8; 32];
-        let mut pos = 0;
-
-        // Write "$"
-        header[pos] = b'$';
-        pos += 1;
-
-        // Write length using itoa
-        let mut len_buf = itoa::Buffer::new();
-        let len_str = len_buf.format(value_ref.len()).as_bytes();
-        header[pos..pos + len_str.len()].copy_from_slice(len_str);
-        pos += len_str.len();
-
-        // Write "\r\n"
-        header[pos] = b'\r';
-        header[pos + 1] = b'\n';
-        pos += 2;
-
-        Self {
-            header,
-            header_len: pos as u8,
-            value_ref,
-        }
-    }
-
-    /// Consume the response and return header bytes and the value ref separately.
-    ///
-    /// Used by the zero-copy send queue path to avoid copying the value.
-    #[inline]
-    fn into_parts(self) -> (Bytes, ValueRef) {
-        let header = Bytes::copy_from_slice(&self.header[..self.header_len as usize]);
-        (header, self.value_ref)
-    }
-
-    /// Serialize the entire response into the provided buffer.
-    ///
-    /// This copies the response data into write_buf for reliable sending
-    /// via the normal send path. Used for small values where queue overhead
-    /// isn't worthwhile.
-    ///
-    /// Returns the number of bytes written to the buffer.
-    #[inline]
-    fn serialize_to_buf(self, buf: &mut BytesMut) -> usize {
-        let header = &self.header[..self.header_len as usize];
-        let value = self.value_ref.as_slice();
-
-        buf.extend_from_slice(header);
-        buf.extend_from_slice(value);
-        buf.extend_from_slice(RESP_CRLF);
-
-        header.len() + value.len() + RESP_CRLF.len()
-    }
-}
 
 /// Protocol type detected for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,9 +251,14 @@ impl Connection {
                         if let Some(value_ref) = cache.get_value_ref(key) {
                             HITS.increment();
                             buf.consume(consumed);
-                            self.queue_zero_copy_response(ZeroCopyResponse::new_resp_bulk_string(
-                                value_ref,
-                            ));
+                            // Write RESP header: $<len>\r\n
+                            self.write_buf.extend_from_slice(b"$");
+                            let mut len_buf = itoa::Buffer::new();
+                            self.write_buf
+                                .extend_from_slice(len_buf.format(value_ref.len()).as_bytes());
+                            self.write_buf.extend_from_slice(b"\r\n");
+                            // Queue value with CRLF trailer
+                            self.queue_zero_copy_value(value_ref, b"\r\n");
                             continue;
                         }
 
@@ -638,6 +564,30 @@ impl Connection {
                 MEMCACHE_STREAMING_THRESHOLD,
             ) {
                 Ok(MemcacheParseProgress::Complete(cmd, consumed)) => {
+                    // Intercept GET for zero-copy path
+                    if let protocol_memcache::Command::Get { key } = cmd {
+                        use crate::metrics::{GETS, HITS, MISSES};
+                        GETS.increment();
+                        if let Some(value_ref) = cache.get_value_ref(key) {
+                            HITS.increment();
+                            // Header: VALUE <key> 0 <len>\r\n
+                            self.write_buf.extend_from_slice(b"VALUE ");
+                            self.write_buf.extend_from_slice(key);
+                            self.write_buf.extend_from_slice(b" 0 ");
+                            let mut len_buf = itoa::Buffer::new();
+                            self.write_buf
+                                .extend_from_slice(len_buf.format(value_ref.len()).as_bytes());
+                            self.write_buf.extend_from_slice(b"\r\n");
+                            // Queue value with trailer \r\nEND\r\n
+                            self.queue_zero_copy_value(value_ref, b"\r\nEND\r\n");
+                        } else {
+                            MISSES.increment();
+                            self.write_buf.extend_from_slice(b"END\r\n");
+                        }
+                        buf.consume(consumed);
+                        continue;
+                    }
+
                     if execute_memcache(&cmd, cache, &mut self.write_buf, self.allow_flush) {
                         self.should_close = true;
                     }
@@ -885,6 +835,89 @@ impl Connection {
             let data = buf.as_slice();
             match parse_binary_streaming(data, BINARY_STREAMING_THRESHOLD) {
                 Ok(BinaryParseProgress::Complete(cmd, consumed)) => {
+                    // Intercept GET variants for zero-copy path
+                    use protocol_memcache::binary::{
+                        BinaryCommand, BinaryResponse, HEADER_SIZE, Opcode, ResponseHeader, Status,
+                    };
+                    match &cmd {
+                        BinaryCommand::Get { key, opaque }
+                        | BinaryCommand::GetK { key, opaque }
+                        | BinaryCommand::GetQ { key, opaque }
+                        | BinaryCommand::GetKQ { key, opaque } => {
+                            use crate::metrics::{GETS, HITS, MISSES};
+                            GETS.increment();
+                            let is_getk = matches!(
+                                cmd,
+                                BinaryCommand::GetK { .. } | BinaryCommand::GetKQ { .. }
+                            );
+                            let is_quiet = matches!(
+                                cmd,
+                                BinaryCommand::GetQ { .. } | BinaryCommand::GetKQ { .. }
+                            );
+                            let opaque = *opaque;
+
+                            if let Some(value_ref) = cache.get_value_ref(key) {
+                                HITS.increment();
+                                let opcode = match &cmd {
+                                    BinaryCommand::Get { .. } => Opcode::Get,
+                                    BinaryCommand::GetK { .. } => Opcode::GetK,
+                                    BinaryCommand::GetQ { .. } => Opcode::GetQ,
+                                    BinaryCommand::GetKQ { .. } => Opcode::GetKQ,
+                                    _ => unreachable!(),
+                                };
+                                let extras_len: usize = 4;
+                                let key_len = if is_getk { key.len() } else { 0 };
+                                let total_body = extras_len + key_len + value_ref.len();
+
+                                // Write response header + extras + key into write_buf
+                                let header_total = HEADER_SIZE + extras_len + key_len;
+                                let start = self.write_buf.len();
+                                self.write_buf.reserve(header_total);
+                                // Safety: we just reserved enough capacity
+                                unsafe {
+                                    self.write_buf.set_len(start + header_total);
+                                }
+                                let mut header = ResponseHeader::new(opcode, Status::NoError);
+                                header.extras_length = extras_len as u8;
+                                if is_getk {
+                                    header.key_length = key.len() as u16;
+                                }
+                                header.total_body_length = total_body as u32;
+                                header.opaque = opaque;
+                                header.encode(&mut self.write_buf[start..]);
+                                // Flags (always 0)
+                                self.write_buf[start + HEADER_SIZE..start + HEADER_SIZE + 4]
+                                    .copy_from_slice(&0u32.to_be_bytes());
+                                // Key (for GetK/GetKQ only)
+                                if is_getk {
+                                    let key_start = start + HEADER_SIZE + extras_len;
+                                    self.write_buf[key_start..key_start + key.len()]
+                                        .copy_from_slice(key);
+                                }
+                                // Queue value (no trailer for binary protocol)
+                                self.queue_zero_copy_value(value_ref, b"");
+                            } else {
+                                MISSES.increment();
+                                if !is_quiet {
+                                    let start = self.write_buf.len();
+                                    self.write_buf.reserve(HEADER_SIZE + 32);
+                                    unsafe {
+                                        self.write_buf.set_len(start + HEADER_SIZE + 32);
+                                    }
+                                    let len = BinaryResponse::encode_not_found(
+                                        &mut self.write_buf[start..],
+                                        Opcode::Get,
+                                        opaque,
+                                    );
+                                    self.write_buf.truncate(start + len);
+                                }
+                            }
+                            buf.consume(consumed);
+                            continue;
+                        }
+                        _ => {}
+                    }
+
                     if execute_memcache_binary(&cmd, cache, &mut self.write_buf, self.allow_flush) {
                         self.should_close = true;
                     }
@@ -1236,41 +1269,34 @@ impl Connection {
         }
     }
 
-    /// Queue a zero-copy response for sending.
+    /// Queue a value for sending, using zero-copy for large values.
     ///
-    /// For large values (>= ZERO_COPY_MIN_VALUE_SIZE), the value `Bytes` from
-    /// segment memory goes into the send queue without copying. The RESP header
-    /// and any preceding responses in `write_buf` are flushed to the queue first
-    /// to preserve pipeline ordering.
+    /// The caller must have already written the protocol-specific header
+    /// into `write_buf` before calling this method.
     ///
-    /// For small values, the response is serialized into `write_buf` as before,
-    /// avoiding queue overhead.
+    /// For large values (>= ZERO_COPY_MIN_VALUE_SIZE): flushes write_buf
+    /// (including header) to the send queue, pushes the value zero-copy,
+    /// then writes the trailer to write_buf.
+    ///
+    /// For small values: copies value + trailer directly into write_buf.
     #[inline]
-    fn queue_zero_copy_response(&mut self, resp: ZeroCopyResponse) {
-        if resp.value_ref.len() < ZERO_COPY_MIN_VALUE_SIZE {
-            // Small value: copy into write_buf (avoids queue overhead)
-            resp.serialize_to_buf(&mut self.write_buf);
+    fn queue_zero_copy_value(&mut self, value_ref: ValueRef, trailer: &[u8]) {
+        if value_ref.len() < ZERO_COPY_MIN_VALUE_SIZE {
+            self.write_buf.extend_from_slice(value_ref.as_slice());
+            self.write_buf.extend_from_slice(trailer);
             return;
         }
 
-        // Large value: zero-copy path
-        // Consume the response to get header bytes and value ref separately
-        let (header_bytes, value_ref) = resp.into_parts();
-
-        // 1. Write the RESP header into write_buf
-        self.write_buf.extend_from_slice(&header_bytes);
-
-        // 2. Flush all unsent write_buf data (including the header) to the queue
+        // Flush write_buf (including the header the caller just wrote) to the queue
         self.flush_write_buf_to_queue();
 
-        // 3. Push the value directly into the queue (zero-copy — just takes ownership)
+        // Push the value directly into the queue (zero-copy)
         let value_bytes = value_ref.into_bytes();
         self.send_queue_bytes += value_bytes.len();
         self.send_queue.push_back(value_bytes);
 
-        // 4. Write the RESP trailer into the fresh write_buf
-        //    (it will merge with subsequent small responses)
-        self.write_buf.extend_from_slice(RESP_CRLF);
+        // Write the trailer into the fresh write_buf
+        self.write_buf.extend_from_slice(trailer);
     }
 }
 
@@ -1906,5 +1932,247 @@ mod tests {
         assert!(conn.send_queue.is_empty());
         assert_eq!(conn.send_queue_bytes, 0);
         assert!(!conn.has_pending_write());
+    }
+
+    // --- Memcache ASCII zero-copy tests ---
+
+    #[test]
+    fn test_memcache_ascii_get_hit_large_value() {
+        let value = vec![b'M'; 2048];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"get foo\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        // Large value should use the send queue
+        assert!(
+            !conn.send_queue.is_empty(),
+            "memcache ASCII large value should use send queue"
+        );
+
+        let output = drain_all_pending(&mut conn);
+        // Expected: VALUE foo 0 2048\r\n<2048 bytes>\r\nEND\r\n
+        let expected_header = b"VALUE foo 0 2048\r\n";
+        assert!(
+            output.starts_with(expected_header),
+            "output should start with VALUE header, got: {:?}",
+            String::from_utf8_lossy(&output[..std::cmp::min(30, output.len())])
+        );
+        assert_eq!(
+            &output[expected_header.len()..expected_header.len() + 2048],
+            &value[..],
+            "output should contain the value"
+        );
+        assert!(
+            output.ends_with(b"\r\nEND\r\n"),
+            "output should end with \\r\\nEND\\r\\n"
+        );
+        assert_eq!(
+            output.len(),
+            expected_header.len() + 2048 + b"\r\nEND\r\n".len()
+        );
+    }
+
+    #[test]
+    fn test_memcache_ascii_get_hit_small_value() {
+        let value = vec![b'S'; 512];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"get foo\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        // Small value should NOT use the send queue
+        assert!(
+            conn.send_queue.is_empty(),
+            "memcache ASCII small value should NOT use send queue"
+        );
+        assert!(conn.has_pending_write());
+
+        let output = drain_all_pending(&mut conn);
+        let expected_header = b"VALUE foo 0 512\r\n";
+        assert!(output.starts_with(expected_header));
+        assert_eq!(
+            &output[expected_header.len()..expected_header.len() + 512],
+            &value[..]
+        );
+        assert!(output.ends_with(b"\r\nEND\r\n"));
+    }
+
+    #[test]
+    fn test_memcache_ascii_get_miss() {
+        let cache = MockCache;
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"get foo\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        let output = drain_all_pending(&mut conn);
+        assert_eq!(output, b"END\r\n");
+    }
+
+    // --- Memcache binary zero-copy tests ---
+
+    #[test]
+    fn test_memcache_binary_get_hit_large_value() {
+        use protocol_memcache::binary::{BinaryRequest, HEADER_SIZE, ParsedBinaryResponse};
+
+        let value = vec![b'B'; 2048];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        // Encode a binary GET request
+        let mut req_buf = [0u8; 256];
+        let req_len = BinaryRequest::encode_get(&mut req_buf, b"foo", 42);
+
+        let mut buf = TestRecvBuf::new(&req_buf[..req_len]);
+        conn.process_from(&mut buf, &cache);
+
+        // Large value should use the send queue
+        assert!(
+            !conn.send_queue.is_empty(),
+            "memcache binary large value should use send queue"
+        );
+
+        let output = drain_all_pending(&mut conn);
+
+        // Parse the response to verify correctness
+        let (resp, consumed) = ParsedBinaryResponse::parse(&output).unwrap();
+        assert_eq!(consumed, output.len());
+        if let ParsedBinaryResponse::Value {
+            opaque,
+            flags,
+            value: resp_value,
+            ..
+        } = resp
+        {
+            assert_eq!(opaque, 42);
+            assert_eq!(flags, 0);
+            assert_eq!(resp_value, &value[..]);
+        } else {
+            panic!("Expected Value response, got: {:?}", resp);
+        }
+
+        // Verify total size: header(24) + extras(4) + value(2048)
+        assert_eq!(output.len(), HEADER_SIZE + 4 + 2048);
+    }
+
+    #[test]
+    fn test_memcache_binary_get_hit_small_value() {
+        use protocol_memcache::binary::{BinaryRequest, ParsedBinaryResponse};
+
+        let value = vec![b'S'; 512];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        let mut req_buf = [0u8; 256];
+        let req_len = BinaryRequest::encode_get(&mut req_buf, b"foo", 42);
+
+        let mut buf = TestRecvBuf::new(&req_buf[..req_len]);
+        conn.process_from(&mut buf, &cache);
+
+        // Small value should NOT use the send queue
+        assert!(
+            conn.send_queue.is_empty(),
+            "memcache binary small value should NOT use send queue"
+        );
+
+        let output = drain_all_pending(&mut conn);
+        let (resp, _) = ParsedBinaryResponse::parse(&output).unwrap();
+        if let ParsedBinaryResponse::Value {
+            opaque,
+            value: resp_value,
+            ..
+        } = resp
+        {
+            assert_eq!(opaque, 42);
+            assert_eq!(resp_value, &value[..]);
+        } else {
+            panic!("Expected Value response");
+        }
+    }
+
+    #[test]
+    fn test_memcache_binary_get_miss() {
+        use protocol_memcache::binary::{BinaryRequest, ParsedBinaryResponse, Status};
+
+        let cache = MockCache;
+        let mut conn = Connection::default();
+
+        let mut req_buf = [0u8; 256];
+        let req_len = BinaryRequest::encode_get(&mut req_buf, b"foo", 42);
+
+        let mut buf = TestRecvBuf::new(&req_buf[..req_len]);
+        conn.process_from(&mut buf, &cache);
+
+        let output = drain_all_pending(&mut conn);
+        let (resp, _) = ParsedBinaryResponse::parse(&output).unwrap();
+        assert!(
+            matches!(
+                resp,
+                ParsedBinaryResponse::Error {
+                    status: Status::KeyNotFound,
+                    opaque: 42,
+                    ..
+                }
+            ),
+            "expected KeyNotFound error, got: {:?}",
+            resp
+        );
+    }
+
+    #[test]
+    fn test_memcache_binary_getq_miss_silent() {
+        use protocol_memcache::binary::BinaryRequest;
+
+        let cache = MockCache;
+        let mut conn = Connection::default();
+
+        // Encode a quiet GET request
+        let mut req_buf = [0u8; 256];
+        let req_len = BinaryRequest::encode_getq(&mut req_buf, b"foo", 42);
+
+        let mut buf = TestRecvBuf::new(&req_buf[..req_len]);
+        conn.process_from(&mut buf, &cache);
+
+        // GetQ miss should produce no response
+        assert!(!conn.has_pending_write(), "GetQ miss should be silent");
+    }
+
+    #[test]
+    fn test_memcache_binary_getk_hit_large_value() {
+        use protocol_memcache::binary::{BinaryRequest, ParsedBinaryResponse};
+
+        let value = vec![b'K'; 2048];
+        let cache = MockCacheWithValue::new(value.clone());
+        let mut conn = Connection::default();
+
+        let mut req_buf = [0u8; 256];
+        let req_len = BinaryRequest::encode_getk(&mut req_buf, b"foo", 42);
+
+        let mut buf = TestRecvBuf::new(&req_buf[..req_len]);
+        conn.process_from(&mut buf, &cache);
+
+        assert!(
+            !conn.send_queue.is_empty(),
+            "binary GetK large value should use send queue"
+        );
+
+        let output = drain_all_pending(&mut conn);
+        let (resp, _) = ParsedBinaryResponse::parse(&output).unwrap();
+        if let ParsedBinaryResponse::Value {
+            opaque,
+            key,
+            value: resp_value,
+            ..
+        } = resp
+        {
+            assert_eq!(opaque, 42);
+            assert_eq!(key, Some(b"foo".as_slice()));
+            assert_eq!(resp_value, &value[..]);
+        } else {
+            panic!("Expected Value response with key");
+        }
     }
 }
