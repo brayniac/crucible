@@ -422,13 +422,18 @@ impl UringDriver {
         data: &[u8],
         msg_flags: i32,
     ) -> io::Result<()> {
+        let generation = self
+            .connections
+            .get(conn_id)
+            .map(|c| c.generation)
+            .unwrap_or(0);
         let mut send_builder = SendZc::new(Fixed(fixed_slot), data.as_ptr(), data.len() as u32);
         if msg_flags != 0 {
             send_builder = send_builder.flags(msg_flags);
         }
         let send_op = send_builder
             .build()
-            .user_data(encode_user_data(conn_id, 0, buf_idx, OP_SEND));
+            .user_data(encode_user_data(conn_id, generation, buf_idx, OP_SEND));
 
         unsafe {
             self.ring
@@ -463,6 +468,11 @@ impl UringDriver {
         data: &[u8],
         msg_flags: i32,
     ) -> io::Result<()> {
+        let generation = self
+            .connections
+            .get(conn_id)
+            .map(|c| c.generation)
+            .unwrap_or(0);
         let mut send_builder =
             opcode::Send::new(Fixed(fixed_slot), data.as_ptr(), data.len() as u32);
         if msg_flags != 0 {
@@ -471,7 +481,7 @@ impl UringDriver {
         let send_op =
             send_builder
                 .build()
-                .user_data(encode_user_data(conn_id, 0, buf_idx, OP_SEND_REGULAR));
+                .user_data(encode_user_data(conn_id, generation, buf_idx, OP_SEND_REGULAR));
 
         unsafe {
             self.ring
@@ -494,9 +504,14 @@ impl UringDriver {
         slot: u8,
         msghdr: *const libc::msghdr,
     ) -> io::Result<()> {
+        let generation = self
+            .connections
+            .get(conn_id)
+            .map(|c| c.generation)
+            .unwrap_or(0);
         let sendmsg_op = opcode::SendMsgZc::new(Fixed(fixed_slot), msghdr as *const _)
             .build()
-            .user_data(encode_user_data(conn_id, 0, slot, OP_SENDMSG));
+            .user_data(encode_user_data(conn_id, generation, slot, OP_SENDMSG));
 
         unsafe {
             self.ring
@@ -522,8 +537,10 @@ impl UringDriver {
                 self.handle_multishot_recv(id, generation, result, flags);
             }
             OP_SEND => {
-                let (id, _, buf_idx, _) = decode_user_data(user_data);
-                self.handle_send(id, buf_idx as usize, result, flags);
+                let (id, generation, buf_idx, _) = decode_user_data(user_data);
+                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                    self.handle_send(id, buf_idx as usize, result, flags);
+                }
             }
             OP_ACCEPT => {
                 let (id, _, _, _) = decode_user_data(user_data);
@@ -544,8 +561,10 @@ impl UringDriver {
             }
             OP_SENDMSG => {
                 // Regular TCP scatter-gather send (not via send_owned)
-                let (id, _, buf_idx, _) = decode_user_data(user_data);
-                self.handle_send(id, buf_idx as usize, result, flags);
+                let (id, generation, buf_idx, _) = decode_user_data(user_data);
+                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                    self.handle_send(id, buf_idx as usize, result, flags);
+                }
             }
             OP_ZC_SENDMSG => {
                 // Zero-copy sendmsg completion from send_owned
@@ -592,8 +611,10 @@ impl UringDriver {
             }
             OP_SEND_REGULAR => {
                 // Regular send completion (no NOTIF expected)
-                let (id, _, buf_idx, _) = decode_user_data(user_data);
-                self.handle_send_regular(id, buf_idx as usize, result);
+                let (id, generation, buf_idx, _) = decode_user_data(user_data);
+                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                    self.handle_send_regular(id, buf_idx as usize, result);
+                }
             }
             _ => {}
         }
@@ -1108,7 +1129,8 @@ impl UringDriver {
         };
 
         if has_remaining {
-            // Partial send - continue with remaining data
+            // Partial send - continue with remaining data internally.
+            // Do NOT emit SendReady here (same rationale as handle_send).
             if let Some(conn) = self.connections.get_mut(conn_id) {
                 if let Some(crate::uring::connection::SendContinuation::Flat { ptr, len }) =
                     conn.prepare_partial_continuation(slot)
@@ -1118,15 +1140,17 @@ impl UringDriver {
                     let _ = self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
                 }
             }
-        } else if should_continue {
-            // Slot freed and more data pending - continue sending
-            self.continue_send_regular(conn_id);
+        } else {
+            if should_continue {
+                // Slot freed and more data pending - continue sending
+                self.continue_send_regular(conn_id);
+            }
+            // Full send complete - notify server a slot is available.
+            self.pending_completions
+                .push(Completion::new(CompletionKind::SendReady {
+                    conn_id: full_conn_id,
+                }));
         }
-
-        self.pending_completions
-            .push(Completion::new(CompletionKind::SendReady {
-                conn_id: full_conn_id,
-            }));
     }
 
     fn handle_accept(&mut self, listener_id: usize, result: i32, flags: u32) {
