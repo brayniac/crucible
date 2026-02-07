@@ -2373,6 +2373,13 @@ impl IoDriver for UringDriver {
         }
         self.cqe_scratch = cqes; // restore empty vec with capacity preserved
 
+        // Submit any SQEs pushed during CQE processing (e.g. partial send
+        // continuations) immediately, so they don't wait until the next
+        // poll() or external flush() call.
+        if !self.ring.submission().is_empty() {
+            let _ = self.ring.submitter().submit();
+        }
+
         Ok(count)
     }
 
