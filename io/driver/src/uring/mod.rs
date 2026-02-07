@@ -989,14 +989,20 @@ impl UringDriver {
         };
 
         if has_remaining {
-            // Partial send - continue with remaining data in send buffer
+            // Partial send - driver handles continuation internally.
+            // Do NOT emit SendReady here; it would cause the server to
+            // push redundant work into the event loop on every partial
+            // CQE (~40 per 5MB transfer × 16 connections = ~640 spurious
+            // completions per round, causing severe tail latency).
             self.continue_partial_send(conn_id, slot);
+        } else {
+            // Full send complete - notify the server that a send slot is
+            // available so it can submit the next queued write.
+            self.pending_completions
+                .push(Completion::new(CompletionKind::SendReady {
+                    conn_id: full_conn_id,
+                }));
         }
-
-        self.pending_completions
-            .push(Completion::new(CompletionKind::SendReady {
-                conn_id: full_conn_id,
-            }));
     }
 
     /// Continue a partial send (either single or vectored).
