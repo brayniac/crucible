@@ -43,6 +43,14 @@ pub enum SendBuffers {
     Vectored(Box<VectoredSend>),
 }
 
+/// Describes how to continue a partial send.
+pub enum SendContinuation {
+    /// Flat buffer remainder (for single-buffer sends).
+    Flat { ptr: *const u8, len: usize },
+    /// Rebuilt vectored send (msghdr with updated iovecs).
+    Vectored { msghdr_ptr: *const libc::msghdr },
+}
+
 /// State for a vectored (scatter-gather) send operation.
 pub struct VectoredSend {
     /// Owned buffers that must stay alive until NOTIF.
@@ -100,6 +108,52 @@ impl VectoredSend {
             .filter_map(|b| b.as_ref())
             .map(|b| b.len())
             .sum()
+    }
+
+    /// Rebuild iovecs for a partial send continuation.
+    ///
+    /// Given `pos` bytes already sent, updates iovecs and msghdr to point to the
+    /// remaining data. Returns the msghdr pointer, or None if all data was sent.
+    ///
+    /// Safe to call multiple times with increasing `pos` because it rebuilds from
+    /// the original `Bytes` buffers (which are immutable).
+    pub fn rebuild_from_pos(&mut self, pos: usize) -> Option<*const libc::msghdr> {
+        let mut skip = pos;
+        let mut first_iov = self.count; // default: nothing left
+
+        for i in 0..self.count {
+            if let Some(buf) = &self.buffers[i] {
+                if skip < buf.len() {
+                    // Partial consumption of this buffer
+                    self.iovecs[i] = libc::iovec {
+                        iov_base: unsafe { buf.as_ptr().add(skip) as *mut libc::c_void },
+                        iov_len: buf.len() - skip,
+                    };
+                    first_iov = i;
+                    break;
+                }
+                skip -= buf.len();
+            }
+        }
+
+        if first_iov >= self.count {
+            return None; // all data sent
+        }
+
+        // Rebuild subsequent iovecs at full length
+        for i in (first_iov + 1)..self.count {
+            if let Some(buf) = &self.buffers[i] {
+                self.iovecs[i] = libc::iovec {
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
+                };
+            }
+        }
+
+        self.msghdr.msg_iov = &mut self.iovecs[first_iov] as *mut _;
+        self.msghdr.msg_iovlen = self.count - first_iov;
+
+        Some(&self.msghdr as *const _)
     }
 }
 
@@ -343,18 +397,6 @@ impl UringConnection {
         Some((slot, msghdr_ptr, total_len))
     }
 
-    /// Increment notifs_pending for a slot (e.g., for partial send continuation).
-    #[inline]
-    pub fn increment_notifs(&mut self, slot: u8) {
-        if let Some(send) = self
-            .send_slots
-            .get_mut(slot as usize)
-            .and_then(|s| s.as_mut())
-        {
-            send.notifs_pending += 1;
-        }
-    }
-
     /// Handle send completion (result, not notif).
     ///
     /// Advances the send position. Returns true if more data remains
@@ -376,25 +418,38 @@ impl UringConnection {
         }
     }
 
-    /// Get pointer and length for continuing a partial send.
-    #[inline]
-    pub fn remaining_send(&self, slot: u8) -> (*const u8, usize) {
-        if let Some(Some(send)) = self.send_slots.get(slot as usize) {
-            match &send.buffers {
+    /// Prepare a continuation for a partial send.
+    ///
+    /// Returns `Some(SendContinuation)` with the data needed to submit a new
+    /// SQE for the remaining bytes. Increments `notifs_pending` for the slot.
+    /// Returns `None` if there's nothing left to send.
+    pub fn prepare_partial_continuation(&mut self, slot: u8) -> Option<SendContinuation> {
+        if let Some(send) = self
+            .send_slots
+            .get_mut(slot as usize)
+            .and_then(|s| s.as_mut())
+        {
+            let result = match &mut send.buffers {
                 SendBuffers::Single(chunk) => {
                     if send.pos < chunk.len() {
                         let ptr = unsafe { chunk.as_ptr().add(send.pos) };
                         let len = chunk.len() - send.pos;
-                        return (ptr, len);
+                        Some(SendContinuation::Flat { ptr, len })
+                    } else {
+                        None
                     }
                 }
-                SendBuffers::Vectored(_) => {
-                    // Partial sends for vectored are more complex - not supported yet
-                    // For now, the kernel handles partial vectored sends internally
-                }
+                SendBuffers::Vectored(v) => v
+                    .rebuild_from_pos(send.pos)
+                    .map(|msghdr_ptr| SendContinuation::Vectored { msghdr_ptr }),
+            };
+            if result.is_some() {
+                send.notifs_pending += 1;
             }
+            result
+        } else {
+            None
         }
-        (std::ptr::null(), 0)
     }
 
     /// Handle send notification (kernel done with buffer).

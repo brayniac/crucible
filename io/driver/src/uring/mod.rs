@@ -990,22 +990,41 @@ impl UringDriver {
 
         if has_remaining {
             // Partial send - continue with remaining data in send buffer
-            if let Some(conn) = self.connections.get_mut(conn_id) {
-                let (ptr, len) = conn.remaining_send(slot);
-                if !ptr.is_null() && len > 0 {
-                    let fixed_slot = conn.fixed_slot;
-                    // Increment notifs for this continuation (same slot)
-                    conn.increment_notifs(slot);
-                    let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                    let _ = self.submit_send_zc(conn_id, fixed_slot, slot, send_data);
-                }
-            }
+            self.continue_partial_send(conn_id, slot);
         }
 
         self.pending_completions
             .push(Completion::new(CompletionKind::SendReady {
                 conn_id: full_conn_id,
             }));
+    }
+
+    /// Continue a partial send (either single or vectored).
+    ///
+    /// Called when SendMsgZc completes with fewer bytes than requested.
+    /// Rebuilds the iovec array for vectored sends or resubmits the remaining
+    /// single buffer, then submits a new SendMsgZc for the remainder.
+    fn continue_partial_send(&mut self, conn_id: usize, slot: u8) {
+        use crate::uring::connection::SendContinuation;
+
+        let continuation = if let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.prepare_partial_continuation(slot)
+                .map(|c| (c, conn.fixed_slot))
+        } else {
+            None
+        };
+
+        if let Some((cont, fixed_slot)) = continuation {
+            match cont {
+                SendContinuation::Vectored { msghdr_ptr } => {
+                    let _ = self.submit_tcp_sendmsg_zc(conn_id, fixed_slot, slot, msghdr_ptr);
+                }
+                SendContinuation::Flat { ptr, len } => {
+                    let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    let _ = self.submit_send_zc(conn_id, fixed_slot, slot, send_data);
+                }
+            }
+        }
     }
 
     /// Continue sending from fragmentation buffer after a slot is freed (zero-copy).
@@ -1085,8 +1104,9 @@ impl UringDriver {
         if has_remaining {
             // Partial send - continue with remaining data
             if let Some(conn) = self.connections.get_mut(conn_id) {
-                let (ptr, len) = conn.remaining_send(slot);
-                if !ptr.is_null() && len > 0 {
+                if let Some(crate::uring::connection::SendContinuation::Flat { ptr, len }) =
+                    conn.prepare_partial_continuation(slot)
+                {
                     let fixed_slot = conn.fixed_slot;
                     let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
                     let _ = self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
