@@ -57,8 +57,12 @@ pub struct VectoredSend {
 
 impl VectoredSend {
     /// Create a new vectored send from owned Bytes buffers.
-    pub fn new(buffers: Vec<Bytes>) -> Self {
-        let mut result = Self {
+    ///
+    /// Returns a `Box<VectoredSend>` because the struct contains a self-referential
+    /// pointer (`msghdr.msg_iov` -> `iovecs`). Boxing first ensures the pointers
+    /// reference the final heap location, not a temporary stack frame.
+    pub fn new(buffers: Vec<Bytes>) -> Box<Self> {
+        let mut boxed = Box::new(Self {
             buffers: [None, None, None, None],
             count: 0,
             iovecs: [libc::iovec {
@@ -66,22 +70,22 @@ impl VectoredSend {
                 iov_len: 0,
             }; MAX_IOVECS],
             msghdr: unsafe { std::mem::zeroed() },
-        };
+        });
 
         for (i, buf) in buffers.into_iter().take(MAX_IOVECS).enumerate() {
-            result.iovecs[i] = libc::iovec {
+            boxed.iovecs[i] = libc::iovec {
                 iov_base: buf.as_ptr() as *mut libc::c_void,
                 iov_len: buf.len(),
             };
-            result.buffers[i] = Some(buf);
-            result.count = i + 1;
+            boxed.buffers[i] = Some(buf);
+            boxed.count = i + 1;
         }
 
-        // Set up msghdr to point to iovecs
-        result.msghdr.msg_iov = result.iovecs.as_mut_ptr();
-        result.msghdr.msg_iovlen = result.count;
+        // Set up msghdr to point to iovecs at their final heap location
+        boxed.msghdr.msg_iov = boxed.iovecs.as_mut_ptr();
+        boxed.msghdr.msg_iovlen = boxed.count;
 
-        result
+        boxed
     }
 
     /// Get the msghdr pointer for SendMsg.
@@ -324,11 +328,13 @@ impl UringConnection {
             return None;
         }
 
+        // Take pointers AFTER boxing - VectoredSend::new() returns a Box,
+        // so msghdr and iovecs are already at their final heap location.
         let msghdr_ptr = vectored.msghdr_ptr();
         let total_len = vectored.total_len();
 
         self.send_slots[slot as usize] = Some(InFlightSend {
-            buffers: SendBuffers::Vectored(Box::new(vectored)),
+            buffers: SendBuffers::Vectored(vectored),
             pos: 0,
             notifs_pending: 1,
         });

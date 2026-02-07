@@ -920,20 +920,31 @@ impl UringDriver {
         // Check if this is a SendZc notification
         if cqueue::notif(flags) {
             // Handle notification for this slot
-            let (should_continue, should_finish_close) =
+            let (slot_freed, should_continue, should_finish_close, generation, is_closing) =
                 if let Some(conn) = self.connections.get_mut(conn_id) {
                     let (slot_freed, should_continue) = conn.on_send_notif(slot);
                     let should_close = slot_freed && conn.closing && conn.all_sends_complete();
-                    (should_continue, should_close)
+                    (slot_freed, should_continue, should_close, conn.generation, conn.closing)
                 } else {
-                    (false, false)
+                    (false, false, false, 0, true)
                 };
 
             if should_finish_close {
                 self.finish_deferred_close(conn_id);
             } else if should_continue {
-                // Slot freed, more data to send - prepare next chunk
+                // Slot freed, more data to send from internal frag_buf
                 self.continue_send(conn_id);
+            } else if slot_freed && !is_closing {
+                // Slot freed but no internal pending data. Emit SendReady so
+                // the caller can send application-level pending data (e.g. from
+                // send_vectored_owned which bypasses the internal frag_buf).
+                // Without this, the caller never learns that a slot is available
+                // and pending writes stall indefinitely.
+                let full_conn_id = ConnId::with_generation(conn_id, generation);
+                self.pending_completions
+                    .push(Completion::new(CompletionKind::SendReady {
+                        conn_id: full_conn_id,
+                    }));
             }
             return;
         }
