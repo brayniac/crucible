@@ -1017,8 +1017,19 @@ impl UringDriver {
             // completions per round, causing severe tail latency).
             self.continue_partial_send(conn_id, slot);
         } else {
-            // Full send complete - notify the server that a send slot is
-            // available so it can submit the next queued write.
+            // Full send complete - free slot now, keep buffer alive for NOTIF.
+            // This lets new sends start immediately instead of waiting for the
+            // kernel to release zero-copy pages (which waits for TCP ACK).
+            let should_continue = if let Some(conn) = self.connections.get_mut(conn_id) {
+                conn.complete_send_early(slot)
+            } else {
+                false
+            };
+
+            if should_continue {
+                self.continue_send(conn_id);
+            }
+
             self.pending_completions
                 .push(Completion::new(CompletionKind::SendReady {
                     conn_id: full_conn_id,

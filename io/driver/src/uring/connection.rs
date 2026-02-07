@@ -6,6 +6,7 @@
 
 use crate::recv_state::ConnectionRecvState;
 use bytes::{Bytes, BytesMut};
+use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 
 /// Size of send chunks (64KB).
@@ -49,6 +50,19 @@ pub enum SendContinuation {
     Flat { ptr: *const u8, len: usize },
     /// Rebuilt vectored send (msghdr with updated iovecs).
     Vectored { msghdr_ptr: *const libc::msghdr },
+}
+
+/// A buffer awaiting NOTIF completion (kernel done with zero-copy pages).
+///
+/// When a zero-copy send completes (initial CQE), the send slot is freed
+/// immediately for reuse, but the buffer must stay alive until the kernel
+/// signals it has released the pages (NOTIF CQE). This struct holds the
+/// buffer in a FIFO queue until that notification arrives.
+struct PendingNotif {
+    /// The buffer(s) keeping user pages pinned.
+    _buffers: SendBuffers,
+    /// Number of NOTIF CQEs still expected for this send.
+    notifs_remaining: u32,
 }
 
 /// State for a vectored (scatter-gather) send operation.
@@ -185,6 +199,11 @@ pub struct UringConnection {
     /// Grows as needed for large sends, shrinks when cleared.
     frag_buf: BytesMut,
 
+    /// Buffers awaiting NOTIF (send complete, pages still pinned by kernel).
+    /// FIFO: push on initial CQE completion, pop on NOTIF arrival.
+    /// TCP guarantees in-order completion, so FIFO ordering is correct.
+    notif_buffers: VecDeque<PendingNotif>,
+
     // === Recv state ===
     /// Whether multishot recv is currently active.
     pub multishot_active: bool,
@@ -237,6 +256,7 @@ impl UringConnection {
             free_slots: 0xFF, // All 8 slots free
             sends_in_flight: 0,
             frag_buf: BytesMut::with_capacity(FRAG_DEFAULT_CAPACITY),
+            notif_buffers: VecDeque::new(),
             multishot_active: false,
             single_recv_pending: false,
             use_single_recv: false,
@@ -452,13 +472,47 @@ impl UringConnection {
         }
     }
 
-    /// Handle send notification (kernel done with buffer).
+    /// Complete a zero-copy send early: free the slot now, keep buffer alive for NOTIF.
+    ///
+    /// Called when the initial CQE indicates the full send is complete (no remaining
+    /// data). The buffer is moved to `notif_buffers` so the kernel can keep pages
+    /// pinned until the NOTIF arrives, while the send slot is freed for reuse.
+    ///
+    /// Returns true if there's pending data in frag_buf to send.
+    #[inline]
+    pub fn complete_send_early(&mut self, slot: u8) -> bool {
+        if let Some(send) = self.send_slots[slot as usize].take() {
+            self.notif_buffers.push_back(PendingNotif {
+                _buffers: send.buffers,
+                notifs_remaining: send.notifs_pending,
+            });
+            self.free_slots |= 1 << slot;
+            self.sends_in_flight = self.sends_in_flight.saturating_sub(1);
+        }
+        self.has_pending_data()
+    }
+
+    /// Handle send notification (kernel done with zero-copy pages).
+    ///
+    /// Tries the notif_buffers queue first (normal path after early slot freeing).
+    /// Falls back to slot-based cleanup for closing connections where the initial
+    /// CQE was skipped.
     ///
     /// Returns (slot_freed, should_continue) where:
-    /// - slot_freed: true if this slot is now free (all notifs received)
+    /// - slot_freed: true if a slot was freed (only in fallback path)
     /// - should_continue: true if there's pending data to send
     #[inline]
     pub fn on_send_notif(&mut self, slot: u8) -> (bool, bool) {
+        // Normal path: buffer was moved to notif_buffers on initial CQE completion
+        if let Some(front) = self.notif_buffers.front_mut() {
+            front.notifs_remaining = front.notifs_remaining.saturating_sub(1);
+            if front.notifs_remaining == 0 {
+                self.notif_buffers.pop_front(); // drops the buffer
+            }
+            return (false, false);
+        }
+
+        // Fallback: buffer still in slot (e.g., connection closing, initial CQE skipped)
         let slot_freed = if let Some(send) = self
             .send_slots
             .get_mut(slot as usize)
@@ -486,9 +540,9 @@ impl UringConnection {
         !self.frag_buf.is_empty()
     }
 
-    /// Check if all sends are complete (nothing in flight, no pending data).
+    /// Check if all sends and NOTIF cleanups are complete.
     #[inline]
     pub fn all_sends_complete(&self) -> bool {
-        self.sends_in_flight == 0 && self.frag_buf.is_empty()
+        self.sends_in_flight == 0 && self.notif_buffers.is_empty() && self.frag_buf.is_empty()
     }
 }
