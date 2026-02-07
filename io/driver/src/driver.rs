@@ -531,6 +531,20 @@ pub trait IoDriver: Send {
     /// Returns an iterator over the completions.
     fn drain_completions(&mut self) -> Vec<Completion>;
 
+    /// Submit any pending I/O operations to the kernel without waiting.
+    ///
+    /// For io_uring, this flushes the submission queue so that SQEs pushed
+    /// during completion processing (e.g. send responses) reach the kernel
+    /// immediately, rather than waiting until the next `poll()` call.
+    ///
+    /// For mio, this is a no-op since sends execute inline.
+    ///
+    /// Call this after processing completions and submitting responses
+    /// to minimize response latency.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     // === Introspection ===
 
     /// Get the number of registered connections.

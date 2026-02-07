@@ -637,6 +637,11 @@ fn run_worker<C: Cache>(
             }
         }
 
+        // Flush pending send SQEs to the kernel immediately.
+        // Without this, sends queued during completion processing wait
+        // until the next poll() call, adding one poll-cycle of latency.
+        let _ = driver.flush();
+
         // Check if we should exit (shutdown requested and no active connections)
         if shutting_down {
             let active = connections.iter().filter(|c| c.is_some()).count();

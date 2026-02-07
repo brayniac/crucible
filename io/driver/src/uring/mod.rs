@@ -2369,6 +2369,10 @@ impl IoDriver for UringDriver {
         std::mem::take(&mut self.pending_completions)
     }
 
+    fn flush(&mut self) -> io::Result<()> {
+        self.ring.submitter().submit().map(|_| ())
+    }
+
     fn connection_count(&self) -> usize {
         self.connections.len()
     }
