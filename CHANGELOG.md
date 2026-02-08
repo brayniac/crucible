@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.16] - 2026-02-08
+
+### Changed
+- Re-enabled io_uring as default I/O engine (was temporarily disabled in 0.2.15)
+- io_uring poll() now drains partial send continuations in a tight loop, matching mio's
+  write loop behavior and eliminating per-partial-send event loop round-trips
+
+### Fixed
+- Benchmark client latency measurement inflated by pipelining: now measures from when bytes
+  are sent to kernel (`sent_at`) instead of when request is encoded into buffer (`queued_at`)
+- Clippy warnings in large value I/O tests
+
 ## [0.2.15] - 2026-02-08
 
 ### Added
