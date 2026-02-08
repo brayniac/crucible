@@ -15,6 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.17] - 2026-02-08
+
+### Added
+- GET TTFB (time-to-first-byte) metric in benchmark: stamps when first response bytes arrive,
+  enabling apples-to-apples comparison with tools like valkey-benchmark. Displayed in all
+  output formats (clean, verbose, JSON)
+
+### Changed
+- Benchmark io_uring recv buffers increased from 16KB to 256KB, reducing CQE overhead 16x
+  for large value responses (e.g., 4MB GET: ~256 CQEs → ~16 CQEs)
+
+### Fixed
+- Benchmark tail latency inflation from sequential completion processing: all connections
+  in a poll batch now share a single receive timestamp instead of per-connection timestamps
+  that were delayed by earlier connections' read processing
+
 ## [0.2.16] - 2026-02-08
 
 ### Changed
