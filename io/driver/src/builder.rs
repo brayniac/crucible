@@ -125,12 +125,9 @@ impl DriverBuilder {
     pub fn build(self) -> io::Result<Box<dyn IoDriver>> {
         match self.engine {
             IoEngine::Auto => {
-                #[cfg(all(target_os = "linux", feature = "io_uring"))]
-                {
-                    if crate::uring::is_supported() {
-                        return self.build_uring();
-                    }
-                }
+                // io_uring send path has correctness and performance issues
+                // with large values. Default to mio until resolved.
+                // To opt-in to io_uring explicitly, use IoEngine::Uring.
                 self.build_mio()
             }
             IoEngine::Mio => self.build_mio(),
