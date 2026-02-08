@@ -128,6 +128,17 @@ impl OutputFormatter for VerboseFormatter {
             results.get_latencies.p9999_us,
             results.get_latencies.max_us,
         );
+        if results.get_ttfb.p50_us > 0.0 {
+            tracing::info!(
+                "GET TTFB:    p50={:.0}us p90={:.0}us p99={:.0}us p99.9={:.0}us p99.99={:.0}us max={:.0}us",
+                results.get_ttfb.p50_us,
+                results.get_ttfb.p90_us,
+                results.get_ttfb.p99_us,
+                results.get_ttfb.p999_us,
+                results.get_ttfb.p9999_us,
+                results.get_ttfb.max_us,
+            );
+        }
         tracing::info!(
             "SET latency: p50={:.0}us p90={:.0}us p99={:.0}us p99.9={:.0}us p99.99={:.0}us max={:.0}us",
             results.set_latencies.p50_us,

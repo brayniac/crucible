@@ -444,6 +444,7 @@ impl MomentoSession {
                     success,
                     is_error_response: is_error,
                     latency_ns,
+                    ttfb_ns: None,
                     request_type: req.request_type,
                     hit,
                 });

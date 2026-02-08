@@ -182,9 +182,13 @@ pub struct IoWorker {
 impl IoWorker {
     /// Create a new worker.
     pub fn new(cfg: IoWorkerConfig) -> io::Result<Self> {
-        // Use io-driver defaults for buffer sizing (16KB * 2048 buffers, sq_depth 1024)
+        // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
+        // With 16KB buffers, a 4MB response generates ~256 CQEs; with 256KB it's ~16.
+        // 1024 buffers × 256KB = 256MB per worker — acceptable for a benchmark tool.
         let driver = Driver::builder()
             .engine(cfg.config.general.io_engine)
+            .buffer_size(256 * 1024)
+            .buffer_count(1024)
             .build()?;
 
         let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);
@@ -404,8 +408,12 @@ impl IoWorker {
         let count = self.driver.poll(Some(Duration::from_micros(100)))?;
 
         if count > 0 {
-            // Process completions
-            self.process_completions()?;
+            // Timestamp taken once after poll returns — all connections in this
+            // batch became ready during the same poll window, so they share the
+            // same receive timestamp. This avoids inflating tail latency for
+            // connections processed later in the batch.
+            let poll_time = std::time::Instant::now();
+            self.process_completions(poll_time)?;
         }
 
         // Process any received data into responses
@@ -544,7 +552,8 @@ impl IoWorker {
         let count = self.driver.poll(Some(Duration::from_micros(100)))?;
 
         if count > 0 {
-            self.process_completions()?;
+            let poll_time = std::time::Instant::now();
+            self.process_completions(poll_time)?;
         }
 
         // Process responses (to clear pipeline for more requests)
@@ -769,7 +778,7 @@ impl IoWorker {
     }
 
     #[inline]
-    fn process_completions(&mut self) -> io::Result<()> {
+    fn process_completions(&mut self, poll_time: std::time::Instant) -> io::Result<()> {
         let completions = self.driver.drain_completions();
 
         // Collect indices and reasons for sessions to close (to avoid borrow conflicts)
@@ -783,10 +792,14 @@ impl IoWorker {
                     if let Some(&idx) = self.conn_id_to_idx.get(&id) {
                         // Zero-copy path: parse responses directly from driver's buffer
                         // This avoids copying data to an intermediate session buffer
-                        let now = std::time::Instant::now();
+                        let now = poll_time;
                         self.results.clear();
                         let results = &mut self.results;
                         let session = &mut self.sessions[idx];
+
+                        // Stamp TTFB on the first unstamped in-flight request
+                        // before reading data, using the poll return time.
+                        session.stamp_first_byte(now);
 
                         let result =
                             self.driver
@@ -844,6 +857,9 @@ impl IoWorker {
                                     RequestType::Get => {
                                         metrics::GET_COUNT.increment();
                                         let _ = metrics::GET_LATENCY.increment(result.latency_ns);
+                                        if let Some(ttfb) = result.ttfb_ns {
+                                            let _ = metrics::GET_TTFB.increment(ttfb);
+                                        }
                                     }
                                     RequestType::Set => {
                                         metrics::SET_COUNT.increment();
@@ -967,6 +983,9 @@ impl IoWorker {
                     RequestType::Get => {
                         metrics::GET_COUNT.increment();
                         let _ = metrics::GET_LATENCY.increment(result.latency_ns);
+                        if let Some(ttfb) = result.ttfb_ns {
+                            let _ = metrics::GET_TTFB.increment(ttfb);
+                        }
                     }
                     RequestType::Set => {
                         metrics::SET_COUNT.increment();

@@ -87,6 +87,8 @@ struct ResultsOutput {
     rx_bps: u64,
     tx_bps: u64,
     get: LatencyOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    get_ttfb: Option<LatencyOutput>,
     set: LatencyOutput,
     conns_active: u64,
     conns_failed: u64,
@@ -209,6 +211,19 @@ impl OutputFormatter for JsonFormatter {
                 p999_us: results.get_latencies.p999_us as u64,
                 p9999_us: results.get_latencies.p9999_us as u64,
                 max_us: results.get_latencies.max_us as u64,
+            },
+            get_ttfb: if results.get_ttfb.p50_us > 0.0 {
+                Some(LatencyOutput {
+                    count: results.get_count,
+                    p50_us: results.get_ttfb.p50_us as u64,
+                    p90_us: results.get_ttfb.p90_us as u64,
+                    p99_us: results.get_ttfb.p99_us as u64,
+                    p999_us: results.get_ttfb.p999_us as u64,
+                    p9999_us: results.get_ttfb.p9999_us as u64,
+                    max_us: results.get_ttfb.max_us as u64,
+                })
+            } else {
+                None
             },
             set: LatencyOutput {
                 count: results.set_count,

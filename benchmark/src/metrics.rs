@@ -159,3 +159,9 @@ pub static SET_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
     description = "DELETE response latency histogram (nanoseconds)"
 )]
 pub static DELETE_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "get_ttfb",
+    description = "GET time-to-first-byte histogram (nanoseconds)"
+)]
+pub static GET_TTFB: AtomicHistogram = AtomicHistogram::new(7, 64);

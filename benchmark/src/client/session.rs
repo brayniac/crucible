@@ -94,6 +94,8 @@ struct InFlightRequest {
     queued_at: Instant,
     /// When the request bytes were actually sent to the kernel.
     sent_at: Option<Instant>,
+    /// When the first bytes of the response were received (readability notification).
+    first_byte_at: Option<Instant>,
     /// Cumulative byte offset where this request's data ends in the send stream.
     bytes_end: u64,
     tx_timestamp: Option<Timestamp>,
@@ -403,6 +405,7 @@ impl Session {
             request_type: RequestType::Get,
             queued_at: now,
             sent_at: None,
+            first_byte_at: None,
             bytes_end: self.bytes_written,
             tx_timestamp: None,
         });
@@ -453,6 +456,7 @@ impl Session {
             request_type: RequestType::Set,
             queued_at: now,
             sent_at: None,
+            first_byte_at: None,
             bytes_end: self.bytes_written,
             tx_timestamp: None,
         });
@@ -504,6 +508,7 @@ impl Session {
             request_type: RequestType::Delete,
             queued_at: now,
             sent_at: None,
+            first_byte_at: None,
             bytes_end: self.bytes_written,
             tx_timestamp: None,
         });
@@ -648,6 +653,7 @@ impl Session {
                         );
 
                         let latency_ns = self.calculate_latency(&req, now, rx_timestamp);
+                        let ttfb_ns = self.calculate_ttfb(&req);
 
                         let hit = if req.request_type == RequestType::Get {
                             Some(!resp.is_null)
@@ -660,6 +666,7 @@ impl Session {
                             success: !resp.is_error,
                             is_error_response: resp.is_error,
                             latency_ns,
+                            ttfb_ns,
                             request_type: req.request_type,
                             hit,
                         });
@@ -811,6 +818,7 @@ impl Session {
                 Some(resp) => {
                     if let Some(req) = self.in_flight.pop_front() {
                         let latency_ns = self.calculate_latency(&req, now, rx_timestamp);
+                        let ttfb_ns = self.calculate_ttfb(&req);
 
                         let hit = if req.request_type == RequestType::Get {
                             Some(!resp.is_null)
@@ -833,6 +841,7 @@ impl Session {
                             success: !resp.is_error,
                             is_error_response: resp.is_error,
                             latency_ns,
+                            ttfb_ns,
                             request_type: req.request_type,
                             hit,
                         });
@@ -877,6 +886,24 @@ impl Session {
         }
 
         Ok(count)
+    }
+
+    /// Stamp `first_byte_at` on the first in-flight request that hasn't been
+    /// stamped yet. Called when a recv completion indicates data is available.
+    pub fn stamp_first_byte(&mut self, now: Instant) {
+        for req in &mut self.in_flight {
+            if req.first_byte_at.is_some() {
+                continue;
+            }
+            req.first_byte_at = Some(now);
+            break;
+        }
+    }
+
+    fn calculate_ttfb(&self, req: &InFlightRequest) -> Option<u64> {
+        let first_byte = req.first_byte_at?;
+        let baseline = req.sent_at.unwrap_or(req.queued_at);
+        Some(first_byte.duration_since(baseline).as_nanos() as u64)
     }
 
     fn calculate_latency(

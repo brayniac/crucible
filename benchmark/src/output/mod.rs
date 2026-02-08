@@ -120,6 +120,7 @@ pub struct Results {
     pub get_count: u64,
     pub set_count: u64,
     pub get_latencies: LatencyStats,
+    pub get_ttfb: LatencyStats,
     pub set_latencies: LatencyStats,
     pub conns_active: u64,
     pub conns_failed: u64,

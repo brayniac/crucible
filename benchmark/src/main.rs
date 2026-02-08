@@ -497,6 +497,16 @@ fn run_benchmark(
         max_us: max_percentile(&metrics::GET_LATENCY) / 1000.0,
     };
 
+    // GET time-to-first-byte
+    let get_ttfb = LatencyStats {
+        p50_us: percentile(&metrics::GET_TTFB, 50.0) / 1000.0,
+        p90_us: percentile(&metrics::GET_TTFB, 90.0) / 1000.0,
+        p99_us: percentile(&metrics::GET_TTFB, 99.0) / 1000.0,
+        p999_us: percentile(&metrics::GET_TTFB, 99.9) / 1000.0,
+        p9999_us: percentile(&metrics::GET_TTFB, 99.99) / 1000.0,
+        max_us: max_percentile(&metrics::GET_TTFB) / 1000.0,
+    };
+
     // Get latencies for SET operations
     let set_latencies = LatencyStats {
         p50_us: percentile(&metrics::SET_LATENCY, 50.0) / 1000.0,
@@ -519,6 +529,7 @@ fn run_benchmark(
         get_count,
         set_count,
         get_latencies,
+        get_ttfb,
         set_latencies,
         conns_active: active,
         conns_failed: failed,

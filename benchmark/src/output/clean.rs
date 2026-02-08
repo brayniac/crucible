@@ -272,6 +272,9 @@ impl OutputFormatter for CleanFormatter {
 
         if results.get_count > 0 {
             println!("{}", format_latency_row("GET", &results.get_latencies));
+            if results.get_ttfb.p50_us > 0.0 {
+                println!("{}", format_latency_row("GET TTFB", &results.get_ttfb));
+            }
         }
         if results.set_count > 0 {
             println!("{}", format_latency_row("SET", &results.set_latencies));
