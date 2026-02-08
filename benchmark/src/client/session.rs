@@ -92,6 +92,10 @@ struct InFlightRequest {
     id: u64,
     request_type: RequestType,
     queued_at: Instant,
+    /// When the request bytes were actually sent to the kernel.
+    sent_at: Option<Instant>,
+    /// Cumulative byte offset where this request's data ends in the send stream.
+    bytes_end: u64,
     tx_timestamp: Option<Timestamp>,
 }
 
@@ -201,6 +205,10 @@ pub struct Session {
     last_tx_timestamp: Option<Timestamp>,
     /// Most recent RX timestamp
     last_rx_timestamp: Option<Timestamp>,
+    /// Cumulative bytes written to the send buffer (for sent_at tracking).
+    bytes_written: u64,
+    /// Cumulative bytes confirmed sent by the driver (for sent_at tracking).
+    bytes_confirmed: u64,
 }
 
 impl Session {
@@ -261,6 +269,8 @@ impl Session {
             use_kernel_timestamps: config.use_kernel_timestamps,
             last_tx_timestamp: None,
             last_rx_timestamp: None,
+            bytes_written: 0,
+            bytes_confirmed: 0,
         }
     }
 
@@ -296,6 +306,8 @@ impl Session {
         self.buffers.recv.clear();
         self.last_tx_timestamp = None;
         self.last_rx_timestamp = None;
+        self.bytes_written = 0;
+        self.bytes_confirmed = 0;
 
         // Reset codec state
         match &mut self.codec {
@@ -369,6 +381,7 @@ impl Session {
         let id = self.next_id;
         self.next_id += 1;
 
+        let before = self.buffers.send.readable();
         match &mut self.codec {
             ProtocolCodec::Resp(codec) => {
                 codec.encode_get(&mut self.buffers.send, key);
@@ -383,11 +396,14 @@ impl Session {
                 codec.encode_ping(&mut self.buffers.send);
             }
         }
+        self.bytes_written += (self.buffers.send.readable() - before) as u64;
 
         self.in_flight.push_back(InFlightRequest {
             id,
             request_type: RequestType::Get,
             queued_at: now,
+            sent_at: None,
+            bytes_end: self.bytes_written,
             tx_timestamp: None,
         });
         self.requests_sent += 1;
@@ -415,6 +431,7 @@ impl Session {
         let id = self.next_id;
         self.next_id += 1;
 
+        let before = self.buffers.send.readable();
         match &mut self.codec {
             ProtocolCodec::Resp(codec) => {
                 codec.encode_set(&mut self.buffers.send, key, value);
@@ -429,11 +446,14 @@ impl Session {
                 codec.encode_ping(&mut self.buffers.send);
             }
         }
+        self.bytes_written += (self.buffers.send.readable() - before) as u64;
 
         self.in_flight.push_back(InFlightRequest {
             id,
             request_type: RequestType::Set,
             queued_at: now,
+            sent_at: None,
+            bytes_end: self.bytes_written,
             tx_timestamp: None,
         });
         self.requests_sent += 1;
@@ -461,6 +481,7 @@ impl Session {
         let id = self.next_id;
         self.next_id += 1;
 
+        let before = self.buffers.send.readable();
         match &mut self.codec {
             ProtocolCodec::Resp(codec) => {
                 codec.encode_delete(&mut self.buffers.send, key);
@@ -476,11 +497,14 @@ impl Session {
                 codec.encode_ping(&mut self.buffers.send);
             }
         }
+        self.bytes_written += (self.buffers.send.readable() - before) as u64;
 
         self.in_flight.push_back(InFlightRequest {
             id,
             request_type: RequestType::Delete,
             queued_at: now,
+            sent_at: None,
+            bytes_end: self.bytes_written,
             tx_timestamp: None,
         });
         self.requests_sent += 1;
@@ -506,6 +530,20 @@ impl Session {
 
         // Track bytes transmitted
         crate::metrics::BYTES_TX.add(n as u64);
+
+        // Advance confirmed byte counter and stamp requests that are fully sent
+        self.bytes_confirmed += n as u64;
+        let now = Instant::now();
+        for req in &mut self.in_flight {
+            if req.sent_at.is_some() {
+                continue;
+            }
+            if req.bytes_end <= self.bytes_confirmed {
+                req.sent_at = Some(now);
+            } else {
+                break;
+            }
+        }
 
         // Capture TX timestamp for in-flight requests
         if self.use_kernel_timestamps
@@ -853,7 +891,11 @@ impl Session {
         {
             return rx_ns.saturating_sub(tx_ns);
         }
-        now.duration_since(req.queued_at).as_nanos() as u64
+        // Use sent_at (when bytes actually reached kernel) instead of queued_at
+        // (when request was encoded into buffer) to avoid inflating latency
+        // from pipelining and send buffer queuing delays.
+        let baseline = req.sent_at.unwrap_or(req.queued_at);
+        now.duration_since(baseline).as_nanos() as u64
     }
 
     /// Clear all buffers and in-flight state (for reconnection).
@@ -863,6 +905,8 @@ impl Session {
         self.in_flight.clear();
         self.last_tx_timestamp = None;
         self.last_rx_timestamp = None;
+        self.bytes_written = 0;
+        self.bytes_confirmed = 0;
 
         match &mut self.codec {
             ProtocolCodec::Resp(codec) => codec.reset_counter(),

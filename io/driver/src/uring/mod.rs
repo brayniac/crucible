@@ -2359,6 +2359,38 @@ impl IoDriver for UringDriver {
         }
         self.cqe_scratch = cqes; // restore empty vec with capacity preserved
 
+        // Handle partial send continuations in a tight loop.
+        //
+        // Without this, each partial send (e.g. 200KB of a 5MB response)
+        // requires a full event loop round-trip: poll → server → flush → poll.
+        // For a 5MB value with ~200KB socket buffer, that's ~25 round-trips.
+        //
+        // This loop submits continuation SQEs and immediately drains their
+        // CQEs, collapsing all partial sends into a single poll() call —
+        // matching mio's tight write loop behavior.
+        loop {
+            if self.ring.submission().is_empty() {
+                break;
+            }
+
+            // Submit continuation SQEs pushed during CQE processing
+            let _ = self.ring.submitter().submit();
+
+            // Non-blocking drain of any new CQEs
+            self.cqe_scratch.extend(self.ring.completion());
+            if self.cqe_scratch.is_empty() {
+                // Kernel hasn't produced CQEs yet (e.g. async ZC send).
+                // They'll be picked up on the next poll() call.
+                break;
+            }
+
+            let mut cqes = std::mem::take(&mut self.cqe_scratch);
+            for cqe in cqes.drain(..) {
+                self.process_cqe(cqe);
+            }
+            self.cqe_scratch = cqes;
+        }
+
         Ok(count)
     }
 
