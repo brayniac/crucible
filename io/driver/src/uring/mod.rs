@@ -479,10 +479,12 @@ impl UringDriver {
         if msg_flags != 0 {
             send_builder = send_builder.flags(msg_flags);
         }
-        let send_op =
-            send_builder
-                .build()
-                .user_data(encode_user_data(conn_id, generation, buf_idx, OP_SEND_REGULAR));
+        let send_op = send_builder.build().user_data(encode_user_data(
+            conn_id,
+            generation,
+            buf_idx,
+            OP_SEND_REGULAR,
+        ));
 
         unsafe {
             self.ring
@@ -541,7 +543,12 @@ impl UringDriver {
             .unwrap_or(0);
         let sendmsg_op = opcode::SendMsg::new(Fixed(fixed_slot), msghdr as *const _)
             .build()
-            .user_data(encode_user_data(conn_id, generation, slot, OP_SENDMSG_REGULAR));
+            .user_data(encode_user_data(
+                conn_id,
+                generation,
+                slot,
+                OP_SENDMSG_REGULAR,
+            ));
 
         unsafe {
             self.ring
@@ -568,7 +575,11 @@ impl UringDriver {
             }
             OP_SEND => {
                 let (id, generation, buf_idx, _) = decode_user_data(user_data);
-                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                if self
+                    .connections
+                    .get(id)
+                    .is_some_and(|c| c.generation == generation)
+                {
                     self.handle_send(id, buf_idx as usize, result, flags);
                 }
             }
@@ -592,7 +603,11 @@ impl UringDriver {
             OP_SENDMSG => {
                 // Regular TCP scatter-gather send (not via send_owned)
                 let (id, generation, buf_idx, _) = decode_user_data(user_data);
-                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                if self
+                    .connections
+                    .get(id)
+                    .is_some_and(|c| c.generation == generation)
+                {
                     self.handle_send(id, buf_idx as usize, result, flags);
                 }
             }
@@ -642,7 +657,11 @@ impl UringDriver {
             OP_SEND_REGULAR | OP_SENDMSG_REGULAR => {
                 // Regular send completion (no NOTIF expected)
                 let (id, generation, buf_idx, _) = decode_user_data(user_data);
-                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                if self
+                    .connections
+                    .get(id)
+                    .is_some_and(|c| c.generation == generation)
+                {
                     self.handle_send_regular(id, buf_idx as usize, result);
                 }
             }
@@ -975,7 +994,13 @@ impl UringDriver {
                 if let Some(conn) = self.connections.get_mut(conn_id) {
                     let (slot_freed, should_continue) = conn.on_send_notif(slot);
                     let should_close = slot_freed && conn.closing && conn.all_sends_complete();
-                    (slot_freed, should_continue, should_close, conn.generation, conn.closing)
+                    (
+                        slot_freed,
+                        should_continue,
+                        should_close,
+                        conn.generation,
+                        conn.closing,
+                    )
                 } else {
                     (false, false, false, 0, true)
                 };
@@ -1178,12 +1203,10 @@ impl UringDriver {
                     match cont {
                         crate::uring::connection::SendContinuation::Flat { ptr, len } => {
                             let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                            let _ =
-                                self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
+                            let _ = self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
                         }
                         crate::uring::connection::SendContinuation::Vectored { msghdr_ptr } => {
-                            let _ =
-                                self.submit_tcp_sendmsg(conn_id, fixed_slot, slot, msghdr_ptr);
+                            let _ = self.submit_tcp_sendmsg(conn_id, fixed_slot, slot, msghdr_ptr);
                         }
                     }
                 }
