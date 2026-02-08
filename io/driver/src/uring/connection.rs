@@ -384,9 +384,9 @@ impl UringConnection {
         self.sends_in_flight = self.sends_in_flight.saturating_sub(1);
     }
 
-    /// Prepare a vectored (scatter-gather) send from owned Bytes buffers.
+    /// Prepare a vectored (scatter-gather) send from owned Bytes buffers (zero-copy).
     ///
-    /// Returns (slot_index, msghdr_ptr, total_len) for SendMsg. Returns None if:
+    /// Returns (slot_index, msghdr_ptr, total_len) for SendMsgZc. Returns None if:
     /// - All send slots are in use
     /// - No buffers provided
     #[inline]
@@ -411,6 +411,36 @@ impl UringConnection {
             buffers: SendBuffers::Vectored(vectored),
             pos: 0,
             notifs_pending: 1,
+        });
+        self.sends_in_flight += 1;
+
+        Some((slot, msghdr_ptr, total_len))
+    }
+
+    /// Prepare a vectored (scatter-gather) send from owned Bytes buffers (non-zero-copy).
+    ///
+    /// Like `prepare_vectored_send()` but sets notifs_pending = 0 since regular
+    /// sends don't generate a NOTIF - the slot can be freed immediately on completion.
+    #[inline]
+    pub fn prepare_vectored_send_regular(
+        &mut self,
+        buffers: Vec<Bytes>,
+    ) -> Option<(u8, *const libc::msghdr, usize)> {
+        let slot = self.alloc_send_slot()?;
+
+        let vectored = VectoredSend::new(buffers);
+        if vectored.count == 0 {
+            self.free_slots |= 1 << slot; // Return slot
+            return None;
+        }
+
+        let msghdr_ptr = vectored.msghdr_ptr();
+        let total_len = vectored.total_len();
+
+        self.send_slots[slot as usize] = Some(InFlightSend {
+            buffers: SendBuffers::Vectored(vectored),
+            pos: 0,
+            notifs_pending: 0,
         });
         self.sends_in_flight += 1;
 

@@ -54,6 +54,7 @@ const OP_ZC_SENDMSG: u64 = 8; // Zero-copy sendmsg via send_owned
 const OP_DIRECT_RECV: u64 = 9; // Zero-copy recv into raw pointer
 const OP_TCP_RECVMSG: u64 = 10; // TCP scatter-gather recvmsg
 const OP_SEND_REGULAR: u64 = 11; // Regular send (kernel copies immediately)
+const OP_SENDMSG_REGULAR: u64 = 12; // Regular TCP scatter-gather send (kernel copies)
 
 /// Maximum number of iovecs for zero-copy sends.
 /// 8 covers typical responses (header + value + trailer = 3) with room to spare.
@@ -522,6 +523,35 @@ impl UringDriver {
         Ok(())
     }
 
+    /// Submit a regular (non-zero-copy) SendMsg operation for TCP scatter-gather.
+    ///
+    /// Uses IORING_OP_SENDMSG which copies data to the kernel socket buffer.
+    /// Single CQE on completion, no NOTIF. Slot can be freed immediately.
+    fn submit_tcp_sendmsg(
+        &mut self,
+        conn_id: usize,
+        fixed_slot: u32,
+        slot: u8,
+        msghdr: *const libc::msghdr,
+    ) -> io::Result<()> {
+        let generation = self
+            .connections
+            .get(conn_id)
+            .map(|c| c.generation)
+            .unwrap_or(0);
+        let sendmsg_op = opcode::SendMsg::new(Fixed(fixed_slot), msghdr as *const _)
+            .build()
+            .user_data(encode_user_data(conn_id, generation, slot, OP_SENDMSG_REGULAR));
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&sendmsg_op)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+        Ok(())
+    }
+
     /// Process a completion queue entry.
     fn process_cqe(&mut self, cqe: io_uring::cqueue::Entry) {
         let user_data = cqe.user_data();
@@ -609,7 +639,7 @@ impl UringDriver {
                 let (conn_id, generation, _, _) = decode_user_data(user_data);
                 self.handle_tcp_recvmsg(conn_id, generation, result);
             }
-            OP_SEND_REGULAR => {
+            OP_SEND_REGULAR | OP_SENDMSG_REGULAR => {
                 // Regular send completion (no NOTIF expected)
                 let (id, generation, buf_idx, _) = decode_user_data(user_data);
                 if self.connections.get(id).is_some_and(|c| c.generation == generation) {
@@ -1039,9 +1069,9 @@ impl UringDriver {
 
     /// Continue a partial send (either single or vectored).
     ///
-    /// Called when SendMsgZc completes with fewer bytes than requested.
+    /// Called when a send completes with fewer bytes than requested.
     /// Rebuilds the iovec array for vectored sends or resubmits the remaining
-    /// single buffer, then submits a new SendMsgZc for the remainder.
+    /// single buffer, then submits a new send for the remainder.
     fn continue_partial_send(&mut self, conn_id: usize, slot: u8) {
         use crate::uring::connection::SendContinuation;
 
@@ -1055,24 +1085,24 @@ impl UringDriver {
         if let Some((cont, fixed_slot)) = continuation {
             match cont {
                 SendContinuation::Vectored { msghdr_ptr } => {
-                    let _ = self.submit_tcp_sendmsg_zc(conn_id, fixed_slot, slot, msghdr_ptr);
+                    let _ = self.submit_tcp_sendmsg(conn_id, fixed_slot, slot, msghdr_ptr);
                 }
                 SendContinuation::Flat { ptr, len } => {
                     let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                    let _ = self.submit_send_zc(conn_id, fixed_slot, slot, send_data);
+                    let _ = self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
                 }
             }
         }
     }
 
-    /// Continue sending from fragmentation buffer after a slot is freed (zero-copy).
+    /// Continue sending from fragmentation buffer after a slot is freed.
     fn continue_send(&mut self, conn_id: usize) {
         if let Some(conn) = self.connections.get_mut(conn_id)
-            && let Some((slot, ptr, len)) = conn.prepare_send()
+            && let Some((slot, ptr, len)) = conn.prepare_send_regular()
         {
             let fixed_slot = conn.fixed_slot;
             let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let _ = self.submit_send_zc(conn_id, fixed_slot, slot, send_data);
+            let _ = self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
         }
     }
 
@@ -1143,12 +1173,19 @@ impl UringDriver {
             // Partial send - continue with remaining data internally.
             // Do NOT emit SendReady here (same rationale as handle_send).
             if let Some(conn) = self.connections.get_mut(conn_id) {
-                if let Some(crate::uring::connection::SendContinuation::Flat { ptr, len }) =
-                    conn.prepare_partial_continuation(slot)
-                {
+                if let Some(cont) = conn.prepare_partial_continuation(slot) {
                     let fixed_slot = conn.fixed_slot;
-                    let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                    let _ = self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
+                    match cont {
+                        crate::uring::connection::SendContinuation::Flat { ptr, len } => {
+                            let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+                            let _ =
+                                self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
+                        }
+                        crate::uring::connection::SendContinuation::Vectored { msghdr_ptr } => {
+                            let _ =
+                                self.submit_tcp_sendmsg(conn_id, fixed_slot, slot, msghdr_ptr);
+                        }
+                    }
                 }
             }
         } else {
@@ -1874,11 +1911,11 @@ impl IoDriver for UringDriver {
         conn.queue_send(data);
 
         // Try to start sending if slots available
-        // Use zero-copy send (avoids kernel copy, higher overhead per-op)
-        if let Some((slot, ptr, len)) = conn.prepare_send() {
+        // Use regular send (kernel copies immediately, single CQE, no NOTIF delay)
+        if let Some((slot, ptr, len)) = conn.prepare_send_regular() {
             let fixed_slot = conn.fixed_slot;
             let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-            self.submit_send_zc(conn_id, fixed_slot, slot, send_data)?;
+            self.submit_send_regular(conn_id, fixed_slot, slot, send_data)?;
         }
 
         Ok(data.len())
@@ -1909,13 +1946,13 @@ impl IoDriver for UringDriver {
 
         // Prepare vectored send - allocates slot and stores buffers
         let (slot, msghdr_ptr, total_len) = conn
-            .prepare_vectored_send(buffers)
+            .prepare_vectored_send_regular(buffers)
             .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
 
         let fixed_slot = conn.fixed_slot;
 
-        // Submit SendMsgZc operation for true zero-copy scatter-gather
-        self.submit_tcp_sendmsg_zc(conn_id, fixed_slot, slot, msghdr_ptr)?;
+        // Submit regular SendMsg (kernel copies immediately, single CQE)
+        self.submit_tcp_sendmsg(conn_id, fixed_slot, slot, msghdr_ptr)?;
 
         Ok(total_len)
     }
