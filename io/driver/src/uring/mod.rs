@@ -27,7 +27,7 @@ use arrayvec::ArrayVec;
 use buf_ring::BufRing;
 use connection::UringConnection;
 use io_uring::cqueue;
-use io_uring::opcode::{self, AcceptMulti, RecvMulti, SendZc};
+use io_uring::opcode::{self, AcceptMulti, RecvMulti};
 use io_uring::squeue;
 use io_uring::types::Fixed;
 use io_uring::{IoUring, Probe};
