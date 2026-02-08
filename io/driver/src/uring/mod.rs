@@ -27,7 +27,7 @@ use arrayvec::ArrayVec;
 use buf_ring::BufRing;
 use connection::UringConnection;
 use io_uring::cqueue;
-use io_uring::opcode::{self, AcceptMulti, RecvMulti, SendZc};
+use io_uring::opcode::{self, AcceptMulti, RecvMulti};
 use io_uring::squeue;
 use io_uring::types::Fixed;
 use io_uring::{IoUring, Probe};
@@ -403,48 +403,6 @@ impl UringDriver {
         Ok(())
     }
 
-    /// Submit a SendZc operation.
-    fn submit_send_zc(
-        &mut self,
-        conn_id: usize,
-        fixed_slot: u32,
-        buf_idx: u8,
-        data: &[u8],
-    ) -> io::Result<()> {
-        self.submit_send_zc_flags(conn_id, fixed_slot, buf_idx, data, 0)
-    }
-
-    /// Submit a SendZc operation with optional flags (MSG_MORE, etc).
-    fn submit_send_zc_flags(
-        &mut self,
-        conn_id: usize,
-        fixed_slot: u32,
-        buf_idx: u8,
-        data: &[u8],
-        msg_flags: i32,
-    ) -> io::Result<()> {
-        let generation = self
-            .connections
-            .get(conn_id)
-            .map(|c| c.generation)
-            .unwrap_or(0);
-        let mut send_builder = SendZc::new(Fixed(fixed_slot), data.as_ptr(), data.len() as u32);
-        if msg_flags != 0 {
-            send_builder = send_builder.flags(msg_flags);
-        }
-        let send_op = send_builder
-            .build()
-            .user_data(encode_user_data(conn_id, generation, buf_idx, OP_SEND));
-
-        unsafe {
-            self.ring
-                .submission()
-                .push(&send_op)
-                .map_err(|_| io::Error::other("SQ full"))?;
-        }
-        Ok(())
-    }
-
     /// Submit a regular Send operation (kernel copies immediately).
     ///
     /// Uses IORING_OP_SEND which copies data to the kernel socket buffer.
@@ -479,45 +437,17 @@ impl UringDriver {
         if msg_flags != 0 {
             send_builder = send_builder.flags(msg_flags);
         }
-        let send_op =
-            send_builder
-                .build()
-                .user_data(encode_user_data(conn_id, generation, buf_idx, OP_SEND_REGULAR));
+        let send_op = send_builder.build().user_data(encode_user_data(
+            conn_id,
+            generation,
+            buf_idx,
+            OP_SEND_REGULAR,
+        ));
 
         unsafe {
             self.ring
                 .submission()
                 .push(&send_op)
-                .map_err(|_| io::Error::other("SQ full"))?;
-        }
-        Ok(())
-    }
-
-    /// Submit a SendMsgZc operation for TCP scatter-gather with zero-copy.
-    ///
-    /// Uses IORING_OP_SENDMSG_ZC which sends data directly from user buffers
-    /// without copying to kernel socket buffers. A NOTIF completion is sent
-    /// when the kernel is done with the buffers.
-    fn submit_tcp_sendmsg_zc(
-        &mut self,
-        conn_id: usize,
-        fixed_slot: u32,
-        slot: u8,
-        msghdr: *const libc::msghdr,
-    ) -> io::Result<()> {
-        let generation = self
-            .connections
-            .get(conn_id)
-            .map(|c| c.generation)
-            .unwrap_or(0);
-        let sendmsg_op = opcode::SendMsgZc::new(Fixed(fixed_slot), msghdr as *const _)
-            .build()
-            .user_data(encode_user_data(conn_id, generation, slot, OP_SENDMSG));
-
-        unsafe {
-            self.ring
-                .submission()
-                .push(&sendmsg_op)
                 .map_err(|_| io::Error::other("SQ full"))?;
         }
         Ok(())
@@ -541,7 +471,12 @@ impl UringDriver {
             .unwrap_or(0);
         let sendmsg_op = opcode::SendMsg::new(Fixed(fixed_slot), msghdr as *const _)
             .build()
-            .user_data(encode_user_data(conn_id, generation, slot, OP_SENDMSG_REGULAR));
+            .user_data(encode_user_data(
+                conn_id,
+                generation,
+                slot,
+                OP_SENDMSG_REGULAR,
+            ));
 
         unsafe {
             self.ring
@@ -568,7 +503,11 @@ impl UringDriver {
             }
             OP_SEND => {
                 let (id, generation, buf_idx, _) = decode_user_data(user_data);
-                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                if self
+                    .connections
+                    .get(id)
+                    .is_some_and(|c| c.generation == generation)
+                {
                     self.handle_send(id, buf_idx as usize, result, flags);
                 }
             }
@@ -592,7 +531,11 @@ impl UringDriver {
             OP_SENDMSG => {
                 // Regular TCP scatter-gather send (not via send_owned)
                 let (id, generation, buf_idx, _) = decode_user_data(user_data);
-                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                if self
+                    .connections
+                    .get(id)
+                    .is_some_and(|c| c.generation == generation)
+                {
                     self.handle_send(id, buf_idx as usize, result, flags);
                 }
             }
@@ -642,7 +585,11 @@ impl UringDriver {
             OP_SEND_REGULAR | OP_SENDMSG_REGULAR => {
                 // Regular send completion (no NOTIF expected)
                 let (id, generation, buf_idx, _) = decode_user_data(user_data);
-                if self.connections.get(id).is_some_and(|c| c.generation == generation) {
+                if self
+                    .connections
+                    .get(id)
+                    .is_some_and(|c| c.generation == generation)
+                {
                     self.handle_send_regular(id, buf_idx as usize, result);
                 }
             }
@@ -764,10 +711,8 @@ impl UringDriver {
         // Only deactivate multishot when the kernel signals no more completions.
         // When !has_more, the multishot operation has terminated and must be re-armed
         // (handled by the poll() re-arm logic).
-        if !has_more {
-            if let Some(conn) = self.connections.get_mut(conn_id) {
-                conn.multishot_active = false;
-            }
+        if !has_more && let Some(conn) = self.connections.get_mut(conn_id) {
+            conn.multishot_active = false;
         }
     }
 
@@ -975,7 +920,13 @@ impl UringDriver {
                 if let Some(conn) = self.connections.get_mut(conn_id) {
                     let (slot_freed, should_continue) = conn.on_send_notif(slot);
                     let should_close = slot_freed && conn.closing && conn.all_sends_complete();
-                    (slot_freed, should_continue, should_close, conn.generation, conn.closing)
+                    (
+                        slot_freed,
+                        should_continue,
+                        should_close,
+                        conn.generation,
+                        conn.closing,
+                    )
                 } else {
                     (false, false, false, 0, true)
                 };
@@ -1172,19 +1123,17 @@ impl UringDriver {
         if has_remaining {
             // Partial send - continue with remaining data internally.
             // Do NOT emit SendReady here (same rationale as handle_send).
-            if let Some(conn) = self.connections.get_mut(conn_id) {
-                if let Some(cont) = conn.prepare_partial_continuation(slot) {
-                    let fixed_slot = conn.fixed_slot;
-                    match cont {
-                        crate::uring::connection::SendContinuation::Flat { ptr, len } => {
-                            let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                            let _ =
-                                self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
-                        }
-                        crate::uring::connection::SendContinuation::Vectored { msghdr_ptr } => {
-                            let _ =
-                                self.submit_tcp_sendmsg(conn_id, fixed_slot, slot, msghdr_ptr);
-                        }
+            if let Some(conn) = self.connections.get_mut(conn_id)
+                && let Some(cont) = conn.prepare_partial_continuation(slot)
+            {
+                let fixed_slot = conn.fixed_slot;
+                match cont {
+                    crate::uring::connection::SendContinuation::Flat { ptr, len } => {
+                        let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+                        let _ = self.submit_send_regular(conn_id, fixed_slot, slot, send_data);
+                    }
+                    crate::uring::connection::SendContinuation::Vectored { msghdr_ptr } => {
+                        let _ = self.submit_tcp_sendmsg(conn_id, fixed_slot, slot, msghdr_ptr);
                     }
                 }
             }

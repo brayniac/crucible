@@ -15,6 +15,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.15] - 2026-02-08
+
+### Added
+- Vectored I/O for server send path
+- Zero-copy GET support for memcache ASCII and binary protocols
+
+### Changed
+- Default I/O engine changed from io_uring to mio
+- io_uring sends switched from zero-copy (SendZc) to regular sends for better throughput
+- io_uring continuation SQEs submitted inline during poll for lower latency
+- io_uring send slot lifecycle decoupled from SendZc NOTIF events
+- io_uring send SQEs flushed immediately after completion processing
+- Removed inline SQE submit at end of io_uring poll()
+- Refactored zero-copy GET integration into `process_from` with simplified server loop
+- Updated dependencies
+
+### Fixed
+- io_uring vectored send (SendMsgZc) partial send handling
+- io_uring VectoredSend dangling pointer and missing SendReady on NOTIF
+- io_uring multishot recv accumulation leak
+- io_uring spurious SendReady on partial send CQEs
+- io_uring generation validation for send CQEs and handle_send_regular
+
 ## [0.2.14] - 2026-02-06
 
 ### Added
