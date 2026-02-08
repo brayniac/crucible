@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # Only run if the commit message starts with "release: prepare v"
-    if: "startsWith(github.event.head_commit.message, 'release: prepare v')"
+    # Only run if the commit message starts with "release: v" (matches merge commit titles)
+    if: "startsWith(github.event.head_commit.message, 'release: v')"
 
     steps:
       - uses: actions/checkout@v4
