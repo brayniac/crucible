@@ -303,43 +303,6 @@ impl UringConnection {
         self.free_slots |= 1 << slot;
     }
 
-    /// Prepare the next chunk for sending.
-    ///
-    /// Splits a chunk from frag_buf and freezes it into an immutable Bytes.
-    /// This is zero-copy - freeze() is just an Arc increment.
-    /// Returns (slot_index, pointer, length) for SendZc. Returns None if:
-    /// - All send slots are in use
-    /// - No data to send
-    #[inline]
-    pub fn prepare_send(&mut self) -> Option<(u8, *const u8, usize)> {
-        if self.frag_buf.is_empty() {
-            return None;
-        }
-
-        let slot = self.alloc_send_slot()?;
-
-        // Split off next chunk and freeze it (zero-copy - just Arc increment)
-        let chunk_size = self.frag_buf.len().min(SEND_CHUNK_SIZE);
-        let chunk = self.frag_buf.split_to(chunk_size).freeze();
-
-        let ptr = chunk.as_ptr();
-        let len = chunk.len();
-
-        self.send_slots[slot as usize] = Some(InFlightSend {
-            buffers: SendBuffers::Single(chunk),
-            pos: 0,
-            notifs_pending: 1,
-        });
-        self.sends_in_flight += 1;
-
-        // Shrink frag_buf if it grew too large
-        if self.frag_buf.is_empty() && self.frag_buf.capacity() > FRAG_SHRINK_THRESHOLD {
-            self.frag_buf = BytesMut::with_capacity(FRAG_DEFAULT_CAPACITY);
-        }
-
-        Some((slot, ptr, len))
-    }
-
     /// Prepare the next chunk for regular (non-zero-copy) sending.
     ///
     /// Like `prepare_send()` but sets notifs_pending = 0 since regular sends
@@ -382,39 +345,6 @@ impl UringConnection {
     pub fn free_send_slot_regular(&mut self, slot: u8) {
         self.free_send_slot(slot);
         self.sends_in_flight = self.sends_in_flight.saturating_sub(1);
-    }
-
-    /// Prepare a vectored (scatter-gather) send from owned Bytes buffers (zero-copy).
-    ///
-    /// Returns (slot_index, msghdr_ptr, total_len) for SendMsgZc. Returns None if:
-    /// - All send slots are in use
-    /// - No buffers provided
-    #[inline]
-    pub fn prepare_vectored_send(
-        &mut self,
-        buffers: Vec<Bytes>,
-    ) -> Option<(u8, *const libc::msghdr, usize)> {
-        let slot = self.alloc_send_slot()?;
-
-        let vectored = VectoredSend::new(buffers);
-        if vectored.count == 0 {
-            self.free_slots |= 1 << slot; // Return slot
-            return None;
-        }
-
-        // Take pointers AFTER boxing - VectoredSend::new() returns a Box,
-        // so msghdr and iovecs are already at their final heap location.
-        let msghdr_ptr = vectored.msghdr_ptr();
-        let total_len = vectored.total_len();
-
-        self.send_slots[slot as usize] = Some(InFlightSend {
-            buffers: SendBuffers::Vectored(vectored),
-            pos: 0,
-            notifs_pending: 1,
-        });
-        self.sends_in_flight += 1;
-
-        Some((slot, msghdr_ptr, total_len))
     }
 
     /// Prepare a vectored (scatter-gather) send from owned Bytes buffers (non-zero-copy).
