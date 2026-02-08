@@ -74,9 +74,14 @@ Example: `/release minor`
    The changelog should follow Keep a Changelog format. Ask the user if they want to review/edit the changelog before proceeding.
 
 7. **Commit changes**:
+
+   **CRITICAL**: The commit message MUST start with `release: v` (no other words before the version).
+   The `tag-release.yml` workflow matches `startsWith(message, 'release: v')` on the merge commit.
+   When GitHub squash-merges a single-commit PR, the commit message becomes the merge commit message.
+
    ```bash
    git add -A
-   git commit -m "release: prepare v${NEW_VERSION}"
+   git commit -m "release: v${NEW_VERSION}"
    ```
 
 8. **Push and create PR**:
