@@ -39,7 +39,7 @@ use std::mem;
 use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// User data encoding for operations.
 /// Format: (id << 8) | (buf_idx << 4) | op_type
@@ -273,8 +273,24 @@ impl UringDriver {
         }
 
         let mut builder = IoUring::builder();
+
+        // COOP_TASKRUN: Don't interrupt userspace for CQE posting; instead
+        // defer to the next io_uring_enter() call. Reduces context switches.
+        builder.setup_coop_taskrun();
+
+        // SINGLE_ISSUER: Only one thread submits to this ring, enabling
+        // kernel-side optimizations (no cross-thread synchronization).
+        builder.setup_single_issuer();
+
         if sqpoll {
+            // SQPOLL: Kernel thread polls the SQ, eliminating submission syscalls.
+            // Incompatible with DEFER_TASKRUN (kernel rejects both together).
             builder.setup_sqpoll(1000);
+        } else {
+            // DEFER_TASKRUN: Defer async completion processing to the submitter's
+            // io_uring_enter() call. CQEs batch together and are delivered on the
+            // same CPU that submitted, improving cache locality.
+            builder.setup_defer_taskrun();
         }
 
         let ring = builder.build(sq_depth)?;
@@ -2335,63 +2351,86 @@ impl IoDriver for UringDriver {
             }
         }
 
-        // Submit pending operations and wait for completions
-        // Note: submit_and_wait/submit_with_args both submit AND wait in a single syscall
-        if let Some(t) = timeout {
-            let ts = io_uring::types::Timespec::new()
-                .sec(t.as_secs())
-                .nsec(t.subsec_nanos());
-            let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-            let _ = self.ring.submitter().submit_with_args(1, &args);
-        } else {
-            self.ring.submit_and_wait(1)?;
-        }
-
-        // Collect completions - reuse scratch buffer to avoid allocation
-        self.cqe_scratch.extend(self.ring.completion());
-        let count = self.cqe_scratch.len();
-
-        // Process in order (FIFO) - critical for correct data sequencing with multishot recv
-        // Take ownership temporarily to avoid borrow conflict with process_cqe
-        let mut cqes = std::mem::take(&mut self.cqe_scratch);
-        for cqe in cqes.drain(..) {
-            self.process_cqe(cqe);
-        }
-        self.cqe_scratch = cqes; // restore empty vec with capacity preserved
-
-        // Handle partial send continuations in a tight loop.
+        // Submit pending operations and wait for completions.
         //
-        // Without this, each partial send (e.g. 200KB of a 5MB response)
-        // requires a full event loop round-trip: poll → server → flush → poll.
-        // For a 5MB value with ~200KB socket buffer, that's ~25 round-trips.
-        //
-        // This loop submits continuation SQEs and immediately drains their
-        // CQEs, collapsing all partial sends into a single poll() call —
-        // matching mio's tight write loop behavior.
+        // Smart poll: only return to the caller when there are "useful"
+        // completions (recv, accept, close, error) — not just send CQEs.
+        // Send CQEs are processed internally (partial sends, slot management)
+        // but don't require caller action. Without this, send CQEs wake
+        // poll() before recv CQEs arrive, adding an extra event loop
+        // round-trip per request in request-response patterns.
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let completions_before = self.pending_completions.len();
+
         loop {
-            if self.ring.submission().is_empty() {
-                break;
+            // Calculate remaining timeout for this iteration
+            let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+
+            // If we had a timeout and it's expired, break out
+            if let Some(rem) = remaining {
+                if rem.is_zero() {
+                    break;
+                }
             }
 
-            // Submit continuation SQEs pushed during CQE processing
-            let _ = self.ring.submitter().submit();
+            // Submit and wait for at least one CQE
+            match remaining {
+                Some(rem) => {
+                    let ts = io_uring::types::Timespec::new()
+                        .sec(rem.as_secs())
+                        .nsec(rem.subsec_nanos());
+                    let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+                    let _ = self.ring.submitter().submit_with_args(1, &args);
+                }
+                None => {
+                    self.ring.submit_and_wait(1)?;
+                }
+            }
 
-            // Non-blocking drain of any new CQEs
+            // Collect and process completions
             self.cqe_scratch.extend(self.ring.completion());
-            if self.cqe_scratch.is_empty() {
-                // Kernel hasn't produced CQEs yet (e.g. async ZC send).
-                // They'll be picked up on the next poll() call.
-                break;
-            }
-
             let mut cqes = std::mem::take(&mut self.cqe_scratch);
             for cqe in cqes.drain(..) {
                 self.process_cqe(cqe);
             }
             self.cqe_scratch = cqes;
+
+            // Handle partial send continuations in a tight loop.
+            // Collapses all partial sends into a single poll() call.
+            loop {
+                if self.ring.submission().is_empty() {
+                    break;
+                }
+                let _ = self.ring.submitter().submit();
+                self.cqe_scratch.extend(self.ring.completion());
+                if self.cqe_scratch.is_empty() {
+                    break;
+                }
+                let mut cqes = std::mem::take(&mut self.cqe_scratch);
+                for cqe in cqes.drain(..) {
+                    self.process_cqe(cqe);
+                }
+                self.cqe_scratch = cqes;
+            }
+
+            // Check if any new completions are "useful" (not just SendReady).
+            // SendReady means a send slot freed up — useful for the server's
+            // flow control, but not worth waking the caller if it's the only
+            // event. Recv, Accept, Close, Error all require caller action.
+            let has_useful = self.pending_completions[completions_before..]
+                .iter()
+                .any(|c| !matches!(c.kind, CompletionKind::SendReady { .. }));
+
+            if has_useful {
+                break;
+            }
+
+            // Only got send completions — loop and wait for recv/accept/close.
+            // The send completions are already processed (partial sends handled,
+            // slots freed) and will be delivered to the caller when we return.
         }
 
-        Ok(count)
+        Ok(self.pending_completions.len() - completions_before)
     }
 
     fn drain_completions(&mut self) -> Vec<Completion> {
