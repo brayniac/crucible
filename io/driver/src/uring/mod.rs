@@ -1839,11 +1839,37 @@ impl IoDriver for UringDriver {
             ));
         }
 
-        // Queue data in fragmentation buffer
-        conn.queue_send(data);
+        // Fast path: try direct write() when no data is pending.
+        // This avoids SQE submission and CQE generation for the common case
+        // (small sends that fit in the socket buffer). Only safe when there's
+        // no buffered data — otherwise we'd send out of order.
+        if conn.all_sends_complete() {
+            let raw_fd = conn.raw_fd;
+            let n = unsafe { libc::write(raw_fd, data.as_ptr() as *const libc::c_void, data.len()) };
+            if n > 0 {
+                let written = n as usize;
+                if written == data.len() {
+                    // Full write — no SQE, no CQE, no send slot consumed
+                    return Ok(written);
+                }
+                // Partial write — buffer remainder for SQE-based continuation
+                conn.queue_send(&data[written..]);
+            } else if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            } else {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    return Err(err);
+                }
+                // EAGAIN — buffer all data for SQE-based send
+                conn.queue_send(data);
+            }
+        } else {
+            // Slow path: data already pending, must buffer to preserve ordering
+            conn.queue_send(data);
+        }
 
-        // Try to start sending if slots available
-        // Use regular send (kernel copies immediately, lower overhead for small data)
+        // Submit SQE for any buffered data
         if let Some((slot, ptr, len)) = conn.prepare_send_regular() {
             let fixed_slot = conn.fixed_slot;
             let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -1854,40 +1880,9 @@ impl IoDriver for UringDriver {
     }
 
     fn send_zc(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize> {
-        let conn_id = id.slot();
-        let conn = self
-            .connections
-            .get_mut(conn_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection not found"))?;
-
-        // Validate generation to prevent sending to wrong connection
-        if conn.generation != id.generation() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "connection generation mismatch",
-            ));
-        }
-
-        // Don't allow sending to closing connections
-        if conn.closing {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "connection is closing",
-            ));
-        }
-
-        // Queue data in fragmentation buffer
-        conn.queue_send(data);
-
-        // Try to start sending if slots available
-        // Use regular send (kernel copies immediately, single CQE, no NOTIF delay)
-        if let Some((slot, ptr, len)) = conn.prepare_send_regular() {
-            let fixed_slot = conn.fixed_slot;
-            let send_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-            self.submit_send_regular(conn_id, fixed_slot, slot, send_data)?;
-        }
-
-        Ok(data.len())
+        // send_zc currently delegates to the same path as send()
+        // (SendZc was disabled for throughput reasons — regular send is used)
+        self.send(id, data)
     }
 
     fn send_vectored_owned(&mut self, id: ConnId, buffers: Vec<bytes::Bytes>) -> io::Result<usize> {
