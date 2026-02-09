@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.2.18] - 2026-02-09
+
+### Changed
+- io_uring ring setup now uses COOP_TASKRUN and SINGLE_ISSUER flags for reduced context
+  switches and kernel-side lock-free optimizations
+- io_uring send path uses hybrid direct write: tries write() on the raw fd first, falls back
+  to SQE-based send only when the socket buffer is full or sends are in flight
+- io_uring smart poll loop re-waits when only SendReady completions arrive, reducing
+  unnecessary event loop wakeups for the benchmark client
+
+### Fixed
+- io_uring high latency variance under sustained load caused by DEFER_TASKRUN batching CQEs
+- Clippy 1.93 collapsible-if warning in io_uring poll loop
+
 ## [0.2.17] - 2026-02-08
 
 ### Added

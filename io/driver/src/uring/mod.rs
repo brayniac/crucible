@@ -1835,7 +1835,8 @@ impl IoDriver for UringDriver {
         // no buffered data — otherwise we'd send out of order.
         if conn.all_sends_complete() {
             let raw_fd = conn.raw_fd;
-            let n = unsafe { libc::write(raw_fd, data.as_ptr() as *const libc::c_void, data.len()) };
+            let n =
+                unsafe { libc::write(raw_fd, data.as_ptr() as *const libc::c_void, data.len()) };
             if n > 0 {
                 let written = n as usize;
                 if written == data.len() {
