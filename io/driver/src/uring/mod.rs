@@ -2356,10 +2356,10 @@ impl IoDriver for UringDriver {
             let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
 
             // If we had a timeout and it's expired, break out
-            if let Some(rem) = remaining {
-                if rem.is_zero() {
-                    break;
-                }
+            if let Some(rem) = remaining
+                && rem.is_zero()
+            {
+                break;
             }
 
             // Submit and wait for at least one CQE
