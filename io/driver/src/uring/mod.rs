@@ -284,13 +284,7 @@ impl UringDriver {
 
         if sqpoll {
             // SQPOLL: Kernel thread polls the SQ, eliminating submission syscalls.
-            // Incompatible with DEFER_TASKRUN (kernel rejects both together).
             builder.setup_sqpoll(1000);
-        } else {
-            // DEFER_TASKRUN: Defer async completion processing to the submitter's
-            // io_uring_enter() call. CQEs batch together and are delivered on the
-            // same CPU that submitted, improving cache locality.
-            builder.setup_defer_taskrun();
         }
 
         let ring = builder.build(sq_depth)?;
@@ -1458,9 +1452,7 @@ impl IoDriver for UringDriver {
             listener.multishot_active = true;
         }
 
-        // submit_and_wait(0): submit SQEs and process deferred task work
-        // (required by DEFER_TASKRUN) without blocking.
-        self.ring.submit_and_wait(0)?;
+        self.ring.submit()?;
 
         Ok(ListenerId::new(id))
     }
@@ -1530,9 +1522,7 @@ impl IoDriver for UringDriver {
             listener.multishot_active = true;
         }
 
-        // submit_and_wait(0): submit SQEs and process deferred task work
-        // (required by DEFER_TASKRUN) without blocking.
-        self.ring.submit_and_wait(0)?;
+        self.ring.submit()?;
 
         Ok(ListenerId::new(id))
     }
@@ -2400,9 +2390,7 @@ impl IoDriver for UringDriver {
                 if self.ring.submission().is_empty() {
                     break;
                 }
-                // submit_and_wait(0): submit + process deferred task work
-                // (required by DEFER_TASKRUN) without blocking.
-                let _ = self.ring.submit_and_wait(0);
+                let _ = self.ring.submit();
                 self.cqe_scratch.extend(self.ring.completion());
                 if self.cqe_scratch.is_empty() {
                     break;
@@ -2452,9 +2440,7 @@ impl IoDriver for UringDriver {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // submit_and_wait(0): submit SQEs and process deferred task work
-        // (required by DEFER_TASKRUN) without blocking.
-        self.ring.submit_and_wait(0).map(|_| ())
+        self.ring.submit().map(|_| ())
     }
 
     fn connection_count(&self) -> usize {
@@ -2802,9 +2788,7 @@ impl IoDriver for UringDriver {
             }
         }
 
-        // submit_and_wait(0): submit + process deferred task work
-        // (required by DEFER_TASKRUN) without blocking.
-        self.ring.submit_and_wait(0)?;
+        self.ring.submit()?;
 
         Ok(total_len)
     }
