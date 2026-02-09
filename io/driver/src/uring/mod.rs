@@ -1458,7 +1458,9 @@ impl IoDriver for UringDriver {
             listener.multishot_active = true;
         }
 
-        self.ring.submit()?;
+        // submit_and_wait(0): submit SQEs and process deferred task work
+        // (required by DEFER_TASKRUN) without blocking.
+        self.ring.submit_and_wait(0)?;
 
         Ok(ListenerId::new(id))
     }
@@ -1528,7 +1530,9 @@ impl IoDriver for UringDriver {
             listener.multishot_active = true;
         }
 
-        self.ring.submit()?;
+        // submit_and_wait(0): submit SQEs and process deferred task work
+        // (required by DEFER_TASKRUN) without blocking.
+        self.ring.submit_and_wait(0)?;
 
         Ok(ListenerId::new(id))
     }
@@ -2401,7 +2405,9 @@ impl IoDriver for UringDriver {
                 if self.ring.submission().is_empty() {
                     break;
                 }
-                let _ = self.ring.submitter().submit();
+                // submit_and_wait(0): submit + process deferred task work
+                // (required by DEFER_TASKRUN) without blocking.
+                let _ = self.ring.submit_and_wait(0);
                 self.cqe_scratch.extend(self.ring.completion());
                 if self.cqe_scratch.is_empty() {
                     break;
@@ -2413,21 +2419,34 @@ impl IoDriver for UringDriver {
                 self.cqe_scratch = cqes;
             }
 
-            // Check if any new completions are "useful" (not just SendReady).
-            // SendReady means a send slot freed up — useful for the server's
-            // flow control, but not worth waking the caller if it's the only
-            // event. Recv, Accept, Close, Error all require caller action.
-            let has_useful = self.pending_completions[completions_before..]
-                .iter()
-                .any(|c| !matches!(c.kind, CompletionKind::SendReady { .. }));
+            // Check if any new completions arrived.
+            //
+            // For client-only drivers (no listeners), filter out SendReady —
+            // these just confirm request bytes reached the socket buffer and
+            // aren't actionable. Re-waiting lets us coalesce with the recv CQE,
+            // eliminating an extra poll cycle per request.
+            //
+            // For server drivers (has listeners), SendReady IS actionable
+            // (flow control: a send slot freed, queue more data). Filtering it
+            // would deadlock: server waits for recv, client waits for response
+            // that's stuck behind the stalled send.
+            let new_completions = &self.pending_completions[completions_before..];
+            let has_useful = if self.listeners.is_empty() {
+                // Client mode: skip SendReady-only batches
+                new_completions
+                    .iter()
+                    .any(|c| !matches!(c.kind, CompletionKind::SendReady { .. }))
+            } else {
+                // Server mode: any completion is useful
+                !new_completions.is_empty()
+            };
 
             if has_useful {
                 break;
             }
 
-            // Only got send completions — loop and wait for recv/accept/close.
-            // The send completions are already processed (partial sends handled,
-            // slots freed) and will be delivered to the caller when we return.
+            // Only got send completions on a client driver — loop and wait
+            // for recv/accept/close.
         }
 
         Ok(self.pending_completions.len() - completions_before)
@@ -2438,7 +2457,9 @@ impl IoDriver for UringDriver {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.ring.submitter().submit().map(|_| ())
+        // submit_and_wait(0): submit SQEs and process deferred task work
+        // (required by DEFER_TASKRUN) without blocking.
+        self.ring.submit_and_wait(0).map(|_| ())
     }
 
     fn connection_count(&self) -> usize {
@@ -2786,7 +2807,9 @@ impl IoDriver for UringDriver {
             }
         }
 
-        self.ring.submit()?;
+        // submit_and_wait(0): submit + process deferred task work
+        // (required by DEFER_TASKRUN) without blocking.
+        self.ring.submit_and_wait(0)?;
 
         Ok(total_len)
     }
