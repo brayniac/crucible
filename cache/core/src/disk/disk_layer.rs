@@ -171,6 +171,42 @@ impl DiskLayer {
         self.allocate_segment_for_bucket(bucket_index, bucket.ttl())
     }
 
+    /// Remove all hashtable entries for items in a segment, without releasing.
+    fn drain_segment_from_hashtable<H: Hashtable>(&self, segment_id: u32, hashtable: &H) {
+        let segment = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut offset = 0u32;
+        let write_offset = segment.write_offset();
+
+        while offset < write_offset {
+            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
+                if let Some(header) = BasicHeader::try_from_bytes(data) {
+                    let item_size = header.padded_size() as u32;
+
+                    let key_start =
+                        offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
+                    let key_len = header.key_len() as usize;
+
+                    if let Some(key) = segment.data_slice(key_start as u32, key_len)
+                        && !header.is_deleted()
+                    {
+                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        hashtable.remove(key, location.to_location());
+                    }
+
+                    offset += item_size;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Process items in an evicted segment.
     fn process_evicted_segment<H: Hashtable>(&self, segment_id: u32, hashtable: &H) {
         let segment = match self.pool.get(segment_id) {
@@ -178,9 +214,11 @@ impl DiskLayer {
             None => return,
         };
 
-        // Wait for readers to finish
-        while segment.ref_count() > 0 {
-            std::hint::spin_loop();
+        if segment.ref_count() > 0 {
+            // Drain hashtable entries and defer to last reader's drop
+            self.drain_segment_from_hashtable(segment_id, hashtable);
+            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            return;
         }
 
         // Transition to Locked for clearing

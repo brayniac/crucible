@@ -273,6 +273,110 @@ impl FifoChain {
         Ok(head)
     }
 
+    /// Remove a specific segment from the chain (for emergency eviction).
+    ///
+    /// The segment must be in Sealed state. It will be transitioned to Draining.
+    /// This walks the chain from head to find and unlink the target segment.
+    ///
+    /// # Arguments
+    /// * `segment_id` - ID of the segment to remove
+    /// * `pool` - The pool containing the segments
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(ChainError)` if the operation fails
+    pub fn try_remove<P: RamPool>(&self, segment_id: u32, pool: &P) -> Result<(), ChainError>
+    where
+        P::Segment: Segment,
+    {
+        let _guard = self.chain_mutex.lock();
+
+        let current = self.head_tail.load(Ordering::Acquire);
+        let (head, tail) = Self::unpack(current);
+
+        if head == INVALID_SEGMENT_ID {
+            return Err(ChainError::EmptyChain);
+        }
+
+        // Don't remove the Live tail
+        if segment_id == tail {
+            return Err(ChainError::CannotEvictLiveSegment);
+        }
+
+        let target = pool.get(segment_id).ok_or(ChainError::InvalidSegmentId)?;
+        if target.state() != State::Sealed {
+            return Err(ChainError::InvalidState);
+        }
+
+        // Transition target: Sealed -> Draining
+        if !target.cas_metadata(State::Sealed, State::Draining, None, None) {
+            return Err(ChainError::StateTransitionFailed);
+        }
+
+        let target_next = target.next().unwrap_or(INVALID_SEGMENT_ID);
+
+        if segment_id == head {
+            // Removing head - same as pop
+            let new_head = target_next;
+            let new_tail = if new_head == INVALID_SEGMENT_ID {
+                INVALID_SEGMENT_ID
+            } else {
+                tail
+            };
+            self.head_tail
+                .store(Self::pack(new_head, new_tail), Ordering::Release);
+
+            // Update new head's prev pointer
+            if new_head != INVALID_SEGMENT_ID
+                && let Some(new_head_seg) = pool.get(new_head)
+            {
+                new_head_seg.cas_metadata(
+                    new_head_seg.state(),
+                    new_head_seg.state(),
+                    None,
+                    Some(INVALID_SEGMENT_ID),
+                );
+            }
+        } else {
+            // Removing from middle - walk from head to find predecessor
+            let mut prev_id = head;
+            loop {
+                let prev_seg = pool.get(prev_id).ok_or(ChainError::InvalidSegmentId)?;
+                let next_id = prev_seg.next().unwrap_or(INVALID_SEGMENT_ID);
+                if next_id == segment_id {
+                    // Found predecessor - unlink target
+                    prev_seg.cas_metadata(
+                        prev_seg.state(),
+                        prev_seg.state(),
+                        Some(target_next),
+                        None,
+                    );
+                    // Update successor's prev pointer
+                    if target_next != INVALID_SEGMENT_ID
+                        && let Some(next_seg) = pool.get(target_next)
+                    {
+                        next_seg.cas_metadata(
+                            next_seg.state(),
+                            next_seg.state(),
+                            None,
+                            Some(prev_id),
+                        );
+                    }
+                    break;
+                }
+                if next_id == INVALID_SEGMENT_ID || next_id == tail {
+                    // Didn't find target in chain - rollback
+                    target.cas_metadata(State::Draining, State::Sealed, None, None);
+                    return Err(ChainError::InvalidSegmentId);
+                }
+                prev_id = next_id;
+            }
+        }
+
+        self.segment_count.fetch_sub(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Get the write segment (tail) if available and Live.
     ///
     /// Returns the tail segment ID if the tail is in Live state.

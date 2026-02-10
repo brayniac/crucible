@@ -1351,6 +1351,9 @@ impl Cache for HeapCache {
                 ref_count as *const AtomicU32,
                 value_copy.as_ptr(),
                 value_copy.len(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
             ))
         }
     }

@@ -27,6 +27,6 @@ mod fifo_layer;
 mod traits;
 mod ttl_layer;
 
-pub use fifo_layer::{FifoLayer, FifoLayerBuilder};
+pub use fifo_layer::{EvictResult, FifoLayer, FifoLayerBuilder};
 pub use traits::Layer;
 pub use ttl_layer::{TtlLayer, TtlLayerBuilder};

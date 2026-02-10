@@ -403,7 +403,7 @@ impl FileSegment<'_> {
         &self,
         offset: u32,
         key: &[u8],
-    ) -> Result<(*const crate::sync::AtomicU32, *const u8, usize), CacheError> {
+    ) -> Result<crate::slice_segment::ValueRefRaw, CacheError> {
         self.inner.get_value_ref_raw(offset, key)
     }
 }

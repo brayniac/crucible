@@ -12,6 +12,18 @@ use crate::sync::*;
 use std::ptr::NonNull;
 use std::time::Duration;
 
+/// Raw value reference components for constructing a `ValueRef`.
+///
+/// Fields: (ref_count_ptr, value_ptr, value_len, metadata_ptr, free_queue_ptr, segment_id)
+pub type ValueRefRaw = (
+    *const AtomicU32,
+    *const u8,
+    usize,
+    *const AtomicU64,
+    *const crossbeam_deque::Injector<u32>,
+    u32,
+);
+
 /// Retry configuration for CAS operations.
 struct CasRetryConfig {
     max_attempts: u32,
@@ -426,11 +438,7 @@ impl<'a> SliceSegment<'a> {
     /// If this method returns `Ok`, the ref_count has been incremented and
     /// the caller must ensure it is decremented when done (typically by
     /// constructing a `ValueRef` from the returned pointers).
-    pub fn get_value_ref_raw(
-        &self,
-        offset: u32,
-        key: &[u8],
-    ) -> Result<(*const AtomicU32, *const u8, usize), CacheError> {
+    pub fn get_value_ref_raw(&self, offset: u32, key: &[u8]) -> Result<ValueRefRaw, CacheError> {
         // Check state and increment ref count
         let state = self.state();
         if !state.is_readable() {
@@ -456,11 +464,7 @@ impl<'a> SliceSegment<'a> {
     }
 
     /// Get raw value reference for BasicHeader segments.
-    fn get_value_ref_raw_basic(
-        &self,
-        offset: u32,
-        key: &[u8],
-    ) -> Result<(*const AtomicU32, *const u8, usize), CacheError> {
+    fn get_value_ref_raw_basic(&self, offset: u32, key: &[u8]) -> Result<ValueRefRaw, CacheError> {
         // Check segment expiration
         let now = clocksource::coarse::UnixInstant::now()
             .duration_since(clocksource::coarse::UnixInstant::EPOCH)
@@ -522,16 +526,21 @@ impl<'a> SliceSegment<'a> {
 
         let ref_count_ptr = &self.ref_count as *const AtomicU32;
         let value_ptr = unsafe { data_ptr.add(value_start) };
+        let metadata_ptr = &self.metadata as *const AtomicU64;
+        let free_queue_ptr = self.free_queue;
 
-        Ok((ref_count_ptr, value_ptr, value_len))
+        Ok((
+            ref_count_ptr,
+            value_ptr,
+            value_len,
+            metadata_ptr,
+            free_queue_ptr,
+            self.id,
+        ))
     }
 
     /// Get raw value reference for TtlHeader segments.
-    fn get_value_ref_raw_ttl(
-        &self,
-        offset: u32,
-        key: &[u8],
-    ) -> Result<(*const AtomicU32, *const u8, usize), CacheError> {
+    fn get_value_ref_raw_ttl(&self, offset: u32, key: &[u8]) -> Result<ValueRefRaw, CacheError> {
         // Validate offset
         if offset as usize + TtlHeader::SIZE > self.capacity as usize {
             self.ref_count.fetch_sub(1, Ordering::Release);
@@ -592,8 +601,17 @@ impl<'a> SliceSegment<'a> {
 
         let ref_count_ptr = &self.ref_count as *const AtomicU32;
         let value_ptr = unsafe { data_ptr.add(value_start) };
+        let metadata_ptr = &self.metadata as *const AtomicU64;
+        let free_queue_ptr = self.free_queue;
 
-        Ok((ref_count_ptr, value_ptr, value_len))
+        Ok((
+            ref_count_ptr,
+            value_ptr,
+            value_len,
+            metadata_ptr,
+            free_queue_ptr,
+            self.id,
+        ))
     }
 
     /// Verify key with BasicHeader (segment-level TTL).

@@ -13,7 +13,7 @@ use crate::error::{CacheError, CacheResult};
 use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::item::ItemGuard;
 use crate::item_location::ItemLocation;
-use crate::layer::{FifoLayer, Layer, TtlLayer};
+use crate::layer::{EvictResult, FifoLayer, Layer, TtlLayer};
 use crate::location::Location;
 use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
@@ -94,6 +94,9 @@ impl CacheLayer {
     /// - `ref_count_ptr`: Pointer to segment's ref_count (already incremented)
     /// - `value_ptr`: Pointer to value bytes in segment memory
     /// - `value_len`: Length of the value
+    /// - `metadata_ptr`: Pointer to segment's packed metadata
+    /// - `free_queue_ptr`: Pointer to pool's free queue
+    /// - `segment_id`: Segment ID for free queue return
     ///
     /// Returns `None` if the item is not found or not accessible.
     /// Note: For disk layers, this returns pointers to mmap'd memory.
@@ -101,7 +104,7 @@ impl CacheLayer {
         &self,
         location: ItemLocation,
         key: &[u8],
-    ) -> Option<(*const crate::sync::AtomicU32, *const u8, usize)> {
+    ) -> Option<crate::slice_segment::ValueRefRaw> {
         match self {
             CacheLayer::Fifo(layer) => {
                 let pool = layer.pool();
@@ -191,6 +194,51 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.evict_with_demoter(hashtable, demoter),
             CacheLayer::Ttl(layer) => layer.evict_with_demoter(hashtable, demoter),
             CacheLayer::Disk(layer) => layer.evict_with_demoter(hashtable, demoter),
+        }
+    }
+
+    /// Try to evict without blocking on ref_count.
+    pub fn evict_nonblocking<H: Hashtable>(&self, hashtable: &H) -> EvictResult {
+        match self {
+            CacheLayer::Fifo(layer) => layer.evict_nonblocking(hashtable),
+            CacheLayer::Ttl(layer) => layer.evict_nonblocking(hashtable),
+            // Disk layer: fall back to regular evict (disk segments rarely have readers)
+            CacheLayer::Disk(layer) => {
+                if layer.evict(hashtable) {
+                    EvictResult::Freed
+                } else {
+                    EvictResult::NoCandidate
+                }
+            }
+        }
+    }
+
+    /// Try to evict without blocking, with demotion callback.
+    pub fn evict_nonblocking_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> EvictResult
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        match self {
+            CacheLayer::Fifo(layer) => layer.evict_nonblocking_with_demoter(hashtable, demoter),
+            CacheLayer::Ttl(layer) => layer.evict_nonblocking_with_demoter(hashtable, demoter),
+            CacheLayer::Disk(layer) => {
+                if layer.evict_with_demoter(hashtable, demoter) {
+                    EvictResult::Freed
+                } else {
+                    EvictResult::NoCandidate
+                }
+            }
+        }
+    }
+
+    /// Emergency eviction: find any segment with ref_count == 0 to free.
+    pub fn emergency_evict<H: Hashtable>(&self, hashtable: &H) -> bool {
+        match self {
+            CacheLayer::Fifo(layer) => layer.try_emergency_evict(hashtable),
+            CacheLayer::Ttl(layer) => layer.try_emergency_evict(hashtable),
+            // Disk layer doesn't support emergency eviction
+            CacheLayer::Disk(_) => false,
         }
     }
 
@@ -687,11 +735,21 @@ impl<H: Hashtable> TieredCache<H> {
         let layer = self.layers.get(layer_idx)?;
 
         // Get raw pointers from layer
-        let (ref_count_ptr, value_ptr, value_len) = layer.get_value_ref_raw(item_loc, key)?;
+        let (ref_count_ptr, value_ptr, value_len, metadata_ptr, free_queue_ptr, segment_id) =
+            layer.get_value_ref_raw(item_loc, key)?;
 
         // Safety: The layer's get_value_ref_raw has incremented ref_count and
         // validated that the pointers are valid. ValueRef will decrement ref_count on drop.
-        Some(unsafe { crate::cache_trait::ValueRef::new(ref_count_ptr, value_ptr, value_len) })
+        Some(unsafe {
+            crate::cache_trait::ValueRef::new(
+                ref_count_ptr,
+                value_ptr,
+                value_len,
+                metadata_ptr,
+                free_queue_ptr,
+                segment_id,
+            )
+        })
     }
 
     /// Get an item from the cache with a CAS token.
@@ -1137,6 +1195,10 @@ impl<H: Hashtable> TieredCache<H> {
     }
 
     /// Evict from a specific layer, optionally demoting to disk.
+    ///
+    /// Uses non-blocking eviction: if the policy-selected segment has active readers,
+    /// it is deferred (AwaitingRelease) and an emergency eviction of a different
+    /// ref_count==0 segment is attempted instead.
     fn evict_from_layer(&self, layer_idx: usize, disk_layer_idx: Option<usize>) -> bool {
         let layer = match self.layers.get(layer_idx) {
             Some(l) => l,
@@ -1167,11 +1229,25 @@ impl<H: Hashtable> TieredCache<H> {
                 }
             };
 
-            return layer.evict_with_demoter(hashtable, demoter);
+            return match layer.evict_nonblocking_with_demoter(hashtable, demoter) {
+                EvictResult::Freed => true,
+                EvictResult::Deferred => {
+                    // Segment was pinned by readers — try emergency evict of a different segment
+                    layer.emergency_evict(hashtable)
+                }
+                EvictResult::NoCandidate => false,
+            };
         }
 
-        // No disk layer or this is the disk layer - use regular eviction
-        layer.evict(self.hashtable.as_ref())
+        // No disk layer or this is the disk layer - use non-blocking eviction
+        match layer.evict_nonblocking(self.hashtable.as_ref()) {
+            EvictResult::Freed => true,
+            EvictResult::Deferred => {
+                // Segment was pinned by readers — try emergency evict
+                layer.emergency_evict(self.hashtable.as_ref())
+            }
+            EvictResult::NoCandidate => false,
+        }
     }
 
     /// Mark an item as deleted at the given location.

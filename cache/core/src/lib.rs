@@ -111,7 +111,7 @@ pub use hugepage::{
 };
 pub use memory_pool::{MemoryPool, MemoryPoolBuilder};
 pub use pool::RamPool;
-pub use slice_segment::SliceSegment;
+pub use slice_segment::{SliceSegment, ValueRefRaw};
 
 // Phase 5 - Organization
 mod organization;

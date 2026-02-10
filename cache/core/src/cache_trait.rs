@@ -5,7 +5,8 @@
 //! protocol servers like iou-cache and tokio-cache.
 
 use crate::error::CacheError;
-use crate::sync::{AtomicU32, Ordering};
+use crate::state::{Metadata, State};
+use crate::sync::{AtomicU32, AtomicU64, Ordering};
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -40,6 +41,13 @@ pub struct ValueRef {
     value_ptr: *const u8,
     /// Length of the value in bytes.
     value_len: usize,
+    /// Pointer to segment's packed metadata (AtomicU64) for AwaitingRelease detection.
+    /// Null if this ValueRef was not created from a segment (e.g., test mocks).
+    metadata: *const AtomicU64,
+    /// Pointer to the pool's free queue for returning segments after AwaitingRelease.
+    free_queue: *const crossbeam_deque::Injector<u32>,
+    /// Segment ID for returning to free queue.
+    segment_id: u32,
 }
 
 impl ValueRef {
@@ -51,12 +59,24 @@ impl ValueRef {
     /// - `ref_count` points to a valid AtomicU32 that has been incremented
     /// - `value_ptr` and `value_len` describe valid memory that will remain
     ///   valid as long as the ref_count is held
+    /// - `metadata` (if non-null) points to the segment's packed AtomicU64 metadata
+    /// - `free_queue` (if non-null) points to the pool's Injector free queue
     #[inline]
-    pub unsafe fn new(ref_count: *const AtomicU32, value_ptr: *const u8, value_len: usize) -> Self {
+    pub unsafe fn new(
+        ref_count: *const AtomicU32,
+        value_ptr: *const u8,
+        value_len: usize,
+        metadata: *const AtomicU64,
+        free_queue: *const crossbeam_deque::Injector<u32>,
+        segment_id: u32,
+    ) -> Self {
         Self {
             ref_count,
             value_ptr,
             value_len,
+            metadata,
+            free_queue,
+            segment_id,
         }
     }
 
@@ -118,8 +138,35 @@ impl std::ops::Deref for ValueRef {
 impl Drop for ValueRef {
     fn drop(&mut self) {
         // SAFETY: ref_count is a valid AtomicU32 pointer from the segment
-        unsafe {
-            (*self.ref_count).fetch_sub(1, Ordering::Release);
+        let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::Release) };
+
+        // If we were the last reader and this segment has auto-release info,
+        // check if the segment is condemned (AwaitingRelease) and free it.
+        if prev_count == 1 && !self.metadata.is_null() {
+            // Acquire fence to see the AwaitingRelease state written by eviction thread
+            std::sync::atomic::fence(Ordering::Acquire);
+
+            let packed = unsafe { (*self.metadata).load(Ordering::Acquire) };
+            let meta = Metadata::unpack(packed);
+            if meta.state == State::AwaitingRelease {
+                // Try to transition AwaitingRelease -> Free
+                let new_meta = Metadata::new(State::Free);
+                if unsafe {
+                    (*self.metadata).compare_exchange(
+                        packed,
+                        new_meta.pack(),
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                }
+                .is_ok()
+                {
+                    // Push segment back to free queue
+                    unsafe {
+                        (*self.free_queue).push(self.segment_id);
+                    }
+                }
+            }
         }
     }
 }

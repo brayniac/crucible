@@ -99,6 +99,151 @@ impl FifoLayer {
             .as_secs()
     }
 
+    /// Remove all hashtable entries for items in a segment, without waiting for
+    /// readers or releasing the segment. Used by non-blocking eviction to "condemn"
+    /// a segment that still has active readers.
+    fn drain_segment_from_hashtable<H: Hashtable>(&self, segment_id: u32, hashtable: &H) {
+        let segment = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let now = Self::now_secs();
+        let mut offset = 0u32;
+        let write_offset = segment.write_offset();
+
+        while offset < write_offset {
+            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
+                if let Some(header) = TtlHeader::try_from_bytes(data) {
+                    let item_size = header.padded_size() as u32;
+
+                    if !header.is_deleted() && !header.is_expired(now) {
+                        let key_start =
+                            offset as usize + TtlHeader::SIZE + header.optional_len() as usize;
+                        let key_len = header.key_len() as usize;
+
+                        if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                            let location =
+                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+
+                            let verifier = SinglePoolVerifier { pool: &self.pool };
+                            let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+                            let fate = determine_item_fate(freq, &self.config);
+
+                            match fate {
+                                ItemFate::Ghost => {
+                                    hashtable.convert_to_ghost(key, location.to_location());
+                                }
+                                ItemFate::Demote | ItemFate::Discard => {
+                                    hashtable.remove(key, location.to_location());
+                                }
+                            }
+                        }
+                    }
+
+                    offset += item_size;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Non-blocking eviction: process an evicted segment without spinning on ref_count.
+    ///
+    /// Returns `true` if the segment was fully processed (ref_count was 0),
+    /// `false` if it was deferred (transitioned to AwaitingRelease for last reader to free).
+    fn process_evicted_segment_nonblocking<H: Hashtable>(
+        &self,
+        segment_id: u32,
+        hashtable: &H,
+    ) -> bool {
+        let segment = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => return true,
+        };
+
+        if segment.ref_count() > 0 {
+            // Segment pinned by readers — remove hashtable entries and defer
+            self.drain_segment_from_hashtable(segment_id, hashtable);
+            // Draining → AwaitingRelease (last reader's ValueRef::drop will free it)
+            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            return false;
+        }
+
+        // Normal path: ref_count == 0, process immediately
+        segment.cas_metadata(State::Draining, State::Locked, None, None);
+
+        let now = Self::now_secs();
+        let mut offset = 0u32;
+        let write_offset = segment.write_offset();
+
+        while offset < write_offset {
+            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
+                if let Some(header) = TtlHeader::try_from_bytes(data) {
+                    let item_size = header.padded_size() as u32;
+
+                    if !header.is_deleted() && !header.is_expired(now) {
+                        let key_start =
+                            offset as usize + TtlHeader::SIZE + header.optional_len() as usize;
+                        let key_len = header.key_len() as usize;
+
+                        if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                            let location =
+                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+
+                            let verifier = SinglePoolVerifier { pool: &self.pool };
+                            let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+                            let fate = determine_item_fate(freq, &self.config);
+
+                            match fate {
+                                ItemFate::Ghost => {
+                                    hashtable.convert_to_ghost(key, location.to_location());
+                                }
+                                ItemFate::Demote | ItemFate::Discard => {
+                                    hashtable.remove(key, location.to_location());
+                                }
+                            }
+                        }
+                    }
+
+                    offset += item_size;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        segment.cas_metadata(State::Locked, State::Reserved, None, None);
+        self.pool.release(segment_id);
+        true
+    }
+
+    /// Emergency eviction: find any Sealed segment with ref_count == 0 and evict it.
+    ///
+    /// This is called when the policy-selected segment was deferred due to active readers.
+    /// Scans the pool for an alternative segment that can be freed immediately.
+    fn emergency_evict<H: Hashtable>(&self, hashtable: &H) -> bool {
+        let num_segments = self.pool.segment_count();
+        for i in 0..num_segments {
+            if let Some(segment) = self.pool.get(i as u32)
+                && segment.state() == State::Sealed
+                && segment.ref_count() == 0
+            {
+                // Try to remove this specific segment from the chain
+                if self.chain.try_remove(i as u32, &self.pool).is_ok() {
+                    self.process_evicted_segment(i as u32, hashtable);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Process items in an evicted segment.
     fn process_evicted_segment<H: Hashtable>(&self, segment_id: u32, hashtable: &H) {
         let segment = match self.pool.get(segment_id) {
@@ -277,6 +422,37 @@ impl FifoLayer {
         // Clear segment state and release to pool
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
         self.pool.release(segment_id);
+    }
+
+    /// Non-blocking variant of process_evicted_segment_with_demoter.
+    ///
+    /// Returns `true` if fully processed, `false` if deferred (AwaitingRelease).
+    /// For deferred segments, demotion is skipped (can't read data while readers hold refs).
+    fn process_evicted_segment_with_demoter_nonblocking<H, F>(
+        &self,
+        segment_id: u32,
+        hashtable: &H,
+        demoter: F,
+    ) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        let segment = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => return true,
+        };
+
+        if segment.ref_count() > 0 {
+            // Can't demote while readers hold refs - just drain hashtable and defer
+            self.drain_segment_from_hashtable(segment_id, hashtable);
+            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            return false;
+        }
+
+        // Normal path: use full demoter logic
+        self.process_evicted_segment_with_demoter(segment_id, hashtable, demoter);
+        true
     }
 }
 
@@ -506,6 +682,63 @@ impl Layer for FifoLayer {
     fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, _hashtable: &H) {
         // FIFO layer doesn't do compaction - just mark deleted
         self.mark_deleted(location);
+    }
+}
+
+/// Result of a non-blocking eviction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictResult {
+    /// Segment was freed immediately (ref_count was 0).
+    Freed,
+    /// Segment was deferred (ref_count > 0, transitioned to AwaitingRelease).
+    Deferred,
+    /// No segment could be evicted at all.
+    NoCandidate,
+}
+
+/// Non-blocking eviction methods for FifoLayer.
+impl FifoLayer {
+    /// Try to evict without blocking on ref_count.
+    ///
+    /// Returns `EvictResult::Freed` if a segment was freed,
+    /// `EvictResult::Deferred` if the segment was condemned but not yet freed,
+    /// `EvictResult::NoCandidate` if no segment could be evicted.
+    pub fn evict_nonblocking<H: Hashtable>(&self, hashtable: &H) -> EvictResult {
+        match self.chain.pop(&self.pool) {
+            Ok(segment_id) => {
+                if self.process_evicted_segment_nonblocking(segment_id, hashtable) {
+                    EvictResult::Freed
+                } else {
+                    EvictResult::Deferred
+                }
+            }
+            Err(_) => EvictResult::NoCandidate,
+        }
+    }
+
+    /// Try to evict without blocking, with demotion callback.
+    pub fn evict_nonblocking_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> EvictResult
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        match self.chain.pop(&self.pool) {
+            Ok(segment_id) => {
+                if self.process_evicted_segment_with_demoter_nonblocking(
+                    segment_id, hashtable, demoter,
+                ) {
+                    EvictResult::Freed
+                } else {
+                    EvictResult::Deferred
+                }
+            }
+            Err(_) => EvictResult::NoCandidate,
+        }
+    }
+
+    /// Emergency eviction: find any Sealed segment with ref_count == 0.
+    pub fn try_emergency_evict<H: Hashtable>(&self, hashtable: &H) -> bool {
+        self.emergency_evict(hashtable)
     }
 }
 

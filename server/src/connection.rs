@@ -1726,6 +1726,9 @@ mod tests {
                     self.ref_count as *const cache_core::sync::AtomicU32,
                     self.value.as_ptr(),
                     self.value.len(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
                 )
             })
         }

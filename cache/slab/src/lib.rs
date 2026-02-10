@@ -846,7 +846,17 @@ impl Cache for SlabCache {
             unsafe { self.allocator.get_value_ref_raw(slab_loc)? };
 
         // Construct ValueRef - it will decrement ref_count on drop
-        Some(unsafe { ValueRef::new(ref_count_ptr, value_ptr, value_len) })
+        // Slab cache doesn't use segment-based eviction, so no auto-release metadata
+        Some(unsafe {
+            ValueRef::new(
+                ref_count_ptr,
+                value_ptr,
+                value_len,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        })
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
