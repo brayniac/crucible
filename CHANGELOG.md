@@ -15,6 +15,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.3.0] - 2026-02-11
+
+### Added
+- New `kompio` I/O framework replacing `io-driver`: push-based io_uring event loop with
+  `EventHandler` trait callbacks, scatter-gather `send_parts()` API, `InFlightSendSlab` for
+  zero-copy SendMsgZc sends, and bundled acceptor/worker thread management
+- Scatter-gather send for large value responses: header + value + trailer sent as a single
+  atomic `SendMsgZc` operation instead of one 16KB chunk per event loop iteration, eliminating
+  ~1.3ms of added latency for 4MB responses
+- `RegionId::UNREGISTERED` sentinel for heap-backed zero-copy guards that skip io_uring
+  fixed buffer validation
+- `cache-bench`: standalone cache benchmarking tool for direct cache library performance testing
+
+### Changed
+- Server, benchmark, and proxy migrated from `io-driver` to `kompio` EventHandler trait
+- Transport types (`TlsTransport`, `PlainTransport`) moved from `io-driver` to `http2` crate
+- CI test matrix reduced to Linux-only (macOS removed; kompio requires io_uring / Linux 6.0+)
+
+### Fixed
+- Non-blocking segment eviction under reader pressure in cache-core
+- All clippy -D warnings across workspace (collapsible_if, redundant_closure, implicit borrow
+  patterns, io_other_error, etc.)
+- Rustdoc invalid HTML tag warnings
+
+### Removed
+- `io-driver` crate (replaced by `kompio`)
+
 ## [0.2.18] - 2026-02-09
 
 ### Changed
