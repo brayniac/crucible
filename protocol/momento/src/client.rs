@@ -9,7 +9,7 @@ use crate::transport::{
 
 use bytes::Bytes;
 use grpc::StreamId;
-use io_driver::{TlsConfig, TlsTransport, Transport};
+use http2::{TlsConfig, TlsTransport, Transport};
 use std::io;
 use std::time::Duration;
 

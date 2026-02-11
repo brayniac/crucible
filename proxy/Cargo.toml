@@ -8,8 +8,7 @@ repository.workspace = true
 description = "High-performance Valkey/Redis proxy with io_uring networking"
 
 [features]
-default = ["io_uring"]
-io_uring = ["io-driver/io_uring"]
+default = []
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
@@ -19,8 +18,8 @@ segcache = { workspace = true }
 # Protocol parsing
 protocol-resp = { workspace = true, features = ["resp3"] }
 
-# I/O driver (io_uring on Linux, mio fallback)
-io-driver = { workspace = true, features = ["serde"] }
+# I/O event loop
+kompio = { workspace = true }
 
 # Core utilities
 bytes = { workspace = true }
@@ -28,7 +27,6 @@ crossbeam-channel = { workspace = true }
 slab = { workspace = true }
 libc = { workspace = true }
 ahash = { workspace = true }
-socket2 = "0.5"
 
 # Configuration
 serde = { workspace = true, features = ["derive"] }

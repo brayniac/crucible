@@ -18,7 +18,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use io_driver::{TlsConfig, TlsTransport, Transport, TransportState};
+use http2::{TlsConfig, TlsTransport, Transport, TransportState};
 use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential, WireFormat};
 
 fn main() {

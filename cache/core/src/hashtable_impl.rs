@@ -571,6 +571,36 @@ impl MultiChoiceHashtable {
         None
     }
 
+    /// Increment frequency of ghost entries with matching tag in a bucket.
+    ///
+    /// Called on lookup miss so ghosts accumulate frequency from read traffic.
+    /// Uses tag-only matching since ghost data is gone (12-bit tag gives
+    /// ~1/4096 false positive rate, acceptable for best-effort frequency).
+    fn increment_ghost_freq_in_bucket(&self, bucket_index: usize, tag: u16) {
+        let bucket = self.bucket(bucket_index);
+
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            let packed = bucket.items[slot_index].load(Ordering::Acquire);
+
+            if packed != 0
+                && Hashbucket::is_ghost(packed)
+                && Hashbucket::tag(packed) == tag
+            {
+                let freq = Hashbucket::freq(packed);
+                if freq < 127 {
+                    if let Some(new_packed) = Hashbucket::try_update_freq(packed, freq) {
+                        let _ = bucket.items[slot_index].compare_exchange(
+                            packed,
+                            new_packed,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Search for frequency of a specific item.
     fn search_bucket_for_freq(
         &self,
@@ -1183,6 +1213,12 @@ impl Hashtable for MultiChoiceHashtable {
             if let Some(result) = self.search_bucket_for_get(bucket_index, tag, key, verifier) {
                 return Some(result);
             }
+        }
+
+        // Miss: increment frequency of any matching ghosts so they are
+        // promoted when re-inserted by a subsequent write.
+        for &bucket_index in &buckets[..num_choices] {
+            self.increment_ghost_freq_in_bucket(bucket_index, tag);
         }
 
         None
@@ -1935,6 +1971,37 @@ mod tests {
         let verifier = MockVerifier::new();
 
         assert!(ht.lookup(b"nonexistent", &verifier).is_none());
+    }
+
+    #[test]
+    fn test_lookup_miss_increments_ghost_frequency() {
+        let ht = MultiChoiceHashtable::new(10);
+        let mut verifier = MockVerifier::new();
+
+        let location = Location::new(100);
+        verifier.add(b"key", location, false);
+
+        // Insert and convert to ghost with freq=0
+        ht.insert(b"key", location, &verifier).unwrap();
+
+        // Fresh insert has freq >= 1, so read the baseline
+        let freq_before_ghost = ht.get_frequency(b"key", &verifier).unwrap();
+
+        assert!(ht.convert_to_ghost(b"key", location));
+
+        let ghost_freq_before = ht.get_ghost_frequency(b"key").unwrap();
+        assert_eq!(ghost_freq_before, freq_before_ghost);
+
+        // Lookup misses on ghost but should increment ghost frequency
+        assert!(ht.lookup(b"key", &verifier).is_none());
+
+        let ghost_freq_after = ht.get_ghost_frequency(b"key").unwrap();
+        assert!(
+            ghost_freq_after > ghost_freq_before,
+            "ghost freq should increase: before={}, after={}",
+            ghost_freq_before,
+            ghost_freq_after
+        );
     }
 
     #[test]

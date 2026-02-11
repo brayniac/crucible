@@ -8,8 +8,12 @@ repository.workspace = true
 description = "High-performance cache protocol benchmark tool"
 
 [dependencies]
-# I/O abstraction layer
-io-driver = { workspace = true, features = ["serde"] }
+# I/O event loop
+kompio = { workspace = true }
+http2 = { workspace = true, features = ["tls"] }
+
+# Channels
+crossbeam-channel = { workspace = true }
 
 # Protocol implementations
 protocol-ping = { workspace = true }
@@ -69,8 +73,7 @@ ringlog = "0.7"
 http = "1"
 
 [features]
-default = ["io_uring"]
-io_uring = ["io-driver/io_uring"]
+default = []
 
 [[bin]]
 name = "crucible-benchmark"

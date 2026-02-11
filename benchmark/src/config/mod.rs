@@ -1,5 +1,4 @@
 use crate::output::{ColorMode, OutputFormat};
-use io_driver::IoEngine;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -34,9 +33,6 @@ pub struct General {
     /// CPU list for pinning worker threads (Linux style: "0-3,8-11,13")
     #[serde(default)]
     pub cpu_list: Option<String>,
-    /// I/O engine selection (auto, mio, uring)
-    #[serde(default)]
-    pub io_engine: IoEngine,
 }
 
 impl Default for General {
@@ -46,7 +42,6 @@ impl Default for General {
             warmup: default_warmup(),
             threads: default_threads(),
             cpu_list: None,
-            io_engine: IoEngine::default(),
         }
     }
 }

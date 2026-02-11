@@ -1,7 +1,7 @@
 //! Single backend connection.
 
 use bytes::BytesMut;
-use io_driver::ConnId;
+use kompio::ConnToken;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -30,8 +30,8 @@ pub enum BackendState {
 /// An in-flight request to the backend.
 #[derive(Debug)]
 pub struct InFlightRequest {
-    /// Originating client connection ID.
-    pub client_id: ConnId,
+    /// Originating client connection token.
+    pub client: ConnToken,
     /// Request ID for correlation.
     pub request_id: u64,
     /// The key (for caching GET responses).
@@ -42,8 +42,8 @@ pub struct InFlightRequest {
 
 /// A connection to a backend node.
 pub struct BackendConnection {
-    /// Connection ID from the I/O driver.
-    pub conn_id: ConnId,
+    /// Connection token from kompio.
+    pub conn: ConnToken,
 
     /// Backend address.
     pub addr: SocketAddr,
@@ -63,9 +63,9 @@ pub struct BackendConnection {
 
 impl BackendConnection {
     /// Create a new backend connection (in connecting state).
-    pub fn new(conn_id: ConnId, addr: SocketAddr) -> Self {
+    pub fn new(conn: ConnToken, addr: SocketAddr) -> Self {
         Self {
-            conn_id,
+            conn,
             addr,
             state: BackendState::Connecting,
             send_buf: BytesMut::with_capacity(4096),

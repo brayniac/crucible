@@ -5,10 +5,15 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "HTTP/2 implementation for io-driver-based applications"
+description = "HTTP/2 implementation with optional TLS transport"
+
+[features]
+default = ["tls"]
+tls = ["rustls", "webpki-roots"]
 
 [dependencies]
 bytes = { workspace = true }
-io-driver = { workspace = true }
+rustls = { workspace = true, optional = true, features = ["std", "ring", "tls12"] }
+webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]

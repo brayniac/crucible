@@ -9,27 +9,28 @@ Crucible is a high-performance cache server and benchmarking toolkit written in 
 - **Cache Server** (`crucible-server`) - Multi-protocol cache server supporting Redis (RESP) and Memcache protocols
 - **Benchmark Tool** (`crucible-benchmark`) - Load generator with detailed latency metrics
 - **Cache Libraries** - Multiple cache implementations (Segcache, Slab, Heap)
-- **I/O Framework** (`io-driver`) - Unified I/O abstraction with io_uring and mio backends
+- **I/O Framework** (`kompio`) - Push-based io_uring event loop with callback-driven `EventHandler` trait
 
 ## Design Philosophy
 
 Crucible is built for **performance-critical deployments where microseconds matter**. The architecture reflects deliberate trade-offs that prioritize latency predictability and throughput over developer convenience.
 
-### Why We Built Our Own I/O Driver (Not Tokio)
+### Why We Built Our Own I/O Framework (Not Tokio)
 
 Tokio is an excellent general-purpose async runtime, but it abstracts away platform-specific capabilities that are essential for cache server performance:
 
-1. **Completion-based model vs async/await**: Our `io-driver` uses explicit `poll()` → `drain_completions()` loops instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight loop with predictable behavior.
+1. **Push-based callback model vs async/await**: Our `kompio` framework uses an `EventHandler` trait with callbacks (`on_data`, `on_accept`, `on_send_complete`, `on_close`, `on_tick`) instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight event loop with predictable behavior.
 
 2. **Direct access to io_uring features**: Tokio's abstractions hide advanced io_uring capabilities that we need:
    - **Multishot recv/accept**: Single submission, multiple completions without re-submission overhead
    - **Ring-provided buffers**: Kernel manages buffer pool with zero-copy semantics
-   - **SendZc**: Kernel DMAs directly from user buffers—true zero-copy send
-   - **SQPOLL mode**: Kernel thread polls submission queue, eliminating syscalls entirely
+   - **SendMsgZc**: Kernel DMAs directly from user buffers—true zero-copy send
 
-3. **Explicit buffer lifecycle management**: Zero-copy I/O requires precise control over when buffers can be released. Async/await complicates lifetime management across await points. Our completion model lets us hold buffer ownership until the kernel signals completion.
+3. **Explicit buffer lifecycle management**: Zero-copy I/O requires precise control over when buffers can be released. Async/await complicates lifetime management across await points. Our callback model lets us hold buffer ownership until the kernel signals completion.
 
 4. **Thread-per-core with CPU pinning**: Workers are pinned to specific cores, keeping hot data in CPU cache. Tokio's work-stealing scheduler moves tasks between threads, invalidating caches and adding unpredictable latency.
+
+5. **Bundled infrastructure**: kompio manages acceptor threads, worker threads, connection lifecycle, and the io_uring submission/completion loop internally—consumers only implement the `EventHandler` trait.
 
 ### Why The Benchmark Tool Doesn't Use Tokio
 
@@ -37,7 +38,7 @@ The benchmark needs to measure latency accurately without introducing measuremen
 
 - **Precise timing**: Direct `Instant::now()` calls at exact points in the event loop, not filtered through async task scheduling
 - **CPU pinning**: Threads pinned to cores for reproducible results across runs
-- **Same I/O advantages**: Uses `io-driver` to leverage io_uring on Linux, matching the server's I/O characteristics
+- **Same I/O advantages**: Uses `kompio` to leverage io_uring on Linux, matching the server's I/O characteristics
 - **Dual timestamp modes**: Supports both userspace timing and kernel SO_TIMESTAMPING for sub-microsecond accuracy
 
 The admin/metrics server within the benchmark *does* use Tokio—it's isolated on a separate thread where convenience matters more than latency.
@@ -49,7 +50,7 @@ The server supports both runtimes via configuration:
 | Aspect | Native (default) | Tokio |
 |--------|------------------|-------|
 | Threading | Explicit thread-per-core | Work-stealing pool |
-| I/O | io_uring (Linux 6.0+) / mio | Tokio reactor (epoll/kqueue) |
+| I/O | io_uring via kompio (Linux 6.0+) | Tokio reactor (epoll/kqueue) |
 | CPU pinning | Direct, per-worker | Optional callback |
 | Latency | Predictable, low variance | Higher variance from scheduler |
 | Use case | Production, performance-critical | Development, portability |
@@ -120,8 +121,8 @@ crucible/
     slab/       # Memcached-style slab allocator with slab-level eviction
     heap/       # Heap-allocated cache using system allocator
   io/
-    driver/     # Unified I/O driver (io_uring + mio backends)
-    http2/      # HTTP/2 framing
+    kompio/     # Push-based io_uring event loop (EventHandler trait)
+    http2/      # HTTP/2 framing and Transport abstraction
     grpc/       # gRPC client implementation
   protocol/
     resp/       # Redis RESP2/RESP3 protocol
@@ -134,34 +135,32 @@ crucible/
   metrics/      # Metrics infrastructure
 ```
 
-### I/O Driver Design
+### Kompio I/O Framework
 
-The `io-driver` crate provides a unified completion-based I/O abstraction:
+The `kompio` crate provides a push-based io_uring event loop. Applications implement the `EventHandler` trait:
 
 ```rust
-// The core event loop pattern used throughout Crucible
-loop {
-    driver.poll(Some(Duration::from_millis(1)))?;
-    for completion in driver.drain_completions() {
-        match completion.kind {
-            CompletionKind::Recv { conn_id, .. } => { /* process recv */ }
-            CompletionKind::SendReady { conn_id } => { /* send response */ }
-            // ...
-        }
-    }
+// Applications implement EventHandler callbacks
+impl EventHandler for MyHandler {
+    fn create_for_worker(worker_id: usize) -> Self { /* per-worker init */ }
+    fn on_accept(&mut self, ctx: &mut DriverCtx, conn: ConnToken) { /* new connection */ }
+    fn on_data(&mut self, ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize { /* returns bytes consumed */ }
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<usize>) { /* send done */ }
+    fn on_close(&mut self, ctx: &mut DriverCtx, conn: ConnToken) { /* connection closed */ }
+    fn on_tick(&mut self, ctx: &mut DriverCtx) { /* periodic callback */ }
 }
+
+// Launch with builder pattern
+KompioBuilder::new(config).bind("0.0.0.0:6379").launch::<MyHandler>()?;
 ```
 
-**Backend selection** (automatic):
-- **Linux 6.0+**: io_uring with multishot recv/accept, SendZc, ring-provided buffers
-- **Other platforms**: mio (epoll on Linux, kqueue on macOS)
+**Key features:**
+- **io_uring**: Multishot recv/accept, SendMsgZc, ring-provided buffers
+- **Thread-per-core**: Bundled acceptor thread + N pinned worker threads
+- **ConnToken**: Opaque connection handle with `index()` for per-connection state arrays
+- **DriverCtx**: Send (`ctx.send()`), close (`ctx.close()`), connect (`ctx.connect()`) operations
 
-**Copy semantics** (why this matters for performance):
-- io_uring single-shot recv + SendZc: **0 copies** (kernel writes to user buffer, DMAs response directly)
-- io_uring multishot recv + SendZc: **1 copy** (ring buffer → coalesce buffer)
-- mio fallback: **2 copies** (standard read/write syscalls)
-
-See `io/driver/ARCHITECTURE.md` for detailed buffer management documentation.
+**Platform**: Linux 6.0+ only (io_uring required for native runtime).
 
 ### Cache Architecture (cache-core)
 
@@ -224,9 +223,8 @@ policy = "s3fifo"    # Eviction policy (depends on backend)
 
 ## Platform Support
 
-- **Linux 6.0+**: Full support with io_uring, CPU pinning, NUMA binding, hugepages
-- **Linux < 6.0**: mio backend (epoll), still supports CPU pinning
-- **macOS**: mio backend only (kqueue)
+- **Linux 6.0+**: Full support with io_uring (native runtime), CPU pinning, NUMA binding, hugepages
+- **Other platforms**: Tokio runtime only (epoll/kqueue via Tokio reactor)
 - **Architectures**: x86_64 and ARM64
 
 ## Testing

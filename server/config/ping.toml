@@ -5,12 +5,6 @@
 # Listen address
 listen = "0.0.0.0:6379"
 
-# I/O engine: "auto", "mio", or "uring"
-# - auto: uses io_uring on Linux, mio elsewhere
-# - mio: epoll/kqueue based (cross-platform)
-# - uring: io_uring (Linux 5.6+ only)
-io_engine = "auto"
-
 [workers]
 # Number of worker threads
 # 0 = single-threaded mode (simplest, good for testing)

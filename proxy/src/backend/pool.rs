@@ -2,19 +2,16 @@
 
 use super::connection::BackendConnection;
 use ahash::AHashMap;
-use io_driver::ConnId;
+use kompio::ConnToken;
 use std::net::SocketAddr;
 
 /// A pool of connections to backend nodes.
-///
-/// For Phase 1, this is simplified to a single backend node.
-/// Phase 3 will add cluster support with multiple nodes and slot routing.
 pub struct BackendPool {
-    /// Backend address (single node for Phase 1).
+    /// Backend address (single node).
     backend_addr: SocketAddr,
 
-    /// Connections indexed by ConnId.
-    connections: AHashMap<ConnId, BackendConnection>,
+    /// Connections indexed by ConnToken::index().
+    connections: AHashMap<usize, BackendConnection>,
 
     /// Target pool size.
     pool_size: usize,
@@ -35,11 +32,6 @@ impl BackendPool {
         self.backend_addr
     }
 
-    /// Get the target pool size.
-    pub fn target_size(&self) -> usize {
-        self.pool_size
-    }
-
     /// Get current number of connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
@@ -52,53 +44,50 @@ impl BackendPool {
 
     /// Add a connection (in connecting state).
     pub fn add_connection(&mut self, conn: BackendConnection) {
-        self.connections.insert(conn.conn_id, conn);
+        self.connections.insert(conn.conn.index(), conn);
     }
 
-    /// Get a connection by ID.
-    pub fn get_connection(&self, conn_id: ConnId) -> Option<&BackendConnection> {
-        self.connections.get(&conn_id)
+    /// Get a connection by token.
+    pub fn get_connection(&self, conn: ConnToken) -> Option<&BackendConnection> {
+        let bc = self.connections.get(&conn.index())?;
+        // Verify generation matches
+        if bc.conn == conn { Some(bc) } else { None }
     }
 
-    /// Get a mutable connection by ID.
-    pub fn get_connection_mut(&mut self, conn_id: ConnId) -> Option<&mut BackendConnection> {
-        self.connections.get_mut(&conn_id)
+    /// Get a mutable connection by token.
+    pub fn get_connection_mut(&mut self, conn: ConnToken) -> Option<&mut BackendConnection> {
+        let bc = self.connections.get_mut(&conn.index())?;
+        if bc.conn == conn { Some(bc) } else { None }
     }
 
     /// Remove a connection.
-    pub fn remove_connection(&mut self, conn_id: ConnId) -> Option<BackendConnection> {
-        self.connections.remove(&conn_id)
-    }
-
-    /// Get an idle connection for sending a request.
-    pub fn get_idle_connection(&mut self) -> Option<&mut BackendConnection> {
-        self.connections.values_mut().find(|c| c.is_idle())
+    pub fn remove_connection(&mut self, conn: ConnToken) -> Option<BackendConnection> {
+        if self.connections.get(&conn.index()).is_some_and(|bc| bc.conn == conn) {
+            return self.connections.remove(&conn.index());
+        }
+        None
     }
 
     /// Get a usable connection with least in-flight requests (load balancing).
     pub fn get_usable_connection(&mut self) -> Option<&mut BackendConnection> {
-        // Find the usable connection with the fewest in-flight requests
-        // This distributes load evenly across all backend connections
-        let mut best_id = None;
+        let mut best_index = None;
         let mut best_in_flight = usize::MAX;
 
-        for (conn_id, conn) in &self.connections {
+        for (index, conn) in &self.connections {
             if !conn.is_usable() {
                 continue;
             }
             let in_flight = conn.in_flight.len();
-            // Prefer idle (0 in-flight), then least loaded
             if in_flight < best_in_flight {
                 best_in_flight = in_flight;
-                best_id = Some(*conn_id);
-                // Short-circuit if we find an idle connection
+                best_index = Some(*index);
                 if in_flight == 0 {
                     break;
                 }
             }
         }
 
-        best_id.and_then(|id| self.connections.get_mut(&id))
+        best_index.and_then(|idx| self.connections.get_mut(&idx))
     }
 
     /// Iterate over all connections.
@@ -109,12 +98,5 @@ impl BackendPool {
     /// Iterate mutably over all connections.
     pub fn connections_mut(&mut self) -> impl Iterator<Item = &mut BackendConnection> {
         self.connections.values_mut()
-    }
-
-    /// Mark a connection as connected.
-    pub fn mark_connected(&mut self, conn_id: ConnId) {
-        if let Some(conn) = self.connections.get_mut(&conn_id) {
-            conn.mark_connected();
-        }
     }
 }

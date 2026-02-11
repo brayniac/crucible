@@ -2,7 +2,7 @@ mod momento;
 mod session;
 
 pub use momento::MomentoSession;
-pub use session::{Session, SessionConfig, SessionError, Timestamp};
+pub use session::{RecvBuf, Session, SessionConfig, SessionError, Timestamp};
 
 /// Result of a completed request.
 #[derive(Debug, Clone)]

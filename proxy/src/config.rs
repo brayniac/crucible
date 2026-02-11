@@ -1,6 +1,5 @@
 //! Proxy configuration.
 
-use io_driver::IoEngine;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -60,14 +59,6 @@ impl Config {
             .map(|s| parse_cpu_list(s))
     }
 
-    /// Get the I/O engine to use.
-    pub fn io_engine(&self) -> IoEngine {
-        #[cfg(target_os = "linux")]
-        if io_driver::uring_available() {
-            return IoEngine::Uring;
-        }
-        IoEngine::Mio
-    }
 }
 
 /// Proxy listener configuration.

@@ -114,7 +114,7 @@ impl OutputFormatter for JsonFormatter {
             keyspace: config.workload.keyspace.count as u64,
             key_size: config.workload.keyspace.length,
             value_size: config.workload.values.length,
-            engine: format!("{}", config.general.io_engine),
+            engine: "io_uring".to_string(),
             ratelimit: config.workload.rate_limit,
             warmup_secs: config.general.warmup.as_secs(),
             duration_secs: config.general.duration.as_secs(),

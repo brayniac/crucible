@@ -1,7 +1,7 @@
-//! grpc - gRPC implementation for io-driver-based applications.
+//! grpc - gRPC implementation for kompio-based applications.
 //!
 //! This crate provides gRPC framing on top of HTTP/2, designed to work
-//! with the io-driver I/O driver. It does not use async/await or tokio.
+//! with the kompio I/O framework. It does not use async/await or tokio.
 //!
 //! # Features
 //!
@@ -35,4 +35,4 @@ pub use status::{Code, Status};
 
 // Re-export useful types from dependencies
 pub use http2::{Connection, StreamId};
-pub use io_driver::{TlsConfig, TlsTransport, Transport};
+pub use http2::{TlsConfig, TlsTransport, Transport};

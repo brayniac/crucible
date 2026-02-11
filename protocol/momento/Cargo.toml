@@ -5,13 +5,12 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Lightweight Momento cache protocol implementation for io-driver-based applications"
+description = "Lightweight Momento cache protocol implementation for kompio-based applications"
 
 [dependencies]
 bytes = { workspace = true }
 grpc = { workspace = true }
 http2 = { workspace = true }
-io-driver = { workspace = true }
 
 [[bin]]
 name = "momento-cli"

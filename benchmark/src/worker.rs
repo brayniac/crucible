@@ -1,25 +1,25 @@
-//! Worker implementation using IoDriver abstraction.
+//! Worker implementation using kompio EventHandler.
 //!
-//! This worker uses the IoDriver trait to abstract over mio and io_uring,
-//! enabling the use of advanced io_uring features like multishot recv and
-//! registered file descriptors for lower latency.
+//! Each worker runs inside a kompio event loop, using callbacks
+//! (`on_tick`, `on_connect`, `on_data`, `on_send_complete`, `on_close`)
+//! to drive the benchmark workload.
 
-use crate::client::{MomentoSession, RequestResult, RequestType, Session};
+use crate::client::{MomentoSession, RecvBuf, RequestResult, RequestType, Session};
 use crate::config::{Config, Protocol as CacheProtocol};
 use crate::metrics;
 use crate::ratelimit::DynamicRateLimiter;
 
-use io_driver::{CompletionKind, ConnId, Driver, IoDriver, RecvBuf};
+use kompio::{ConnToken, DriverCtx, EventHandler};
 
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
-use socket2::{Domain, Protocol, Socket, Type};
+use std::any::Any;
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
 
 /// Test phase, controlled by main thread and read by workers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,8 +124,8 @@ impl Default for SharedState {
     }
 }
 
-/// Worker configuration.
-pub struct IoWorkerConfig {
+/// Worker configuration passed through the config channel.
+pub struct BenchWorkerConfig {
     pub id: usize,
     pub config: Config,
     pub shared: Arc<SharedState>,
@@ -133,22 +133,86 @@ pub struct IoWorkerConfig {
     /// Whether to record metrics (only true during Running phase)
     pub recording: bool,
     /// Range of key IDs this worker should prefill (start..end).
-    /// Only used when prefill is enabled.
     pub prefill_range: Option<std::ops::Range<usize>>,
+    /// CPU IDs for pinning (if configured).
+    pub cpu_ids: Option<Vec<usize>>,
 }
 
-/// A worker using IoDriver for I/O operations.
-pub struct IoWorker {
+// ── Config channel (same pattern as server) ──────────────────────────────
+
+static CONFIG_CHANNEL: OnceLock<Mutex<Box<dyn Any + Send>>> = OnceLock::new();
+
+/// Initialize the global config channel. Must be called before launch.
+pub fn init_config_channel(rx: crossbeam_channel::Receiver<BenchWorkerConfig>) {
+    let boxed: Box<dyn Any + Send> = Box::new(rx);
+    CONFIG_CHANNEL
+        .set(Mutex::new(boxed))
+        .expect("init_config_channel called twice");
+}
+
+fn recv_config() -> BenchWorkerConfig {
+    let guard = CONFIG_CHANNEL
+        .get()
+        .expect("config channel not initialized")
+        .lock()
+        .unwrap();
+    let rx = guard
+        .downcast_ref::<crossbeam_channel::Receiver<BenchWorkerConfig>>()
+        .expect("wrong config channel type");
+    rx.recv().expect("config channel closed")
+}
+
+// ── DataSlice adapter for zero-copy parsing ──────────────────────────────
+
+/// Wraps a `&[u8]` slice as a RecvBuf for zero-copy response parsing.
+struct DataSlice<'a> {
+    data: &'a [u8],
+    consumed: usize,
+}
+
+impl<'a> DataSlice<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, consumed: 0 }
+    }
+}
+
+impl RecvBuf for DataSlice<'_> {
+    fn as_slice(&self) -> &[u8] {
+        &self.data[self.consumed..]
+    }
+    fn len(&self) -> usize {
+        self.data.len() - self.consumed
+    }
+    fn consume(&mut self, n: usize) {
+        self.consumed += n;
+    }
+    fn capacity(&self) -> usize {
+        self.data.len()
+    }
+    fn shrink_if_oversized(&mut self) {
+        // no-op for borrowed slice
+    }
+}
+
+// ── BenchHandler ─────────────────────────────────────────────────────────
+
+/// Benchmark worker event handler for kompio.
+pub struct BenchHandler {
     id: usize,
-    driver: Box<dyn IoDriver>,
     config: Config,
     shared: Arc<SharedState>,
 
     /// Sessions (stable storage)
     sessions: Vec<Session>,
 
-    /// Maps conn_id -> session index (for completion lookup)
-    conn_id_to_idx: HashMap<usize, usize>,
+    /// Maps ConnToken::index() -> session index
+    conn_to_session: HashMap<usize, usize>,
+
+    /// Maps ConnToken::index() -> ConnToken (preserves generation)
+    conn_tokens: HashMap<usize, ConnToken>,
+
+    /// Tracks sessions that are being connected (ConnToken::index() -> session index)
+    pending_connects: HashMap<usize, usize>,
 
     /// Momento sessions (handle their own I/O)
     momento_sessions: Vec<MomentoSession>,
@@ -167,152 +231,87 @@ pub struct IoWorker {
     /// Whether to record metrics (only true during Running phase)
     recording: bool,
 
-    /// Prefill state: keys pending to be written (not yet sent or need retry)
+    /// Last observed phase (for transition detection)
+    last_phase: Phase,
+
+    /// Whether initial connections have been established
+    connections_initiated: bool,
+
+    /// Prefill state
     prefill_pending: std::collections::VecDeque<usize>,
-    /// Prefill state: in-flight key IDs per session index (waiting for response)
     prefill_in_flight: Vec<std::collections::VecDeque<usize>>,
-    /// Number of keys successfully confirmed during prefill
     prefill_confirmed: usize,
-    /// Total keys to prefill (for completion check)
     prefill_total: usize,
-    /// Whether this worker has finished prefilling
     prefill_done: bool,
+
+    /// Endpoint list for connections
+    endpoints: Vec<SocketAddr>,
+    /// Number of connections this worker should manage
+    my_connections: usize,
+    /// Starting global connection index for endpoint distribution
+    my_start: usize,
 }
 
-impl IoWorker {
-    /// Create a new worker.
-    pub fn new(cfg: IoWorkerConfig) -> io::Result<Self> {
-        // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
-        // With 16KB buffers, a 4MB response generates ~256 CQEs; with 256KB it's ~16.
-        // 1024 buffers × 256KB = 256MB per worker — acceptable for a benchmark tool.
-        let driver = Driver::builder()
-            .engine(cfg.config.general.io_engine)
-            .buffer_size(256 * 1024)
-            .buffer_count(1024)
-            .build()?;
-
-        let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);
-        let key_buf = vec![0u8; cfg.config.workload.keyspace.length];
-        let mut value_buf = vec![0u8; cfg.config.workload.values.length];
-        let pipeline_depth = cfg.config.connection.pipeline_depth;
-
-        // Fill value buffer with random data
-        let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);
-        init_rng.fill_bytes(&mut value_buf);
-
-        // Initialize prefill state
-        let (prefill_pending, prefill_total, prefill_done) = match cfg.prefill_range {
-            Some(range) => {
-                let pending: std::collections::VecDeque<usize> = (range.start..range.end).collect();
-                let total = range.end - range.start;
-                tracing::debug!(
-                    worker_id = cfg.id,
-                    total,
-                    start = range.start,
-                    end = range.end,
-                    "prefill initialized"
-                );
-                (pending, total, total == 0)
-            }
-            None => (std::collections::VecDeque::new(), 0, true),
-        };
-
-        Ok(Self {
-            id: cfg.id,
-            driver,
-            config: cfg.config,
-            shared: cfg.shared,
-            sessions: Vec::new(),
-            conn_id_to_idx: HashMap::new(),
-            momento_sessions: Vec::new(),
-            rng,
-            key_buf,
-            value_buf,
-            results: Vec::with_capacity(pipeline_depth),
-            ratelimiter: cfg.ratelimiter,
-            recording: cfg.recording,
-            prefill_pending,
-            prefill_in_flight: Vec::new(), // Will be sized when sessions are created
-            prefill_confirmed: 0,
-            prefill_total,
-            prefill_done,
-        })
-    }
-
-    /// Connect to all endpoints.
-    pub fn connect(&mut self) -> io::Result<()> {
-        // Handle Momento differently - it manages its own connections
+impl BenchHandler {
+    /// Initiate connections to all endpoints.
+    fn initiate_connections(&mut self, ctx: &mut DriverCtx) {
         if self.config.target.protocol == CacheProtocol::Momento {
-            return self.connect_momento();
+            self.connect_momento();
+            self.connections_initiated = true;
+            return;
         }
 
-        let endpoints = self.config.target.endpoints.clone();
-        let total_connections = self.config.connection.total_connections();
-        let num_threads = self.config.general.threads;
-        let num_endpoints = endpoints.len();
+        let num_endpoints = self.endpoints.len();
 
-        // Distribute connections across threads
-        let base_per_thread = total_connections / num_threads;
-        let remainder = total_connections % num_threads;
-        let my_connections = if self.id < remainder {
-            base_per_thread + 1
-        } else {
-            base_per_thread
-        };
-
-        let my_start = if self.id < remainder {
-            self.id * (base_per_thread + 1)
-        } else {
-            remainder * (base_per_thread + 1) + (self.id - remainder) * base_per_thread
-        };
-
-        for i in 0..my_connections {
-            let global_conn_idx = my_start + i;
+        for i in 0..self.my_connections {
+            let global_conn_idx = self.my_start + i;
             let endpoint_idx = global_conn_idx % num_endpoints;
-            let endpoint = endpoints[endpoint_idx];
+            let endpoint = self.endpoints[endpoint_idx];
 
-            match self.connect_one(endpoint) {
-                Ok(()) => {
-                    metrics::CONNECTIONS_ACTIVE.increment();
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "worker {} failed to connect to {}: {}",
-                        self.id,
-                        endpoint,
-                        e
-                    );
-                    metrics::CONNECTIONS_FAILED.increment();
-                    // Create disconnected session for reconnection attempts
-                    match Session::from_config(endpoint, &self.config) {
-                        Ok(session) => {
-                            self.sessions.push(session);
-                            self.prefill_in_flight
-                                .push(std::collections::VecDeque::new());
+            // Create session
+            match Session::from_config(endpoint, &self.config) {
+                Ok(session) => {
+                    let idx = self.sessions.len();
+                    self.sessions.push(session);
+                    self.prefill_in_flight
+                        .push(std::collections::VecDeque::new());
+
+                    // Initiate async connect
+                    match ctx.connect(endpoint) {
+                        Ok(token) => {
+                            self.conn_tokens.insert(token.index(), token);
+                            self.pending_connects.insert(token.index(), idx);
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "worker {} failed to create session for {}: {}",
+                            tracing::warn!(
+                                "worker {} failed to connect to {}: {}",
                                 self.id,
                                 endpoint,
                                 e
                             );
+                            metrics::CONNECTIONS_FAILED.increment();
                         }
                     }
-                    // Not added to send_queue - will be added on successful reconnect
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "worker {} failed to create session for {}: {}",
+                        self.id,
+                        endpoint,
+                        e
+                    );
                 }
             }
         }
 
-        Ok(())
+        self.connections_initiated = true;
     }
 
     /// Connect Momento sessions.
-    fn connect_momento(&mut self) -> io::Result<()> {
+    fn connect_momento(&mut self) {
         let total_connections = self.config.connection.total_connections();
         let num_threads = self.config.general.threads;
 
-        // Distribute connections across threads
         let base_per_thread = total_connections / num_threads;
         let remainder = total_connections % num_threads;
         let my_connections = if self.id < remainder {
@@ -328,7 +327,6 @@ impl IoWorker {
                         tracing::warn!("failed to connect Momento session: {}", e);
                         metrics::CONNECTIONS_FAILED.increment();
                     }
-                    // Add session even if connect failed - we'll retry in poll_once
                     self.momento_sessions.push(session);
                 }
                 Err(e) => {
@@ -337,254 +335,23 @@ impl IoWorker {
                 }
             }
         }
-
-        Ok(())
     }
 
-    fn connect_one(&mut self, addr: SocketAddr) -> io::Result<()> {
-        let stream = Self::create_connection(addr, self.config.connection.connect_timeout)?;
-        let conn_id = self.driver.register(stream)?;
+    /// Drive the Momento workload (both prefill and normal).
+    fn poll_momento(&mut self, now: std::time::Instant) {
+        let phase = self.shared.phase();
 
-        let mut session = Session::from_config(addr, &self.config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        session.set_conn_id(conn_id);
-
-        let idx = self.sessions.len();
-        self.sessions.push(session);
-        self.prefill_in_flight
-            .push(std::collections::VecDeque::new());
-        self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
-
-        Ok(())
-    }
-
-    fn create_connection(addr: SocketAddr, _timeout: Duration) -> io::Result<TcpStream> {
-        let domain = if addr.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_nonblocking(true)?;
-        socket.set_nodelay(true)?;
-
-        // Connect (non-blocking)
-        match socket.connect(&addr.into()) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-            Err(e) => return Err(e),
+        if phase == Phase::Prefill && !self.prefill_done {
+            self.poll_momento_prefill(now);
+            return;
         }
 
-        Ok(socket.into())
-    }
-
-    /// Set whether to record metrics (only true during Running phase).
-    pub fn set_recording(&mut self, recording: bool) {
-        self.recording = recording;
-    }
-
-    /// Run a single iteration of the event loop.
-    #[inline]
-    pub fn poll_once(&mut self) -> io::Result<()> {
-        // Get timestamp once for the entire poll cycle
-        let now = std::time::Instant::now();
-
-        // Handle Momento sessions differently
-        if self.config.target.protocol == CacheProtocol::Momento {
-            return self.poll_once_momento(now);
-        }
-
-        // Try to reconnect disconnected sessions
-        self.try_reconnect();
-
-        // Generate and queue requests
-        self.drive_requests(now)?;
-
-        // Flush send buffers
-        self.flush_sends()?;
-
-        // Poll for I/O completions
-        let count = self.driver.poll(Some(Duration::from_micros(100)))?;
-
-        if count > 0 {
-            // Timestamp taken once after poll returns — all connections in this
-            // batch became ready during the same poll window, so they share the
-            // same receive timestamp. This avoids inflating tail latency for
-            // connections processed later in the batch.
-            let poll_time = std::time::Instant::now();
-            self.process_completions(poll_time)?;
-        }
-
-        // Process any received data into responses
-        // Use a fresh timestamp to accurately measure latency (not the one used for sending)
-        self.poll_responses(std::time::Instant::now());
-
-        Ok(())
-    }
-
-    /// Poll loop for Momento sessions.
-    #[inline]
-    fn poll_once_momento(&mut self, now: std::time::Instant) -> io::Result<()> {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let delete_ratio = self.config.workload.commands.delete;
         let recording = self.recording;
 
         for session in &mut self.momento_sessions {
-            // Drive connection (TLS handshake, HTTP/2 setup)
-            if !session.is_connected() {
-                match session.drive() {
-                    Ok(true) => {
-                        metrics::CONNECTIONS_ACTIVE.increment();
-                    }
-                    Ok(false) => continue, // Still connecting
-                    Err(e) => {
-                        tracing::debug!("Momento connection error: {}", e);
-                        continue;
-                    }
-                }
-            }
-
-            // Generate and send requests
-            while session.can_send() {
-                // Check rate limiter
-                if let Some(ref rl) = self.ratelimiter
-                    && !rl.try_acquire()
-                {
-                    break;
-                }
-
-                let key_id = self.rng.random_range(0..key_count);
-                write_key(&mut self.key_buf, key_id);
-
-                // Command selection: GET if < get_ratio, DELETE if < get_ratio + delete_ratio, else SET
-                let roll = self.rng.random_range(0..100);
-                let sent = if roll < get_ratio {
-                    session.get(&self.key_buf, now).is_some()
-                } else if roll < get_ratio + delete_ratio {
-                    session.delete(&self.key_buf, now).is_some()
-                } else {
-                    self.rng.fill_bytes(&mut self.value_buf);
-                    session.set(&self.key_buf, &self.value_buf, now).is_some()
-                };
-
-                if sent && recording {
-                    metrics::REQUESTS_SENT.increment();
-                }
-
-                if !sent {
-                    break;
-                }
-            }
-
-            // Poll for responses (this also drives I/O)
-            // Use a fresh timestamp to accurately measure latency (not the one used for sending)
-            self.results.clear();
-            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
-                tracing::debug!("Momento poll error: {}", e);
-            }
-
-            if recording {
-                for result in &self.results {
-                    metrics::RESPONSES_RECEIVED.increment();
-                    if result.is_error_response {
-                        metrics::REQUEST_ERRORS.increment();
-                    }
-
-                    if let Some(hit) = result.hit {
-                        if hit {
-                            metrics::CACHE_HITS.increment();
-                        } else {
-                            metrics::CACHE_MISSES.increment();
-                        }
-                    }
-
-                    let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
-
-                    match result.request_type {
-                        RequestType::Get => {
-                            metrics::GET_COUNT.increment();
-                            let _ = metrics::GET_LATENCY.increment(result.latency_ns);
-                        }
-                        RequestType::Set => {
-                            metrics::SET_COUNT.increment();
-                            let _ = metrics::SET_LATENCY.increment(result.latency_ns);
-                        }
-                        RequestType::Delete => {
-                            metrics::DELETE_COUNT.increment();
-                            let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);
-                        }
-                        RequestType::Ping | RequestType::Other => {}
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Run a single iteration of prefill (write sequential keys).
-    /// Returns true when prefill is complete.
-    #[inline]
-    pub fn poll_once_prefill(&mut self) -> io::Result<bool> {
-        if self.prefill_done {
-            return Ok(true);
-        }
-
-        let now = std::time::Instant::now();
-
-        // Handle Momento sessions differently
-        if self.config.target.protocol == CacheProtocol::Momento {
-            return self.poll_once_prefill_momento(now);
-        }
-
-        // Try to reconnect disconnected sessions
-        self.try_reconnect();
-
-        // Drive prefill requests (sequential SET commands)
-        self.drive_prefill_requests(now)?;
-
-        // Flush send buffers
-        self.flush_sends()?;
-
-        // Poll for I/O completions
-        let count = self.driver.poll(Some(Duration::from_micros(100)))?;
-
-        if count > 0 {
-            let poll_time = std::time::Instant::now();
-            self.process_completions(poll_time)?;
-        }
-
-        // Process responses (to clear pipeline for more requests)
-        self.poll_responses(std::time::Instant::now());
-
-        // Check if prefill is done: all keys have been confirmed
-        if self.prefill_confirmed >= self.prefill_total {
-            self.prefill_done = true;
-            tracing::debug!(
-                worker_id = self.id,
-                confirmed = self.prefill_confirmed,
-                total = self.prefill_total,
-                "prefill complete"
-            );
-            self.shared.mark_prefill_complete();
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    /// Prefill for Momento sessions.
-    ///
-    /// Note: Momento uses a simpler prefill approach since it handles its own
-    /// connection management. We pop keys from the pending queue but don't
-    /// track per-session in-flight state since Momento sessions handle retries
-    /// internally.
-    #[inline]
-    fn poll_once_prefill_momento(&mut self, now: std::time::Instant) -> io::Result<bool> {
-        for session in &mut self.momento_sessions {
-            // Drive connection
             if !session.is_connected() {
                 match session.drive() {
                     Ok(true) => {
@@ -598,115 +365,16 @@ impl IoWorker {
                 }
             }
 
-            // Send SET commands from pending queue
             while session.can_send() {
-                let key_id = match self.prefill_pending.pop_front() {
-                    Some(id) => id,
-                    None => break,
-                };
-
-                write_key(&mut self.key_buf, key_id);
-                self.rng.fill_bytes(&mut self.value_buf);
-
-                if session.set(&self.key_buf, &self.value_buf, now).is_none() {
-                    // Couldn't send - put the key back
-                    self.prefill_pending.push_front(key_id);
-                    break;
-                }
-                // Note: Momento handles retries internally, so we don't track in-flight
-            }
-
-            // Poll for responses and count successful SETs
-            self.results.clear();
-            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
-                tracing::debug!("Momento poll error: {}", e);
-            }
-            // Count successful SET responses
-            for result in &self.results {
-                if result.request_type == RequestType::Set && result.success {
-                    self.prefill_confirmed += 1;
-                }
-            }
-        }
-
-        // Check if prefill is done: all keys have been confirmed
-        if self.prefill_confirmed >= self.prefill_total {
-            self.prefill_done = true;
-            tracing::debug!(
-                worker_id = self.id,
-                confirmed = self.prefill_confirmed,
-                total = self.prefill_total,
-                "prefill complete (momento)"
-            );
-            self.shared.mark_prefill_complete();
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    /// Drive sequential SET requests for prefill.
-    #[inline]
-    fn drive_prefill_requests(&mut self, now: std::time::Instant) -> io::Result<()> {
-        // Fill each session's pipeline with SET commands from the pending queue
-        for idx in 0..self.sessions.len() {
-            let session = &mut self.sessions[idx];
-            if !session.is_connected() {
-                continue;
-            }
-
-            while session.can_send() {
-                // Pop a key from the pending queue
-                let key_id = match self.prefill_pending.pop_front() {
-                    Some(id) => id,
-                    None => break, // No more keys to send
-                };
-
-                write_key(&mut self.key_buf, key_id);
-                self.rng.fill_bytes(&mut self.value_buf);
-
-                if session.set(&self.key_buf, &self.value_buf, now).is_some() {
-                    // Track this key as in-flight for this session
-                    self.prefill_in_flight[idx].push_back(key_id);
-                } else {
-                    // Couldn't send - put the key back at the front
-                    self.prefill_pending.push_front(key_id);
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    fn drive_requests(&mut self, now: std::time::Instant) -> io::Result<()> {
-        let key_count = self.config.workload.keyspace.count;
-        let get_ratio = self.config.workload.commands.get;
-        let delete_ratio = self.config.workload.commands.delete;
-        let recording = self.recording;
-
-        // Pack each connection's pipeline to maximize throughput.
-        // Fill each session's pipeline completely before moving to the next.
-        for session in &mut self.sessions {
-            if !session.is_connected() {
-                continue;
-            }
-
-            // Fill this session's pipeline
-            while session.can_send() {
-                // Check rate limiter
                 if let Some(ref rl) = self.ratelimiter
                     && !rl.try_acquire()
                 {
-                    return Ok(());
+                    break;
                 }
 
-                // Generate and send request
                 let key_id = self.rng.random_range(0..key_count);
                 write_key(&mut self.key_buf, key_id);
 
-                // Command selection: GET if < get_ratio, DELETE if < get_ratio + delete_ratio, else SET
                 let roll = self.rng.random_range(0..100);
                 let sent = if roll < get_ratio {
                     session.get(&self.key_buf, now).is_some()
@@ -725,344 +393,206 @@ impl IoWorker {
                     break;
                 }
             }
-        }
 
-        Ok(())
+            self.results.clear();
+            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
+                tracing::debug!("Momento poll error: {}", e);
+            }
+
+            if recording {
+                for result in &self.results {
+                    record_metrics(result);
+                }
+            }
+        }
     }
 
-    #[inline]
-    fn flush_sends(&mut self) -> io::Result<()> {
-        // Collect indices of sessions that fail during send
-        let mut to_close = Vec::new();
+    /// Momento prefill.
+    fn poll_momento_prefill(&mut self, now: std::time::Instant) {
+        for session in &mut self.momento_sessions {
+            if !session.is_connected() {
+                match session.drive() {
+                    Ok(true) => {
+                        metrics::CONNECTIONS_ACTIVE.increment();
+                    }
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::debug!("Momento connection error: {}", e);
+                        continue;
+                    }
+                }
+            }
 
-        for (idx, session) in self.sessions.iter_mut().enumerate() {
+            while session.can_send() {
+                let key_id = match self.prefill_pending.pop_front() {
+                    Some(id) => id,
+                    None => break,
+                };
+
+                write_key(&mut self.key_buf, key_id);
+                self.rng.fill_bytes(&mut self.value_buf);
+
+                if session.set(&self.key_buf, &self.value_buf, now).is_none() {
+                    self.prefill_pending.push_front(key_id);
+                    break;
+                }
+            }
+
+            self.results.clear();
+            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
+                tracing::debug!("Momento poll error: {}", e);
+            }
+            for result in &self.results {
+                if result.request_type == RequestType::Set && result.success {
+                    self.prefill_confirmed += 1;
+                }
+            }
+        }
+
+        if self.prefill_confirmed >= self.prefill_total {
+            self.prefill_done = true;
+            tracing::debug!(
+                worker_id = self.id,
+                confirmed = self.prefill_confirmed,
+                total = self.prefill_total,
+                "prefill complete (momento)"
+            );
+            self.shared.mark_prefill_complete();
+        }
+    }
+
+    /// Drive normal workload requests.
+    fn drive_requests(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
+        let key_count = self.config.workload.keyspace.count;
+        let get_ratio = self.config.workload.commands.get;
+        let delete_ratio = self.config.workload.commands.delete;
+        let recording = self.recording;
+
+        for idx in 0..self.sessions.len() {
+            let session = &mut self.sessions[idx];
             if !session.is_connected() {
                 continue;
             }
 
-            let conn_id = match session.conn_id() {
-                Some(id) => id,
-                None => continue,
-            };
+            while session.can_send() {
+                if let Some(ref rl) = self.ratelimiter
+                    && !rl.try_acquire()
+                {
+                    return;
+                }
 
-            let send_buf = session.send_buffer();
-            if send_buf.is_empty() {
+                let key_id = self.rng.random_range(0..key_count);
+                write_key(&mut self.key_buf, key_id);
+
+                let roll = self.rng.random_range(0..100);
+                let sent = if roll < get_ratio {
+                    session.get(&self.key_buf, now).is_some()
+                } else if roll < get_ratio + delete_ratio {
+                    session.delete(&self.key_buf, now).is_some()
+                } else {
+                    self.rng.fill_bytes(&mut self.value_buf);
+                    session.set(&self.key_buf, &self.value_buf, now).is_some()
+                };
+
+                if sent && recording {
+                    metrics::REQUESTS_SENT.increment();
+                }
+
+                if !sent {
+                    break;
+                }
+            }
+
+            // Flush send buffer
+            self.flush_session(ctx, idx);
+        }
+    }
+
+    /// Drive prefill requests (sequential SET commands).
+    fn drive_prefill_requests(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
+        for idx in 0..self.sessions.len() {
+            let session = &mut self.sessions[idx];
+            if !session.is_connected() {
                 continue;
             }
 
-            match self.driver.send(conn_id, send_buf) {
-                Ok(n) => {
-                    tracing::trace!("worker {} sent {} bytes", self.id, n);
-                    session.bytes_sent(n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    tracing::trace!(
-                        "worker {} send would block ({} bytes pending)",
-                        self.id,
-                        send_buf.len()
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!("worker {} send error: {}", self.id, e);
-                    to_close.push(idx);
+            while session.can_send() {
+                let key_id = match self.prefill_pending.pop_front() {
+                    Some(id) => id,
+                    None => break,
+                };
+
+                write_key(&mut self.key_buf, key_id);
+                self.rng.fill_bytes(&mut self.value_buf);
+
+                if session.set(&self.key_buf, &self.value_buf, now).is_some() {
+                    self.prefill_in_flight[idx].push_back(key_id);
+                } else {
+                    self.prefill_pending.push_front(key_id);
+                    break;
                 }
             }
-        }
 
-        // Close failed sessions after iteration
-        for idx in to_close {
-            self.close_session(idx, DisconnectReason::SendError);
+            // Flush send buffer
+            self.flush_session(ctx, idx);
         }
-
-        Ok(())
     }
 
-    #[inline]
-    fn process_completions(&mut self, poll_time: std::time::Instant) -> io::Result<()> {
-        let completions = self.driver.drain_completions();
+    /// Flush a session's send buffer via kompio.
+    fn flush_session(&mut self, ctx: &mut DriverCtx, idx: usize) {
+        let conn_id = match self.sessions[idx].conn_id() {
+            Some(id) => id,
+            None => return,
+        };
 
-        // Collect indices and reasons for sessions to close (to avoid borrow conflicts)
-        let mut to_close: Vec<(usize, DisconnectReason)> = Vec::new();
-
-        for completion in completions {
-            match completion.kind {
-                CompletionKind::Recv { conn_id } => {
-                    // Data is available to read via with_recv_buf
-                    let id = conn_id.as_usize();
-                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        // Zero-copy path: parse responses directly from driver's buffer
-                        // This avoids copying data to an intermediate session buffer
-                        let now = poll_time;
-                        self.results.clear();
-                        let results = &mut self.results;
-                        let session = &mut self.sessions[idx];
-
-                        // Stamp TTFB on the first unstamped in-flight request
-                        // before reading data, using the poll return time.
-                        session.stamp_first_byte(now);
-
-                        let result =
-                            self.driver
-                                .with_recv_buf(conn_id, &mut |buf: &mut dyn RecvBuf| {
-                                    if let Err(e) = session.poll_responses_from(buf, results, now) {
-                                        tracing::debug!("protocol error: {}", e);
-                                    }
-                                    // Shrink buffer if it grew large from big responses
-                                    buf.shrink_if_oversized();
-                                });
-
-                        // Check for EOF or errors
-                        if let Err(e) = result {
-                            if e.kind() == io::ErrorKind::UnexpectedEof {
-                                to_close.push((idx, DisconnectReason::Eof));
-                            } else if e.kind() != io::ErrorKind::NotFound {
-                                to_close.push((idx, DisconnectReason::RecvError));
-                            }
-                        }
-
-                        // Handle prefill tracking: pop from in-flight and confirm
-                        if !self.prefill_done {
-                            for result in &self.results {
-                                if result.request_type == RequestType::Set {
-                                    // Pop the oldest in-flight key for this session
-                                    if let Some(_key_id) = self.prefill_in_flight[idx].pop_front() {
-                                        if result.success {
-                                            // Key confirmed successfully
-                                            self.prefill_confirmed += 1;
-                                        } else {
-                                            // SET failed - put key back in pending for retry
-                                            self.prefill_pending.push_back(_key_id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Record metrics from parsed responses (outside closure)
-                        if self.recording {
-                            for result in &self.results {
-                                metrics::RESPONSES_RECEIVED.increment();
-                                if result.is_error_response {
-                                    metrics::REQUEST_ERRORS.increment();
-                                }
-                                if let Some(hit) = result.hit {
-                                    if hit {
-                                        metrics::CACHE_HITS.increment();
-                                    } else {
-                                        metrics::CACHE_MISSES.increment();
-                                    }
-                                }
-                                let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
-                                match result.request_type {
-                                    RequestType::Get => {
-                                        metrics::GET_COUNT.increment();
-                                        let _ = metrics::GET_LATENCY.increment(result.latency_ns);
-                                        if let Some(ttfb) = result.ttfb_ns {
-                                            let _ = metrics::GET_TTFB.increment(ttfb);
-                                        }
-                                    }
-                                    RequestType::Set => {
-                                        metrics::SET_COUNT.increment();
-                                        let _ = metrics::SET_LATENCY.increment(result.latency_ns);
-                                    }
-                                    RequestType::Delete => {
-                                        metrics::DELETE_COUNT.increment();
-                                        let _ =
-                                            metrics::DELETE_LATENCY.increment(result.latency_ns);
-                                    }
-                                    RequestType::Ping | RequestType::Other => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                CompletionKind::SendReady { conn_id } => {
-                    // Socket is writable, try to flush
-                    let id = conn_id.as_usize();
-                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        let session = &mut self.sessions[idx];
-                        let send_buf = session.send_buffer();
-                        if !send_buf.is_empty() {
-                            match self.driver.send(conn_id, send_buf) {
-                                Ok(n) => {
-                                    session.bytes_sent(n);
-                                }
-                                Err(_) => {
-                                    // WouldBlock is expected, other errors handled elsewhere
-                                }
-                            }
-                        }
-                    }
-                }
-                CompletionKind::Closed { conn_id } => {
-                    let id = conn_id.as_usize();
-                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        to_close.push((idx, DisconnectReason::ClosedEvent));
-                    }
-                }
-                CompletionKind::Error { conn_id, error } => {
-                    let id = conn_id.as_usize();
-                    tracing::trace!("connection {} error: {}", id, error);
-                    if let Some(&idx) = self.conn_id_to_idx.get(&id) {
-                        to_close.push((idx, DisconnectReason::ErrorEvent));
-                    }
-                }
-                // Accept, AcceptRaw, and ListenerError are for server-side, not used here
-                CompletionKind::Accept { .. }
-                | CompletionKind::AcceptRaw { .. }
-                | CompletionKind::ListenerError { .. } => {}
-
-                // RecvComplete is for io_uring single-shot recv - not used anymore
-                CompletionKind::RecvComplete { .. } => {}
-
-                // UDP events not used in TCP client
-                CompletionKind::UdpReadable { .. }
-                | CompletionKind::RecvMsgComplete { .. }
-                | CompletionKind::UdpWritable { .. }
-                | CompletionKind::SendMsgComplete { .. }
-                | CompletionKind::UdpError { .. } => {}
-            }
-        }
-
-        // Close failed sessions after processing all completions
-        for (idx, reason) in to_close {
-            self.close_session(idx, reason);
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    fn poll_responses(&mut self, now: std::time::Instant) {
-        if !self.recording {
-            // Still need to parse responses but don't record metrics
-            for idx in 0..self.sessions.len() {
-                self.results.clear();
-                let _ = self.sessions[idx].poll_responses(&mut self.results, now);
-                // Handle prefill tracking: pop from in-flight and confirm
-                if !self.prefill_done {
-                    for result in &self.results {
-                        if result.request_type == RequestType::Set
-                            && let Some(_key_id) = self.prefill_in_flight[idx].pop_front()
-                        {
-                            if result.success {
-                                self.prefill_confirmed += 1;
-                            } else {
-                                self.prefill_pending.push_back(_key_id);
-                            }
-                        }
-                    }
-                }
-            }
+        let send_buf = self.sessions[idx].send_buffer();
+        if send_buf.is_empty() {
             return;
         }
 
-        for idx in 0..self.sessions.len() {
-            self.results.clear();
-            if let Err(e) = self.sessions[idx].poll_responses(&mut self.results, now) {
-                tracing::debug!("protocol error: {}", e);
+        let token = match self.get_token(conn_id) {
+            Some(t) => t,
+            None => return,
+        };
+        let n = send_buf.len();
+
+        match ctx.send(token, send_buf) {
+            Ok(()) => {
+                self.sessions[idx].bytes_sent(n);
             }
-
-            for result in &self.results {
-                metrics::RESPONSES_RECEIVED.increment();
-                if result.is_error_response {
-                    metrics::REQUEST_ERRORS.increment();
+            Err(e) => {
+                if e.kind() != io::ErrorKind::Other {
+                    // Real error - close session
+                    self.close_session(ctx, idx, DisconnectReason::SendError);
                 }
-
-                if let Some(hit) = result.hit {
-                    if hit {
-                        metrics::CACHE_HITS.increment();
-                    } else {
-                        metrics::CACHE_MISSES.increment();
-                    }
-                }
-
-                let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
-
-                match result.request_type {
-                    RequestType::Get => {
-                        metrics::GET_COUNT.increment();
-                        let _ = metrics::GET_LATENCY.increment(result.latency_ns);
-                        if let Some(ttfb) = result.ttfb_ns {
-                            let _ = metrics::GET_TTFB.increment(ttfb);
-                        }
-                    }
-                    RequestType::Set => {
-                        metrics::SET_COUNT.increment();
-                        let _ = metrics::SET_LATENCY.increment(result.latency_ns);
-                    }
-                    RequestType::Delete => {
-                        metrics::DELETE_COUNT.increment();
-                        let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);
-                    }
-                    RequestType::Ping | RequestType::Other => {}
-                }
+                // Pool exhausted - wait for on_send_complete
             }
         }
     }
 
-    /// Get the number of active connections.
-    pub fn active_connections(&self) -> usize {
-        let tcp_sessions = self.sessions.iter().filter(|s| s.is_connected()).count();
-        let momento_sessions = self
-            .momento_sessions
-            .iter()
-            .filter(|s| s.is_connected())
-            .count();
-        tcp_sessions + momento_sessions
-    }
-
-    /// Get the total in-flight count.
-    #[allow(dead_code)]
-    pub fn in_flight_count(&self) -> usize {
-        let tcp: usize = self.sessions.iter().map(|s| s.in_flight_count()).sum();
-        let momento: usize = self
-            .momento_sessions
-            .iter()
-            .map(|s| s.in_flight_count())
-            .sum();
-        tcp + momento
-    }
-
     /// Try to reconnect disconnected sessions.
-    fn try_reconnect(&mut self) {
-        // Collect indices of sessions that need reconnection
-        let to_reconnect: Vec<_> = self
+    fn try_reconnect(&mut self, ctx: &mut DriverCtx) {
+        let to_reconnect: Vec<(usize, SocketAddr, Option<usize>)> = self
             .sessions
             .iter()
             .enumerate()
             .filter(|(_, s)| s.should_reconnect())
-            .map(|(idx, s)| (idx, s.addr(), s.conn_id().map(|c| c.as_usize())))
+            .map(|(idx, s)| (idx, s.addr(), s.conn_id()))
             .collect();
 
         for (idx, addr, old_conn_id) in to_reconnect {
-            // Close the old connection if it exists (it may have been marked
-            // disconnected but the socket never closed)
+            // Remove old mapping
             if let Some(old_id) = old_conn_id {
-                let _ = self.driver.close(ConnId::new(old_id));
-                self.conn_id_to_idx.remove(&old_id);
+                self.conn_to_session.remove(&old_id);
+                self.conn_tokens.remove(&old_id);
             }
 
-            // Try to connect
-            match Self::create_connection(addr, self.config.connection.connect_timeout) {
-                Ok(stream) => {
-                    match self.driver.register(stream) {
-                        Ok(conn_id) => {
-                            let session = &mut self.sessions[idx];
-                            // Reset state BEFORE setting new conn_id to ensure
-                            // there's no window where new conn_id has old state
-                            session.reset();
-                            session.set_conn_id(conn_id);
-                            session.reconnect_attempted(true);
-
-                            self.conn_id_to_idx.insert(conn_id.as_usize(), idx);
-
-                            metrics::CONNECTIONS_ACTIVE.increment();
-                        }
-                        Err(_) => {
-                            self.sessions[idx].reconnect_attempted(false);
-                        }
-                    }
+            match ctx.connect(addr) {
+                Ok(token) => {
+                    let session = &mut self.sessions[idx];
+                    session.reset();
+                    self.conn_tokens.insert(token.index(), token);
+                    self.pending_connects.insert(token.index(), idx);
                 }
                 Err(_) => {
                     self.sessions[idx].reconnect_attempted(false);
@@ -1071,47 +601,384 @@ impl IoWorker {
         }
     }
 
-    /// Close a session's connection in the driver and mark it as disconnected.
-    /// This ensures the socket is properly closed so the server receives FIN/RST.
-    fn close_session(&mut self, idx: usize, reason: DisconnectReason) {
-        let session = &mut self.sessions[idx];
-        if let Some(conn_id) = session.conn_id() {
-            let _ = self.driver.close(conn_id);
-            self.conn_id_to_idx.remove(&conn_id.as_usize());
+    /// Close a session and mark it disconnected.
+    fn close_session(&mut self, ctx: &mut DriverCtx, idx: usize, reason: DisconnectReason) {
+        let conn_id = self.sessions[idx].conn_id();
+        if let Some(conn_id) = conn_id {
+            if let Some(token) = self.conn_tokens.remove(&conn_id) {
+                ctx.close(token);
+            }
+            self.conn_to_session.remove(&conn_id);
         }
-        session.disconnect();
+        self.sessions[idx].disconnect();
 
-        // Move any in-flight prefill keys back to pending queue for retry
+        // Move in-flight prefill keys back to pending
         if !self.prefill_done && idx < self.prefill_in_flight.len() {
             while let Some(key_id) = self.prefill_in_flight[idx].pop_front() {
                 self.prefill_pending.push_back(key_id);
             }
         }
 
-        // Track connection state
         metrics::CONNECTIONS_FAILED.increment();
 
-        // Track disconnect reason
         match reason {
-            DisconnectReason::Eof => {
-                metrics::DISCONNECTS_EOF.increment();
-            }
-            DisconnectReason::RecvError => {
-                metrics::DISCONNECTS_RECV_ERROR.increment();
-            }
-            DisconnectReason::SendError => {
-                metrics::DISCONNECTS_SEND_ERROR.increment();
-            }
-            DisconnectReason::ClosedEvent => {
-                metrics::DISCONNECTS_CLOSED_EVENT.increment();
-            }
-            DisconnectReason::ErrorEvent => {
-                metrics::DISCONNECTS_ERROR_EVENT.increment();
-            }
-            DisconnectReason::ConnectFailed => {
-                metrics::DISCONNECTS_CONNECT_FAILED.increment();
+            DisconnectReason::Eof => metrics::DISCONNECTS_EOF.increment(),
+            DisconnectReason::RecvError => metrics::DISCONNECTS_RECV_ERROR.increment(),
+            DisconnectReason::SendError => metrics::DISCONNECTS_SEND_ERROR.increment(),
+            DisconnectReason::ClosedEvent => metrics::DISCONNECTS_CLOSED_EVENT.increment(),
+            DisconnectReason::ErrorEvent => metrics::DISCONNECTS_ERROR_EVENT.increment(),
+            DisconnectReason::ConnectFailed => metrics::DISCONNECTS_CONNECT_FAILED.increment(),
+        }
+    }
+
+    /// Look up the stored ConnToken for a connection index.
+    fn get_token(&self, conn_index: usize) -> Option<ConnToken> {
+        self.conn_tokens.get(&conn_index).copied()
+    }
+
+    /// Handle prefill response tracking.
+    fn handle_prefill_results(&mut self, idx: usize) {
+        if self.prefill_done {
+            return;
+        }
+
+        for result in &self.results {
+            if result.request_type == RequestType::Set
+                && let Some(key_id) = self.prefill_in_flight[idx].pop_front()
+            {
+                if result.success {
+                    self.prefill_confirmed += 1;
+                } else {
+                    self.prefill_pending.push_back(key_id);
+                }
             }
         }
+
+        if self.prefill_confirmed >= self.prefill_total {
+            self.prefill_done = true;
+            tracing::debug!(
+                worker_id = self.id,
+                confirmed = self.prefill_confirmed,
+                total = self.prefill_total,
+                "prefill complete"
+            );
+            self.shared.mark_prefill_complete();
+        }
+    }
+
+    /// Process responses from session internal buffers (for data not parsed in on_data).
+    fn poll_session_responses(&mut self, now: std::time::Instant) {
+        for idx in 0..self.sessions.len() {
+            self.results.clear();
+            let _ = self.sessions[idx].poll_responses(&mut self.results, now);
+
+            self.handle_prefill_results(idx);
+
+            if self.recording {
+                for result in &self.results {
+                    record_metrics(result);
+                }
+            }
+        }
+    }
+}
+
+impl EventHandler for BenchHandler {
+    fn create_for_worker(worker_id: usize) -> Self {
+        let cfg = recv_config();
+
+        // Pin to CPU if configured
+        if let Some(ref ids) = cfg.cpu_ids
+            && !ids.is_empty()
+        {
+            let cpu_id = ids[cfg.id % ids.len()];
+            #[cfg(target_os = "linux")]
+            {
+                if let Err(e) = pin_to_cpu(cpu_id) {
+                    tracing::warn!(
+                        "failed to pin worker {} to CPU {}: {}",
+                        cfg.id,
+                        cpu_id,
+                        e
+                    );
+                } else {
+                    tracing::debug!("pinned worker {} to CPU {}", cfg.id, cpu_id);
+                }
+            }
+            let _ = cpu_id;
+        }
+
+        // Set metrics thread shard
+        metrics::set_thread_shard(worker_id);
+
+        let rng = Xoshiro256PlusPlus::seed_from_u64(42 + cfg.id as u64);
+        let key_buf = vec![0u8; cfg.config.workload.keyspace.length];
+        let mut value_buf = vec![0u8; cfg.config.workload.values.length];
+        let pipeline_depth = cfg.config.connection.pipeline_depth;
+
+        // Fill value buffer with random data
+        let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);
+        init_rng.fill_bytes(&mut value_buf);
+
+        // Initialize prefill state
+        let (prefill_pending, prefill_total, prefill_done) = match cfg.prefill_range {
+            Some(range) => {
+                let pending: std::collections::VecDeque<usize> =
+                    (range.start..range.end).collect();
+                let total = range.end - range.start;
+                tracing::debug!(
+                    worker_id = cfg.id,
+                    total,
+                    start = range.start,
+                    end = range.end,
+                    "prefill initialized"
+                );
+                (pending, total, total == 0)
+            }
+            None => (std::collections::VecDeque::new(), 0, true),
+        };
+
+        // Compute connection distribution
+        let endpoints = cfg.config.target.endpoints.clone();
+        let total_connections = cfg.config.connection.total_connections();
+        let num_threads = cfg.config.general.threads;
+
+        let base_per_thread = total_connections / num_threads;
+        let remainder = total_connections % num_threads;
+        let my_connections = if cfg.id < remainder {
+            base_per_thread + 1
+        } else {
+            base_per_thread
+        };
+        let my_start = if cfg.id < remainder {
+            cfg.id * (base_per_thread + 1)
+        } else {
+            remainder * (base_per_thread + 1) + (cfg.id - remainder) * base_per_thread
+        };
+
+        BenchHandler {
+            id: cfg.id,
+            config: cfg.config,
+            shared: cfg.shared,
+            sessions: Vec::new(),
+            conn_to_session: HashMap::new(),
+            conn_tokens: HashMap::new(),
+            pending_connects: HashMap::new(),
+            momento_sessions: Vec::new(),
+            rng,
+            key_buf,
+            value_buf,
+            results: Vec::with_capacity(pipeline_depth),
+            ratelimiter: cfg.ratelimiter,
+            recording: cfg.recording,
+            last_phase: Phase::Connect,
+            connections_initiated: false,
+            prefill_pending,
+            prefill_in_flight: Vec::new(),
+            prefill_confirmed: 0,
+            prefill_total,
+            prefill_done,
+            endpoints,
+            my_connections,
+            my_start,
+        }
+    }
+
+    fn on_accept(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {
+        // Benchmark is client-only, no accepts expected
+    }
+
+    fn on_connect(&mut self, _ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<()>) {
+        let idx = match self.pending_connects.remove(&conn.index()) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        match result {
+            Ok(()) => {
+                let session = &mut self.sessions[idx];
+                session.set_conn_id(conn.index());
+                session.reconnect_attempted(true);
+                self.conn_to_session.insert(conn.index(), idx);
+                self.conn_tokens.insert(conn.index(), conn);
+                metrics::CONNECTIONS_ACTIVE.increment();
+
+                tracing::debug!(
+                    "worker {} connected session {} (conn_index={})",
+                    self.id,
+                    idx,
+                    conn.index()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "worker {} connection failed for session {}: {}",
+                    self.id,
+                    idx,
+                    e
+                );
+                self.sessions[idx].reconnect_attempted(false);
+                metrics::CONNECTIONS_FAILED.increment();
+            }
+        }
+    }
+
+    fn on_data(&mut self, _ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize {
+        let idx = match self.conn_to_session.get(&conn.index()) {
+            Some(&idx) => idx,
+            None => return data.len(),
+        };
+
+        let now = std::time::Instant::now();
+        let session = &mut self.sessions[idx];
+
+        // Stamp TTFB on the first unstamped in-flight request
+        session.stamp_first_byte(now);
+
+        // Zero-copy path: parse responses directly from kompio's buffer
+        self.results.clear();
+        let mut buf = DataSlice::new(data);
+        if let Err(e) = session.poll_responses_from(&mut buf, &mut self.results, now) {
+            tracing::debug!("protocol error: {}", e);
+        }
+
+        // Handle prefill tracking
+        self.handle_prefill_results(idx);
+
+        // Record metrics
+        if self.recording {
+            for result in &self.results {
+                record_metrics(result);
+            }
+        }
+
+        // Track bytes received
+        if buf.consumed > 0 {
+            metrics::BYTES_RX.add(buf.consumed as u64);
+        }
+
+        buf.consumed
+    }
+
+    fn on_send_complete(
+        &mut self,
+        ctx: &mut DriverCtx,
+        conn: ConnToken,
+        result: io::Result<u32>,
+    ) {
+        if result.is_err() {
+            if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
+                self.close_session(ctx, idx, DisconnectReason::SendError);
+            }
+            return;
+        }
+
+        // Try to flush more pending data for this session
+        if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
+            self.flush_session(ctx, idx);
+        }
+    }
+
+    fn on_close(&mut self, _ctx: &mut DriverCtx, conn: ConnToken) {
+        // Check pending connects first
+        if let Some(idx) = self.pending_connects.remove(&conn.index()) {
+            self.conn_tokens.remove(&conn.index());
+            self.sessions[idx].reconnect_attempted(false);
+            metrics::CONNECTIONS_FAILED.increment();
+            return;
+        }
+
+        if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
+            self.sessions[idx].disconnect();
+            self.conn_to_session.remove(&conn.index());
+            self.conn_tokens.remove(&conn.index());
+
+            // Move in-flight prefill keys back to pending
+            if !self.prefill_done && idx < self.prefill_in_flight.len() {
+                while let Some(key_id) = self.prefill_in_flight[idx].pop_front() {
+                    self.prefill_pending.push_back(key_id);
+                }
+            }
+
+            metrics::CONNECTIONS_FAILED.increment();
+            metrics::DISCONNECTS_CLOSED_EVENT.increment();
+        }
+    }
+
+    fn on_tick(&mut self, ctx: &mut DriverCtx) {
+        let phase = self.shared.phase();
+
+        // Initiate connections on first tick
+        if !self.connections_initiated {
+            self.initiate_connections(ctx);
+        }
+
+        // Update recording state on phase transition
+        if phase != self.last_phase {
+            self.recording = phase.is_recording();
+            self.last_phase = phase;
+        }
+
+        // Check for shutdown
+        if phase.should_stop() {
+            ctx.request_shutdown();
+            return;
+        }
+
+        let now = std::time::Instant::now();
+
+        // Momento sessions: drive entirely from on_tick
+        if self.config.target.protocol == CacheProtocol::Momento {
+            self.poll_momento(now);
+            return;
+        }
+
+        // Try to reconnect disconnected sessions
+        self.try_reconnect(ctx);
+
+        // Phase-specific work
+        if phase == Phase::Prefill && !self.prefill_done {
+            self.drive_prefill_requests(ctx, now);
+        } else if phase == Phase::Warmup || phase == Phase::Running {
+            self.drive_requests(ctx, now);
+        }
+
+        // Process any responses from session internal buffers
+        self.poll_session_responses(std::time::Instant::now());
+    }
+}
+
+/// Record metrics for a completed request result.
+fn record_metrics(result: &RequestResult) {
+    metrics::RESPONSES_RECEIVED.increment();
+    if result.is_error_response {
+        metrics::REQUEST_ERRORS.increment();
+    }
+    if let Some(hit) = result.hit {
+        if hit {
+            metrics::CACHE_HITS.increment();
+        } else {
+            metrics::CACHE_MISSES.increment();
+        }
+    }
+    let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
+    match result.request_type {
+        RequestType::Get => {
+            metrics::GET_COUNT.increment();
+            let _ = metrics::GET_LATENCY.increment(result.latency_ns);
+            if let Some(ttfb) = result.ttfb_ns {
+                let _ = metrics::GET_TTFB.increment(ttfb);
+            }
+        }
+        RequestType::Set => {
+            metrics::SET_COUNT.increment();
+            let _ = metrics::SET_LATENCY.increment(result.latency_ns);
+        }
+        RequestType::Delete => {
+            metrics::DELETE_COUNT.increment();
+            let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);
+        }
+        RequestType::Ping | RequestType::Other => {}
     }
 }
 
@@ -1122,5 +989,25 @@ fn write_key(buf: &mut [u8], id: usize) {
     for byte in buf.iter_mut().rev() {
         *byte = HEX[n & 0xf];
         n >>= 4;
+    }
+}
+
+/// Pin the current thread to a specific CPU core.
+#[cfg(target_os = "linux")]
+fn pin_to_cpu(cpu_id: usize) -> std::io::Result<()> {
+    use std::mem;
+
+    unsafe {
+        let mut cpuset: libc::cpu_set_t = mem::zeroed();
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(cpu_id, &mut cpuset);
+
+        let result = libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &cpuset);
+
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }

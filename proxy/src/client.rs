@@ -1,7 +1,7 @@
 //! Client connection handling.
 
 use bytes::BytesMut;
-use io_driver::ConnId;
+use kompio::ConnToken;
 use std::net::SocketAddr;
 
 /// State of a client connection.
@@ -28,8 +28,8 @@ pub enum ClientState {
 
 /// A client connection.
 pub struct ClientConnection {
-    /// Connection ID from the I/O driver.
-    pub conn_id: ConnId,
+    /// Connection token from kompio.
+    pub conn: ConnToken,
 
     /// Remote address.
     pub addr: SocketAddr,
@@ -49,9 +49,9 @@ pub struct ClientConnection {
 
 impl ClientConnection {
     /// Create a new client connection.
-    pub fn new(conn_id: ConnId, addr: SocketAddr) -> Self {
+    pub fn new(conn: ConnToken, addr: SocketAddr) -> Self {
         Self {
-            conn_id,
+            conn,
             addr,
             state: ClientState::Reading,
             recv_buf: BytesMut::with_capacity(4096),

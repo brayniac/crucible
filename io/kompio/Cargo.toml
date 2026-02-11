@@ -1,0 +1,17 @@
+[package]
+name = "kompio"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tls = ["rustls"]
+
+[dependencies]
+crossbeam-channel = "0.5"
+io-uring = "0.7"
+libc = "0.2"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring"] }
+
+[[example]]
+name = "echo_tls_server"
+required-features = ["tls"]

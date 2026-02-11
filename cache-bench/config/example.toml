@@ -1,0 +1,35 @@
+[general]
+duration = "60s"
+warmup = "10s"
+threads = 4
+
+[cache]
+backend = "segment"
+policy = "s3fifo"
+heap_size = "1GB"
+segment_size = "1MB"
+hashtable_power = 20
+
+[cache.disk]
+enabled = true
+path = "disk.dat"
+size = "10GB"
+promotion_threshold = 2
+sync_mode = "async"
+recover_on_startup = false
+
+[workload]
+rate_limit = 0
+prefill = true
+
+[workload.keyspace]
+length = 16
+count = 1000000
+
+[workload.commands]
+get = 80
+set = 20
+delete = 0
+
+[workload.values]
+length = 64

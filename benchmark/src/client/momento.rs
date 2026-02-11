@@ -6,7 +6,7 @@
 use super::{ConnectionState, RequestResult, RequestType};
 use crate::config::{Config, MomentoWireFormat};
 
-use io_driver::{TlsConfig, TlsTransport, Transport, TransportState};
+use http2::{TlsConfig, TlsTransport, Transport, TransportState};
 use protocol_momento::{
     CacheClient, CacheValue, CompletedOp, Credential, EndpointsFetcher, WireFormat,
 };

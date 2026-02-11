@@ -3,21 +3,19 @@ use benchmark::metrics;
 use benchmark::ratelimit::DynamicRateLimiter;
 use benchmark::saturation::SaturationSearchState;
 use benchmark::viewer;
-use benchmark::worker::Phase;
+use benchmark::worker::{BenchWorkerConfig, Phase, init_config_channel};
 use benchmark::{
-    AdminServer, IoWorker, IoWorkerConfig, LatencyStats, OutputFormatter, Results, Sample,
+    AdminServer, LatencyStats, OutputFormatter, Results, Sample,
     SharedState, create_formatter, parse_cpu_list,
 };
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use io_driver::IoEngine;
+use kompio::KompioBuilder;
 use metriken::{AtomicHistogram, histogram::Histogram};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 /// Timeout for waiting on worker threads to finish during shutdown.
@@ -101,9 +99,6 @@ fn run_benchmark_cli(config_path: &PathBuf, cli: &Cli) -> Result<(), Box<dyn std
         None
     };
 
-    // Validate io_engine selection (still need this for internal logic)
-    let _effective_engine = validate_io_engine(config.general.io_engine);
-
     // Create the output formatter
     let formatter = create_formatter(config.admin.format, config.admin.color);
 
@@ -138,7 +133,6 @@ fn run_benchmark(
     let shared = Arc::new(SharedState::new());
 
     // Create shared rate limiter
-    // Priority: saturation_search.start_rate > rate_limit > unlimited (0)
     let initial_rate = if let Some(ref sat) = config.workload.saturation_search {
         sat.start_rate
     } else {
@@ -193,48 +187,46 @@ fn run_benchmark(
     if prefill_enabled {
         formatter.print_prefill(key_count);
     } else {
-        // Print warmup phase indicator
         formatter.print_warmup(warmup);
     }
 
-    // Channel for worker completion notifications
-    let (completion_tx, completion_rx) = mpsc::channel::<usize>();
-
-    // Spawn worker threads
-    let mut handles = Vec::with_capacity(num_threads);
-
+    // Set up config channel for kompio workers
+    let (config_tx, config_rx) = crossbeam_channel::bounded::<BenchWorkerConfig>(num_threads);
     for id in 0..num_threads {
-        let config = config.clone();
-        let shared = Arc::clone(&shared);
-        let ratelimiter = ratelimiter.clone();
-        let cpu_ids = cpu_ids.clone();
-        let completion_tx = completion_tx.clone();
-        let prefill_range = prefill_ranges[id].clone();
-
-        let handle = thread::Builder::new()
-            .name(format!("worker-{}", id))
-            .spawn(move || {
-                // Pin to CPU if configured
-                if let Some(ref ids) = cpu_ids
-                    && !ids.is_empty()
-                {
-                    let cpu_id = ids[id % ids.len()];
-                    if let Err(e) = pin_to_cpu(cpu_id) {
-                        tracing::warn!("failed to pin worker {} to CPU {}: {}", id, cpu_id, e);
-                    } else {
-                        tracing::debug!("pinned worker {} to CPU {}", id, cpu_id);
-                    }
-                }
-                run_worker(id, config, shared, ratelimiter, prefill_range);
-                // Signal completion (ignore send errors - receiver may be gone)
-                let _ = completion_tx.send(id);
-            })?;
-
-        handles.push(handle);
+        config_tx
+            .send(BenchWorkerConfig {
+                id,
+                config: config.clone(),
+                shared: Arc::clone(&shared),
+                ratelimiter: ratelimiter.clone(),
+                recording: false,
+                prefill_range: prefill_ranges[id].clone(),
+                cpu_ids: cpu_ids.clone(),
+            })
+            .expect("failed to queue worker config");
     }
+    init_config_channel(config_rx);
 
-    // Drop our copy of the sender so the channel closes when all workers finish
-    drop(completion_tx);
+    // Build kompio config (client-only, no bind)
+    let kompio_config = kompio::Config {
+        recv_buffer: kompio::RecvBufferConfig {
+            // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
+            ring_size: 1024u16.next_power_of_two(),
+            buffer_size: 256 * 1024,
+            ..Default::default()
+        },
+        worker: kompio::WorkerConfig {
+            threads: num_threads,
+            pin_to_core: false, // We pin in create_for_worker instead
+            core_offset: 0,
+        },
+        tcp_nodelay: true,
+        ..Default::default()
+    };
+
+    // Launch kompio workers (client-only, no bind)
+    let (shutdown_handle, handles) =
+        KompioBuilder::new(kompio_config).launch::<benchmark::worker::BenchHandler>()?;
 
     // Start in prefill or warmup phase
     if prefill_enabled {
@@ -270,12 +262,11 @@ fn run_benchmark(
     let mut warmup_start: Option<Instant> = if prefill_enabled { None } else { Some(start) };
 
     loop {
-        thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
 
         // Check for signal
         if !running.load(Ordering::SeqCst) {
             shared.set_phase(Phase::Stop);
-            // Calculate actual running duration (exclude warmup and prefill)
             if let Some(ws) = warmup_start {
                 let warmup_elapsed = ws.elapsed();
                 if warmup_elapsed > warmup {
@@ -318,7 +309,6 @@ fn run_benchmark(
             formatter.print_running(duration);
             formatter.print_header();
             last_report = Instant::now();
-            // Initialize baseline for delta calculations
             last_responses = metrics::RESPONSES_RECEIVED.value();
             last_errors = metrics::REQUEST_ERRORS.value();
             last_conn_failures = metrics::CONNECTIONS_FAILED.value();
@@ -328,7 +318,6 @@ fn run_benchmark(
             baseline_bytes_tx = metrics::BYTES_TX.value();
             baseline_bytes_rx = metrics::BYTES_RX.value();
 
-            // Initialize saturation search if configured
             if let Some(ref sat_config) = config.workload.saturation_search
                 && let Some(ref rl) = ratelimiter
             {
@@ -354,19 +343,16 @@ fn run_benchmark(
 
             let elapsed_secs = last_report.elapsed().as_secs_f64();
 
-            // Calculate rates
             let delta_responses = responses - last_responses;
             let rate = delta_responses as f64 / elapsed_secs;
             last_responses = responses;
 
-            // Calculate error rate (request errors + connection failures)
             let delta_errors = errors - last_errors;
             let delta_conn_failures = conn_failures - last_conn_failures;
             let err_rate = (delta_errors + delta_conn_failures) as f64 / elapsed_secs;
             last_errors = errors;
             last_conn_failures = conn_failures;
 
-            // Calculate hit rate for this interval
             let delta_hits = hits - last_hits;
             let delta_misses = misses - last_misses;
             let delta_gets = delta_hits + delta_misses;
@@ -378,7 +364,6 @@ fn run_benchmark(
             last_hits = hits;
             last_misses = misses;
 
-            // Get percentiles from delta histogram (this interval only)
             let current_histogram = metrics::RESPONSE_LATENCY.load();
             let (p50, p90, p99, p999, p9999, max) = match (&current_histogram, &last_histogram) {
                 (Some(current), Some(previous)) => {
@@ -422,7 +407,6 @@ fn run_benchmark(
 
             formatter.print_sample(&sample);
 
-            // Check saturation search progress
             if let Some(ref mut state) = saturation_state {
                 state.check_and_advance(&*formatter);
             }
@@ -431,49 +415,22 @@ fn run_benchmark(
         }
     }
 
+    // Shutdown kompio workers
+    shutdown_handle.shutdown();
+
     // Wait for workers to finish with timeout
     let shutdown_start = Instant::now();
-    let mut completed = 0;
-
-    while completed < num_threads {
+    for handle in handles {
         let remaining = WORKER_SHUTDOWN_TIMEOUT.saturating_sub(shutdown_start.elapsed());
         if remaining.is_zero() {
-            tracing::warn!(
-                "shutdown timeout: {} of {} workers did not finish within {:?}",
-                num_threads - completed,
-                num_threads,
-                WORKER_SHUTDOWN_TIMEOUT
-            );
+            tracing::warn!("shutdown timeout: some workers did not finish");
             break;
         }
-
-        match completion_rx.recv_timeout(remaining) {
-            Ok(id) => {
-                tracing::debug!("worker {} finished", id);
-                completed += 1;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                tracing::warn!(
-                    "shutdown timeout: {} of {} workers did not finish within {:?}",
-                    num_threads - completed,
-                    num_threads,
-                    WORKER_SHUTDOWN_TIMEOUT
-                );
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // All senders dropped, all workers finished
-                break;
-            }
-        }
-    }
-
-    // Join the handles (should be immediate for completed workers)
-    for handle in handles {
+        // JoinHandle doesn't have timeout, just join
         let _ = handle.join();
     }
 
-    // Final report - collect all metrics
+    // Final report
     let requests = metrics::REQUESTS_SENT.value();
     let responses = metrics::RESPONSES_RECEIVED.value();
     let errors = metrics::REQUEST_ERRORS.value();
@@ -487,7 +444,6 @@ fn run_benchmark(
     let failed = metrics::CONNECTIONS_FAILED.value();
     let elapsed_secs = actual_duration.as_secs_f64();
 
-    // Get latencies for GET operations
     let get_latencies = LatencyStats {
         p50_us: percentile(&metrics::GET_LATENCY, 50.0) / 1000.0,
         p90_us: percentile(&metrics::GET_LATENCY, 90.0) / 1000.0,
@@ -497,7 +453,6 @@ fn run_benchmark(
         max_us: max_percentile(&metrics::GET_LATENCY) / 1000.0,
     };
 
-    // GET time-to-first-byte
     let get_ttfb = LatencyStats {
         p50_us: percentile(&metrics::GET_TTFB, 50.0) / 1000.0,
         p90_us: percentile(&metrics::GET_TTFB, 90.0) / 1000.0,
@@ -507,7 +462,6 @@ fn run_benchmark(
         max_us: max_percentile(&metrics::GET_TTFB) / 1000.0,
     };
 
-    // Get latencies for SET operations
     let set_latencies = LatencyStats {
         p50_us: percentile(&metrics::SET_LATENCY, 50.0) / 1000.0,
         p90_us: percentile(&metrics::SET_LATENCY, 90.0) / 1000.0,
@@ -538,7 +492,6 @@ fn run_benchmark(
 
     formatter.print_results(&results);
 
-    // Print saturation search results if configured
     if let Some(state) = saturation_state {
         formatter.print_saturation_results(&state.results());
     }
@@ -546,75 +499,6 @@ fn run_benchmark(
     drop(_admin_handle);
 
     Ok(())
-}
-
-fn run_worker(
-    id: usize,
-    config: Config,
-    shared: Arc<SharedState>,
-    ratelimiter: Option<Arc<DynamicRateLimiter>>,
-    prefill_range: Option<std::ops::Range<usize>>,
-) {
-    // Set this thread's shard ID for metrics to avoid false sharing
-    metrics::set_thread_shard(id);
-
-    let worker_config = IoWorkerConfig {
-        id,
-        config,
-        shared: Arc::clone(&shared),
-        ratelimiter,
-        recording: false,
-        prefill_range,
-    };
-
-    let mut worker = match IoWorker::new(worker_config) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::error!("worker {} failed to initialize: {}", id, e);
-            return;
-        }
-    };
-
-    if let Err(e) = worker.connect() {
-        tracing::error!("worker {} failed to connect: {}", id, e);
-        return;
-    }
-
-    tracing::debug!(
-        "worker {} started with {} connections",
-        id,
-        worker.active_connections()
-    );
-
-    let mut last_phase = Phase::Connect;
-
-    loop {
-        let phase = shared.phase();
-
-        if phase.should_stop() {
-            break;
-        }
-
-        // Update recording state on phase transition
-        if phase != last_phase {
-            worker.set_recording(phase.is_recording());
-            last_phase = phase;
-        }
-
-        // Handle prefill phase
-        if phase == Phase::Prefill {
-            if let Err(e) = worker.poll_once_prefill() {
-                tracing::debug!("worker {} prefill error: {}", id, e);
-            }
-            continue;
-        }
-
-        if let Err(e) = worker.poll_once() {
-            tracing::debug!("worker {} poll error: {}", id, e);
-        }
-    }
-
-    tracing::debug!("worker {} exiting", id);
 }
 
 /// Get a percentile from the atomic histogram (cumulative).
@@ -647,67 +531,10 @@ fn max_percentile(hist: &AtomicHistogram) -> f64 {
 
 /// Get the max value from a histogram snapshot.
 fn max_from_histogram(hist: &Histogram) -> f64 {
-    // Use 100th percentile as max
     if let Ok(Some(results)) = hist.percentiles(&[100.0])
         && let Some((_pct, bucket)) = results.first()
     {
         return bucket.end() as f64;
     }
     0.0
-}
-
-/// Pin the current thread to a specific CPU core.
-#[cfg(target_os = "linux")]
-fn pin_to_cpu(cpu_id: usize) -> std::io::Result<()> {
-    use std::io;
-    use std::mem;
-
-    unsafe {
-        let mut cpuset: libc::cpu_set_t = mem::zeroed();
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(cpu_id, &mut cpuset);
-
-        let result = libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &cpuset);
-
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}
-
-/// Pin the current thread to a specific CPU core (no-op on non-Linux).
-#[cfg(not(target_os = "linux"))]
-fn pin_to_cpu(_cpu_id: usize) -> std::io::Result<()> {
-    // CPU pinning is only supported on Linux
-    Ok(())
-}
-
-/// Validate and resolve the effective I/O engine.
-/// Returns the engine that will actually be used at runtime.
-fn validate_io_engine(engine: IoEngine) -> IoEngine {
-    match engine {
-        IoEngine::Auto => {
-            if io_driver::uring_available() {
-                IoEngine::Uring
-            } else {
-                IoEngine::Mio
-            }
-        }
-        IoEngine::Uring => {
-            if io_driver::uring_available() {
-                IoEngine::Uring
-            } else {
-                #[cfg(target_os = "linux")]
-                tracing::warn!(
-                    "io_uring requested but not available on this kernel, falling back to mio"
-                );
-                #[cfg(not(target_os = "linux"))]
-                tracing::warn!("io_uring is only available on Linux, falling back to mio");
-                IoEngine::Mio
-            }
-        }
-        IoEngine::Mio => IoEngine::Mio,
-    }
 }

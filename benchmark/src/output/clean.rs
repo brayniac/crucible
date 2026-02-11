@@ -119,8 +119,7 @@ impl OutputFormatter for CleanFormatter {
         );
 
         // Engine line
-        let engine_str = format!("{}", config.general.io_engine);
-        println!("engine     {}", engine_str);
+        println!("engine     io_uring");
 
         // Rate limit line (optional)
         if let Some(rate) = config.workload.rate_limit {

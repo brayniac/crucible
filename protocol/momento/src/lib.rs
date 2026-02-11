@@ -1,4 +1,4 @@
-//! protocol-momento - Lightweight Momento cache implementation for io-driver-based applications.
+//! protocol-momento - Lightweight Momento cache implementation for kompio-based applications.
 //!
 //! This crate provides a minimal Momento cache client and server that supports both
 //! the gRPC API and the higher-performance protosocket wire format, without pulling
@@ -17,14 +17,14 @@
 //! - Get, Set, Delete cache operations
 //! - Client and server implementations
 //! - Minimal protobuf encoding (no code generation)
-//! - Completion-based I/O via io-driver
+//! - Completion-based I/O via kompio
 //! - Support for both gRPC and protosocket wire formats
 //!
 //! # Client Example
 //!
 //! ```ignore
 //! use protocol_momento::{CacheClient, Credential, WireFormat};
-//! use io_driver::TlsConfig;
+//! use http2::TlsConfig;
 //!
 //! // Create client with gRPC (default)
 //! let credential = Credential::from_token("your-api-token")?;
@@ -55,7 +55,7 @@ pub use server::{CacheRequest, CacheResponse, CacheServer, CacheServerBuilder, C
 
 // Re-export useful types
 pub use grpc::{Code, Status};
-pub use io_driver::{TlsConfig, TlsTransport};
+pub use http2::{TlsConfig, TlsTransport};
 
 /// Wire format for Momento communication.
 ///

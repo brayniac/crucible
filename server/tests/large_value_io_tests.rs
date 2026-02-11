@@ -1,7 +1,6 @@
-//! Comprehensive large value tests for all I/O driver modes.
+//! Comprehensive large value tests for the kompio (io_uring) backend.
 //!
-//! These tests verify correct handling of large values (256KB to 64MB+) across:
-//! - I/O backends: mio, io_uring (multishot and singleshot)
+//! These tests verify correct handling of large values (256KB to 64MB+):
 //! - Send modes: buffered, zerocopy, threshold
 //! - Various connection and pipelining configurations
 //!
@@ -59,7 +58,6 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
 /// Start a test server with full configuration options.
 fn start_test_server_full(
     port: u16,
-    io_engine: &str,
     worker_threads: usize,
     heap_size_mb: usize,
     segment_size_mb: usize,
@@ -68,7 +66,6 @@ fn start_test_server_full(
     let max_value_size_mb = std::cmp::max(1, segment_size_mb - 1);
     start_test_server_full_with_max_value(
         port,
-        io_engine,
         worker_threads,
         heap_size_mb,
         segment_size_mb,
@@ -79,24 +76,16 @@ fn start_test_server_full(
 /// Start a test server with full configuration options including max_value_size.
 fn start_test_server_full_with_max_value(
     port: u16,
-    io_engine: &str,
     worker_threads: usize,
     heap_size_mb: usize,
     segment_size_mb: usize,
     max_value_size_mb: usize,
 ) -> thread::JoinHandle<()> {
-    let io_engine = io_engine.to_string();
-
     thread::spawn(move || {
         let config_str = format!(
             r#"
-            io_engine = "{io_engine}"
-
             [workers]
             threads = {worker_threads}
-
-            [uring]
-            # Hybrid recv mode is now automatic
 
             [cache]
             backend = "segment"
@@ -325,7 +314,6 @@ fn try_parse_bulk_string(data: &[u8], expected_size: usize) -> Result<Option<Vec
 
 /// Configuration for large value tests.
 struct LargeValueTestConfig {
-    io_engine: &'static str,
     sizes: &'static [usize],
     heap_size_mb: usize,
     segment_size_mb: usize,
@@ -335,7 +323,6 @@ struct LargeValueTestConfig {
 impl Default for LargeValueTestConfig {
     fn default() -> Self {
         Self {
-            io_engine: "mio",
             sizes: LARGE_SIZES,
             heap_size_mb: 256,
             segment_size_mb: 32,
@@ -351,7 +338,6 @@ fn run_large_value_test(config: LargeValueTestConfig) {
 
     let _server_handle = start_test_server_full_with_max_value(
         port,
-        config.io_engine,
         2, // 2 worker threads
         config.heap_size_mb,
         config.segment_size_mb,
@@ -360,8 +346,7 @@ fn run_large_value_test(config: LargeValueTestConfig) {
 
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {}",
-        config.io_engine
+        "Server failed to start"
     );
 
     let mut stream = TcpStream::connect(addr).expect("Failed to connect");
@@ -377,31 +362,24 @@ fn run_large_value_test(config: LargeValueTestConfig) {
         let key = format!("largekey_{}", size);
         let value = generate_large_value(size);
 
-        println!("Testing {} with {}: {} bytes", key, config.io_engine, size);
+        println!("Testing {}: {} bytes", key, size);
 
         // SET the large value
         send_large_set(&mut stream, &key, &value).unwrap_or_else(|e| {
-            panic!(
-                "SET failed for {} ({} bytes) with {}: {}",
-                key, size, config.io_engine, e
-            )
+            panic!("SET failed for {} ({} bytes): {}", key, size, e)
         });
 
         // GET the large value back
         let retrieved = send_large_get(&mut stream, &key, size).unwrap_or_else(|e| {
-            panic!(
-                "GET failed for {} ({} bytes) with {}: {}",
-                key, size, config.io_engine, e
-            )
+            panic!("GET failed for {} ({} bytes): {}", key, size, e)
         });
 
         // Verify data integrity
         assert!(
             verify_value(&retrieved, size),
-            "Data corruption detected for {} ({} bytes) with {}",
+            "Data corruption detected for {} ({} bytes)",
             key,
-            size,
-            config.io_engine
+            size
         );
 
         println!("  PASSED: {} bytes verified", size);
@@ -409,7 +387,7 @@ fn run_large_value_test(config: LargeValueTestConfig) {
 }
 
 /// Run a concurrent large value test with multiple connections.
-fn run_concurrent_large_value_test(io_engine: &'static str, connections: usize, value_size: usize) {
+fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -418,7 +396,6 @@ fn run_concurrent_large_value_test(io_engine: &'static str, connections: usize, 
 
     let _server_handle = start_test_server_full(
         port,
-        io_engine,
         4, // More workers for concurrent load
         heap_size_mb,
         64, // 64MB segments
@@ -426,8 +403,7 @@ fn run_concurrent_large_value_test(io_engine: &'static str, connections: usize, 
 
     assert!(
         wait_for_server(addr, Duration::from_secs(10)),
-        "Server failed to start with {}",
-        io_engine
+        "Server failed to start"
     );
 
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -495,80 +471,28 @@ fn run_concurrent_large_value_test(io_engine: &'static str, connections: usize, 
 
     assert_eq!(
         err_count, 0,
-        "Concurrent test had {} errors ({} successes) with {}",
-        err_count, success_count, io_engine
+        "Concurrent test had {} errors ({} successes)",
+        err_count, success_count
     );
     assert_eq!(
         success_count, connections,
-        "Not all connections succeeded: {} of {} with {}",
-        success_count, connections, io_engine
+        "Not all connections succeeded: {} of {}",
+        success_count, connections
     );
 }
 
 // =============================================================================
-// Mio Backend Large Value Tests
+// Large Value Tests
 // =============================================================================
 
 #[test]
-fn test_mio_large_values_256k_to_1m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "mio",
-        ..Default::default()
-    });
-}
-
-#[test]
-fn test_mio_large_values_4m_to_16m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "mio",
-        sizes: VERY_LARGE_SIZES,
-        heap_size_mb: 512,
-        segment_size_mb: 64,
-        max_value_size_mb: 63, // Must be less than segment_size
-    });
-}
-
-#[test]
-#[ignore] // Expensive test
-fn test_mio_large_values_64m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "mio",
-        sizes: EXTREME_SIZES,
-        heap_size_mb: 1024,
-        segment_size_mb: 128,
-        max_value_size_mb: 127, // Must be less than segment_size
-    });
-}
-
-#[test]
-fn test_mio_concurrent_large_values_1m() {
-    run_concurrent_large_value_test("mio", 8, 1024 * 1024);
-}
-
-#[test]
-#[ignore] // Expensive test
-fn test_mio_concurrent_large_values_4m() {
-    run_concurrent_large_value_test("mio", 4, 4 * 1024 * 1024);
-}
-
-// =============================================================================
-// io_uring Hybrid Recv Mode Large Value Tests (Linux only)
-// =============================================================================
-
-#[test]
-#[cfg(target_os = "linux")]
 fn test_uring_large_values_256k_to_1m() {
-    run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
-        ..Default::default()
-    });
+    run_large_value_test(LargeValueTestConfig::default());
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn test_uring_large_values_4m_to_16m() {
     run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
         sizes: VERY_LARGE_SIZES,
         heap_size_mb: 512,
         segment_size_mb: 64,
@@ -577,11 +501,9 @@ fn test_uring_large_values_4m_to_16m() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 #[ignore] // Expensive test
 fn test_uring_large_values_64m() {
     run_large_value_test(LargeValueTestConfig {
-        io_engine: "uring",
         sizes: EXTREME_SIZES,
         heap_size_mb: 1024,
         segment_size_mb: 128,
@@ -590,16 +512,14 @@ fn test_uring_large_values_64m() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn test_uring_concurrent_large_values_1m() {
-    run_concurrent_large_value_test("uring", 8, 1024 * 1024);
+    run_concurrent_large_value_test(8, 1024 * 1024);
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 #[ignore] // Expensive test
 fn test_uring_concurrent_large_values_4m() {
-    run_concurrent_large_value_test("uring", 4, 4 * 1024 * 1024);
+    run_concurrent_large_value_test(4, 4 * 1024 * 1024);
 }
 
 // =============================================================================
@@ -608,51 +528,11 @@ fn test_uring_concurrent_large_values_4m() {
 
 /// Test rapid large value SET/GET cycles to stress buffer recycling.
 #[test]
-fn test_mio_rapid_large_value_cycles() {
-    let port = get_available_port();
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    let _server_handle = start_test_server_full(port, "mio", 2, 256, 32);
-
-    assert!(wait_for_server(addr, Duration::from_secs(10)));
-
-    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-
-    let size = 512 * 1024; // 512KB
-
-    // Rapid cycles of SET/GET with the same key
-    for cycle in 0..20 {
-        let key = "rapid_cycle_key";
-        let value = generate_large_value(size);
-
-        send_large_set(&mut stream, key, &value)
-            .unwrap_or_else(|e| panic!("SET failed on cycle {}: {}", cycle, e));
-
-        let retrieved = send_large_get(&mut stream, key, size)
-            .unwrap_or_else(|e| panic!("GET failed on cycle {}: {}", cycle, e));
-
-        assert!(
-            verify_value(&retrieved, size),
-            "Data corruption on cycle {}",
-            cycle
-        );
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
 fn test_uring_rapid_large_value_cycles() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -688,68 +568,13 @@ fn test_uring_rapid_large_value_cycles() {
 /// Test increasing value sizes in sequence.
 /// This stresses coalesce buffer growth.
 #[test]
-fn test_mio_increasing_value_sizes() {
-    let port = get_available_port();
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    // Use larger segment/max_value to support up to 2MB values
-    let _server_handle = start_test_server_full_with_max_value(
-        port, "mio", 2, 256, 8, 7, // 8MB segment, 7MB max value
-    );
-
-    assert!(wait_for_server(addr, Duration::from_secs(10)));
-
-    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(120)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(120)))
-        .unwrap();
-
-    // Start small and grow
-    let sizes = [
-        1024,            // 1KB
-        16 * 1024,       // 16KB (ring buffer size)
-        32 * 1024,       // 32KB
-        64 * 1024,       // 64KB (shrink threshold)
-        128 * 1024,      // 128KB
-        256 * 1024,      // 256KB
-        512 * 1024,      // 512KB
-        1024 * 1024,     // 1MB
-        2 * 1024 * 1024, // 2MB
-    ];
-
-    for &size in &sizes {
-        let key = format!("increasing_key_{}", size);
-        let value = generate_large_value(size);
-
-        println!("Testing increasing size: {} bytes", size);
-
-        send_large_set(&mut stream, &key, &value)
-            .unwrap_or_else(|e| panic!("SET failed for size {}: {}", size, e));
-
-        let retrieved = send_large_get(&mut stream, &key, size)
-            .unwrap_or_else(|e| panic!("GET failed for size {}: {}", size, e));
-
-        assert!(
-            verify_value(&retrieved, size),
-            "Data corruption for size {}",
-            size
-        );
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
 fn test_uring_increasing_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Use larger segment/max_value to support up to 2MB values
     let _server_handle = start_test_server_full_with_max_value(
-        port, "uring", 2, 256, 8, 7, // 8MB segment, 7MB max value
+        port, 2, 256, 8, 7, // 8MB segment, 7MB max value
     );
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
@@ -798,55 +623,11 @@ fn test_uring_increasing_value_sizes() {
 /// Test alternating between small and large values.
 /// This tests buffer shrink/grow behavior.
 #[test]
-fn test_mio_alternating_value_sizes() {
-    let port = get_available_port();
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    let _server_handle = start_test_server_full(port, "mio", 2, 256, 32);
-
-    assert!(wait_for_server(addr, Duration::from_secs(10)));
-
-    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-
-    for i in 0..10 {
-        // Alternate between small (64 bytes) and large (1MB) values
-        let (key, size) = if i % 2 == 0 {
-            (format!("small_key_{}", i), 64)
-        } else {
-            (format!("large_key_{}", i), 1024 * 1024)
-        };
-
-        let value = generate_large_value(size);
-
-        send_large_set(&mut stream, &key, &value)
-            .unwrap_or_else(|e| panic!("SET failed for key {} (size {}): {}", key, size, e));
-
-        let retrieved = send_large_get(&mut stream, &key, size)
-            .unwrap_or_else(|e| panic!("GET failed for key {} (size {}): {}", key, size, e));
-
-        assert!(
-            verify_value(&retrieved, size),
-            "Data corruption for key {} (size {})",
-            key,
-            size
-        );
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
 fn test_uring_alternating_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 
@@ -886,63 +667,11 @@ fn test_uring_alternating_value_sizes() {
 /// Test values at exact buffer boundary sizes.
 /// Ring buffers are 16KB, so test around that boundary.
 #[test]
-fn test_mio_buffer_boundary_sizes() {
-    let port = get_available_port();
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    let _server_handle = start_test_server_full(port, "mio", 2, 256, 32);
-
-    assert!(wait_for_server(addr, Duration::from_secs(10)));
-
-    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-
-    // Test around 16KB boundary (ring buffer size)
-    let sizes = [
-        16 * 1024 - 1, // Just under 16KB
-        16 * 1024,     // Exactly 16KB
-        16 * 1024 + 1, // Just over 16KB
-        32 * 1024 - 1, // Just under 32KB (2 buffers)
-        32 * 1024,     // Exactly 32KB
-        32 * 1024 + 1, // Just over 32KB
-        64 * 1024 - 1, // Just under 64KB (shrink threshold)
-        64 * 1024,     // Exactly 64KB
-        64 * 1024 + 1, // Just over 64KB
-    ];
-
-    for &size in &sizes {
-        let key = format!("boundary_key_{}", size);
-        let value = generate_large_value(size);
-
-        println!("Testing boundary size: {} bytes", size);
-
-        send_large_set(&mut stream, &key, &value)
-            .unwrap_or_else(|e| panic!("SET failed for size {}: {}", size, e));
-
-        let retrieved = send_large_get(&mut stream, &key, size)
-            .unwrap_or_else(|e| panic!("GET failed for size {}: {}", size, e));
-
-        assert!(
-            verify_value(&retrieved, size),
-            "Data corruption for size {}",
-            size
-        );
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
 fn test_uring_buffer_boundary_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let _server_handle = start_test_server_full(port, "uring", 2, 256, 32);
+    let _server_handle = start_test_server_full(port, 2, 256, 32);
 
     assert!(wait_for_server(addr, Duration::from_secs(10)));
 

@@ -35,6 +35,18 @@ fn format_hex_preview(data: &[u8], max_each: usize) -> String {
         )
     }
 }
+/// Receive buffer trait for zero-copy response parsing.
+pub trait RecvBuf {
+    fn as_slice(&self) -> &[u8];
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn consume(&mut self, n: usize);
+    fn capacity(&self) -> usize;
+    fn shrink_if_oversized(&mut self);
+}
+
 use crate::config::{Config, Protocol};
 use crate::protocol::{
     MemcacheBinaryCodec, MemcacheBinaryError, MemcacheCodec, MemcacheError, PingCodec, PingError,
@@ -54,8 +66,6 @@ const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
 fn resp_parse_options() -> RespParseOptions {
     RespParseOptions::new().max_bulk_string_len(MAX_BULK_STRING_LEN)
 }
-
-use io_driver::{ConnId, RecvBuf};
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -175,8 +185,8 @@ enum ProtocolCodec {
 /// - Actual send/recv operations
 /// - Connection state
 pub struct Session {
-    /// Connection ID (set when connected via IoDriver)
-    conn_id: Option<ConnId>,
+    /// Connection index (set when connected)
+    conn_id: Option<usize>,
     /// Target address
     addr: SocketAddr,
     /// Protocol codec
@@ -281,13 +291,13 @@ impl Session {
         self.addr
     }
 
-    /// Get the connection ID if connected.
-    pub fn conn_id(&self) -> Option<ConnId> {
+    /// Get the connection index if connected.
+    pub fn conn_id(&self) -> Option<usize> {
         self.conn_id
     }
 
-    /// Set the connection ID (called after IoDriver::register).
-    pub fn set_conn_id(&mut self, id: ConnId) {
+    /// Set the connection index (called after connection established).
+    pub fn set_conn_id(&mut self, id: usize) {
         self.conn_id = Some(id);
         self.state = ConnectionState::Connected;
         self.reconnect_delay = self.base_reconnect_delay;

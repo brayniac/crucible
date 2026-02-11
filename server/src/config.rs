@@ -2,7 +2,6 @@
 //!
 //! Supports cache backend selection and multiple protocol listeners.
 
-use io_driver::IoEngine;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -35,11 +34,7 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
 
-    /// I/O engine selection: "auto", "mio", or "uring"
-    #[serde(default)]
-    pub io_engine: IoEngine,
-
-    /// io_uring specific configuration (only used when io_engine = "uring" or "auto" on Linux 6.0+)
+    /// io_uring specific configuration
     #[serde(default)]
     pub uring: UringConfig,
 }

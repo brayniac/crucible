@@ -21,7 +21,7 @@ use crate::frame::{
     HeadersFrame, PingFrame, RstStreamFrame, Setting, SettingId, SettingsFrame, WindowUpdateFrame,
 };
 use crate::hpack::{HeaderField, HpackDecoder, HpackEncoder};
-use io_driver::Transport;
+use crate::transport::Transport;
 
 use bytes::BytesMut;
 use std::collections::HashMap;
@@ -589,7 +589,7 @@ impl<T: Transport> Connection<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use io_driver::TransportState;
+    use crate::transport::TransportState;
 
     // ConnectionState tests
 

@@ -1,7 +1,7 @@
-//! http2 - HTTP/2 implementation for io-driver-based applications.
+//! http2 - HTTP/2 implementation with optional TLS transport.
 //!
-//! This crate provides a completion-based HTTP/2 implementation designed
-//! to work with the io-driver I/O driver. It does not use async/await or tokio.
+//! This crate provides a completion-based HTTP/2 implementation. It does not
+//! use async/await or tokio.
 //!
 //! # Features
 //!
@@ -9,21 +9,12 @@
 //! - HPACK header compression
 //! - Connection and stream state management
 //! - Flow control
-//! - TLS integration via io-driver's transport layer
-//!
-//! # Architecture
-//!
-//! The crate is organized into several modules:
-//!
-//! - `frame`: HTTP/2 frame types, encoding, and decoding
-//! - `hpack`: HPACK header compression
-//! - `connection`: HTTP/2 connection state machine
-//!
-//! Transport layer (plain TCP, TLS) is provided by the `io-driver` crate.
+//! - Transport layer abstraction (plain TCP, TLS)
 
 pub mod connection;
 pub mod frame;
 pub mod hpack;
+pub mod transport;
 
 // Re-export commonly used types
 pub use frame::{
@@ -36,8 +27,10 @@ pub use frame::{
 
 pub use hpack::{HeaderField, HpackDecoder, HpackEncoder};
 
-// Re-export transport types from io-driver for convenience
-pub use io_driver::{PlainTransport, TlsConfig, TlsTransport, Transport, TransportState};
+// Re-export transport types for convenience
+pub use transport::{PlainTransport, ProcessResult, Transport, TransportState};
+#[cfg(feature = "tls")]
+pub use transport::{TlsConfig, TlsTransport};
 
 pub use connection::{
     Connection, ConnectionError, ConnectionEvent, ConnectionSettings, ConnectionState, FlowControl,

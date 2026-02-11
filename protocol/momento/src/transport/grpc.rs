@@ -12,7 +12,7 @@ use crate::proto::{
 use bytes::Bytes;
 use grpc::{CallBuilder, CallEvent, Channel, Code, Status};
 use http2::Connection;
-use io_driver::Transport;
+use http2::Transport;
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;

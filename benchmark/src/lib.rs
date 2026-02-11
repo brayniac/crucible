@@ -12,11 +12,10 @@ pub mod worker;
 
 pub use admin::{AdminHandle, AdminServer};
 pub use config::{Config, parse_cpu_list};
-pub use io_driver::{CompletionKind, ConnId, Driver, IoDriver, IoEngine};
 pub use output::{
     ColorMode, LatencyStats, OutputFormat, OutputFormatter, Results, Sample, SaturationResults,
     SaturationStep, create_formatter,
 };
 pub use ratelimit::DynamicRateLimiter;
 pub use saturation::SaturationSearchState;
-pub use worker::{IoWorker, IoWorkerConfig, Phase, SharedState};
+pub use worker::{BenchWorkerConfig, Phase, SharedState};

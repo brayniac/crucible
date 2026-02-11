@@ -71,7 +71,7 @@ fn run(
     let cpu_affinity = config.cpu_affinity();
     let cpu_affinity_slice = cpu_affinity.as_deref();
 
-    let backend_detail = server::native::backend_detail(config.io_engine);
+    let backend_detail = server::native::backend_detail();
 
     let numa_node = config.numa_node();
     let policy = config.cache.effective_policy();

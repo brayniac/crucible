@@ -1,0 +1,42 @@
+[package]
+name = "cache-bench"
+version = "0.2.19-alpha.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process cache benchmark tool"
+
+[dependencies]
+# Cache implementations
+cache-core = { workspace = true }
+segcache = { workspace = true }
+slab-cache = { workspace = true }
+heap-cache = { workspace = true }
+
+# Metrics
+metrics = { workspace = true }
+metriken = { workspace = true }
+
+# Configuration
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive"] }
+
+# RNG
+rand = { workspace = true }
+rand_xoshiro = "0.7"
+
+# Utilities
+libc = { workspace = true }
+ctrlc = { version = "3", features = ["termination"] }
+humantime = "2.1"
+
+# Jemalloc
+tikv-jemallocator = { workspace = true }
+
+[[bin]]
+name = "crucible-cache-bench"
+path = "src/main.rs"

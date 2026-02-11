@@ -8,10 +8,10 @@ members = [
 	"cache/slab",
 	"cache/heap",
 
-	# IO Driver and Transport
+	# IO Framework and Transport
 	"io/grpc",
 	"io/http2",
-	"io/driver",
+	"io/kompio",
 
 	# Protocol Implementations
 	"protocol/momento",
@@ -27,6 +27,9 @@ members = [
 
 	# Benchmark Tool
 	"benchmark",
+
+	# In-Process Cache Benchmark
+	"cache-bench",
 
 	# Development Tasks
 	"xtask",
@@ -59,7 +62,6 @@ loom = "0.7"
 memchr = "2.7"
 memmap2 = "0.9"
 metriken = "0.7"
-mio = "1"
 num_cpus = "1.16"
 parking_lot = "0.12"
 rand = "0.9"
@@ -78,7 +80,7 @@ tracing = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-io-driver = { path = "io/driver" }
+kompio = { path = "io/kompio" }
 http2 = { path = "io/http2" }
 grpc = { path = "io/grpc" }
 protocol-momento = { path = "protocol/momento" }
@@ -91,8 +93,6 @@ slab-cache = { path = "cache/slab" }
 heap-cache = { path = "cache/heap" }
 metrics = { path = "metrics" }
 
-# Platform-specific (Linux io_uring)
-io-uring = "0.7"
 
 # Jemalloc allocator
 tikv-jemallocator = "0.6"

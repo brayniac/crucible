@@ -2,7 +2,71 @@
 
 use bytes::{Bytes, BytesMut};
 use cache_core::{Cache, CacheError, SegmentReservation, SetReservation, ValueRef};
-use io_driver::RecvBuf;
+/// Trait for receive buffer access.
+///
+/// Provides a unified interface for accessing received data.
+pub trait RecvBuf {
+    /// Get a contiguous slice of all available data.
+    fn as_slice(&self) -> &[u8];
+
+    /// Get the number of bytes available.
+    fn len(&self) -> usize;
+
+    /// Check if the buffer is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Mark `n` bytes as consumed.
+    fn consume(&mut self, n: usize);
+
+    /// Get the current buffer capacity.
+    fn capacity(&self) -> usize;
+
+    /// Shrink the buffer if it has grown too large.
+    fn shrink_if_oversized(&mut self);
+}
+
+/// Adapter that wraps a `&[u8]` slice as a `RecvBuf`.
+///
+/// Used with kompio's `on_data` callback. Tracks consumed bytes
+/// so the caller can return the consumed count.
+pub struct SliceRecvBuf<'a> {
+    data: &'a [u8],
+    consumed: usize,
+}
+
+impl<'a> SliceRecvBuf<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        SliceRecvBuf { data, consumed: 0 }
+    }
+
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+}
+
+impl RecvBuf for SliceRecvBuf<'_> {
+    fn as_slice(&self) -> &[u8] {
+        &self.data[self.consumed..]
+    }
+
+    fn len(&self) -> usize {
+        self.data.len() - self.consumed
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.consumed += n;
+    }
+
+    fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    fn shrink_if_oversized(&mut self) {
+        // No-op: the underlying slice is borrowed from kompio's accumulator
+    }
+}
 use protocol_memcache::binary::{
     BINARY_STREAMING_THRESHOLD, BinaryParseProgress, REQUEST_MAGIC, parse_binary_streaming,
 };
