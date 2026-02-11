@@ -582,20 +582,17 @@ impl MultiChoiceHashtable {
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
             let packed = bucket.items[slot_index].load(Ordering::Acquire);
 
-            if packed != 0
-                && Hashbucket::is_ghost(packed)
-                && Hashbucket::tag(packed) == tag
-            {
+            if packed != 0 && Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
                 let freq = Hashbucket::freq(packed);
-                if freq < 127 {
-                    if let Some(new_packed) = Hashbucket::try_update_freq(packed, freq) {
-                        let _ = bucket.items[slot_index].compare_exchange(
-                            packed,
-                            new_packed,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        );
-                    }
+                if freq < 127
+                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
+                {
+                    let _ = bucket.items[slot_index].compare_exchange(
+                        packed,
+                        new_packed,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    );
                 }
             }
         }

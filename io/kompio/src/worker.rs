@@ -1,14 +1,23 @@
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use crate::acceptor::{run_acceptor, AcceptorConfig};
+use crate::acceptor::{AcceptorConfig, run_acceptor};
 use crate::config::Config;
 use crate::event_loop::EventLoop;
 use crate::handler::EventHandler;
+
+/// Result type for `launch` / `KompioBuilder::launch` to avoid type-complexity warnings.
+type LaunchResult = Result<
+    (
+        ShutdownHandle,
+        Vec<thread::JoinHandle<Result<(), crate::error::Error>>>,
+    ),
+    crate::error::Error,
+>;
 
 /// Handle returned by `launch()` to trigger graceful shutdown of all workers.
 pub struct ShutdownHandle {
@@ -27,11 +36,11 @@ impl ShutdownHandle {
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
         // Close listen_fd to unblock the acceptor thread's accept4() call.
-        if let (Some(fd), Some(closed)) = (self.listen_fd, &self.listen_fd_closed) {
-            if !closed.swap(true, Ordering::AcqRel) {
-                unsafe {
-                    libc::close(fd);
-                }
+        if let (Some(fd), Some(closed)) = (self.listen_fd, &self.listen_fd_closed)
+            && !closed.swap(true, Ordering::AcqRel)
+        {
+            unsafe {
+                libc::close(fd);
             }
         }
         // Wake all workers so they see the flag even if blocked in submit_and_wait.
@@ -70,10 +79,8 @@ impl KompioBuilder {
     ///
     /// If `bind()` was called, creates a listener + acceptor thread.
     /// Otherwise runs in client-only mode (no acceptor).
-    pub fn launch<H: EventHandler>(
-        self,
-    ) -> Result<(ShutdownHandle, Vec<thread::JoinHandle<Result<(), crate::error::Error>>>), crate::error::Error>
-    {
+    #[allow(clippy::needless_range_loop)]
+    pub fn launch<H: EventHandler>(self) -> LaunchResult {
         let num_threads = if self.config.worker.threads == 0 {
             num_cpus()
         } else {
@@ -90,7 +97,9 @@ impl KompioBuilder {
             let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
             if efd < 0 {
                 for &fd in &worker_eventfds {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
                 return Err(crate::error::Error::Io(io::Error::last_os_error()));
             }
@@ -120,10 +129,12 @@ impl KompioBuilder {
                 .spawn(move || {
                     run_acceptor(acceptor_config);
                     if !acceptor_closed.swap(true, Ordering::AcqRel) {
-                        unsafe { libc::close(fd); }
+                        unsafe {
+                            libc::close(fd);
+                        }
                     }
                 })
-                .map_err(|e| crate::error::Error::Io(e))?;
+                .map_err(crate::error::Error::Io)?;
 
             (Some(fd), Some(closed))
         } else {
@@ -153,14 +164,13 @@ impl KompioBuilder {
                     let handler = H::create_for_worker(worker_id);
 
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
-                    let mut event_loop = EventLoop::new(
-                        &config, handler, accept_rx, eventfd, shutdown_flag,
-                    )?;
+                    let mut event_loop =
+                        EventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
                     event_loop.run()?;
 
                     Ok(())
                 })
-                .map_err(|e| crate::error::Error::Io(e))?;
+                .map_err(crate::error::Error::Io)?;
 
             handles.push(handle);
         }
@@ -179,10 +189,7 @@ impl KompioBuilder {
 /// Launch worker threads with a centralized acceptor thread.
 ///
 /// This is a convenience wrapper around `KompioBuilder`.
-pub fn launch<H: EventHandler>(
-    config: Config,
-    bind_addr: &str,
-) -> Result<(ShutdownHandle, Vec<thread::JoinHandle<Result<(), crate::error::Error>>>), crate::error::Error> {
+pub fn launch<H: EventHandler>(config: Config, bind_addr: &str) -> LaunchResult {
     KompioBuilder::new(config).bind(bind_addr).launch::<H>()
 }
 
@@ -202,11 +209,9 @@ fn pin_to_core(core: usize) -> Result<(), crate::error::Error> {
 
 /// Create a TCP listener without SO_REUSEPORT (just SO_REUSEADDR).
 fn create_listener(addr: &str, backlog: i32) -> Result<RawFd, crate::error::Error> {
-    let parsed: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e: std::net::AddrParseError| {
-            crate::error::Error::RingSetup(format!("invalid address: {e}"))
-        })?;
+    let parsed: std::net::SocketAddr = addr.parse().map_err(|e: std::net::AddrParseError| {
+        crate::error::Error::RingSetup(format!("invalid address: {e}"))
+    })?;
 
     let domain = if parsed.is_ipv4() {
         libc::AF_INET
@@ -256,12 +261,12 @@ fn create_listener(addr: &str, backlog: i32) -> Result<RawFd, crate::error::Erro
         }
     };
 
-    let ret = unsafe {
-        libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len)
-    };
+    let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
     if ret < 0 {
         let err = io::Error::last_os_error();
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         return Err(crate::error::Error::Io(err));
     }
 
@@ -274,7 +279,9 @@ fn create_listener(addr: &str, backlog: i32) -> Result<RawFd, crate::error::Erro
     let ret = unsafe { libc::listen(fd, backlog) };
     if ret < 0 {
         let err = io::Error::last_os_error();
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         return Err(crate::error::Error::Io(err));
     }
 
@@ -284,9 +291,5 @@ fn create_listener(addr: &str, backlog: i32) -> Result<RawFd, crate::error::Erro
 /// Get the number of available CPU cores.
 fn num_cpus() -> usize {
     let ret = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if ret < 1 {
-        1
-    } else {
-        ret as usize
-    }
+    if ret < 1 { 1 } else { ret as usize }
 }

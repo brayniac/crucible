@@ -695,12 +695,7 @@ impl EventHandler for BenchHandler {
             #[cfg(target_os = "linux")]
             {
                 if let Err(e) = pin_to_cpu(cpu_id) {
-                    tracing::warn!(
-                        "failed to pin worker {} to CPU {}: {}",
-                        cfg.id,
-                        cpu_id,
-                        e
-                    );
+                    tracing::warn!("failed to pin worker {} to CPU {}: {}", cfg.id, cpu_id, e);
                 } else {
                     tracing::debug!("pinned worker {} to CPU {}", cfg.id, cpu_id);
                 }
@@ -723,8 +718,7 @@ impl EventHandler for BenchHandler {
         // Initialize prefill state
         let (prefill_pending, prefill_total, prefill_done) = match cfg.prefill_range {
             Some(range) => {
-                let pending: std::collections::VecDeque<usize> =
-                    (range.start..range.end).collect();
+                let pending: std::collections::VecDeque<usize> = (range.start..range.end).collect();
                 let total = range.end - range.start;
                 tracing::debug!(
                     worker_id = cfg.id,
@@ -860,12 +854,7 @@ impl EventHandler for BenchHandler {
         buf.consumed
     }
 
-    fn on_send_complete(
-        &mut self,
-        ctx: &mut DriverCtx,
-        conn: ConnToken,
-        result: io::Result<u32>,
-    ) {
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
         if result.is_err() {
             if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
                 self.close_session(ctx, idx, DisconnectReason::SendError);

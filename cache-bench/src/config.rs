@@ -171,8 +171,7 @@ impl Config {
         let config: Config = toml::from_str(&contents)?;
 
         // Validate command mix
-        let total =
-            config.workload.commands.get as u16
+        let total = config.workload.commands.get as u16
             + config.workload.commands.set as u16
             + config.workload.commands.delete as u16;
         if total != 100 {

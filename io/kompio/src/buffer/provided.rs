@@ -43,10 +43,7 @@ impl ProvidedBufRing {
     /// `ring_size` must be a power of 2.
     /// The ring memory is mmap'd so the kernel can access it directly.
     pub fn new(bgid: u16, ring_size: u16, buf_size: u32) -> io::Result<Self> {
-        assert!(
-            ring_size.is_power_of_two(),
-            "ring_size must be power of 2"
-        );
+        assert!(ring_size.is_power_of_two(), "ring_size must be power of 2");
 
         let ring_mmap_len = ring_size as usize * Self::ENTRY_SIZE;
         let buf_backing = vec![0u8; ring_size as usize * buf_size as usize];

@@ -8,8 +8,8 @@ use kompio::{ConnToken, DriverCtx, EventHandler, KompioBuilder};
 use protocol_ping::Response;
 use serde::Deserialize;
 use std::io;
-use std::path::Path;
 use std::net::SocketAddr;
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "ping-server")]
@@ -60,6 +60,7 @@ struct WorkersConfig {
     #[serde(default)]
     threads: usize,
     #[serde(default)]
+    #[allow(dead_code)]
     cpu_affinity: Option<String>,
 }
 
@@ -185,7 +186,7 @@ impl EventHandler for PingHandler {
     fn on_data(&mut self, ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize {
         let idx = conn.index();
 
-        let consumed = if let Some(c) = self.connections.get_mut(idx).and_then(|c| c.as_mut()) {
+        if let Some(c) = self.connections.get_mut(idx).and_then(|c| c.as_mut()) {
             let n = c.process(data);
 
             // Send pending responses
@@ -202,17 +203,10 @@ impl EventHandler for PingHandler {
             n
         } else {
             0
-        };
-
-        consumed
+        }
     }
 
-    fn on_send_complete(
-        &mut self,
-        ctx: &mut DriverCtx,
-        conn: ConnToken,
-        result: io::Result<u32>,
-    ) {
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
         if result.is_err() {
             ctx.close(conn);
             let idx = conn.index();
@@ -278,7 +272,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let workers = if threads == 0 { "auto" } else { &threads.to_string() };
+    let workers = if threads == 0 {
+        "auto"
+    } else {
+        &threads.to_string()
+    };
     eprintln!("Listening on {} ({} workers)", listen, workers);
 
     let (shutdown_handle, handles) = KompioBuilder::new(kompio_config)

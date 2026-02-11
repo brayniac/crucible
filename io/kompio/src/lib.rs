@@ -1,5 +1,5 @@
-pub mod accumulator;
 pub mod acceptor;
+pub mod accumulator;
 pub mod buffer;
 pub mod completion;
 pub mod config;
@@ -14,18 +14,18 @@ pub mod tls;
 pub mod worker;
 
 // Public API re-exports
-pub use config::{Config, RecvBufferConfig, WorkerConfig};
-#[cfg(feature = "tls")]
-pub use config::TlsConfig;
-#[cfg(feature = "tls")]
-pub use config::TlsClientConfig;
-pub use error::Error;
-pub use guard::{GuardBox, SendGuard};
-pub use handler::{ConnToken, DriverCtx, EventHandler, SendBuilder};
 pub use buffer::fixed::{MemoryRegion, RegionId};
 pub use buffer::send_slab::{MAX_GUARDS, MAX_IOVECS};
 pub use completion::{OpTag, UserData};
+#[cfg(feature = "tls")]
+pub use config::TlsClientConfig;
+#[cfg(feature = "tls")]
+pub use config::TlsConfig;
+pub use config::{Config, RecvBufferConfig, WorkerConfig};
+pub use error::Error;
 pub use event_loop::EventLoop;
-pub use worker::{launch, KompioBuilder, ShutdownHandle};
+pub use guard::{GuardBox, SendGuard};
+pub use handler::{ConnToken, DriverCtx, EventHandler, SendBuilder};
 #[cfg(feature = "tls")]
 pub use tls::TlsInfo;
+pub use worker::{KompioBuilder, ShutdownHandle, launch};

@@ -70,8 +70,8 @@ fn main() {
 
     eprintln!("starting echo server on {bind_addr}");
 
-    let (_shutdown, handles) = kompio::launch::<EchoHandler>(config, &bind_addr)
-        .expect("failed to launch workers");
+    let (_shutdown, handles) =
+        kompio::launch::<EchoHandler>(config, &bind_addr).expect("failed to launch workers");
 
     for handle in handles {
         if let Err(e) = handle.join().expect("worker thread panicked") {

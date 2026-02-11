@@ -62,7 +62,11 @@ impl BackendPool {
 
     /// Remove a connection.
     pub fn remove_connection(&mut self, conn: ConnToken) -> Option<BackendConnection> {
-        if self.connections.get(&conn.index()).is_some_and(|bc| bc.conn == conn) {
+        if self
+            .connections
+            .get(&conn.index())
+            .is_some_and(|bc| bc.conn == conn)
+        {
             return self.connections.remove(&conn.index());
         }
         None

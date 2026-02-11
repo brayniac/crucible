@@ -5,8 +5,8 @@ use benchmark::saturation::SaturationSearchState;
 use benchmark::viewer;
 use benchmark::worker::{BenchWorkerConfig, Phase, init_config_channel};
 use benchmark::{
-    AdminServer, LatencyStats, OutputFormatter, Results, Sample,
-    SharedState, create_formatter, parse_cpu_list,
+    AdminServer, LatencyStats, OutputFormatter, Results, Sample, SharedState, create_formatter,
+    parse_cpu_list,
 };
 
 use chrono::Utc;
@@ -192,6 +192,7 @@ fn run_benchmark(
 
     // Set up config channel for kompio workers
     let (config_tx, config_rx) = crossbeam_channel::bounded::<BenchWorkerConfig>(num_threads);
+    #[allow(clippy::needless_range_loop)]
     for id in 0..num_threads {
         config_tx
             .send(BenchWorkerConfig {

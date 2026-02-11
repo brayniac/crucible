@@ -1,12 +1,12 @@
 //! Kompio EventHandler implementation for the cache server.
 
-use bytes::Bytes;
 use crate::connection::{Connection, SliceRecvBuf};
-use crate::metrics::{
-    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats,
-};
+use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats};
+use bytes::Bytes;
 use cache_core::Cache;
-use kompio::{ConnToken, DriverCtx, EventHandler, GuardBox, RegionId, SendGuard, MAX_GUARDS, MAX_IOVECS};
+use kompio::{
+    ConnToken, DriverCtx, EventHandler, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
+};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -122,7 +122,8 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
         let idx = conn.index();
 
         // Backpressure: if too much write data is pending, refuse more data
-        let should_process = self.connections
+        let should_process = self
+            .connections
             .get(idx)
             .and_then(|c| c.as_ref())
             .map(|c| c.should_read())
@@ -156,12 +157,7 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
         consumed
     }
 
-    fn on_send_complete(
-        &mut self,
-        ctx: &mut DriverCtx,
-        conn: ConnToken,
-        result: io::Result<u32>,
-    ) {
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
         self.stats[self.worker_id].inc_send_ready();
         let idx = conn.index();
 

@@ -7,7 +7,7 @@ pub struct SendCopyPool {
     slot_size: u32,
     count: u16,
     free_list: Vec<u16>,
-    slot_offset: Vec<u32>,    // current byte offset within slot (advances on partial send)
+    slot_offset: Vec<u32>, // current byte offset within slot (advances on partial send)
     slot_remaining: Vec<u32>, // bytes remaining to send
 }
 
@@ -91,7 +91,10 @@ impl SendCopyPool {
         self.slot_offset[i] += bytes_sent;
         self.slot_remaining[i] = new_remaining;
         let base = i * self.slot_size as usize;
-        let ptr = self.backing.as_ptr().wrapping_add(base + self.slot_offset[i] as usize);
+        let ptr = self
+            .backing
+            .as_ptr()
+            .wrapping_add(base + self.slot_offset[i] as usize);
         Some((ptr, new_remaining))
     }
 

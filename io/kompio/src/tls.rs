@@ -1,8 +1,8 @@
 use std::io::{self, Read as _, Write as _};
 use std::sync::Arc;
 
-use rustls::{ClientConnection, ServerConnection};
 use rustls::pki_types::ServerName;
+use rustls::{ClientConnection, ServerConnection};
 
 use crate::accumulator::AccumulatorTable;
 use crate::buffer::send_copy::SendCopyPool;
@@ -154,7 +154,9 @@ impl TlsTable {
 
     /// Create a new TLS server connection at the given index.
     pub fn create(&mut self, conn_index: u32) {
-        let server_config = self.server_config.as_ref()
+        let server_config = self
+            .server_config
+            .as_ref()
             .expect("create() called without server_config");
         let conn = ServerConnection::new(server_config.clone())
             .expect("rustls ServerConnection::new failed");
@@ -166,7 +168,9 @@ impl TlsTable {
 
     /// Create a new TLS client connection at the given index.
     pub fn create_client(&mut self, conn_index: u32, server_name: ServerName<'static>) {
-        let client_config = self.client_config.as_ref()
+        let client_config = self
+            .client_config
+            .as_ref()
             .expect("create_client() called without client_config");
         let conn = ClientConnection::new(client_config.clone(), server_name)
             .expect("rustls ClientConnection::new failed");
@@ -261,7 +265,13 @@ pub fn feed_tls_recv(
         Err(e) => {
             // Try to flush alert before returning error.
             if tls_conn.conn.wants_write() {
-                flush_tls_output_inner(tls_conn, &mut tls_table.write_buf, ring, send_copy_pool, conn_index);
+                flush_tls_output_inner(
+                    tls_conn,
+                    &mut tls_table.write_buf,
+                    ring,
+                    send_copy_pool,
+                    conn_index,
+                );
             }
             return TlsRecvResult::Error(e);
         }
@@ -284,7 +294,13 @@ pub fn feed_tls_recv(
 
     // Flush any TLS output (handshake messages, alerts, etc.).
     if tls_conn.conn.wants_write() {
-        flush_tls_output_inner(tls_conn, &mut tls_table.write_buf, ring, send_copy_pool, conn_index);
+        flush_tls_output_inner(
+            tls_conn,
+            &mut tls_table.write_buf,
+            ring,
+            send_copy_pool,
+            conn_index,
+        );
     }
 
     // Check if handshake just completed.
@@ -388,27 +404,27 @@ pub fn encrypt_and_send(
         .conn
         .writer()
         .write_all(plaintext)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     // Extract ciphertext into shared scratch buffer.
     write_buf.clear();
     tls_conn
         .conn
         .write_tls(write_buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     if write_buf.is_empty() {
         return Ok(());
     }
 
     let slot_size = send_copy_pool.slot_size() as usize;
-    let total_chunks = (write_buf.len() + slot_size - 1) / slot_size;
+    let total_chunks = write_buf.len().div_ceil(slot_size);
     let last_idx = total_chunks.saturating_sub(1);
 
     for (i, chunk) in write_buf.chunks(slot_size).enumerate() {
-        let (slot, ptr, len) = send_copy_pool.copy_in(chunk).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "send copy pool exhausted for TLS")
-        })?;
+        let (slot, ptr, len) = send_copy_pool
+            .copy_in(chunk)
+            .ok_or_else(|| io::Error::other("send copy pool exhausted for TLS"))?;
 
         if i == last_idx {
             // Last chunk uses OpTag::Send so handler gets on_send_complete.

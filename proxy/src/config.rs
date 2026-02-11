@@ -58,7 +58,6 @@ impl Config {
             .as_ref()
             .map(|s| parse_cpu_list(s))
     }
-
 }
 
 /// Proxy listener configuration.

@@ -365,14 +365,12 @@ fn run_large_value_test(config: LargeValueTestConfig) {
         println!("Testing {}: {} bytes", key, size);
 
         // SET the large value
-        send_large_set(&mut stream, &key, &value).unwrap_or_else(|e| {
-            panic!("SET failed for {} ({} bytes): {}", key, size, e)
-        });
+        send_large_set(&mut stream, &key, &value)
+            .unwrap_or_else(|e| panic!("SET failed for {} ({} bytes): {}", key, size, e));
 
         // GET the large value back
-        let retrieved = send_large_get(&mut stream, &key, size).unwrap_or_else(|e| {
-            panic!("GET failed for {} ({} bytes): {}", key, size, e)
-        });
+        let retrieved = send_large_get(&mut stream, &key, size)
+            .unwrap_or_else(|e| panic!("GET failed for {} ({} bytes): {}", key, size, e));
 
         // Verify data integrity
         assert!(

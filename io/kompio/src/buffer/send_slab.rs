@@ -61,7 +61,7 @@ impl InFlightSendSlab {
     /// Returns `None` if the slab is full.
     ///
     /// `iovecs_slice` must have length <= MAX_IOVECS.
-    /// `guards` is an array of Option<GuardBox> to move into the entry.
+    /// `guards` is an array of `Option<GuardBox>` to move into the entry.
     /// `guard_count` is the number of Some guards.
     pub fn allocate(
         &mut self,
@@ -102,6 +102,7 @@ impl InFlightSendSlab {
     /// Advance past `bytes_sent` bytes in the iovec array.
     /// Returns `Some(msghdr_ptr)` if there are remaining bytes to send (partial resubmit).
     /// Returns `None` if all data has been sent.
+    #[allow(clippy::mut_range_bound)]
     pub fn try_advance(&mut self, idx: u16, bytes_sent: u32) -> Option<*const libc::msghdr> {
         let entry = &mut self.entries[idx as usize];
         debug_assert!(entry.in_use);
@@ -145,7 +146,10 @@ impl InFlightSendSlab {
     /// Decrement pending notification count. Returns the new count.
     pub fn dec_pending_notifs(&mut self, idx: u16) -> u8 {
         let entry = &mut self.entries[idx as usize];
-        debug_assert!(entry.pending_notifs > 0, "notification underflow for slab entry {idx}");
+        debug_assert!(
+            entry.pending_notifs > 0,
+            "notification underflow for slab entry {idx}"
+        );
         entry.pending_notifs -= 1;
         entry.pending_notifs
     }
@@ -208,8 +212,8 @@ mod tests {
     use super::*;
     use crate::buffer::fixed::RegionId;
     use crate::guard::SendGuard;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct TestGuard {
         ptr: *const u8,
@@ -245,7 +249,9 @@ mod tests {
             iov_len: 100,
         }];
         let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
-        let (idx, ptr) = slab.allocate(42, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+        let (idx, ptr) = slab
+            .allocate(42, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
         assert_eq!(slab.free_count(), 3);
         assert!(!ptr.is_null());
         assert_eq!(slab.conn_index(idx), 42);
@@ -367,6 +373,9 @@ mod tests {
         let _ = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 10).unwrap();
 
         let guards2: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
-        assert!(slab.allocate(0, &iovecs, u16::MAX, guards2, 0, 10).is_none());
+        assert!(
+            slab.allocate(0, &iovecs, u16::MAX, guards2, 0, 10)
+                .is_none()
+        );
     }
 }

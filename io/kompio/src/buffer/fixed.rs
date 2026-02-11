@@ -120,9 +120,10 @@ mod tests {
         // Pointer at start
         assert!(reg.validate_region_ptr(rid, ptr, 100).is_ok());
         // Pointer at end
-        assert!(reg
-            .validate_region_ptr(rid, unsafe { ptr.add(4000) }, 96)
-            .is_ok());
+        assert!(
+            reg.validate_region_ptr(rid, unsafe { ptr.add(4000) }, 96)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -134,9 +135,10 @@ mod tests {
         let rid = reg.region_id(0).unwrap();
 
         // Past end
-        assert!(reg
-            .validate_region_ptr(rid, unsafe { ptr.add(4000) }, 200)
-            .is_err());
+        assert!(
+            reg.validate_region_ptr(rid, unsafe { ptr.add(4000) }, 200)
+                .is_err()
+        );
     }
 
     #[test]

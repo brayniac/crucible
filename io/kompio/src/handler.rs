@@ -110,9 +110,10 @@ impl<'a> DriverCtx<'a> {
             }
         }
 
-        let (slot, ptr, len) = self.send_copy_pool.copy_in(data).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "send copy pool exhausted")
-        })?;
+        let (slot, ptr, len) = self
+            .send_copy_pool
+            .copy_in(data)
+            .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
         self.ring.submit_send_copied(conn.index, ptr, len, slot)?;
         Ok(())
     }
@@ -178,9 +179,17 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Create socket.
-        let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
         let raw_fd = unsafe {
-            libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+            libc::socket(
+                domain,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
         };
         if raw_fd < 0 {
             self.connections.release(conn_index);
@@ -203,11 +212,15 @@ impl<'a> DriverCtx<'a> {
 
         // Register in the direct file table, then close the original fd.
         if let Err(e) = self.ring.register_files_update(conn_index, &[raw_fd]) {
-            unsafe { libc::close(raw_fd); }
+            unsafe {
+                libc::close(raw_fd);
+            }
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
-        unsafe { libc::close(raw_fd); }
+        unsafe {
+            libc::close(raw_fd);
+        }
 
         // Fill sockaddr_storage for the connect SQE.
         let addrlen = fill_sockaddr_storage(&mut self.connect_addrs[conn_index as usize], &addr);
@@ -271,9 +284,17 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Create socket.
-        let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
         let raw_fd = unsafe {
-            libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+            libc::socket(
+                domain,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
         };
         if raw_fd < 0 {
             self.connections.release(conn_index);
@@ -296,19 +317,22 @@ impl<'a> DriverCtx<'a> {
 
         // Register in the direct file table, then close the original fd.
         if let Err(e) = self.ring.register_files_update(conn_index, &[raw_fd]) {
-            unsafe { libc::close(raw_fd); }
+            unsafe {
+                libc::close(raw_fd);
+            }
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
-        unsafe { libc::close(raw_fd); }
+        unsafe {
+            libc::close(raw_fd);
+        }
 
         // Create TLS client state (buffers ClientHello internally).
-        let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-            .map_err(|e| {
-                let _ = self.ring.register_files_update(conn_index, &[-1]);
-                self.connections.release(conn_index);
-                crate::error::Error::RingSetup(format!("invalid server name: {e}"))
-            })?;
+        let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned()).map_err(|e| {
+            let _ = self.ring.register_files_update(conn_index, &[-1]);
+            self.connections.release(conn_index);
+            crate::error::Error::RingSetup(format!("invalid server name: {e}"))
+        })?;
         tls_table.create_client(conn_index, sni);
 
         // Fill sockaddr_storage for the connect SQE.
@@ -344,9 +368,10 @@ impl<'a> DriverCtx<'a> {
 
     /// Cancel pending operations on a connection.
     pub fn cancel(&mut self, conn: ConnToken) -> io::Result<()> {
-        let cs = self.connections.get_mut(conn.index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "invalid connection")
-        })?;
+        let cs = self
+            .connections
+            .get_mut(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
         if cs.generation != conn.generation {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -389,15 +414,12 @@ impl<'a> DriverCtx<'a> {
             .sec(timeout_ms / 1000)
             .nsec((timeout_ms % 1000) as u32 * 1_000_000);
 
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::Timeout,
-            conn_index,
-            0,
-        );
-        if self.ring.submit_timeout(ts as *const _, ud).is_ok() {
-            if let Some(cs) = self.connections.get_mut(conn_index) {
-                cs.connect_timeout_armed = true;
-            }
+        let ud =
+            crate::completion::UserData::encode(crate::completion::OpTag::Timeout, conn_index, 0);
+        if self.ring.submit_timeout(ts as *const _, ud).is_ok()
+            && let Some(cs) = self.connections.get_mut(conn_index)
+        {
+            cs.connect_timeout_armed = true;
         }
     }
 }
@@ -407,7 +429,13 @@ fn fill_sockaddr_storage(
     storage: &mut libc::sockaddr_storage,
     addr: &SocketAddr,
 ) -> libc::socklen_t {
-    unsafe { std::ptr::write_bytes(storage as *mut _ as *mut u8, 0, std::mem::size_of::<libc::sockaddr_storage>()); }
+    unsafe {
+        std::ptr::write_bytes(
+            storage as *mut _ as *mut u8,
+            0,
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        );
+    }
     match addr {
         SocketAddr::V4(v4) => {
             let sa = storage as *mut _ as *mut libc::sockaddr_in;
@@ -592,14 +620,15 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.total_copy_len,
             )
         }
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "send copy pool exhausted")
-        })?;
-        self.ctx.ring.submit_send_copied(self.conn.index, ptr, len, slot)?;
+        .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+        self.ctx
+            .ring
+            .submit_send_copied(self.conn.index, ptr, len, slot)?;
         Ok(())
     }
 
     /// Mixed copy+guard path: allocate pool slot for copy data, build iovecs, submit SendMsgZc.
+    #[allow(clippy::needless_range_loop)]
     fn submit_with_guards(self) -> io::Result<()> {
         let slot_size = self.ctx.send_copy_pool.slot_size() as usize;
         if self.total_copy_len > slot_size {
@@ -617,9 +646,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                     self.total_copy_len,
                 )
             }
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "send copy pool exhausted")
-            })?;
+            .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
 
             // Now build iovecs. Copy parts point into subranges of the pool slot.
             let mut iovecs = [libc::iovec {
@@ -643,7 +670,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                         // Validate guard region (skip for unregistered heap memory).
                         let region = g.region();
                         if region != crate::buffer::fixed::RegionId::UNREGISTERED {
-                            self.ctx.fixed_buffers
+                            self.ctx
+                                .fixed_buffers
                                 .validate_region_ptr(region, gptr, glen)
                                 .map_err(|e| {
                                     // Release pool slot on error.
@@ -663,14 +691,25 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             // Allocate slab entry (moves guards in).
             let iov_slice = &iovecs[..self.part_count as usize];
             let total_len = self.total_len;
-            let (slab_idx, msg_ptr) = self.ctx.send_slab
-                .allocate(self.conn.index, iov_slice, slot, self.guards, self.guard_count, total_len)
+            let (slab_idx, msg_ptr) = self
+                .ctx
+                .send_slab
+                .allocate(
+                    self.conn.index,
+                    iov_slice,
+                    slot,
+                    self.guards,
+                    self.guard_count,
+                    total_len,
+                )
                 .ok_or_else(|| {
                     self.ctx.send_copy_pool.release(slot);
-                    io::Error::new(io::ErrorKind::Other, "send slab exhausted")
+                    io::Error::other("send slab exhausted")
                 })?;
 
-            self.ctx.ring.submit_send_msg_zc(self.conn.index, msg_ptr, slab_idx)?;
+            self.ctx
+                .ring
+                .submit_send_msg_zc(self.conn.index, msg_ptr, slab_idx)?;
             // Guards have been moved into the slab; prevent double-drop
             // (self.guards are now all None after the move above — the array was moved by value)
             slot
@@ -681,36 +720,43 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 iov_len: 0,
             }; MAX_IOVECS];
             for i in 0..self.part_count as usize {
-                match self.parts[i] {
-                    PartSlot::Guard { guard_idx } => {
-                        let g = self.guards[guard_idx as usize].as_ref().unwrap();
-                        let (gptr, glen) = g.as_ptr_len();
-                        let region = g.region();
-                        if region != crate::buffer::fixed::RegionId::UNREGISTERED {
-                            self.ctx.fixed_buffers
-                                .validate_region_ptr(region, gptr, glen)
-                                .map_err(|e| {
-                                    io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
-                                })?;
-                        }
-                        iovecs[i] = libc::iovec {
-                            iov_base: gptr as *mut _,
-                            iov_len: glen as usize,
-                        };
+                if let PartSlot::Guard { guard_idx } = self.parts[i] {
+                    let g = self.guards[guard_idx as usize].as_ref().unwrap();
+                    let (gptr, glen) = g.as_ptr_len();
+                    let region = g.region();
+                    if region != crate::buffer::fixed::RegionId::UNREGISTERED {
+                        self.ctx
+                            .fixed_buffers
+                            .validate_region_ptr(region, gptr, glen)
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+                            })?;
                     }
-                    _ => {}
+                    iovecs[i] = libc::iovec {
+                        iov_base: gptr as *mut _,
+                        iov_len: glen as usize,
+                    };
                 }
             }
 
             let iov_slice = &iovecs[..self.part_count as usize];
             let total_len = self.total_len;
-            let (slab_idx, msg_ptr) = self.ctx.send_slab
-                .allocate(self.conn.index, iov_slice, u16::MAX, self.guards, self.guard_count, total_len)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::Other, "send slab exhausted")
-                })?;
+            let (slab_idx, msg_ptr) = self
+                .ctx
+                .send_slab
+                .allocate(
+                    self.conn.index,
+                    iov_slice,
+                    u16::MAX,
+                    self.guards,
+                    self.guard_count,
+                    total_len,
+                )
+                .ok_or_else(|| io::Error::other("send slab exhausted"))?;
 
-            self.ctx.ring.submit_send_msg_zc(self.conn.index, msg_ptr, slab_idx)?;
+            self.ctx
+                .ring
+                .submit_send_msg_zc(self.conn.index, msg_ptr, slab_idx)?;
             return Ok(());
         };
 
@@ -734,12 +780,7 @@ pub trait EventHandler: Send + 'static {
 
     /// Send operation completed (the operation CQE, not the ZC notification).
     /// Reports the total original length on success.
-    fn on_send_complete(
-        &mut self,
-        ctx: &mut DriverCtx,
-        conn: ConnToken,
-        result: io::Result<u32>,
-    );
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>);
 
     /// Connection closed (by peer, error, or explicit close).
     fn on_close(&mut self, ctx: &mut DriverCtx, conn: ConnToken);

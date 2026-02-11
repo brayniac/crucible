@@ -64,11 +64,10 @@ fn load_tls_config() -> Arc<rustls::ServerConfig> {
     let cert_pem = std::env::var("TLS_CERT").unwrap_or_else(|_| "cert.pem".into());
     let key_pem = std::env::var("TLS_KEY").unwrap_or_else(|_| "key.pem".into());
 
-    let certs: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_file_iter(&cert_pem)
-            .unwrap_or_else(|e| panic!("failed to read {cert_pem}: {e}"))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap_or_else(|e| panic!("failed to parse certs from {cert_pem}: {e}"));
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_pem)
+        .unwrap_or_else(|e| panic!("failed to read {cert_pem}: {e}"))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| panic!("failed to parse certs from {cert_pem}: {e}"));
 
     if certs.is_empty() {
         panic!("no certificates found in {cert_pem}");
@@ -104,8 +103,8 @@ fn main() {
     eprintln!("starting TLS echo server on {bind_addr}");
     eprintln!("test with: openssl s_client -connect {bind_addr}");
 
-    let (_shutdown, handles) = kompio::launch::<EchoHandler>(config, &bind_addr)
-        .expect("failed to launch workers");
+    let (_shutdown, handles) =
+        kompio::launch::<EchoHandler>(config, &bind_addr).expect("failed to launch workers");
 
     for handle in handles {
         if let Err(e) = handle.join().expect("worker thread panicked") {

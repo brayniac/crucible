@@ -1,8 +1,8 @@
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use io_uring::cqueue;
@@ -75,15 +75,10 @@ impl<H: EventHandler> EventLoop<H> {
         ring.register_buf_ring(&provided_bufs)?;
 
         let connections = ConnectionTable::new(config.max_connections);
-        let send_copy_pool = SendCopyPool::new(
-            config.send_copy_count,
-            config.send_copy_slot_size,
-        );
+        let send_copy_pool = SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
-        let accumulators = AccumulatorTable::new(
-            config.max_connections,
-            config.recv_accumulator_capacity,
-        );
+        let accumulators =
+            AccumulatorTable::new(config.max_connections, config.recv_accumulator_capacity);
 
         // Deadline flush: disabled when SQPOLL (kernel polls SQ) or interval is 0.
         let flush_interval = if config.sqpoll || config.flush_interval_us == 0 {
@@ -100,7 +95,10 @@ impl<H: EventHandler> EventLoop<H> {
                 Some(crate::tls::TlsTable::new(
                     config.max_connections,
                     config.tls.as_ref().map(|tc| tc.server_config.clone()),
-                    config.tls_client.as_ref().map(|tc| tc.client_config.clone()),
+                    config
+                        .tls_client
+                        .as_ref()
+                        .map(|tc| tc.client_config.clone()),
                 ))
             } else {
                 None
@@ -110,10 +108,15 @@ impl<H: EventHandler> EventLoop<H> {
         let tls_scratch = vec![0u8; 16384];
 
         let mut connect_addrs = Vec::with_capacity(config.max_connections as usize);
-        connect_addrs.resize(config.max_connections as usize, unsafe { std::mem::zeroed() });
+        connect_addrs.resize(config.max_connections as usize, unsafe {
+            std::mem::zeroed()
+        });
 
         let mut connect_timespecs = Vec::with_capacity(config.max_connections as usize);
-        connect_timespecs.resize(config.max_connections as usize, io_uring::types::Timespec::new());
+        connect_timespecs.resize(
+            config.max_connections as usize,
+            io_uring::types::Timespec::new(),
+        );
 
         Ok(EventLoop {
             ring,
@@ -145,7 +148,8 @@ impl<H: EventHandler> EventLoop<H> {
     /// Run the event loop. This blocks the current thread.
     pub fn run(&mut self) -> Result<(), crate::error::Error> {
         // Always arm eventfd read — needed for shutdown wakeup even in client-only mode.
-        self.ring.submit_eventfd_read(self.eventfd, self.eventfd_buf.as_mut_ptr())?;
+        self.ring
+            .submit_eventfd_read(self.eventfd, self.eventfd_buf.as_mut_ptr())?;
 
         // Kick the eventfd so the first submit_and_wait(1) returns immediately.
         // Without this, client-only mode (no acceptor) would deadlock because
@@ -153,11 +157,7 @@ impl<H: EventHandler> EventLoop<H> {
         // In server mode this causes one harmless handle_eventfd_read at startup.
         let kick: u64 = 1;
         unsafe {
-            libc::write(
-                self.eventfd,
-                &kick as *const u64 as *const libc::c_void,
-                8,
-            );
+            libc::write(self.eventfd, &kick as *const u64 as *const libc::c_void, 8);
         }
 
         loop {
@@ -221,7 +221,8 @@ impl<H: EventHandler> EventLoop<H> {
             {
                 let cq = self.ring.ring.completion();
                 for cqe in cq {
-                    self.cqe_batch.push((cqe.user_data(), cqe.result(), cqe.flags()));
+                    self.cqe_batch
+                        .push((cqe.user_data(), cqe.result(), cqe.flags()));
                 }
             }
 
@@ -292,7 +293,8 @@ impl<H: EventHandler> EventLoop<H> {
         {
             let cq = self.ring.ring.completion();
             for cqe in cq {
-                self.cqe_batch.push((cqe.user_data(), cqe.result(), cqe.flags()));
+                self.cqe_batch
+                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
         }
 
@@ -384,7 +386,7 @@ impl<H: EventHandler> EventLoop<H> {
 
         // TLS path
         #[cfg(feature = "tls")]
-        let is_tls_conn = self.tls_table.as_ref().map_or(false, |t| t.has(conn_index));
+        let is_tls_conn = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
         #[cfg(not(feature = "tls"))]
         let is_tls_conn = false;
 
@@ -404,7 +406,9 @@ impl<H: EventHandler> EventLoop<H> {
 
                 match result {
                     crate::tls::TlsRecvResult::HandshakeJustCompleted => {
-                        let is_outbound = self.connections.get(conn_index)
+                        let is_outbound = self
+                            .connections
+                            .get(conn_index)
                             .map(|c| c.outbound)
                             .unwrap_or(false);
 
@@ -511,12 +515,11 @@ impl<H: EventHandler> EventLoop<H> {
             );
         }
 
-        if !has_more {
-            if let Some(conn) = self.connections.get(conn_index) {
-                if matches!(conn.recv_mode, RecvMode::Multi) {
-                    let _ = self.ring.submit_multishot_recv(conn_index);
-                }
-            }
+        if !has_more
+            && let Some(conn) = self.connections.get(conn_index)
+            && matches!(conn.recv_mode, RecvMode::Multi)
+        {
+            let _ = self.ring.submit_multishot_recv(conn_index);
         }
     }
 
@@ -531,7 +534,9 @@ impl<H: EventHandler> EventLoop<H> {
             let conn_index = match self.connections.allocate() {
                 Some(idx) => idx,
                 None => {
-                    unsafe { libc::close(raw_fd); }
+                    unsafe {
+                        libc::close(raw_fd);
+                    }
                     continue;
                 }
             };
@@ -542,12 +547,20 @@ impl<H: EventHandler> EventLoop<H> {
             }
 
             // Register the fd in the direct file table, then close the original.
-            if self.ring.register_files_update(conn_index, &[raw_fd]).is_err() {
+            if self
+                .ring
+                .register_files_update(conn_index, &[raw_fd])
+                .is_err()
+            {
                 self.connections.release(conn_index);
-                unsafe { libc::close(raw_fd); }
+                unsafe {
+                    libc::close(raw_fd);
+                }
                 continue;
             }
-            unsafe { libc::close(raw_fd); }
+            unsafe {
+                libc::close(raw_fd);
+            }
 
             // Reset accumulator for this connection.
             self.accumulators.reset(conn_index);
@@ -557,11 +570,11 @@ impl<H: EventHandler> EventLoop<H> {
 
             // TLS path: create TLS state and defer on_accept until handshake completes.
             #[cfg(feature = "tls")]
-            if let Some(ref mut tls_table) = self.tls_table {
-                if tls_table.has_server_config() {
-                    tls_table.create(conn_index);
-                    continue; // skip on_accept — deferred until handshake completes
-                }
+            if let Some(ref mut tls_table) = self.tls_table
+                && tls_table.has_server_config()
+            {
+                tls_table.create(conn_index);
+                continue; // skip on_accept — deferred until handshake completes
             }
 
             // Plaintext path: mark established and call on_accept immediately.
@@ -591,7 +604,9 @@ impl<H: EventHandler> EventLoop<H> {
 
         // Re-arm eventfd read, unless shutdown was requested.
         if !self.shutdown_flag.load(Ordering::Relaxed) {
-            let _ = self.ring.submit_eventfd_read(self.eventfd, self.eventfd_buf.as_mut_ptr());
+            let _ = self
+                .ring
+                .submit_eventfd_read(self.eventfd, self.eventfd_buf.as_mut_ptr());
         }
     }
 
@@ -600,8 +615,12 @@ impl<H: EventHandler> EventLoop<H> {
         let pool_slot = ud.payload() as u16;
 
         if result > 0 {
-            if let Some((ptr, remaining)) = self.send_copy_pool.try_advance(pool_slot, result as u32) {
-                let _ = self.ring.submit_send_copied(conn_index, ptr, remaining, pool_slot);
+            if let Some((ptr, remaining)) =
+                self.send_copy_pool.try_advance(pool_slot, result as u32)
+            {
+                let _ = self
+                    .ring
+                    .submit_send_copied(conn_index, ptr, remaining, pool_slot);
                 return;
             }
             let total = self.send_copy_pool.original_len(pool_slot);
@@ -689,12 +708,14 @@ impl<H: EventHandler> EventLoop<H> {
 
         self.send_slab.inc_pending_notifs(slab_idx);
 
-        if result > 0 {
-            if let Some(msg_ptr) = self.send_slab.try_advance(slab_idx, result as u32) {
-                if self.ring.submit_send_msg_zc(conn_index, msg_ptr, slab_idx).is_ok() {
-                    return;
-                }
-            }
+        if result > 0
+            && let Some(msg_ptr) = self.send_slab.try_advance(slab_idx, result as u32)
+            && self
+                .ring
+                .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+                .is_ok()
+        {
+            return;
         }
 
         self.send_slab.mark_awaiting_notifications(slab_idx);
@@ -756,7 +777,9 @@ impl<H: EventHandler> EventLoop<H> {
 
             // ECANCELED and no timeout armed = user-initiated cancel.
             if errno == libc::ECANCELED {
-                let timeout_armed = self.connections.get(conn_index)
+                let timeout_armed = self
+                    .connections
+                    .get(conn_index)
                     .map(|c| c.connect_timeout_armed)
                     .unwrap_or(false);
                 if !timeout_armed {
@@ -791,7 +814,12 @@ impl<H: EventHandler> EventLoop<H> {
             }
 
             // Cancel the timeout if one was armed.
-            if self.connections.get(conn_index).map(|c| c.connect_timeout_armed).unwrap_or(false) {
+            if self
+                .connections
+                .get(conn_index)
+                .map(|c| c.connect_timeout_armed)
+                .unwrap_or(false)
+            {
                 let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, 0);
                 let _ = self.ring.submit_async_cancel(timeout_ud.raw(), conn_index);
                 if let Some(cs) = self.connections.get_mut(conn_index) {
@@ -829,12 +857,16 @@ impl<H: EventHandler> EventLoop<H> {
         }
 
         // Connect succeeded — cancel timeout if armed.
-        let timeout_was_armed = self.connections.get(conn_index)
+        let timeout_was_armed = self
+            .connections
+            .get(conn_index)
             .map(|c| c.connect_timeout_armed)
             .unwrap_or(false);
         if timeout_was_armed {
             // Check if the connection is already closed (timeout already fired).
-            let still_connecting = self.connections.get(conn_index)
+            let still_connecting = self
+                .connections
+                .get(conn_index)
                 .map(|c| matches!(c.recv_mode, RecvMode::Connecting))
                 .unwrap_or(false);
             if !still_connecting {
@@ -856,16 +888,21 @@ impl<H: EventHandler> EventLoop<H> {
 
         // TLS client path
         #[cfg(feature = "tls")]
-        if let Some(ref mut tls_table) = self.tls_table {
-            if tls_table.get_mut(conn_index).is_some() {
-                crate::tls::flush_tls_output(tls_table, &mut self.ring, &mut self.send_copy_pool, conn_index);
+        if let Some(ref mut tls_table) = self.tls_table
+            && tls_table.get_mut(conn_index).is_some()
+        {
+            crate::tls::flush_tls_output(
+                tls_table,
+                &mut self.ring,
+                &mut self.send_copy_pool,
+                conn_index,
+            );
 
-                if let Some(cs) = self.connections.get_mut(conn_index) {
-                    cs.recv_mode = RecvMode::Multi;
-                }
-                let _ = self.ring.submit_multishot_recv(conn_index);
-                return;
+            if let Some(cs) = self.connections.get_mut(conn_index) {
+                cs.recv_mode = RecvMode::Multi;
             }
+            let _ = self.ring.submit_multishot_recv(conn_index);
+            return;
         }
 
         // Plaintext path
@@ -899,7 +936,7 @@ impl<H: EventHandler> EventLoop<H> {
 
         // Timeout fired (result == -ETIME) means the connect timed out.
         // If result == -ECANCELED, the timeout was cancelled (connect succeeded first).
-        if result != -(libc::ETIME as i32) {
+        if result != -libc::ETIME {
             return;
         }
 
@@ -957,7 +994,9 @@ impl<H: EventHandler> EventLoop<H> {
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
-        let was_established = self.connections.get(conn_index)
+        let was_established = self
+            .connections
+            .get(conn_index)
             .map(|c| c.established)
             .unwrap_or(false);
 
@@ -1002,11 +1041,14 @@ impl<H: EventHandler> EventLoop<H> {
         let conn_index = ud.conn_index();
         let pool_slot = ud.payload() as u16;
 
-        if result > 0 {
-            if let Some((ptr, remaining)) = self.send_copy_pool.try_advance(pool_slot, result as u32) {
-                let _ = self.ring.submit_tls_send(conn_index, ptr, remaining, pool_slot);
-                return;
-            }
+        if result > 0
+            && let Some((ptr, remaining)) =
+                self.send_copy_pool.try_advance(pool_slot, result as u32)
+        {
+            let _ = self
+                .ring
+                .submit_tls_send(conn_index, ptr, remaining, pool_slot);
+            return;
         }
         self.send_copy_pool.release(pool_slot);
     }
@@ -1025,6 +1067,7 @@ impl<H: EventHandler> EventLoop<H> {
 }
 
 /// Free function for borrow-splitting: calls handler.on_data with disjoint borrows.
+#[allow(clippy::too_many_arguments)]
 fn call_on_data<H: EventHandler>(
     handler: &mut H,
     accumulators: &mut AccumulatorTable,
@@ -1053,7 +1096,7 @@ fn call_on_data<H: EventHandler>(
         send_slab,
         #[cfg(feature = "tls")]
         tls_table: match tls_table {
-            Some(ref mut t) => t as *mut crate::tls::TlsTable,
+            Some(t) => t as *mut crate::tls::TlsTable,
             None => std::ptr::null_mut(),
         },
         shutdown_requested: shutdown_local,

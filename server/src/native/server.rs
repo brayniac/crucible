@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use super::handler::{HandlerConfig, ServerHandler, init_config_channel, launch_lock, wait_for_workers};
+use super::handler::{
+    HandlerConfig, ServerHandler, init_config_channel, launch_lock, wait_for_workers,
+};
 
 /// Run the native runtime server.
 pub fn run<C: Cache + 'static>(
@@ -147,8 +149,7 @@ pub fn run<C: Cache + 'static>(
     if active_conns > 0 {
         warn!(
             active_connections = active_conns,
-            "Drain timeout reached, {} connections still active",
-            active_conns
+            "Drain timeout reached, {} connections still active", active_conns
         );
     }
 
@@ -166,8 +167,7 @@ pub fn run<C: Cache + 'static>(
 
 /// Diagnostics thread that periodically reports per-worker stats.
 fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
-    let mut prev_snapshots: Vec<WorkerStatsSnapshot> =
-        stats.iter().map(|s| s.snapshot()).collect();
+    let mut prev_snapshots: Vec<WorkerStatsSnapshot> = stats.iter().map(|s| s.snapshot()).collect();
     let mut last_report = Instant::now();
     let report_interval = Duration::from_secs(10);
 
@@ -177,8 +177,7 @@ fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
         std::thread::sleep(Duration::from_secs(1));
 
         if last_report.elapsed() >= report_interval {
-            let current: Vec<WorkerStatsSnapshot> =
-                stats.iter().map(|s| s.snapshot()).collect();
+            let current: Vec<WorkerStatsSnapshot> = stats.iter().map(|s| s.snapshot()).collect();
 
             eprintln!(
                 "\n[diagnostics] === Worker Stats (last {}s) ===",
@@ -186,13 +185,18 @@ fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
             );
             eprintln!(
                 "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
-                "worker", "polls", "accepts", "closes", "recv", "send_rdy",
-                "bytes_in", "bytes_out", "conns"
+                "worker",
+                "polls",
+                "accepts",
+                "closes",
+                "recv",
+                "send_rdy",
+                "bytes_in",
+                "bytes_out",
+                "conns"
             );
 
-            for (i, (curr, prev)) in
-                current.iter().zip(prev_snapshots.iter()).enumerate()
-            {
+            for (i, (curr, prev)) in current.iter().zip(prev_snapshots.iter()).enumerate() {
                 let delta = curr.delta(prev);
                 eprintln!(
                     "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",

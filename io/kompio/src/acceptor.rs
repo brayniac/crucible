@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::Sender;
 
@@ -91,12 +91,17 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 continue;
             }
 
-            if config.worker_channels[worker_idx].send((fd, peer_addr)).is_err() {
+            if config.worker_channels[worker_idx]
+                .send((fd, peer_addr))
+                .is_err()
+            {
                 // Worker has exited — mark dead.
                 alive[worker_idx] = false;
                 alive_count -= 1;
                 if alive_count == 0 {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                     return;
                 }
                 continue;
@@ -117,7 +122,9 @@ pub fn run_acceptor(config: AcceptorConfig) {
 
         if !sent {
             // All workers dead.
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return;
         }
     }

@@ -2,11 +2,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OpTag {
-    RecvMulti   = 0,
-    Send        = 2,
-    SendMsgZc   = 3,
-    Close       = 4,
-    Shutdown    = 5,
+    RecvMulti = 0,
+    Send = 2,
+    SendMsgZc = 3,
+    Close = 4,
+    Shutdown = 5,
     EventFdRead = 6,
     /// TLS-internal send (handshake, alert). Releases pool slot, no user callback.
     #[cfg(feature = "tls")]

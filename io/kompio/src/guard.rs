@@ -112,8 +112,8 @@ fn vtable_for<G: SendGuard>() -> &'static GuardVTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct TestGuard {
         ptr: *const u8,

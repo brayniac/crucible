@@ -86,7 +86,9 @@ fn run_with_cache<C: Cache>(
 
     // Rate limiter
     let ratelimiter = if config.workload.rate_limit > 0 {
-        Some(Arc::new(DynamicRateLimiter::new(config.workload.rate_limit)))
+        Some(Arc::new(DynamicRateLimiter::new(
+            config.workload.rate_limit,
+        )))
     } else {
         None
     };
@@ -394,7 +396,9 @@ fn print_latency_summary(label: &str, hist: &AtomicHistogram) {
 // --- Cache constructors ---
 
 fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
-    use segcache::{DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache, SyncMode};
+    use segcache::{
+        DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache, SyncMode,
+    };
 
     let mut builder = SegCache::builder()
         .heap_size(config.cache.heap_size)

@@ -20,8 +20,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
 /// Request ID counter.
@@ -210,7 +210,6 @@ impl ProxyHandler {
 
         // Parse responses - we need to work with the backend through the pool
         while let Some(backend) = self.backend_pool.get_connection_mut(conn) {
-
             let recv_data = &backend.recv_buf[..];
             if recv_data.is_empty() {
                 break;
@@ -221,9 +220,9 @@ impl ProxyHandler {
                     BACKEND_RESPONSES.increment();
 
                     // Get request info before mutating
-                    let request_info = backend.oldest_request().map(|req| {
-                        (req.request_id, req.client, req.cacheable, req.key.clone())
-                    });
+                    let request_info = backend
+                        .oldest_request()
+                        .map(|req| (req.request_id, req.client, req.cacheable, req.key.clone()));
 
                     if let Some((request_id, client_token, cacheable, key)) = request_info {
                         let response_bytes = recv_data[..consumed].to_vec();
@@ -454,12 +453,7 @@ impl EventHandler for ProxyHandler {
         n // Always consume all data (we copy to internal buffers)
     }
 
-    fn on_send_complete(
-        &mut self,
-        ctx: &mut DriverCtx,
-        conn: ConnToken,
-        result: io::Result<u32>,
-    ) {
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
         if result.is_err() {
             return;
         }

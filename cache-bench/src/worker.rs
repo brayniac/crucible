@@ -120,11 +120,11 @@ pub fn run_worker<C: Cache>(
         }
 
         // Rate limiting
-        if let Some(rl) = ratelimiter {
-            if !rl.try_acquire() {
-                std::hint::spin_loop();
-                continue;
-            }
+        if let Some(rl) = ratelimiter
+            && !rl.try_acquire()
+        {
+            std::hint::spin_loop();
+            continue;
         }
 
         // Generate random key

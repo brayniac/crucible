@@ -2,7 +2,7 @@ use std::io;
 use std::os::fd::RawFd;
 
 use io_uring::types::{Fd, Fixed};
-use io_uring::{opcode, IoUring};
+use io_uring::{IoUring, opcode};
 
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::buffer::provided::ProvidedBufRing;
@@ -19,7 +19,10 @@ pub struct Ring {
 impl Ring {
     /// Create and configure the io_uring instance.
     pub fn setup(config: &Config) -> io::Result<Self> {
-        let cq_entries = config.sq_entries.checked_mul(4).unwrap_or(config.sq_entries);
+        let cq_entries = config
+            .sq_entries
+            .checked_mul(4)
+            .unwrap_or(config.sq_entries);
 
         let mut builder = IoUring::builder();
         builder.setup_cqsize(cq_entries);
@@ -65,9 +68,7 @@ impl Ring {
 
     /// Update registered file table at given offset.
     pub fn register_files_update(&self, offset: u32, fds: &[RawFd]) -> io::Result<()> {
-        self.ring
-            .submitter()
-            .register_files_update(offset, fds)?;
+        self.ring.submitter().register_files_update(offset, fds)?;
         Ok(())
     }
 
@@ -176,11 +177,7 @@ impl Ring {
     }
 
     /// Submit an eventfd read (8 bytes).
-    pub fn submit_eventfd_read(
-        &mut self,
-        eventfd: RawFd,
-        buf: *mut u8,
-    ) -> io::Result<()> {
+    pub fn submit_eventfd_read(&mut self, eventfd: RawFd, buf: *mut u8) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::EventFdRead, 0, 0);
         let entry = opcode::Read::new(Fd(eventfd), buf, 8)
             .build()
@@ -254,7 +251,7 @@ impl Ring {
     /// Submit a shutdown(SHUT_WR) for a connection.
     pub fn submit_shutdown(&mut self, conn_index: u32) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Shutdown, conn_index, 0);
-        let entry = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_WR as i32)
+        let entry = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_WR)
             .build()
             .user_data(user_data.raw());
         unsafe {
@@ -265,7 +262,9 @@ impl Ring {
 
     /// Submit all pending SQEs and wait for at least `min_complete` CQEs.
     pub fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
-        self.ring.submitter().submit_and_wait(min_complete as usize)?;
+        self.ring
+            .submitter()
+            .submit_and_wait(min_complete as usize)?;
         Ok(())
     }
 
@@ -287,7 +286,7 @@ impl Ring {
                 self.ring
                     .submission()
                     .push(&entry)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ still full after submit"))?;
+                    .map_err(|_| io::Error::other("SQ still full after submit"))?;
             }
         }
         Ok(())

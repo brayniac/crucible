@@ -12,9 +12,7 @@ fn main() {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.expect("failed to read stdin");
-        stream
-            .write_all(line.as_bytes())
-            .expect("failed to send");
+        stream.write_all(line.as_bytes()).expect("failed to send");
         stream.write_all(b"\n").expect("failed to send newline");
 
         let mut buf = vec![0u8; line.len() + 1];

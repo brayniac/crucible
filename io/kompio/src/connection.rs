@@ -28,6 +28,12 @@ pub struct ConnectionState {
     pub connect_timeout_armed: bool,
 }
 
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionState {
     pub fn new() -> Self {
         ConnectionState {
