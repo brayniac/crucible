@@ -226,10 +226,10 @@ fn run_benchmark(
     };
 
     // Launch kompio workers (client-only, no bind)
-    tracing::info!(num_threads, "launching kompio workers");
+    tracing::debug!(num_threads, "launching kompio workers");
     let (shutdown_handle, handles) =
         KompioBuilder::new(kompio_config).launch::<benchmark::worker::BenchHandler>()?;
-    tracing::info!(workers = handles.len(), "kompio workers launched");
+    tracing::debug!(workers = handles.len(), "kompio workers launched");
 
     // Start in prefill or warmup phase
     if prefill_enabled {
@@ -255,7 +255,11 @@ fn run_benchmark(
         if errors.is_empty() {
             return Err("all worker threads exited immediately with no error".into());
         }
-        return Err(format!("all workers failed during startup:\n  {}", errors.join("\n  ")).into());
+        return Err(format!(
+            "all workers failed during startup:\n  {}",
+            errors.join("\n  ")
+        )
+        .into());
     }
 
     // Main thread: reporting loop

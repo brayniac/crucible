@@ -705,7 +705,7 @@ impl BenchHandler {
 
 impl EventHandler for BenchHandler {
     fn create_for_worker(worker_id: usize) -> Self {
-        tracing::info!(worker_id, "worker thread starting create_for_worker");
+        tracing::debug!(worker_id, "worker thread starting create_for_worker");
         let cfg = recv_config();
         if let Some(ref ids) = cfg.cpu_ids
             && !ids.is_empty()
@@ -801,7 +801,7 @@ impl EventHandler for BenchHandler {
             bytes_received: 0,
             send_failures: 0,
         };
-        tracing::info!(
+        tracing::debug!(
             worker_id = result.id,
             sessions = result.sessions.len(),
             my_connections = result.my_connections,
@@ -944,7 +944,7 @@ impl EventHandler for BenchHandler {
                 let connected = self.sessions.iter().filter(|s| s.is_connected()).count();
                 let total_in_flight: usize =
                     self.sessions.iter().map(|s| s.in_flight_count()).sum();
-                tracing::info!(
+                tracing::debug!(
                     worker = self.id,
                     connected,
                     total_sessions = self.sessions.len(),
@@ -987,10 +987,7 @@ impl EventHandler for BenchHandler {
         self.tick_count += 1;
         if self.last_diag.elapsed() >= std::time::Duration::from_secs(2) {
             let connected = self.sessions.iter().filter(|s| s.is_connected()).count();
-            let total_in_flight: usize =
-                self.sessions.iter().map(|s| s.in_flight_count()).sum();
-            let pending_parts: usize =
-                self.sessions.iter().filter(|s| s.has_pending_parts()).count();
+            let total_in_flight: usize = self.sessions.iter().map(|s| s.in_flight_count()).sum();
             let can_send_count = self.sessions.iter().filter(|s| s.can_send()).count();
             tracing::trace!(
                 worker = self.id,
@@ -998,7 +995,6 @@ impl EventHandler for BenchHandler {
                 recording = self.recording,
                 connected,
                 total_in_flight,
-                pending_parts_sessions = pending_parts,
                 can_send = can_send_count,
                 ticks = self.tick_count,
                 reqs_driven = self.requests_driven,

@@ -203,7 +203,10 @@ pub fn launch<H: EventHandler>(config: Config, bind_addr: &str) -> LaunchResult 
 /// immediately after `register_files_update` — so they don't consume process
 /// FD table entries. We only need headroom for ring fds, eventfds, the listen
 /// socket, stdin/stdout/stderr, etc.
-fn ensure_nofile_limit(max_connections: u32, num_workers: usize) -> Result<(), crate::error::Error> {
+fn ensure_nofile_limit(
+    max_connections: u32,
+    num_workers: usize,
+) -> Result<(), crate::error::Error> {
     let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
     if ret != 0 {
