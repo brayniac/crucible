@@ -77,7 +77,7 @@ impl Default for Config {
             registered_regions: Vec::new(),
             worker: WorkerConfig::default(),
             backlog: 1024,
-            max_connections: 16384,
+            max_connections: 16000,
             recv_accumulator_capacity: 65536,
             send_copy_count: 1024,
             send_copy_slot_size: 16384,
