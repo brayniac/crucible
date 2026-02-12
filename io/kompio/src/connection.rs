@@ -105,6 +105,9 @@ impl ConnectionTable {
     /// Release a connection slot back to the free list.
     pub fn release(&mut self, idx: u32) {
         if (idx as usize) < self.slots.len() {
+            if !self.slots[idx as usize].active {
+                return; // Already released — avoid double-push to free list
+            }
             self.slots[idx as usize].deactivate();
             self.free_list.push(idx);
         }
@@ -127,7 +130,7 @@ impl ConnectionTable {
 
     /// Number of active connections.
     pub fn active_count(&self) -> usize {
-        self.slots.len() - self.free_list.len()
+        self.slots.len().saturating_sub(self.free_list.len())
     }
 
     /// Total number of connection slots (max_connections).

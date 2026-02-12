@@ -198,13 +198,13 @@ impl HashSlot {
         }
     }
 
-    /// Get the current generation.
+    /// Get the current generation (masked to 9 bits for TypedLocation compatibility).
     #[inline]
     pub fn generation(&self) -> u16 {
-        self.generation.load(Ordering::Acquire)
+        self.generation.load(Ordering::Acquire) & 0x1FF
     }
 
-    /// Increment generation (wraps at 9 bits for TypedLocation compatibility).
+    /// Increment generation (wraps at 9 bits via mask in `generation()`).
     #[inline]
     fn increment_generation(&self) {
         self.generation.fetch_add(1, Ordering::Release);

@@ -35,7 +35,7 @@ pub struct Slot {
     /// Writers must wait for this to reach 0 before dropping the entry.
     readers: AtomicU32,
 
-    /// Generation counter (12 bits used). Incremented when slot is cleared.
+    /// Generation counter (9 bits used). Incremented when slot is cleared.
     /// Provides ABA protection - stale SlotLocations will have wrong generation.
     generation: AtomicU32,
 
@@ -56,13 +56,13 @@ impl Slot {
         }
     }
 
-    /// Get the current generation (12-bit value).
+    /// Get the current generation (9-bit value, matching TypedLocation MAX_GENERATION).
     #[inline]
     pub fn generation(&self) -> u16 {
-        (self.generation.load(Ordering::Acquire) & 0xFFF) as u16
+        (self.generation.load(Ordering::Acquire) & 0x1FF) as u16
     }
 
-    /// Increment generation (wraps at 12 bits).
+    /// Increment generation (wraps at 9 bits via mask in `generation()`).
     #[inline]
     fn increment_generation(&self) {
         self.generation.fetch_add(1, Ordering::Release);
