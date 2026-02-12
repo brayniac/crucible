@@ -534,6 +534,77 @@ impl Session {
         Some(id)
     }
 
+    /// Encode a SET command's framing (prefix + suffix) for guard-based zero-copy sends.
+    ///
+    /// Unlike `set()`, this does NOT write the value bytes into the send buffer.
+    /// Instead it writes just the protocol framing into `prefix_buf` and returns
+    /// a static suffix slice. The caller is responsible for sending the three parts
+    /// (prefix, value guard, suffix) via `ctx.send_parts()`.
+    ///
+    /// The in-flight request is tracked with `sent_at = Some(now)` because it will
+    /// be submitted to the kernel immediately via `send_parts()`.
+    ///
+    /// Returns `Some((request_id, suffix_bytes))` on success, `None` if the pipeline
+    /// is full.
+    #[inline]
+    pub fn encode_set_guard(
+        &mut self,
+        prefix_buf: &mut Vec<u8>,
+        key: &[u8],
+        value_len: usize,
+        now: Instant,
+    ) -> Option<(u64, &'static [u8])> {
+        if !self.can_send() {
+            return None;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        prefix_buf.clear();
+        let suffix: &'static [u8] = match &mut self.codec {
+            ProtocolCodec::Resp(_codec) => {
+                encode_resp_set_prefix(prefix_buf, key, value_len);
+                b"\r\n"
+            }
+            ProtocolCodec::Memcache(codec) => {
+                encode_memcache_set_prefix(prefix_buf, key, value_len, 0, 0);
+                codec.notify_request_sent();
+                b"\r\n"
+            }
+            ProtocolCodec::MemcacheBinary(codec) => {
+                let opaque = codec.allocate_opaque();
+                encode_memcache_binary_set_prefix(prefix_buf, key, value_len, 0, 0, opaque);
+                b""
+            }
+            ProtocolCodec::Ping(_codec) => {
+                // Ping protocol doesn't support SET; fall back to nothing
+                return None;
+            }
+        };
+
+        // The total wire bytes for this request: prefix + value + suffix.
+        // Since we're sending via send_parts() (submitted immediately), we set
+        // sent_at to now. bytes_end is set to current bytes_written since this
+        // data doesn't go through the send buffer.
+        self.in_flight.push_back(InFlightRequest {
+            id,
+            request_type: RequestType::Set,
+            queued_at: now,
+            sent_at: Some(now),
+            first_byte_at: None,
+            bytes_end: self.bytes_written,
+            tx_timestamp: None,
+        });
+        self.requests_sent += 1;
+
+        // Track TX bytes for the full message
+        let total_bytes = prefix_buf.len() + value_len + suffix.len();
+        crate::metrics::BYTES_TX.add(total_bytes as u64);
+
+        Some((id, suffix))
+    }
+
     /// Get the send buffer to be written to the socket.
     pub fn send_buffer(&self) -> &[u8] {
         self.buffers.send.as_slice()
@@ -979,3 +1050,78 @@ impl std::fmt::Display for SessionError {
 }
 
 impl std::error::Error for SessionError {}
+
+// ── Guard-based SET framing encoders ─────────────────────────────────────
+
+/// Encode RESP SET prefix into `buf`:
+/// `*3\r\n$3\r\nSET\r\n${keylen}\r\n{key}\r\n${valuelen}\r\n`
+///
+/// The value bytes and trailing `\r\n` are NOT included; the caller sends them
+/// separately via a guard and a copy suffix.
+fn encode_resp_set_prefix(buf: &mut Vec<u8>, key: &[u8], value_len: usize) {
+    use std::io::Write;
+    // *3\r\n$3\r\nSET\r\n
+    buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
+    // ${keylen}\r\n{key}\r\n
+    write!(buf, "${}\r\n", key.len()).unwrap();
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(b"\r\n");
+    // ${valuelen}\r\n
+    write!(buf, "${}\r\n", value_len).unwrap();
+}
+
+/// Encode memcache text SET prefix into `buf`:
+/// `set {key} {flags} {exptime} {valuelen}\r\n`
+///
+/// The value bytes and trailing `\r\n` are NOT included.
+fn encode_memcache_set_prefix(
+    buf: &mut Vec<u8>,
+    key: &[u8],
+    value_len: usize,
+    flags: u32,
+    exptime: u32,
+) {
+    use std::io::Write;
+    buf.extend_from_slice(b"set ");
+    buf.extend_from_slice(key);
+    write!(buf, " {} {} {}\r\n", flags, exptime, value_len).unwrap();
+}
+
+/// Encode memcache binary SET prefix into `buf`:
+/// 24-byte header + 8-byte extras (flags + expiration) + key
+///
+/// The header's `total_body_length` includes the value length so the server
+/// knows how many bytes to expect, but the value bytes themselves are sent
+/// separately via a guard.
+fn encode_memcache_binary_set_prefix(
+    buf: &mut Vec<u8>,
+    key: &[u8],
+    value_len: usize,
+    flags: u32,
+    expiration: u32,
+    opaque: u32,
+) {
+    let extras_len: usize = 8;
+    let total_body = extras_len + key.len() + value_len;
+
+    // 24-byte header
+    let header_start = buf.len();
+    buf.resize(header_start + 24, 0);
+    let hdr = &mut buf[header_start..header_start + 24];
+    hdr[0] = 0x80; // REQUEST_MAGIC
+    hdr[1] = 0x01; // Opcode::Set
+    hdr[2..4].copy_from_slice(&(key.len() as u16).to_be_bytes());
+    hdr[4] = extras_len as u8;
+    hdr[5] = 0; // data_type
+    hdr[6..8].copy_from_slice(&0u16.to_be_bytes()); // vbucket_id
+    hdr[8..12].copy_from_slice(&(total_body as u32).to_be_bytes());
+    hdr[12..16].copy_from_slice(&opaque.to_be_bytes());
+    hdr[16..24].copy_from_slice(&0u64.to_be_bytes()); // cas
+
+    // 8-byte extras (flags + expiration)
+    buf.extend_from_slice(&flags.to_be_bytes());
+    buf.extend_from_slice(&expiration.to_be_bytes());
+
+    // Key
+    buf.extend_from_slice(key);
+}

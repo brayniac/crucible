@@ -14,6 +14,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use kompio::KompioBuilder;
 use metriken::{AtomicHistogram, histogram::Histogram};
+use rand::RngCore;
+use rand_xoshiro::Xoshiro256PlusPlus;
+use rand_xoshiro::rand_core::SeedableRng;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -191,6 +194,21 @@ fn run_benchmark(
         formatter.print_warmup(warmup);
     }
 
+    // Allocate shared value pool: 1GB of random bytes shared across all workers.
+    // Workers pick random offsets into this pool for SET values, avoiding per-worker
+    // copies. The pool is seeded deterministically for reproducibility.
+    let value_pool = {
+        const POOL_SIZE: usize = 1024 * 1024 * 1024; // 1 GB
+        let mut pool = vec![0u8; POOL_SIZE];
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xdeadbeef);
+        // Fill in 8KB chunks for efficiency
+        const CHUNK: usize = 8192;
+        for chunk in pool.chunks_mut(CHUNK) {
+            rng.fill_bytes(chunk);
+        }
+        Arc::new(pool)
+    };
+
     // Set up config channel for kompio workers
     let (config_tx, config_rx) = crossbeam_channel::bounded::<BenchWorkerConfig>(num_threads);
     #[allow(clippy::needless_range_loop)]
@@ -204,12 +222,15 @@ fn run_benchmark(
                 recording: false,
                 prefill_range: prefill_ranges[id].clone(),
                 cpu_ids: cpu_ids.clone(),
+                value_pool: Arc::clone(&value_pool),
             })
             .expect("failed to queue worker config");
     }
     init_config_channel(config_rx);
 
-    // Build kompio config (client-only, no bind)
+    // Build kompio config (client-only, no bind).
+    // With guard-based sends for SET values, the copy pool only holds small
+    // protocol framing data, so the default 16KB slot size is sufficient.
     let kompio_config = kompio::Config {
         recv_buffer: kompio::RecvBufferConfig {
             // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
