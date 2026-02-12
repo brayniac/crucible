@@ -992,7 +992,7 @@ impl EventHandler for BenchHandler {
             let pending_parts: usize =
                 self.sessions.iter().filter(|s| s.has_pending_parts()).count();
             let can_send_count = self.sessions.iter().filter(|s| s.can_send()).count();
-            tracing::info!(
+            tracing::trace!(
                 worker = self.id,
                 phase = ?phase,
                 recording = self.recording,

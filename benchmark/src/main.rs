@@ -431,7 +431,7 @@ fn run_benchmark(
             formatter.print_sample(&sample);
 
             // Diagnostic: absolute counter values to detect data flow
-            tracing::info!(
+            tracing::trace!(
                 responses_total = responses,
                 requests_total = metrics::REQUESTS_SENT.value(),
                 bytes_tx = metrics::BYTES_TX.value(),
