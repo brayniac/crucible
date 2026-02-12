@@ -83,6 +83,10 @@ pub struct SharedState {
     phase: AtomicU8,
     /// Number of workers that have completed prefill
     prefill_complete: AtomicUsize,
+    /// Total number of prefill keys confirmed across all workers
+    prefill_keys_confirmed: AtomicUsize,
+    /// Total number of prefill keys assigned across all workers
+    prefill_keys_total: AtomicUsize,
 }
 
 impl SharedState {
@@ -90,6 +94,8 @@ impl SharedState {
         Self {
             phase: AtomicU8::new(Phase::Connect as u8),
             prefill_complete: AtomicUsize::new(0),
+            prefill_keys_confirmed: AtomicUsize::new(0),
+            prefill_keys_total: AtomicUsize::new(0),
         }
     }
 
@@ -115,6 +121,30 @@ impl SharedState {
     #[inline]
     pub fn prefill_complete_count(&self) -> usize {
         self.prefill_complete.load(Ordering::Acquire)
+    }
+
+    /// Add to the total prefill keys confirmed count.
+    #[inline]
+    pub fn add_prefill_confirmed(&self, n: usize) {
+        self.prefill_keys_confirmed.fetch_add(n, Ordering::Release);
+    }
+
+    /// Get the total prefill keys confirmed across all workers.
+    #[inline]
+    pub fn prefill_keys_confirmed(&self) -> usize {
+        self.prefill_keys_confirmed.load(Ordering::Acquire)
+    }
+
+    /// Add to the total prefill keys assigned count.
+    #[inline]
+    pub fn add_prefill_total(&self, n: usize) {
+        self.prefill_keys_total.fetch_add(n, Ordering::Release);
+    }
+
+    /// Get the total prefill keys assigned across all workers.
+    #[inline]
+    pub fn prefill_keys_total(&self) -> usize {
+        self.prefill_keys_total.load(Ordering::Acquire)
     }
 }
 
@@ -455,10 +485,15 @@ impl BenchHandler {
             if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
                 tracing::debug!("Momento poll error: {}", e);
             }
+            let mut confirmed_batch = 0usize;
             for result in &self.results {
                 if result.request_type == RequestType::Set && result.success {
                     self.prefill_confirmed += 1;
+                    confirmed_batch += 1;
                 }
+            }
+            if confirmed_batch > 0 {
+                self.shared.add_prefill_confirmed(confirmed_batch);
             }
         }
 
@@ -662,16 +697,22 @@ impl BenchHandler {
             return;
         }
 
+        let mut confirmed_batch = 0usize;
         for result in &self.results {
             if result.request_type == RequestType::Set
                 && let Some(key_id) = self.prefill_in_flight[idx].pop_front()
             {
                 if result.success {
                     self.prefill_confirmed += 1;
+                    confirmed_batch += 1;
                 } else {
                     self.prefill_pending.push_back(key_id);
                 }
             }
+        }
+
+        if confirmed_batch > 0 {
+            self.shared.add_prefill_confirmed(confirmed_batch);
         }
 
         if self.prefill_confirmed >= self.prefill_total {
@@ -739,6 +780,7 @@ impl EventHandler for BenchHandler {
             Some(range) => {
                 let pending: std::collections::VecDeque<usize> = (range.start..range.end).collect();
                 let total = range.end - range.start;
+                cfg.shared.add_prefill_total(total);
                 tracing::debug!(
                     worker_id = cfg.id,
                     total,

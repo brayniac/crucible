@@ -1,6 +1,6 @@
 //! JSON (NDJSON) formatter for machine-readable output.
 
-use super::{OutputFormatter, Results, Sample};
+use super::{OutputFormatter, PrefillDiagnostics, Results, Sample};
 use crate::config::Config;
 use serde::Serialize;
 use std::time::Duration;
@@ -151,6 +151,78 @@ impl OutputFormatter for JsonFormatter {
             p999_us: sample.p999_us as u64,
             p9999_us: sample.p9999_us as u64,
             max_us: sample.max_us as u64,
+        };
+
+        if let Ok(json) = serde_json::to_string(&output) {
+            println!("{}", json);
+        }
+    }
+
+    fn print_prefill_progress(&self, confirmed: usize, total: usize, elapsed: std::time::Duration) {
+        #[derive(Serialize)]
+        struct PrefillProgress {
+            #[serde(rename = "type")]
+            msg_type: &'static str,
+            confirmed: usize,
+            total: usize,
+            pct: f64,
+            rate: f64,
+            elapsed_secs: f64,
+        }
+
+        let pct = if total > 0 {
+            (confirmed as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let secs = elapsed.as_secs_f64();
+        let rate = if secs > 0.0 {
+            confirmed as f64 / secs
+        } else {
+            0.0
+        };
+
+        let output = PrefillProgress {
+            msg_type: "prefill_progress",
+            confirmed,
+            total,
+            pct,
+            rate,
+            elapsed_secs: secs,
+        };
+
+        if let Ok(json) = serde_json::to_string(&output) {
+            println!("{}", json);
+        }
+    }
+
+    fn print_prefill_timeout(&self, diag: &PrefillDiagnostics) {
+        #[derive(Serialize)]
+        struct PrefillTimeout {
+            #[serde(rename = "type")]
+            msg_type: &'static str,
+            cause: String,
+            keys_confirmed: usize,
+            keys_total: usize,
+            workers_complete: usize,
+            workers_total: usize,
+            elapsed_secs: f64,
+            conns_active: u64,
+            bytes_rx: u64,
+            requests_sent: u64,
+        }
+
+        let output = PrefillTimeout {
+            msg_type: "prefill_timeout",
+            cause: format!("{}", diag.likely_cause),
+            keys_confirmed: diag.keys_confirmed,
+            keys_total: diag.keys_total,
+            workers_complete: diag.workers_complete,
+            workers_total: diag.workers_total,
+            elapsed_secs: diag.elapsed.as_secs_f64(),
+            conns_active: diag.conns_active,
+            bytes_rx: diag.bytes_rx,
+            requests_sent: diag.requests_sent,
         };
 
         if let Ok(json) = serde_json::to_string(&output) {
