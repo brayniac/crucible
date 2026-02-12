@@ -19,14 +19,19 @@ Crucible is built for **performance-critical deployments where microseconds matt
 
 Tokio is an excellent general-purpose async runtime, but it abstracts away platform-specific capabilities that are essential for cache server performance:
 
-1. **Push-based callback model vs async/await**: Our `kompio` framework uses an `EventHandler` trait with callbacks (`on_data`, `on_accept`, `on_send_complete`, `on_close`, `on_tick`) instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight event loop with predictable behavior.
+1. **Push-based callback model vs async/await**: Our `kompio` framework uses an `EventHandler` trait with callbacks (`on_data`, `on_accept`, `on_connect`, `on_send_complete`, `on_close`, `on_tick`) instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight event loop with predictable behavior.
 
 2. **Direct access to io_uring features**: Tokio's abstractions hide advanced io_uring capabilities that we need:
-   - **Multishot recv/accept**: Single submission, multiple completions without re-submission overhead
-   - **Ring-provided buffers**: Kernel manages buffer pool with zero-copy semantics
-   - **SendMsgZc**: Kernel DMAs directly from user buffers—true zero-copy send
+   - **Multishot recv**: Single submission, multiple completions without re-submission overhead
+   - **Ring-provided buffers**: Kernel-managed buffer pool for recv — the kernel selects buffers at completion time, eliminating pre-submission buffer assignment
+   - **SendMsgZc**: Zero-copy send with scatter-gather — the kernel DMAs directly from application buffers. Cache values are sent without any copies via `SendGuard` references that pin memory until the kernel signals completion
+   - **Fixed file table**: Connections use direct descriptors, eliminating per-syscall fd table lookups
+   - **Dedicated acceptor thread**: A separate thread runs blocking `accept4()` and distributes connections round-robin to workers via channels (multishot accept is on the roadmap)
 
-3. **Explicit buffer lifecycle management**: Zero-copy I/O requires precise control over when buffers can be released. Async/await complicates lifetime management across await points. Our callback model lets us hold buffer ownership until the kernel signals completion.
+3. **End-to-end zero-copy data paths**: The server minimizes copies across the full request/response lifecycle:
+   - **Writes (SET)**: Large values are streamed directly into cache segment memory via `SegmentReservation` — data goes from the kernel recv buffer straight into the cache with a single copy, no intermediate application buffers
+   - **Reads (GET)**: Values are read from cache segments via `ValueRef` (reference-counted, no copy), converted to `Bytes`, and sent via `SendMsgZc` with `SendGuard` — zero copies from cache to kernel
+   - **Buffer lifecycle**: Our callback model provides precise control over when buffers can be released. `SendGuard` references pin cache memory until the kernel signals send completion via the ZC notification CQE
 
 4. **Thread-per-core with CPU pinning**: Workers are pinned to specific cores, keeping hot data in CPU cache. Tokio's work-stealing scheduler moves tasks between threads, invalidating caches and adding unpredictable latency.
 
@@ -43,19 +48,16 @@ The benchmark needs to measure latency accurately without introducing measuremen
 
 The admin/metrics server within the benchmark *does* use Tokio—it's isolated on a separate thread where convenience matters more than latency.
 
-### Native vs Tokio Runtime
+### Runtime Architecture
 
-The server supports both runtimes via configuration:
+The server uses kompio's native io_uring runtime for all cache I/O. Tokio is only used for the admin/metrics HTTP server, which runs on a separate thread where convenience matters more than latency.
 
-| Aspect | Native (default) | Tokio |
-|--------|------------------|-------|
-| Threading | Explicit thread-per-core | Work-stealing pool |
-| I/O | io_uring via kompio (Linux 6.0+) | Tokio reactor (epoll/kqueue) |
-| CPU pinning | Direct, per-worker | Optional callback |
-| Latency | Predictable, low variance | Higher variance from scheduler |
-| Use case | Production, performance-critical | Development, portability |
-
-**Choose native** when performance matters. **Choose Tokio** for portability or when integrating with async ecosystems.
+| Aspect | Cache I/O (kompio) | Admin server (Tokio) |
+|--------|-------------------|---------------------|
+| Threading | Thread-per-core with CPU pinning | Single-threaded Tokio runtime |
+| I/O | io_uring (Linux 6.0+) | Tokio reactor (epoll) |
+| Purpose | Performance-critical cache operations | Metrics, health checks |
+| Isolation | N pinned worker threads | Separate thread, no interference |
 
 ## Build Commands
 
@@ -96,7 +98,7 @@ cargo xtask flamegraph --duration 10 --output profile.svg
 ## Running the Server and Benchmark
 
 ```bash
-# Run cache server with native runtime (io_uring on Linux 6.0+)
+# Run cache server (requires Linux 6.0+ for io_uring)
 ./target/release/crucible-server server/config/example.toml
 
 # Run benchmark against a server
@@ -129,7 +131,7 @@ crucible/
     memcache/   # Memcache ASCII and binary protocols
     momento/    # Momento cache protocol
     ping/       # Simple ping protocol for testing
-  server/       # Cache server binary with native/tokio runtimes
+  server/       # Cache server binary (kompio/io_uring runtime)
   benchmark/    # Benchmark tool binary
   xtask/        # Development tasks (fuzz-all, flamegraph)
   metrics/      # Metrics infrastructure
@@ -144,8 +146,9 @@ The `kompio` crate provides a push-based io_uring event loop. Applications imple
 impl EventHandler for MyHandler {
     fn create_for_worker(worker_id: usize) -> Self { /* per-worker init */ }
     fn on_accept(&mut self, ctx: &mut DriverCtx, conn: ConnToken) { /* new connection */ }
+    fn on_connect(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<()>) { /* outbound connect done */ }
     fn on_data(&mut self, ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize { /* returns bytes consumed */ }
-    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<usize>) { /* send done */ }
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) { /* send done */ }
     fn on_close(&mut self, ctx: &mut DriverCtx, conn: ConnToken) { /* connection closed */ }
     fn on_tick(&mut self, ctx: &mut DriverCtx) { /* periodic callback */ }
 }
@@ -155,12 +158,12 @@ KompioBuilder::new(config).bind("0.0.0.0:6379").launch::<MyHandler>()?;
 ```
 
 **Key features:**
-- **io_uring**: Multishot recv/accept, SendMsgZc, ring-provided buffers
-- **Thread-per-core**: Bundled acceptor thread + N pinned worker threads
+- **io_uring**: Multishot recv, SendMsgZc, ring-provided buffers, fixed file table
+- **Thread-per-core**: Dedicated acceptor thread + N pinned worker threads
 - **ConnToken**: Opaque connection handle with `index()` for per-connection state arrays
-- **DriverCtx**: Send (`ctx.send()`), close (`ctx.close()`), connect (`ctx.connect()`) operations
+- **DriverCtx**: `send()`, `send_parts()` (scatter-gather), `close()`, `shutdown_write()`, `connect()`, `connect_with_timeout()`, `request_shutdown()`, `peer_addr()`
 
-**Platform**: Linux 6.0+ only (io_uring required for native runtime).
+**Platform**: Linux 6.0+ only (io_uring required).
 
 ### Cache Architecture (cache-core)
 
@@ -223,8 +226,7 @@ policy = "s3fifo"    # Eviction policy (depends on backend)
 
 ## Platform Support
 
-- **Linux 6.0+**: Full support with io_uring (native runtime), CPU pinning, NUMA binding, hugepages
-- **Other platforms**: Tokio runtime only (epoll/kqueue via Tokio reactor)
+- **Linux 6.0+**: Required (io_uring, CPU pinning, NUMA binding, hugepages)
 - **Architectures**: x86_64 and ARM64
 
 ## Testing
