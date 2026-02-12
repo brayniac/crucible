@@ -13,8 +13,8 @@ pub mod worker;
 pub use admin::{AdminHandle, AdminServer};
 pub use config::{Config, parse_cpu_list};
 pub use output::{
-    ColorMode, LatencyStats, OutputFormat, OutputFormatter, Results, Sample, SaturationResults,
-    SaturationStep, create_formatter,
+    ColorMode, LatencyStats, OutputFormat, OutputFormatter, PrefillDiagnostics, PrefillStallCause,
+    Results, Sample, SaturationResults, SaturationStep, create_formatter,
 };
 pub use ratelimit::DynamicRateLimiter;
 pub use saturation::SaturationSearchState;

@@ -1,7 +1,7 @@
 //! Crucible cache server.
 //!
 //! A high-performance cache server supporting multiple protocols (RESP, Memcache, Momento)
-//! with native io_uring/mio runtime.
+//! with native io_uring runtime via kompio.
 
 pub mod admin;
 pub mod affinity;

@@ -9,7 +9,7 @@ use crate::config::{Config, Protocol as CacheProtocol};
 use crate::metrics;
 use crate::ratelimit::DynamicRateLimiter;
 
-use kompio::{ConnToken, DriverCtx, EventHandler};
+use kompio::{ConnToken, DriverCtx, EventHandler, GuardBox, RegionId, SendGuard};
 
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -83,6 +83,10 @@ pub struct SharedState {
     phase: AtomicU8,
     /// Number of workers that have completed prefill
     prefill_complete: AtomicUsize,
+    /// Total number of prefill keys confirmed across all workers
+    prefill_keys_confirmed: AtomicUsize,
+    /// Total number of prefill keys assigned across all workers
+    prefill_keys_total: AtomicUsize,
 }
 
 impl SharedState {
@@ -90,6 +94,8 @@ impl SharedState {
         Self {
             phase: AtomicU8::new(Phase::Connect as u8),
             prefill_complete: AtomicUsize::new(0),
+            prefill_keys_confirmed: AtomicUsize::new(0),
+            prefill_keys_total: AtomicUsize::new(0),
         }
     }
 
@@ -116,6 +122,30 @@ impl SharedState {
     pub fn prefill_complete_count(&self) -> usize {
         self.prefill_complete.load(Ordering::Acquire)
     }
+
+    /// Add to the total prefill keys confirmed count.
+    #[inline]
+    pub fn add_prefill_confirmed(&self, n: usize) {
+        self.prefill_keys_confirmed.fetch_add(n, Ordering::Release);
+    }
+
+    /// Get the total prefill keys confirmed across all workers.
+    #[inline]
+    pub fn prefill_keys_confirmed(&self) -> usize {
+        self.prefill_keys_confirmed.load(Ordering::Acquire)
+    }
+
+    /// Add to the total prefill keys assigned count.
+    #[inline]
+    pub fn add_prefill_total(&self, n: usize) {
+        self.prefill_keys_total.fetch_add(n, Ordering::Release);
+    }
+
+    /// Get the total prefill keys assigned across all workers.
+    #[inline]
+    pub fn prefill_keys_total(&self) -> usize {
+        self.prefill_keys_total.load(Ordering::Acquire)
+    }
 }
 
 impl Default for SharedState {
@@ -136,6 +166,8 @@ pub struct BenchWorkerConfig {
     pub prefill_range: Option<std::ops::Range<usize>>,
     /// CPU IDs for pinning (if configured).
     pub cpu_ids: Option<Vec<usize>>,
+    /// Shared 1GB random value pool (all workers share the same Arc).
+    pub value_pool: Arc<Vec<u8>>,
 }
 
 // ── Config channel (same pattern as server) ──────────────────────────────
@@ -194,6 +226,33 @@ impl RecvBuf for DataSlice<'_> {
     }
 }
 
+// ── ValuePoolGuard ────────────────────────────────────────────────────────
+
+/// Zero-copy send guard referencing a slice of the shared value pool.
+///
+/// When used with `ctx.send_parts().guard()`, the kernel sends directly from
+/// the pool memory via SendMsgZc. The `Arc<Vec<u8>>` keeps the pool alive
+/// until the kernel signals completion.
+///
+/// Size: 8 (Arc ptr) + 4 + 4 = 16 bytes, well within GuardBox's 64-byte limit.
+struct ValuePoolGuard {
+    pool: Arc<Vec<u8>>,
+    offset: u32,
+    len: u32,
+}
+
+impl SendGuard for ValuePoolGuard {
+    fn as_ptr_len(&self) -> (*const u8, u32) {
+        // SAFETY: offset + len is always within the pool bounds (enforced at construction).
+        let ptr = unsafe { self.pool.as_ptr().add(self.offset as usize) };
+        (ptr, self.len)
+    }
+
+    fn region(&self) -> RegionId {
+        RegionId::UNREGISTERED
+    }
+}
+
 // ── BenchHandler ─────────────────────────────────────────────────────────
 
 /// Benchmark worker event handler for kompio.
@@ -220,7 +279,12 @@ pub struct BenchHandler {
     /// Workload generation
     rng: Xoshiro256PlusPlus,
     key_buf: Vec<u8>,
+    /// Value buffer for Momento sessions (they use their own TLS transport, not kompio)
     value_buf: Vec<u8>,
+    /// Shared 1GB random value pool for zero-copy SET sends via send_parts()
+    value_pool: Arc<Vec<u8>>,
+    /// Reusable buffer for SET protocol framing (prefix bytes)
+    set_prefix_buf: Vec<u8>,
 
     /// Results buffer (reused)
     results: Vec<RequestResult>,
@@ -455,10 +519,15 @@ impl BenchHandler {
             if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
                 tracing::debug!("Momento poll error: {}", e);
             }
+            let mut confirmed_batch = 0usize;
             for result in &self.results {
                 if result.request_type == RequestType::Set && result.success {
                     self.prefill_confirmed += 1;
+                    confirmed_batch += 1;
                 }
+            }
+            if confirmed_batch > 0 {
+                self.shared.add_prefill_confirmed(confirmed_batch);
             }
         }
 
@@ -480,14 +549,19 @@ impl BenchHandler {
         let get_ratio = self.config.workload.commands.get;
         let delete_ratio = self.config.workload.commands.delete;
         let recording = self.recording;
+        let value_len = self.config.workload.values.length;
+        let pool_len = self.value_pool.len();
 
         for idx in 0..self.sessions.len() {
-            let session = &mut self.sessions[idx];
-            if !session.is_connected() {
+            if !self.sessions[idx].is_connected() {
                 continue;
             }
 
-            while session.can_send() {
+            loop {
+                if !self.sessions[idx].can_send() {
+                    break;
+                }
+
                 if let Some(ref rl) = self.ratelimiter
                     && !rl.try_acquire()
                 {
@@ -498,59 +572,87 @@ impl BenchHandler {
                 write_key(&mut self.key_buf, key_id);
 
                 let roll = self.rng.random_range(0..100);
-                let sent = if roll < get_ratio {
-                    session.get(&self.key_buf, now).is_some()
+                if roll < get_ratio {
+                    // GET: encode into session buffer, batch-flush later
+                    if self.sessions[idx].get(&self.key_buf, now).is_none() {
+                        break;
+                    }
                 } else if roll < get_ratio + delete_ratio {
-                    session.delete(&self.key_buf, now).is_some()
+                    // DELETE: encode into session buffer, batch-flush later
+                    if self.sessions[idx].delete(&self.key_buf, now).is_none() {
+                        break;
+                    }
                 } else {
-                    self.rng.fill_bytes(&mut self.value_buf);
-                    session.set(&self.key_buf, &self.value_buf, now).is_some()
-                };
+                    // SET: flush any pending GET/DELETE data first, then send via guard
+                    self.flush_session(ctx, idx);
 
-                if sent {
-                    self.requests_driven += 1;
-                    if recording {
-                        metrics::REQUESTS_SENT.increment();
+                    if let Some((_id, suffix)) =
+                        self.sessions[idx].encode_set_guard(&mut self.set_prefix_buf, &self.key_buf, value_len, now)
+                    {
+                        if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
+                            self.send_failures += 1;
+                            if e.kind() != io::ErrorKind::Other {
+                                tracing::debug!(worker = self.id, error = %e, "send_parts error (closing)");
+                                self.close_session(ctx, idx, DisconnectReason::SendError);
+                            }
+                            break;
+                        }
+                    } else {
+                        break;
                     }
                 }
 
-                if !sent {
-                    break;
+                self.requests_driven += 1;
+                if recording {
+                    metrics::REQUESTS_SENT.increment();
                 }
             }
 
-            // Flush send buffer
+            // Flush any remaining GET/DELETE data in the send buffer
             self.flush_session(ctx, idx);
         }
     }
 
     /// Drive prefill requests (sequential SET commands).
     fn drive_prefill_requests(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
+        let value_len = self.config.workload.values.length;
+        let pool_len = self.value_pool.len();
+
         for idx in 0..self.sessions.len() {
-            let session = &mut self.sessions[idx];
-            if !session.is_connected() {
+            if !self.sessions[idx].is_connected() {
                 continue;
             }
 
-            while session.can_send() {
+            loop {
+                if !self.sessions[idx].can_send() {
+                    break;
+                }
+
                 let key_id = match self.prefill_pending.pop_front() {
                     Some(id) => id,
                     None => break,
                 };
 
                 write_key(&mut self.key_buf, key_id);
-                self.rng.fill_bytes(&mut self.value_buf);
 
-                if session.set(&self.key_buf, &self.value_buf, now).is_some() {
+                if let Some((_id, suffix)) =
+                    self.sessions[idx].encode_set_guard(&mut self.set_prefix_buf, &self.key_buf, value_len, now)
+                {
+                    if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
+                        self.send_failures += 1;
+                        self.prefill_pending.push_front(key_id);
+                        if e.kind() != io::ErrorKind::Other {
+                            tracing::debug!(worker = self.id, error = %e, "prefill send_parts error (closing)");
+                            self.close_session(ctx, idx, DisconnectReason::SendError);
+                        }
+                        break;
+                    }
                     self.prefill_in_flight[idx].push_back(key_id);
                 } else {
                     self.prefill_pending.push_front(key_id);
                     break;
                 }
             }
-
-            // Flush send buffer
-            self.flush_session(ctx, idx);
         }
     }
 
@@ -570,9 +672,9 @@ impl BenchHandler {
             Some(t) => t,
             None => return,
         };
-        let n = send_buf.len();
 
-        match ctx.send(token, send_buf) {
+        let n = send_buf.len();
+        match ctx.send(token, &send_buf[..n]) {
             Ok(()) => {
                 self.sessions[idx].bytes_sent(n);
             }
@@ -580,7 +682,6 @@ impl BenchHandler {
                 self.send_failures += 1;
                 if e.kind() != io::ErrorKind::Other {
                     tracing::debug!(worker = self.id, error = %e, "send submit error (closing)");
-                    // Real error - close session
                     self.close_session(ctx, idx, DisconnectReason::SendError);
                 } else {
                     tracing::debug!(worker = self.id, error = %e, "send submit pool exhausted");
@@ -588,6 +689,53 @@ impl BenchHandler {
                 // Pool exhausted - wait for on_send_complete
             }
         }
+    }
+
+    /// Submit a guard-based SET send via send_parts().
+    fn send_set_parts(
+        &mut self,
+        ctx: &mut DriverCtx,
+        idx: usize,
+        value_len: usize,
+        pool_len: usize,
+        suffix: &'static [u8],
+    ) -> io::Result<()> {
+        let conn_id = match self.sessions[idx].conn_id() {
+            Some(id) => id,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "session not connected",
+                ));
+            }
+        };
+
+        let token = match self.get_token(conn_id) {
+            Some(t) => t,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no token for connection",
+                ));
+            }
+        };
+
+        // Pick a random offset into the value pool
+        let max_offset = pool_len - value_len;
+        let offset = self.rng.random_range(0..=max_offset);
+
+        let guard = ValuePoolGuard {
+            pool: Arc::clone(&self.value_pool),
+            offset: offset as u32,
+            len: value_len as u32,
+        };
+
+        let mut builder = ctx.send_parts(token).copy(&self.set_prefix_buf);
+        builder = builder.guard(GuardBox::new(guard));
+        if !suffix.is_empty() {
+            builder = builder.copy(suffix);
+        }
+        builder.submit()
     }
 
     /// Try to reconnect disconnected sessions.
@@ -662,16 +810,22 @@ impl BenchHandler {
             return;
         }
 
+        let mut confirmed_batch = 0usize;
         for result in &self.results {
             if result.request_type == RequestType::Set
                 && let Some(key_id) = self.prefill_in_flight[idx].pop_front()
             {
                 if result.success {
                     self.prefill_confirmed += 1;
+                    confirmed_batch += 1;
                 } else {
                     self.prefill_pending.push_back(key_id);
                 }
             }
+        }
+
+        if confirmed_batch > 0 {
+            self.shared.add_prefill_confirmed(confirmed_batch);
         }
 
         if self.prefill_confirmed >= self.prefill_total {
@@ -729,8 +883,9 @@ impl EventHandler for BenchHandler {
         let key_buf = vec![0u8; cfg.config.workload.keyspace.length];
         let mut value_buf = vec![0u8; cfg.config.workload.values.length];
         let pipeline_depth = cfg.config.connection.pipeline_depth;
+        let value_pool = cfg.value_pool;
 
-        // Fill value buffer with random data
+        // Fill value buffer with random data (used only for Momento sessions)
         let mut init_rng = Xoshiro256PlusPlus::seed_from_u64(42);
         init_rng.fill_bytes(&mut value_buf);
 
@@ -739,6 +894,7 @@ impl EventHandler for BenchHandler {
             Some(range) => {
                 let pending: std::collections::VecDeque<usize> = (range.start..range.end).collect();
                 let total = range.end - range.start;
+                cfg.shared.add_prefill_total(total);
                 tracing::debug!(
                     worker_id = cfg.id,
                     total,
@@ -781,6 +937,8 @@ impl EventHandler for BenchHandler {
             rng,
             key_buf,
             value_buf,
+            value_pool,
+            set_prefix_buf: Vec::with_capacity(256),
             results: Vec::with_capacity(pipeline_depth),
             ratelimiter: cfg.ratelimiter,
             recording: cfg.recording,

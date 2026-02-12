@@ -4,6 +4,7 @@ use benchmark::ratelimit::DynamicRateLimiter;
 use benchmark::saturation::SaturationSearchState;
 use benchmark::viewer;
 use benchmark::worker::{BenchWorkerConfig, Phase, init_config_channel};
+use benchmark::output::{PrefillDiagnostics, PrefillStallCause};
 use benchmark::{
     AdminServer, LatencyStats, OutputFormatter, Results, Sample, SharedState, create_formatter,
     parse_cpu_list,
@@ -13,6 +14,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use kompio::KompioBuilder;
 use metriken::{AtomicHistogram, histogram::Histogram};
+use rand::RngCore;
+use rand_xoshiro::Xoshiro256PlusPlus;
+use rand_xoshiro::rand_core::SeedableRng;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,6 +194,21 @@ fn run_benchmark(
         formatter.print_warmup(warmup);
     }
 
+    // Allocate shared value pool: 1GB of random bytes shared across all workers.
+    // Workers pick random offsets into this pool for SET values, avoiding per-worker
+    // copies. The pool is seeded deterministically for reproducibility.
+    let value_pool = {
+        const POOL_SIZE: usize = 1024 * 1024 * 1024; // 1 GB
+        let mut pool = vec![0u8; POOL_SIZE];
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xdeadbeef);
+        // Fill in 8KB chunks for efficiency
+        const CHUNK: usize = 8192;
+        for chunk in pool.chunks_mut(CHUNK) {
+            rng.fill_bytes(chunk);
+        }
+        Arc::new(pool)
+    };
+
     // Set up config channel for kompio workers
     let (config_tx, config_rx) = crossbeam_channel::bounded::<BenchWorkerConfig>(num_threads);
     #[allow(clippy::needless_range_loop)]
@@ -203,12 +222,15 @@ fn run_benchmark(
                 recording: false,
                 prefill_range: prefill_ranges[id].clone(),
                 cpu_ids: cpu_ids.clone(),
+                value_pool: Arc::clone(&value_pool),
             })
             .expect("failed to queue worker config");
     }
     init_config_channel(config_rx);
 
-    // Build kompio config (client-only, no bind)
+    // Build kompio config (client-only, no bind).
+    // With guard-based sends for SET values, the copy pool only holds small
+    // protocol framing data, so the default 16KB slot size is sufficient.
     let kompio_config = kompio::Config {
         recv_buffer: kompio::RecvBufferConfig {
             // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
@@ -288,6 +310,16 @@ fn run_benchmark(
     // Track when warmup actually starts (after prefill completes)
     let mut warmup_start: Option<Instant> = if prefill_enabled { None } else { Some(start) };
 
+    // Prefill progress tracking
+    let prefill_start = Instant::now();
+    let mut last_prefill_confirmed: usize = 0;
+    let mut last_prefill_progress_time = Instant::now();
+    let mut last_prefill_progress_report = Instant::now();
+    let prefill_timeout = config.workload.prefill_timeout;
+    let prefill_stall_threshold = Duration::from_secs(30);
+    let prefill_progress_interval = Duration::from_secs(5);
+    let mut prefill_timeout_diag: Option<PrefillDiagnostics> = None;
+
     loop {
         std::thread::sleep(Duration::from_millis(100));
 
@@ -315,7 +347,71 @@ fn run_benchmark(
                 current_phase = Phase::Warmup;
                 warmup_start = Some(Instant::now());
                 formatter.print_warmup(warmup);
+                continue;
             }
+
+            let confirmed = shared.prefill_keys_confirmed();
+            let total = shared.prefill_keys_total();
+            let elapsed = prefill_start.elapsed();
+
+            // Progress reporting
+            if last_prefill_progress_report.elapsed() >= prefill_progress_interval && total > 0 {
+                formatter.print_prefill_progress(confirmed, total, elapsed);
+                last_prefill_progress_report = Instant::now();
+            }
+
+            // Track progress for stall detection
+            if confirmed > last_prefill_confirmed {
+                last_prefill_confirmed = confirmed;
+                last_prefill_progress_time = Instant::now();
+            }
+
+            // Stall detection: no progress for 30s after some progress was made
+            let stalled = last_prefill_confirmed > 0
+                && last_prefill_progress_time.elapsed() >= prefill_stall_threshold;
+
+            // Timeout detection (skip if timeout is zero = disabled)
+            let timed_out = !prefill_timeout.is_zero() && elapsed >= prefill_timeout;
+
+            if stalled || timed_out {
+                let conns_active = metrics::CONNECTIONS_ACTIVE.value();
+                let bytes_rx = metrics::BYTES_RX.value();
+                let requests_sent = metrics::REQUESTS_SENT.value();
+
+                let likely_cause = if conns_active == 0 {
+                    PrefillStallCause::NoConnections
+                } else if bytes_rx == 0 {
+                    PrefillStallCause::NoResponses
+                } else if stalled {
+                    PrefillStallCause::Stalled
+                } else if confirmed > 0 && total > confirmed {
+                    // Still progressing but hit timeout - estimate remaining time
+                    let rate = confirmed as f64 / elapsed.as_secs_f64();
+                    let remaining_keys = (total - confirmed) as f64;
+                    let estimated_remaining = if rate > 0.0 {
+                        Duration::from_secs_f64(remaining_keys / rate)
+                    } else {
+                        Duration::from_secs(0)
+                    };
+                    PrefillStallCause::TooSlow { estimated_remaining }
+                } else {
+                    PrefillStallCause::Unknown
+                };
+
+                prefill_timeout_diag = Some(PrefillDiagnostics {
+                    workers_complete: prefill_complete,
+                    workers_total: num_threads,
+                    keys_confirmed: confirmed,
+                    keys_total: total,
+                    elapsed,
+                    conns_active,
+                    bytes_rx,
+                    requests_sent,
+                    likely_cause,
+                });
+                break;
+            }
+
             continue;
         }
 
@@ -451,6 +547,26 @@ fn run_benchmark(
 
             last_report = Instant::now();
         }
+    }
+
+    // Handle prefill timeout/stall
+    if let Some(ref diag) = prefill_timeout_diag {
+        shared.set_phase(Phase::Stop);
+        formatter.print_prefill_timeout(diag);
+
+        // Still shutdown workers cleanly
+        shutdown_handle.shutdown();
+
+        let shutdown_start = Instant::now();
+        for handle in handles {
+            let remaining = WORKER_SHUTDOWN_TIMEOUT.saturating_sub(shutdown_start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = handle.join();
+        }
+
+        return Err("prefill failed: timed out or stalled".into());
     }
 
     // Shutdown kompio workers

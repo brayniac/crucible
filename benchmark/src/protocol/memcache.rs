@@ -117,6 +117,12 @@ impl MemcacheCodec {
         self.pending_responses
     }
 
+    /// Notify the codec that a request was sent (for guard-based send path).
+    /// Increments the pending response counter without encoding anything.
+    pub fn notify_request_sent(&mut self) {
+        self.pending_responses += 1;
+    }
+
     /// Attempts to decode a response from the buffer.
     ///
     /// Returns:

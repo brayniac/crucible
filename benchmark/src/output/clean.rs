@@ -4,7 +4,8 @@ use super::format::{
     format_bandwidth_bps, format_count, format_latency_padded, format_pct, format_rate_padded,
 };
 use super::{
-    ColorMode, LatencyStats, OutputFormatter, Results, Sample, SaturationResults, SaturationStep,
+    ColorMode, LatencyStats, OutputFormatter, PrefillDiagnostics, PrefillStallCause, Results,
+    Sample, SaturationResults, SaturationStep,
 };
 use crate::config::Config;
 use std::io::{self, IsTerminal, Write};
@@ -291,6 +292,108 @@ impl OutputFormatter for CleanFormatter {
             format!("{} active, 0 failed", results.conns_active)
         };
         println!("connections  {}", conn_str);
+    }
+
+    fn print_prefill_progress(&self, confirmed: usize, total: usize, elapsed: Duration) {
+        use super::format::format_count;
+
+        let pct = if total > 0 {
+            (confirmed as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            confirmed as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        println!(
+            "[prefill] {}/{} ({:.1}%) @ {} SET/s",
+            format_count(confirmed as u64),
+            format_count(total as u64),
+            pct,
+            format_count(rate as u64),
+        );
+        let _ = io::stdout().flush();
+    }
+
+    fn print_prefill_timeout(&self, diag: &PrefillDiagnostics) {
+        use super::format::format_count;
+
+        println!();
+        println!(
+            "{}",
+            self.red(
+                "────────────────────────────────────────────────────────────────────────"
+            )
+        );
+        println!("{}", self.red("PREFILL TIMEOUT"));
+        println!(
+            "{}",
+            self.red(
+                "────────────────────────────────────────────────────────────────────────"
+            )
+        );
+
+        let cause_str = match &diag.likely_cause {
+            PrefillStallCause::NoConnections => "no connections established",
+            PrefillStallCause::NoResponses => "connections up but no responses received",
+            PrefillStallCause::Stalled => "progress stalled (no new confirmations for 30s)",
+            PrefillStallCause::TooSlow { .. } => "progressing too slowly to finish in time",
+            PrefillStallCause::Unknown => "unknown",
+        };
+        println!("cause        {}", self.red(cause_str));
+        println!(
+            "progress     {}/{} keys ({:.1}%)",
+            format_count(diag.keys_confirmed as u64),
+            format_count(diag.keys_total as u64),
+            if diag.keys_total > 0 {
+                (diag.keys_confirmed as f64 / diag.keys_total as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "workers      {}/{} complete",
+            diag.workers_complete, diag.workers_total,
+        );
+        println!("elapsed      {:.0}s", diag.elapsed.as_secs_f64());
+        println!(
+            "connections  {} active",
+            diag.conns_active,
+        );
+        println!(
+            "requests     {} sent, {} bytes rx",
+            format_count(diag.requests_sent),
+            format_count(diag.bytes_rx),
+        );
+
+        println!();
+        match &diag.likely_cause {
+            PrefillStallCause::NoConnections => {
+                println!("hint: check that the server is running and reachable");
+                println!("hint: check firewall rules and target address in config");
+            }
+            PrefillStallCause::NoResponses => {
+                println!("hint: server may be overloaded or not processing commands");
+                println!("hint: check server logs for errors");
+            }
+            PrefillStallCause::Stalled => {
+                println!("hint: server may have stopped responding");
+                println!("hint: check server logs and connection state");
+            }
+            PrefillStallCause::TooSlow { estimated_remaining } => {
+                println!(
+                    "hint: estimated {:.0}s remaining at current rate",
+                    estimated_remaining.as_secs_f64()
+                );
+                println!("hint: increase prefill_timeout or reduce keyspace size");
+            }
+            PrefillStallCause::Unknown => {
+                println!("hint: check server and network connectivity");
+            }
+        }
+        let _ = io::stdout().flush();
     }
 
     fn print_saturation_header(&self) {

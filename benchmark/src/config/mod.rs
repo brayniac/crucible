@@ -166,6 +166,10 @@ pub struct Workload {
     /// before the warmup phase begins.
     #[serde(default)]
     pub prefill: bool,
+    /// Maximum time to wait for prefill to complete before aborting.
+    /// Set to "0s" to disable the timeout. Default: 300s.
+    #[serde(default = "default_prefill_timeout", with = "humantime_serde")]
+    pub prefill_timeout: Duration,
     #[serde(default)]
     pub keyspace: Keyspace,
     #[serde(default)]
@@ -250,6 +254,10 @@ fn default_max_rate() -> u64 {
 
 fn default_min_throughput_ratio() -> f64 {
     0.9
+}
+
+fn default_prefill_timeout() -> Duration {
+    Duration::from_secs(300)
 }
 
 #[derive(Debug, Clone, Deserialize)]

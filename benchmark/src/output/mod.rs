@@ -19,6 +19,7 @@ pub use verbose::VerboseFormatter;
 
 use crate::config::Config;
 use chrono::{DateTime, Utc};
+use std::fmt;
 use std::time::Duration;
 
 /// Output format selection.
@@ -153,6 +154,67 @@ pub struct SaturationResults {
     pub steps: Vec<SaturationStep>,
 }
 
+/// Reason why prefill stalled or timed out.
+#[derive(Debug, Clone)]
+pub enum PrefillStallCause {
+    /// No connections were established.
+    NoConnections,
+    /// Connections established but no responses received.
+    NoResponses,
+    /// Progress was being made but stalled for an extended period.
+    Stalled,
+    /// Progress is still being made but won't finish in time.
+    TooSlow {
+        /// Estimated time remaining based on current rate.
+        estimated_remaining: Duration,
+    },
+    /// Unable to determine the cause.
+    Unknown,
+}
+
+impl fmt::Display for PrefillStallCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PrefillStallCause::NoConnections => write!(f, "no connections established"),
+            PrefillStallCause::NoResponses => {
+                write!(f, "connections established but no responses received")
+            }
+            PrefillStallCause::Stalled => write!(f, "progress stalled"),
+            PrefillStallCause::TooSlow {
+                estimated_remaining,
+            } => write!(
+                f,
+                "too slow (estimated {:.0}s remaining)",
+                estimated_remaining.as_secs_f64()
+            ),
+            PrefillStallCause::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Diagnostics collected when prefill times out or stalls.
+#[derive(Debug, Clone)]
+pub struct PrefillDiagnostics {
+    /// Number of workers that completed prefill.
+    pub workers_complete: usize,
+    /// Total number of workers.
+    pub workers_total: usize,
+    /// Number of keys confirmed across all workers.
+    pub keys_confirmed: usize,
+    /// Total number of keys to prefill.
+    pub keys_total: usize,
+    /// Time elapsed since prefill started.
+    pub elapsed: Duration,
+    /// Number of active connections.
+    pub conns_active: u64,
+    /// Total bytes received.
+    pub bytes_rx: u64,
+    /// Total requests sent.
+    pub requests_sent: u64,
+    /// Likely cause of the stall/timeout.
+    pub likely_cause: PrefillStallCause,
+}
+
 /// Trait for output formatters.
 pub trait OutputFormatter: Send + Sync {
     /// Print the configuration summary at startup.
@@ -177,6 +239,37 @@ pub trait OutputFormatter: Send + Sync {
 
     /// Print the final results.
     fn print_results(&self, results: &Results);
+
+    /// Print prefill progress (called periodically during prefill).
+    fn print_prefill_progress(&self, confirmed: usize, total: usize, elapsed: Duration) {
+        let pct = if total > 0 {
+            (confirmed as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            confirmed as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        println!(
+            "[prefill] {}/{} ({:.1}%) @ {:.0} SET/s",
+            confirmed, total, pct, rate
+        );
+    }
+
+    /// Print prefill timeout/stall diagnostics.
+    fn print_prefill_timeout(&self, diag: &PrefillDiagnostics) {
+        println!("PREFILL FAILED: {}", diag.likely_cause);
+        println!(
+            "  keys: {}/{}, workers: {}/{}, elapsed: {:.0}s",
+            diag.keys_confirmed,
+            diag.keys_total,
+            diag.workers_complete,
+            diag.workers_total,
+            diag.elapsed.as_secs_f64()
+        );
+    }
 
     /// Print the saturation search header (for formats that use one).
     fn print_saturation_header(&self) {}

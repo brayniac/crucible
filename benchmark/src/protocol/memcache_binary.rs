@@ -136,6 +136,15 @@ impl MemcacheBinaryCodec {
         self.pending_responses
     }
 
+    /// Allocate the next opaque value and increment pending responses
+    /// (for guard-based send path where encoding is done externally).
+    pub fn allocate_opaque(&mut self) -> u32 {
+        let opaque = self.next_opaque;
+        self.next_opaque = self.next_opaque.wrapping_add(1);
+        self.pending_responses += 1;
+        opaque
+    }
+
     /// Attempts to decode a response from the buffer.
     ///
     /// Returns:

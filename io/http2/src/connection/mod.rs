@@ -521,7 +521,8 @@ impl<T: Transport> Connection<T> {
                 self.flow_control.available() as usize,
                 stream.send_window() as usize,
             );
-            let to_send = std::cmp::min(available, data.len());
+            let max_frame = self.frame_encoder.max_frame_size() as usize;
+            let to_send = data.len().min(available).min(max_frame);
             let is_end = end_stream && to_send == data.len();
 
             (to_send, is_end)
