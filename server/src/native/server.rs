@@ -153,8 +153,12 @@ pub fn run<C: Cache + 'static>(
         );
     }
 
-    for handle in handles {
-        let _ = handle.join();
+    for (i, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(worker_id = i, error = %e, "worker thread returned error"),
+            Err(e) => warn!(worker_id = i, "worker thread panicked: {e:?}"),
+        }
     }
 
     if let Some(handle) = diagnostics_handle {

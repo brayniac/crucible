@@ -182,6 +182,16 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
         new_prev: Option<u32>,
     ) -> bool;
 
+    /// Try to free a segment stuck in `AwaitingRelease` state.
+    ///
+    /// This handles the race where the last reader drops between the eviction
+    /// thread's `ref_count()` check and the CAS to `AwaitingRelease`. In that
+    /// window the reader sees `Draining` (not `AwaitingRelease`) and does nothing,
+    /// leaving the segment orphaned. Calling this after the CAS reclaims it.
+    ///
+    /// Returns `true` if the segment was freed, `false` otherwise.
+    fn release_condemned(&self) -> bool;
+
     // ========== Chain Pointers ==========
 
     /// Get the next segment ID in the chain, or `None` if this is the tail.

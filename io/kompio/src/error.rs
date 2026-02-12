@@ -20,6 +20,8 @@ pub enum Error {
     InvalidRegion,
     /// Pointer not within the specified registered region.
     PointerOutOfRegion,
+    /// System resource limit too low (e.g., RLIMIT_NOFILE).
+    ResourceLimit(String),
 }
 
 impl fmt::Display for Error {
@@ -33,6 +35,7 @@ impl fmt::Display for Error {
             Error::SendPoolExhausted => write!(f, "send pool exhausted"),
             Error::InvalidRegion => write!(f, "invalid memory region ID"),
             Error::PointerOutOfRegion => write!(f, "pointer not within registered region"),
+            Error::ResourceLimit(msg) => write!(f, "{msg}"),
         }
     }
 }

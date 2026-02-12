@@ -734,7 +734,6 @@ impl Session {
     ) -> Result<usize, SessionError> {
         let rx_timestamp = self.last_rx_timestamp;
         let mut count = 0;
-        let mut total_bytes_rx: usize = 0;
 
         loop {
             let data = recv_buf.as_slice();
@@ -754,7 +753,6 @@ impl Session {
                     match RespValueParser::parse_with_options(data, &resp_parse_options()) {
                         Ok((value, consumed)) => {
                             recv_buf.consume(consumed);
-                            total_bytes_rx += consumed;
                             codec.increment_parsed();
                             Some(ResponseInfo {
                                 is_error: value.is_error(),
@@ -768,7 +766,6 @@ impl Session {
                 ProtocolCodec::Memcache(_codec) => match MemcacheResponseParser::parse(data) {
                     Ok((value, consumed)) => {
                         recv_buf.consume(consumed);
-                        total_bytes_rx += consumed;
                         Some(ResponseInfo {
                             is_error: value.is_error(),
                             is_null: value.is_miss(),
@@ -792,7 +789,6 @@ impl Session {
                                 _ => (false, false),
                             };
                             recv_buf.consume(consumed);
-                            total_bytes_rx += consumed;
                             codec.decrement_pending();
                             Some(ResponseInfo {
                                 is_error,
@@ -811,7 +807,6 @@ impl Session {
                     match PingResponseParser::parse(data) {
                         Ok((_response, consumed)) => {
                             recv_buf.consume(consumed);
-                            total_bytes_rx += consumed;
                             codec.decrement_pending();
                             Some(ResponseInfo {
                                 is_error: false, // PONG is never an error
@@ -890,10 +885,8 @@ impl Session {
             self.last_rx_timestamp = None;
         }
 
-        // Track bytes received
-        if total_bytes_rx > 0 {
-            crate::metrics::BYTES_RX.add(total_bytes_rx as u64);
-        }
+        // Note: BYTES_RX is tracked by the caller (on_data in worker.rs)
+        // to avoid double-counting when using the zero-copy DataSlice path.
 
         Ok(count)
     }

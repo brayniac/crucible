@@ -87,6 +87,8 @@ impl KompioBuilder {
             self.config.worker.threads
         };
 
+        ensure_nofile_limit(self.config.max_connections, num_threads)?;
+
         // Create per-worker channels and eventfds.
         let mut worker_txs = Vec::with_capacity(num_threads);
         let mut worker_rxs = Vec::with_capacity(num_threads);
@@ -191,6 +193,58 @@ impl KompioBuilder {
 /// This is a convenience wrapper around `KompioBuilder`.
 pub fn launch<H: EventHandler>(config: Config, bind_addr: &str) -> LaunchResult {
     KompioBuilder::new(config).bind(bind_addr).launch::<H>()
+}
+
+/// Ensure RLIMIT_NOFILE is high enough for the io_uring fixed file table.
+///
+/// Each worker calls `register_files_sparse(max_connections)`, and the kernel
+/// checks `nr_args > rlimit(RLIMIT_NOFILE)` per call (not cumulative across
+/// workers). Connections use the fixed file table — the original FD is closed
+/// immediately after `register_files_update` — so they don't consume process
+/// FD table entries. We only need headroom for ring fds, eventfds, the listen
+/// socket, stdin/stdout/stderr, etc.
+fn ensure_nofile_limit(max_connections: u32, num_workers: usize) -> Result<(), crate::error::Error> {
+    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+    if ret != 0 {
+        return Err(crate::error::Error::Io(io::Error::last_os_error()));
+    }
+
+    // register_files_sparse(max_connections) needs RLIMIT_NOFILE >= max_connections.
+    // Add per-worker overhead (ring fd, eventfd, transient socket fds) and global
+    // overhead (listen socket, stdio, misc).
+    let per_worker_overhead: u64 = 8;
+    let global_overhead: u64 = 64;
+    let required =
+        max_connections as u64 + per_worker_overhead * num_workers as u64 + global_overhead;
+
+    let soft = rlim.rlim_cur;
+    let hard = rlim.rlim_max;
+
+    if soft >= required {
+        return Ok(());
+    }
+
+    if hard >= required || hard == libc::RLIM_INFINITY {
+        // Raise soft limit to required (or hard if hard is finite and smaller)
+        let new_soft = if hard == libc::RLIM_INFINITY {
+            required
+        } else {
+            std::cmp::min(required, hard)
+        };
+        rlim.rlim_cur = new_soft;
+        let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+        if ret != 0 {
+            return Err(crate::error::Error::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    } else {
+        Err(crate::error::Error::ResourceLimit(format!(
+            "RLIMIT_NOFILE too low: need {} but hard limit is {} (soft: {}). \
+             Raise it with: ulimit -n {}",
+            required, hard, soft, required
+        )))
+    }
 }
 
 /// Pin the current thread to a specific CPU core.
