@@ -235,10 +235,15 @@ impl<H: EventHandler> EventLoop<H> {
         }
 
         // 2. Submit + drain loop until all connections are closed.
+        //    Arm a timeout SQE each iteration so submit_and_wait(1) never blocks
+        //    indefinitely (the tick timeout from the main loop is not armed here).
+        let shutdown_ts = io_uring::types::Timespec::new().nsec(100_000_000); // 100ms
         for _ in 0..100 {
             if self.connections.active_count() == 0 {
                 break;
             }
+            let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+            let _ = self.ring.submit_tick_timeout(&shutdown_ts, ud.raw());
             if self.ring.submit_and_wait(1).is_err() {
                 break;
             }
