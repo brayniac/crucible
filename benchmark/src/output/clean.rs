@@ -323,16 +323,12 @@ impl OutputFormatter for CleanFormatter {
         println!();
         println!(
             "{}",
-            self.red(
-                "────────────────────────────────────────────────────────────────────────"
-            )
+            self.red("────────────────────────────────────────────────────────────────────────")
         );
         println!("{}", self.red("PREFILL TIMEOUT"));
         println!(
             "{}",
-            self.red(
-                "────────────────────────────────────────────────────────────────────────"
-            )
+            self.red("────────────────────────────────────────────────────────────────────────")
         );
 
         let cause_str = match &diag.likely_cause {
@@ -358,10 +354,7 @@ impl OutputFormatter for CleanFormatter {
             diag.workers_complete, diag.workers_total,
         );
         println!("elapsed      {:.0}s", diag.elapsed.as_secs_f64());
-        println!(
-            "connections  {} active",
-            diag.conns_active,
-        );
+        println!("connections  {} active", diag.conns_active,);
         println!(
             "requests     {} sent, {} bytes rx",
             format_count(diag.requests_sent),
@@ -382,7 +375,9 @@ impl OutputFormatter for CleanFormatter {
                 println!("hint: server may have stopped responding");
                 println!("hint: check server logs and connection state");
             }
-            PrefillStallCause::TooSlow { estimated_remaining } => {
+            PrefillStallCause::TooSlow {
+                estimated_remaining,
+            } => {
                 println!(
                     "hint: estimated {:.0}s remaining at current rate",
                     estimated_remaining.as_secs_f64()

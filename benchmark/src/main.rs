@@ -1,10 +1,10 @@
 use benchmark::config::Config;
 use benchmark::metrics;
+use benchmark::output::{PrefillDiagnostics, PrefillStallCause};
 use benchmark::ratelimit::DynamicRateLimiter;
 use benchmark::saturation::SaturationSearchState;
 use benchmark::viewer;
 use benchmark::worker::{BenchWorkerConfig, Phase, init_config_channel};
-use benchmark::output::{PrefillDiagnostics, PrefillStallCause};
 use benchmark::{
     AdminServer, LatencyStats, OutputFormatter, Results, Sample, SharedState, create_formatter,
     parse_cpu_list,
@@ -393,7 +393,9 @@ fn run_benchmark(
                     } else {
                         Duration::from_secs(0)
                     };
-                    PrefillStallCause::TooSlow { estimated_remaining }
+                    PrefillStallCause::TooSlow {
+                        estimated_remaining,
+                    }
                 } else {
                     PrefillStallCause::Unknown
                 };

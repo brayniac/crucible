@@ -586,9 +586,12 @@ impl BenchHandler {
                     // SET: flush any pending GET/DELETE data first, then send via guard
                     self.flush_session(ctx, idx);
 
-                    if let Some((_id, suffix)) =
-                        self.sessions[idx].encode_set_guard(&mut self.set_prefix_buf, &self.key_buf, value_len, now)
-                    {
+                    if let Some((_id, suffix)) = self.sessions[idx].encode_set_guard(
+                        &mut self.set_prefix_buf,
+                        &self.key_buf,
+                        value_len,
+                        now,
+                    ) {
                         if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
                             self.send_failures += 1;
                             if e.kind() != io::ErrorKind::Other {
@@ -635,9 +638,12 @@ impl BenchHandler {
 
                 write_key(&mut self.key_buf, key_id);
 
-                if let Some((_id, suffix)) =
-                    self.sessions[idx].encode_set_guard(&mut self.set_prefix_buf, &self.key_buf, value_len, now)
-                {
+                if let Some((_id, suffix)) = self.sessions[idx].encode_set_guard(
+                    &mut self.set_prefix_buf,
+                    &self.key_buf,
+                    value_len,
+                    now,
+                ) {
                     if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
                         self.send_failures += 1;
                         self.prefill_pending.push_front(key_id);
