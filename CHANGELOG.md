@@ -15,6 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.3.2] - 2026-02-12
+
+### Added
+- Benchmark prefill timeout detection and diagnostics: configurable timeout (default 300s),
+  periodic progress reporting, stall detection, and root-cause diagnostics
+- Zero-copy benchmark SET sends via `send_parts()` + `ValuePoolGuard`: shared 1GB random value
+  pool with scatter-gather sends eliminates the 16KB send slot size limit that caused deadlocks
+  when `value_size >= 16384`
+
+### Changed
+- Updated I/O documentation in CLAUDE.md for factual accuracy (zero-copy data paths, EventHandler
+  trait signatures, platform requirements)
+
+### Fixed
+- HTTP/2 DATA frames now clamped to negotiated `max_frame_size` per RFC 9113 Section 4.2
+- Benchmark SET deadlock when `value_size >= 16384` (send pool slot overflow)
+- Rustfmt formatting in benchmark crate
+
 ## [0.3.1] - 2026-02-12
 
 ### Changed
