@@ -48,6 +48,11 @@ pub struct EventLoop<H: EventHandler> {
     cqe_batch: Vec<(u64, i32, u32)>,
     /// Whether to set TCP_NODELAY on connections.
     tcp_nodelay: bool,
+    /// Tick timeout duration. When set, a timeout SQE ensures the event loop
+    /// wakes periodically even when no I/O completions are pending.
+    tick_timeout_ts: Option<io_uring::types::Timespec>,
+    /// Whether a tick timeout SQE is currently in-flight.
+    tick_timeout_armed: bool,
 }
 
 impl<H: EventHandler> EventLoop<H> {
@@ -142,6 +147,16 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs,
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             tcp_nodelay: config.tcp_nodelay,
+            tick_timeout_ts: if config.tick_timeout_us > 0 {
+                Some(
+                    io_uring::types::Timespec::new()
+                        .sec(config.tick_timeout_us / 1_000_000)
+                        .nsec((config.tick_timeout_us % 1_000_000) as u32 * 1000),
+                )
+            } else {
+                None
+            },
+            tick_timeout_armed: false,
         })
     }
 
@@ -161,6 +176,17 @@ impl<H: EventHandler> EventLoop<H> {
         }
 
         loop {
+            // Arm a tick timeout before blocking so on_tick fires periodically
+            // even when no I/O completions are pending (e.g., client-only mode
+            // between phases).
+            if !self.tick_timeout_armed
+                && let Some(ref ts) = self.tick_timeout_ts
+            {
+                let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+                let _ = self.ring.submit_tick_timeout(ts as *const _, ud.raw());
+                self.tick_timeout_armed = true;
+            }
+
             self.ring.submit_and_wait(1)?;
 
             self.drain_completions();
@@ -209,10 +235,15 @@ impl<H: EventHandler> EventLoop<H> {
         }
 
         // 2. Submit + drain loop until all connections are closed.
+        //    Arm a timeout SQE each iteration so submit_and_wait(1) never blocks
+        //    indefinitely (the tick timeout from the main loop is not armed here).
+        let shutdown_ts = io_uring::types::Timespec::new().nsec(100_000_000); // 100ms
         for _ in 0..100 {
             if self.connections.active_count() == 0 {
                 break;
             }
+            let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+            let _ = self.ring.submit_tick_timeout(&shutdown_ts, ud.raw());
             if self.ring.submit_and_wait(1).is_err() {
                 break;
             }
@@ -336,6 +367,9 @@ impl<H: EventHandler> EventLoop<H> {
             OpTag::Connect => self.handle_connect(ud, result),
             OpTag::Timeout => self.handle_timeout(ud, result),
             OpTag::Cancel => {} // informational only
+            OpTag::TickTimeout => {
+                self.tick_timeout_armed = false;
+            }
         }
     }
 

@@ -202,6 +202,11 @@ impl Segment for FileSegment<'_> {
     }
 
     #[inline]
+    fn release_condemned(&self) -> bool {
+        self.inner.release_condemned()
+    }
+
+    #[inline]
     fn cas_metadata(
         &self,
         expected_state: State,

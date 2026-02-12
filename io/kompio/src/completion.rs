@@ -17,6 +17,8 @@ pub enum OpTag {
     Timeout = 9,
     /// Async cancel (informational CQE only).
     Cancel = 10,
+    /// Periodic tick timeout to prevent submit_and_wait from blocking indefinitely.
+    TickTimeout = 11,
 }
 
 impl OpTag {
@@ -33,6 +35,7 @@ impl OpTag {
             8 => Some(OpTag::Connect),
             9 => Some(OpTag::Timeout),
             10 => Some(OpTag::Cancel),
+            11 => Some(OpTag::TickTimeout),
             _ => None,
         }
     }

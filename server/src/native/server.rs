@@ -149,12 +149,17 @@ pub fn run<C: Cache + 'static>(
     if active_conns > 0 {
         warn!(
             active_connections = active_conns,
-            "Drain timeout reached, {} connections still active", active_conns
+            "Drain timeout reached, {} connections still active — forcing exit", active_conns
         );
+        std::process::exit(0);
     }
 
-    for handle in handles {
-        let _ = handle.join();
+    for (i, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(worker_id = i, error = %e, "worker thread returned error"),
+            Err(e) => warn!(worker_id = i, "worker thread panicked: {e:?}"),
+        }
     }
 
     if let Some(handle) = diagnostics_handle {

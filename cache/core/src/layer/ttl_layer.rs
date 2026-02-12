@@ -230,6 +230,10 @@ impl TtlLayer {
         if segment.ref_count() > 0 {
             self.drain_segment_from_hashtable(segment_id, hashtable);
             segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            // Race fix: reclaim if last reader dropped during the window above.
+            if segment.ref_count() == 0 && segment.release_condemned() {
+                return true;
+            }
             return false;
         }
 
@@ -301,6 +305,10 @@ impl TtlLayer {
             // Can't demote while readers hold refs
             self.drain_segment_from_hashtable(segment_id, hashtable);
             segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            // Race fix: reclaim if last reader dropped during the window above.
+            if segment.ref_count() == 0 && segment.release_condemned() {
+                return true;
+            }
             return false;
         }
 
@@ -651,6 +659,10 @@ impl TtlLayer {
                 if seg.ref_count() > 0 {
                     // Segment has active readers - defer to last reader's drop
                     seg.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+                    // Race fix: reclaim if last reader dropped during the window above.
+                    if seg.ref_count() == 0 {
+                        seg.release_condemned();
+                    }
                 } else {
                     seg.cas_metadata(State::Draining, State::Locked, None, None);
                     seg.cas_metadata(State::Locked, State::Reserved, None, None);

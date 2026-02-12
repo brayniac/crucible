@@ -226,14 +226,40 @@ fn run_benchmark(
     };
 
     // Launch kompio workers (client-only, no bind)
+    tracing::debug!(num_threads, "launching kompio workers");
     let (shutdown_handle, handles) =
         KompioBuilder::new(kompio_config).launch::<benchmark::worker::BenchHandler>()?;
+    tracing::debug!(workers = handles.len(), "kompio workers launched");
 
     // Start in prefill or warmup phase
     if prefill_enabled {
         shared.set_phase(Phase::Prefill);
     } else {
         shared.set_phase(Phase::Warmup);
+    }
+
+    // Early liveness check: give workers time to complete EventLoop::new(),
+    // then verify at least one is still alive. This catches setup failures
+    // (e.g., RLIMIT_NOFILE too low) before entering the reporting loop.
+    std::thread::sleep(Duration::from_millis(200));
+    if handles.iter().all(|h| h.is_finished()) {
+        shutdown_handle.shutdown();
+        let mut errors = Vec::new();
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(Err(e)) => errors.push(format!("worker {i}: {e}")),
+                Err(e) => errors.push(format!("worker {i} panicked: {e:?}")),
+                Ok(Ok(())) => {}
+            }
+        }
+        if errors.is_empty() {
+            return Err("all worker threads exited immediately with no error".into());
+        }
+        return Err(format!(
+            "all workers failed during startup:\n  {}",
+            errors.join("\n  ")
+        )
+        .into());
     }
 
     // Main thread: reporting loop
@@ -408,6 +434,17 @@ fn run_benchmark(
 
             formatter.print_sample(&sample);
 
+            // Diagnostic: absolute counter values to detect data flow
+            tracing::trace!(
+                responses_total = responses,
+                requests_total = metrics::REQUESTS_SENT.value(),
+                bytes_tx = metrics::BYTES_TX.value(),
+                bytes_rx = metrics::BYTES_RX.value(),
+                conns_active = metrics::CONNECTIONS_ACTIVE.value(),
+                conns_failed = metrics::CONNECTIONS_FAILED.value(),
+                "main thread diagnostic"
+            );
+
             if let Some(ref mut state) = saturation_state {
                 state.check_and_advance(&*formatter);
             }
@@ -428,7 +465,11 @@ fn run_benchmark(
             break;
         }
         // JoinHandle doesn't have timeout, just join
-        let _ = handle.join();
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("worker thread returned error: {}", e),
+            Err(e) => tracing::error!("worker thread panicked: {:?}", e),
+        }
     }
 
     // Final report

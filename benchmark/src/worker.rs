@@ -250,6 +250,19 @@ pub struct BenchHandler {
     my_connections: usize,
     /// Starting global connection index for endpoint distribution
     my_start: usize,
+
+    /// Tick counter for periodic diagnostics
+    tick_count: u64,
+    /// Last diagnostic log time
+    last_diag: std::time::Instant,
+    /// Requests driven since last diagnostic
+    requests_driven: u64,
+    /// Responses parsed since last diagnostic
+    responses_parsed: u64,
+    /// Bytes received since last diagnostic
+    bytes_received: u64,
+    /// Send failures since last diagnostic
+    send_failures: u64,
 }
 
 impl BenchHandler {
@@ -494,8 +507,11 @@ impl BenchHandler {
                     session.set(&self.key_buf, &self.value_buf, now).is_some()
                 };
 
-                if sent && recording {
-                    metrics::REQUESTS_SENT.increment();
+                if sent {
+                    self.requests_driven += 1;
+                    if recording {
+                        metrics::REQUESTS_SENT.increment();
+                    }
                 }
 
                 if !sent {
@@ -561,9 +577,13 @@ impl BenchHandler {
                 self.sessions[idx].bytes_sent(n);
             }
             Err(e) => {
+                self.send_failures += 1;
                 if e.kind() != io::ErrorKind::Other {
+                    tracing::debug!(worker = self.id, error = %e, "send submit error (closing)");
                     // Real error - close session
                     self.close_session(ctx, idx, DisconnectReason::SendError);
+                } else {
+                    tracing::debug!(worker = self.id, error = %e, "send submit pool exhausted");
                 }
                 // Pool exhausted - wait for on_send_complete
             }
@@ -685,9 +705,8 @@ impl BenchHandler {
 
 impl EventHandler for BenchHandler {
     fn create_for_worker(worker_id: usize) -> Self {
+        tracing::debug!(worker_id, "worker thread starting create_for_worker");
         let cfg = recv_config();
-
-        // Pin to CPU if configured
         if let Some(ref ids) = cfg.cpu_ids
             && !ids.is_empty()
         {
@@ -750,7 +769,7 @@ impl EventHandler for BenchHandler {
             remainder * (base_per_thread + 1) + (cfg.id - remainder) * base_per_thread
         };
 
-        BenchHandler {
+        let result = BenchHandler {
             id: cfg.id,
             config: cfg.config,
             shared: cfg.shared,
@@ -775,7 +794,20 @@ impl EventHandler for BenchHandler {
             endpoints,
             my_connections,
             my_start,
-        }
+            tick_count: 0,
+            last_diag: std::time::Instant::now(),
+            requests_driven: 0,
+            responses_parsed: 0,
+            bytes_received: 0,
+            send_failures: 0,
+        };
+        tracing::debug!(
+            worker_id = result.id,
+            sessions = result.sessions.len(),
+            my_connections = result.my_connections,
+            "worker create_for_worker complete, entering event loop"
+        );
+        result
     }
 
     fn on_accept(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {
@@ -851,6 +883,10 @@ impl EventHandler for BenchHandler {
             metrics::BYTES_RX.add(buf.consumed as u64);
         }
 
+        // Diagnostic tracking
+        self.bytes_received += data.len() as u64;
+        self.responses_parsed += self.results.len() as u64;
+
         buf.consumed
     }
 
@@ -904,6 +940,18 @@ impl EventHandler for BenchHandler {
 
         // Update recording state on phase transition
         if phase != self.last_phase {
+            if phase == Phase::Running {
+                let connected = self.sessions.iter().filter(|s| s.is_connected()).count();
+                let total_in_flight: usize =
+                    self.sessions.iter().map(|s| s.in_flight_count()).sum();
+                tracing::debug!(
+                    worker = self.id,
+                    connected,
+                    total_sessions = self.sessions.len(),
+                    total_in_flight,
+                    "entering Running phase"
+                );
+            }
             self.recording = phase.is_recording();
             self.last_phase = phase;
         }
@@ -934,6 +982,34 @@ impl EventHandler for BenchHandler {
 
         // Process any responses from session internal buffers
         self.poll_session_responses(std::time::Instant::now());
+
+        // Periodic diagnostic heartbeat (every 2 seconds)
+        self.tick_count += 1;
+        if self.last_diag.elapsed() >= std::time::Duration::from_secs(2) {
+            let connected = self.sessions.iter().filter(|s| s.is_connected()).count();
+            let total_in_flight: usize = self.sessions.iter().map(|s| s.in_flight_count()).sum();
+            let can_send_count = self.sessions.iter().filter(|s| s.can_send()).count();
+            tracing::trace!(
+                worker = self.id,
+                phase = ?phase,
+                recording = self.recording,
+                connected,
+                total_in_flight,
+                can_send = can_send_count,
+                ticks = self.tick_count,
+                reqs_driven = self.requests_driven,
+                resps_parsed = self.responses_parsed,
+                bytes_rx = self.bytes_received,
+                send_fails = self.send_failures,
+                "diagnostic heartbeat"
+            );
+            self.tick_count = 0;
+            self.requests_driven = 0;
+            self.responses_parsed = 0;
+            self.bytes_received = 0;
+            self.send_failures = 0;
+            self.last_diag = std::time::Instant::now();
+        }
     }
 }
 

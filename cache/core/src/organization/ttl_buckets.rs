@@ -643,6 +643,15 @@ impl TtlBucket {
             Some(INVALID_SEGMENT_ID),
         );
 
+        // Race fix: if readers dropped during the transition window above,
+        // the segments would be stuck in AwaitingRelease with ref_count == 0.
+        if src_a.ref_count() == 0 {
+            src_a.release_condemned();
+        }
+        if src_b.ref_count() == 0 {
+            src_b.release_condemned();
+        }
+
         // Update segment count: removed 2, added 1 = net -1
         self.segment_count.fetch_sub(1, Ordering::Relaxed);
 

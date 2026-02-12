@@ -899,6 +899,11 @@ impl Segment for SliceSegment<'_> {
         }
     }
 
+    fn release_condemned(&self) -> bool {
+        // Delegate to the inherent method
+        SliceSegment::release_condemned(self)
+    }
+
     fn cas_metadata(
         &self,
         expected_state: State,

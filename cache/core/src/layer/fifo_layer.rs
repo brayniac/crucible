@@ -170,6 +170,12 @@ impl FifoLayer {
             self.drain_segment_from_hashtable(segment_id, hashtable);
             // Draining → AwaitingRelease (last reader's ValueRef::drop will free it)
             segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            // Race fix: if the last reader dropped between our ref_count check
+            // and the CAS above, the segment is now AwaitingRelease with
+            // ref_count == 0 and nobody will free it. Reclaim it now.
+            if segment.ref_count() == 0 && segment.release_condemned() {
+                return true;
+            }
             return false;
         }
 
@@ -447,6 +453,10 @@ impl FifoLayer {
             // Can't demote while readers hold refs - just drain hashtable and defer
             self.drain_segment_from_hashtable(segment_id, hashtable);
             segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            // Race fix: reclaim if last reader dropped during the window above.
+            if segment.ref_count() == 0 && segment.release_condemned() {
+                return true;
+            }
             return false;
         }
 

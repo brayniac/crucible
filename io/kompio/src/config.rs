@@ -56,6 +56,12 @@ pub struct Config {
     /// while processing a CQE batch, pending SQEs are flushed mid-iteration.
     /// 0 = disabled. Ignored when SQPOLL is active (kernel handles it).
     pub flush_interval_us: u64,
+    /// Maximum time in microseconds that `submit_and_wait` will block before
+    /// returning to call `on_tick`. Prevents the event loop from stalling when
+    /// there are no pending completions (e.g., client-only mode between phases).
+    /// 0 = no timeout (block indefinitely until a CQE arrives).
+    /// Default: 1000 (1ms).
+    pub tick_timeout_us: u64,
     /// Optional TLS configuration. When set, all accepted connections use TLS.
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
@@ -77,12 +83,13 @@ impl Default for Config {
             registered_regions: Vec::new(),
             worker: WorkerConfig::default(),
             backlog: 1024,
-            max_connections: 16384,
+            max_connections: 16000,
             recv_accumulator_capacity: 65536,
             send_copy_count: 1024,
             send_copy_slot_size: 16384,
             send_slab_slots: 512,
             flush_interval_us: 100,
+            tick_timeout_us: 1000,
             #[cfg(feature = "tls")]
             tls: None,
             #[cfg(feature = "tls")]
