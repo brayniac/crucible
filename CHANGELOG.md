@@ -15,6 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.3.1] - 2026-02-12
+
+### Changed
+- Benchmark diagnostic and startup logging lowered from info to debug/trace
+
+### Fixed
+- Segment leak race in non-blocking eviction (cache-core): last reader could drop between
+  ref_count check and CAS to AwaitingRelease, leaving segment stuck forever. Re-check
+  ref_count after CAS and call `release_condemned()` if zero
+- Event loop stall in client-only mode (kompio): tick timeout now armed to prevent indefinite
+  wait when no I/O completions arrive
+- Default max_connections lowered to fit typical RLIMIT_NOFILE on Linux
+- Server force-exits after drain timeout instead of hanging on shutdown
+- Heap cache generation overflow panic: slot generation counters used 12-bit mask but
+  TypedLocation only encodes 9 bits, causing panic after 512+ slot reuses
+- ConnectionTable double-release during shutdown: duplicate Close CQEs could push the same
+  index onto the free list twice, causing active_count() underflow
+
 ## [0.3.0] - 2026-02-11
 
 ### Added
