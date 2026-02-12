@@ -268,6 +268,21 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a timeout SQE that fires after the given duration.
+    /// Produces a CQE with the given user_data when it fires (-ETIME)
+    /// or is cancelled (-ECANCELED).
+    pub fn submit_tick_timeout(
+        &mut self,
+        ts: *const io_uring::types::Timespec,
+        user_data: u64,
+    ) -> io::Result<()> {
+        let entry = opcode::Timeout::new(ts).build().user_data(user_data);
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit pending SQEs without waiting. Used for mid-iteration flush.
     pub fn flush(&self) -> io::Result<()> {
         self.ring.submit()?;
