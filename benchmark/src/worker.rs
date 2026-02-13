@@ -1244,6 +1244,18 @@ impl EventHandler for BenchHandler {
         if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
             self.flush_session(ctx, idx);
         }
+
+        // Drive more requests immediately so the pipeline refills without
+        // waiting for the next on_tick. This is critical for throughput when
+        // send_pending serializes sends to one-at-a-time per session.
+        let phase = self.shared.phase();
+        if phase == Phase::Warmup || phase == Phase::Running {
+            let now = std::time::Instant::now();
+            self.drive_requests(ctx, now);
+        } else if phase == Phase::Prefill && !self.prefill_done {
+            let now = std::time::Instant::now();
+            self.drive_prefill_requests(ctx, now);
+        }
     }
 
     fn on_close(&mut self, _ctx: &mut DriverCtx, conn: ConnToken) {
