@@ -70,6 +70,11 @@ pub struct Config {
     pub tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub tcp_nodelay: bool,
+    /// Maximum number of SQEs per IOSQE_IO_LINK chain. 0 disables chaining.
+    /// When disabled, sends exceeding MAX_IOVECS fall back to sequential
+    /// round-trips (one SQE at a time via on_send_complete).
+    /// Default: 16.
+    pub max_chain_length: u16,
 }
 
 impl Default for Config {
@@ -95,6 +100,7 @@ impl Default for Config {
             #[cfg(feature = "tls")]
             tls_client: None,
             tcp_nodelay: true,
+            max_chain_length: 16,
         }
     }
 }

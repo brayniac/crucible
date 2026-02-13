@@ -240,8 +240,9 @@ impl SendGuard for BytesGuard {
 /// Large parts (>= GUARD_MIN_SIZE) use zero-copy guards; small parts
 /// are copied into the send pool.
 ///
-/// If there are more than MAX_IOVECS parts, the first batch is sent and
-/// `on_send_complete` will call us again for the remainder.
+/// If there are more than MAX_IOVECS parts and IO_LINK chaining is enabled,
+/// multiple SQEs are submitted as a linked chain. Otherwise, the first batch
+/// is sent and `on_send_complete` will call us again for the remainder.
 ///
 /// Returns `Err(())` on fatal send error.
 #[inline]
@@ -271,6 +272,13 @@ fn send_pending(
             Err(e) if e.kind() == io::ErrorKind::Other => return Ok(()),
             Err(_) => return Err(()),
         }
+    }
+
+    // Chain path: when parts exceed MAX_IOVECS and chaining is enabled,
+    // submit multiple SQEs as an IO_LINK chain.
+    let max_chain = ctx.max_chain_length() as usize;
+    if parts.len() > MAX_IOVECS && max_chain > 0 {
+        return send_pending_chain(ctx, conn, token, slot_size, &parts);
     }
 
     // Scatter-gather path: build a send_parts() call with mixed copy + guard parts.
@@ -314,6 +322,82 @@ fn send_pending(
             // Send pool or slab exhausted — stop sending, wait for on_send_complete.
             Ok(())
         }
+        Err(_) => Err(()),
+    }
+}
+
+/// Chain path: submit multiple batches of parts as linked IO_LINK SQEs.
+#[inline]
+fn send_pending_chain(
+    ctx: &mut DriverCtx,
+    conn: &mut Connection,
+    token: ConnToken,
+    slot_size: usize,
+    parts: &[Bytes],
+) -> Result<(), ()> {
+    let max_chain = ctx.max_chain_length() as usize;
+    let mut chain = ctx.send_chain(token);
+    let mut total_advance = 0usize;
+    let mut sqe_count = 0usize;
+
+    // Partition parts into batches of up to MAX_IOVECS each.
+    let mut batch_start = 0;
+    while batch_start < parts.len() && sqe_count < max_chain {
+        let batch_end = (batch_start + MAX_IOVECS).min(parts.len());
+
+        let mut parts_builder = chain.parts();
+        let mut copy_budget = slot_size;
+        let mut guard_count = 0usize;
+        let mut batch_advance = 0usize;
+
+        for part in &parts[batch_start..batch_end] {
+            if part.len() >= GUARD_MIN_SIZE && guard_count < MAX_GUARDS {
+                parts_builder = parts_builder.guard(GuardBox::new(BytesGuard(part.clone())));
+                guard_count += 1;
+            } else if part.len() <= copy_budget {
+                parts_builder = parts_builder.copy(part);
+                copy_budget -= part.len();
+            } else {
+                // Can't fit this part in the current batch — stop this batch.
+                break;
+            }
+            batch_advance += part.len();
+        }
+
+        // Always call .add() to return the chain (even if nothing was added).
+        chain = parts_builder.add();
+
+        if batch_advance == 0 {
+            // Can't fit any parts — stop building the chain.
+            break;
+        }
+        total_advance += batch_advance;
+        sqe_count += 1;
+
+        // Advance batch_start by the number of parts we actually consumed.
+        // Count consumed parts based on accumulated bytes.
+        let mut consumed = 0;
+        let mut bytes_counted = 0;
+        for part in &parts[batch_start..batch_end] {
+            bytes_counted += part.len();
+            consumed += 1;
+            if bytes_counted >= batch_advance {
+                break;
+            }
+        }
+        batch_start += consumed;
+    }
+
+    if total_advance == 0 {
+        return Ok(());
+    }
+
+    match chain.finish() {
+        Ok(()) => {
+            conn.advance_write(total_advance);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::Other => Ok(()),
         Err(_) => Err(()),
     }
 }

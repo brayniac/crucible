@@ -1,6 +1,7 @@
 pub mod acceptor;
 pub mod accumulator;
 pub mod buffer;
+pub(crate) mod chain;
 pub mod completion;
 pub mod config;
 pub mod connection;
@@ -25,7 +26,7 @@ pub use config::{Config, RecvBufferConfig, WorkerConfig};
 pub use error::Error;
 pub use event_loop::EventLoop;
 pub use guard::{GuardBox, SendGuard};
-pub use handler::{ConnToken, DriverCtx, EventHandler, SendBuilder};
+pub use handler::{ConnToken, DriverCtx, EventHandler, SendBuilder, SendChainBuilder, ChainPartsBuilder};
 #[cfg(feature = "tls")]
 pub use tls::TlsInfo;
 pub use worker::{KompioBuilder, ShutdownHandle, launch};

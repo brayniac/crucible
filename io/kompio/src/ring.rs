@@ -293,7 +293,10 @@ impl Ring {
     ///
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
-    unsafe fn push_sqe(&mut self, entry: io_uring::squeue::Entry) -> io::Result<()> {
+    pub(crate) unsafe fn push_sqe(
+        &mut self,
+        entry: io_uring::squeue::Entry,
+    ) -> io::Result<()> {
         // Try to push; if SQ is full, submit first to make room.
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
@@ -303,6 +306,54 @@ impl Ring {
                     .push(&entry)
                     .map_err(|_| io::Error::other("SQ still full after submit"))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Push a chain of linked SQEs atomically.
+    ///
+    /// Sets `IOSQE_IO_LINK` on all entries except the last, so the kernel
+    /// executes them sequentially. All entries are pushed via `push_multiple`
+    /// to guarantee contiguous placement in the SQ.
+    ///
+    /// # Safety
+    /// All SQEs must reference valid memory for the lifetime of their operations.
+    pub(crate) unsafe fn push_sqe_chain(
+        &mut self,
+        entries: &mut [io_uring::squeue::Entry],
+    ) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if entries.len() == 1 {
+            return unsafe { self.push_sqe(entries[0].clone()) };
+        }
+
+        // Set IO_LINK on all entries except the last.
+        let last = entries.len() - 1;
+        for entry in entries[..last].iter_mut() {
+            *entry = entry.clone().flags(io_uring::squeue::Flags::IO_LINK);
+        }
+
+        // Ensure enough room in the SQ for the entire chain.
+        {
+            let sq = self.ring.submission();
+            if sq.capacity() - sq.len() < entries.len() {
+                drop(sq);
+                self.ring.submit()?;
+                let sq = self.ring.submission();
+                if sq.capacity() - sq.len() < entries.len() {
+                    return Err(io::Error::other("SQ too small for chain"));
+                }
+            }
+        }
+
+        // Atomic push of the entire chain.
+        unsafe {
+            self.ring
+                .submission()
+                .push_multiple(entries)
+                .map_err(|_| io::Error::other("SQ full after flush for chain"))?;
         }
         Ok(())
     }

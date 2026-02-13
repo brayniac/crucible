@@ -12,6 +12,7 @@ use crate::buffer::fixed::FixedBufferRegistry;
 use crate::buffer::provided::ProvidedBufRing;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::buffer::send_slab::InFlightSendSlab;
+use crate::chain::{ChainEvent, SendChainTable};
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, RecvMode};
@@ -48,6 +49,10 @@ pub struct EventLoop<H: EventHandler> {
     cqe_batch: Vec<(u64, i32, u32)>,
     /// Whether to set TCP_NODELAY on connections.
     tcp_nodelay: bool,
+    /// Per-connection send chain tracking for IOSQE_IO_LINK chains.
+    chain_table: SendChainTable,
+    /// Maximum SQEs per chain (0 = disabled).
+    max_chain_length: u16,
     /// Tick timeout duration. When set, a timeout SQE ensures the event loop
     /// wakes periodically even when no I/O completions are pending.
     tick_timeout_ts: Option<io_uring::types::Timespec>,
@@ -147,6 +152,8 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs,
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             tcp_nodelay: config.tcp_nodelay,
+            chain_table: SendChainTable::new(config.max_connections),
+            max_chain_length: config.max_chain_length,
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
                     io_uring::types::Timespec::new()
@@ -219,6 +226,8 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_addrs: &mut self.connect_addrs,
                 tcp_nodelay: self.tcp_nodelay,
                 connect_timespecs: &mut self.connect_timespecs,
+                chain_table: &mut self.chain_table,
+                max_chain_length: self.max_chain_length,
             };
             self.handler.on_tick(&mut ctx);
         }
@@ -462,6 +471,8 @@ impl<H: EventHandler> EventLoop<H> {
                                 connect_addrs: &mut self.connect_addrs,
                                 tcp_nodelay: self.tcp_nodelay,
                                 connect_timespecs: &mut self.connect_timespecs,
+                                chain_table: &mut self.chain_table,
+                                max_chain_length: self.max_chain_length,
                             };
                             self.handler.on_connect(&mut ctx, token, Ok(()));
                         } else {
@@ -480,6 +491,8 @@ impl<H: EventHandler> EventLoop<H> {
                                 connect_addrs: &mut self.connect_addrs,
                                 tcp_nodelay: self.tcp_nodelay,
                                 connect_timespecs: &mut self.connect_timespecs,
+                                chain_table: &mut self.chain_table,
+                                max_chain_length: self.max_chain_length,
                             };
                             self.handler.on_accept(&mut ctx, token);
                         }
@@ -500,6 +513,8 @@ impl<H: EventHandler> EventLoop<H> {
                             &mut self.connect_addrs,
                             self.tcp_nodelay,
                             &mut self.connect_timespecs,
+                            &mut self.chain_table,
+                            self.max_chain_length,
                         );
                     }
                     crate::tls::TlsRecvResult::Ok => {
@@ -519,6 +534,8 @@ impl<H: EventHandler> EventLoop<H> {
                             &mut self.connect_addrs,
                             self.tcp_nodelay,
                             &mut self.connect_timespecs,
+                            &mut self.chain_table,
+                            self.max_chain_length,
                         );
                     }
                     crate::tls::TlsRecvResult::Error(_) | crate::tls::TlsRecvResult::Closed => {
@@ -546,6 +563,8 @@ impl<H: EventHandler> EventLoop<H> {
                 &mut self.connect_addrs,
                 self.tcp_nodelay,
                 &mut self.connect_timespecs,
+                &mut self.chain_table,
+                self.max_chain_length,
             );
         }
 
@@ -632,6 +651,8 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_addrs: &mut self.connect_addrs,
                 tcp_nodelay: self.tcp_nodelay,
                 connect_timespecs: &mut self.connect_timespecs,
+                chain_table: &mut self.chain_table,
+                max_chain_length: self.max_chain_length,
             };
             self.handler.on_accept(&mut ctx, token);
         }
@@ -647,6 +668,16 @@ impl<H: EventHandler> EventLoop<H> {
     fn handle_send(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let pool_slot = ud.payload() as u16;
+
+        // Chain path: accumulate CQE result, release pool slot immediately.
+        if self.chain_table.is_active(conn_index) {
+            self.send_copy_pool.release(pool_slot);
+            let event = self.chain_table.on_operation_cqe(conn_index, result);
+            if matches!(event, ChainEvent::Complete { .. }) {
+                self.fire_chain_complete(conn_index);
+            }
+            return;
+        }
 
         if result > 0 {
             if let Some((ptr, remaining)) =
@@ -682,6 +713,8 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_addrs: &mut self.connect_addrs,
                 tcp_nodelay: self.tcp_nodelay,
                 connect_timespecs: &mut self.connect_timespecs,
+                chain_table: &mut self.chain_table,
+                max_chain_length: self.max_chain_length,
             };
             self.handler.on_send_complete(&mut ctx, token, Ok(total));
 
@@ -721,6 +754,8 @@ impl<H: EventHandler> EventLoop<H> {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             connect_timespecs: &mut self.connect_timespecs,
+            chain_table: &mut self.chain_table,
+            max_chain_length: self.max_chain_length,
         };
         self.handler.on_send_complete(&mut ctx, token, io_result);
     }
@@ -730,6 +765,49 @@ impl<H: EventHandler> EventLoop<H> {
         let slab_idx = ud.payload() as u16;
 
         if !self.send_slab.in_use(slab_idx) {
+            return;
+        }
+
+        // Chain path: track CQE results and ZC notifications.
+        if self.chain_table.is_active(conn_index) {
+            if cqueue::notif(flags) {
+                // ZC notification — release slab if ready.
+                self.send_slab.dec_pending_notifs(slab_idx);
+                if self.send_slab.should_release(slab_idx) {
+                    let ps = self.send_slab.release(slab_idx);
+                    if ps != u16::MAX {
+                        self.send_copy_pool.release(ps);
+                    }
+                }
+                let event = self.chain_table.on_notif_cqe(conn_index);
+                if matches!(event, ChainEvent::Complete { .. }) {
+                    self.fire_chain_complete(conn_index);
+                }
+                return;
+            }
+            // Operation CQE
+            if result == -libc::ECANCELED {
+                // Cancelled — no NOTIF coming, release slab immediately.
+                let ps = self.send_slab.release(slab_idx);
+                if ps != u16::MAX {
+                    self.send_copy_pool.release(ps);
+                }
+            } else if result >= 0 {
+                // Success (full or partial) — NOTIF will come.
+                self.send_slab.inc_pending_notifs(slab_idx);
+                self.send_slab.mark_awaiting_notifications(slab_idx);
+                self.chain_table.inc_zc_notif(conn_index);
+            } else {
+                // Other error — no NOTIF, release immediately.
+                let ps = self.send_slab.release(slab_idx);
+                if ps != u16::MAX {
+                    self.send_copy_pool.release(ps);
+                }
+            }
+            let event = self.chain_table.on_operation_cqe(conn_index, result);
+            if matches!(event, ChainEvent::Complete { .. }) {
+                self.fire_chain_complete(conn_index);
+            }
             return;
         }
 
@@ -796,6 +874,8 @@ impl<H: EventHandler> EventLoop<H> {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             connect_timespecs: &mut self.connect_timespecs,
+            chain_table: &mut self.chain_table,
+            max_chain_length: self.max_chain_length,
         };
         self.handler.on_send_complete(&mut ctx, token, io_result);
 
@@ -844,6 +924,8 @@ impl<H: EventHandler> EventLoop<H> {
                         connect_addrs: &mut self.connect_addrs,
                         tcp_nodelay: self.tcp_nodelay,
                         connect_timespecs: &mut self.connect_timespecs,
+                        chain_table: &mut self.chain_table,
+                        max_chain_length: self.max_chain_length,
                     };
                     self.handler.on_connect(&mut ctx, token, Err(err));
                     self.close_connection(conn_index);
@@ -893,6 +975,8 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_addrs: &mut self.connect_addrs,
                 tcp_nodelay: self.tcp_nodelay,
                 connect_timespecs: &mut self.connect_timespecs,
+                chain_table: &mut self.chain_table,
+                max_chain_length: self.max_chain_length,
             };
             self.handler.on_connect(&mut ctx, token, Err(err));
 
@@ -971,6 +1055,8 @@ impl<H: EventHandler> EventLoop<H> {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             connect_timespecs: &mut self.connect_timespecs,
+            chain_table: &mut self.chain_table,
+            max_chain_length: self.max_chain_length,
         };
         self.handler.on_connect(&mut ctx, token, Ok(()));
     }
@@ -1029,6 +1115,8 @@ impl<H: EventHandler> EventLoop<H> {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             connect_timespecs: &mut self.connect_timespecs,
+            chain_table: &mut self.chain_table,
+            max_chain_length: self.max_chain_length,
         };
         self.handler.on_connect(&mut ctx, token, Err(err));
 
@@ -1074,6 +1162,8 @@ impl<H: EventHandler> EventLoop<H> {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             connect_timespecs: &mut self.connect_timespecs,
+            chain_table: &mut self.chain_table,
+            max_chain_length: self.max_chain_length,
         };
         self.handler.on_close(&mut ctx, token);
 
@@ -1131,7 +1221,54 @@ impl<H: EventHandler> EventLoop<H> {
             &mut self.connect_addrs,
             self.tcp_nodelay,
             &mut self.connect_timespecs,
+            &mut self.chain_table,
+            self.max_chain_length,
         );
+    }
+
+    /// Fire on_send_complete for a completed chain, then replay accumulated data.
+    fn fire_chain_complete(&mut self, conn_index: u32) {
+        let chain = match self.chain_table.take(conn_index) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let conn = match self.connections.get(conn_index) {
+            Some(c) => c,
+            None => return,
+        };
+        let generation = conn.generation;
+        let token = ConnToken::new(conn_index, generation);
+
+        let io_result = match chain.first_error {
+            Some(errno) => Err(io::Error::from_raw_os_error(-errno)),
+            None => Ok(chain.bytes_sent),
+        };
+
+        let mut ctx = DriverCtx {
+            ring: &mut self.ring,
+            connections: &mut self.connections,
+            fixed_buffers: &mut self.fixed_buffers,
+            send_copy_pool: &mut self.send_copy_pool,
+            send_slab: &mut self.send_slab,
+            #[cfg(feature = "tls")]
+            tls_table: match self.tls_table {
+                Some(ref mut t) => t as *mut crate::tls::TlsTable,
+                None => std::ptr::null_mut(),
+            },
+            shutdown_requested: &mut self.shutdown_local,
+            connect_addrs: &mut self.connect_addrs,
+            tcp_nodelay: self.tcp_nodelay,
+            connect_timespecs: &mut self.connect_timespecs,
+            chain_table: &mut self.chain_table,
+            max_chain_length: self.max_chain_length,
+        };
+        self.handler.on_send_complete(&mut ctx, token, io_result);
+
+        // After chain completes, replay accumulated recv data.
+        if chain.first_error.is_none() {
+            self.replay_accumulated(conn_index);
+        }
     }
 
     fn close_connection(&mut self, conn_index: u32) {
@@ -1143,6 +1280,8 @@ impl<H: EventHandler> EventLoop<H> {
         } else {
             return;
         }
+        // Cancel any active chain — per-SQE resources released as CQEs arrive.
+        self.chain_table.cancel(conn_index);
         let _ = self.ring.submit_close(conn_index);
     }
 }
@@ -1164,6 +1303,8 @@ fn call_on_data<H: EventHandler>(
     connect_addrs: &mut Vec<libc::sockaddr_storage>,
     tcp_nodelay: bool,
     connect_timespecs: &mut Vec<io_uring::types::Timespec>,
+    chain_table: &mut SendChainTable,
+    max_chain_length: u16,
 ) {
     let data = accumulators.data(conn_index);
     if data.is_empty() {
@@ -1184,6 +1325,8 @@ fn call_on_data<H: EventHandler>(
         connect_addrs,
         tcp_nodelay,
         connect_timespecs,
+        chain_table,
+        max_chain_length,
     };
     let consumed = handler.on_data(&mut ctx, token, data);
     accumulators.consume(conn_index, consumed);
