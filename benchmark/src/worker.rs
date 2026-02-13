@@ -368,6 +368,10 @@ impl BenchHandler {
                     self.prefill_session_last_progress
                         .push(std::time::Instant::now());
 
+                    // Mark as having a pending connect so try_reconnect doesn't
+                    // issue a duplicate connect before this one completes.
+                    self.sessions[idx].reconnect_attempted(true);
+
                     // Initiate async connect
                     match ctx.connect(endpoint) {
                         Ok(token) => {
@@ -865,11 +869,15 @@ impl BenchHandler {
 
     /// Try to reconnect disconnected sessions.
     fn try_reconnect(&mut self, ctx: &mut DriverCtx) {
+        // Build set of sessions that already have a pending connect to avoid duplicates.
+        let pending_sessions: std::collections::HashSet<usize> =
+            self.pending_connects.values().copied().collect();
+
         let to_reconnect: Vec<(usize, SocketAddr, Option<usize>)> = self
             .sessions
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.should_reconnect())
+            .filter(|(idx, s)| s.should_reconnect() && !pending_sessions.contains(idx))
             .map(|(idx, s)| (idx, s.addr(), s.conn_id()))
             .collect();
 
