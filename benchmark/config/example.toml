@@ -15,7 +15,7 @@ request_timeout = "1s"
 
 [workload]
 # prefill = true       # Write each key once before test starts
-# set_on_miss = true   # On GET miss, automatically SET the key (cache-aside pattern)
+# backfill_on_miss = true  # On GET miss, SET the key to backfill the cache (cache-aside pattern)
 # rate_limit = 100000  # Uncomment to limit rate
 
 [workload.keyspace]

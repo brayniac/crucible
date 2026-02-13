@@ -109,7 +109,7 @@ struct InFlightRequest {
     /// Cumulative byte offset where this request's data ends in the send stream.
     bytes_end: u64,
     tx_timestamp: Option<Timestamp>,
-    /// Key ID for set_on_miss tracking (GET only).
+    /// Key ID for backfill_on_miss tracking (GET only).
     key_id: Option<usize>,
     /// True if this SET was triggered by a miss (backfill).
     backfill: bool,
@@ -389,7 +389,7 @@ impl Session {
     /// The `now` parameter should be the current time, shared across a batch of
     /// requests to avoid excessive clock_gettime calls.
     ///
-    /// `key_id` is used for set_on_miss tracking: when a GET misses, the worker
+    /// `key_id` is used for backfill_on_miss tracking: when a GET misses, the worker
     /// uses this ID to issue a backfill SET for the same key.
     #[inline]
     pub fn get(&mut self, key: &[u8], now: Instant, key_id: Option<usize>) -> Option<u64> {
@@ -628,7 +628,7 @@ impl Session {
 
     /// Mark the most recently pushed in-flight request as a backfill SET.
     ///
-    /// Called by the worker after `confirm_set_sent()` for set_on_miss backfills.
+    /// Called by the worker after `confirm_set_sent()` for backfill_on_miss backfills.
     #[inline]
     pub fn mark_last_request_backfill(&mut self) {
         if let Some(req) = self.in_flight.back_mut() {

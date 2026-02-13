@@ -21,7 +21,7 @@ pub struct RequestResult {
     pub request_type: RequestType,
     /// For GET requests: true if cache hit, false if miss, None for non-GET
     pub hit: Option<bool>,
-    /// Key ID for set_on_miss tracking (GET only)
+    /// Key ID for backfill_on_miss tracking (GET only)
     pub key_id: Option<usize>,
     /// True if this SET was triggered by a miss (backfill)
     pub backfill: bool,

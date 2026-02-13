@@ -316,10 +316,10 @@ pub struct BenchHandler {
     /// Starting global connection index for endpoint distribution
     my_start: usize,
 
-    /// Backfill queue: key IDs from GET misses that need SET backfills (set_on_miss).
+    /// Backfill queue: key IDs from GET misses that need SET backfills (backfill_on_miss).
     backfill_queue: Vec<usize>,
-    /// Whether set_on_miss is enabled.
-    set_on_miss: bool,
+    /// Whether backfill_on_miss is enabled.
+    backfill_on_miss: bool,
 
     /// Tick counter for periodic diagnostics
     tick_count: u64,
@@ -566,7 +566,7 @@ impl BenchHandler {
         let value_len = self.config.workload.values.length;
         let pool_len = self.value_pool.len();
 
-        // Drain backfill queue before normal requests (set_on_miss)
+        // Drain backfill queue before normal requests (backfill_on_miss)
         if !self.backfill_queue.is_empty() {
             self.drain_backfill_queue(ctx, now, value_len, pool_len);
         }
@@ -593,7 +593,7 @@ impl BenchHandler {
                 let roll = self.rng.random_range(0..100);
                 if roll < get_ratio {
                     // GET: encode into session buffer, batch-flush later
-                    let kid = if self.set_on_miss { Some(key_id) } else { None };
+                    let kid = if self.backfill_on_miss { Some(key_id) } else { None };
                     if self.sessions[idx].get(&self.key_buf, now, kid).is_none() {
                         break;
                     }
@@ -966,8 +966,8 @@ impl BenchHandler {
                 }
             }
 
-            // Queue backfill SETs for GET misses (set_on_miss)
-            if self.set_on_miss {
+            // Queue backfill SETs for GET misses (backfill_on_miss)
+            if self.backfill_on_miss {
                 for result in &self.results {
                     if result.request_type == RequestType::Get
                         && result.hit == Some(false)
@@ -1053,7 +1053,7 @@ impl EventHandler for BenchHandler {
             remainder * (base_per_thread + 1) + (cfg.id - remainder) * base_per_thread
         };
 
-        let set_on_miss = cfg.config.workload.set_on_miss;
+        let backfill_on_miss = cfg.config.workload.backfill_on_miss;
 
         let result = BenchHandler {
             id: cfg.id,
@@ -1084,7 +1084,7 @@ impl EventHandler for BenchHandler {
             my_connections,
             my_start,
             backfill_queue: Vec::new(),
-            set_on_miss,
+            backfill_on_miss,
             tick_count: 0,
             last_diag: std::time::Instant::now(),
             requests_driven: 0,
@@ -1179,8 +1179,8 @@ impl EventHandler for BenchHandler {
             }
         }
 
-        // Queue backfill SETs for GET misses (set_on_miss)
-        if self.set_on_miss {
+        // Queue backfill SETs for GET misses (backfill_on_miss)
+        if self.backfill_on_miss {
             for result in &self.results {
                 if result.request_type == RequestType::Get
                     && result.hit == Some(false)

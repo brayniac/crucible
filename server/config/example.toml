@@ -43,6 +43,11 @@ backend = "segment"
 #   slab:    "lra" (default), "lrc", "random", "none"
 policy = "s3fifo"
 
+# S3-FIFO small queue percentage (1-50, default: 10).
+# Controls the admission filter size as a percentage of total cache capacity.
+# Larger values give items more time to prove popularity before eviction.
+# small_queue_percent = 10
+
 # Total heap size
 heap_size = "1GB"
 

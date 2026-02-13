@@ -92,6 +92,12 @@ pub struct CacheConfig {
     #[serde(default = "default_hashtable_power")]
     pub hashtable_power: u8,
 
+    /// S3-FIFO small queue percentage (1-50, default: 10).
+    /// Controls what fraction of cache capacity is used as the admission filter.
+    /// Only applies when policy is "s3fifo".
+    #[serde(default = "default_small_queue_percent")]
+    pub small_queue_percent: u8,
+
     /// Hugepage size preference: "none", "2mb", or "1gb"
     #[serde(default)]
     pub hugepage: HugepageConfig,
@@ -194,6 +200,7 @@ impl Default for CacheConfig {
             segment_size: default_segment_size(),
             max_value_size: default_max_value_size(),
             hashtable_power: default_hashtable_power(),
+            small_queue_percent: default_small_queue_percent(),
             hugepage: HugepageConfig::default(),
             numa_node: None,
             disk: None,
@@ -555,6 +562,10 @@ fn default_hashtable_power() -> u8 {
     26
 }
 
+fn default_small_queue_percent() -> u8 {
+    10
+}
+
 fn default_metrics_address() -> SocketAddr {
     "0.0.0.0:9090".parse().unwrap()
 }
@@ -740,6 +751,14 @@ impl Config {
             return Err(format!(
                 "max_value_size ({}) must be less than segment_size ({})",
                 self.cache.max_value_size, self.cache.segment_size
+            )
+            .into());
+        }
+
+        if !(1..=50).contains(&self.cache.small_queue_percent) {
+            return Err(format!(
+                "small_queue_percent ({}) must be between 1 and 50",
+                self.cache.small_queue_percent
             )
             .into());
         }

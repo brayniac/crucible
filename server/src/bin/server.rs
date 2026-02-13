@@ -81,6 +81,7 @@ fn run(
         backend_detail,
         cache_backend: config.cache.backend,
         eviction_policy: policy,
+        small_queue_percent: config.cache.small_queue_percent,
         workers: config.threads(),
         listeners: &listeners,
         metrics_address: config.metrics.address,
@@ -152,7 +153,10 @@ fn create_segment(
 
     // Apply eviction policy
     builder = match policy {
-        EvictionPolicy::S3Fifo => builder.s3fifo(),
+        EvictionPolicy::S3Fifo => builder.eviction_policy(SegEvictionPolicy::S3Fifo {
+            small_queue_percent: config.cache.small_queue_percent,
+            demotion_threshold: 1,
+        }),
         EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),
         EvictionPolicy::Random => builder.eviction_policy(SegEvictionPolicy::Random),
         EvictionPolicy::Cte => builder.eviction_policy(SegEvictionPolicy::Cte),
@@ -261,7 +265,8 @@ fn create_heap(
     let mut builder = HeapCache::builder()
         .memory_limit(config.cache.heap_size)
         .hashtable_power(config.cache.hashtable_power)
-        .eviction_policy(heap_policy);
+        .eviction_policy(heap_policy)
+        .small_queue_percent(config.cache.small_queue_percent);
 
     // Configure disk tier if enabled
     if let Some(ref disk_config) = config.cache.disk
@@ -322,6 +327,9 @@ backend = "segment"
 #   heap:    "s3fifo" (default), "lfu"
 #   slab:    "lra" (default), "lrc", "random", "none"
 policy = "s3fifo"
+
+# S3-FIFO small queue percentage (1-50, default: 10)
+# small_queue_percent = 10
 
 # Total heap size (e.g., "4GB", "512MB")
 heap_size = "4GB"

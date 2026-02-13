@@ -85,7 +85,7 @@ pub static DELETE_COUNT: Counter = Counter::new(&OPS, ops::DELETE);
 
 #[metric(
     name = "backfill_set_count",
-    description = "Backfill SET operations (from set_on_miss)"
+    description = "Backfill SET operations (from backfill_on_miss)"
 )]
 pub static BACKFILL_SET_COUNT: Counter = Counter::new(&OPS, ops::BACKFILL_SET);
 

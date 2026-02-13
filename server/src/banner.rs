@@ -14,6 +14,8 @@ pub struct BannerConfig<'a> {
     pub cache_backend: CacheBackend,
     /// Eviction policy
     pub eviction_policy: EvictionPolicy,
+    /// S3-FIFO small queue percentage
+    pub small_queue_percent: u8,
     /// Number of worker threads
     pub workers: usize,
     /// Protocol listeners
@@ -64,7 +66,16 @@ pub fn print_banner(config: &BannerConfig) {
         EvictionPolicy::Lrc => "lrc",
         EvictionPolicy::None => "none",
     };
-    writeln!(output, "Cache:       {} ({})", backend_str, policy_str).unwrap();
+    if config.eviction_policy == EvictionPolicy::S3Fifo {
+        writeln!(
+            output,
+            "Cache:       {} ({}, small_queue={}%)",
+            backend_str, policy_str, config.small_queue_percent
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "Cache:       {} ({})", backend_str, policy_str).unwrap();
+    }
     writeln!(output, "Workers:     {}", config.workers).unwrap();
 
     if let Some(cpus) = config.cpu_affinity {
