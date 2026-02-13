@@ -720,3 +720,96 @@ fn test_uring_deep_pipeline() {
         pong_count
     );
 }
+
+// =============================================================================
+// Pipelined large value tests (regression tests for protocol error cascade)
+// =============================================================================
+
+#[test]
+fn test_uring_pipelined_large_sets_diagnostic() {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let _server_handle = start_test_server(port, 1);
+    assert!(wait_for_server(addr, Duration::from_secs(5)));
+
+    let pipeline_depth = 8;
+
+    // Test pipelined GETs at various value sizes, including sizes that
+    // trigger write backpressure (pending > 256KB).
+    for &vsize in &[32768, 40000, 50000, 55000, 58000, 60000] {
+        let value = generate_value(vsize);
+        let key_prefix = format!("diag:v{}:key", vsize);
+
+        let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Store values one at a time to avoid any SET-related issues
+        for i in 0..pipeline_depth {
+            let key = format!("{}:{}", key_prefix, i);
+            assert!(
+                send_set(&mut stream, &key, &value),
+                "SET failed for size {}, key {}",
+                vsize,
+                i
+            );
+        }
+
+        // Now do pipelined GETs
+        let get_commands = build_pipelined_gets(&key_prefix, pipeline_depth);
+        stream.write_all(&get_commands).unwrap();
+
+        let get_responses = read_responses(&mut stream, pipeline_depth);
+        let get_total = count_resp_responses(&get_responses);
+
+        let expected_bytes = pipeline_depth * (vsize + 2 + format!("${}\r\n", vsize).len());
+        eprintln!(
+            "Value size {}: {} GET responses, {} bytes (expected ~{})",
+            vsize,
+            get_total,
+            get_responses.len(),
+            expected_bytes
+        );
+
+        assert_eq!(
+            get_total,
+            pipeline_depth,
+            "Pipelined GETs failed for value size {}: got {} of {} (received {} bytes)",
+            vsize,
+            get_total,
+            pipeline_depth,
+            get_responses.len()
+        );
+    }
+
+    eprintln!("All value sizes passed!");
+}
+
+#[test]
+fn test_uring_1conn_p8_60k() {
+    run_parameterized_test(TestConfig::new(1, 8, 60_000));
+}
+
+#[test]
+fn test_uring_1conn_p8_65535() {
+    // Just below streaming threshold (65536)
+    run_parameterized_test(TestConfig::new(1, 8, 65_535));
+}
+
+#[test]
+fn test_uring_1conn_p8_65536() {
+    // Exactly at streaming threshold
+    run_parameterized_test(TestConfig::new(1, 8, 65_536));
+}
+
+#[test]
+fn test_uring_1conn_p8_100k() {
+    // Above streaming threshold
+    run_parameterized_test(TestConfig::new(1, 8, 100_000));
+}

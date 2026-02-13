@@ -684,6 +684,10 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_timespecs: &mut self.connect_timespecs,
             };
             self.handler.on_send_complete(&mut ctx, token, Ok(total));
+
+            // After sends drain, replay accumulated recv data that was deferred
+            // due to write backpressure.
+            self.replay_accumulated(conn_index);
             return;
         }
 
@@ -794,6 +798,12 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs: &mut self.connect_timespecs,
         };
         self.handler.on_send_complete(&mut ctx, token, io_result);
+
+        // After sends drain, replay accumulated recv data that was deferred
+        // due to write backpressure.
+        if result >= 0 {
+            self.replay_accumulated(conn_index);
+        }
     }
 
     fn handle_connect(&mut self, ud: UserData, result: i32) {
@@ -1085,6 +1095,43 @@ impl<H: EventHandler> EventLoop<H> {
             return;
         }
         self.send_copy_pool.release(pool_slot);
+    }
+
+    /// Replay accumulated recv data for a connection after write backpressure
+    /// has been relieved. If `on_data` previously returned without consuming all
+    /// data (because pending writes exceeded the backpressure threshold), the
+    /// unconsumed data sits in the accumulator. After a send completes and
+    /// frees write capacity, we re-invoke `on_data` to process the remaining
+    /// commands.
+    fn replay_accumulated(&mut self, conn_index: u32) {
+        if self.accumulators.data(conn_index).is_empty() {
+            return;
+        }
+
+        let conn = match self.connections.get(conn_index) {
+            Some(c) => c,
+            None => return,
+        };
+        let generation = conn.generation;
+        let token = ConnToken::new(conn_index, generation);
+
+        call_on_data(
+            &mut self.handler,
+            &mut self.accumulators,
+            &mut self.ring,
+            &mut self.connections,
+            &mut self.fixed_buffers,
+            &mut self.send_copy_pool,
+            &mut self.send_slab,
+            &mut self.shutdown_local,
+            conn_index,
+            token,
+            #[cfg(feature = "tls")]
+            &mut self.tls_table,
+            &mut self.connect_addrs,
+            self.tcp_nodelay,
+            &mut self.connect_timespecs,
+        );
     }
 
     fn close_connection(&mut self, conn_index: u32) {

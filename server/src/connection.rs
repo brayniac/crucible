@@ -297,8 +297,13 @@ impl Connection {
 
             // Check if we're in the middle of receiving a large value
             // This must be checked before we borrow data for parsing
+            let len_before = buf.len();
             if self.continue_streaming_recv(buf, cache) {
-                // Still receiving value data, or completed a streaming SET
+                if buf.len() == len_before {
+                    // Streaming needs more data (e.g. trailing CRLF split across
+                    // recv buffers). Break to return to the event loop.
+                    break;
+                }
                 continue;
             }
 
@@ -616,7 +621,11 @@ impl Connection {
             }
 
             // Check if we're in the middle of receiving a large value
+            let len_before = buf.len();
             if self.continue_memcache_ascii_streaming_recv(buf, cache) {
+                if buf.len() == len_before {
+                    break; // Streaming needs more data
+                }
                 continue;
             }
 
@@ -891,7 +900,11 @@ impl Connection {
             }
 
             // Check if we're in the middle of receiving a large value
+            let len_before = buf.len();
             if self.continue_memcache_binary_streaming_recv(buf, cache) {
+                if buf.len() == len_before {
+                    break; // Streaming needs more data
+                }
                 continue;
             }
 
@@ -2264,5 +2277,91 @@ mod tests {
         } else {
             panic!("Expected Value response with key");
         }
+    }
+
+    /// Build a RESP SET command as bytes.
+    fn build_resp_set(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut cmd = Vec::new();
+        cmd.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
+        cmd.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+        cmd.extend_from_slice(key);
+        cmd.extend_from_slice(b"\r\n");
+        cmd.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+        cmd.extend_from_slice(value);
+        cmd.extend_from_slice(b"\r\n");
+        cmd
+    }
+
+    #[test]
+    fn test_pipelined_large_sets_all_at_once() {
+        let cache = MockCache;
+        let mut conn = Connection::default();
+
+        let value = vec![b'x'; 60_000];
+        let mut pipeline = Vec::new();
+        for i in 0..8 {
+            let key = format!("key{}", i);
+            pipeline.extend(build_resp_set(key.as_bytes(), &value));
+        }
+
+        // Feed the entire pipeline at once
+        let mut buf = TestRecvBuf::new(&pipeline);
+        conn.process_from(&mut buf, &cache);
+
+        let response = conn.pending_write_data();
+        let response_str = String::from_utf8_lossy(response);
+        let ok_count = response_str.matches("+OK").count();
+
+        assert_eq!(
+            ok_count,
+            8,
+            "Expected 8 OKs, got {}. Response: {:?}",
+            ok_count,
+            &response_str[..std::cmp::min(500, response_str.len())]
+        );
+        assert!(
+            buf.as_slice().is_empty(),
+            "Buffer should be fully consumed, {} bytes remain",
+            buf.len()
+        );
+    }
+
+    #[test]
+    fn test_pipelined_large_sets_chunked() {
+        // Simulate receiving large pipelined SETs in 16KB chunks (like io_uring)
+        let cache = MockCache;
+        let mut conn = Connection::default();
+
+        let value = vec![b'x'; 60_000];
+        let mut pipeline = Vec::new();
+        for i in 0..8 {
+            let key = format!("key{}", i);
+            pipeline.extend(build_resp_set(key.as_bytes(), &value));
+        }
+
+        // Feed in 16KB chunks
+        let chunk_size = 16384;
+        let mut buf = TestRecvBuf::new(&[]);
+        let mut offset = 0;
+        while offset < pipeline.len() {
+            let end = std::cmp::min(offset + chunk_size, pipeline.len());
+            buf.append(&pipeline[offset..end]);
+            conn.process_from(&mut buf, &cache);
+            offset = end;
+        }
+
+        let response = conn.pending_write_data();
+        let response_str = String::from_utf8_lossy(response);
+        let ok_count = response_str.matches("+OK").count();
+        let err_count = response_str.matches("-ERR").count();
+
+        assert_eq!(
+            ok_count,
+            8,
+            "Expected 8 OKs, got {} OKs and {} ERRs. Response: {:?}",
+            ok_count,
+            err_count,
+            &response_str[..std::cmp::min(500, response_str.len())]
+        );
     }
 }
