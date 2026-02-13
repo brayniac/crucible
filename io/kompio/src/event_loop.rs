@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
@@ -16,7 +17,7 @@ use crate::chain::{ChainEvent, SendChainTable};
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, RecvMode};
-use crate::handler::{ConnToken, DriverCtx, EventHandler};
+use crate::handler::{ConnSendState, ConnToken, DriverCtx, EventHandler};
 use crate::ring::Ring;
 
 /// The core event loop that drives io_uring and dispatches to the EventHandler.
@@ -53,6 +54,8 @@ pub struct EventLoop<H: EventHandler> {
     chain_table: SendChainTable,
     /// Maximum SQEs per chain (0 = disabled).
     max_chain_length: u16,
+    /// Per-connection send queues for serializing sends (one in-flight at a time).
+    send_queues: Vec<ConnSendState>,
     /// Tick timeout duration. When set, a timeout SQE ensures the event loop
     /// wakes periodically even when no I/O completions are pending.
     tick_timeout_ts: Option<io_uring::types::Timespec>,
@@ -128,6 +131,11 @@ impl<H: EventHandler> EventLoop<H> {
             io_uring::types::Timespec::new(),
         );
 
+        let mut send_queues = Vec::with_capacity(config.max_connections as usize);
+        for _ in 0..config.max_connections {
+            send_queues.push(ConnSendState::new());
+        }
+
         Ok(EventLoop {
             ring,
             connections,
@@ -154,6 +162,7 @@ impl<H: EventHandler> EventLoop<H> {
             tcp_nodelay: config.tcp_nodelay,
             chain_table: SendChainTable::new(config.max_connections),
             max_chain_length: config.max_chain_length,
+            send_queues,
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
                     io_uring::types::Timespec::new()
@@ -228,6 +237,7 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_timespecs: &mut self.connect_timespecs,
                 chain_table: &mut self.chain_table,
                 max_chain_length: self.max_chain_length,
+                send_queues: &mut self.send_queues,
             };
             self.handler.on_tick(&mut ctx);
         }
@@ -235,10 +245,11 @@ impl<H: EventHandler> EventLoop<H> {
 
     /// Shutdown: close all connections, drain remaining CQEs, close eventfd.
     fn run_shutdown(&mut self) {
-        // 1. Close all active connections.
+        // 1. Close all active connections and drain their send queues.
         let max = self.connections.max_slots();
         for i in 0..max {
             if self.connections.get(i).is_some() {
+                self.drain_conn_send_queue(i);
                 let _ = self.ring.submit_close(i);
             }
         }
@@ -473,6 +484,7 @@ impl<H: EventHandler> EventLoop<H> {
                                 connect_timespecs: &mut self.connect_timespecs,
                                 chain_table: &mut self.chain_table,
                                 max_chain_length: self.max_chain_length,
+                                send_queues: &mut self.send_queues,
                             };
                             self.handler.on_connect(&mut ctx, token, Ok(()));
                         } else {
@@ -493,6 +505,7 @@ impl<H: EventHandler> EventLoop<H> {
                                 connect_timespecs: &mut self.connect_timespecs,
                                 chain_table: &mut self.chain_table,
                                 max_chain_length: self.max_chain_length,
+                                send_queues: &mut self.send_queues,
                             };
                             self.handler.on_accept(&mut ctx, token);
                         }
@@ -515,6 +528,7 @@ impl<H: EventHandler> EventLoop<H> {
                             &mut self.connect_timespecs,
                             &mut self.chain_table,
                             self.max_chain_length,
+                            &mut self.send_queues,
                         );
                     }
                     crate::tls::TlsRecvResult::Ok => {
@@ -536,6 +550,7 @@ impl<H: EventHandler> EventLoop<H> {
                             &mut self.connect_timespecs,
                             &mut self.chain_table,
                             self.max_chain_length,
+                            &mut self.send_queues,
                         );
                     }
                     crate::tls::TlsRecvResult::Error(_) | crate::tls::TlsRecvResult::Closed => {
@@ -565,6 +580,7 @@ impl<H: EventHandler> EventLoop<H> {
                 &mut self.connect_timespecs,
                 &mut self.chain_table,
                 self.max_chain_length,
+                &mut self.send_queues,
             );
         }
 
@@ -653,6 +669,7 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_timespecs: &mut self.connect_timespecs,
                 chain_table: &mut self.chain_table,
                 max_chain_length: self.max_chain_length,
+                send_queues: &mut self.send_queues,
             };
             self.handler.on_accept(&mut ctx, token);
         }
@@ -691,6 +708,9 @@ impl<H: EventHandler> EventLoop<H> {
             let total = self.send_copy_pool.original_len(pool_slot);
             self.send_copy_pool.release(pool_slot);
 
+            // Submit next queued send immediately (before on_send_complete).
+            self.submit_next_queued(conn_index);
+
             let conn = match self.connections.get(conn_index) {
                 Some(c) => c,
                 None => return,
@@ -715,6 +735,7 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_timespecs: &mut self.connect_timespecs,
                 chain_table: &mut self.chain_table,
                 max_chain_length: self.max_chain_length,
+                send_queues: &mut self.send_queues,
             };
             self.handler.on_send_complete(&mut ctx, token, Ok(total));
 
@@ -725,6 +746,9 @@ impl<H: EventHandler> EventLoop<H> {
         }
 
         self.send_copy_pool.release(pool_slot);
+
+        // Error or zero-length send — drain the queue.
+        self.drain_conn_send_queue(conn_index);
 
         let conn = match self.connections.get(conn_index) {
             Some(c) => c,
@@ -756,6 +780,7 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
+            send_queues: &mut self.send_queues,
         };
         self.handler.on_send_complete(&mut ctx, token, io_result);
     }
@@ -846,6 +871,13 @@ impl<H: EventHandler> EventLoop<H> {
             }
         }
 
+        // Submit next queued send (or drain queue on error) before on_send_complete.
+        if result >= 0 {
+            self.submit_next_queued(conn_index);
+        } else {
+            self.drain_conn_send_queue(conn_index);
+        }
+
         let conn = match self.connections.get(conn_index) {
             Some(c) => c,
             None => return,
@@ -876,6 +908,7 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
+            send_queues: &mut self.send_queues,
         };
         self.handler.on_send_complete(&mut ctx, token, io_result);
 
@@ -926,6 +959,7 @@ impl<H: EventHandler> EventLoop<H> {
                         connect_timespecs: &mut self.connect_timespecs,
                         chain_table: &mut self.chain_table,
                         max_chain_length: self.max_chain_length,
+                        send_queues: &mut self.send_queues,
                     };
                     self.handler.on_connect(&mut ctx, token, Err(err));
                     self.close_connection(conn_index);
@@ -977,6 +1011,7 @@ impl<H: EventHandler> EventLoop<H> {
                 connect_timespecs: &mut self.connect_timespecs,
                 chain_table: &mut self.chain_table,
                 max_chain_length: self.max_chain_length,
+                send_queues: &mut self.send_queues,
             };
             self.handler.on_connect(&mut ctx, token, Err(err));
 
@@ -1057,6 +1092,7 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
+            send_queues: &mut self.send_queues,
         };
         self.handler.on_connect(&mut ctx, token, Ok(()));
     }
@@ -1117,6 +1153,7 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
+            send_queues: &mut self.send_queues,
         };
         self.handler.on_connect(&mut ctx, token, Err(err));
 
@@ -1164,6 +1201,7 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
+            send_queues: &mut self.send_queues,
         };
         self.handler.on_close(&mut ctx, token);
 
@@ -1223,6 +1261,7 @@ impl<H: EventHandler> EventLoop<H> {
             &mut self.connect_timespecs,
             &mut self.chain_table,
             self.max_chain_length,
+            &mut self.send_queues,
         );
     }
 
@@ -1245,6 +1284,13 @@ impl<H: EventHandler> EventLoop<H> {
             None => Ok(chain.bytes_sent),
         };
 
+        // Submit next queued send (or drain on error) before on_send_complete.
+        if chain.first_error.is_none() {
+            self.submit_next_queued(conn_index);
+        } else {
+            self.drain_conn_send_queue(conn_index);
+        }
+
         let mut ctx = DriverCtx {
             ring: &mut self.ring,
             connections: &mut self.connections,
@@ -1262,12 +1308,88 @@ impl<H: EventHandler> EventLoop<H> {
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
+            send_queues: &mut self.send_queues,
         };
         self.handler.on_send_complete(&mut ctx, token, io_result);
 
         // After chain completes, replay accumulated recv data.
         if chain.first_error.is_none() {
             self.replay_accumulated(conn_index);
+        }
+    }
+
+    /// Pop the next queued send for a connection and submit it to the ring.
+    /// Returns true if a send was submitted, false if the queue was empty
+    /// (in which case in_flight is set to false).
+    fn submit_next_queued(&mut self, conn_index: u32) -> bool {
+        let state = &mut self.send_queues[conn_index as usize];
+        match state.queue.pop_front() {
+            Some(built) => {
+                let pool_slot = built.pool_slot;
+                let slab_idx = built.slab_idx;
+                match unsafe { self.ring.push_sqe(built.entry) } {
+                    Ok(()) => true,
+                    Err(_) => {
+                        // SQ full — release this entry and drain remaining queue.
+                        Self::release_built_resources(
+                            &mut self.send_slab,
+                            &mut self.send_copy_pool,
+                            pool_slot,
+                            slab_idx,
+                        );
+                        Self::release_queued_sends(
+                            &mut state.queue,
+                            &mut self.send_slab,
+                            &mut self.send_copy_pool,
+                        );
+                        state.in_flight = false;
+                        false
+                    }
+                }
+            }
+            None => {
+                state.in_flight = false;
+                false
+            }
+        }
+    }
+
+    /// Drain and release all queued sends for a connection.
+    fn drain_conn_send_queue(&mut self, conn_index: u32) {
+        let state = &mut self.send_queues[conn_index as usize];
+        Self::release_queued_sends(
+            &mut state.queue,
+            &mut self.send_slab,
+            &mut self.send_copy_pool,
+        );
+        state.in_flight = false;
+    }
+
+    /// Release all entries from a send queue.
+    fn release_queued_sends(
+        queue: &mut VecDeque<crate::handler::BuiltSend>,
+        send_slab: &mut InFlightSendSlab,
+        send_copy_pool: &mut SendCopyPool,
+    ) {
+        for built in queue.drain(..) {
+            Self::release_built_resources(send_slab, send_copy_pool, built.pool_slot, built.slab_idx);
+        }
+    }
+
+    /// Release pool slot and/or slab entry for a single BuiltSend.
+    fn release_built_resources(
+        send_slab: &mut InFlightSendSlab,
+        send_copy_pool: &mut SendCopyPool,
+        pool_slot: u16,
+        slab_idx: u16,
+    ) {
+        if slab_idx != u16::MAX {
+            let ps = send_slab.release(slab_idx);
+            if ps != u16::MAX {
+                send_copy_pool.release(ps);
+            }
+        } else if pool_slot != u16::MAX {
+            send_copy_pool.release(pool_slot);
         }
     }
 
@@ -1282,6 +1404,8 @@ impl<H: EventHandler> EventLoop<H> {
         }
         // Cancel any active chain — per-SQE resources released as CQEs arrive.
         self.chain_table.cancel(conn_index);
+        // Drain queued sends and release resources.
+        self.drain_conn_send_queue(conn_index);
         let _ = self.ring.submit_close(conn_index);
     }
 }
@@ -1305,6 +1429,7 @@ fn call_on_data<H: EventHandler>(
     connect_timespecs: &mut Vec<io_uring::types::Timespec>,
     chain_table: &mut SendChainTable,
     max_chain_length: u16,
+    send_queues: &mut Vec<ConnSendState>,
 ) {
     let data = accumulators.data(conn_index);
     if data.is_empty() {
@@ -1327,6 +1452,7 @@ fn call_on_data<H: EventHandler>(
         connect_timespecs,
         chain_table,
         max_chain_length,
+        send_queues,
     };
     let consumed = handler.on_data(&mut ctx, token, data);
     accumulators.consume(conn_index, consumed);

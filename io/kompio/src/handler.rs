@@ -1,9 +1,30 @@
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 
 use crate::buffer::send_copy::SendCopyPool;
 use crate::buffer::send_slab::{InFlightSendSlab, MAX_GUARDS, MAX_IOVECS};
 use crate::guard::GuardBox;
+
+/// Per-connection send queue state.
+///
+/// Ensures at most one send SQE is in-flight per connection at a time.
+/// When a send is already in-flight, subsequent sends are queued and
+/// submitted immediately inside the CQE completion handler — before
+/// `on_send_complete`, before returning to the event loop.
+pub(crate) struct ConnSendState {
+    pub in_flight: bool,
+    pub queue: VecDeque<BuiltSend>,
+}
+
+impl ConnSendState {
+    pub fn new() -> Self {
+        ConnSendState {
+            in_flight: false,
+            queue: VecDeque::new(),
+        }
+    }
+}
 
 /// Opaque connection token handed to the EventHandler.
 /// Encodes the connection index and generation for stale detection.
@@ -47,6 +68,8 @@ pub struct DriverCtx<'a> {
     pub(crate) chain_table: &'a mut crate::chain::SendChainTable,
     /// Maximum SQEs per chain (0 = disabled).
     pub(crate) max_chain_length: u16,
+    /// Per-connection send queues for serializing sends.
+    pub(crate) send_queues: &'a mut Vec<ConnSendState>,
 }
 
 impl<'a> DriverCtx<'a> {
@@ -118,8 +141,45 @@ impl<'a> DriverCtx<'a> {
             .send_copy_pool
             .copy_in(data)
             .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
-        self.ring.submit_send_copied(conn.index, ptr, len, slot)?;
-        Ok(())
+
+        let user_data = crate::completion::UserData::encode(
+            crate::completion::OpTag::Send,
+            conn.index,
+            slot as u32,
+        );
+        let entry = io_uring::opcode::Send::new(
+            io_uring::types::Fixed(conn.index),
+            ptr,
+            len,
+        )
+        .build()
+        .user_data(user_data.raw());
+
+        let built = BuiltSend {
+            entry,
+            pool_slot: slot,
+            slab_idx: u16::MAX,
+            total_len: data.len() as u32,
+        };
+
+        self.submit_or_queue(conn.index, built)
+    }
+
+    /// Submit a built send SQE or queue it if a send is already in-flight.
+    pub(crate) fn submit_or_queue(&mut self, conn_index: u32, built: BuiltSend) -> io::Result<()> {
+        let state = &mut self.send_queues[conn_index as usize];
+        if state.in_flight {
+            state.queue.push_back(built);
+            Ok(())
+        } else {
+            match unsafe { self.ring.push_sqe(built.entry) } {
+                Ok(()) => {
+                    state.in_flight = true;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
     }
 
     /// Returns the maximum number of SQEs per IO_LINK chain.
@@ -171,6 +231,20 @@ impl<'a> DriverCtx<'a> {
                 return;
             }
             conn_state.recv_mode = crate::connection::RecvMode::Closed;
+
+            // Drain the send queue and release all queued resources.
+            let state = &mut self.send_queues[conn.index as usize];
+            for built in state.queue.drain(..) {
+                if built.slab_idx != u16::MAX {
+                    let pool_slot = self.send_slab.release(built.slab_idx);
+                    if pool_slot != u16::MAX {
+                        self.send_copy_pool.release(pool_slot);
+                    }
+                } else if built.pool_slot != u16::MAX {
+                    self.send_copy_pool.release(built.pool_slot);
+                }
+            }
+            state.in_flight = false;
 
             // Graceful TLS shutdown: send close_notify before closing.
             #[cfg(feature = "tls")]
@@ -871,22 +945,16 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         }
     }
 
-    /// Copy-only path: gather all copy parts, submit.
+    /// Copy-only path: gather all copy parts, submit or queue.
     fn submit_copy_only(mut self) -> io::Result<()> {
         let built = self.build_copy_only()?;
-        unsafe {
-            self.ctx.ring.push_sqe(built.entry)?;
-        }
-        Ok(())
+        self.ctx.submit_or_queue(self.conn.index, built)
     }
 
-    /// Mixed copy+guard path: submit.
+    /// Mixed copy+guard path: submit or queue.
     fn submit_with_guards(mut self) -> io::Result<()> {
         let built = self.build_with_guards()?;
-        unsafe {
-            self.ctx.ring.push_sqe(built.entry)?;
-        }
-        Ok(())
+        self.ctx.submit_or_queue(self.conn.index, built)
     }
 }
 

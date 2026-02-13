@@ -159,12 +159,6 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
 
     fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
         self.stats[self.worker_id].inc_send_ready();
-        let idx = conn.index();
-
-        // Clear the in-flight flag FIRST so send_pending can submit again.
-        if let Some(c) = self.connections.get_mut(idx).and_then(|c| c.as_mut()) {
-            c.clear_send_outstanding();
-        }
 
         match result {
             Ok(n) => {
@@ -177,6 +171,7 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
         }
 
         // After send completes, try draining more pending data
+        let idx = conn.index();
         if let Some(c) = self.connections.get_mut(idx).and_then(|c| c.as_mut())
             && c.has_pending_write()
             && send_pending(ctx, c, conn, self.send_copy_slot_size).is_err()
@@ -238,16 +233,12 @@ impl SendGuard for BytesGuard {
     }
 }
 
-/// Send pending response data for a connection using scatter-gather.
+/// Send ALL pending response data for a connection using scatter-gather.
 ///
-/// Gathers all pending parts via `collect_pending_writes()` and submits
-/// them as a single `SendMsgZc` operation (up to MAX_IOVECS parts).
-/// Large parts (>= GUARD_MIN_SIZE) use zero-copy guards; small parts
-/// are copied into the send pool.
-///
-/// At most one send SQE is in-flight per connection at any time. If
-/// there are more parts than fit in one batch, `on_send_complete` will
-/// call us again for the remainder.
+/// Loops to submit ALL pending batches. Kompio's per-connection send queue
+/// ensures at most one SQE is in-flight at a time — excess sends are queued
+/// internally and submitted immediately from the CQE completion handler,
+/// with zero gap between consecutive sends.
 ///
 /// Returns `Err(())` on fatal send error.
 #[inline]
@@ -257,86 +248,69 @@ fn send_pending(
     token: ConnToken,
     slot_size: usize,
 ) -> Result<(), ()> {
-    if !conn.has_pending_write() {
-        return Ok(());
-    }
+    loop {
+        if !conn.has_pending_write() {
+            return Ok(());
+        }
 
-    // Only one send SQE may be in-flight per connection at a time.
-    // Submitting multiple sends concurrently lets the kernel interleave
-    // data on the TCP stream, corrupting the protocol.
-    if conn.is_send_outstanding() {
-        return Ok(());
-    }
+        let parts = conn.collect_pending_writes();
+        if parts.is_empty() {
+            return Ok(());
+        }
 
-    let parts = conn.collect_pending_writes();
-    if parts.is_empty() {
-        return Ok(());
-    }
+        // Fast path: single small part — use simple copy send (avoids slab overhead).
+        if parts.len() == 1 && parts[0].len() <= slot_size {
+            let data = &parts[0];
+            match ctx.send(token, data) {
+                Ok(()) => {
+                    conn.advance_write(data.len());
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Other => return Ok(()),
+                Err(_) => return Err(()),
+            }
+        }
 
-    // Fast path: single small part — use simple copy send (avoids slab overhead).
-    if parts.len() == 1 && parts[0].len() <= slot_size {
-        let data = &parts[0];
-        match ctx.send(token, data) {
+        // Scatter-gather path: build a send_parts() call with mixed copy + guard parts.
+        let mut builder = ctx.send_parts(token);
+        let mut total_advance = 0usize;
+        let mut copy_budget = slot_size;
+        let mut guard_count = 0usize;
+
+        for (i, part) in parts.iter().enumerate() {
+            if i >= MAX_IOVECS {
+                break;
+            }
+
+            if part.len() >= GUARD_MIN_SIZE && guard_count < MAX_GUARDS {
+                builder = builder.guard(GuardBox::new(BytesGuard(part.clone())));
+                guard_count += 1;
+            } else if part.len() <= copy_budget {
+                builder = builder.copy(part);
+                copy_budget -= part.len();
+            } else {
+                break;
+            }
+
+            total_advance += part.len();
+        }
+
+        if total_advance == 0 {
+            // Pool/slab exhausted — stop, on_send_complete will retry.
+            return Ok(());
+        }
+
+        match builder.submit() {
             Ok(()) => {
-                conn.advance_write(data.len());
-                conn.set_send_outstanding();
+                conn.advance_write(total_advance);
+                // Loop to submit more batches — kompio queues if in-flight.
+            }
+            Err(e) if e.kind() == io::ErrorKind::Other => {
+                // Send pool or slab exhausted — stop, wait for on_send_complete.
                 return Ok(());
             }
-            Err(e) if e.kind() == io::ErrorKind::Other => return Ok(()),
             Err(_) => return Err(()),
         }
-    }
-
-    // NOTE: IO_LINK chains are intentionally NOT used here. When a linked
-    // SQE does a partial send (common over real networks), the kernel still
-    // executes subsequent SQEs in the chain, interleaving data on the TCP
-    // stream and corrupting the protocol. The scatter-gather path below
-    // safely handles > MAX_IOVECS parts by sending one batch at a time and
-    // deferring the remainder to on_send_complete.
-
-    // Scatter-gather path: build a send_parts() call with mixed copy + guard parts.
-    let mut builder = ctx.send_parts(token);
-    let mut total_advance = 0usize;
-    let mut copy_budget = slot_size;
-    let mut guard_count = 0usize;
-
-    for (i, part) in parts.iter().enumerate() {
-        if i >= MAX_IOVECS {
-            break;
-        }
-
-        if part.len() >= GUARD_MIN_SIZE && guard_count < MAX_GUARDS {
-            // Zero-copy guard path for large parts.
-            builder = builder.guard(GuardBox::new(BytesGuard(part.clone())));
-            guard_count += 1;
-        } else if part.len() <= copy_budget {
-            // Copy path for small parts.
-            builder = builder.copy(part);
-            copy_budget -= part.len();
-        } else {
-            // Can't fit this part — stop here, defer to next round.
-            break;
-        }
-
-        total_advance += part.len();
-    }
-
-    if total_advance == 0 {
-        // Nothing could be submitted (pool/slab exhausted), wait for on_send_complete.
-        return Ok(());
-    }
-
-    match builder.submit() {
-        Ok(()) => {
-            conn.advance_write(total_advance);
-            conn.set_send_outstanding();
-            Ok(())
-        }
-        Err(e) if e.kind() == io::ErrorKind::Other => {
-            // Send pool or slab exhausted — stop sending, wait for on_send_complete.
-            Ok(())
-        }
-        Err(_) => Err(()),
     }
 }
 
