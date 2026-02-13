@@ -1170,7 +1170,7 @@ impl EventHandler for BenchHandler {
         }
     }
 
-    fn on_data(&mut self, _ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize {
+    fn on_data(&mut self, ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize {
         let idx = match self.conn_to_session.get(&conn.index()) {
             Some(&idx) => idx,
             None => return data.len(),
@@ -1223,6 +1223,19 @@ impl EventHandler for BenchHandler {
         // Diagnostic tracking
         self.bytes_received += data.len() as u64;
         self.responses_parsed += self.results.len() as u64;
+
+        // Drive more requests immediately when responses free pipeline slots.
+        // Without this, we'd wait for the next on_tick (~1ms) before refilling
+        // the pipeline, which severely limits throughput with large values where
+        // each response takes several ms to arrive.
+        if !self.results.is_empty() {
+            let phase = self.shared.phase();
+            if phase == Phase::Warmup || phase == Phase::Running {
+                self.drive_requests(ctx, now);
+            } else if phase == Phase::Prefill && !self.prefill_done {
+                self.drive_prefill_requests(ctx, now);
+            }
+        }
 
         buf.consumed
     }
