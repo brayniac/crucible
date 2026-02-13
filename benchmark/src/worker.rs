@@ -1186,7 +1186,14 @@ impl EventHandler for BenchHandler {
         self.results.clear();
         let mut buf = DataSlice::new(data);
         if let Err(e) = session.poll_responses_from(&mut buf, &mut self.results, now) {
-            tracing::debug!("protocol error: {}", e);
+            tracing::debug!(
+                worker = self.id,
+                consumed = buf.consumed,
+                remaining_len = data.len() - buf.consumed,
+                in_flight = session.in_flight_count(),
+                "protocol error: {}",
+                e,
+            );
         }
 
         // Handle prefill tracking

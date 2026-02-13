@@ -193,6 +193,10 @@ pub struct Connection {
     streaming_state: StreamingState,
     /// Whether flush commands are allowed on this connection
     allow_flush: bool,
+    /// Whether a send SQE is currently in-flight for this connection.
+    /// Prevents submitting multiple SendMsgZc SQEs simultaneously, which
+    /// would let the kernel interleave data on the TCP stream.
+    send_outstanding: bool,
 }
 
 impl Connection {
@@ -216,6 +220,7 @@ impl Connection {
             memcache_parse_options: MemcacheParseOptions::new().max_value_len(max_value_size),
             streaming_state: StreamingState::None,
             allow_flush,
+            send_outstanding: false,
         }
     }
 
@@ -1269,6 +1274,24 @@ impl Connection {
     #[inline]
     pub fn has_pending_write(&self) -> bool {
         !self.send_queue.is_empty() || self.write_pos < self.write_buf.len()
+    }
+
+    /// Returns true if a send SQE is currently in-flight for this connection.
+    #[inline]
+    pub fn is_send_outstanding(&self) -> bool {
+        self.send_outstanding
+    }
+
+    /// Mark a send as in-flight.
+    #[inline]
+    pub fn set_send_outstanding(&mut self) {
+        self.send_outstanding = true;
+    }
+
+    /// Clear the send in-flight flag (called when send completes).
+    #[inline]
+    pub fn clear_send_outstanding(&mut self) {
+        self.send_outstanding = false;
     }
 
     #[inline]

@@ -161,6 +161,11 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
         self.stats[self.worker_id].inc_send_ready();
         let idx = conn.index();
 
+        // Clear the in-flight flag FIRST so send_pending can submit again.
+        if let Some(c) = self.connections.get_mut(idx).and_then(|c| c.as_mut()) {
+            c.clear_send_outstanding();
+        }
+
         match result {
             Ok(n) => {
                 self.stats[self.worker_id].add_bytes_sent(n as u64);
@@ -240,9 +245,9 @@ impl SendGuard for BytesGuard {
 /// Large parts (>= GUARD_MIN_SIZE) use zero-copy guards; small parts
 /// are copied into the send pool.
 ///
-/// If there are more than MAX_IOVECS parts and IO_LINK chaining is enabled,
-/// multiple SQEs are submitted as a linked chain. Otherwise, the first batch
-/// is sent and `on_send_complete` will call us again for the remainder.
+/// At most one send SQE is in-flight per connection at any time. If
+/// there are more parts than fit in one batch, `on_send_complete` will
+/// call us again for the remainder.
 ///
 /// Returns `Err(())` on fatal send error.
 #[inline]
@@ -253,6 +258,13 @@ fn send_pending(
     slot_size: usize,
 ) -> Result<(), ()> {
     if !conn.has_pending_write() {
+        return Ok(());
+    }
+
+    // Only one send SQE may be in-flight per connection at a time.
+    // Submitting multiple sends concurrently lets the kernel interleave
+    // data on the TCP stream, corrupting the protocol.
+    if conn.is_send_outstanding() {
         return Ok(());
     }
 
@@ -267,6 +279,7 @@ fn send_pending(
         match ctx.send(token, data) {
             Ok(()) => {
                 conn.advance_write(data.len());
+                conn.set_send_outstanding();
                 return Ok(());
             }
             Err(e) if e.kind() == io::ErrorKind::Other => return Ok(()),
@@ -316,6 +329,7 @@ fn send_pending(
     match builder.submit() {
         Ok(()) => {
             conn.advance_write(total_advance);
+            conn.set_send_outstanding();
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::Other => {
