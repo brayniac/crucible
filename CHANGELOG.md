@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.3.3] - 2026-02-13
+
+### Fixed
+- Pipelined large-value response stall (kompio): when `process_from` hit write backpressure
+  (pending > 256KB), remaining commands sat in the recv accumulator with no mechanism to resume.
+  Added `replay_accumulated()` to re-invoke `on_data` after send completions drain write capacity
+- Streaming recv CRLF livelock (server): when a large SET value's trailing `\r\n` was split across
+  recv buffers, `continue_streaming_recv()` returned true without consuming data, causing an
+  infinite processing loop. Fixed for RESP, memcache ASCII, and memcache binary protocols
+
 ## [0.3.2] - 2026-02-12
 
 ### Added

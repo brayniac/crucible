@@ -1,6 +1,6 @@
 [package]
 name = "kompio"
-version = "0.3.3-alpha.0"
+version = "0.3.3"
 edition = "2024"
 
 [features]
