@@ -123,6 +123,8 @@ pub struct Results {
     pub get_latencies: LatencyStats,
     pub get_ttfb: LatencyStats,
     pub set_latencies: LatencyStats,
+    pub backfill_set_count: u64,
+    pub backfill_set_latencies: LatencyStats,
     pub conns_active: i64,
     pub conns_failed: u64,
     pub conns_total: u64,

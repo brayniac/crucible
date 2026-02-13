@@ -90,6 +90,8 @@ struct ResultsOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     get_ttfb: Option<LatencyOutput>,
     set: LatencyOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backfill_set: Option<LatencyOutput>,
     conns_active: i64,
     conns_failed: u64,
 }
@@ -307,6 +309,19 @@ impl OutputFormatter for JsonFormatter {
                 p999_us: results.set_latencies.p999_us as u64,
                 p9999_us: results.set_latencies.p9999_us as u64,
                 max_us: results.set_latencies.max_us as u64,
+            },
+            backfill_set: if results.backfill_set_count > 0 {
+                Some(LatencyOutput {
+                    count: results.backfill_set_count,
+                    p50_us: results.backfill_set_latencies.p50_us as u64,
+                    p90_us: results.backfill_set_latencies.p90_us as u64,
+                    p99_us: results.backfill_set_latencies.p99_us as u64,
+                    p999_us: results.backfill_set_latencies.p999_us as u64,
+                    p9999_us: results.backfill_set_latencies.p9999_us as u64,
+                    max_us: results.backfill_set_latencies.max_us as u64,
+                })
+            } else {
+                None
             },
             conns_active: results.conns_active,
             conns_failed: results.conns_failed,

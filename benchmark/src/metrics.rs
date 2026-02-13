@@ -46,6 +46,7 @@ pub mod ops {
     pub const GET: usize = 0;
     pub const SET: usize = 1;
     pub const DELETE: usize = 2;
+    pub const BACKFILL_SET: usize = 3;
 }
 
 // Request counters
@@ -81,6 +82,12 @@ pub static SET_COUNT: Counter = Counter::new(&OPS, ops::SET);
 
 #[metric(name = "delete_count", description = "Total DELETE operations")]
 pub static DELETE_COUNT: Counter = Counter::new(&OPS, ops::DELETE);
+
+#[metric(
+    name = "backfill_set_count",
+    description = "Backfill SET operations (from set_on_miss)"
+)]
+pub static BACKFILL_SET_COUNT: Counter = Counter::new(&OPS, ops::BACKFILL_SET);
 
 // Connection gauge (tracks current active connections; decremented on disconnect)
 #[metric(name = "connections_active", description = "Active connections")]
@@ -164,3 +171,9 @@ pub static DELETE_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
     description = "GET time-to-first-byte histogram (nanoseconds)"
 )]
 pub static GET_TTFB: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "backfill_set_latency",
+    description = "Backfill SET latency histogram (nanoseconds)"
+)]
+pub static BACKFILL_SET_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);

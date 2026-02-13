@@ -316,6 +316,17 @@ pub struct BenchHandler {
     /// Starting global connection index for endpoint distribution
     my_start: usize,
 
+    /// Per-session flag: true when a send SQE is outstanding for this session.
+    /// Ensures at most one outstanding send per connection to prevent partial-send
+    /// interleaving with pipelined requests (io_uring resubmits go to the end of
+    /// the submission queue, which can interleave data from different requests).
+    send_pending: Vec<bool>,
+
+    /// Backfill queue: key IDs from GET misses that need SET backfills (set_on_miss).
+    backfill_queue: Vec<usize>,
+    /// Whether set_on_miss is enabled.
+    set_on_miss: bool,
+
     /// Tick counter for periodic diagnostics
     tick_count: u64,
     /// Last diagnostic log time
@@ -351,6 +362,7 @@ impl BenchHandler {
                 Ok(session) => {
                     let idx = self.sessions.len();
                     self.sessions.push(session);
+                    self.send_pending.push(false);
                     self.prefill_in_flight
                         .push(std::collections::VecDeque::new());
                     self.prefill_session_last_progress
@@ -557,6 +569,11 @@ impl BenchHandler {
         let value_len = self.config.workload.values.length;
         let pool_len = self.value_pool.len();
 
+        // Drain backfill queue before normal requests (set_on_miss)
+        if !self.backfill_queue.is_empty() {
+            self.drain_backfill_queue(ctx, now, value_len, pool_len);
+        }
+
         for idx in 0..self.sessions.len() {
             if !self.sessions[idx].is_connected() {
                 continue;
@@ -564,6 +581,9 @@ impl BenchHandler {
 
             loop {
                 if !self.sessions[idx].can_send() {
+                    break;
+                }
+                if self.send_pending[idx] {
                     break;
                 }
 
@@ -579,7 +599,8 @@ impl BenchHandler {
                 let roll = self.rng.random_range(0..100);
                 if roll < get_ratio {
                     // GET: encode into session buffer, batch-flush later
-                    if self.sessions[idx].get(&self.key_buf, now).is_none() {
+                    let kid = if self.set_on_miss { Some(key_id) } else { None };
+                    if self.sessions[idx].get(&self.key_buf, now, kid).is_none() {
                         break;
                     }
                 } else if roll < get_ratio + delete_ratio {
@@ -590,13 +611,17 @@ impl BenchHandler {
                 } else {
                     // SET: flush any pending GET/DELETE data first, then send via guard
                     self.flush_session(ctx, idx);
+                    if self.send_pending[idx] {
+                        break;
+                    }
 
-                    if let Some((_id, suffix)) = self.sessions[idx].encode_set_guard(
+                    if let Some(suffix) = self.sessions[idx].encode_set_prefix(
                         &mut self.set_prefix_buf,
                         &self.key_buf,
                         value_len,
-                        now,
                     ) {
+                        let prefix_len = self.set_prefix_buf.len();
+                        let suffix_len = suffix.len();
                         if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
                             self.send_failures += 1;
                             if e.kind() != io::ErrorKind::Other {
@@ -605,6 +630,8 @@ impl BenchHandler {
                             }
                             break;
                         }
+                        self.sessions[idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
+                        self.send_pending[idx] = true;
                     } else {
                         break;
                     }
@@ -616,6 +643,79 @@ impl BenchHandler {
 
             // Flush any remaining GET/DELETE data in the send buffer
             self.flush_session(ctx, idx);
+        }
+    }
+
+    /// Drain the backfill queue by sending SET requests for keys that missed on GET.
+    ///
+    /// Backfill SETs use the same zero-copy path as regular SETs (encode_set_prefix +
+    /// send_set_parts). Each backfill SET counts against rate limit and pipeline depth.
+    fn drain_backfill_queue(
+        &mut self,
+        ctx: &mut DriverCtx,
+        now: std::time::Instant,
+        value_len: usize,
+        pool_len: usize,
+    ) {
+        let mut session_idx = 0;
+        let num_sessions = self.sessions.len();
+
+        while !self.backfill_queue.is_empty() && session_idx < num_sessions {
+            if !self.sessions[session_idx].is_connected()
+                || !self.sessions[session_idx].can_send()
+                || self.send_pending[session_idx]
+            {
+                session_idx += 1;
+                continue;
+            }
+
+            if let Some(ref rl) = self.ratelimiter
+                && !rl.try_acquire()
+            {
+                return;
+            }
+
+            let key_id = self.backfill_queue.pop().unwrap();
+            write_key(&mut self.key_buf, key_id);
+
+            // Flush any pending GET/DELETE data first
+            self.flush_session(ctx, session_idx);
+            if self.send_pending[session_idx] {
+                self.backfill_queue.push(key_id);
+                session_idx += 1;
+                continue;
+            }
+
+            if let Some(suffix) = self.sessions[session_idx].encode_set_prefix(
+                &mut self.set_prefix_buf,
+                &self.key_buf,
+                value_len,
+            ) {
+                let prefix_len = self.set_prefix_buf.len();
+                let suffix_len = suffix.len();
+                if let Err(e) =
+                    self.send_set_parts(ctx, session_idx, value_len, pool_len, suffix)
+                {
+                    self.send_failures += 1;
+                    self.backfill_queue.push(key_id);
+                    if e.kind() != io::ErrorKind::Other {
+                        tracing::debug!(worker = self.id, error = %e, "backfill send_parts error (closing)");
+                        self.close_session(ctx, session_idx, DisconnectReason::SendError);
+                    }
+                    session_idx += 1;
+                    continue;
+                }
+                self.sessions[session_idx].confirm_set_sent(
+                    prefix_len, value_len, suffix_len, now,
+                );
+                self.sessions[session_idx].mark_last_request_backfill();
+                self.send_pending[session_idx] = true;
+                self.requests_driven += 1;
+                metrics::REQUESTS_SENT.increment();
+            } else {
+                self.backfill_queue.push(key_id);
+                session_idx += 1;
+            }
         }
     }
 
@@ -636,6 +736,7 @@ impl BenchHandler {
             loop {
                 if !self.sessions[idx].can_send()
                     || self.prefill_in_flight[idx].len() >= Self::PREFILL_MAX_PIPELINE
+                    || self.send_pending[idx]
                 {
                     break;
                 }
@@ -647,12 +748,13 @@ impl BenchHandler {
 
                 write_key(&mut self.key_buf, key_id);
 
-                if let Some((_id, suffix)) = self.sessions[idx].encode_set_guard(
+                if let Some(suffix) = self.sessions[idx].encode_set_prefix(
                     &mut self.set_prefix_buf,
                     &self.key_buf,
                     value_len,
-                    now,
                 ) {
+                    let prefix_len = self.set_prefix_buf.len();
+                    let suffix_len = suffix.len();
                     if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
                         self.send_failures += 1;
                         self.prefill_pending.push_front(key_id);
@@ -662,6 +764,8 @@ impl BenchHandler {
                         }
                         break;
                     }
+                    self.sessions[idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
+                    self.send_pending[idx] = true;
                     self.prefill_in_flight[idx].push_back(key_id);
                     metrics::REQUESTS_SENT.increment();
                 } else {
@@ -674,6 +778,10 @@ impl BenchHandler {
 
     /// Flush a session's send buffer via kompio.
     fn flush_session(&mut self, ctx: &mut DriverCtx, idx: usize) {
+        if self.send_pending[idx] {
+            return;
+        }
+
         let conn_id = match self.sessions[idx].conn_id() {
             Some(id) => id,
             None => return,
@@ -693,6 +801,7 @@ impl BenchHandler {
         match ctx.send(token, &send_buf[..n]) {
             Ok(()) => {
                 self.sessions[idx].bytes_sent(n);
+                self.send_pending[idx] = true;
             }
             Err(e) => {
                 self.send_failures += 1;
@@ -796,6 +905,7 @@ impl BenchHandler {
             metrics::CONNECTIONS_ACTIVE.decrement();
         }
         self.sessions[idx].disconnect();
+        self.send_pending[idx] = false;
 
         // Move in-flight prefill keys back to pending
         if !self.prefill_done && idx < self.prefill_in_flight.len() {
@@ -876,6 +986,19 @@ impl BenchHandler {
                     record_latencies(result);
                 }
             }
+
+            // Queue backfill SETs for GET misses (set_on_miss)
+            if self.set_on_miss {
+                for result in &self.results {
+                    if result.request_type == RequestType::Get
+                        && result.hit == Some(false)
+                        && result.success
+                        && let Some(key_id) = result.key_id
+                    {
+                        self.backfill_queue.push(key_id);
+                    }
+                }
+            }
         }
     }
 }
@@ -927,7 +1050,10 @@ impl EventHandler for BenchHandler {
                 );
                 (pending, total, total == 0)
             }
-            None => (std::collections::VecDeque::new(), 0, true),
+            None => {
+                cfg.shared.mark_prefill_complete();
+                (std::collections::VecDeque::new(), 0, true)
+            }
         };
 
         // Compute connection distribution
@@ -947,6 +1073,8 @@ impl EventHandler for BenchHandler {
         } else {
             remainder * (base_per_thread + 1) + (cfg.id - remainder) * base_per_thread
         };
+
+        let set_on_miss = cfg.config.workload.set_on_miss;
 
         let result = BenchHandler {
             id: cfg.id,
@@ -976,6 +1104,9 @@ impl EventHandler for BenchHandler {
             endpoints,
             my_connections,
             my_start,
+            send_pending: Vec::new(),
+            backfill_queue: Vec::new(),
+            set_on_miss,
             tick_count: 0,
             last_diag: std::time::Instant::now(),
             requests_driven: 0,
@@ -1063,6 +1194,19 @@ impl EventHandler for BenchHandler {
             }
         }
 
+        // Queue backfill SETs for GET misses (set_on_miss)
+        if self.set_on_miss {
+            for result in &self.results {
+                if result.request_type == RequestType::Get
+                    && result.hit == Some(false)
+                    && result.success
+                    && let Some(key_id) = result.key_id
+                {
+                    self.backfill_queue.push(key_id);
+                }
+            }
+        }
+
         // Track bytes received
         if buf.consumed > 0 {
             metrics::BYTES_RX.add(buf.consumed as u64);
@@ -1076,6 +1220,11 @@ impl EventHandler for BenchHandler {
     }
 
     fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
+        // Clear send_pending before any action so flush_session can re-submit
+        if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
+            self.send_pending[idx] = false;
+        }
+
         if result.is_err() {
             if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
                 self.close_session(ctx, idx, DisconnectReason::SendError);
@@ -1254,6 +1403,10 @@ fn record_latencies(result: &RequestResult) {
         }
         RequestType::Set => {
             let _ = metrics::SET_LATENCY.increment(result.latency_ns);
+            if result.backfill {
+                metrics::BACKFILL_SET_COUNT.increment();
+                let _ = metrics::BACKFILL_SET_LATENCY.increment(result.latency_ns);
+            }
         }
         RequestType::Delete => {
             let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);

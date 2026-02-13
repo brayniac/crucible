@@ -447,6 +447,8 @@ impl MomentoSession {
                     ttfb_ns: None,
                     request_type: req.request_type,
                     hit,
+                    key_id: None,
+                    backfill: false,
                 });
             }
         }

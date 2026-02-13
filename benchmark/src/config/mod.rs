@@ -170,6 +170,9 @@ pub struct Workload {
     /// Set to "0s" to disable the timeout. Default: 300s.
     #[serde(default = "default_prefill_timeout", with = "humantime_serde")]
     pub prefill_timeout: Duration,
+    /// On GET miss, automatically SET the key (cache-aside pattern).
+    #[serde(default)]
+    pub set_on_miss: bool,
     #[serde(default)]
     pub keyspace: Keyspace,
     #[serde(default)]

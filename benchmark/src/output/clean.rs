@@ -278,6 +278,12 @@ impl OutputFormatter for CleanFormatter {
         }
         if results.set_count > 0 {
             println!("{}", format_latency_row("SET", &results.set_latencies));
+            if results.backfill_set_count > 0 {
+                println!(
+                    "{}",
+                    format_latency_row("  backfill", &results.backfill_set_latencies)
+                );
+            }
         }
 
         println!();

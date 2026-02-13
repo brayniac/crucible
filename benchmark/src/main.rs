@@ -162,20 +162,40 @@ fn run_benchmark(
         None
     };
 
-    // Calculate prefill ranges for each worker
+    // Calculate prefill ranges for each worker.
+    // Only distribute keys to workers that will have at least one connection,
+    // using the same distribution formula as worker.rs create_for_worker().
     let prefill_enabled = config.workload.prefill;
     let key_count = config.workload.keyspace.count;
     let prefill_ranges: Vec<Option<std::ops::Range<usize>>> = if prefill_enabled {
-        let keys_per_worker = key_count / num_threads;
-        let remainder = key_count % num_threads;
+        let base_conns = total_connections / num_threads;
+        let conn_remainder = total_connections % num_threads;
+        let workers_with_conns = if base_conns > 0 {
+            num_threads
+        } else {
+            conn_remainder.min(num_threads)
+        };
+
+        let keys_per_worker = key_count / workers_with_conns;
+        let key_remainder = key_count % workers_with_conns;
+
+        // Track which effective worker index we're at (among workers with conns)
+        let mut effective_id = 0usize;
         (0..num_threads)
             .map(|id| {
-                let start = if id < remainder {
-                    id * (keys_per_worker + 1)
+                let has_conns = id < conn_remainder || base_conns > 0;
+                if !has_conns {
+                    return None;
+                }
+                let eid = effective_id;
+                effective_id += 1;
+                let start = if eid < key_remainder {
+                    eid * (keys_per_worker + 1)
                 } else {
-                    remainder * (keys_per_worker + 1) + (id - remainder) * keys_per_worker
+                    key_remainder * (keys_per_worker + 1)
+                        + (eid - key_remainder) * keys_per_worker
                 };
-                let count = if id < remainder {
+                let count = if eid < key_remainder {
                     keys_per_worker + 1
                 } else {
                     keys_per_worker
@@ -303,6 +323,7 @@ fn run_benchmark(
     let mut baseline_misses = 0u64;
     let mut baseline_get_count = 0u64;
     let mut baseline_set_count = 0u64;
+    let mut baseline_backfill_set_count = 0u64;
     let mut current_phase = if prefill_enabled {
         Phase::Prefill
     } else {
@@ -454,6 +475,7 @@ fn run_benchmark(
             baseline_misses = metrics::CACHE_MISSES.value();
             baseline_get_count = metrics::GET_COUNT.value();
             baseline_set_count = metrics::SET_COUNT.value();
+            baseline_backfill_set_count = metrics::BACKFILL_SET_COUNT.value();
             baseline_bytes_tx = metrics::BYTES_TX.value();
             baseline_bytes_rx = metrics::BYTES_RX.value();
 
@@ -621,6 +643,7 @@ fn run_benchmark(
     let bytes_rx = metrics::BYTES_RX.value() - baseline_bytes_rx;
     let get_count = metrics::GET_COUNT.value() - baseline_get_count;
     let set_count = metrics::SET_COUNT.value() - baseline_set_count;
+    let backfill_set_count = metrics::BACKFILL_SET_COUNT.value() - baseline_backfill_set_count;
     let active = metrics::CONNECTIONS_ACTIVE.value();
     let failed = metrics::CONNECTIONS_FAILED.value();
     let elapsed_secs = actual_duration.as_secs_f64();
@@ -652,6 +675,15 @@ fn run_benchmark(
         max_us: max_percentile(&metrics::SET_LATENCY) / 1000.0,
     };
 
+    let backfill_set_latencies = LatencyStats {
+        p50_us: percentile(&metrics::BACKFILL_SET_LATENCY, 50.0) / 1000.0,
+        p90_us: percentile(&metrics::BACKFILL_SET_LATENCY, 90.0) / 1000.0,
+        p99_us: percentile(&metrics::BACKFILL_SET_LATENCY, 99.0) / 1000.0,
+        p999_us: percentile(&metrics::BACKFILL_SET_LATENCY, 99.9) / 1000.0,
+        p9999_us: percentile(&metrics::BACKFILL_SET_LATENCY, 99.99) / 1000.0,
+        max_us: max_percentile(&metrics::BACKFILL_SET_LATENCY) / 1000.0,
+    };
+
     let results = Results {
         duration_secs: elapsed_secs,
         requests,
@@ -666,6 +698,8 @@ fn run_benchmark(
         get_latencies,
         get_ttfb,
         set_latencies,
+        backfill_set_count,
+        backfill_set_latencies,
         conns_active: active,
         conns_failed: failed,
         conns_total: total_connections as u64,

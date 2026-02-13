@@ -109,6 +109,10 @@ struct InFlightRequest {
     /// Cumulative byte offset where this request's data ends in the send stream.
     bytes_end: u64,
     tx_timestamp: Option<Timestamp>,
+    /// Key ID for set_on_miss tracking (GET only).
+    key_id: Option<usize>,
+    /// True if this SET was triggered by a miss (backfill).
+    backfill: bool,
 }
 
 /// Session configuration.
@@ -384,8 +388,11 @@ impl Session {
     ///
     /// The `now` parameter should be the current time, shared across a batch of
     /// requests to avoid excessive clock_gettime calls.
+    ///
+    /// `key_id` is used for set_on_miss tracking: when a GET misses, the worker
+    /// uses this ID to issue a backfill SET for the same key.
     #[inline]
-    pub fn get(&mut self, key: &[u8], now: Instant) -> Option<u64> {
+    pub fn get(&mut self, key: &[u8], now: Instant, key_id: Option<usize>) -> Option<u64> {
         if !self.can_send() {
             return None;
         }
@@ -418,6 +425,8 @@ impl Session {
             first_byte_at: None,
             bytes_end: self.bytes_written,
             tx_timestamp: None,
+            key_id,
+            backfill: false,
         });
         self.requests_sent += 1;
 
@@ -469,6 +478,8 @@ impl Session {
             first_byte_at: None,
             bytes_end: self.bytes_written,
             tx_timestamp: None,
+            key_id: None,
+            backfill: false,
         });
         self.requests_sent += 1;
 
@@ -521,6 +532,8 @@ impl Session {
             first_byte_at: None,
             bytes_end: self.bytes_written,
             tx_timestamp: None,
+            key_id: None,
+            backfill: false,
         });
         self.requests_sent += 1;
 
@@ -541,25 +554,21 @@ impl Session {
     /// a static suffix slice. The caller is responsible for sending the three parts
     /// (prefix, value guard, suffix) via `ctx.send_parts()`.
     ///
-    /// The in-flight request is tracked with `sent_at = Some(now)` because it will
-    /// be submitted to the kernel immediately via `send_parts()`.
+    /// This method has **no side effects**: it does not push to `in_flight`, does
+    /// not increment counters, and does not track bytes. The caller must call
+    /// `confirm_set_sent()` after the send succeeds to record the request.
     ///
-    /// Returns `Some((request_id, suffix_bytes))` on success, `None` if the pipeline
-    /// is full.
+    /// Returns `Some(suffix_bytes)` on success, `None` if the pipeline is full.
     #[inline]
-    pub fn encode_set_guard(
+    pub fn encode_set_prefix(
         &mut self,
         prefix_buf: &mut Vec<u8>,
         key: &[u8],
         value_len: usize,
-        now: Instant,
-    ) -> Option<(u64, &'static [u8])> {
+    ) -> Option<&'static [u8]> {
         if !self.can_send() {
             return None;
         }
-
-        let id = self.next_id;
-        self.next_id += 1;
 
         prefix_buf.clear();
         let suffix: &'static [u8] = match &mut self.codec {
@@ -583,10 +592,24 @@ impl Session {
             }
         };
 
-        // The total wire bytes for this request: prefix + value + suffix.
-        // Since we're sending via send_parts() (submitted immediately), we set
-        // sent_at to now. bytes_end is set to current bytes_written since this
-        // data doesn't go through the send buffer.
+        Some(suffix)
+    }
+
+    /// Record a SET request after it has been successfully submitted to the kernel.
+    ///
+    /// Must be called exactly once after `encode_set_prefix()` + `send_set_parts()`
+    /// succeeds. This pushes to `in_flight`, increments counters, and tracks bytes.
+    #[inline]
+    pub fn confirm_set_sent(
+        &mut self,
+        prefix_len: usize,
+        value_len: usize,
+        suffix_len: usize,
+        now: Instant,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+
         self.in_flight.push_back(InFlightRequest {
             id,
             request_type: RequestType::Set,
@@ -595,14 +618,22 @@ impl Session {
             first_byte_at: None,
             bytes_end: self.bytes_written,
             tx_timestamp: None,
+            key_id: None,
+            backfill: false,
         });
         self.requests_sent += 1;
 
-        // Track TX bytes for the full message
-        let total_bytes = prefix_buf.len() + value_len + suffix.len();
-        crate::metrics::BYTES_TX.add(total_bytes as u64);
+        crate::metrics::BYTES_TX.add((prefix_len + value_len + suffix_len) as u64);
+    }
 
-        Some((id, suffix))
+    /// Mark the most recently pushed in-flight request as a backfill SET.
+    ///
+    /// Called by the worker after `confirm_set_sent()` for set_on_miss backfills.
+    #[inline]
+    pub fn mark_last_request_backfill(&mut self) {
+        if let Some(req) = self.in_flight.back_mut() {
+            req.backfill = true;
+        }
     }
 
     /// Get the send buffer to be written to the socket.
@@ -750,6 +781,8 @@ impl Session {
                             ttfb_ns,
                             request_type: req.request_type,
                             hit,
+                            key_id: req.key_id,
+                            backfill: req.backfill,
                         });
                         count += 1;
                     } else {
@@ -920,6 +953,8 @@ impl Session {
                             ttfb_ns,
                             request_type: req.request_type,
                             hit,
+                            key_id: req.key_id,
+                            backfill: req.backfill,
                         });
                         count += 1;
                     } else {
