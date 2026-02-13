@@ -1,6 +1,6 @@
 [package]
 name = "metrics"
-version = "0.3.3-alpha.0"
+version = "0.3.3"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
