@@ -296,6 +296,13 @@ fn run_benchmark(
     let mut last_histogram: Option<Histogram> = None;
     let mut baseline_bytes_tx = 0u64;
     let mut baseline_bytes_rx = 0u64;
+    let mut baseline_requests = 0u64;
+    let mut baseline_responses = 0u64;
+    let mut baseline_errors = 0u64;
+    let mut baseline_hits = 0u64;
+    let mut baseline_misses = 0u64;
+    let mut baseline_get_count = 0u64;
+    let mut baseline_set_count = 0u64;
     let mut current_phase = if prefill_enabled {
         Phase::Prefill
     } else {
@@ -400,6 +407,7 @@ fn run_benchmark(
                     PrefillStallCause::Unknown
                 };
 
+                let conns_failed = metrics::CONNECTIONS_FAILED.value();
                 prefill_timeout_diag = Some(PrefillDiagnostics {
                     workers_complete: prefill_complete,
                     workers_total: num_threads,
@@ -407,6 +415,7 @@ fn run_benchmark(
                     keys_total: total,
                     elapsed,
                     conns_active,
+                    conns_failed,
                     bytes_rx,
                     requests_sent,
                     likely_cause,
@@ -434,14 +443,26 @@ fn run_benchmark(
             formatter.print_running(duration);
             formatter.print_header();
             last_report = Instant::now();
-            last_responses = metrics::RESPONSES_RECEIVED.value();
-            last_errors = metrics::REQUEST_ERRORS.value();
-            last_conn_failures = metrics::CONNECTIONS_FAILED.value();
-            last_hits = metrics::CACHE_HITS.value();
-            last_misses = metrics::CACHE_MISSES.value();
-            last_histogram = metrics::RESPONSE_LATENCY.load();
+
+            // Capture baselines for all counters at the start of the recording phase.
+            // Counters are now always incremented (including during prefill/warmup),
+            // so we subtract these baselines in the final results.
+            baseline_requests = metrics::REQUESTS_SENT.value();
+            baseline_responses = metrics::RESPONSES_RECEIVED.value();
+            baseline_errors = metrics::REQUEST_ERRORS.value();
+            baseline_hits = metrics::CACHE_HITS.value();
+            baseline_misses = metrics::CACHE_MISSES.value();
+            baseline_get_count = metrics::GET_COUNT.value();
+            baseline_set_count = metrics::SET_COUNT.value();
             baseline_bytes_tx = metrics::BYTES_TX.value();
             baseline_bytes_rx = metrics::BYTES_RX.value();
+
+            last_responses = baseline_responses;
+            last_errors = baseline_errors;
+            last_conn_failures = metrics::CONNECTIONS_FAILED.value();
+            last_hits = baseline_hits;
+            last_misses = baseline_misses;
+            last_histogram = metrics::RESPONSE_LATENCY.load();
 
             if let Some(ref sat_config) = config.workload.saturation_search
                 && let Some(ref rl) = ratelimiter
@@ -590,16 +611,16 @@ fn run_benchmark(
         }
     }
 
-    // Final report
-    let requests = metrics::REQUESTS_SENT.value();
-    let responses = metrics::RESPONSES_RECEIVED.value();
-    let errors = metrics::REQUEST_ERRORS.value();
-    let hits = metrics::CACHE_HITS.value();
-    let misses = metrics::CACHE_MISSES.value();
+    // Final report — subtract baselines captured at warmup→running transition
+    let requests = metrics::REQUESTS_SENT.value() - baseline_requests;
+    let responses = metrics::RESPONSES_RECEIVED.value() - baseline_responses;
+    let errors = metrics::REQUEST_ERRORS.value() - baseline_errors;
+    let hits = metrics::CACHE_HITS.value() - baseline_hits;
+    let misses = metrics::CACHE_MISSES.value() - baseline_misses;
     let bytes_tx = metrics::BYTES_TX.value() - baseline_bytes_tx;
     let bytes_rx = metrics::BYTES_RX.value() - baseline_bytes_rx;
-    let get_count = metrics::GET_COUNT.value();
-    let set_count = metrics::SET_COUNT.value();
+    let get_count = metrics::GET_COUNT.value() - baseline_get_count;
+    let set_count = metrics::SET_COUNT.value() - baseline_set_count;
     let active = metrics::CONNECTIONS_ACTIVE.value();
     let failed = metrics::CONNECTIONS_FAILED.value();
     let elapsed_secs = actual_duration.as_secs_f64();

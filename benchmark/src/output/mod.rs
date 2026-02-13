@@ -123,7 +123,7 @@ pub struct Results {
     pub get_latencies: LatencyStats,
     pub get_ttfb: LatencyStats,
     pub set_latencies: LatencyStats,
-    pub conns_active: u64,
+    pub conns_active: i64,
     pub conns_failed: u64,
     pub conns_total: u64,
 }
@@ -206,7 +206,9 @@ pub struct PrefillDiagnostics {
     /// Time elapsed since prefill started.
     pub elapsed: Duration,
     /// Number of active connections.
-    pub conns_active: u64,
+    pub conns_active: i64,
+    /// Number of failed connections.
+    pub conns_failed: u64,
     /// Total bytes received.
     pub bytes_rx: u64,
     /// Total requests sent.
