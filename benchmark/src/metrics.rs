@@ -26,7 +26,6 @@ pub mod cache {
 
 /// Counter slot indices for connection metrics.
 pub mod connection {
-    pub const ACTIVE: usize = 0;
     pub const FAILED: usize = 1;
     pub const DISCONNECT_EOF: usize = 2;
     pub const DISCONNECT_RECV_ERROR: usize = 3;
@@ -83,9 +82,9 @@ pub static SET_COUNT: Counter = Counter::new(&OPS, ops::SET);
 #[metric(name = "delete_count", description = "Total DELETE operations")]
 pub static DELETE_COUNT: Counter = Counter::new(&OPS, ops::DELETE);
 
-// Connection counters
+// Connection gauge (tracks current active connections; decremented on disconnect)
 #[metric(name = "connections_active", description = "Active connections")]
-pub static CONNECTIONS_ACTIVE: Counter = Counter::new(&CONNECTION, connection::ACTIVE);
+pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
 #[metric(name = "connections_failed", description = "Failed connections")]
 pub static CONNECTIONS_FAILED: Counter = Counter::new(&CONNECTION, connection::FAILED);

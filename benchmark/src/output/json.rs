@@ -90,7 +90,7 @@ struct ResultsOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     get_ttfb: Option<LatencyOutput>,
     set: LatencyOutput,
-    conns_active: u64,
+    conns_active: i64,
     conns_failed: u64,
 }
 
@@ -207,7 +207,8 @@ impl OutputFormatter for JsonFormatter {
             workers_complete: usize,
             workers_total: usize,
             elapsed_secs: f64,
-            conns_active: u64,
+            conns_active: i64,
+            conns_failed: u64,
             bytes_rx: u64,
             requests_sent: u64,
         }
@@ -221,6 +222,7 @@ impl OutputFormatter for JsonFormatter {
             workers_total: diag.workers_total,
             elapsed_secs: diag.elapsed.as_secs_f64(),
             conns_active: diag.conns_active,
+            conns_failed: diag.conns_failed,
             bytes_rx: diag.bytes_rx,
             requests_sent: diag.requests_sent,
         };

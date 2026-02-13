@@ -304,6 +304,7 @@ pub struct BenchHandler {
     /// Prefill state
     prefill_pending: std::collections::VecDeque<usize>,
     prefill_in_flight: Vec<std::collections::VecDeque<usize>>,
+    prefill_session_last_progress: Vec<std::time::Instant>,
     prefill_confirmed: usize,
     prefill_total: usize,
     prefill_done: bool,
@@ -352,6 +353,8 @@ impl BenchHandler {
                     self.sessions.push(session);
                     self.prefill_in_flight
                         .push(std::collections::VecDeque::new());
+                    self.prefill_session_last_progress
+                        .push(std::time::Instant::now());
 
                     // Initiate async connect
                     match ctx.connect(endpoint) {
@@ -426,7 +429,6 @@ impl BenchHandler {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let delete_ratio = self.config.workload.commands.delete;
-        let recording = self.recording;
 
         for session in &mut self.momento_sessions {
             if !session.is_connected() {
@@ -462,7 +464,7 @@ impl BenchHandler {
                     session.set(&self.key_buf, &self.value_buf, now).is_some()
                 };
 
-                if sent && recording {
+                if sent {
                     metrics::REQUESTS_SENT.increment();
                 }
 
@@ -476,9 +478,12 @@ impl BenchHandler {
                 tracing::debug!("Momento poll error: {}", e);
             }
 
-            if recording {
+            for result in &self.results {
+                record_counters(result);
+            }
+            if self.recording {
                 for result in &self.results {
-                    record_metrics(result);
+                    record_latencies(result);
                 }
             }
         }
@@ -513,6 +518,7 @@ impl BenchHandler {
                     self.prefill_pending.push_front(key_id);
                     break;
                 }
+                metrics::REQUESTS_SENT.increment();
             }
 
             self.results.clear();
@@ -548,7 +554,6 @@ impl BenchHandler {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let delete_ratio = self.config.workload.commands.delete;
-        let recording = self.recording;
         let value_len = self.config.workload.values.length;
         let pool_len = self.value_pool.len();
 
@@ -606,15 +611,17 @@ impl BenchHandler {
                 }
 
                 self.requests_driven += 1;
-                if recording {
-                    metrics::REQUESTS_SENT.increment();
-                }
+                metrics::REQUESTS_SENT.increment();
             }
 
             // Flush any remaining GET/DELETE data in the send buffer
             self.flush_session(ctx, idx);
         }
     }
+
+    /// Maximum in-flight prefill requests per session, independent of the
+    /// user-configured pipeline depth. Limits blast radius when a connection stalls.
+    const PREFILL_MAX_PIPELINE: usize = 16;
 
     /// Drive prefill requests (sequential SET commands).
     fn drive_prefill_requests(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
@@ -627,7 +634,9 @@ impl BenchHandler {
             }
 
             loop {
-                if !self.sessions[idx].can_send() {
+                if !self.sessions[idx].can_send()
+                    || self.prefill_in_flight[idx].len() >= Self::PREFILL_MAX_PIPELINE
+                {
                     break;
                 }
 
@@ -654,6 +663,7 @@ impl BenchHandler {
                         break;
                     }
                     self.prefill_in_flight[idx].push_back(key_id);
+                    metrics::REQUESTS_SENT.increment();
                 } else {
                     self.prefill_pending.push_front(key_id);
                     break;
@@ -783,6 +793,7 @@ impl BenchHandler {
                 ctx.close(token);
             }
             self.conn_to_session.remove(&conn_id);
+            metrics::CONNECTIONS_ACTIVE.decrement();
         }
         self.sessions[idx].disconnect();
 
@@ -832,6 +843,9 @@ impl BenchHandler {
 
         if confirmed_batch > 0 {
             self.shared.add_prefill_confirmed(confirmed_batch);
+            if idx < self.prefill_session_last_progress.len() {
+                self.prefill_session_last_progress[idx] = std::time::Instant::now();
+            }
         }
 
         if self.prefill_confirmed >= self.prefill_total {
@@ -854,9 +868,12 @@ impl BenchHandler {
 
             self.handle_prefill_results(idx);
 
+            for result in &self.results {
+                record_counters(result);
+            }
             if self.recording {
                 for result in &self.results {
-                    record_metrics(result);
+                    record_latencies(result);
                 }
             }
         }
@@ -952,6 +969,7 @@ impl EventHandler for BenchHandler {
             connections_initiated: false,
             prefill_pending,
             prefill_in_flight: Vec::new(),
+            prefill_session_last_progress: Vec::new(),
             prefill_confirmed: 0,
             prefill_total,
             prefill_done,
@@ -1035,10 +1053,13 @@ impl EventHandler for BenchHandler {
         // Handle prefill tracking
         self.handle_prefill_results(idx);
 
-        // Record metrics
+        // Record metrics (counters always, latencies only when recording)
+        for result in &self.results {
+            record_counters(result);
+        }
         if self.recording {
             for result in &self.results {
-                record_metrics(result);
+                record_latencies(result);
             }
         }
 
@@ -1089,6 +1110,7 @@ impl EventHandler for BenchHandler {
                 }
             }
 
+            metrics::CONNECTIONS_ACTIVE.decrement();
             metrics::CONNECTIONS_FAILED.increment();
             metrics::DISCONNECTS_CLOSED_EVENT.increment();
         }
@@ -1140,6 +1162,28 @@ impl EventHandler for BenchHandler {
         // Phase-specific work
         if phase == Phase::Prefill && !self.prefill_done {
             self.drive_prefill_requests(ctx, now);
+
+            // Per-session prefill timeout: close sessions that have in-flight
+            // keys but haven't received a response within 10 seconds.
+            const PREFILL_SESSION_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(10);
+            for idx in 0..self.sessions.len() {
+                if !self.prefill_in_flight[idx].is_empty()
+                    && idx < self.prefill_session_last_progress.len()
+                    && self.prefill_session_last_progress[idx].elapsed() > PREFILL_SESSION_TIMEOUT
+                {
+                    tracing::warn!(
+                        worker = self.id,
+                        session = idx,
+                        in_flight = self.prefill_in_flight[idx].len(),
+                        "prefill session stalled for >10s, closing"
+                    );
+                    self.close_session(ctx, idx, DisconnectReason::SendError);
+                    // Reset the progress timer so we don't immediately re-trigger
+                    // after reconnect. close_session moves keys back to prefill_pending.
+                    self.prefill_session_last_progress[idx] = now;
+                }
+            }
         } else if phase == Phase::Warmup || phase == Phase::Running {
             self.drive_requests(ctx, now);
         }
@@ -1177,8 +1221,8 @@ impl EventHandler for BenchHandler {
     }
 }
 
-/// Record metrics for a completed request result.
-fn record_metrics(result: &RequestResult) {
+/// Record counter metrics for a completed request result (always called).
+fn record_counters(result: &RequestResult) {
     metrics::RESPONSES_RECEIVED.increment();
     if result.is_error_response {
         metrics::REQUEST_ERRORS.increment();
@@ -1190,21 +1234,28 @@ fn record_metrics(result: &RequestResult) {
             metrics::CACHE_MISSES.increment();
         }
     }
+    match result.request_type {
+        RequestType::Get => metrics::GET_COUNT.increment(),
+        RequestType::Set => metrics::SET_COUNT.increment(),
+        RequestType::Delete => metrics::DELETE_COUNT.increment(),
+        RequestType::Ping | RequestType::Other => {}
+    }
+}
+
+/// Record latency histograms for a completed request result (only during Running phase).
+fn record_latencies(result: &RequestResult) {
     let _ = metrics::RESPONSE_LATENCY.increment(result.latency_ns);
     match result.request_type {
         RequestType::Get => {
-            metrics::GET_COUNT.increment();
             let _ = metrics::GET_LATENCY.increment(result.latency_ns);
             if let Some(ttfb) = result.ttfb_ns {
                 let _ = metrics::GET_TTFB.increment(ttfb);
             }
         }
         RequestType::Set => {
-            metrics::SET_COUNT.increment();
             let _ = metrics::SET_LATENCY.increment(result.latency_ns);
         }
         RequestType::Delete => {
-            metrics::DELETE_COUNT.increment();
             let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);
         }
         RequestType::Ping | RequestType::Other => {}

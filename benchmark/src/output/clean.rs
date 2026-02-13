@@ -354,7 +354,10 @@ impl OutputFormatter for CleanFormatter {
             diag.workers_complete, diag.workers_total,
         );
         println!("elapsed      {:.0}s", diag.elapsed.as_secs_f64());
-        println!("connections  {} active", diag.conns_active,);
+        println!(
+            "connections  {} active, {} failed",
+            diag.conns_active, diag.conns_failed,
+        );
         println!(
             "requests     {} sent, {} bytes rx",
             format_count(diag.requests_sent),
