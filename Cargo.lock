@@ -418,7 +418,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "benchmark"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "arrow",
  "axum",
@@ -531,7 +531,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cache-bench"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "cache-core",
  "clap",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "cache-core"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "grpc"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "bytes",
  "http2",
@@ -1104,7 +1104,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "heap-cache"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "http2"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "bytes",
  "rustls",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "kompio"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "crossbeam-channel",
  "io-uring",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "metriken",
 ]
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-memcache"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "itoa",
  "memchr",
@@ -2128,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-momento"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "bytes",
  "grpc",
@@ -2138,14 +2138,14 @@ dependencies = [
 
 [[package]]
 name = "protocol-ping"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "protocol-resp"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "itoa",
  "memchr",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "ahash",
  "axum",
@@ -2475,7 +2475,7 @@ checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "segcache"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -2597,7 +2597,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2667,7 +2667,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slab-cache"
-version = "0.3.3"
+version = "0.3.4-alpha.0"
 dependencies = [
  "cache-core",
  "clocksource",
