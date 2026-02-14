@@ -217,16 +217,16 @@ mod tests {
         assert_eq!(event, ChainEvent::Pending);
 
         // Second SQE fails (partial write)
-        let event = table.on_operation_cqe(0, -(libc::EIO as i32));
+        let event = table.on_operation_cqe(0, -libc::EIO);
         assert_eq!(event, ChainEvent::Pending);
 
         // Third SQE cancelled (IO_LINK chain broken)
-        let event = table.on_operation_cqe(0, -(libc::ECANCELED as i32));
+        let event = table.on_operation_cqe(0, -libc::ECANCELED);
         assert_eq!(
             event,
             ChainEvent::Complete {
                 bytes_sent: 100,
-                error: Some(-(libc::EIO as i32))
+                error: Some(-libc::EIO)
             }
         );
     }
