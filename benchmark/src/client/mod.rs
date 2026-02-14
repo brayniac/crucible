@@ -1,7 +1,7 @@
 mod momento;
 mod session;
 
-pub use momento::MomentoSession;
+pub use momento::{MomentoConn, MomentoSetup, build_momento_tls_config};
 pub use session::{RecvBuf, Session, SessionConfig, SessionError, Timestamp};
 
 /// Result of a completed request.

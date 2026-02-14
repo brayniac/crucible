@@ -4,7 +4,7 @@
 //! (`on_tick`, `on_connect`, `on_data`, `on_send_complete`, `on_close`)
 //! to drive the benchmark workload.
 
-use crate::client::{MomentoSession, RecvBuf, RequestResult, RequestType, Session};
+use crate::client::{MomentoConn, MomentoSetup, RecvBuf, RequestResult, RequestType, Session};
 use crate::config::{Config, Protocol as CacheProtocol};
 use crate::metrics;
 use crate::ratelimit::DynamicRateLimiter;
@@ -273,13 +273,17 @@ pub struct BenchHandler {
     /// Tracks sessions that are being connected (ConnToken::index() -> session index)
     pending_connects: HashMap<usize, usize>,
 
-    /// Momento sessions (handle their own I/O)
-    momento_sessions: Vec<MomentoSession>,
+    /// Momento connections (protocol state only, kompio handles I/O)
+    momento_conns: Vec<MomentoConn>,
+    /// Maps ConnToken::index() -> momento connection index
+    conn_to_momento: HashMap<usize, usize>,
+    /// Momento setup (credential, addresses, TLS host) resolved once per worker
+    momento_setup: Option<MomentoSetup>,
 
     /// Workload generation
     rng: Xoshiro256PlusPlus,
     key_buf: Vec<u8>,
-    /// Value buffer for Momento sessions (they use their own TLS transport, not kompio)
+    /// Value buffer for Momento SET operations
     value_buf: Vec<u8>,
     /// Shared 1GB random value pool for zero-copy SET sends via send_parts()
     value_pool: Arc<Vec<u8>>,
@@ -339,7 +343,7 @@ impl BenchHandler {
     /// Initiate connections to all endpoints.
     fn initiate_connections(&mut self, ctx: &mut DriverCtx) {
         if self.config.target.protocol == CacheProtocol::Momento {
-            self.connect_momento();
+            self.connect_momento(ctx);
             self.connections_initiated = true;
             return;
         }
@@ -396,8 +400,20 @@ impl BenchHandler {
         self.connections_initiated = true;
     }
 
-    /// Connect Momento sessions.
-    fn connect_momento(&mut self) {
+    /// Connect Momento sessions via kompio TLS.
+    fn connect_momento(&mut self, ctx: &mut DriverCtx) {
+        // Resolve setup once per worker
+        if self.momento_setup.is_none() {
+            match MomentoSetup::from_config(&self.config) {
+                Ok(setup) => self.momento_setup = Some(setup),
+                Err(e) => {
+                    tracing::error!("failed to resolve Momento config: {}", e);
+                    metrics::CONNECTIONS_FAILED.increment();
+                    return;
+                }
+            }
+        }
+
         let total_connections = self.config.connection.total_connections();
         let num_threads = self.config.general.threads;
 
@@ -409,51 +425,45 @@ impl BenchHandler {
             base_per_thread
         };
 
-        for _ in 0..my_connections {
-            match MomentoSession::new(&self.config) {
-                Ok(mut session) => {
-                    if let Err(e) = session.connect() {
-                        tracing::warn!("failed to connect Momento session: {}", e);
-                        metrics::CONNECTIONS_FAILED.increment();
-                    }
-                    self.momento_sessions.push(session);
+        let setup = self.momento_setup.as_ref().unwrap();
+        let num_addrs = setup.addresses.len();
+
+        for i in 0..my_connections {
+            let addr = setup.addresses[i % num_addrs];
+            let conn = MomentoConn::new(&setup.credential, &self.config);
+            let momento_idx = self.momento_conns.len();
+            self.momento_conns.push(conn);
+
+            match ctx.connect_tls(addr, &setup.tls_host) {
+                Ok(token) => {
+                    self.conn_tokens.insert(token.index(), token);
+                    self.pending_connects.insert(token.index(), momento_idx);
                 }
                 Err(e) => {
-                    tracing::error!("failed to create Momento session: {}", e);
+                    tracing::warn!(
+                        "worker {} failed to connect Momento to {}: {}",
+                        self.id,
+                        addr,
+                        e
+                    );
                     metrics::CONNECTIONS_FAILED.increment();
                 }
             }
         }
     }
 
-    /// Drive the Momento workload (both prefill and normal).
-    fn poll_momento(&mut self, now: std::time::Instant) {
-        let phase = self.shared.phase();
-
-        if phase == Phase::Prefill && !self.prefill_done {
-            self.poll_momento_prefill(now);
-            return;
-        }
-
+    /// Drive the Momento workload requests and flush pending sends.
+    fn drive_momento_requests(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
         let delete_ratio = self.config.workload.commands.delete;
 
-        for session in &mut self.momento_sessions {
-            if !session.is_connected() {
-                match session.drive() {
-                    Ok(true) => {
-                        metrics::CONNECTIONS_ACTIVE.increment();
-                    }
-                    Ok(false) => continue,
-                    Err(e) => {
-                        tracing::debug!("Momento connection error: {}", e);
-                        continue;
-                    }
-                }
+        for idx in 0..self.momento_conns.len() {
+            if !self.momento_conns[idx].is_ready() {
+                continue;
             }
 
-            while session.can_send() {
+            while self.momento_conns[idx].can_send() {
                 if let Some(ref rl) = self.ratelimiter
                     && !rl.try_acquire()
                 {
@@ -465,56 +475,36 @@ impl BenchHandler {
 
                 let roll = self.rng.random_range(0..100);
                 let sent = if roll < get_ratio {
-                    session.get(&self.key_buf, now).is_some()
+                    self.momento_conns[idx].get(&self.key_buf, now).is_some()
                 } else if roll < get_ratio + delete_ratio {
-                    session.delete(&self.key_buf, now).is_some()
+                    self.momento_conns[idx].delete(&self.key_buf, now).is_some()
                 } else {
                     self.rng.fill_bytes(&mut self.value_buf);
-                    session.set(&self.key_buf, &self.value_buf, now).is_some()
+                    self.momento_conns[idx]
+                        .set(&self.key_buf, &self.value_buf, now)
+                        .is_some()
                 };
 
                 if sent {
+                    self.requests_driven += 1;
                     metrics::REQUESTS_SENT.increment();
-                }
-
-                if !sent {
+                } else {
                     break;
                 }
             }
 
-            self.results.clear();
-            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
-                tracing::debug!("Momento poll error: {}", e);
-            }
-
-            for result in &self.results {
-                record_counters(result);
-            }
-            if self.recording {
-                for result in &self.results {
-                    record_latencies(result);
-                }
-            }
+            self.flush_momento(ctx, idx);
         }
     }
 
-    /// Momento prefill.
-    fn poll_momento_prefill(&mut self, now: std::time::Instant) {
-        for session in &mut self.momento_sessions {
-            if !session.is_connected() {
-                match session.drive() {
-                    Ok(true) => {
-                        metrics::CONNECTIONS_ACTIVE.increment();
-                    }
-                    Ok(false) => continue,
-                    Err(e) => {
-                        tracing::debug!("Momento connection error: {}", e);
-                        continue;
-                    }
-                }
+    /// Drive Momento prefill requests and flush pending sends.
+    fn drive_momento_prefill(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
+        for idx in 0..self.momento_conns.len() {
+            if !self.momento_conns[idx].is_ready() {
+                continue;
             }
 
-            while session.can_send() {
+            while self.momento_conns[idx].can_send() {
                 let key_id = match self.prefill_pending.pop_front() {
                     Some(id) => id,
                     None => break,
@@ -523,29 +513,138 @@ impl BenchHandler {
                 write_key(&mut self.key_buf, key_id);
                 self.rng.fill_bytes(&mut self.value_buf);
 
-                if session.set(&self.key_buf, &self.value_buf, now).is_none() {
+                if self.momento_conns[idx]
+                    .set(&self.key_buf, &self.value_buf, now)
+                    .is_none()
+                {
                     self.prefill_pending.push_front(key_id);
                     break;
                 }
                 metrics::REQUESTS_SENT.increment();
             }
 
-            self.results.clear();
-            if let Err(e) = session.poll_responses(&mut self.results, std::time::Instant::now()) {
-                tracing::debug!("Momento poll error: {}", e);
+            self.flush_momento(ctx, idx);
+        }
+    }
+
+    /// Flush pending send data for a Momento connection via kompio.
+    fn flush_momento(&mut self, ctx: &mut DriverCtx, idx: usize) {
+        let pending = self.momento_conns[idx].pending_send();
+        if pending.is_empty() {
+            return;
+        }
+
+        // Find the ConnToken for this momento connection
+        let token = match self.find_momento_token(idx) {
+            Some(t) => t,
+            None => return,
+        };
+
+        let n = pending.len();
+        match ctx.send(token, pending) {
+            Ok(()) => {
+                self.momento_conns[idx].advance_send(n);
             }
-            let mut confirmed_batch = 0usize;
+            Err(e) => {
+                self.send_failures += 1;
+                tracing::debug!(worker = self.id, error = %e, "momento send error");
+            }
+        }
+    }
+
+    /// Find the ConnToken for a Momento connection by scanning conn_to_momento.
+    fn find_momento_token(&self, momento_idx: usize) -> Option<ConnToken> {
+        for (&conn_index, &midx) in &self.conn_to_momento {
+            if midx == momento_idx {
+                return self.conn_tokens.get(&conn_index).copied();
+            }
+        }
+        None
+    }
+
+    /// Handle Momento data received from kompio.
+    fn on_momento_data(
+        &mut self,
+        ctx: &mut DriverCtx,
+        _conn: ConnToken,
+        midx: usize,
+        data: &[u8],
+    ) -> usize {
+        let now = std::time::Instant::now();
+
+        // Feed plaintext data directly into the HTTP/2 framing layer
+        if let Err(e) = self.momento_conns[midx].feed_data(data) {
+            tracing::debug!(worker = self.id, error = %e, "Momento feed_data error");
+            return data.len();
+        }
+
+        // Poll for completed operations
+        self.results.clear();
+        self.momento_conns[midx].poll_responses(&mut self.results, now);
+
+        // Handle prefill tracking
+        let phase = self.shared.phase();
+        if phase == Phase::Prefill && !self.prefill_done {
+            self.handle_momento_prefill_results();
+        }
+
+        // Record metrics
+        for result in &self.results {
+            record_counters(result);
+        }
+        if self.recording {
             for result in &self.results {
-                if result.request_type == RequestType::Set && result.success {
-                    self.prefill_confirmed += 1;
-                    confirmed_batch += 1;
-                }
-            }
-            if confirmed_batch > 0 {
-                self.shared.add_prefill_confirmed(confirmed_batch);
+                record_latencies(result);
             }
         }
 
+        self.bytes_received += data.len() as u64;
+        self.responses_parsed += self.results.len() as u64;
+
+        if data.len() > 0 {
+            metrics::BYTES_RX.add(data.len() as u64);
+        }
+
+        // Flush any pending sends generated by processing responses
+        self.flush_momento(ctx, midx);
+
+        // Drive more requests immediately when responses free pipeline slots
+        if !self.results.is_empty() {
+            if phase == Phase::Warmup || phase == Phase::Running {
+                self.drive_momento_requests(ctx, now);
+            } else if phase == Phase::Prefill && !self.prefill_done {
+                self.drive_momento_prefill(ctx, now);
+            }
+        }
+
+        data.len()
+    }
+
+    /// Close a Momento connection and clean up state.
+    fn close_momento(&mut self, ctx: &mut DriverCtx, conn: ConnToken, _midx: usize) {
+        self.conn_to_momento.remove(&conn.index());
+        if let Some(token) = self.conn_tokens.remove(&conn.index()) {
+            ctx.close(token);
+        }
+        metrics::CONNECTIONS_ACTIVE.decrement();
+        metrics::CONNECTIONS_FAILED.increment();
+    }
+
+    /// Handle Momento prefill response tracking.
+    fn handle_momento_prefill_results(&mut self) {
+        if self.prefill_done {
+            return;
+        }
+        let mut confirmed_batch = 0usize;
+        for result in &self.results {
+            if result.request_type == RequestType::Set && result.success {
+                self.prefill_confirmed += 1;
+                confirmed_batch += 1;
+            }
+        }
+        if confirmed_batch > 0 {
+            self.shared.add_prefill_confirmed(confirmed_batch);
+        }
         if self.prefill_confirmed >= self.prefill_total {
             self.prefill_done = true;
             tracing::debug!(
@@ -1063,7 +1162,9 @@ impl EventHandler for BenchHandler {
             conn_to_session: HashMap::new(),
             conn_tokens: HashMap::new(),
             pending_connects: HashMap::new(),
-            momento_sessions: Vec::new(),
+            momento_conns: Vec::new(),
+            conn_to_momento: HashMap::new(),
+            momento_setup: None,
             rng,
             key_buf,
             value_buf,
@@ -1105,42 +1206,93 @@ impl EventHandler for BenchHandler {
         // Benchmark is client-only, no accepts expected
     }
 
-    fn on_connect(&mut self, _ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<()>) {
+    fn on_connect(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<()>) {
         let idx = match self.pending_connects.remove(&conn.index()) {
             Some(idx) => idx,
             None => return,
         };
 
-        match result {
-            Ok(()) => {
-                let session = &mut self.sessions[idx];
-                session.set_conn_id(conn.index());
-                session.reconnect_attempted(true);
-                self.conn_to_session.insert(conn.index(), idx);
-                self.conn_tokens.insert(conn.index(), conn);
-                metrics::CONNECTIONS_ACTIVE.increment();
+        if self.config.target.protocol == CacheProtocol::Momento {
+            // Momento connection: idx is a momento_conns index
+            match result {
+                Ok(()) => {
+                    self.conn_to_momento.insert(conn.index(), idx);
+                    self.conn_tokens.insert(conn.index(), conn);
 
-                tracing::debug!(
-                    "worker {} connected session {} (conn_index={})",
-                    self.id,
-                    idx,
-                    conn.index()
-                );
+                    // Initialize HTTP/2 preface (or protosocket auth)
+                    if let Err(e) = self.momento_conns[idx].on_transport_ready() {
+                        tracing::warn!(
+                            "worker {} Momento transport ready failed: {}",
+                            self.id,
+                            e
+                        );
+                        ctx.close(conn);
+                        self.conn_to_momento.remove(&conn.index());
+                        self.conn_tokens.remove(&conn.index());
+                        metrics::CONNECTIONS_FAILED.increment();
+                        return;
+                    }
+
+                    // Flush the HTTP/2 connection preface
+                    self.flush_momento(ctx, idx);
+                    metrics::CONNECTIONS_ACTIVE.increment();
+
+                    tracing::debug!(
+                        "worker {} connected Momento {} (conn_index={})",
+                        self.id,
+                        idx,
+                        conn.index()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "worker {} Momento connection failed for {}: {}",
+                        self.id,
+                        idx,
+                        e
+                    );
+                    self.conn_tokens.remove(&conn.index());
+                    metrics::CONNECTIONS_FAILED.increment();
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    "worker {} connection failed for session {}: {}",
-                    self.id,
-                    idx,
-                    e
-                );
-                self.sessions[idx].reconnect_attempted(false);
-                metrics::CONNECTIONS_FAILED.increment();
+        } else {
+            // Regular session connection
+            match result {
+                Ok(()) => {
+                    let session = &mut self.sessions[idx];
+                    session.set_conn_id(conn.index());
+                    session.reconnect_attempted(true);
+                    self.conn_to_session.insert(conn.index(), idx);
+                    self.conn_tokens.insert(conn.index(), conn);
+                    metrics::CONNECTIONS_ACTIVE.increment();
+
+                    tracing::debug!(
+                        "worker {} connected session {} (conn_index={})",
+                        self.id,
+                        idx,
+                        conn.index()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "worker {} connection failed for session {}: {}",
+                        self.id,
+                        idx,
+                        e
+                    );
+                    self.sessions[idx].reconnect_attempted(false);
+                    metrics::CONNECTIONS_FAILED.increment();
+                }
             }
         }
     }
 
     fn on_data(&mut self, ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize {
+        // Check if this is a Momento connection
+        if let Some(&midx) = self.conn_to_momento.get(&conn.index()) {
+            return self.on_momento_data(ctx, conn, midx, data);
+        }
+
         let idx = match self.conn_to_session.get(&conn.index()) {
             Some(&idx) => idx,
             None => return data.len(),
@@ -1218,6 +1370,24 @@ impl EventHandler for BenchHandler {
     }
 
     fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
+        // Check if this is a Momento connection
+        if let Some(&midx) = self.conn_to_momento.get(&conn.index()) {
+            if result.is_err() {
+                self.close_momento(ctx, conn, midx);
+                return;
+            }
+            // Flush remaining pending data and drive more requests
+            self.flush_momento(ctx, midx);
+            let phase = self.shared.phase();
+            let now = std::time::Instant::now();
+            if phase == Phase::Prefill && !self.prefill_done {
+                self.drive_momento_prefill(ctx, now);
+            } else if phase == Phase::Warmup || phase == Phase::Running {
+                self.drive_momento_requests(ctx, now);
+            }
+            return;
+        }
+
         if result.is_err() {
             if let Some(&idx) = self.conn_to_session.get(&conn.index()) {
                 self.close_session(ctx, idx, DisconnectReason::SendError);
@@ -1245,10 +1415,27 @@ impl EventHandler for BenchHandler {
 
     fn on_close(&mut self, _ctx: &mut DriverCtx, conn: ConnToken) {
         // Check pending connects first
-        if let Some(idx) = self.pending_connects.remove(&conn.index()) {
+        if let Some(_idx) = self.pending_connects.remove(&conn.index()) {
             self.conn_tokens.remove(&conn.index());
-            self.sessions[idx].reconnect_attempted(false);
+            if self.config.target.protocol != CacheProtocol::Momento {
+                self.sessions[_idx].reconnect_attempted(false);
+            }
             metrics::CONNECTIONS_FAILED.increment();
+            return;
+        }
+
+        // Momento connection close
+        if let Some(&midx) = self.conn_to_momento.get(&conn.index()) {
+            self.conn_to_momento.remove(&conn.index());
+            self.conn_tokens.remove(&conn.index());
+            metrics::CONNECTIONS_ACTIVE.decrement();
+            metrics::CONNECTIONS_FAILED.increment();
+            metrics::DISCONNECTS_CLOSED_EVENT.increment();
+            tracing::debug!(
+                worker = self.id,
+                momento_idx = midx,
+                "Momento connection closed"
+            );
             return;
         }
 
@@ -1304,9 +1491,41 @@ impl EventHandler for BenchHandler {
 
         let now = std::time::Instant::now();
 
-        // Momento sessions: drive entirely from on_tick
+        // Momento connections: drive requests from on_tick
         if self.config.target.protocol == CacheProtocol::Momento {
-            self.poll_momento(now);
+            if phase == Phase::Prefill && !self.prefill_done {
+                self.drive_momento_prefill(ctx, now);
+            } else if phase == Phase::Warmup || phase == Phase::Running {
+                self.drive_momento_requests(ctx, now);
+            }
+
+            // Periodic diagnostic heartbeat
+            self.tick_count += 1;
+            if self.last_diag.elapsed() >= std::time::Duration::from_secs(2) {
+                let ready = self.momento_conns.iter().filter(|c| c.is_ready()).count();
+                let total_in_flight: usize =
+                    self.momento_conns.iter().map(|c| c.in_flight_count()).sum();
+                tracing::trace!(
+                    worker = self.id,
+                    phase = ?phase,
+                    recording = self.recording,
+                    ready,
+                    total_momento = self.momento_conns.len(),
+                    total_in_flight,
+                    ticks = self.tick_count,
+                    reqs_driven = self.requests_driven,
+                    resps_parsed = self.responses_parsed,
+                    bytes_rx = self.bytes_received,
+                    send_fails = self.send_failures,
+                    "momento diagnostic heartbeat"
+                );
+                self.tick_count = 0;
+                self.requests_driven = 0;
+                self.responses_parsed = 0;
+                self.bytes_received = 0;
+                self.send_failures = 0;
+                self.last_diag = std::time::Instant::now();
+            }
             return;
         }
 

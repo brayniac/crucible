@@ -304,6 +304,12 @@ impl<T: Transport> MomentoTransport for ProtosocketTransport<T> {
         Ok(())
     }
 
+    fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
+        self.recv_buf.extend_from_slice(data);
+        self.process_recv_buffer();
+        Ok(())
+    }
+
     fn pending_send(&self) -> &[u8] {
         // Return encrypted data from TLS layer
         self.transport.pending_send()

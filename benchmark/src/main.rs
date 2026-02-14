@@ -1,4 +1,5 @@
-use benchmark::config::Config;
+use benchmark::client::build_momento_tls_config;
+use benchmark::config::{Config, MomentoWireFormat, Protocol as CacheProtocol};
 use benchmark::metrics;
 use benchmark::output::{PrefillDiagnostics, PrefillStallCause};
 use benchmark::ratelimit::DynamicRateLimiter;
@@ -251,6 +252,19 @@ fn run_benchmark(
     // Build kompio config (client-only, no bind).
     // With guard-based sends for SET values, the copy pool only holds small
     // protocol framing data, so the default 16KB slot size is sufficient.
+    let tls_client = if config.target.protocol == CacheProtocol::Momento {
+        let wire_format = match config.momento.wire_format {
+            MomentoWireFormat::Grpc => protocol_momento::WireFormat::Grpc,
+            MomentoWireFormat::Protosocket => protocol_momento::WireFormat::Protosocket,
+        };
+        let tls_config = build_momento_tls_config(wire_format)?;
+        Some(kompio::TlsClientConfig {
+            client_config: Arc::new(tls_config),
+        })
+    } else {
+        None
+    };
+
     let kompio_config = kompio::Config {
         recv_buffer: kompio::RecvBufferConfig {
             // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
@@ -264,6 +278,7 @@ fn run_benchmark(
             core_offset: 0,
         },
         tcp_nodelay: true,
+        tls_client,
         ..Default::default()
     };
 

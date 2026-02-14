@@ -9,8 +9,12 @@ description = "High-performance cache protocol benchmark tool"
 
 [dependencies]
 # I/O event loop
-kompio = { workspace = true }
+kompio = { workspace = true, features = ["tls"] }
 http2 = { workspace = true, features = ["tls"] }
+
+# TLS
+rustls = { workspace = true, features = ["std", "ring"] }
+webpki-roots = { workspace = true }
 
 # Channels
 crossbeam-channel = { workspace = true }

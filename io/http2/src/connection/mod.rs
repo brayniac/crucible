@@ -226,6 +226,15 @@ impl<T: Transport> Connection<T> {
         self.process_transport_data()
     }
 
+    /// Feed plaintext data directly into the connection's frame buffer.
+    ///
+    /// More efficient than `on_recv()` when TLS is handled externally (e.g.,
+    /// by kompio's native TLS). Skips the Transport recv buffer entirely.
+    pub fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
+        self.read_buf.extend_from_slice(data);
+        self.process_frames()
+    }
+
     /// Process data from the transport.
     fn process_transport_data(&mut self) -> io::Result<()> {
         // Read decrypted data from transport

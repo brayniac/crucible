@@ -96,6 +96,13 @@ impl Server {
         self.conn.on_recv(data);
     }
 
+    /// Feed plaintext data directly into the connection's frame buffer.
+    ///
+    /// More efficient than `on_recv()` when TLS is handled externally.
+    pub fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
+        self.conn.feed_data(data)
+    }
+
     /// Process received data and return events.
     pub fn process(&mut self) -> io::Result<Vec<GrpcServerEvent>> {
         self.conn.process()?;

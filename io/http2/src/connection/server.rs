@@ -118,6 +118,15 @@ impl ServerConnection {
         self.read_buf.extend_from_slice(data);
     }
 
+    /// Feed plaintext data directly into the connection's frame buffer.
+    ///
+    /// Equivalent to `on_recv()` followed by `process()`, but named
+    /// consistently with `Connection::feed_data()` for kompio integration.
+    pub fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
+        self.read_buf.extend_from_slice(data);
+        self.process()
+    }
+
     /// Process received data and return events.
     pub fn process(&mut self) -> io::Result<()> {
         // First, check for connection preface if we haven't seen it

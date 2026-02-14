@@ -142,6 +142,10 @@ impl<T: Transport> MomentoTransport for GrpcTransport<T> {
         self.channel.on_recv(data)
     }
 
+    fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
+        self.channel.feed_data(data)
+    }
+
     fn pending_send(&self) -> &[u8] {
         self.channel.pending_send()
     }
