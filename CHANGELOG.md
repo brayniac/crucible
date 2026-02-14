@@ -15,6 +15,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## [0.3.4] - 2026-02-14
+
+### Added
+- Benchmark `backfill_on_miss` mode: on GET miss, automatically issue a SET for the same key
+  to simulate cache-aside (read-through) workloads. Backfill SETs count against rate limit and
+  pipeline depth, use zero-copy sends, and are tracked with dedicated metrics
+  (`backfill_set_count`, `backfill_set_latency`)
+- Configurable S3-FIFO small queue percent (`small_queue_percent` in `[cache]` config, default
+  10, valid 1-50) for tuning the admission filter size in both segment and heap backends
+- Per-connection send queue in kompio: handlers call `send()`/`send_parts()` freely and kompio
+  queues excess sends internally, submitting the next one immediately in the CQE completion
+  handler to eliminate throughput gaps at deep pipeline depths
+
+### Fixed
+- TCP stream interleaving with large pipelined responses: serialized sends to at most one
+  in-flight SQE per connection, preventing kernel interleaving of concurrent SendMsgZc
+  operations that corrupted RESP framing
+- IO_LINK send chains removed: partial sends caused io_uring to execute linked SQEs
+  immediately, interleaving unsent data with the next batch and corrupting the protocol stream
+- Benchmark pipeline starvation: requests now driven from `on_send_complete` in addition to
+  `on_tick`, keeping the pipeline filled without waiting for the next tick cycle
+- Duplicate benchmark connections from `try_reconnect` during initial connect phase: sessions
+  now marked with `reconnect_attempted` after creation to prevent double-connect
+- Prefill metrics, connection gauge, and per-session prefill timeout accuracy
+- Unnecessary i32 casts in kompio chain tests
+
 ## [0.3.3] - 2026-02-13
 
 ### Fixed
