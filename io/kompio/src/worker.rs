@@ -28,6 +28,12 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
+    /// Returns the per-worker eventfd file descriptors.
+    /// External threads can write to these to wake specific workers.
+    pub fn worker_eventfds(&self) -> &[RawFd] {
+        &self.worker_eventfds
+    }
+
     /// Signal all workers to shut down gracefully.
     ///
     /// Workers will stop accepting new connections, close all active connections,

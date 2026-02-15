@@ -593,65 +593,86 @@ impl<H: EventHandler> EventLoop<H> {
     }
 
     fn handle_eventfd_read(&mut self) {
-        let accept_rx = match self.accept_rx {
-            Some(ref rx) => rx,
-            None => return,
-        };
+        // Drain accept channel (server mode only).
+        if let Some(ref accept_rx) = self.accept_rx {
+            while let Ok((raw_fd, peer_addr)) = accept_rx.try_recv() {
+                let conn_index = match self.connections.allocate() {
+                    Some(idx) => idx,
+                    None => {
+                        unsafe {
+                            libc::close(raw_fd);
+                        }
+                        continue;
+                    }
+                };
 
-        // Drain all (fd, addr) pairs from the channel.
-        while let Ok((raw_fd, peer_addr)) = accept_rx.try_recv() {
-            let conn_index = match self.connections.allocate() {
-                Some(idx) => idx,
-                None => {
+                // Store peer address.
+                if let Some(cs) = self.connections.get_mut(conn_index) {
+                    cs.peer_addr = Some(peer_addr);
+                }
+
+                // Register the fd in the direct file table, then close the original.
+                if self
+                    .ring
+                    .register_files_update(conn_index, &[raw_fd])
+                    .is_err()
+                {
+                    self.connections.release(conn_index);
                     unsafe {
                         libc::close(raw_fd);
                     }
                     continue;
                 }
-            };
-
-            // Store peer address.
-            if let Some(cs) = self.connections.get_mut(conn_index) {
-                cs.peer_addr = Some(peer_addr);
-            }
-
-            // Register the fd in the direct file table, then close the original.
-            if self
-                .ring
-                .register_files_update(conn_index, &[raw_fd])
-                .is_err()
-            {
-                self.connections.release(conn_index);
                 unsafe {
                     libc::close(raw_fd);
                 }
-                continue;
-            }
-            unsafe {
-                libc::close(raw_fd);
-            }
 
-            // Reset accumulator for this connection.
-            self.accumulators.reset(conn_index);
+                // Reset accumulator for this connection.
+                self.accumulators.reset(conn_index);
 
-            // Arm multishot recv.
-            let _ = self.ring.submit_multishot_recv(conn_index);
+                // Arm multishot recv.
+                let _ = self.ring.submit_multishot_recv(conn_index);
 
-            // TLS path: create TLS state and defer on_accept until handshake completes.
-            #[cfg(feature = "tls")]
-            if let Some(ref mut tls_table) = self.tls_table
-                && tls_table.has_server_config()
-            {
-                tls_table.create(conn_index);
-                continue; // skip on_accept — deferred until handshake completes
+                // TLS path: create TLS state and defer on_accept until handshake completes.
+                #[cfg(feature = "tls")]
+                if let Some(ref mut tls_table) = self.tls_table
+                    && tls_table.has_server_config()
+                {
+                    tls_table.create(conn_index);
+                    continue; // skip on_accept — deferred until handshake completes
+                }
+
+                // Plaintext path: mark established and call on_accept immediately.
+                if let Some(cs) = self.connections.get_mut(conn_index) {
+                    cs.established = true;
+                }
+                let generation = self.connections.generation(conn_index);
+                let token = ConnToken::new(conn_index, generation);
+                let mut ctx = DriverCtx {
+                    ring: &mut self.ring,
+                    connections: &mut self.connections,
+                    fixed_buffers: &mut self.fixed_buffers,
+                    send_copy_pool: &mut self.send_copy_pool,
+                    send_slab: &mut self.send_slab,
+                    #[cfg(feature = "tls")]
+                    tls_table: match self.tls_table {
+                        Some(ref mut t) => t as *mut crate::tls::TlsTable,
+                        None => std::ptr::null_mut(),
+                    },
+                    shutdown_requested: &mut self.shutdown_local,
+                    connect_addrs: &mut self.connect_addrs,
+                    tcp_nodelay: self.tcp_nodelay,
+                    connect_timespecs: &mut self.connect_timespecs,
+                    chain_table: &mut self.chain_table,
+                    max_chain_length: self.max_chain_length,
+                    send_queues: &mut self.send_queues,
+                };
+                self.handler.on_accept(&mut ctx, token);
             }
+        }
 
-            // Plaintext path: mark established and call on_accept immediately.
-            if let Some(cs) = self.connections.get_mut(conn_index) {
-                cs.established = true;
-            }
-            let generation = self.connections.generation(conn_index);
-            let token = ConnToken::new(conn_index, generation);
+        // Always call on_notify — this is the external wakeup hook.
+        {
             let mut ctx = DriverCtx {
                 ring: &mut self.ring,
                 connections: &mut self.connections,
@@ -671,7 +692,7 @@ impl<H: EventHandler> EventLoop<H> {
                 max_chain_length: self.max_chain_length,
                 send_queues: &mut self.send_queues,
             };
-            self.handler.on_accept(&mut ctx, token);
+            self.handler.on_notify(&mut ctx);
         }
 
         // Re-arm eventfd read, unless shutdown was requested.

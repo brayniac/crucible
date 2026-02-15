@@ -1,0 +1,23 @@
+[package]
+name = "crucible-client"
+version = "0.3.5-alpha.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kompio = { workspace = true }
+protocol-resp = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+crossbeam-channel = { workspace = true }
+bytes = { workspace = true }
+libc = { workspace = true }
+metriken = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+server = { path = "../server" }
+segcache = { path = "../cache/segcache" }
+toml = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+metriken = { workspace = true }

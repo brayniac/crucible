@@ -1403,6 +1403,11 @@ pub trait EventHandler: Send + 'static {
     /// Called once per event loop iteration after all CQEs processed.
     fn on_tick(&mut self, _ctx: &mut DriverCtx) {}
 
+    /// Called when the worker's eventfd is signaled by an external thread.
+    /// Use this to drain command channels or respond to external wakeups.
+    /// Default: no-op.
+    fn on_notify(&mut self, _ctx: &mut DriverCtx) {}
+
     /// Create a new handler instance for each worker thread.
     fn create_for_worker(worker_id: usize) -> Self
     where

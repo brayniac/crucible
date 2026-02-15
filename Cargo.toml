@@ -25,6 +25,9 @@ members = [
 	# Proxy
 	"proxy",
 
+	# Client Library
+	"client",
+
 	# Benchmark Tool
 	"benchmark",
 
@@ -92,6 +95,7 @@ segcache = { path = "cache/segcache" }
 slab-cache = { path = "cache/slab" }
 heap-cache = { path = "cache/heap" }
 metrics = { path = "metrics" }
+crucible-client = { path = "client" }
 
 
 # Jemalloc allocator
