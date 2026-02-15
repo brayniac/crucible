@@ -1,15 +1,18 @@
 pub mod acceptor;
 pub mod accumulator;
+pub(crate) mod async_event_loop;
 pub mod buffer;
 pub(crate) mod chain;
 pub mod completion;
 pub mod config;
 pub mod connection;
+pub(crate) mod driver;
 pub mod error;
 pub mod event_loop;
 pub mod guard;
 pub mod handler;
 pub mod ring;
+pub(crate) mod runtime;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod worker;
@@ -31,4 +34,8 @@ pub use handler::{
 };
 #[cfg(feature = "tls")]
 pub use tls::TlsInfo;
+pub use runtime::handler::AsyncEventHandler;
+pub use runtime::io::{
+    AsyncSendBuilder, ConnCtx, ConnectFuture, SendFuture, WithDataFuture,
+};
 pub use worker::{KompioBuilder, ShutdownHandle, launch};

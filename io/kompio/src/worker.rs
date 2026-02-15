@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use crate::acceptor::{AcceptorConfig, run_acceptor};
+use crate::async_event_loop::AsyncEventLoop;
 use crate::config::Config;
 use crate::event_loop::EventLoop;
 use crate::handler::EventHandler;
+use crate::runtime::handler::AsyncEventHandler;
 
 /// Result type for `launch` / `KompioBuilder::launch` to avoid type-complexity warnings.
 type LaunchResult = Result<
@@ -81,12 +83,49 @@ impl KompioBuilder {
         self
     }
 
-    /// Launch worker threads.
+    /// Launch worker threads with the callback-based `EventHandler`.
     ///
     /// If `bind()` was called, creates a listener + acceptor thread.
     /// Otherwise runs in client-only mode (no acceptor).
-    #[allow(clippy::needless_range_loop)]
     pub fn launch<H: EventHandler>(self) -> LaunchResult {
+        self.launch_inner(|worker_id, config, accept_rx, eventfd, shutdown_flag| {
+            let handler = H::create_for_worker(worker_id);
+            let mut event_loop =
+                EventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
+            event_loop.run()?;
+            Ok(())
+        })
+    }
+
+    /// Launch worker threads with the async `AsyncEventHandler`.
+    ///
+    /// Each accepted connection gets a long-lived async task. The executor
+    /// polls futures on the same thread-per-core model as the callback API.
+    pub fn launch_async<A: AsyncEventHandler>(self) -> LaunchResult {
+        self.launch_inner(|worker_id, config, accept_rx, eventfd, shutdown_flag| {
+            let handler = A::create_for_worker(worker_id);
+            let mut event_loop =
+                AsyncEventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
+            event_loop.run()?;
+            Ok(())
+        })
+    }
+
+    /// Common infrastructure setup for both sync and async launch.
+    #[allow(clippy::needless_range_loop)]
+    fn launch_inner<F>(self, worker_fn: F) -> LaunchResult
+    where
+        F: Fn(
+                usize,
+                Config,
+                Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
+                RawFd,
+                Arc<AtomicBool>,
+            ) -> Result<(), crate::error::Error>
+            + Send
+            + Clone
+            + 'static,
+    {
         let num_threads = if self.config.worker.threads == 0 {
             num_cpus()
         } else {
@@ -153,13 +192,14 @@ impl KompioBuilder {
 
         // Spawn worker threads.
         let mut handles = Vec::with_capacity(num_threads);
+        let has_acceptor = self.bind_addr.is_some();
 
         for worker_id in 0..num_threads {
             let config = self.config.clone();
             let rx = worker_rxs.remove(0);
             let eventfd = worker_eventfds[worker_id];
             let shutdown_flag = shutdown_flag.clone();
-            let has_acceptor = self.bind_addr.is_some();
+            let worker_fn = worker_fn.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("kompio-worker-{worker_id}"))
@@ -169,14 +209,8 @@ impl KompioBuilder {
                         pin_to_core(core)?;
                     }
 
-                    let handler = H::create_for_worker(worker_id);
-
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
-                    let mut event_loop =
-                        EventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
-                    event_loop.run()?;
-
-                    Ok(())
+                    worker_fn(worker_id, config, accept_rx, eventfd, shutdown_flag)
                 })
                 .map_err(crate::error::Error::Io)?;
 

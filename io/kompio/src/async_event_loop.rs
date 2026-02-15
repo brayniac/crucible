@@ -1,5 +1,6 @@
 use std::io;
 use std::sync::atomic::Ordering;
+use std::task::Context;
 use std::time::Instant;
 
 use io_uring::cqueue;
@@ -8,38 +9,45 @@ use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
 use crate::connection::RecvMode;
 use crate::driver::Driver;
-use crate::handler::{ConnToken, DriverCtx, EventHandler};
+use crate::runtime::handler::AsyncEventHandler;
+use crate::runtime::io::{ConnCtx, DriverState, clear_driver_state, set_driver_state};
+use crate::runtime::waker::conn_waker;
+use crate::runtime::Executor;
 
-/// The core event loop that drives io_uring and dispatches to the EventHandler.
-pub struct EventLoop<H: EventHandler> {
-    pub(crate) driver: Driver,
-    handler: H,
+/// Async event loop that reuses `Driver` infrastructure with an `Executor`
+/// for polling connection futures instead of push-based callbacks.
+pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
+    driver: Driver,
+    handler: A,
+    executor: Executor,
 }
 
-impl<H: EventHandler> EventLoop<H> {
-    /// Create a new event loop for a worker thread.
-    pub fn new(
+impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+    /// Create a new async event loop for a worker thread.
+    pub(crate) fn new(
         config: &crate::config::Config,
-        handler: H,
+        handler: A,
         accept_rx: Option<crossbeam_channel::Receiver<(std::os::fd::RawFd, std::net::SocketAddr)>>,
         eventfd: std::os::fd::RawFd,
         shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, crate::error::Error> {
         let driver = Driver::new(config, accept_rx, eventfd, shutdown_flag)?;
-        Ok(EventLoop { driver, handler })
+        let executor = Executor::new(config.max_connections);
+        Ok(AsyncEventLoop {
+            driver,
+            handler,
+            executor,
+        })
     }
 
-    /// Run the event loop. This blocks the current thread.
-    pub fn run(&mut self) -> Result<(), crate::error::Error> {
+    /// Run the async event loop. Blocks the current thread.
+    pub(crate) fn run(&mut self) -> Result<(), crate::error::Error> {
         // Always arm eventfd read — needed for shutdown wakeup even in client-only mode.
         self.driver
             .ring
             .submit_eventfd_read(self.driver.eventfd, self.driver.eventfd_buf.as_mut_ptr())?;
 
         // Kick the eventfd so the first submit_and_wait(1) returns immediately.
-        // Without this, client-only mode (no acceptor) would deadlock because
-        // nobody writes to the eventfd, so the eventfd read never completes.
-        // In server mode this causes one harmless handle_eventfd_read at startup.
         let kick: u64 = 1;
         unsafe {
             libc::write(
@@ -50,9 +58,7 @@ impl<H: EventHandler> EventLoop<H> {
         }
 
         loop {
-            // Arm a tick timeout before blocking so on_tick fires periodically
-            // even when no I/O completions are pending (e.g., client-only mode
-            // between phases).
+            // Arm a tick timeout before blocking.
             if !self.driver.tick_timeout_armed
                 && let Some(ref ts) = self.driver.tick_timeout_ts
             {
@@ -66,9 +72,7 @@ impl<H: EventHandler> EventLoop<H> {
             self.drain_completions();
 
             // Check for shutdown after processing completions.
-            if self.driver.shutdown_local
-                || self.driver.shutdown_flag.load(Ordering::Relaxed)
-            {
+            if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
                 self.driver.run_shutdown();
                 return Ok(());
             }
@@ -81,10 +85,56 @@ impl<H: EventHandler> EventLoop<H> {
                 self.driver.pending_replenish.clear();
             }
 
-            // on_tick callback
+            // Drain waker-based ready queue (from wakers fired during poll).
+            self.executor.collect_wakeups();
+
+            // Poll all ready tasks.
+            self.poll_ready_tasks();
+
+            // on_tick callback (synchronous).
             let mut ctx = self.driver.make_ctx();
             self.handler.on_tick(&mut ctx);
         }
+    }
+
+    /// Poll all tasks in the ready queue.
+    fn poll_ready_tasks(&mut self) {
+        // Set thread-local driver pointer once for the entire batch.
+        let mut driver_state = DriverState {
+            driver: &mut self.driver as *mut Driver,
+            executor: &mut self.executor as *mut Executor,
+        };
+        set_driver_state(&mut driver_state);
+
+        let mut i = 0;
+        while i < self.executor.ready_queue.len() {
+            let conn_index = self.executor.ready_queue[i];
+            i += 1;
+
+            if let Some(mut fut) = self.executor.task_slab.take_ready(conn_index) {
+                let waker = conn_waker(conn_index);
+                let mut cx = Context::from_waker(&waker);
+
+                match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(()) => {
+                        // Task completed — connection handler is done.
+                        self.driver.close_connection(conn_index);
+                        self.executor.remove_connection(conn_index);
+                    }
+                    std::task::Poll::Pending => {
+                        self.executor.task_slab.park(conn_index, fut);
+                    }
+                }
+            }
+        }
+
+        clear_driver_state();
+
+        // Clear processed entries.
+        self.executor.ready_queue.clear();
+
+        // Drain any wakeups that happened during polling.
+        self.executor.collect_wakeups();
     }
 
     fn drain_completions(&mut self) {
@@ -136,7 +186,7 @@ impl<H: EventHandler> EventLoop<H> {
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
             OpTag::Timeout => self.handle_timeout(ud, result),
-            OpTag::Cancel => {} // informational only
+            OpTag::Cancel => {}
             OpTag::TickTimeout => {
                 self.driver.tick_timeout_armed = false;
             }
@@ -147,17 +197,14 @@ impl<H: EventHandler> EventLoop<H> {
         let conn_index = ud.conn_index();
         let has_more = cqueue::more(flags);
 
-        let conn = match self.driver.connections.get(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-        let generation = conn.generation;
-        let token = ConnToken::new(conn_index, generation);
+        if self.driver.connections.get(conn_index).is_none() {
+            return;
+        }
 
         if result <= 0 {
             if result == 0 {
-                // EOF
                 self.driver.close_connection(conn_index);
+                self.executor.remove_connection(conn_index);
                 return;
             }
             let errno = -result;
@@ -166,15 +213,14 @@ impl<H: EventHandler> EventLoop<H> {
                     let _ = self.driver.ring.submit_multishot_recv(conn_index);
                 }
             } else if errno == libc::ECANCELED {
-                // User-initiated cancel — don't re-arm, don't close.
                 return;
             } else if !has_more {
                 self.driver.close_connection(conn_index);
+                self.executor.remove_connection(conn_index);
             }
             return;
         }
 
-        // Extract buffer ID from CQE flags.
         let bid = match cqueue::buffer_select(flags) {
             Some(bid) => bid,
             None => return,
@@ -182,10 +228,8 @@ impl<H: EventHandler> EventLoop<H> {
 
         let bytes_received = result as u32;
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
-
         let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
 
-        // Schedule buffer for replenishment.
         self.driver.pending_replenish.push(bid);
 
         // TLS path
@@ -225,31 +269,32 @@ impl<H: EventHandler> EventLoop<H> {
                             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                                 cs.established = true;
                             }
-                            let mut ctx = self.driver.make_ctx();
-                            self.handler.on_connect(&mut ctx, token, Ok(()));
+                            // Wake connect waiter.
+                            self.executor.wake_connect(conn_index, Ok(()));
                         } else {
                             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                                 cs.established = true;
                             }
-                            let mut ctx = self.driver.make_ctx();
-                            self.handler.on_accept(&mut ctx, token);
+                            // Spawn async task for accepted connection.
+                            self.spawn_accept_task(conn_index);
                         }
 
-                        call_on_data(&mut self.handler, &mut self.driver, conn_index, token);
+                        // Wake recv waiter if data accumulated during handshake.
+                        self.executor.wake_recv(conn_index);
                     }
                     crate::tls::TlsRecvResult::Ok => {
-                        call_on_data(&mut self.handler, &mut self.driver, conn_index, token);
+                        self.executor.wake_recv(conn_index);
                     }
                     crate::tls::TlsRecvResult::Error(_) | crate::tls::TlsRecvResult::Closed => {
                         self.driver.close_connection(conn_index);
+                        self.executor.remove_connection(conn_index);
                     }
                 }
             }
         } else {
-            // Plaintext path
+            // Plaintext path: append data, wake recv waiter.
             self.driver.accumulators.append(conn_index, data);
-
-            call_on_data(&mut self.handler, &mut self.driver, conn_index, token);
+            self.executor.wake_recv(conn_index);
         }
 
         if !has_more
@@ -271,6 +316,7 @@ impl<H: EventHandler> EventLoop<H> {
                 let Some((raw_fd, peer_addr)) = item else {
                     break;
                 };
+
                 let conn_index = match self.driver.connections.allocate() {
                     Some(idx) => idx,
                     None => {
@@ -281,12 +327,10 @@ impl<H: EventHandler> EventLoop<H> {
                     }
                 };
 
-                // Store peer address.
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.peer_addr = Some(peer_addr);
                 }
 
-                // Register the fd in the direct file table, then close the original.
                 if self
                     .driver
                     .ring
@@ -303,39 +347,33 @@ impl<H: EventHandler> EventLoop<H> {
                     libc::close(raw_fd);
                 }
 
-                // Reset accumulator for this connection.
                 self.driver.accumulators.reset(conn_index);
-
-                // Arm multishot recv.
                 let _ = self.driver.ring.submit_multishot_recv(conn_index);
 
-                // TLS path: create TLS state and defer on_accept until handshake completes.
+                // TLS path: defer accept until handshake completes.
                 #[cfg(feature = "tls")]
                 if let Some(ref mut tls_table) = self.driver.tls_table
                     && tls_table.has_server_config()
                 {
                     tls_table.create(conn_index);
-                    continue; // skip on_accept — deferred until handshake completes
+                    continue;
                 }
 
-                // Plaintext path: mark established and call on_accept immediately.
+                // Plaintext path: mark established and spawn async task.
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.established = true;
                 }
-                let generation = self.driver.connections.generation(conn_index);
-                let token = ConnToken::new(conn_index, generation);
-                let mut ctx = self.driver.make_ctx();
-                self.handler.on_accept(&mut ctx, token);
+                self.spawn_accept_task(conn_index);
             }
         }
 
-        // Always call on_notify — this is the external wakeup hook.
+        // on_notify (synchronous).
         {
             let mut ctx = self.driver.make_ctx();
             self.handler.on_notify(&mut ctx);
         }
 
-        // Re-arm eventfd read, unless shutdown was requested.
+        // Re-arm eventfd read.
         if !self.driver.shutdown_flag.load(Ordering::Relaxed) {
             let _ = self.driver.ring.submit_eventfd_read(
                 self.driver.eventfd,
@@ -348,7 +386,7 @@ impl<H: EventHandler> EventLoop<H> {
         let conn_index = ud.conn_index();
         let pool_slot = ud.payload() as u16;
 
-        // Chain path: accumulate CQE result, release pool slot immediately.
+        // Chain path.
         if self.driver.chain_table.is_active(conn_index) {
             self.driver.send_copy_pool.release(pool_slot);
             let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
@@ -373,45 +411,22 @@ impl<H: EventHandler> EventLoop<H> {
             let total = self.driver.send_copy_pool.original_len(pool_slot);
             self.driver.send_copy_pool.release(pool_slot);
 
-            // Submit next queued send immediately (before on_send_complete).
             self.driver.submit_next_queued(conn_index);
 
-            let conn = match self.driver.connections.get(conn_index) {
-                Some(c) => c,
-                None => return,
-            };
-            let generation = conn.generation;
-            let token = ConnToken::new(conn_index, generation);
-
-            let mut ctx = self.driver.make_ctx();
-            self.handler.on_send_complete(&mut ctx, token, Ok(total));
-
-            // After sends drain, replay accumulated recv data that was deferred
-            // due to write backpressure.
-            self.replay_accumulated(conn_index);
+            // Wake the send waiter.
+            self.executor.wake_send(conn_index, Ok(total));
             return;
         }
 
         self.driver.send_copy_pool.release(pool_slot);
-
-        // Error or zero-length send — drain the queue.
         self.driver.drain_conn_send_queue(conn_index);
-
-        let conn = match self.driver.connections.get(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-        let generation = conn.generation;
-        let token = ConnToken::new(conn_index, generation);
 
         let io_result = if result == 0 {
             Ok(0u32)
         } else {
             Err(io::Error::from_raw_os_error(-result))
         };
-
-        let mut ctx = self.driver.make_ctx();
-        self.handler.on_send_complete(&mut ctx, token, io_result);
+        self.executor.wake_send(conn_index, io_result);
     }
 
     fn handle_send_msg_zc(&mut self, ud: UserData, result: i32, flags: u32) {
@@ -422,10 +437,9 @@ impl<H: EventHandler> EventLoop<H> {
             return;
         }
 
-        // Chain path: track CQE results and ZC notifications.
+        // Chain path.
         if self.driver.chain_table.is_active(conn_index) {
             if cqueue::notif(flags) {
-                // ZC notification — release slab if ready.
                 self.driver.send_slab.dec_pending_notifs(slab_idx);
                 if self.driver.send_slab.should_release(slab_idx) {
                     let ps = self.driver.send_slab.release(slab_idx);
@@ -439,20 +453,16 @@ impl<H: EventHandler> EventLoop<H> {
                 }
                 return;
             }
-            // Operation CQE
             if result == -libc::ECANCELED {
-                // Cancelled — no NOTIF coming, release slab immediately.
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
                     self.driver.send_copy_pool.release(ps);
                 }
             } else if result >= 0 {
-                // Success (full or partial) — NOTIF will come.
                 self.driver.send_slab.inc_pending_notifs(slab_idx);
                 self.driver.send_slab.mark_awaiting_notifications(slab_idx);
                 self.driver.chain_table.inc_zc_notif(conn_index);
             } else {
-                // Other error — no NOTIF, release immediately.
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
                     self.driver.send_copy_pool.release(ps);
@@ -504,50 +514,30 @@ impl<H: EventHandler> EventLoop<H> {
             }
         }
 
-        // Submit next queued send (or drain queue on error) before on_send_complete.
         if result >= 0 {
             self.driver.submit_next_queued(conn_index);
         } else {
             self.driver.drain_conn_send_queue(conn_index);
         }
 
-        let conn = match self.driver.connections.get(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-        let generation = conn.generation;
-        let token = ConnToken::new(conn_index, generation);
-
         let io_result = if result >= 0 {
             Ok(total_len)
         } else {
             Err(io::Error::from_raw_os_error(-result))
         };
-
-        let mut ctx = self.driver.make_ctx();
-        self.handler.on_send_complete(&mut ctx, token, io_result);
-
-        // After sends drain, replay accumulated recv data that was deferred
-        // due to write backpressure.
-        if result >= 0 {
-            self.replay_accumulated(conn_index);
-        }
+        self.executor.wake_send(conn_index, io_result);
     }
 
     fn handle_connect(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
 
-        let conn_state = match self.driver.connections.get(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-        let generation = conn_state.generation;
-        let token = ConnToken::new(conn_index, generation);
+        if self.driver.connections.get(conn_index).is_none() {
+            return;
+        }
 
         if result < 0 {
             let errno = -result;
 
-            // ECANCELED and no timeout armed = user-initiated cancel.
             if errno == libc::ECANCELED {
                 let timeout_armed = self
                     .driver
@@ -556,22 +546,18 @@ impl<H: EventHandler> EventLoop<H> {
                     .map(|c| c.connect_timeout_armed)
                     .unwrap_or(false);
                 if !timeout_armed {
-                    // User-initiated cancel.
                     let err = io::Error::from_raw_os_error(errno);
-                    let mut ctx = self.driver.make_ctx();
-                    self.handler.on_connect(&mut ctx, token, Err(err));
+                    self.executor.wake_connect(conn_index, Err(err));
                     self.driver.close_connection(conn_index);
+                    self.executor.remove_connection(conn_index);
                     return;
                 }
-                // Timeout-initiated cancel — handle_timeout will fire on_connect.
-                // Clean up the timeout flag; the Timeout CQE will handle the rest.
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.connect_timeout_armed = false;
                 }
                 return;
             }
 
-            // Cancel the timeout if one was armed.
             if self
                 .driver
                 .connections
@@ -589,21 +575,19 @@ impl<H: EventHandler> EventLoop<H> {
                 }
             }
 
-            // Connect failed.
             #[cfg(feature = "tls")]
             if let Some(ref mut tls_table) = self.driver.tls_table {
                 tls_table.remove(conn_index);
             }
 
             let err = io::Error::from_raw_os_error(errno);
-            let mut ctx = self.driver.make_ctx();
-            self.handler.on_connect(&mut ctx, token, Err(err));
-
+            self.executor.wake_connect(conn_index, Err(err));
             self.driver.close_connection(conn_index);
+            self.executor.remove_connection(conn_index);
             return;
         }
 
-        // Connect succeeded — cancel timeout if armed.
+        // Connect succeeded.
         let timeout_was_armed = self
             .driver
             .connections
@@ -611,7 +595,6 @@ impl<H: EventHandler> EventLoop<H> {
             .map(|c| c.connect_timeout_armed)
             .unwrap_or(false);
         if timeout_was_armed {
-            // Check if the connection is already closed (timeout already fired).
             let still_connecting = self
                 .driver
                 .connections
@@ -619,7 +602,6 @@ impl<H: EventHandler> EventLoop<H> {
                 .map(|c| matches!(c.recv_mode, RecvMode::Connecting))
                 .unwrap_or(false);
             if !still_connecting {
-                // Timeout already fired and closed this connection — discard late success.
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.connect_timeout_armed = false;
                 }
@@ -635,7 +617,6 @@ impl<H: EventHandler> EventLoop<H> {
             }
         }
 
-        // Reset accumulator.
         self.driver.accumulators.reset(conn_index);
 
         // TLS client path
@@ -649,7 +630,6 @@ impl<H: EventHandler> EventLoop<H> {
                 &mut self.driver.send_copy_pool,
                 conn_index,
             );
-
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.recv_mode = RecvMode::Multi;
             }
@@ -664,15 +644,12 @@ impl<H: EventHandler> EventLoop<H> {
         }
         let _ = self.driver.ring.submit_multishot_recv(conn_index);
 
-        let mut ctx = self.driver.make_ctx();
-        self.handler.on_connect(&mut ctx, token, Ok(()));
+        self.executor.wake_connect(conn_index, Ok(()));
     }
 
     fn handle_timeout(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
 
-        // Timeout fired (result == -ETIME) means the connect timed out.
-        // If result == -ECANCELED, the timeout was cancelled (connect succeeded first).
         if result != -libc::ETIME {
             return;
         }
@@ -683,67 +660,36 @@ impl<H: EventHandler> EventLoop<H> {
         };
 
         if !matches!(conn.recv_mode, RecvMode::Connecting) {
-            // Connection already completed or closed.
             return;
         }
 
-        let generation = conn.generation;
-        let token = ConnToken::new(conn_index, generation);
-
-        // Cancel the in-flight connect SQE.
         let connect_ud = UserData::encode(OpTag::Connect, conn_index, 0);
         let _ = self
             .driver
             .ring
             .submit_async_cancel(connect_ud.raw(), conn_index);
 
-        // Leave connect_timeout_armed == true so that when the Connect CQE
-        // arrives (ECANCELED or even success), handle_connect sees the flag
-        // and takes the silent-return branch instead of firing a second
-        // on_connect callback.
-
-        // Fire on_connect with TimedOut error.
-        let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
-
         #[cfg(feature = "tls")]
         if let Some(ref mut tls_table) = self.driver.tls_table {
             tls_table.remove(conn_index);
         }
 
-        let mut ctx = self.driver.make_ctx();
-        self.handler.on_connect(&mut ctx, token, Err(err));
-
+        let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
+        self.executor.wake_connect(conn_index, Err(err));
         self.driver.close_connection(conn_index);
+        self.executor.remove_connection(conn_index);
     }
 
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
-        let was_established = self
-            .driver
-            .connections
-            .get(conn_index)
-            .map(|c| c.established)
-            .unwrap_or(false);
-
-        // TLS cleanup.
         #[cfg(feature = "tls")]
         if let Some(ref mut tls_table) = self.driver.tls_table {
             tls_table.remove(conn_index);
         }
 
-        if !was_established {
-            self.driver.connections.release(conn_index);
-            return;
-        }
-
-        // Fire on_close BEFORE release so peer_addr() and other queries
-        // still work inside the callback.
-        let generation = self.driver.connections.generation(conn_index);
-        let token = ConnToken::new(conn_index, generation);
-        let mut ctx = self.driver.make_ctx();
-        self.handler.on_close(&mut ctx, token);
-
+        // Remove the async task (drops the future).
+        self.executor.remove_connection(conn_index);
         self.driver.connections.release(conn_index);
     }
 
@@ -767,93 +713,32 @@ impl<H: EventHandler> EventLoop<H> {
         self.driver.send_copy_pool.release(pool_slot);
     }
 
-    /// Replay accumulated recv data for a connection after write backpressure
-    /// has been relieved. If `on_data` previously returned without consuming all
-    /// data (because pending writes exceeded the backpressure threshold), the
-    /// unconsumed data sits in the accumulator. After a send completes and
-    /// frees write capacity, we re-invoke `on_data` to process the remaining
-    /// commands.
-    fn replay_accumulated(&mut self, conn_index: u32) {
-        if self.driver.accumulators.data(conn_index).is_empty() {
-            return;
-        }
-
-        let conn = match self.driver.connections.get(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-        let generation = conn.generation;
-        let token = ConnToken::new(conn_index, generation);
-
-        call_on_data(&mut self.handler, &mut self.driver, conn_index, token);
-    }
-
-    /// Fire on_send_complete for a completed chain, then replay accumulated data.
     fn fire_chain_complete(&mut self, conn_index: u32) {
         let chain = match self.driver.chain_table.take(conn_index) {
             Some(c) => c,
             None => return,
         };
 
-        let conn = match self.driver.connections.get(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-        let generation = conn.generation;
-        let token = ConnToken::new(conn_index, generation);
-
         let io_result = match chain.first_error {
             Some(errno) => Err(io::Error::from_raw_os_error(-errno)),
             None => Ok(chain.bytes_sent),
         };
 
-        // Submit next queued send (or drain on error) before on_send_complete.
         if chain.first_error.is_none() {
             self.driver.submit_next_queued(conn_index);
         } else {
             self.driver.drain_conn_send_queue(conn_index);
         }
 
-        let mut ctx = self.driver.make_ctx();
-        self.handler.on_send_complete(&mut ctx, token, io_result);
-
-        // After chain completes, replay accumulated recv data.
-        if chain.first_error.is_none() {
-            self.replay_accumulated(conn_index);
-        }
+        self.executor.wake_send(conn_index, io_result);
     }
-}
 
-/// Free function for borrow-splitting: calls handler.on_data with disjoint borrows.
-fn call_on_data<H: EventHandler>(
-    handler: &mut H,
-    driver: &mut Driver,
-    conn_index: u32,
-    token: ConnToken,
-) {
-    let data = driver.accumulators.data(conn_index);
-    if data.is_empty() {
-        return;
+    /// Spawn an async task for a newly accepted connection.
+    fn spawn_accept_task(&mut self, conn_index: u32) {
+        let generation = self.driver.connections.generation(conn_index);
+        let conn_ctx = ConnCtx::new(conn_index, generation);
+        let future = self.handler.on_accept(conn_ctx);
+        self.executor.task_slab.spawn(conn_index, future);
+        self.executor.ready_queue.push_back(conn_index);
     }
-    let mut ctx = DriverCtx {
-        ring: &mut driver.ring,
-        connections: &mut driver.connections,
-        fixed_buffers: &mut driver.fixed_buffers,
-        send_copy_pool: &mut driver.send_copy_pool,
-        send_slab: &mut driver.send_slab,
-        #[cfg(feature = "tls")]
-        tls_table: match driver.tls_table {
-            Some(ref mut t) => t as *mut crate::tls::TlsTable,
-            None => std::ptr::null_mut(),
-        },
-        shutdown_requested: &mut driver.shutdown_local,
-        connect_addrs: &mut driver.connect_addrs,
-        tcp_nodelay: driver.tcp_nodelay,
-        connect_timespecs: &mut driver.connect_timespecs,
-        chain_table: &mut driver.chain_table,
-        max_chain_length: driver.max_chain_length,
-        send_queues: &mut driver.send_queues,
-    };
-    let consumed = handler.on_data(&mut ctx, token, data);
-    driver.accumulators.consume(conn_index, consumed);
 }
