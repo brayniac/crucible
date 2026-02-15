@@ -841,24 +841,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
-name = "crucible-client"
-version = "0.3.5-alpha.0"
-dependencies = [
- "bytes",
- "crossbeam-channel",
- "kompio",
- "libc",
- "metriken",
- "protocol-resp",
- "segcache",
- "serde",
- "server",
- "thiserror 2.0.18",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "crucible-grpc-client"
 version = "0.3.5-alpha.0"
 dependencies = [
@@ -897,6 +879,7 @@ version = "0.3.5-alpha.0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "ketama",
  "kompio",
  "libc",
  "metriken",
@@ -924,6 +907,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "crucible-resp-client"
+version = "0.3.5-alpha.0"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "ketama",
+ "kompio",
+ "libc",
+ "metriken",
+ "protocol-resp",
+ "segcache",
+ "serde",
+ "server",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1460,6 +1462,10 @@ dependencies = [
  "once_cell",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "ketama"
+version = "0.3.5-alpha.0"
 
 [[package]]
 name = "kompio"

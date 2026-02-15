@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 kompio = { workspace = true }
+ketama = { workspace = true }
 protocol-memcache = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 crossbeam-channel = { workspace = true }

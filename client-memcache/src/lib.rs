@@ -30,7 +30,6 @@ mod config;
 mod error;
 mod handle;
 mod latency;
-mod router;
 mod worker;
 
 pub use config::ClientConfig;

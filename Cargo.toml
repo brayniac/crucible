@@ -25,8 +25,11 @@ members = [
 	# Proxy
 	"proxy",
 
+	# Consistent Hashing
+	"ketama",
+
 	# Client Libraries
-	"client",
+	"client-resp",
 	"client-memcache",
 	"client-http",
 	"client-grpc",
@@ -99,7 +102,8 @@ segcache = { path = "cache/segcache" }
 slab-cache = { path = "cache/slab" }
 heap-cache = { path = "cache/heap" }
 metrics = { path = "metrics" }
-crucible-client = { path = "client" }
+ketama = { path = "ketama" }
+crucible-resp-client = { path = "client-resp" }
 crucible-http-client = { path = "client-http" }
 crucible-grpc-client = { path = "client-grpc" }
 crucible-memcache-client = { path = "client-memcache" }

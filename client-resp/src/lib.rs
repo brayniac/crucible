@@ -6,9 +6,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use crucible_client::{Client, ClientConfig};
+//! use crucible_resp_client::{Client, ClientConfig};
 //!
-//! # async fn example() -> Result<(), crucible_client::ClientError> {
+//! # async fn example() -> Result<(), crucible_resp_client::ClientError> {
 //! let client = Client::connect(ClientConfig {
 //!     servers: vec!["127.0.0.1:6379".to_string()],
 //!     workers: 1,
@@ -30,7 +30,6 @@ mod config;
 mod error;
 mod handle;
 mod latency;
-mod router;
 mod worker;
 
 pub use config::ClientConfig;

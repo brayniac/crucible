@@ -14,7 +14,6 @@ use crate::command::{
 };
 use crate::error::ClientError;
 use crate::latency::ClientLatency;
-use crate::router;
 
 /// Configuration passed to each worker via the global config channel.
 pub(crate) struct ClientWorkerConfig {
@@ -77,6 +76,9 @@ struct ReconnectEntry {
 pub(crate) struct ClientHandler {
     cmd_rx: crossbeam_channel::Receiver<Command>,
     pending: Arc<AtomicU32>,
+
+    // Consistent hash ring for key routing
+    ring: ketama::Ring,
 
     // Connection management
     pools: Vec<ShardPool>,
@@ -275,10 +277,8 @@ impl ClientHandler {
         // Reset atomic counter (coalescing)
         self.pending.swap(0, Ordering::AcqRel);
 
-        let shard_count = self.pools.len();
-
         while let Ok(cmd) = self.cmd_rx.try_recv() {
-            let shard_idx = router::route_key(cmd.key(), shard_count);
+            let shard_idx = self.ring.route(cmd.key());
             let conn_token = match self.pick_connection(shard_idx) {
                 Some(t) => t,
                 None => {
@@ -295,6 +295,9 @@ impl EventHandler for ClientHandler {
     fn create_for_worker(_worker_id: usize) -> Self {
         let config = recv_config();
 
+        let server_ids: Vec<String> = config.servers.iter().map(|a| a.to_string()).collect();
+        let ring = ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
         let mut pools = Vec::with_capacity(config.servers.len());
         for addr in &config.servers {
             pools.push(ShardPool {
@@ -308,6 +311,7 @@ impl EventHandler for ClientHandler {
         ClientHandler {
             cmd_rx: config.cmd_rx,
             pending: config.pending,
+            ring,
             pools,
             conn_map: Vec::new(),
             reconnect_queue: VecDeque::new(),

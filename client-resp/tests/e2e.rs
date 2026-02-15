@@ -1,4 +1,4 @@
-//! End-to-end integration tests for crucible-client.
+//! End-to-end integration tests for crucible-resp-client.
 //!
 //! Spawns a real crucible-server in a background thread and exercises the full
 //! path: Client::connect → kompio workers → io_uring → server → response →
@@ -14,7 +14,7 @@ use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Duration;
 
-use crucible_client::{Client, ClientConfig};
+use crucible_resp_client::{Client, ClientConfig};
 
 // ── Shared test environment ─────────────────────────────────────────────
 
