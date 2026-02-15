@@ -859,6 +859,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-http-client"
+version = "0.3.5-alpha.0"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "http2",
+ "kompio",
+ "libc",
+ "metriken",
+ "rustls",
+ "thiserror 2.0.18",
+ "tokio",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
