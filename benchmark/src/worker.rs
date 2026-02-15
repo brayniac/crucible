@@ -325,6 +325,13 @@ pub struct BenchHandler {
     /// Whether backfill_on_miss is enabled.
     backfill_on_miss: bool,
 
+    /// Ketama consistent hash ring for key routing.
+    ring: ketama::Ring,
+    /// Maps endpoint_idx -> list of session indices connected to that endpoint.
+    endpoint_sessions: Vec<Vec<usize>>,
+    /// Per-endpoint round-robin counter for session selection.
+    endpoint_next: Vec<usize>,
+
     /// Tick counter for periodic diagnostics
     tick_count: u64,
     /// Last diagnostic log time
@@ -364,6 +371,7 @@ impl BenchHandler {
                         .push(std::collections::VecDeque::new());
                     self.prefill_session_last_progress
                         .push(std::time::Instant::now());
+                    self.endpoint_sessions[endpoint_idx].push(idx);
 
                     // Mark as having a pending connect so try_reconnect doesn't
                     // issue a duplicate connect before this one completes.
@@ -657,7 +665,39 @@ impl BenchHandler {
         }
     }
 
+    /// Route a key to an endpoint index. Skips the hash when there is only one endpoint.
+    #[inline]
+    fn route_key(&self, key: &[u8]) -> usize {
+        if self.endpoints.len() == 1 {
+            0
+        } else {
+            self.ring.route(key)
+        }
+    }
+
+    /// Pick a connected session with available pipeline capacity for the given endpoint.
+    /// Round-robins among sessions assigned to the endpoint.
+    fn pick_endpoint_session(&mut self, endpoint_idx: usize) -> Option<usize> {
+        let sessions = &self.endpoint_sessions[endpoint_idx];
+        if sessions.is_empty() {
+            return None;
+        }
+        let start = self.endpoint_next[endpoint_idx] % sessions.len();
+        for i in 0..sessions.len() {
+            let idx = sessions[(start + i) % sessions.len()];
+            if self.sessions[idx].is_connected() && self.sessions[idx].can_send() {
+                self.endpoint_next[endpoint_idx] = (start + i + 1) % sessions.len();
+                return Some(idx);
+            }
+        }
+        None
+    }
+
     /// Drive normal workload requests.
+    ///
+    /// Key-first loop: generate a random key, route it via the ketama ring to
+    /// the correct endpoint, pick a session connected to that endpoint, then
+    /// send. This ensures the same key always goes to the same server.
     fn drive_requests(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
         let key_count = self.config.workload.keyspace.count;
         let get_ratio = self.config.workload.commands.get;
@@ -670,79 +710,78 @@ impl BenchHandler {
             self.drain_backfill_queue(ctx, now, value_len, pool_len);
         }
 
-        for idx in 0..self.sessions.len() {
-            if !self.sessions[idx].is_connected() {
-                continue;
+        loop {
+            if let Some(ref rl) = self.ratelimiter
+                && !rl.try_acquire()
+            {
+                break;
             }
 
-            loop {
-                if !self.sessions[idx].can_send() {
+            let key_id = self.rng.random_range(0..key_count);
+            write_key(&mut self.key_buf, key_id);
+
+            let endpoint_idx = self.route_key(&self.key_buf);
+            let idx = match self.pick_endpoint_session(endpoint_idx) {
+                Some(idx) => idx,
+                None => break,
+            };
+
+            let roll = self.rng.random_range(0..100);
+            if roll < get_ratio {
+                // GET: encode into session buffer, batch-flush later
+                let kid = if self.backfill_on_miss {
+                    Some(key_id)
+                } else {
+                    None
+                };
+                if self.sessions[idx].get(&self.key_buf, now, kid).is_none() {
                     break;
                 }
-
-                if let Some(ref rl) = self.ratelimiter
-                    && !rl.try_acquire()
-                {
-                    return;
+            } else if roll < get_ratio + delete_ratio {
+                // DELETE: encode into session buffer, batch-flush later
+                if self.sessions[idx].delete(&self.key_buf, now).is_none() {
+                    break;
                 }
+            } else {
+                // SET: flush any pending GET/DELETE data first, then send via guard
+                self.flush_session(ctx, idx);
 
-                let key_id = self.rng.random_range(0..key_count);
-                write_key(&mut self.key_buf, key_id);
-
-                let roll = self.rng.random_range(0..100);
-                if roll < get_ratio {
-                    // GET: encode into session buffer, batch-flush later
-                    let kid = if self.backfill_on_miss {
-                        Some(key_id)
-                    } else {
-                        None
-                    };
-                    if self.sessions[idx].get(&self.key_buf, now, kid).is_none() {
-                        break;
-                    }
-                } else if roll < get_ratio + delete_ratio {
-                    // DELETE: encode into session buffer, batch-flush later
-                    if self.sessions[idx].delete(&self.key_buf, now).is_none() {
-                        break;
-                    }
-                } else {
-                    // SET: flush any pending GET/DELETE data first, then send via guard
-                    self.flush_session(ctx, idx);
-
-                    if let Some(suffix) = self.sessions[idx].encode_set_prefix(
-                        &mut self.set_prefix_buf,
-                        &self.key_buf,
-                        value_len,
-                    ) {
-                        let prefix_len = self.set_prefix_buf.len();
-                        let suffix_len = suffix.len();
-                        if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
-                            self.send_failures += 1;
-                            if e.kind() != io::ErrorKind::Other {
-                                tracing::debug!(worker = self.id, error = %e, "send_parts error (closing)");
-                                self.close_session(ctx, idx, DisconnectReason::SendError);
-                            }
-                            break;
+                if let Some(suffix) = self.sessions[idx].encode_set_prefix(
+                    &mut self.set_prefix_buf,
+                    &self.key_buf,
+                    value_len,
+                ) {
+                    let prefix_len = self.set_prefix_buf.len();
+                    let suffix_len = suffix.len();
+                    if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
+                        self.send_failures += 1;
+                        if e.kind() != io::ErrorKind::Other {
+                            tracing::debug!(worker = self.id, error = %e, "send_parts error (closing)");
+                            self.close_session(ctx, idx, DisconnectReason::SendError);
                         }
-                        self.sessions[idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
-                    } else {
                         break;
                     }
+                    self.sessions[idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
+                } else {
+                    break;
                 }
-
-                self.requests_driven += 1;
-                metrics::REQUESTS_SENT.increment();
             }
 
-            // Flush any remaining GET/DELETE data in the send buffer
+            self.requests_driven += 1;
+            metrics::REQUESTS_SENT.increment();
+        }
+
+        // Flush all sessions with pending data
+        for idx in 0..self.sessions.len() {
             self.flush_session(ctx, idx);
         }
     }
 
     /// Drain the backfill queue by sending SET requests for keys that missed on GET.
     ///
-    /// Backfill SETs use the same zero-copy path as regular SETs (encode_set_prefix +
-    /// send_set_parts). Each backfill SET counts against rate limit and pipeline depth.
+    /// Key-first: iterate backfill keys, route each to endpoint via the ring,
+    /// pick a session, send. Keys whose endpoint has no available session are
+    /// skipped and remain in the queue.
     fn drain_backfill_queue(
         &mut self,
         ctx: &mut DriverCtx,
@@ -750,24 +789,27 @@ impl BenchHandler {
         value_len: usize,
         pool_len: usize,
     ) {
-        let mut session_idx = 0;
-        let num_sessions = self.sessions.len();
-
-        while !self.backfill_queue.is_empty() && session_idx < num_sessions {
-            if !self.sessions[session_idx].is_connected() || !self.sessions[session_idx].can_send()
-            {
-                session_idx += 1;
-                continue;
-            }
-
+        let mut i = 0;
+        while i < self.backfill_queue.len() {
             if let Some(ref rl) = self.ratelimiter
                 && !rl.try_acquire()
             {
                 return;
             }
 
-            let key_id = self.backfill_queue.pop().unwrap();
+            let key_id = self.backfill_queue[i];
             write_key(&mut self.key_buf, key_id);
+
+            let endpoint_idx = self.route_key(&self.key_buf);
+            let session_idx = match self.pick_endpoint_session(endpoint_idx) {
+                Some(idx) => idx,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+
+            self.backfill_queue.swap_remove(i);
 
             // Flush any pending GET/DELETE data first
             self.flush_session(ctx, session_idx);
@@ -786,7 +828,6 @@ impl BenchHandler {
                         tracing::debug!(worker = self.id, error = %e, "backfill send_parts error (closing)");
                         self.close_session(ctx, session_idx, DisconnectReason::SendError);
                     }
-                    session_idx += 1;
                     continue;
                 }
                 self.sessions[session_idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
@@ -795,7 +836,7 @@ impl BenchHandler {
                 metrics::REQUESTS_SENT.increment();
             } else {
                 self.backfill_queue.push(key_id);
-                session_idx += 1;
+                i += 1;
             }
         }
     }
@@ -805,52 +846,78 @@ impl BenchHandler {
     const PREFILL_MAX_PIPELINE: usize = 16;
 
     /// Drive prefill requests (sequential SET commands).
+    ///
+    /// Key-first: peek at the front key, route it via the ring, find a session
+    /// on that endpoint. If no session is available, rotate the key to the back
+    /// and try the next. Stop after N consecutive skips (N = endpoint count)
+    /// to avoid infinite looping when all endpoints are saturated.
     fn drive_prefill_requests(&mut self, ctx: &mut DriverCtx, now: std::time::Instant) {
         let value_len = self.config.workload.values.length;
         let pool_len = self.value_pool.len();
+        let endpoint_count = self.endpoints.len();
 
-        for idx in 0..self.sessions.len() {
-            if !self.sessions[idx].is_connected() {
-                continue;
-            }
+        let mut consecutive_skips = 0;
+        while !self.prefill_pending.is_empty() && consecutive_skips < endpoint_count {
+            let key_id = *self.prefill_pending.front().unwrap();
+            write_key(&mut self.key_buf, key_id);
 
-            loop {
-                if !self.sessions[idx].can_send()
-                    || self.prefill_in_flight[idx].len() >= Self::PREFILL_MAX_PIPELINE
-                {
-                    break;
-                }
+            let endpoint_idx = self.route_key(&self.key_buf);
 
-                let key_id = match self.prefill_pending.pop_front() {
-                    Some(id) => id,
-                    None => break,
-                };
-
-                write_key(&mut self.key_buf, key_id);
-
-                if let Some(suffix) = self.sessions[idx].encode_set_prefix(
-                    &mut self.set_prefix_buf,
-                    &self.key_buf,
-                    value_len,
-                ) {
-                    let prefix_len = self.set_prefix_buf.len();
-                    let suffix_len = suffix.len();
-                    if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
-                        self.send_failures += 1;
-                        self.prefill_pending.push_front(key_id);
-                        if e.kind() != io::ErrorKind::Other {
-                            tracing::debug!(worker = self.id, error = %e, "prefill send_parts error (closing)");
-                            self.close_session(ctx, idx, DisconnectReason::SendError);
+            // Find a session on this endpoint that has capacity for prefill
+            let session_idx = {
+                let sessions = &self.endpoint_sessions[endpoint_idx];
+                let mut found = None;
+                if !sessions.is_empty() {
+                    let start = self.endpoint_next[endpoint_idx] % sessions.len();
+                    for i in 0..sessions.len() {
+                        let idx = sessions[(start + i) % sessions.len()];
+                        if self.sessions[idx].is_connected()
+                            && self.sessions[idx].can_send()
+                            && self.prefill_in_flight[idx].len() < Self::PREFILL_MAX_PIPELINE
+                        {
+                            self.endpoint_next[endpoint_idx] = (start + i + 1) % sessions.len();
+                            found = Some(idx);
+                            break;
                         }
-                        break;
                     }
-                    self.sessions[idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
-                    self.prefill_in_flight[idx].push_back(key_id);
-                    metrics::REQUESTS_SENT.increment();
-                } else {
+                }
+                found
+            };
+
+            let idx = match session_idx {
+                Some(idx) => idx,
+                None => {
+                    // No capacity on this endpoint; rotate key to back and try next
+                    self.prefill_pending.rotate_left(1);
+                    consecutive_skips += 1;
+                    continue;
+                }
+            };
+            consecutive_skips = 0;
+            self.prefill_pending.pop_front();
+
+            if let Some(suffix) = self.sessions[idx].encode_set_prefix(
+                &mut self.set_prefix_buf,
+                &self.key_buf,
+                value_len,
+            ) {
+                let prefix_len = self.set_prefix_buf.len();
+                let suffix_len = suffix.len();
+                if let Err(e) = self.send_set_parts(ctx, idx, value_len, pool_len, suffix) {
+                    self.send_failures += 1;
                     self.prefill_pending.push_front(key_id);
+                    if e.kind() != io::ErrorKind::Other {
+                        tracing::debug!(worker = self.id, error = %e, "prefill send_parts error (closing)");
+                        self.close_session(ctx, idx, DisconnectReason::SendError);
+                    }
                     break;
                 }
+                self.sessions[idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
+                self.prefill_in_flight[idx].push_back(key_id);
+                metrics::REQUESTS_SENT.increment();
+            } else {
+                self.prefill_pending.push_front(key_id);
+                break;
             }
         }
     }
@@ -1153,6 +1220,12 @@ impl EventHandler for BenchHandler {
 
         let backfill_on_miss = cfg.config.workload.backfill_on_miss;
 
+        // Build ketama consistent hash ring from endpoint addresses
+        let server_ids: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
+        let ring = ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let endpoint_sessions = vec![Vec::new(); endpoints.len()];
+        let endpoint_next = vec![0usize; endpoints.len()];
+
         let result = BenchHandler {
             id: cfg.id,
             config: cfg.config,
@@ -1185,6 +1258,9 @@ impl EventHandler for BenchHandler {
             my_start,
             backfill_queue: Vec::new(),
             backfill_on_miss,
+            ring,
+            endpoint_sessions,
+            endpoint_next,
             tick_count: 0,
             last_diag: std::time::Instant::now(),
             requests_driven: 0,

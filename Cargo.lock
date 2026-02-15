@@ -432,6 +432,7 @@ dependencies = [
  "http2",
  "include_dir",
  "itoa",
+ "ketama",
  "kompio",
  "libc",
  "metrics",

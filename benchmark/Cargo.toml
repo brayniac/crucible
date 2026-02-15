@@ -16,6 +16,9 @@ http2 = { workspace = true, features = ["tls"] }
 rustls = { workspace = true, features = ["std", "ring"] }
 webpki-roots = { workspace = true }
 
+# Consistent hashing
+ketama = { workspace = true }
+
 # Channels
 crossbeam-channel = { workspace = true }
 
