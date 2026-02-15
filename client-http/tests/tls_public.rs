@@ -76,7 +76,10 @@ async fn test_tls_get_google_generate_204() {
 
     let resp = client.get("/generate_204").await.unwrap();
     assert_eq!(resp.status(), 204, "expected 204 No Content");
-    println!("GET https://www.google.com/generate_204 → {}", resp.status());
+    println!(
+        "GET https://www.google.com/generate_204 → {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
@@ -118,10 +121,7 @@ async fn test_tls_latency_recorded() {
         lat.request().load().is_some(),
         "request latency should be recorded"
     );
-    assert!(
-        lat.get().load().is_some(),
-        "GET latency should be recorded"
-    );
+    assert!(lat.get().load().is_some(), "GET latency should be recorded");
     if let Some(snap) = lat.request().load() {
         if let Ok(Some(pcts)) = snap.percentiles(&[50.0, 99.0]) {
             let p50 = pcts.get(0).map(|(_, b)| b.end() as f64).unwrap_or(0.0);

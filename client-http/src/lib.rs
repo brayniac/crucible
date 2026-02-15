@@ -14,8 +14,8 @@ pub use request::{Method, Request};
 pub use response::HttpResponse;
 
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
 use bytes::Bytes;
@@ -49,7 +49,11 @@ impl HttpClient {
     /// This is synchronous — it spawns kompio background threads and returns
     /// immediately. Connections are established asynchronously by the workers.
     pub fn connect(config: HttpClientConfig) -> Result<Self, HttpError> {
-        let num_workers = if config.workers == 0 { 1 } else { config.workers };
+        let num_workers = if config.workers == 0 {
+            1
+        } else {
+            config.workers
+        };
 
         // Resolve server addresses
         let mut server_addrs = Vec::with_capacity(config.servers.len());
@@ -134,9 +138,8 @@ impl HttpClient {
         // Configure TLS if enabled
         #[cfg(feature = "tls")]
         if config.tls {
-            let root_store = rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            );
+            let root_store =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let mut tls_config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
@@ -217,11 +220,7 @@ impl HttpClient {
     }
 
     /// PUT request with body.
-    pub async fn put(
-        &self,
-        path: &str,
-        body: impl Into<Bytes>,
-    ) -> Result<HttpResponse, HttpError> {
+    pub async fn put(&self, path: &str, body: impl Into<Bytes>) -> Result<HttpResponse, HttpError> {
         self.request(Request::put(path, body)).await
     }
 

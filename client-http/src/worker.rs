@@ -169,9 +169,10 @@ impl HttpHandler {
         for tokens in &self.conn_tokens {
             for &token in tokens {
                 if let Some(state) = self.conn_map.get(token.index()).and_then(|o| o.as_ref())
-                    && state.ready {
-                        return Some((token, token.index()));
-                    }
+                    && state.ready
+                {
+                    return Some((token, token.index()));
+                }
             }
         }
         None
@@ -219,15 +220,9 @@ impl HttpHandler {
                     b":method".to_vec(),
                     request.method.as_bytes().to_vec(),
                 ));
-                headers.push(HeaderField::new(
-                    b":path".to_vec(),
-                    request.path.to_vec(),
-                ));
+                headers.push(HeaderField::new(b":path".to_vec(), request.path.to_vec()));
                 headers.push(HeaderField::new(b":scheme".to_vec(), scheme.to_vec()));
-                headers.push(HeaderField::new(
-                    b":authority".to_vec(),
-                    authority.to_vec(),
-                ));
+                headers.push(HeaderField::new(b":authority".to_vec(), authority.to_vec()));
 
                 for (name, value) in &request.headers {
                     headers.push(HeaderField::new(name.to_vec(), value.to_vec()));
@@ -241,13 +236,12 @@ impl HttpHandler {
 
                         // Send body if present
                         if let Some(body) = request.body
-                            && let Err(e) =
-                                state.http2.send_data(stream_id, &body, true)
-                            {
-                                let _ = tx.send(Err(HttpError::Http2(e.to_string())));
-                                self.flush(ctx, conn_idx, token);
-                                return;
-                            }
+                            && let Err(e) = state.http2.send_data(stream_id, &body, true)
+                        {
+                            let _ = tx.send(Err(HttpError::Http2(e.to_string())));
+                            self.flush(ctx, conn_idx, token);
+                            return;
+                        }
 
                         state.pending.insert(
                             stream_id.value(),
@@ -305,10 +299,8 @@ impl HttpHandler {
                 } => {
                     if let Some(pending) = state.pending.get_mut(&stream_id.value()) {
                         for hf in &headers {
-                            let name =
-                                String::from_utf8_lossy(&hf.name).into_owned();
-                            let value =
-                                String::from_utf8_lossy(&hf.value).into_owned();
+                            let name = String::from_utf8_lossy(&hf.name).into_owned();
+                            let value = String::from_utf8_lossy(&hf.value).into_owned();
                             if name == ":status" {
                                 pending.status = value.parse().ok();
                             } else {
@@ -349,8 +341,7 @@ impl HttpHandler {
                     state.ready = false;
                     let pending_map = std::mem::take(&mut state.pending);
                     for (_, pending) in pending_map {
-                        let _ =
-                            pending.tx.send(Err(HttpError::Http2(format!("{e:?}"))));
+                        let _ = pending.tx.send(Err(HttpError::Http2(format!("{e:?}"))));
                     }
                 }
             }
@@ -381,12 +372,10 @@ impl HttpHandler {
             }
 
             let status = pending.status.unwrap_or(0);
-            let response =
-                HttpResponse::new(status, pending.headers, pending.body.freeze());
+            let response = HttpResponse::new(status, pending.headers, pending.body.freeze());
             let _ = pending.tx.send(Ok(response));
         }
     }
-
 }
 
 impl EventHandler for HttpHandler {
@@ -443,26 +432,23 @@ impl EventHandler for HttpHandler {
         let idx = conn.index();
 
         if let Some(state) = self.conn_map.get_mut(idx).and_then(|o| o.as_mut())
-            && state.http2.feed_data(data).is_err() {
-                return data.len();
-            }
+            && state.http2.feed_data(data).is_err()
+        {
+            return data.len();
+        }
 
         self.process_events(ctx, idx, conn);
 
         data.len()
     }
 
-    fn on_send_complete(
-        &mut self,
-        ctx: &mut DriverCtx,
-        conn: ConnToken,
-        _result: io::Result<u32>,
-    ) {
+    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, _result: io::Result<u32>) {
         let idx = conn.index();
         if let Some(state) = self.conn_map.get(idx).and_then(|o| o.as_ref())
-            && state.http2.has_pending_send() {
-                self.flush(ctx, idx, conn);
-            }
+            && state.http2.has_pending_send()
+        {
+            self.flush(ctx, idx, conn);
+        }
     }
 
     fn on_close(&mut self, _ctx: &mut DriverCtx, conn: ConnToken) {

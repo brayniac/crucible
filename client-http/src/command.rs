@@ -13,4 +13,3 @@ pub(crate) enum HttpCommand {
         tx: oneshot::Sender<Result<HttpResponse, HttpError>>,
     },
 }
-

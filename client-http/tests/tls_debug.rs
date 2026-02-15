@@ -1,9 +1,9 @@
 //! Minimal TLS debug test.
 #![cfg(feature = "tls")]
 
+use crucible_http_client::{HttpClient, HttpClientConfig};
 use std::sync::LazyLock;
 use std::time::Duration;
-use crucible_http_client::{HttpClient, HttpClientConfig};
 
 static CLIENT: LazyLock<HttpClient> = LazyLock::new(|| {
     HttpClient::connect(HttpClientConfig {
@@ -43,7 +43,11 @@ async fn debug_tls_get_with_body() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         match CLIENT.get("/robots.txt").await {
             Ok(resp) => {
-                println!("robots attempt {i}: status={} body_len={}", resp.status(), resp.body().len());
+                println!(
+                    "robots attempt {i}: status={} body_len={}",
+                    resp.status(),
+                    resp.body().len()
+                );
                 let body_str = String::from_utf8_lossy(resp.body());
                 println!("body: {}", &body_str[..body_str.len().min(200)]);
                 assert!(resp.body().len() > 0, "expected non-empty body");

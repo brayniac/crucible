@@ -286,7 +286,10 @@ async fn test_post_echo() {
     let client = &ENV.client;
     wait_for_client(client).await;
 
-    let resp = client.post("/echo", Bytes::from("hello world")).await.unwrap();
+    let resp = client
+        .post("/echo", Bytes::from("hello world"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.body().as_ref(), b"hello world");
 }
@@ -298,7 +301,10 @@ async fn test_post_echo_large() {
 
     // 2KB body — exercises flow control
     let body = vec![0xABu8; 2048];
-    let resp = client.post("/echo", Bytes::from(body.clone())).await.unwrap();
+    let resp = client
+        .post("/echo", Bytes::from(body.clone()))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.body().as_ref(), &body[..]);
 }

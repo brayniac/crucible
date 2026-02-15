@@ -37,11 +37,7 @@ impl WorkerHandle {
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {
             let val: u64 = 1;
             unsafe {
-                libc::write(
-                    self.eventfd,
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
+                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
             }
         }
         Ok(())
