@@ -29,6 +29,7 @@ members = [
 	"client",
 	"client-http",
 	"client-grpc",
+	"client-momento",
 
 	# Benchmark Tool
 	"benchmark",
@@ -100,6 +101,7 @@ metrics = { path = "metrics" }
 crucible-client = { path = "client" }
 crucible-http-client = { path = "client-http" }
 crucible-grpc-client = { path = "client-grpc" }
+crucible-momento-client = { path = "client-momento" }
 
 
 # Jemalloc allocator
