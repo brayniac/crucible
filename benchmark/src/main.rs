@@ -193,8 +193,7 @@ fn run_benchmark(
                 let start = if eid < key_remainder {
                     eid * (keys_per_worker + 1)
                 } else {
-                    key_remainder * (keys_per_worker + 1)
-                        + (eid - key_remainder) * keys_per_worker
+                    key_remainder * (keys_per_worker + 1) + (eid - key_remainder) * keys_per_worker
                 };
                 let count = if eid < key_remainder {
                     keys_per_worker + 1

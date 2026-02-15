@@ -22,24 +22,22 @@ impl WorkerHandle {
         eventfd: RawFd,
         pending: Arc<AtomicU32>,
     ) -> Self {
-        Self { tx, eventfd, pending }
+        Self {
+            tx,
+            eventfd,
+            pending,
+        }
     }
 
     /// Send a command and wake the worker if needed.
     pub fn send(&self, cmd: Command) -> Result<(), ClientError> {
-        self.tx
-            .send(cmd)
-            .map_err(|_| ClientError::WorkerClosed)?;
+        self.tx.send(cmd).map_err(|_| ClientError::WorkerClosed)?;
 
         // Only the first sender (prev == 0) writes to the eventfd.
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {
             let val: u64 = 1;
             unsafe {
-                libc::write(
-                    self.eventfd,
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
+                libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
             }
         }
         Ok(())

@@ -13,10 +13,7 @@ pub(crate) enum ChainEvent {
     /// All operation CQEs received, but ZC notifications still pending.
     AllOpsComplete,
     /// Chain fully complete (all operation CQEs + all ZC notifications).
-    Complete {
-        bytes_sent: u32,
-        error: Option<i32>,
-    },
+    Complete { bytes_sent: u32, error: Option<i32> },
 }
 
 /// State for a single in-flight send chain on a connection.

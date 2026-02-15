@@ -200,7 +200,8 @@ impl ClientHandler {
     /// Send a single command on a specific connection.
     fn send_command(&mut self, ctx: &mut DriverCtx, cmd: Command, conn_token: ConnToken) {
         // Check if this is a SET with a value large enough for zero-copy
-        let is_large_set = matches!(&cmd, Command::Set { value, .. } if value.len() >= ZC_THRESHOLD);
+        let is_large_set =
+            matches!(&cmd, Command::Set { value, .. } if value.len() >= ZC_THRESHOLD);
 
         if is_large_set {
             let Command::Set {

@@ -601,7 +601,7 @@ impl BenchHandler {
         self.bytes_received += data.len() as u64;
         self.responses_parsed += self.results.len() as u64;
 
-        if data.len() > 0 {
+        if !data.is_empty() {
             metrics::BYTES_RX.add(data.len() as u64);
         }
 
@@ -692,7 +692,11 @@ impl BenchHandler {
                 let roll = self.rng.random_range(0..100);
                 if roll < get_ratio {
                     // GET: encode into session buffer, batch-flush later
-                    let kid = if self.backfill_on_miss { Some(key_id) } else { None };
+                    let kid = if self.backfill_on_miss {
+                        Some(key_id)
+                    } else {
+                        None
+                    };
                     if self.sessions[idx].get(&self.key_buf, now, kid).is_none() {
                         break;
                     }
@@ -750,8 +754,7 @@ impl BenchHandler {
         let num_sessions = self.sessions.len();
 
         while !self.backfill_queue.is_empty() && session_idx < num_sessions {
-            if !self.sessions[session_idx].is_connected()
-                || !self.sessions[session_idx].can_send()
+            if !self.sessions[session_idx].is_connected() || !self.sessions[session_idx].can_send()
             {
                 session_idx += 1;
                 continue;
@@ -776,9 +779,7 @@ impl BenchHandler {
             ) {
                 let prefix_len = self.set_prefix_buf.len();
                 let suffix_len = suffix.len();
-                if let Err(e) =
-                    self.send_set_parts(ctx, session_idx, value_len, pool_len, suffix)
-                {
+                if let Err(e) = self.send_set_parts(ctx, session_idx, value_len, pool_len, suffix) {
                     self.send_failures += 1;
                     self.backfill_queue.push(key_id);
                     if e.kind() != io::ErrorKind::Other {
@@ -788,9 +789,7 @@ impl BenchHandler {
                     session_idx += 1;
                     continue;
                 }
-                self.sessions[session_idx].confirm_set_sent(
-                    prefix_len, value_len, suffix_len, now,
-                );
+                self.sessions[session_idx].confirm_set_sent(prefix_len, value_len, suffix_len, now);
                 self.sessions[session_idx].mark_last_request_backfill();
                 self.requests_driven += 1;
                 metrics::REQUESTS_SENT.increment();
@@ -1221,11 +1220,7 @@ impl EventHandler for BenchHandler {
 
                     // Initialize HTTP/2 preface (or protosocket auth)
                     if let Err(e) = self.momento_conns[idx].on_transport_ready() {
-                        tracing::warn!(
-                            "worker {} Momento transport ready failed: {}",
-                            self.id,
-                            e
-                        );
+                        tracing::warn!("worker {} Momento transport ready failed: {}", self.id, e);
                         ctx.close(conn);
                         self.conn_to_momento.remove(&conn.index());
                         self.conn_tokens.remove(&conn.index());
@@ -1538,8 +1533,7 @@ impl EventHandler for BenchHandler {
 
             // Per-session prefill timeout: close sessions that have in-flight
             // keys but haven't received a response within 10 seconds.
-            const PREFILL_SESSION_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(10);
+            const PREFILL_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             for idx in 0..self.sessions.len() {
                 if !self.prefill_in_flight[idx].is_empty()
                     && idx < self.prefill_session_last_progress.len()

@@ -26,7 +26,9 @@ pub use config::{Config, RecvBufferConfig, WorkerConfig};
 pub use error::Error;
 pub use event_loop::EventLoop;
 pub use guard::{GuardBox, SendGuard};
-pub use handler::{ConnToken, DriverCtx, EventHandler, SendBuilder, SendChainBuilder, ChainPartsBuilder};
+pub use handler::{
+    ChainPartsBuilder, ConnToken, DriverCtx, EventHandler, SendBuilder, SendChainBuilder,
+};
 #[cfg(feature = "tls")]
 pub use tls::TlsInfo;
 pub use worker::{KompioBuilder, ShutdownHandle, launch};

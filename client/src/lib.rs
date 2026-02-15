@@ -38,8 +38,8 @@ pub use error::ClientError;
 pub use latency::ClientLatency;
 
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
 use bytes::Bytes;
@@ -71,7 +71,11 @@ impl Client {
     /// This is synchronous — it spawns kompio background threads and returns
     /// immediately. Connections are established asynchronously by the workers.
     pub fn connect(config: ClientConfig) -> Result<Self, ClientError> {
-        let num_workers = if config.workers == 0 { 1 } else { config.workers };
+        let num_workers = if config.workers == 0 {
+            1
+        } else {
+            config.workers
+        };
 
         // Resolve server addresses
         let mut server_addrs = Vec::with_capacity(config.servers.len());
@@ -129,8 +133,8 @@ impl Client {
         kompio_config.tick_timeout_us = 10_000; // 10ms tick for reconnects
 
         // Launch without bind (client-only mode)
-        let (shutdown, threads) = kompio::KompioBuilder::new(kompio_config)
-            .launch::<ClientHandler>()?;
+        let (shutdown, threads) =
+            kompio::KompioBuilder::new(kompio_config).launch::<ClientHandler>()?;
 
         // Build WorkerHandle for each worker
         let eventfds = shutdown.worker_eventfds();
@@ -175,11 +179,7 @@ impl Client {
     ///
     /// Accepts any type that converts to `Bytes` — pass `Bytes` directly for
     /// zero-copy, or `&[u8]` / `Vec<u8>` for convenience (copies once).
-    pub async fn set(
-        &self,
-        key: &[u8],
-        value: impl Into<Bytes>,
-    ) -> Result<(), ClientError> {
+    pub async fn set(&self, key: &[u8], value: impl Into<Bytes>) -> Result<(), ClientError> {
         let (tx, rx) = oneshot::channel();
         let cmd = Command::Set {
             key: Bytes::copy_from_slice(key),
