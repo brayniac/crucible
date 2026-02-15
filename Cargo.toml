@@ -28,6 +28,7 @@ members = [
 	# Client Libraries
 	"client",
 	"client-http",
+	"client-grpc",
 
 	# Benchmark Tool
 	"benchmark",
@@ -98,6 +99,7 @@ heap-cache = { path = "cache/heap" }
 metrics = { path = "metrics" }
 crucible-client = { path = "client" }
 crucible-http-client = { path = "client-http" }
+crucible-grpc-client = { path = "client-grpc" }
 
 
 # Jemalloc allocator

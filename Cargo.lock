@@ -859,6 +859,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-grpc-client"
+version = "0.3.5-alpha.0"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "grpc",
+ "http2",
+ "kompio",
+ "libc",
+ "metriken",
+ "rustls",
+ "thiserror 2.0.18",
+ "tokio",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "crucible-http-client"
 version = "0.3.5-alpha.0"
 dependencies = [
