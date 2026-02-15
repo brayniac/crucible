@@ -293,10 +293,7 @@ impl Ring {
     ///
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
-    pub(crate) unsafe fn push_sqe(
-        &mut self,
-        entry: io_uring::squeue::Entry,
-    ) -> io::Result<()> {
+    pub(crate) unsafe fn push_sqe(&mut self, entry: io_uring::squeue::Entry) -> io::Result<()> {
         // Try to push; if SQ is full, submit first to make room.
         unsafe {
             if self.ring.submission().push(&entry).is_err() {

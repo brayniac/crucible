@@ -86,12 +86,7 @@ impl Command {
 /// Encode the RESP header for a SET command (everything before the value body).
 ///
 /// Writes: `*<argc>\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n`
-pub(crate) fn encode_set_header(
-    buf: &mut Vec<u8>,
-    key: &[u8],
-    value_len: usize,
-    has_ttl: bool,
-) {
+pub(crate) fn encode_set_header(buf: &mut Vec<u8>, key: &[u8], value_len: usize, has_ttl: bool) {
     let argc: u8 = if has_ttl { 5 } else { 3 };
     buf.push(b'*');
     push_decimal(buf, argc as u64);
@@ -188,9 +183,9 @@ impl PendingResponse {
                         Ok(Some(Bytes::from(data)))
                     }
                     protocol_resp::Value::Null => Ok(None),
-                    protocol_resp::Value::Error(msg) => {
-                        Err(ClientError::Redis(String::from_utf8_lossy(&msg).into_owned()))
-                    }
+                    protocol_resp::Value::Error(msg) => Err(ClientError::Redis(
+                        String::from_utf8_lossy(&msg).into_owned(),
+                    )),
                     other => Err(ClientError::Protocol(format!(
                         "unexpected GET response: {other:?}",
                     ))),
@@ -200,9 +195,9 @@ impl PendingResponse {
             ResponseKind::Set(tx) => {
                 let result = match value {
                     protocol_resp::Value::SimpleString(ref s) if s == b"OK" => Ok(()),
-                    protocol_resp::Value::Error(msg) => {
-                        Err(ClientError::Redis(String::from_utf8_lossy(&msg).into_owned()))
-                    }
+                    protocol_resp::Value::Error(msg) => Err(ClientError::Redis(
+                        String::from_utf8_lossy(&msg).into_owned(),
+                    )),
                     other => Err(ClientError::Protocol(format!(
                         "unexpected SET response: {other:?}",
                     ))),
@@ -212,9 +207,9 @@ impl PendingResponse {
             ResponseKind::Del(tx) => {
                 let result = match value {
                     protocol_resp::Value::Integer(n) => Ok(n as u64),
-                    protocol_resp::Value::Error(msg) => {
-                        Err(ClientError::Redis(String::from_utf8_lossy(&msg).into_owned()))
-                    }
+                    protocol_resp::Value::Error(msg) => Err(ClientError::Redis(
+                        String::from_utf8_lossy(&msg).into_owned(),
+                    )),
                     other => Err(ClientError::Protocol(format!(
                         "unexpected DEL response: {other:?}",
                     ))),
@@ -224,9 +219,9 @@ impl PendingResponse {
             ResponseKind::Ping(tx) => {
                 let result = match value {
                     protocol_resp::Value::SimpleString(ref s) if s == b"PONG" => Ok(()),
-                    protocol_resp::Value::Error(msg) => {
-                        Err(ClientError::Redis(String::from_utf8_lossy(&msg).into_owned()))
-                    }
+                    protocol_resp::Value::Error(msg) => Err(ClientError::Redis(
+                        String::from_utf8_lossy(&msg).into_owned(),
+                    )),
                     other => Err(ClientError::Protocol(format!(
                         "unexpected PING response: {other:?}",
                     ))),

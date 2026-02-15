@@ -147,13 +147,9 @@ impl<'a> DriverCtx<'a> {
             conn.index,
             slot as u32,
         );
-        let entry = io_uring::opcode::Send::new(
-            io_uring::types::Fixed(conn.index),
-            ptr,
-            len,
-        )
-        .build()
-        .user_data(user_data.raw());
+        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
+            .build()
+            .user_data(user_data.raw());
 
         let built = BuiltSend {
             entry,
@@ -741,13 +737,9 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             self.conn.index,
             slot as u32,
         );
-        let entry = io_uring::opcode::Send::new(
-            io_uring::types::Fixed(self.conn.index),
-            ptr,
-            len,
-        )
-        .build()
-        .user_data(user_data.raw());
+        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
+            .build()
+            .user_data(user_data.raw());
 
         Ok(BuiltSend {
             entry,
@@ -1001,13 +993,9 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             self.conn.index,
             slot as u32,
         );
-        let entry = io_uring::opcode::Send::new(
-            io_uring::types::Fixed(self.conn.index),
-            ptr,
-            len,
-        )
-        .build()
-        .user_data(user_data.raw());
+        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
+            .build()
+            .user_data(user_data.raw());
 
         self.total_bytes += data.len() as u32;
         self.built.push(BuiltSend {
@@ -1060,9 +1048,7 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             // Single SQE — no IO_LINK needed, but register chain state for
             // consistent CQE handling.
             let built = self.built.pop().unwrap();
-            self.ctx
-                .chain_table
-                .start(conn_index, 1, total_bytes);
+            self.ctx.chain_table.start(conn_index, 1, total_bytes);
             unsafe {
                 self.ctx.ring.push_sqe(built.entry)?;
             }
@@ -1206,13 +1192,10 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         conn_index,
                         slot as u32,
                     );
-                    let entry = io_uring::opcode::Send::new(
-                        io_uring::types::Fixed(conn_index),
-                        ptr,
-                        len,
-                    )
-                    .build()
-                    .user_data(user_data.raw());
+                    let entry =
+                        io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
+                            .build()
+                            .user_data(user_data.raw());
 
                     BuiltSend {
                         entry,
@@ -1307,8 +1290,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                             }
                             None => {
                                 self.chain.ctx.send_copy_pool.release(slot);
-                                self.chain.error =
-                                    Some(io::Error::other("send slab exhausted"));
+                                self.chain.error = Some(io::Error::other("send slab exhausted"));
                                 return self.chain;
                             }
                         }

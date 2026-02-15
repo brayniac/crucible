@@ -1393,7 +1393,12 @@ impl<H: EventHandler> EventLoop<H> {
         send_copy_pool: &mut SendCopyPool,
     ) {
         for built in queue.drain(..) {
-            Self::release_built_resources(send_slab, send_copy_pool, built.pool_slot, built.slab_idx);
+            Self::release_built_resources(
+                send_slab,
+                send_copy_pool,
+                built.pool_slot,
+                built.slab_idx,
+            );
         }
     }
 

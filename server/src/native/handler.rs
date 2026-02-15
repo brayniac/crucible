@@ -313,5 +313,3 @@ fn send_pending(
         }
     }
 }
-
-

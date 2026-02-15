@@ -144,7 +144,10 @@ impl MomentoConn {
             return None;
         }
 
-        match self.client.set_with_ttl(&self.cache_name, key, value, self.ttl) {
+        match self
+            .client
+            .set_with_ttl(&self.cache_name, key, value, self.ttl)
+        {
             Ok(_pending) => {
                 let id = self.next_id;
                 self.next_id += 1;
