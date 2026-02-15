@@ -892,6 +892,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-memcache-client"
+version = "0.3.5-alpha.0"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "kompio",
+ "libc",
+ "metriken",
+ "protocol-memcache",
+ "segcache",
+ "serde",
+ "server",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "crucible-momento-client"
 version = "0.3.5-alpha.0"
 dependencies = [

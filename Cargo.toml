@@ -27,6 +27,7 @@ members = [
 
 	# Client Libraries
 	"client",
+	"client-memcache",
 	"client-http",
 	"client-grpc",
 	"client-momento",
@@ -101,6 +102,7 @@ metrics = { path = "metrics" }
 crucible-client = { path = "client" }
 crucible-http-client = { path = "client-http" }
 crucible-grpc-client = { path = "client-grpc" }
+crucible-memcache-client = { path = "client-memcache" }
 crucible-momento-client = { path = "client-momento" }
 
 
