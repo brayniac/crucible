@@ -1845,3 +1845,454 @@ fn async_cancel_completed_task() {
     shutdown.shutdown();
     for h in handles { h.join().unwrap().unwrap(); }
 }
+
+// ── Multi-worker tests ──────────────────────────────────────────────
+
+fn multi_worker_config(threads: usize) -> Config {
+    let mut config = test_config();
+    config.worker.threads = threads;
+    config
+}
+
+#[test]
+fn multi_worker_callback_echo() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(multi_worker_config(2))
+        .bind(&addr)
+        .launch::<Echo>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Connect 4 clients sequentially — acceptor round-robins across 2 workers.
+    for i in 0..4 {
+        let msg = format!("multi-worker-cb-{i}");
+        let response = echo_round_trip(&addr, msg.as_bytes());
+        assert_eq!(response, msg.as_bytes(), "mismatch on connection {i}");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn multi_worker_async_echo() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(multi_worker_config(2))
+        .bind(&addr)
+        .launch_async::<AsyncEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Connect 4 clients sequentially — acceptor round-robins across 2 workers.
+    for i in 0..4 {
+        let msg = format!("multi-worker-async-{i}");
+        let response = echo_round_trip(&addr, msg.as_bytes());
+        assert_eq!(response, msg.as_bytes(), "mismatch on connection {i}");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn multi_worker_graceful_shutdown() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(multi_worker_config(4))
+        .bind(&addr)
+        .launch::<Echo>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Open a few connections to exercise the workers.
+    for i in 0..4 {
+        let msg = format!("shutdown-{i}");
+        let response = echo_round_trip(&addr, msg.as_bytes());
+        assert_eq!(response, msg.as_bytes());
+    }
+
+    // Trigger shutdown — all 4 worker threads must join cleanly.
+    shutdown.shutdown();
+    for (i, h) in handles.into_iter().enumerate() {
+        let result = h.join().unwrap_or_else(|_| panic!("worker {i} panicked"));
+        result.unwrap_or_else(|e| panic!("worker {i} returned error: {e}"));
+    }
+}
+
+// ── Awaitable send tests ────────────────────────────────────────────
+
+/// Handler that tests send_await: sends a known payload via send_await
+/// and reports the byte count from the SendFuture.
+struct SendAwaitHandler;
+
+impl AsyncEventHandler for SendAwaitHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            let payload = b"SEND_AWAIT_OK";
+            match conn.send_await(payload) {
+                Ok(fut) => match fut.await {
+                    Ok(bytes) => {
+                        let msg = format!("OK:{bytes}");
+                        let _ = conn.send(msg.as_bytes());
+                    }
+                    Err(e) => {
+                        let _ = conn.send(format!("ERR:{e}").as_bytes());
+                    }
+                },
+                Err(e) => {
+                    let _ = conn.send(format!("SUBMIT_ERR:{e}").as_bytes());
+                }
+            }
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SendAwaitHandler
+    }
+}
+
+#[test]
+fn async_send_await_basic() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<SendAwaitHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // Trigger the handler.
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    // Read "SEND_AWAIT_OK" followed by "OK:13".
+    let mut buf = [0u8; 128];
+    let mut total = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.contains("OK:") && s.len() >= 16 {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        result.starts_with("SEND_AWAIT_OK"),
+        "expected SEND_AWAIT_OK prefix, got: {result}"
+    );
+    assert!(
+        result.contains("OK:13"),
+        "expected OK:13 (send_await byte count), got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that tests send_chain_await.
+struct SendChainAwaitHandler;
+
+impl AsyncEventHandler for SendChainAwaitHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            // Build a chained send with two copy parts and await completion.
+            let part1 = b"HELLO";
+            let part2 = b"WORLD";
+            match conn.send_chain_await(|b| b.copy(part1).copy(part2).finish()) {
+                Ok(fut) => match fut.await {
+                    Ok(bytes) => {
+                        let msg = format!("OK:{bytes}");
+                        let _ = conn.send(msg.as_bytes());
+                    }
+                    Err(e) => {
+                        let _ = conn.send(format!("ERR:{e}").as_bytes());
+                    }
+                },
+                Err(e) => {
+                    let _ = conn.send(format!("SUBMIT_ERR:{e}").as_bytes());
+                }
+            }
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SendChainAwaitHandler
+    }
+}
+
+#[test]
+fn async_send_chain_await_basic() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<SendChainAwaitHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    // Read "HELLOWORLD" followed by "OK:<bytes>".
+    let mut buf = [0u8; 128];
+    let mut total = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.contains("OK:") && s.len() >= 13 {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        result.starts_with("HELLOWORLD"),
+        "expected HELLOWORLD prefix, got: {result}"
+    );
+    assert!(
+        result.contains("OK:10"),
+        "expected OK:10 (5+5 bytes chain send), got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── try_sleep / try_timeout exhaustion tests ────────────────────────
+
+/// Handler that tests try_sleep exhaustion.
+struct TrySleepHandler;
+
+impl AsyncEventHandler for TrySleepHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            let exhausted = {
+                // Allocate all timer slots (config has timer_slots = 2).
+                let _s1 = krio::try_sleep(Duration::from_secs(60));
+                let _s2 = krio::try_sleep(Duration::from_secs(60));
+
+                // Third attempt should fail with TimerExhausted.
+                krio::try_sleep(Duration::from_secs(60)).is_err()
+                // _s1, _s2 dropped here — slots released.
+            };
+
+            if exhausted {
+                let _ = conn.send(b"EXHAUSTED");
+            } else {
+                let _ = conn.send(b"NOT_EXHAUSTED");
+            }
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TrySleepHandler
+    }
+}
+
+#[test]
+fn async_try_sleep_exhaustion() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.timer_slots = 2;
+
+    let (shutdown, handles) = KrioBuilder::new(config)
+        .bind(&addr)
+        .launch_async::<TrySleepHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 32];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s == "EXHAUSTED" || s == "NOT_EXHAUSTED" {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(
+        result, "EXHAUSTED",
+        "expected EXHAUSTED (timer pool full), got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that tests try_timeout exhaustion.
+struct TryTimeoutHandler;
+
+impl AsyncEventHandler for TryTimeoutHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            let exhausted = {
+                // Allocate all timer slots (config has timer_slots = 2).
+                let _t1 = krio::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
+                let _t2 = krio::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
+
+                // Third attempt should fail with TimerExhausted.
+                krio::try_timeout(Duration::from_secs(60), std::future::pending::<()>()).is_err()
+                // _t1, _t2 dropped here — timer slots released.
+            };
+
+            if exhausted {
+                let _ = conn.send(b"EXHAUSTED");
+            } else {
+                let _ = conn.send(b"NOT_EXHAUSTED");
+            }
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TryTimeoutHandler
+    }
+}
+
+#[test]
+fn async_try_timeout_exhaustion() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.timer_slots = 2;
+
+    let (shutdown, handles) = KrioBuilder::new(config)
+        .bind(&addr)
+        .launch_async::<TryTimeoutHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 32];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s == "EXHAUSTED" || s == "NOT_EXHAUSTED" {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(
+        result, "EXHAUSTED",
+        "expected EXHAUSTED (timer pool full), got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

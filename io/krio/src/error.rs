@@ -66,3 +66,16 @@ impl fmt::Display for SpawnError {
 }
 
 impl std::error::Error for SpawnError {}
+
+/// Error returned by [`try_sleep`](crate::try_sleep) and
+/// [`try_timeout`](crate::try_timeout) when the timer slot pool is full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimerExhausted;
+
+impl fmt::Display for TimerExhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("timer slot pool exhausted")
+    }
+}
+
+impl std::error::Error for TimerExhausted {}

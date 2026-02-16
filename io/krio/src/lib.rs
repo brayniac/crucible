@@ -106,12 +106,18 @@ pub use runtime::io::sleep;
 pub use runtime::io::spawn;
 /// Wrap a future with a deadline.
 pub use runtime::io::timeout;
+/// Fallible sleep that returns an error if the timer pool is exhausted.
+pub use runtime::io::try_sleep;
 /// Spawn a standalone task, returning an error if the slab is full.
 pub use runtime::io::try_spawn;
+/// Fallible timeout that returns an error if the timer pool is exhausted.
+pub use runtime::io::try_timeout;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 /// Error returned by [`try_spawn()`] when the standalone task slab is full.
 pub use error::SpawnError;
+/// Error returned by [`try_sleep()`] and [`try_timeout()`] when the timer pool is full.
+pub use error::TimerExhausted;
 /// Poll two futures concurrently, returning whichever completes first.
 pub use runtime::select::select;
 /// Poll three futures concurrently, returning whichever completes first.

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::completion::{OpTag, UserData};
 use crate::driver::Driver;
-use crate::error::SpawnError;
+use crate::error::{SpawnError, TimerExhausted};
 use crate::handler::ConnToken;
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::STANDALONE_BIT;
@@ -262,6 +262,28 @@ impl ConnCtx {
         })
     }
 
+    /// Build an IO_LINK chained send and await completion.
+    ///
+    /// The closure receives a [`SendChainBuilder`](crate::SendChainBuilder) for
+    /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build the
+    /// chain, then `.finish()` to submit it. Returns a [`SendFuture`] that
+    /// resolves with total bytes sent.
+    pub fn send_chain_await<F>(&self, f: F) -> io::Result<SendFuture>
+    where
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
+    {
+        with_state(|driver, executor| {
+            let mut ctx = driver.make_ctx();
+            let token = ConnToken::new(self.conn_index, self.generation);
+            let builder = ctx.send_chain(token);
+            f(builder)?;
+            executor.send_waiters[self.conn_index as usize] = true;
+            Ok(SendFuture {
+                conn_index: self.conn_index,
+            })
+        })
+    }
+
     // ── Shutdown / cancel ─────────────────────────────────────────────
 
     /// Shutdown the write side of the connection (half-close).
@@ -410,6 +432,25 @@ impl AsyncSendBuilder {
             let mut ctx = driver.make_ctx();
             let builder = ctx.send_parts(self.token);
             f(builder)
+        })
+    }
+
+    /// Build and submit a scatter-gather send, then await completion.
+    ///
+    /// Like [`build()`](Self::build) but returns a [`SendFuture`] that resolves
+    /// with the total bytes sent (or error). Use this when you need backpressure
+    /// or send completion notification.
+    pub fn build_await<F>(self, f: F) -> io::Result<SendFuture>
+    where
+        F: FnOnce(crate::handler::SendBuilder<'_, '_>) -> io::Result<()>,
+    {
+        with_state(|driver, executor| {
+            let mut ctx = driver.make_ctx();
+            let builder = ctx.send_parts(self.token);
+            f(builder)?;
+            let conn_index = self.token.index;
+            executor.send_waiters[conn_index as usize] = true;
+            Ok(SendFuture { conn_index })
         })
     }
 }
@@ -606,6 +647,52 @@ impl Drop for SleepFuture {
     }
 }
 
+/// Create a sleep future, returning an error if the timer pool is exhausted.
+///
+/// Unlike [`sleep()`] which panics on pool exhaustion, this returns
+/// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
+///
+/// The timer slot is allocated eagerly (at call time, not on first poll).
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
+    with_state(|driver, executor| {
+        let waker_id = CURRENT_TASK_ID.with(|c| c.get());
+        let (slot, generation) = executor
+            .timer_pool
+            .allocate(waker_id)
+            .ok_or(TimerExhausted)?;
+
+        let secs = duration.as_secs();
+        let nsecs = duration.subsec_nanos();
+        executor.timer_pool.timespecs[slot as usize] =
+            io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
+
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Timer, 0, payload);
+        let ts_ptr =
+            &executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+
+        if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
+            executor.timer_pool.release(slot);
+            // SQE submission failure — complete immediately (same as sleep()).
+            return Ok(SleepFuture {
+                duration,
+                timer_slot: None,
+                generation: 0,
+            });
+        }
+
+        Ok(SleepFuture {
+            duration,
+            timer_slot: Some(slot),
+            generation,
+        })
+    })
+}
+
 // ── Timeout ──────────────────────────────────────────────────────────
 
 /// Error returned when a [`timeout()`] deadline expires.
@@ -636,6 +723,22 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> TimeoutFuture<F> {
         future,
         sleep: sleep(duration),
     }
+}
+
+/// Wrap a future with a deadline, returning an error if the timer pool is full.
+///
+/// Unlike [`timeout()`] which panics on pool exhaustion, this returns
+/// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn try_timeout<F: Future>(
+    duration: Duration,
+    future: F,
+) -> Result<TimeoutFuture<F>, TimerExhausted> {
+    let sleep = try_sleep(duration)?;
+    Ok(TimeoutFuture { future, sleep })
 }
 
 pin_project_lite::pin_project! {
