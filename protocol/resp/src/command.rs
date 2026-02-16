@@ -34,6 +34,17 @@ pub enum Command<'a> {
         subcommand: &'a [u8],
         args: Vec<&'a [u8]>,
     },
+    /// CLUSTER subcommand [args...]
+    Cluster {
+        subcommand: &'a [u8],
+        args: Vec<&'a [u8]>,
+    },
+    /// ASKING — used before retrying a command after an ASK redirect
+    Asking,
+    /// READONLY — enable read queries on a replica node
+    ReadOnly,
+    /// READWRITE — disable READONLY mode
+    ReadWrite,
     /// FLUSHDB
     FlushDb,
     /// FLUSHALL
@@ -382,6 +393,47 @@ impl<'a> Command<'a> {
                     args.push(cursor.read_bulk_string()?);
                 }
                 Command::Config { subcommand, args }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("cluster") => {
+                if count < 2 {
+                    return Err(ParseError::WrongArity(
+                        "CLUSTER requires at least 1 argument".to_string(),
+                    ));
+                }
+                let subcommand = cursor.read_bulk_string()?;
+                let mut args = Vec::with_capacity(count - 2);
+                for _ in 0..(count - 2) {
+                    args.push(cursor.read_bulk_string()?);
+                }
+                Command::Cluster { subcommand, args }
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("asking") => {
+                if count != 1 {
+                    return Err(ParseError::WrongArity(
+                        "ASKING takes no arguments".to_string(),
+                    ));
+                }
+                Command::Asking
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("readonly") => {
+                if count != 1 {
+                    return Err(ParseError::WrongArity(
+                        "READONLY takes no arguments".to_string(),
+                    ));
+                }
+                Command::ReadOnly
+            }
+
+            _ if cmd_str.eq_ignore_ascii_case("readwrite") => {
+                if count != 1 {
+                    return Err(ParseError::WrongArity(
+                        "READWRITE takes no arguments".to_string(),
+                    ));
+                }
+                Command::ReadWrite
             }
 
             _ if cmd_str.eq_ignore_ascii_case("flushdb") => Command::FlushDb,
@@ -1001,6 +1053,10 @@ impl<'a> Command<'a> {
             Command::Del { .. } => "DEL",
             Command::MGet { .. } => "MGET",
             Command::Config { .. } => "CONFIG",
+            Command::Cluster { .. } => "CLUSTER",
+            Command::Asking => "ASKING",
+            Command::ReadOnly => "READONLY",
+            Command::ReadWrite => "READWRITE",
             Command::FlushDb => "FLUSHDB",
             Command::FlushAll => "FLUSHALL",
             Command::Incr { .. } => "INCR",
@@ -1786,6 +1842,110 @@ mod tests {
             .name(),
             "DECRBY"
         );
+    }
+
+    // ========================================================================
+    // Cluster Command Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_cluster_slots() {
+        let data = b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Cluster {
+                subcommand: b"SLOTS",
+                args: vec![],
+            }
+        );
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_cluster_info() {
+        let data = b"*2\r\n$7\r\ncluster\r\n$4\r\nINFO\r\n";
+        let (cmd, _) = Command::parse(data).unwrap();
+        if let Command::Cluster { subcommand, args } = cmd {
+            assert_eq!(subcommand, b"INFO");
+            assert!(args.is_empty());
+        } else {
+            panic!("Expected CLUSTER command");
+        }
+    }
+
+    #[test]
+    fn test_parse_cluster_wrong_arity() {
+        let data = b"*1\r\n$7\r\nCLUSTER\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_asking() {
+        let data = b"*1\r\n$6\r\nASKING\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::Asking);
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_asking_case_insensitive() {
+        let data = b"*1\r\n$6\r\nasking\r\n";
+        let (cmd, _) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::Asking);
+    }
+
+    #[test]
+    fn test_parse_asking_wrong_arity() {
+        let data = b"*2\r\n$6\r\nASKING\r\n$3\r\nfoo\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_readonly() {
+        let data = b"*1\r\n$8\r\nREADONLY\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::ReadOnly);
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_readonly_wrong_arity() {
+        let data = b"*2\r\n$8\r\nREADONLY\r\n$3\r\nfoo\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_readwrite() {
+        let data = b"*1\r\n$9\r\nREADWRITE\r\n";
+        let (cmd, consumed) = Command::parse(data).unwrap();
+        assert_eq!(cmd, Command::ReadWrite);
+        assert_eq!(consumed, data.len());
+    }
+
+    #[test]
+    fn test_parse_readwrite_wrong_arity() {
+        let data = b"*2\r\n$9\r\nREADWRITE\r\n$3\r\nfoo\r\n";
+        let result = Command::parse(data);
+        assert!(matches!(result, Err(ParseError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_cluster_command_names() {
+        assert_eq!(
+            Command::Cluster {
+                subcommand: b"SLOTS",
+                args: vec![]
+            }
+            .name(),
+            "CLUSTER"
+        );
+        assert_eq!(Command::Asking.name(), "ASKING");
+        assert_eq!(Command::ReadOnly.name(), "READONLY");
+        assert_eq!(Command::ReadWrite.name(), "READWRITE");
     }
 
     // ========================================================================

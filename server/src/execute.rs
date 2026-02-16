@@ -405,6 +405,13 @@ pub fn execute_resp<C: Cache>(
             }
         }
 
+        RespCommand::Cluster { .. }
+        | RespCommand::Asking
+        | RespCommand::ReadOnly
+        | RespCommand::ReadWrite => {
+            write_buf.extend_from_slice(b"-ERR unknown command\r\n");
+        }
+
         RespCommand::Hello { proto_version, .. } => {
             let requested_version = proto_version.unwrap_or(2);
             let actual_version = if requested_version >= 3 { 3 } else { 2 };

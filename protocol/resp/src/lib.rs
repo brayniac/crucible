@@ -49,12 +49,17 @@
 //! let len = Value::bulk_string(b"myvalue").encode(&mut buf);
 //! ```
 
+pub mod cluster;
 mod command;
 mod error;
 mod request;
 pub mod streaming;
 mod value;
 
+pub use cluster::{
+    NodeInfo, Redirect, RedirectKind, SLOT_COUNT, SlotMap, SlotRange, crc16, hash_slot,
+    parse_redirect,
+};
 pub use command::Command;
 pub use error::ParseError;
 pub use request::{Request, SetRequest};

@@ -112,6 +112,62 @@ impl<'a> Request<'a> {
         }
     }
 
+    /// Create a CLUSTER SLOTS command.
+    #[inline]
+    pub fn cluster_slots() -> Self {
+        Self {
+            args: vec![b"CLUSTER", b"SLOTS"],
+        }
+    }
+
+    /// Create a CLUSTER NODES command.
+    #[inline]
+    pub fn cluster_nodes() -> Self {
+        Self {
+            args: vec![b"CLUSTER", b"NODES"],
+        }
+    }
+
+    /// Create a CLUSTER INFO command.
+    #[inline]
+    pub fn cluster_info() -> Self {
+        Self {
+            args: vec![b"CLUSTER", b"INFO"],
+        }
+    }
+
+    /// Create a CLUSTER MYID command.
+    #[inline]
+    pub fn cluster_myid() -> Self {
+        Self {
+            args: vec![b"CLUSTER", b"MYID"],
+        }
+    }
+
+    /// Create an ASKING command.
+    #[inline]
+    pub fn asking() -> Self {
+        Self {
+            args: vec![b"ASKING"],
+        }
+    }
+
+    /// Create a READONLY command.
+    #[inline]
+    pub fn readonly() -> Self {
+        Self {
+            args: vec![b"READONLY"],
+        }
+    }
+
+    /// Create a READWRITE command.
+    #[inline]
+    pub fn readwrite() -> Self {
+        Self {
+            args: vec![b"READWRITE"],
+        }
+    }
+
     /// Create a custom command with arbitrary arguments.
     #[inline]
     pub fn cmd(name: &'a [u8]) -> Self {
@@ -560,6 +616,55 @@ mod tests {
         let len1 = set1.encode(&mut buf1);
         let len2 = set2.encode(&mut buf2);
         assert_eq!(&buf1[..len1], &buf2[..len2]);
+    }
+
+    #[test]
+    fn test_encode_cluster_slots() {
+        let mut buf = [0u8; 128];
+        let len = Request::cluster_slots().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n");
+    }
+
+    #[test]
+    fn test_encode_cluster_nodes() {
+        let mut buf = [0u8; 128];
+        let len = Request::cluster_nodes().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n");
+    }
+
+    #[test]
+    fn test_encode_cluster_info() {
+        let mut buf = [0u8; 128];
+        let len = Request::cluster_info().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n");
+    }
+
+    #[test]
+    fn test_encode_cluster_myid() {
+        let mut buf = [0u8; 128];
+        let len = Request::cluster_myid().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nMYID\r\n");
+    }
+
+    #[test]
+    fn test_encode_asking() {
+        let mut buf = [0u8; 64];
+        let len = Request::asking().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*1\r\n$6\r\nASKING\r\n");
+    }
+
+    #[test]
+    fn test_encode_readonly() {
+        let mut buf = [0u8; 64];
+        let len = Request::readonly().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*1\r\n$8\r\nREADONLY\r\n");
+    }
+
+    #[test]
+    fn test_encode_readwrite() {
+        let mut buf = [0u8; 64];
+        let len = Request::readwrite().encode(&mut buf);
+        assert_eq!(&buf[..len], b"*1\r\n$9\r\nREADWRITE\r\n");
     }
 
     #[test]
