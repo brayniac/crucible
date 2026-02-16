@@ -2,15 +2,14 @@
 //!
 //! Mirrors `native/handler.rs` but uses krio's async API (one task per connection).
 //! The per-connection async task reuses `Connection::process_from()` for parsing
-//! and command execution, then drains pending writes via `ConnCtx::send_parts()`.
+//! and command execution, then drains pending writes via copy sends (small
+//! protocol framing) and zero-copy guard sends (large values).
 
 use crate::connection::{Connection, SliceRecvBuf};
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, WorkerStats};
-use bytes::Bytes;
 use cache_core::Cache;
-use krio::{
-    AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
-};
+use bytes::Bytes;
+use krio::{AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, RegionId, SendGuard};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -130,7 +129,7 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
 /// Handle a single connection's lifetime as an async task.
 ///
 /// Loops reading data via `with_data`, processing commands through the shared
-/// `Connection::process_from()`, and draining responses via `send_parts()`.
+/// `Connection::process_from()`, and draining responses via `ConnCtx::send()`.
 async fn handle_connection<C: Cache>(
     conn: ConnCtx,
     cache: Arc<C>,
@@ -143,7 +142,7 @@ async fn handle_connection<C: Cache>(
     loop {
         // Backpressure: if write queue is full, await a send completion first.
         if !connection.should_read() && connection.has_pending_write() {
-            if send_pending_await(&conn, &mut connection, slot_size)
+            if drain_pending(&conn, &mut connection, slot_size, true)
                 .await
                 .is_err()
             {
@@ -164,29 +163,20 @@ async fn handle_connection<C: Cache>(
             })
             .await;
 
-        // Drain pending responses (fire-and-forget).
-        if connection.has_pending_write() {
-            if send_pending(&conn, &mut connection, slot_size).is_err() {
-                break;
-            }
+        // Drain pending responses.
+        if connection.has_pending_write()
+            && drain_pending(&conn, &mut connection, slot_size, false)
+                .await
+                .is_err()
+        {
+            break;
         }
 
         if consumed == 0 {
-            // EOF — drain remaining writes before exiting.
-            while connection.has_pending_write() {
-                if send_pending(&conn, &mut connection, slot_size).is_err() {
-                    break;
-                }
-            }
             break;
         }
 
         if connection.should_close() {
-            while connection.has_pending_write() {
-                if send_pending(&conn, &mut connection, slot_size).is_err() {
-                    break;
-                }
-            }
             conn.close();
             break;
         }
@@ -196,6 +186,9 @@ async fn handle_connection<C: Cache>(
 }
 
 // ── Send helpers ────────────────────────────────────────────────────────
+
+/// Minimum part size to use zero-copy guard path instead of copy.
+const GUARD_MIN_SIZE: usize = 1024;
 
 /// Zero-copy send guard backed by a `Bytes` handle.
 struct BytesGuard(Bytes);
@@ -209,14 +202,22 @@ impl SendGuard for BytesGuard {
     }
 }
 
-/// Send all pending response data for a connection (fire-and-forget).
+/// Drain all pending response data for a connection.
 ///
-/// Mirrors `native/handler.rs::send_pending()` but uses `ConnCtx` instead of `DriverCtx`.
-#[inline]
-fn send_pending(
+/// Small parts (< 1KB protocol framing) use fire-and-forget copy sends via the
+/// copy pool (8192 × 16KB slots). Large parts (≥ 1KB values) use zero-copy
+/// guard sends via `build_await()`, which yields to the event loop after each
+/// guard send. This limits slab usage to at most 1 entry per connection in
+/// flight, preventing the slab exhaustion deadlock that occurs when
+/// fire-and-forget guard sends pile up with no CQE processing.
+///
+/// When `must_yield` is true (backpressure path), the last send is always
+/// awaitable to guarantee at least one yield even when all parts are small.
+async fn drain_pending(
     conn: &ConnCtx,
     connection: &mut Connection,
     slot_size: usize,
+    must_yield: bool,
 ) -> Result<(), ()> {
     loop {
         if !connection.has_pending_write() {
@@ -228,121 +229,86 @@ fn send_pending(
             return Ok(());
         }
 
-        // Fast path: single small part — use simple copy send.
-        if parts.len() == 1 && parts[0].len() <= slot_size {
-            let data = &parts[0];
-            match conn.send(data) {
-                Ok(()) => {
-                    connection.advance_write(data.len());
-                    continue;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Other => return Ok(()),
-                Err(_) => return Err(()),
-            }
-        }
+        let total_bytes: usize = parts.iter().map(|p| p.len()).sum();
+        let mut advanced = 0usize;
+        let mut yielded = false;
 
-        // Scatter-gather path: use guards for all parts.
-        // In the async API, SendBuilder's data lifetime makes .copy() awkward
-        // with owned data. Using guards for everything is simpler and Bytes::clone()
-        // is just an Arc refcount bump (~20 cycles per part).
-        let mut guard_parts: Vec<Bytes> = Vec::new();
-        let mut total_advance = 0usize;
-
-        for (i, part) in parts.iter().enumerate() {
-            if i >= MAX_IOVECS || guard_parts.len() >= MAX_GUARDS {
-                break;
-            }
-            guard_parts.push(part.clone());
-            total_advance += part.len();
-        }
-
-        if total_advance == 0 {
-            return Ok(());
-        }
-
-        let result = conn.send_parts().build(move |mut b| {
-            for part in &guard_parts {
-                b = b.guard(GuardBox::new(BytesGuard(part.clone())));
-            }
-            b.submit()
-        });
-
-        match result {
-            Ok(()) => {
-                connection.advance_write(total_advance);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Other => {
-                return Ok(());
-            }
-            Err(_) => return Err(()),
-        }
-    }
-}
-
-/// Send pending data and await completion for backpressure relief.
-async fn send_pending_await(
-    conn: &ConnCtx,
-    connection: &mut Connection,
-    slot_size: usize,
-) -> Result<(), ()> {
-    if !connection.has_pending_write() {
-        return Ok(());
-    }
-
-    let parts = connection.collect_pending_writes();
-    if parts.is_empty() {
-        return Ok(());
-    }
-
-    // Fast path: single small part.
-    if parts.len() == 1 && parts[0].len() <= slot_size {
-        let data = &parts[0];
-        let len = data.len();
-        match conn.send_await(data) {
-            Ok(fut) => {
-                connection.advance_write(len);
-                match fut.await {
-                    Ok(_) => return Ok(()),
+        for part in &parts {
+            if part.len() >= GUARD_MIN_SIZE {
+                // Zero-copy path: single-guard awaitable send.
+                // Await yields to the event loop, freeing the slab entry before
+                // the next guard send — at most 1 slab entry per connection.
+                let guard_part = part.clone(); // Arc refcount bump only
+                let result = conn.send_parts().build_await(move |b| {
+                    b.guard(GuardBox::new(BytesGuard(guard_part))).submit()
+                });
+                match result {
+                    Ok(fut) => {
+                        advanced += part.len();
+                        if fut.await.is_err() {
+                            connection.advance_write(advanced);
+                            return Err(());
+                        }
+                        yielded = true;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Other => {
+                        connection.advance_write(advanced);
+                        return Ok(());
+                    }
                     Err(_) => return Err(()),
                 }
+            } else if must_yield && !yielded && advanced + part.len() == total_bytes {
+                // Backpressure: await the final small part to guarantee a yield.
+                let mut offset = 0;
+                while offset < part.len() {
+                    let end = (offset + slot_size).min(part.len());
+                    let chunk = &part[offset..end];
+                    let is_last = end == part.len();
+
+                    if is_last {
+                        match conn.send_await(chunk) {
+                            Ok(fut) => {
+                                advanced += end;
+                                if fut.await.is_err() {
+                                    connection.advance_write(advanced);
+                                    return Err(());
+                                }
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::Other => {
+                                connection.advance_write(advanced + offset);
+                                return Ok(());
+                            }
+                            Err(_) => return Err(()),
+                        }
+                    } else {
+                        match conn.send(chunk) {
+                            Ok(()) => offset = end,
+                            Err(e) if e.kind() == io::ErrorKind::Other => {
+                                connection.advance_write(advanced + offset);
+                                return Ok(());
+                            }
+                            Err(_) => return Err(()),
+                        }
+                    }
+                }
+            } else {
+                // Small part: fire-and-forget copy send.
+                let mut offset = 0;
+                while offset < part.len() {
+                    let end = (offset + slot_size).min(part.len());
+                    match conn.send(&part[offset..end]) {
+                        Ok(()) => offset = end,
+                        Err(e) if e.kind() == io::ErrorKind::Other => {
+                            connection.advance_write(advanced + offset);
+                            return Ok(());
+                        }
+                        Err(_) => return Err(()),
+                    }
+                }
+                advanced += part.len();
             }
-            Err(e) if e.kind() == io::ErrorKind::Other => return Ok(()),
-            Err(_) => return Err(()),
         }
-    }
 
-    // Scatter-gather path with await.
-    let mut guard_parts: Vec<Bytes> = Vec::new();
-    let mut total_advance = 0usize;
-
-    for (i, part) in parts.iter().enumerate() {
-        if i >= MAX_IOVECS || guard_parts.len() >= MAX_GUARDS {
-            break;
-        }
-        guard_parts.push(part.clone());
-        total_advance += part.len();
-    }
-
-    if total_advance == 0 {
-        return Ok(());
-    }
-
-    let result = conn.send_parts().build_await(move |mut b| {
-        for part in &guard_parts {
-            b = b.guard(GuardBox::new(BytesGuard(part.clone())));
-        }
-        b.submit()
-    });
-
-    match result {
-        Ok(fut) => {
-            connection.advance_write(total_advance);
-            match fut.await {
-                Ok(_) => Ok(()),
-                Err(_) => Err(()),
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::Other => Ok(()),
-        Err(_) => Err(()),
+        connection.advance_write(advanced);
     }
 }
