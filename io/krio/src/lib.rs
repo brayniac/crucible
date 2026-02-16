@@ -78,10 +78,10 @@ pub use handler::DriverCtx;
 pub use handler::EventHandler;
 /// Builder for constructing a scatter-gather send.
 pub use handler::SendBuilder;
-/// Pre-classified part for [`AsyncSendBuilder::submit_batch`].
-pub use handler::SendPart;
 /// Builder for IO_LINK chained sends.
 pub use handler::SendChainBuilder;
+/// Pre-classified part for [`AsyncSendBuilder::submit_batch`].
+pub use handler::SendPart;
 /// Opaque handle for a UDP socket.
 pub use handler::UdpToken;
 
@@ -103,6 +103,8 @@ pub use runtime::io::ConnectFuture;
 pub use runtime::io::Deadline;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
+/// Future that resolves when recv data is available (sink, accumulator, or close).
+pub use runtime::io::RecvReadyFuture;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
 /// Future returned by [`sleep()`].
@@ -111,8 +113,6 @@ pub use runtime::io::SleepFuture;
 pub use runtime::io::TimeoutFuture;
 /// Async context for a UDP socket.
 pub use runtime::io::UdpCtx;
-/// Future that resolves when recv data is available (sink, accumulator, or close).
-pub use runtime::io::RecvReadyFuture;
 /// Future returned by [`UdpCtx::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
 /// Future that provides received data.

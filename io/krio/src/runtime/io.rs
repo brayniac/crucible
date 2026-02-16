@@ -174,25 +174,23 @@ impl ConnCtx {
     /// resumes and clears the sink.
     pub unsafe fn set_recv_sink(&self, target: *mut u8, len: usize) {
         with_state(|_driver, executor| {
-            executor.recv_sinks[self.conn_index as usize] = Some(
-                crate::runtime::RecvSink {
-                    ptr: target,
-                    cap: len,
-                    pos: 0,
-                },
-            );
+            executor.recv_sinks[self.conn_index as usize] = Some(crate::runtime::RecvSink {
+                ptr: target,
+                cap: len,
+                pos: 0,
+            });
         });
     }
 
     /// Remove the recv sink and return the number of bytes written to it.
     /// Returns 0 if no sink was active.
     pub fn take_recv_sink(&self) -> usize {
-        with_state(|_driver, executor| {
-            match executor.recv_sinks[self.conn_index as usize].take() {
+        with_state(
+            |_driver, executor| match executor.recv_sinks[self.conn_index as usize].take() {
                 Some(sink) => sink.pos,
                 None => 0,
-            }
-        })
+            },
+        )
     }
 
     /// Returns a future that becomes ready when any recv data is available
