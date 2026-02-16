@@ -50,10 +50,7 @@ pub trait AsyncEventHandler: Send + 'static {
     /// Return `Some(future)` to spawn a standalone task that handles datagrams
     /// for this socket. The future typically loops on [`UdpCtx::recv_from()`].
     /// Return `None` to ignore this UDP socket.
-    fn on_udp_bind(
-        &self,
-        _udp: UdpCtx,
-    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(&self, _udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         None
     }
 

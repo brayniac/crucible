@@ -85,15 +85,15 @@ pub fn spawn(future: impl Future<Output = ()> + 'static) -> TaskId {
 ///
 /// Panics if called outside the krio async executor.
 pub fn try_spawn(future: impl Future<Output = ()> + 'static) -> Result<TaskId, SpawnError> {
-    with_state(|_driver, executor| {
-        match executor.standalone_slab.spawn(Box::pin(future)) {
+    with_state(
+        |_driver, executor| match executor.standalone_slab.spawn(Box::pin(future)) {
             Some(idx) => {
                 executor.ready_queue.push_back(idx | STANDALONE_BIT);
                 Ok(TaskId(idx))
             }
             None => Err(SpawnError),
-        }
-    })
+        },
+    )
 }
 
 impl TaskId {
@@ -608,8 +608,9 @@ impl Future for SleepFuture {
 
             let is_absolute = self.absolute.is_some();
             if let Some(deadline) = self.absolute {
-                executor.timer_pool.timespecs[slot as usize] =
-                    io_uring::types::Timespec::new().sec(deadline.secs).nsec(deadline.nsecs);
+                executor.timer_pool.timespecs[slot as usize] = io_uring::types::Timespec::new()
+                    .sec(deadline.secs)
+                    .nsec(deadline.nsecs);
             } else {
                 let secs = self.duration.as_secs();
                 let nsecs = self.duration.subsec_nanos();
@@ -990,10 +991,10 @@ impl Future for UdpRecvFuture {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|_driver, executor| {
             let idx = self.udp_index as usize;
-            if idx < executor.udp_recv_queues.len() {
-                if let Some(datagram) = executor.udp_recv_queues[idx].pop_front() {
-                    return Poll::Ready(datagram);
-                }
+            if idx < executor.udp_recv_queues.len()
+                && let Some(datagram) = executor.udp_recv_queues[idx].pop_front()
+            {
+                return Poll::Ready(datagram);
             }
             // Register as waiter so the CQE handler wakes us.
             let task_id = CURRENT_TASK_ID.with(|c| c.get());

@@ -20,6 +20,7 @@ use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::ring::Ring;
 
 /// Per-worker UDP socket state.
+#[allow(dead_code)]
 pub(crate) struct UdpSocketState {
     /// Fixed file table index for this socket.
     pub fd_index: u32,
@@ -52,17 +53,13 @@ pub(crate) fn sockaddr_to_socket_addr(
 ) -> Option<SocketAddr> {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     match addr.ss_family as libc::c_int {
-        libc::AF_INET
-            if len >= std::mem::size_of::<libc::sockaddr_in>() as u32 =>
-        {
+        libc::AF_INET if len >= std::mem::size_of::<libc::sockaddr_in>() as u32 => {
             let sa = unsafe { &*(addr as *const _ as *const libc::sockaddr_in) };
             let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
             let port = u16::from_be(sa.sin_port);
             Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
         }
-        libc::AF_INET6
-            if len >= std::mem::size_of::<libc::sockaddr_in6>() as u32 =>
-        {
+        libc::AF_INET6 if len >= std::mem::size_of::<libc::sockaddr_in6>() as u32 => {
             let sa = unsafe { &*(addr as *const _ as *const libc::sockaddr_in6) };
             let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
             let port = u16::from_be(sa.sin6_port);
@@ -232,8 +229,7 @@ impl Driver {
         let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
         for (udp_idx, bind_addr) in config.udp_bind.iter().enumerate() {
             let fd_index = config.max_connections + udp_idx as u32;
-            let state =
-                Self::setup_udp_socket(&ring, *bind_addr, fd_index)?;
+            let state = Self::setup_udp_socket(&ring, *bind_addr, fd_index)?;
             udp_sockets.push(state);
         }
 
@@ -279,8 +275,7 @@ impl Driver {
         // Submit initial recvmsg for each UDP socket.
         for udp_idx in 0..driver.udp_sockets.len() {
             let ud = UserData::encode(OpTag::RecvMsgUdp, udp_idx as u32, 0);
-            let msghdr_ptr = &mut *driver.udp_sockets[udp_idx].recv_msghdr
-                as *mut libc::msghdr;
+            let msghdr_ptr = &mut *driver.udp_sockets[udp_idx].recv_msghdr as *mut libc::msghdr;
             let fd_index = driver.udp_sockets[udp_idx].fd_index;
             let _ = driver.ring.submit_recvmsg(fd_index, msghdr_ptr, ud);
         }
@@ -445,62 +440,55 @@ impl Driver {
         // Bind.
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let addr_len = socket_addr_to_sockaddr(bind_addr, &mut storage);
-        let ret = unsafe {
-            libc::bind(
-                fd,
-                &storage as *const _ as *const libc::sockaddr,
-                addr_len,
-            )
-        };
+        let ret =
+            unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(crate::error::Error::Io(err));
         }
 
         // Register in the fixed file table, then close the original fd.
         ring.register_files_update(fd_index, &[fd])?;
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
 
         // Allocate recv state.
         let recv_buf = vec![0u8; 65536].into_boxed_slice();
-        let mut recv_addr: Box<libc::sockaddr_storage> =
-            Box::new(unsafe { std::mem::zeroed() });
+        let mut recv_addr: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
         let mut recv_iov = Box::new(libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         });
-        let mut recv_msghdr: Box<libc::msghdr> =
-            Box::new(unsafe { std::mem::zeroed() });
+        let mut recv_msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
 
         // Set up pointers (stable because everything is boxed).
         recv_iov.iov_base = recv_buf.as_ptr() as *mut libc::c_void;
         recv_iov.iov_len = recv_buf.len();
         recv_msghdr.msg_name = &mut *recv_addr as *mut _ as *mut libc::c_void;
-        recv_msghdr.msg_namelen =
-            std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        recv_msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
         recv_msghdr.msg_iov = &mut *recv_iov as *mut libc::iovec;
         recv_msghdr.msg_iovlen = 1;
 
         // Allocate send state.
-        let send_addr: Box<libc::sockaddr_storage> =
-            Box::new(unsafe { std::mem::zeroed() });
+        let send_addr: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
         let send_iov = Box::new(libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         });
-        let mut send_msghdr: Box<libc::msghdr> =
-            Box::new(unsafe { std::mem::zeroed() });
+        let mut send_msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
 
         send_msghdr.msg_name = Box::into_raw(send_addr) as *mut libc::c_void;
-        send_msghdr.msg_iov = Box::into_raw(send_iov) as *mut libc::iovec;
+        send_msghdr.msg_iov = Box::into_raw(send_iov);
         send_msghdr.msg_iovlen = 1;
 
         // Reconstruct the Boxes from the raw pointers for ownership.
         let send_addr =
             unsafe { Box::from_raw(send_msghdr.msg_name as *mut libc::sockaddr_storage) };
-        let send_iov =
-            unsafe { Box::from_raw(send_msghdr.msg_iov) };
+        let send_iov = unsafe { Box::from_raw(send_msghdr.msg_iov) };
 
         Ok(UdpSocketState {
             fd_index,
@@ -574,8 +562,7 @@ impl Driver {
         }
         self.udp_sockets[idx].reset_recv_namelen();
         let ud = UserData::encode(OpTag::RecvMsgUdp, udp_index, 0);
-        let msghdr_ptr =
-            &mut *self.udp_sockets[idx].recv_msghdr as *mut libc::msghdr;
+        let msghdr_ptr = &mut *self.udp_sockets[idx].recv_msghdr as *mut libc::msghdr;
         let fd_index = self.udp_sockets[idx].fd_index;
         let _ = self.ring.submit_recvmsg(fd_index, msghdr_ptr, ud);
     }

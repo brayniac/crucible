@@ -6,9 +6,9 @@
 use protocol_resp::{Request, Value};
 use tokio::sync::oneshot;
 
+use crate::Client;
 use crate::connection::InFlightCommand;
 use crate::error::ClientError;
-use crate::Client;
 
 /// A pipeline accumulates commands and executes them as a batch.
 ///
@@ -98,8 +98,8 @@ impl Pipeline {
         let key = self.first_key.as_deref().unwrap_or(b"");
         let shard = self.client.inner.ring.route(key);
         let pool = &self.client.inner.pools[shard];
-        let idx = pool.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % pool.connections.len();
+        let idx =
+            pool.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.connections.len();
         let sender = &pool.connections[idx];
 
         let mut receivers = Vec::with_capacity(self.commands.len());

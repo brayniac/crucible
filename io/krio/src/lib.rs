@@ -53,11 +53,11 @@ pub(crate) mod completion;
 pub(crate) mod connection;
 pub(crate) mod driver;
 pub(crate) mod event_loop;
+pub(crate) mod metrics;
 pub(crate) mod ring;
 pub(crate) mod runtime;
 #[cfg(feature = "tls")]
 pub(crate) mod tls;
-pub(crate) mod metrics;
 pub(crate) mod worker;
 
 // ── Public modules ──────────────────────────────────────────────────────
@@ -85,6 +85,10 @@ pub use handler::UdpToken;
 
 // ── Re-exports: Async API ───────────────────────────────────────────────
 
+/// Error returned by [`try_spawn()`] when the standalone task slab is full.
+pub use error::SpawnError;
+/// Error returned by [`try_sleep()`] and [`try_timeout()`] when the timer pool is full.
+pub use error::TimerExhausted;
 /// Trait for async event handlers (one task per connection).
 pub use runtime::handler::AsyncEventHandler;
 /// Async scatter-gather send builder.
@@ -93,6 +97,8 @@ pub use runtime::io::AsyncSendBuilder;
 pub use runtime::io::ConnCtx;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
+/// A monotonic clock deadline for absolute timers.
+pub use runtime::io::Deadline;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
 /// Future that completes when a send finishes.
@@ -101,30 +107,40 @@ pub use runtime::io::SendFuture;
 pub use runtime::io::SleepFuture;
 /// Future returned by [`timeout()`].
 pub use runtime::io::TimeoutFuture;
+/// Async context for a UDP socket.
+pub use runtime::io::UdpCtx;
+/// Future returned by [`UdpCtx::recv_from()`].
+pub use runtime::io::UdpRecvFuture;
 /// Future that provides received data.
 pub use runtime::io::WithDataFuture;
 /// Create a future that completes after a duration.
 pub use runtime::io::sleep;
+/// Create a future that completes at an absolute deadline.
+pub use runtime::io::sleep_until;
 /// Spawn a standalone async task on the current worker.
 pub use runtime::io::spawn;
 /// Wrap a future with a deadline.
 pub use runtime::io::timeout;
+/// Wrap a future with an absolute deadline.
+pub use runtime::io::timeout_at;
 /// Fallible sleep that returns an error if the timer pool is exhausted.
 pub use runtime::io::try_sleep;
+/// Fallible sleep_until that returns an error if the timer pool is exhausted.
+pub use runtime::io::try_sleep_until;
 /// Spawn a standalone task, returning an error if the slab is full.
 pub use runtime::io::try_spawn;
 /// Fallible timeout that returns an error if the timer pool is exhausted.
 pub use runtime::io::try_timeout;
-/// Opaque handle for a standalone spawned task.
-pub use runtime::task::TaskId;
-/// Error returned by [`try_spawn()`] when the standalone task slab is full.
-pub use error::SpawnError;
-/// Error returned by [`try_sleep()`] and [`try_timeout()`] when the timer pool is full.
-pub use error::TimerExhausted;
-/// Poll two futures concurrently, returning whichever completes first.
-pub use runtime::select::select;
-/// Poll three futures concurrently, returning whichever completes first.
-pub use runtime::select::select3;
+/// Fallible timeout_at that returns an error if the timer pool is exhausted.
+pub use runtime::io::try_timeout_at;
+/// Future returned by [`join()`].
+pub use runtime::join::Join;
+/// Future returned by [`join3()`].
+pub use runtime::join::Join3;
+/// Poll two futures concurrently, returning both outputs when complete.
+pub use runtime::join::join;
+/// Poll three futures concurrently, returning all outputs when complete.
+pub use runtime::join::join3;
 /// Result of [`select()`] — which branch completed.
 pub use runtime::select::Either;
 /// Result of [`select3()`] — which branch completed.
@@ -133,28 +149,12 @@ pub use runtime::select::Either3;
 pub use runtime::select::Select;
 /// Future returned by [`select3()`].
 pub use runtime::select::Select3;
-/// Poll two futures concurrently, returning both outputs when complete.
-pub use runtime::join::join;
-/// Poll three futures concurrently, returning all outputs when complete.
-pub use runtime::join::join3;
-/// Future returned by [`join()`].
-pub use runtime::join::Join;
-/// Future returned by [`join3()`].
-pub use runtime::join::Join3;
-/// A monotonic clock deadline for absolute timers.
-pub use runtime::io::Deadline;
-/// Create a future that completes at an absolute deadline.
-pub use runtime::io::sleep_until;
-/// Fallible sleep_until that returns an error if the timer pool is exhausted.
-pub use runtime::io::try_sleep_until;
-/// Wrap a future with an absolute deadline.
-pub use runtime::io::timeout_at;
-/// Fallible timeout_at that returns an error if the timer pool is exhausted.
-pub use runtime::io::try_timeout_at;
-/// Async context for a UDP socket.
-pub use runtime::io::UdpCtx;
-/// Future returned by [`UdpCtx::recv_from()`].
-pub use runtime::io::UdpRecvFuture;
+/// Poll two futures concurrently, returning whichever completes first.
+pub use runtime::select::select;
+/// Poll three futures concurrently, returning whichever completes first.
+pub use runtime::select::select3;
+/// Opaque handle for a standalone spawned task.
+pub use runtime::task::TaskId;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
 

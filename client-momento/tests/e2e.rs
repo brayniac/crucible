@@ -204,9 +204,8 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
 async fn wait_for_client(client: &MomentoClient) {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(10) {
-        match client.get(b"__health_check__").await {
-            Ok(_) => return, // Even a miss means connection is working
-            Err(_) => {}
+        if client.get(b"__health_check__").await.is_ok() {
+            return; // Even a miss means connection is working
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

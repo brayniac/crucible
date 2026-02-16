@@ -107,6 +107,7 @@ impl ProvidedBufRing {
     }
 
     /// Replenish a single buffer back into the ring after processing.
+    #[allow(dead_code)]
     pub fn replenish(&mut self, bid: u16) {
         self.push_entry(bid);
         self.commit_tail();

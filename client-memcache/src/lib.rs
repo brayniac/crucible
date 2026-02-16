@@ -132,8 +132,7 @@ impl Client {
         krio_config.tick_timeout_us = 10_000; // 10ms tick for reconnects
 
         // Launch without bind (client-only mode)
-        let (shutdown, threads) =
-            krio::KrioBuilder::new(krio_config).launch::<ClientHandler>()?;
+        let (shutdown, threads) = krio::KrioBuilder::new(krio_config).launch::<ClientHandler>()?;
 
         // Build WorkerHandle for each worker
         let eventfds = shutdown.worker_eventfds();

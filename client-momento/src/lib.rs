@@ -135,8 +135,7 @@ impl MomentoClient {
         }
 
         // Launch without bind (client-only mode)
-        let (shutdown, threads) =
-            krio::KrioBuilder::new(krio_config).launch::<MomentoHandler>()?;
+        let (shutdown, threads) = krio::KrioBuilder::new(krio_config).launch::<MomentoHandler>()?;
 
         // Build WorkerHandle for each worker
         let eventfds = shutdown.worker_eventfds();

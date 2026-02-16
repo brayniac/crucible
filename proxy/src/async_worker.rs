@@ -88,8 +88,7 @@ impl AsyncEventHandler for AsyncProxyHandler {
 
         // Build ketama consistent hash ring from backend addresses.
         let server_ids: Vec<String> = backends.iter().map(|a| a.to_string()).collect();
-        let ring =
-            ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let ring = ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
         info!(
             worker_id = cfg.worker_id,
@@ -150,16 +149,17 @@ async fn handle_client(
                 Ok((cmd, consumed)) => {
                     // Route the command to the appropriate backend.
                     let endpoint_idx = route_command(&cmd, &ring, backends.len());
-                    let backend = match get_or_connect(&client, &mut conns, &backends, endpoint_idx).await {
-                        Some(conn) => conn,
-                        None => {
-                            let _ = client.send(b"-ERR backend unavailable\r\n");
-                            for (_, conn) in conns.drain() {
-                                conn.close();
+                    let backend =
+                        match get_or_connect(&client, &mut conns, &backends, endpoint_idx).await {
+                            Some(conn) => conn,
+                            None => {
+                                let _ = client.send(b"-ERR backend unavailable\r\n");
+                                for (_, conn) in conns.drain() {
+                                    conn.close();
+                                }
+                                return;
                             }
-                            return;
-                        }
-                    };
+                        };
 
                     match process_command(&cmd, &client, backend, &cache).await {
                         CommandResult::Responded => {}
@@ -194,9 +194,7 @@ fn route_command(cmd: &Command<'_>, ring: &ketama::Ring, num_backends: usize) ->
         return 0;
     }
     match cmd {
-        Command::Get { key } | Command::Set { key, .. } | Command::Del { key } => {
-            ring.route(key)
-        }
+        Command::Get { key } | Command::Set { key, .. } | Command::Del { key } => ring.route(key),
         // Non-keyed commands go to endpoint 0.
         _ => 0,
     }
@@ -261,11 +259,11 @@ async fn process_command(
     }
 
     // GET: check cache first.
-    if let Command::Get { key } = cmd {
-        if let Some(data) = cache.with_value(key, |v| v.to_vec()) {
-            let _ = client.send(&data);
-            return CommandResult::Responded;
-        }
+    if let Command::Get { key } = cmd
+        && let Some(data) = cache.with_value(key, |v| v.to_vec())
+    {
+        let _ = client.send(&data);
+        return CommandResult::Responded;
     }
 
     // Invalidate cache on writes.
@@ -307,13 +305,12 @@ async fn process_command(
                 let response_bytes = &resp_buf[..consumed];
 
                 // Cache successful GET responses.
-                if let Command::Get { key } = cmd {
-                    if !response_bytes.starts_with(b"$-1\r\n")
-                        && !response_bytes.starts_with(b"_\r\n")
-                        && !response_bytes.starts_with(b"-")
-                    {
-                        cache.set(key, response_bytes);
-                    }
+                if let Command::Get { key } = cmd
+                    && !response_bytes.starts_with(b"$-1\r\n")
+                    && !response_bytes.starts_with(b"_\r\n")
+                    && !response_bytes.starts_with(b"-")
+                {
+                    cache.set(key, response_bytes);
                 }
 
                 let _ = client.send(response_bytes);
@@ -388,7 +385,10 @@ fn write_usize(buf: &mut BytesMut, mut n: usize) {
 // ── Public API ──────────────────────────────────────────────────────────
 
 /// Run the proxy in async mode with the given configuration.
-pub fn run_async(config: &Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_async(
+    config: &Config,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let num_workers = config.threads();
     let cpu_affinity = config.cpu_affinity();
     let listen_addr = config.proxy.listen;

@@ -156,7 +156,7 @@ mod tests {
         // Each of 3 servers should get 25-45% of 10k keys
         for (i, &count) in counts.iter().enumerate() {
             assert!(
-                count >= 2500 && count <= 4500,
+                (2500..=4500).contains(&count),
                 "server {i} got {count} keys, expected 2500-4500: {counts:?}"
             );
         }

@@ -7,15 +7,15 @@
 
 use crate::connection::{Connection, SliceRecvBuf};
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, WorkerStats};
-use cache_core::Cache;
 use bytes::Bytes;
+use cache_core::Cache;
 use krio::{AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, RegionId, SendGuard};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ── Config channel ──────────────────────────────────────────────────────
 
@@ -340,14 +340,8 @@ async fn drain_pending(
         if !guard_batch.is_empty() {
             let batch_len: usize = guard_batch.iter().map(|b| b.len()).sum();
             let force_await = need_yield;
-            match flush_guard_batch(
-                conn,
-                &mut guard_batch,
-                slot_size,
-                &mut yielded,
-                force_await,
-            )
-            .await
+            match flush_guard_batch(conn, &mut guard_batch, slot_size, &mut yielded, force_await)
+                .await
             {
                 Ok(()) => advanced += batch_len,
                 Err(true) => {

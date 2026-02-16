@@ -86,9 +86,7 @@ impl Client {
 
         // Build ketama ring
         let server_ids: Vec<String> = server_addrs.iter().map(|a| a.to_string()).collect();
-        let ring = ketama::Ring::build(
-            &server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        );
+        let ring = ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
         // Spawn connection pools
         let mut pools = Vec::with_capacity(server_addrs.len());
@@ -123,7 +121,10 @@ impl Client {
 
         let (tx, rx) = oneshot::channel();
         let cmd = InFlightCommand { encoded, tx };
-        sender.send(cmd).await.map_err(|_| ClientError::PoolClosed)?;
+        sender
+            .send(cmd)
+            .await
+            .map_err(|_| ClientError::PoolClosed)?;
 
         let result = if let Some(timeout) = self.inner.command_timeout {
             tokio::time::timeout(timeout, rx)
@@ -153,7 +154,10 @@ impl Client {
 
         let (tx, rx) = oneshot::channel();
         let cmd = InFlightCommand { encoded, tx };
-        sender.send(cmd).await.map_err(|_| ClientError::PoolClosed)?;
+        sender
+            .send(cmd)
+            .await
+            .map_err(|_| ClientError::PoolClosed)?;
 
         let result = if let Some(timeout) = self.inner.command_timeout {
             tokio::time::timeout(timeout, rx)
@@ -245,11 +249,7 @@ impl Client {
     }
 
     /// Set a key only if it does not already exist. Returns true if the key was set.
-    pub async fn set_nx(
-        &self,
-        key: &[u8],
-        value: impl AsRef<[u8]>,
-    ) -> Result<bool, ClientError> {
+    pub async fn set_nx(&self, key: &[u8], value: impl AsRef<[u8]>) -> Result<bool, ClientError> {
         let encoded = Self::encode_set_request(&Request::set(key, value.as_ref()).nx());
         let resp = self.execute(key, encoded).await?;
         match resp {
@@ -434,14 +434,8 @@ impl Client {
     // ── Hash commands ───────────────────────────────────────────────────
 
     /// Set a field in a hash. Returns true if the field is new.
-    pub async fn hset(
-        &self,
-        key: &[u8],
-        field: &[u8],
-        value: &[u8],
-    ) -> Result<bool, ClientError> {
-        let encoded =
-            Self::encode_request(&Request::cmd(b"HSET").arg(key).arg(field).arg(value));
+    pub async fn hset(&self, key: &[u8], field: &[u8], value: &[u8]) -> Result<bool, ClientError> {
+        let encoded = Self::encode_request(&Request::cmd(b"HSET").arg(key).arg(field).arg(value));
         let resp = self.execute(key, encoded).await?;
         match resp {
             Value::Integer(n) => Ok(n > 0),
@@ -560,12 +554,7 @@ impl Client {
     }
 
     /// Increment the integer value of a hash field.
-    pub async fn hincrby(
-        &self,
-        key: &[u8],
-        field: &[u8],
-        delta: i64,
-    ) -> Result<i64, ClientError> {
+    pub async fn hincrby(&self, key: &[u8], field: &[u8], delta: i64) -> Result<i64, ClientError> {
         let delta_str = delta.to_string();
         let encoded = Self::encode_request(
             &Request::cmd(b"HINCRBY")
@@ -587,8 +576,7 @@ impl Client {
         field: &[u8],
         value: &[u8],
     ) -> Result<bool, ClientError> {
-        let encoded =
-            Self::encode_request(&Request::cmd(b"HSETNX").arg(key).arg(field).arg(value));
+        let encoded = Self::encode_request(&Request::cmd(b"HSETNX").arg(key).arg(field).arg(value));
         let resp = self.execute(key, encoded).await?;
         match resp {
             Value::Integer(n) => Ok(n == 1),
@@ -839,11 +827,7 @@ impl Client {
     }
 
     /// Get random members from a set.
-    pub async fn srandmember(
-        &self,
-        key: &[u8],
-        count: i64,
-    ) -> Result<Vec<Bytes>, ClientError> {
+    pub async fn srandmember(&self, key: &[u8], count: i64) -> Result<Vec<Bytes>, ClientError> {
         let count_str = count.to_string();
         let encoded = Self::encode_request(
             &Request::cmd(b"SRANDMEMBER")

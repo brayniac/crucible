@@ -67,10 +67,7 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
 // ── Bytes ────────────────────────────────────────────────────────
 
-#[metric(
-    name = "krio/bytes/received",
-    description = "Total bytes received"
-)]
+#[metric(name = "krio/bytes/received", description = "Total bytes received")]
 pub static BYTES_RECEIVED: Counter = Counter::new(&BYTES, bytes::RECEIVED);
 
 #[metric(name = "krio/bytes/sent", description = "Total bytes sent")]
@@ -78,10 +75,7 @@ pub static BYTES_SENT: Counter = Counter::new(&BYTES, bytes::SENT);
 
 // ── Ring utilization ─────────────────────────────────────────────
 
-#[metric(
-    name = "krio/cqe/processed",
-    description = "Total CQEs processed"
-)]
+#[metric(name = "krio/cqe/processed", description = "Total CQEs processed")]
 pub static CQE_PROCESSED: Counter = Counter::new(&RING, ring::CQE_PROCESSED);
 
 #[metric(

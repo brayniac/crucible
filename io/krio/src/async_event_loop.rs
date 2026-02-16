@@ -9,9 +9,9 @@ use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
 use crate::connection::RecvMode;
 use crate::driver::Driver;
-use crate::runtime::handler::AsyncEventHandler;
 use crate::driver::sockaddr_to_socket_addr;
 use crate::metrics;
+use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, clear_driver_state, set_driver_state};
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
@@ -69,10 +69,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let udp_ctx = UdpCtx {
                 udp_index: udp_idx as u32,
             };
-            if let Some(future) = self.handler.on_udp_bind(udp_ctx) {
-                if let Some(idx) = self.executor.standalone_slab.spawn(future) {
-                    self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
-                }
+            if let Some(future) = self.handler.on_udp_bind(udp_ctx)
+                && let Some(idx) = self.executor.standalone_slab.spawn(future)
+            {
+                self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
             }
         }
 

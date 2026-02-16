@@ -159,8 +159,7 @@ impl HttpClient {
         }
 
         // Launch without bind (client-only mode)
-        let (shutdown, threads) =
-            krio::KrioBuilder::new(krio_config).launch::<HttpHandler>()?;
+        let (shutdown, threads) = krio::KrioBuilder::new(krio_config).launch::<HttpHandler>()?;
 
         // Build WorkerHandle for each worker
         let eventfds = shutdown.worker_eventfds();

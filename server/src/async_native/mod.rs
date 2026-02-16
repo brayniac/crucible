@@ -85,8 +85,7 @@ mod server {
 
         let _launch_guard = launch_lock();
 
-        let (config_tx, config_rx) =
-            crossbeam_channel::bounded::<HandlerConfig<C>>(num_workers);
+        let (config_tx, config_rx) = crossbeam_channel::bounded::<HandlerConfig<C>>(num_workers);
         for _ in 0..num_workers {
             config_tx
                 .send(HandlerConfig {
@@ -143,8 +142,7 @@ mod server {
         if active_conns > 0 {
             warn!(
                 active_connections = active_conns,
-                "Drain timeout reached, {} connections still active — forcing exit",
-                active_conns
+                "Drain timeout reached, {} connections still active — forcing exit", active_conns
             );
             std::process::exit(0);
         }
@@ -186,13 +184,18 @@ mod server {
                 );
                 eprintln!(
                     "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
-                    "worker", "polls", "accepts", "closes", "recv", "send_rdy", "bytes_in",
-                    "bytes_out", "conns"
+                    "worker",
+                    "polls",
+                    "accepts",
+                    "closes",
+                    "recv",
+                    "send_rdy",
+                    "bytes_in",
+                    "bytes_out",
+                    "conns"
                 );
 
-                for (i, (curr, prev)) in
-                    current.iter().zip(prev_snapshots.iter()).enumerate()
-                {
+                for (i, (curr, prev)) in current.iter().zip(prev_snapshots.iter()).enumerate() {
                     let delta = curr.delta(prev);
                     eprintln!(
                         "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",

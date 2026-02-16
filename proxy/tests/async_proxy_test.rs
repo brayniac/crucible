@@ -9,11 +9,11 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use krio::{AsyncEventHandler, ConnCtx, Config, KrioBuilder};
+use krio::{AsyncEventHandler, Config, ConnCtx, KrioBuilder};
 use proxy::async_worker::run_async;
 
 // ── RESP backend handler ────────────────────────────────────────────
@@ -121,7 +121,11 @@ fn is_complete_resp(s: &str) -> bool {
 }
 
 /// Start a backend krio echo server.
-fn start_backend() -> (String, krio::ShutdownHandle, Vec<std::thread::JoinHandle<Result<(), krio::Error>>>) {
+fn start_backend() -> (
+    String,
+    krio::ShutdownHandle,
+    Vec<std::thread::JoinHandle<Result<(), krio::Error>>>,
+) {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -137,11 +141,7 @@ fn start_backend() -> (String, krio::ShutdownHandle, Vec<std::thread::JoinHandle
 /// Proxy config channel — separate from the handler's internal one.
 /// We need a way to pass config to run_async that doesn't conflict with
 /// the module-level OnceLock.
-fn make_proxy_config(
-    listen_port: u16,
-    backend_addr: &str,
-    cache_enabled: bool,
-) -> proxy::Config {
+fn make_proxy_config(listen_port: u16, backend_addr: &str, cache_enabled: bool) -> proxy::Config {
     // Build a minimal config.
     let toml_str = format!(
         r#"
@@ -185,7 +185,7 @@ fn start_async_proxy(
     let config = config.clone();
     std::thread::spawn(move || {
         run_async(&config, shutdown).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            Box::new(std::io::Error::other(e.to_string()))
         })
     })
 }
@@ -249,18 +249,12 @@ fn async_proxy_set_get() {
     // Since the backend echoes everything, the first parseable RESP value
     // from the echoed "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
     // is actually parsed as a RESP array. The proxy reads it and forwards it.
-    assert!(
-        !response.is_empty(),
-        "expected non-empty response for SET"
-    );
+    assert!(!response.is_empty(), "expected non-empty response for SET");
 
     // GET key
     let get_cmd = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
     let response = send_resp_command(&mut stream, get_cmd);
-    assert!(
-        !response.is_empty(),
-        "expected non-empty response for GET"
-    );
+    assert!(!response.is_empty(), "expected non-empty response for GET");
 
     drop(stream);
     proxy_shutdown.store(true, Ordering::SeqCst);
@@ -375,10 +369,7 @@ fn async_proxy_multiple_clients() {
             .unwrap();
 
         let response = send_resp_command(&mut stream, b"*1\r\n$4\r\nPING\r\n");
-        assert_eq!(
-            response, "+PONG\r\n",
-            "client {i} did not get PONG"
-        );
+        assert_eq!(response, "+PONG\r\n", "client {i} did not get PONG");
         drop(stream);
     }
 

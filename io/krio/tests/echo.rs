@@ -818,9 +818,7 @@ impl AsyncEventHandler for ForwarderHandler {
 
     fn create_for_worker(_id: usize) -> Self {
         let addr = *FORWARDER_BACKEND_ADDR.get().expect("backend addr not set");
-        ForwarderHandler {
-            backend_addr: addr,
-        }
+        ForwarderHandler { backend_addr: addr }
     }
 }
 
@@ -941,7 +939,10 @@ fn async_outbound_connect_refused() {
                 total += n;
                 // Check if we have a complete response.
                 let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
-                if s.starts_with("ERR:") || s.starts_with("CONNECTED") || s.starts_with("SUBMIT_ERR:") {
+                if s.starts_with("ERR:")
+                    || s.starts_with("CONNECTED")
+                    || s.starts_with("SUBMIT_ERR:")
+                {
                     break;
                 }
             }
@@ -1223,8 +1224,12 @@ fn async_select_two_connections() {
         .expect("backend2 launch failed");
     wait_for_server(&backend2_addr);
 
-    SELECT_BACKEND1_ADDR.set(backend1_addr.parse().unwrap()).ok();
-    SELECT_BACKEND2_ADDR.set(backend2_addr.parse().unwrap()).ok();
+    SELECT_BACKEND1_ADDR
+        .set(backend1_addr.parse().unwrap())
+        .ok();
+    SELECT_BACKEND2_ADDR
+        .set(backend2_addr.parse().unwrap())
+        .ok();
 
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -1235,7 +1240,9 @@ fn async_select_two_connections() {
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let mut buf = [0u8; 64];
     let mut total = 0;
@@ -1265,11 +1272,17 @@ fn async_select_two_connections() {
     );
 
     shutdown.shutdown();
-    for h in handles { h.join().unwrap().unwrap(); }
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
     b1_shutdown.shutdown();
-    for h in b1_handles { h.join().unwrap().unwrap(); }
+    for h in b1_handles {
+        h.join().unwrap().unwrap();
+    }
     b2_shutdown.shutdown();
-    for h in b2_handles { h.join().unwrap().unwrap(); }
+    for h in b2_handles {
+        h.join().unwrap().unwrap();
+    }
 }
 
 /// Handler that uses select to show the second branch can win.
@@ -1287,16 +1300,28 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
             let backend1 = match client.connect(addr1) {
                 Ok(fut) => match fut.await {
                     Ok(ctx) => ctx,
-                    Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                    Err(e) => {
+                        let _ = client.send(format!("ERR:{e}").as_bytes());
+                        return;
+                    }
                 },
-                Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                Err(e) => {
+                    let _ = client.send(format!("ERR:{e}").as_bytes());
+                    return;
+                }
             };
             let backend2 = match client.connect(addr2) {
                 Ok(fut) => match fut.await {
                     Ok(ctx) => ctx,
-                    Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                    Err(e) => {
+                        let _ = client.send(format!("ERR:{e}").as_bytes());
+                        return;
+                    }
                 },
-                Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                Err(e) => {
+                    let _ = client.send(format!("ERR:{e}").as_bytes());
+                    return;
+                }
             };
 
             // Send data to backend2 only.
@@ -1367,7 +1392,9 @@ fn async_select_second_wins() {
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let mut buf = [0u8; 64];
     let mut total = 0;
@@ -1397,11 +1424,17 @@ fn async_select_second_wins() {
     );
 
     shutdown.shutdown();
-    for h in handles { h.join().unwrap().unwrap(); }
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
     b1_shutdown.shutdown();
-    for h in b1_handles { h.join().unwrap().unwrap(); }
+    for h in b1_handles {
+        h.join().unwrap().unwrap();
+    }
     b2_shutdown.shutdown();
-    for h in b2_handles { h.join().unwrap().unwrap(); }
+    for h in b2_handles {
+        h.join().unwrap().unwrap();
+    }
 }
 
 // ── Select with sleep test (timer slot leak check) ──────────────────
@@ -1461,7 +1494,9 @@ fn async_select_with_sleep() {
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10)).into()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
 
     // Send 300 messages — each triggers a select(with_data, sleep) where
     // data wins and the SleepFuture is dropped.
@@ -1511,9 +1546,15 @@ impl AsyncEventHandler for Select3Handler {
             let backend = match client.connect(backend_addr) {
                 Ok(fut) => match fut.await {
                     Ok(ctx) => ctx,
-                    Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                    Err(e) => {
+                        let _ = client.send(format!("ERR:{e}").as_bytes());
+                        return;
+                    }
                 },
-                Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                Err(e) => {
+                    let _ = client.send(format!("ERR:{e}").as_bytes());
+                    return;
+                }
             };
 
             // Send data to backend so it echoes.
@@ -1539,12 +1580,16 @@ impl AsyncEventHandler for Select3Handler {
             )
             .await
             {
-                krio::Either3::First(_) => { let _ = client.send(b"FIRST"); }
+                krio::Either3::First(_) => {
+                    let _ = client.send(b"FIRST");
+                }
                 krio::Either3::Second(_) => {
                     let _ = client.send(b"SECOND:");
                     let _ = client.send(&backend_buf);
                 }
-                krio::Either3::Third(()) => { let _ = client.send(b"THIRD"); }
+                krio::Either3::Third(()) => {
+                    let _ = client.send(b"THIRD");
+                }
             }
 
             krio::sleep(Duration::from_secs(5)).await;
@@ -1576,7 +1621,9 @@ fn async_select3_basic() {
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let mut buf = [0u8; 64];
     let mut total = 0;
@@ -1586,7 +1633,9 @@ fn async_select3_basic() {
             Ok(n) => {
                 total += n;
                 let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
-                if s.starts_with("SECOND:") && s.len() >= 12 { break; }
+                if s.starts_with("SECOND:") && s.len() >= 12 {
+                    break;
+                }
                 if s.starts_with("FIRST") || s.starts_with("THIRD") || s.starts_with("ERR") {
                     break;
                 }
@@ -1604,9 +1653,13 @@ fn async_select3_basic() {
     );
 
     shutdown.shutdown();
-    for h in handles { h.join().unwrap().unwrap(); }
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
     b_shutdown.shutdown();
-    for h in b_handles { h.join().unwrap().unwrap(); }
+    for h in b_handles {
+        h.join().unwrap().unwrap();
+    }
 }
 
 // ── try_spawn / cancel tests ────────────────────────────────────────
@@ -1670,7 +1723,9 @@ fn async_try_spawn_failure() {
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.write_all(b"x").unwrap();
     stream.flush().unwrap();
 
@@ -1682,7 +1737,9 @@ fn async_try_spawn_failure() {
             Ok(n) => {
                 total += n;
                 let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
-                if s == "OK" || s == "BOTH_OK" || s == "FAIL" { break; }
+                if s == "OK" || s == "BOTH_OK" || s == "FAIL" {
+                    break;
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1694,7 +1751,9 @@ fn async_try_spawn_failure() {
     assert_eq!(result, "OK", "expected OK, got: {result}");
 
     shutdown.shutdown();
-    for h in handles { h.join().unwrap().unwrap(); }
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
 }
 
 /// Handler that tests cancelling a running task.
@@ -1722,8 +1781,12 @@ impl AsyncEventHandler for CancelTaskHandler {
             });
 
             match result {
-                Ok(_) => { let _ = conn.send(b"OK"); }
-                Err(_) => { let _ = conn.send(b"FAIL"); }
+                Ok(_) => {
+                    let _ = conn.send(b"OK");
+                }
+                Err(_) => {
+                    let _ = conn.send(b"FAIL");
+                }
             }
 
             krio::sleep(Duration::from_secs(5)).await;
@@ -1750,7 +1813,9 @@ fn async_cancel_running_task() {
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.write_all(b"x").unwrap();
     stream.flush().unwrap();
 
@@ -1762,7 +1827,9 @@ fn async_cancel_running_task() {
             Ok(n) => {
                 total += n;
                 let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
-                if s == "OK" || s == "FAIL" { break; }
+                if s == "OK" || s == "FAIL" {
+                    break;
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1771,10 +1838,15 @@ fn async_cancel_running_task() {
     }
 
     let result = std::str::from_utf8(&buf[..total]).unwrap();
-    assert_eq!(result, "OK", "expected OK (slot freed after cancel), got: {result}");
+    assert_eq!(
+        result, "OK",
+        "expected OK (slot freed after cancel), got: {result}"
+    );
 
     shutdown.shutdown();
-    for h in handles { h.join().unwrap().unwrap(); }
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
 }
 
 /// Handler that tests cancelling an already-completed task (should be a no-op).
@@ -1819,7 +1891,9 @@ fn async_cancel_completed_task() {
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.write_all(b"x").unwrap();
     stream.flush().unwrap();
 
@@ -1831,7 +1905,9 @@ fn async_cancel_completed_task() {
             Ok(n) => {
                 total += n;
                 let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
-                if s == "OK" { break; }
+                if s == "OK" {
+                    break;
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1840,10 +1916,15 @@ fn async_cancel_completed_task() {
     }
 
     let result = std::str::from_utf8(&buf[..total]).unwrap();
-    assert_eq!(result, "OK", "expected OK (cancel completed task is no-op), got: {result}");
+    assert_eq!(
+        result, "OK",
+        "expected OK (cancel completed task is no-op), got: {result}"
+    );
 
     shutdown.shutdown();
-    for h in handles { h.join().unwrap().unwrap(); }
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
 }
 
 // ── Multi-worker tests ──────────────────────────────────────────────
@@ -2657,7 +2738,9 @@ struct UdpEchoCallback;
 
 impl EventHandler for UdpEchoCallback {
     fn on_accept(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
-    fn on_data(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _data: &[u8]) -> usize { 0 }
+    fn on_data(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _data: &[u8]) -> usize {
+        0
+    }
     fn on_send_complete(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _r: io::Result<u32>) {}
     fn on_close(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
     fn on_datagram(

@@ -124,6 +124,7 @@ impl ConnectionTable {
     }
 
     /// Get a mutable reference without checking active status (for internal use).
+    #[allow(dead_code)]
     pub fn get_mut_unchecked(&mut self, idx: u32) -> &mut ConnectionState {
         &mut self.slots[idx as usize]
     }

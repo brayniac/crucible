@@ -259,19 +259,11 @@ fn test_mget() {
 fn test_set_nx() {
     run(async {
         // Should succeed — key doesn't exist
-        let set = ENV
-            .client
-            .set_nx(b"e2e:snx:key", b"first")
-            .await
-            .unwrap();
+        let set = ENV.client.set_nx(b"e2e:snx:key", b"first").await.unwrap();
         assert!(set);
 
         // Should fail — key exists
-        let set = ENV
-            .client
-            .set_nx(b"e2e:snx:key", b"second")
-            .await
-            .unwrap();
+        let set = ENV.client.set_nx(b"e2e:snx:key", b"second").await.unwrap();
         assert!(!set);
 
         // Value should still be "first"

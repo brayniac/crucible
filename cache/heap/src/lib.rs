@@ -2755,7 +2755,7 @@ mod tests {
         // but not guaranteed due to the nature of the algorithm
         let hot_exists = cache.contains(hot_key);
         // We just verify the cache is functioning with S3-FIFO enabled
-        assert!(cache.len() > 0);
+        assert!(!cache.is_empty());
         // If hot key survived (likely), great. If not, that's also valid behavior.
         let _ = hot_exists;
     }
@@ -2831,7 +2831,7 @@ mod tests {
         // Cache should be under limit
         assert!(cache.bytes_used() <= 512);
         // Some items should remain
-        assert!(cache.len() > 0);
+        assert!(!cache.is_empty());
     }
 
     #[test]

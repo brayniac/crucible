@@ -23,8 +23,7 @@ impl<F: Future> MaybeDone<F> {
             let this = self.get_unchecked_mut();
             match this {
                 MaybeDone::Done { .. } => {
-                    let MaybeDone::Done { output } =
-                        std::mem::replace(this, MaybeDone::Gone)
+                    let MaybeDone::Done { output } = std::mem::replace(this, MaybeDone::Gone)
                     else {
                         unreachable!()
                     };

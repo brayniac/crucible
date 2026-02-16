@@ -118,6 +118,7 @@ impl LatencyHistogram {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct LatencyStats {
     p50: u64,
     p90: u64,
@@ -149,6 +150,7 @@ fn process_cpu_time_ns() -> u64 {
 
 // ── Client ──────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct ClientResult {
     ops: u64,
     histogram: LatencyHistogram,
@@ -223,6 +225,7 @@ fn run_client(
 // ── Benchmark runner ────────────────────────────────────────────────
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct BenchResult {
     ops_per_sec: f64,
     ns_per_op: f64,
