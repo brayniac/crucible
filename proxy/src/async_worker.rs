@@ -11,8 +11,9 @@ use crate::cache::SharedCache;
 use crate::config::Config;
 
 use bytes::BytesMut;
-use krio::{AsyncEventHandler, ConnCtx, DriverCtx, Either, KrioBuilder};
+use krio::{AsyncEventHandler, ConnCtx, DriverCtx, KrioBuilder};
 use protocol_resp::{Command, ParseError, Value};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -54,14 +55,16 @@ pub struct AsyncProxyHandler {
     worker_id: usize,
     shutdown: Arc<AtomicBool>,
     cache: Arc<SharedCache>,
-    backend_addr: SocketAddr,
+    backends: Vec<SocketAddr>,
+    ring: ketama::Ring,
 }
 
 impl AsyncEventHandler for AsyncProxyHandler {
     fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
         let cache = Arc::clone(&self.cache);
-        let backend_addr = self.backend_addr;
-        Box::pin(handle_client(client, backend_addr, cache))
+        let backends = self.backends.clone();
+        let ring = self.ring.clone();
+        Box::pin(handle_client(client, ring, backends, cache))
     }
 
     fn on_tick(&mut self, ctx: &mut DriverCtx<'_>) {
@@ -80,17 +83,17 @@ impl AsyncEventHandler for AsyncProxyHandler {
 
         ::metrics::set_thread_shard(worker_id);
 
-        let backend_addr = cfg
-            .config
-            .backend
-            .nodes
-            .first()
-            .copied()
-            .expect("at least one backend node required");
+        let backends = cfg.config.backend.nodes.clone();
+        assert!(!backends.is_empty(), "at least one backend node required");
+
+        // Build ketama consistent hash ring from backend addresses.
+        let server_ids: Vec<String> = backends.iter().map(|a| a.to_string()).collect();
+        let ring =
+            ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
         info!(
             worker_id = cfg.worker_id,
-            backend = %backend_addr,
+            backends = ?backends,
             "Async worker starting"
         );
 
@@ -98,77 +101,43 @@ impl AsyncEventHandler for AsyncProxyHandler {
             worker_id: cfg.worker_id,
             shutdown: cfg.shutdown,
             cache: cfg.cache,
-            backend_addr,
+            backends,
+            ring,
         }
     }
 }
 
 // ── Client handler ──────────────────────────────────────────────────────
 
-/// Handle a single client connection: connect to backend, then loop
-/// reading commands and proxying responses.
-///
-/// Uses `krio::select` to concurrently monitor the client and backend
-/// connections — this allows detecting backend disconnection while idle
-/// (waiting for the next client command).
-async fn handle_client(client: ConnCtx, backend_addr: SocketAddr, cache: Arc<SharedCache>) {
-    // Connect to backend.
-    let backend = match client.connect(backend_addr) {
-        Ok(fut) => match fut.await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                warn!(error = %e, "Backend connect failed");
-                let _ = client.send(b"-ERR backend connect failed\r\n");
-                return;
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "Backend connect submission failed");
-            let _ = client.send(b"-ERR backend unavailable\r\n");
-            return;
-        }
-    };
-
-    debug!(
-        client_index = client.index(),
-        backend_index = backend.index(),
-        "Backend connected"
-    );
-
+/// Handle a single client connection: route commands to backends via
+/// ketama consistent hashing, establishing backend connections lazily.
+async fn handle_client(
+    client: ConnCtx,
+    ring: ketama::Ring,
+    backends: Vec<SocketAddr>,
+    cache: Arc<SharedCache>,
+) {
+    let mut conns: HashMap<usize, ConnCtx> = HashMap::new();
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
-        // Concurrently wait for client data or backend disconnect.
-        match krio::select(
-            client.with_data(|data| {
+        // Wait for client data.
+        let got = client
+            .with_data(|data| {
                 if data.is_empty() {
                     return 0;
                 }
                 buf.extend_from_slice(data);
                 data.len()
-            }),
-            backend.with_data(|data| data.len()),
-        )
-        .await
-        {
-            Either::Left(0) => {
-                // Client disconnected.
-                backend.close();
-                break;
+            })
+            .await;
+
+        if got == 0 {
+            // Client disconnected.
+            for (_, conn) in conns.drain() {
+                conn.close();
             }
-            Either::Left(_) => {
-                // Client data received — parse and process below.
-            }
-            Either::Right(0) => {
-                // Backend disconnected while idle.
-                let _ = client.send(b"-ERR backend disconnected\r\n");
-                backend.close();
-                break;
-            }
-            Either::Right(n) => {
-                // Unexpected data from backend (consume and discard).
-                warn!(bytes = n, "unexpected backend data while idle");
-            }
+            break;
         }
 
         // Parse and process all complete commands in the buffer.
@@ -179,13 +148,28 @@ async fn handle_client(client: ConnCtx, backend_addr: SocketAddr, cache: Arc<Sha
 
             match Command::parse(&buf) {
                 Ok((cmd, consumed)) => {
-                    match process_command(&cmd, &client, &backend, &cache).await {
+                    // Route the command to the appropriate backend.
+                    let endpoint_idx = route_command(&cmd, &ring, backends.len());
+                    let backend = match get_or_connect(&client, &mut conns, &backends, endpoint_idx).await {
+                        Some(conn) => conn,
+                        None => {
+                            let _ = client.send(b"-ERR backend unavailable\r\n");
+                            for (_, conn) in conns.drain() {
+                                conn.close();
+                            }
+                            return;
+                        }
+                    };
+
+                    match process_command(&cmd, &client, backend, &cache).await {
                         CommandResult::Responded => {}
                         CommandResult::ForwardedAndResponded => {}
                         CommandResult::BackendDisconnected => {
+                            // Remove the failed backend; next use will reconnect.
+                            if let Some(conn) = conns.remove(&endpoint_idx) {
+                                conn.close();
+                            }
                             let _ = client.send(b"-ERR backend disconnected\r\n");
-                            backend.close();
-                            return;
                         }
                     }
                     let _ = buf.split_to(consumed);
@@ -194,12 +178,63 @@ async fn handle_client(client: ConnCtx, backend_addr: SocketAddr, cache: Arc<Sha
                 Err(e) => {
                     warn!(error = ?e, "Client parse error");
                     let _ = client.send(b"-ERR protocol error\r\n");
-                    backend.close();
+                    for (_, conn) in conns.drain() {
+                        conn.close();
+                    }
                     return;
                 }
             }
         }
     }
+}
+
+/// Determine the backend endpoint index for a command using the ketama ring.
+fn route_command(cmd: &Command<'_>, ring: &ketama::Ring, num_backends: usize) -> usize {
+    if num_backends == 1 {
+        return 0;
+    }
+    match cmd {
+        Command::Get { key } | Command::Set { key, .. } | Command::Del { key } => {
+            ring.route(key)
+        }
+        // Non-keyed commands go to endpoint 0.
+        _ => 0,
+    }
+}
+
+/// Get an existing backend connection or establish a new one lazily.
+async fn get_or_connect<'a>(
+    client: &ConnCtx,
+    conns: &'a mut HashMap<usize, ConnCtx>,
+    backends: &[SocketAddr],
+    idx: usize,
+) -> Option<&'a ConnCtx> {
+    if let std::collections::hash_map::Entry::Vacant(e) = conns.entry(idx) {
+        let addr = backends[idx];
+        let conn = match client.connect(addr) {
+            Ok(fut) => match fut.await {
+                Ok(ctx) => {
+                    debug!(
+                        client_index = client.index(),
+                        backend_index = ctx.index(),
+                        backend_addr = %addr,
+                        "Backend connected"
+                    );
+                    ctx
+                }
+                Err(e) => {
+                    warn!(error = %e, backend_addr = %addr, "Backend connect failed");
+                    return None;
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, backend_addr = %addr, "Backend connect submission failed");
+                return None;
+            }
+        };
+        e.insert(conn);
+    }
+    conns.get(&idx)
 }
 
 /// Result of processing a single command.

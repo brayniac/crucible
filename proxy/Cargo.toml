@@ -25,6 +25,7 @@ krio = { workspace = true }
 bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 slab = { workspace = true }
+ketama = { workspace = true }
 libc = { workspace = true }
 ahash = { workspace = true }
 
