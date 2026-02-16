@@ -106,8 +106,24 @@ pub use runtime::io::sleep;
 pub use runtime::io::spawn;
 /// Wrap a future with a deadline.
 pub use runtime::io::timeout;
+/// Spawn a standalone task, returning an error if the slab is full.
+pub use runtime::io::try_spawn;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
+/// Error returned by [`try_spawn()`] when the standalone task slab is full.
+pub use error::SpawnError;
+/// Poll two futures concurrently, returning whichever completes first.
+pub use runtime::select::select;
+/// Poll three futures concurrently, returning whichever completes first.
+pub use runtime::select::select3;
+/// Result of [`select()`] — which branch completed.
+pub use runtime::select::Either;
+/// Result of [`select3()`] — which branch completed.
+pub use runtime::select::Either3;
+/// Future returned by [`select()`].
+pub use runtime::select::Select;
+/// Future returned by [`select3()`].
+pub use runtime::select::Select3;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
 

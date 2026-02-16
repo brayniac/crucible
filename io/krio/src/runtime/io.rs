@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::completion::{OpTag, UserData};
 use crate::driver::Driver;
+use crate::error::SpawnError;
 use crate::handler::ConnToken;
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::STANDALONE_BIT;
@@ -73,6 +74,43 @@ pub fn spawn(future: impl Future<Output = ()> + 'static) -> TaskId {
         executor.ready_queue.push_back(idx | STANDALONE_BIT);
         TaskId(idx)
     })
+}
+
+/// Spawn a standalone task, returning an error if the slab is full.
+///
+/// Unlike [`spawn()`] which panics on exhaustion, this returns
+/// `Err(SpawnError)` so callers can handle capacity limits gracefully.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn try_spawn(future: impl Future<Output = ()> + 'static) -> Result<TaskId, SpawnError> {
+    with_state(|_driver, executor| {
+        match executor.standalone_slab.spawn(Box::pin(future)) {
+            Some(idx) => {
+                executor.ready_queue.push_back(idx | STANDALONE_BIT);
+                Ok(TaskId(idx))
+            }
+            None => Err(SpawnError),
+        }
+    })
+}
+
+impl TaskId {
+    /// Cancel a standalone task. Drops the future immediately, freeing
+    /// the slab slot. No-op if the task already completed.
+    ///
+    /// Must be called from within the krio executor (i.e., from a
+    /// connection task or standalone task). Panics otherwise.
+    ///
+    /// Any pending timers owned by the dropped future are cancelled
+    /// via their `Drop` impl. Stale entries in the ready queue are
+    /// silently skipped when the executor encounters them.
+    pub fn cancel(self) {
+        with_state(|_driver, executor| {
+            executor.standalone_slab.remove(self.0);
+        });
+    }
 }
 
 /// The async equivalent of `ConnToken` + `DriverCtx`. Passed to the
@@ -174,6 +212,8 @@ impl ConnCtx {
             let token = ctx
                 .connect(addr)
                 .map_err(|e| io::Error::other(e.to_string()))?;
+            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+            executor.owner_task[token.index as usize] = Some(calling_task);
             executor.connect_waiters[token.index as usize] = true;
             Ok(ConnectFuture {
                 conn_index: token.index,
@@ -193,11 +233,32 @@ impl ConnCtx {
             let token = ctx
                 .connect_with_timeout(addr, timeout_ms)
                 .map_err(|e| io::Error::other(e.to_string()))?;
+            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+            executor.owner_task[token.index as usize] = Some(calling_task);
             executor.connect_waiters[token.index as usize] = true;
             Ok(ConnectFuture {
                 conn_index: token.index,
                 generation: token.generation,
             })
+        })
+    }
+
+    // ── Send chain ────────────────────────────────────────────────────
+
+    /// Build an IO_LINK chained send on this connection.
+    ///
+    /// The closure receives a [`SendChainBuilder`](crate::SendChainBuilder) for
+    /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to add SQEs,
+    /// then `.finish()` to submit the chain.
+    pub fn send_chain<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
+    {
+        with_state(|driver, _| {
+            let mut ctx = driver.make_ctx();
+            let token = ConnToken::new(self.conn_index, self.generation);
+            let builder = ctx.send_chain(token);
+            f(builder)
         })
     }
 
@@ -248,6 +309,8 @@ impl ConnCtx {
             let token = ctx
                 .connect_tls(addr, server_name)
                 .map_err(|e| io::Error::other(e.to_string()))?;
+            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+            executor.owner_task[token.index as usize] = Some(calling_task);
             executor.connect_waiters[token.index as usize] = true;
             Ok(ConnectFuture {
                 conn_index: token.index,
@@ -269,6 +332,8 @@ impl ConnCtx {
             let token = ctx
                 .connect_tls_with_timeout(addr, server_name, timeout_ms)
                 .map_err(|e| io::Error::other(e.to_string()))?;
+            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+            executor.owner_task[token.index as usize] = Some(calling_task);
             executor.connect_waiters[token.index as usize] = true;
             Ok(ConnectFuture {
                 conn_index: token.index,
@@ -364,6 +429,19 @@ impl<F: FnOnce(&[u8]) -> usize + Unpin> Future for WithDataFuture<F> {
         with_state(|driver, executor| {
             let data = driver.accumulators.data(self.conn_index);
             if data.is_empty() {
+                // Check if the connection has been closed — return 0 (EOF)
+                // so the caller can detect disconnection.
+                let is_closed = driver
+                    .connections
+                    .get(self.conn_index)
+                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .unwrap_or(true); // connection already released
+                if is_closed {
+                    let f = self.f.take().expect("WithDataFuture polled after Ready");
+                    let consumed = f(&[]);
+                    return Poll::Ready(consumed);
+                }
+
                 // No data available — register as recv waiter and park.
                 executor.recv_waiters[self.conn_index as usize] = true;
                 return Poll::Pending;

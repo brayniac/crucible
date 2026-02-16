@@ -738,3 +738,1110 @@ fn async_timeout_expires() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Cross-connection I/O tests ──────────────────────────────────────
+
+/// Forwarder handler: on accept, connects to a backend, forwards data
+/// through it (echo), and sends the response back to the client.
+/// This exercises the owner_task wakeup chain: client task at index N
+/// owns backend connection at index M, and with_data/send on the backend
+/// connection must correctly wake the client task.
+struct ForwarderHandler {
+    backend_addr: SocketAddr,
+}
+
+use std::net::SocketAddr;
+
+static FORWARDER_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for ForwarderHandler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        let backend_addr = self.backend_addr;
+        Box::pin(async move {
+            // Connect to the backend echo server.
+            let backend = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        let _ = client.send(format!("-ERR connect: {e}\r\n").as_bytes());
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = client.send(format!("-ERR connect: {e}\r\n").as_bytes());
+                    return;
+                }
+            };
+
+            // Forward loop: read from client, send to backend, read echo, send back.
+            loop {
+                let mut data_copy = Vec::new();
+                let n = client
+                    .with_data(|data| {
+                        data_copy = data.to_vec();
+                        data.len()
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+
+                // Forward to backend.
+                if backend.send(&data_copy).is_err() {
+                    break;
+                }
+
+                // Read echo from backend.
+                let mut echo = Vec::new();
+                let target_len = data_copy.len();
+                while echo.len() < target_len {
+                    let remaining = target_len - echo.len();
+                    let got = backend
+                        .with_data(|data| {
+                            let take = data.len().min(remaining);
+                            echo.extend_from_slice(&data[..take]);
+                            take
+                        })
+                        .await;
+                    if got == 0 {
+                        break;
+                    }
+                }
+
+                // Send back to client.
+                if client.send(&echo).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        let addr = *FORWARDER_BACKEND_ADDR.get().expect("backend addr not set");
+        ForwarderHandler {
+            backend_addr: addr,
+        }
+    }
+}
+
+#[test]
+fn async_outbound_connect_and_echo() {
+    // 1. Start a backend echo server.
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+
+    let (backend_shutdown, backend_handles) = KrioBuilder::new(test_config())
+        .bind(&backend_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend launch failed");
+
+    wait_for_server(&backend_addr);
+
+    // 2. Start the forwarder server.
+    FORWARDER_BACKEND_ADDR
+        .set(backend_addr.parse().unwrap())
+        .ok();
+
+    let forwarder_port = free_port();
+    let forwarder_addr = format!("127.0.0.1:{forwarder_port}");
+
+    let (fwd_shutdown, fwd_handles) = KrioBuilder::new(test_config())
+        .bind(&forwarder_addr)
+        .launch_async::<ForwarderHandler>()
+        .expect("forwarder launch failed");
+
+    wait_for_server(&forwarder_addr);
+
+    // 3. Connect to the forwarder, send data, verify echo.
+    let msg = b"cross-connection echo test!";
+    let response = echo_round_trip(&forwarder_addr, msg);
+    assert_eq!(response, msg, "forwarder did not echo correctly");
+
+    // Larger message.
+    let large_msg: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+    let response = echo_round_trip(&forwarder_addr, &large_msg);
+    assert_eq!(response, large_msg, "forwarder did not echo large message");
+
+    fwd_shutdown.shutdown();
+    for h in fwd_handles {
+        h.join().unwrap().unwrap();
+    }
+
+    backend_shutdown.shutdown();
+    for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that tries to connect to a non-listening address.
+struct ConnectRefusedHandler;
+
+static CONNECT_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
+
+impl AsyncEventHandler for ConnectRefusedHandler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            // Wait for trigger byte from client before connecting.
+            client.with_data(|data| data.len()).await;
+
+            let port = CONNECT_REFUSED_PORT.load(Ordering::SeqCst);
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+            let result = match client.connect(addr) {
+                Ok(fut) => match fut.await {
+                    Ok(_) => "CONNECTED".to_string(),
+                    Err(e) => format!("ERR:{}", e.kind()),
+                },
+                Err(e) => format!("SUBMIT_ERR:{e}"),
+            };
+
+            let _ = client.send(result.as_bytes());
+            // Keep connection alive so the send completes.
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ConnectRefusedHandler
+    }
+}
+
+#[test]
+fn async_outbound_connect_refused() {
+    // Bind to a port, then drop the listener so nothing is listening.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    CONNECT_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<ConnectRefusedHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // Trigger the handler.
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 128];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                // Check if we have a complete response.
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.starts_with("ERR:") || s.starts_with("CONNECTED") || s.starts_with("SUBMIT_ERR:") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let response = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        response.starts_with("ERR:"),
+        "expected connect error, got: {response}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that opens multiple outbound connections from a single task.
+struct MultiOutboundHandler;
+
+static MULTI_OUTBOUND_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for MultiOutboundHandler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        let backend_addr = *MULTI_OUTBOUND_BACKEND_ADDR
+            .get()
+            .expect("backend addr not set");
+        Box::pin(async move {
+            // Open two backend connections from the same client task.
+            let backend1 = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        let _ = client.send(format!("ERR1:{e}").as_bytes());
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = client.send(format!("ERR1:{e}").as_bytes());
+                    return;
+                }
+            };
+
+            let backend2 = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        let _ = client.send(format!("ERR2:{e}").as_bytes());
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = client.send(format!("ERR2:{e}").as_bytes());
+                    return;
+                }
+            };
+
+            // Send "AA" through backend1, "BB" through backend2.
+            if backend1.send(b"AA").is_err() {
+                let _ = client.send(b"SEND_ERR1");
+                return;
+            }
+            let mut echo1 = Vec::new();
+            while echo1.len() < 2 {
+                let remaining = 2 - echo1.len();
+                let got = backend1
+                    .with_data(|data| {
+                        let take = data.len().min(remaining);
+                        echo1.extend_from_slice(&data[..take]);
+                        take
+                    })
+                    .await;
+                if got == 0 {
+                    break;
+                }
+            }
+
+            if backend2.send(b"BB").is_err() {
+                let _ = client.send(b"SEND_ERR2");
+                return;
+            }
+            let mut echo2 = Vec::new();
+            while echo2.len() < 2 {
+                let remaining = 2 - echo2.len();
+                let got = backend2
+                    .with_data(|data| {
+                        let take = data.len().min(remaining);
+                        echo2.extend_from_slice(&data[..take]);
+                        take
+                    })
+                    .await;
+                if got == 0 {
+                    break;
+                }
+            }
+
+            // Combine and send back.
+            let mut result = echo1;
+            result.extend_from_slice(&echo2);
+            let _ = client.send(&result);
+            // Keep connection alive so the send completes.
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        MultiOutboundHandler
+    }
+}
+
+#[test]
+fn async_multiple_outbound_from_one_task() {
+    // Start backend echo server.
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+
+    let (backend_shutdown, backend_handles) = KrioBuilder::new(test_config())
+        .bind(&backend_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend launch failed");
+
+    wait_for_server(&backend_addr);
+
+    MULTI_OUTBOUND_BACKEND_ADDR
+        .set(backend_addr.parse().unwrap())
+        .ok();
+
+    // Start the multi-outbound server.
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<MultiOutboundHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Connect and trigger the handler.
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // The handler fires on accept; we just need to read the result.
+    // But the handler awaits with_data from client first — send a trigger byte.
+    // Actually, looking at the handler, it connects on accept, no trigger needed.
+    // But it does need to use with_data — wait, no it doesn't. Let me re-check...
+    // The handler connects immediately on accept and doesn't read from client first.
+
+    let mut buf = [0u8; 64];
+    let mut total = 0;
+    while total < 4 {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(result, "AABB", "expected AABB, got: {result}");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    backend_shutdown.shutdown();
+    for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Select tests ────────────────────────────────────────────────────
+
+/// Handler that uses select to monitor two backend connections.
+/// Connects to two backend echo servers, sends data to one, and uses
+/// select to determine which responds first.
+struct SelectTwoHandler;
+
+static SELECT_BACKEND1_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+static SELECT_BACKEND2_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for SelectTwoHandler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        let addr1 = *SELECT_BACKEND1_ADDR.get().expect("backend1 addr not set");
+        let addr2 = *SELECT_BACKEND2_ADDR.get().expect("backend2 addr not set");
+        Box::pin(async move {
+            // Connect to both backends.
+            let backend1 = match client.connect(addr1) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        let _ = client.send(format!("ERR1:{e}").as_bytes());
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = client.send(format!("ERR1:{e}").as_bytes());
+                    return;
+                }
+            };
+            let backend2 = match client.connect(addr2) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        let _ = client.send(format!("ERR2:{e}").as_bytes());
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = client.send(format!("ERR2:{e}").as_bytes());
+                    return;
+                }
+            };
+
+            // Send data to backend1 only.
+            if backend1.send(b"HELLO").is_err() {
+                let _ = client.send(b"SEND_ERR");
+                return;
+            }
+
+            // Select on both — backend1 should win since we sent data there.
+            // Use separate buffers since each closure needs its own &mut.
+            let mut buf1 = Vec::new();
+            let mut buf2 = Vec::new();
+            match krio::select(
+                backend1.with_data(|data| {
+                    buf1.extend_from_slice(data);
+                    data.len()
+                }),
+                backend2.with_data(|data| {
+                    buf2.extend_from_slice(data);
+                    data.len()
+                }),
+            )
+            .await
+            {
+                krio::Either::Left(_) => {
+                    let _ = client.send(b"LEFT:");
+                    let _ = client.send(&buf1);
+                }
+                krio::Either::Right(_) => {
+                    let _ = client.send(b"RIGHT:");
+                    let _ = client.send(&buf2);
+                }
+            }
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SelectTwoHandler
+    }
+}
+
+#[test]
+fn async_select_two_connections() {
+    // Start two backend echo servers.
+    let backend1_port = free_port();
+    let backend1_addr = format!("127.0.0.1:{backend1_port}");
+    let (b1_shutdown, b1_handles) = KrioBuilder::new(test_config())
+        .bind(&backend1_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend1 launch failed");
+    wait_for_server(&backend1_addr);
+
+    let backend2_port = free_port();
+    let backend2_addr = format!("127.0.0.1:{backend2_port}");
+    let (b2_shutdown, b2_handles) = KrioBuilder::new(test_config())
+        .bind(&backend2_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend2 launch failed");
+    wait_for_server(&backend2_addr);
+
+    SELECT_BACKEND1_ADDR.set(backend1_addr.parse().unwrap()).ok();
+    SELECT_BACKEND2_ADDR.set(backend2_addr.parse().unwrap()).ok();
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<SelectTwoHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.starts_with("LEFT:") || s.starts_with("RIGHT:") || s.starts_with("ERR") {
+                    // Wait for the full response.
+                    if s.len() >= 10 || s.starts_with("ERR") {
+                        break;
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        result.starts_with("LEFT:HELLO"),
+        "expected LEFT:HELLO, got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles { h.join().unwrap().unwrap(); }
+    b1_shutdown.shutdown();
+    for h in b1_handles { h.join().unwrap().unwrap(); }
+    b2_shutdown.shutdown();
+    for h in b2_handles { h.join().unwrap().unwrap(); }
+}
+
+/// Handler that uses select to show the second branch can win.
+/// Sends data to backend2 (not backend1), so Right should win.
+struct SelectSecondWinsHandler;
+
+static SELECT2_BACKEND1_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+static SELECT2_BACKEND2_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for SelectSecondWinsHandler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        let addr1 = *SELECT2_BACKEND1_ADDR.get().expect("backend1 addr not set");
+        let addr2 = *SELECT2_BACKEND2_ADDR.get().expect("backend2 addr not set");
+        Box::pin(async move {
+            let backend1 = match client.connect(addr1) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                },
+                Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+            };
+            let backend2 = match client.connect(addr2) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                },
+                Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+            };
+
+            // Send data to backend2 only.
+            if backend2.send(b"WORLD").is_err() {
+                let _ = client.send(b"SEND_ERR");
+                return;
+            }
+
+            let mut buf1 = Vec::new();
+            let mut buf2 = Vec::new();
+            match krio::select(
+                backend1.with_data(|data| {
+                    buf1.extend_from_slice(data);
+                    data.len()
+                }),
+                backend2.with_data(|data| {
+                    buf2.extend_from_slice(data);
+                    data.len()
+                }),
+            )
+            .await
+            {
+                krio::Either::Left(_) => {
+                    let _ = client.send(b"LEFT:");
+                    let _ = client.send(&buf1);
+                }
+                krio::Either::Right(_) => {
+                    let _ = client.send(b"RIGHT:");
+                    let _ = client.send(&buf2);
+                }
+            }
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SelectSecondWinsHandler
+    }
+}
+
+#[test]
+fn async_select_second_wins() {
+    let b1_port = free_port();
+    let b1_addr = format!("127.0.0.1:{b1_port}");
+    let (b1_shutdown, b1_handles) = KrioBuilder::new(test_config())
+        .bind(&b1_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend1 launch failed");
+    wait_for_server(&b1_addr);
+
+    let b2_port = free_port();
+    let b2_addr = format!("127.0.0.1:{b2_port}");
+    let (b2_shutdown, b2_handles) = KrioBuilder::new(test_config())
+        .bind(&b2_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend2 launch failed");
+    wait_for_server(&b2_addr);
+
+    SELECT2_BACKEND1_ADDR.set(b1_addr.parse().unwrap()).ok();
+    SELECT2_BACKEND2_ADDR.set(b2_addr.parse().unwrap()).ok();
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<SelectSecondWinsHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if (s.starts_with("LEFT:") || s.starts_with("RIGHT:")) && s.len() >= 11 {
+                    break;
+                }
+                if s.starts_with("ERR") || s.starts_with("SEND_ERR") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        result.starts_with("RIGHT:WORLD"),
+        "expected RIGHT:WORLD, got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles { h.join().unwrap().unwrap(); }
+    b1_shutdown.shutdown();
+    for h in b1_handles { h.join().unwrap().unwrap(); }
+    b2_shutdown.shutdown();
+    for h in b2_handles { h.join().unwrap().unwrap(); }
+}
+
+// ── Select with sleep test (timer slot leak check) ──────────────────
+
+/// Handler that uses select(with_data, sleep) as a manual timeout.
+/// Runs many iterations to confirm no timer slot leaks from dropped SleepFutures.
+struct SelectSleepHandler;
+
+impl AsyncEventHandler for SelectSleepHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            // Run 300 iterations of select(with_data, sleep).
+            // Each iteration where data arrives drops the SleepFuture,
+            // which must correctly cancel the io_uring timeout and release
+            // the timer slot. If slots leak, we'll exhaust the pool and panic.
+            for _ in 0..300 {
+                match krio::select(
+                    conn.with_data(|data| {
+                        let _ = conn.send(data);
+                        data.len()
+                    }),
+                    krio::sleep(Duration::from_secs(60)),
+                )
+                .await
+                {
+                    krio::Either::Left(0) => break,
+                    krio::Either::Left(_) => {} // got data, sleep was dropped
+                    krio::Either::Right(()) => {
+                        // Timeout — shouldn't happen with 60s timeout.
+                        let _ = conn.send(b"TIMEOUT");
+                        break;
+                    }
+                }
+            }
+            let _ = conn.send(b"DONE");
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SelectSleepHandler
+    }
+}
+
+#[test]
+fn async_select_with_sleep() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    // Use a config with limited timer slots to make leaks detectable.
+    let mut config = test_config();
+    config.timer_slots = 16;
+
+    let (shutdown, handles) = KrioBuilder::new(config)
+        .bind(&addr)
+        .launch_async::<SelectSleepHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10)).into()).unwrap();
+
+    // Send 300 messages — each triggers a select(with_data, sleep) where
+    // data wins and the SleepFuture is dropped.
+    for i in 0..300 {
+        let msg = format!("msg-{i}\n");
+        stream.write_all(msg.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        // Read the echo.
+        let mut buf = vec![0u8; msg.len()];
+        let mut total = 0;
+        while total < msg.len() {
+            match stream.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("read error on iteration {i}: {e}"),
+            }
+        }
+        assert_eq!(
+            &buf[..total],
+            msg.as_bytes(),
+            "echo mismatch on iteration {i}"
+        );
+    }
+
+    // Close the connection — handler should send "DONE".
+    drop(stream);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── select3 test ────────────────────────────────────────────────────
+
+/// Handler that uses select3 with two data sources + sleep.
+struct Select3Handler;
+
+static SELECT3_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for Select3Handler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        let backend_addr = *SELECT3_BACKEND_ADDR.get().expect("backend addr not set");
+        Box::pin(async move {
+            let backend = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+                },
+                Err(e) => { let _ = client.send(format!("ERR:{e}").as_bytes()); return; }
+            };
+
+            // Send data to backend so it echoes.
+            if backend.send(b"ECHO3").is_err() {
+                let _ = client.send(b"SEND_ERR");
+                return;
+            }
+
+            // select3: client data (none sent), backend echo, long sleep.
+            // Backend should win since we sent data there.
+            let mut client_buf = Vec::new();
+            let mut backend_buf = Vec::new();
+            match krio::select3(
+                client.with_data(|data| {
+                    client_buf.extend_from_slice(data);
+                    data.len()
+                }),
+                backend.with_data(|data| {
+                    backend_buf.extend_from_slice(data);
+                    data.len()
+                }),
+                krio::sleep(Duration::from_secs(60)),
+            )
+            .await
+            {
+                krio::Either3::First(_) => { let _ = client.send(b"FIRST"); }
+                krio::Either3::Second(_) => {
+                    let _ = client.send(b"SECOND:");
+                    let _ = client.send(&backend_buf);
+                }
+                krio::Either3::Third(()) => { let _ = client.send(b"THIRD"); }
+            }
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        Select3Handler
+    }
+}
+
+#[test]
+fn async_select3_basic() {
+    let b_port = free_port();
+    let b_addr = format!("127.0.0.1:{b_port}");
+    let (b_shutdown, b_handles) = KrioBuilder::new(test_config())
+        .bind(&b_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend launch failed");
+    wait_for_server(&b_addr);
+
+    SELECT3_BACKEND_ADDR.set(b_addr.parse().unwrap()).ok();
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<Select3Handler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.starts_with("SECOND:") && s.len() >= 12 { break; }
+                if s.starts_with("FIRST") || s.starts_with("THIRD") || s.starts_with("ERR") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        result.starts_with("SECOND:ECHO3"),
+        "expected SECOND:ECHO3, got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles { h.join().unwrap().unwrap(); }
+    b_shutdown.shutdown();
+    for h in b_handles { h.join().unwrap().unwrap(); }
+}
+
+// ── try_spawn / cancel tests ────────────────────────────────────────
+
+/// Handler that tests try_spawn exhaustion.
+struct TrySpawnHandler;
+
+impl AsyncEventHandler for TrySpawnHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return; // probe connection from wait_for_server
+            }
+
+            // First spawn should succeed.
+            let result1 = krio::try_spawn(async {
+                krio::sleep(Duration::from_secs(60)).await;
+            });
+
+            // Slab capacity is 1, so second spawn should fail.
+            let result2 = krio::try_spawn(async {
+                krio::sleep(Duration::from_secs(60)).await;
+            });
+
+            match (result1, result2) {
+                (Ok(task_id), Err(_)) => {
+                    let _ = conn.send(b"OK");
+                    // Clean up: cancel the first task.
+                    task_id.cancel();
+                }
+                (Ok(_), Ok(_)) => {
+                    let _ = conn.send(b"BOTH_OK");
+                }
+                _ => {
+                    let _ = conn.send(b"FAIL");
+                }
+            }
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TrySpawnHandler
+    }
+}
+
+#[test]
+fn async_try_spawn_failure() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.standalone_task_capacity = 1;
+
+    let (shutdown, handles) = KrioBuilder::new(config)
+        .bind(&addr)
+        .launch_async::<TrySpawnHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 32];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s == "OK" || s == "BOTH_OK" || s == "FAIL" { break; }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(result, "OK", "expected OK, got: {result}");
+
+    shutdown.shutdown();
+    for h in handles { h.join().unwrap().unwrap(); }
+}
+
+/// Handler that tests cancelling a running task.
+struct CancelTaskHandler;
+
+impl AsyncEventHandler for CancelTaskHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return; // probe connection from wait_for_server
+            }
+
+            // Spawn a long-running task.
+            let task_id = krio::spawn(async {
+                krio::sleep(Duration::from_secs(60)).await;
+            });
+
+            // Cancel it immediately.
+            task_id.cancel();
+
+            // The slot should be free — spawn a replacement.
+            let result = krio::try_spawn(async {
+                // Quick task — completes immediately.
+            });
+
+            match result {
+                Ok(_) => { let _ = conn.send(b"OK"); }
+                Err(_) => { let _ = conn.send(b"FAIL"); }
+            }
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        CancelTaskHandler
+    }
+}
+
+#[test]
+fn async_cancel_running_task() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.standalone_task_capacity = 1;
+
+    let (shutdown, handles) = KrioBuilder::new(config)
+        .bind(&addr)
+        .launch_async::<CancelTaskHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 32];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s == "OK" || s == "FAIL" { break; }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(result, "OK", "expected OK (slot freed after cancel), got: {result}");
+
+    shutdown.shutdown();
+    for h in handles { h.join().unwrap().unwrap(); }
+}
+
+/// Handler that tests cancelling an already-completed task (should be a no-op).
+struct CancelCompletedHandler;
+
+impl AsyncEventHandler for CancelCompletedHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return; // probe connection from wait_for_server
+            }
+
+            // Spawn a task that completes immediately.
+            let task_id = krio::spawn(async {});
+
+            // Give it a chance to complete.
+            krio::sleep(Duration::from_millis(50)).await;
+
+            // Cancel after completion — should not panic.
+            task_id.cancel();
+
+            let _ = conn.send(b"OK");
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        CancelCompletedHandler
+    }
+}
+
+#[test]
+fn async_cancel_completed_task() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<CancelCompletedHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 32];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s == "OK" { break; }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(result, "OK", "expected OK (cancel completed task is no-op), got: {result}");
+
+    shutdown.shutdown();
+    for h in handles { h.join().unwrap().unwrap(); }
+}

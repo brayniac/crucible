@@ -234,8 +234,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if result <= 0 {
             if result == 0 {
+                // Wake recv waiter before closing so the owning task can
+                // detect EOF (with_data will see RecvMode::Closed and return 0).
+                self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
-                self.executor.remove_connection(conn_index);
                 return;
             }
             let errno = -result;
@@ -246,8 +248,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else if errno == libc::ECANCELED {
                 return;
             } else if !has_more {
+                self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
-                self.executor.remove_connection(conn_index);
             }
             return;
         }
@@ -576,8 +578,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if !timeout_armed {
                     let err = io::Error::from_raw_os_error(errno);
                     self.executor.wake_connect(conn_index, Err(err));
+                    // Don't call remove_connection here — it would clear io_results
+                    // before the owning task can read the error via ConnectFuture.
+                    // handle_close (triggered by close_connection) will clean up.
                     self.driver.close_connection(conn_index);
-                    self.executor.remove_connection(conn_index);
                     return;
                 }
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
@@ -610,8 +614,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             let err = io::Error::from_raw_os_error(errno);
             self.executor.wake_connect(conn_index, Err(err));
+            // Don't call remove_connection here — it would clear io_results
+            // before the owning task can read the error via ConnectFuture.
+            // handle_close (triggered by close_connection) will clean up.
             self.driver.close_connection(conn_index);
-            self.executor.remove_connection(conn_index);
             return;
         }
 
@@ -704,8 +710,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
         self.executor.wake_connect(conn_index, Err(err));
+        // Don't call remove_connection here — handle_close will clean up.
         self.driver.close_connection(conn_index);
-        self.executor.remove_connection(conn_index);
     }
 
     fn handle_close(&mut self, ud: UserData) {
@@ -773,15 +779,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let (slot, generation) = TimerSlotPool::decode_payload(payload);
 
         if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
-            // Wake the task that owns this timer.
-            if waker_id & STANDALONE_BIT != 0 {
-                let task_idx = waker_id & !STANDALONE_BIT;
-                if self.executor.standalone_slab.wake(task_idx) {
-                    self.executor.ready_queue.push_back(waker_id);
-                }
-            } else if self.executor.task_slab.wake(waker_id) {
-                self.executor.ready_queue.push_back(waker_id);
-            }
+            self.executor.wake_task(waker_id);
         }
     }
 
@@ -790,6 +788,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let generation = self.driver.connections.generation(conn_index);
         let conn_ctx = ConnCtx::new(conn_index, generation);
         let future = self.handler.on_accept(conn_ctx);
+        self.executor.owner_task[conn_index as usize] = Some(conn_index);
         self.executor.task_slab.spawn(conn_index, future);
         self.executor.ready_queue.push_back(conn_index);
     }

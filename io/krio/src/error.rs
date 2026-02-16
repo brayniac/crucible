@@ -54,3 +54,15 @@ impl From<io::Error> for Error {
         Error::Io(e)
     }
 }
+
+/// Error returned by [`try_spawn`](crate::try_spawn) when the standalone task slab is full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnError;
+
+impl fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("standalone task slab exhausted")
+    }
+}
+
+impl std::error::Error for SpawnError {}

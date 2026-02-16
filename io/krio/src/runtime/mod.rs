@@ -20,6 +20,7 @@
 
 pub(crate) mod handler;
 pub(crate) mod io;
+pub(crate) mod select;
 pub(crate) mod task;
 pub(crate) mod waker;
 
@@ -147,6 +148,13 @@ pub(crate) struct Executor {
     pub(crate) connect_waiters: Vec<bool>,
     /// Per-connection: CQE result storage for send/connect.
     pub(crate) io_results: Vec<Option<IoResult>>,
+    /// Maps conn_index → owning task ID. For accepted connections, `owner_task[i] = Some(i)`
+    /// (self-owned). For outbound connections created via `ConnCtx::connect()`,
+    /// `owner_task[i] = Some(calling_task_id)` where `calling_task_id` is the task
+    /// that initiated the connect. This indirection allows `wake_recv`/`wake_send`/
+    /// `wake_connect` to wake the correct task even when the connection index differs
+    /// from the task index.
+    pub(crate) owner_task: Vec<Option<u32>>,
 }
 
 impl Executor {
@@ -168,6 +176,7 @@ impl Executor {
                 }
                 v
             },
+            owner_task: vec![None; cap],
         }
     }
 
@@ -186,17 +195,39 @@ impl Executor {
             self.send_waiters[idx] = false;
             self.connect_waiters[idx] = false;
             self.io_results[idx] = None;
+            self.owner_task[idx] = None;
         }
     }
 
+    /// Wake a task by its ID (connection task or standalone task).
+    ///
+    /// Handles both connection tasks (plain index) and standalone tasks
+    /// (index | STANDALONE_BIT). Returns true if the task was parked and
+    /// is now ready.
+    pub(crate) fn wake_task(&mut self, task_id: u32) -> bool {
+        if task_id & waker::STANDALONE_BIT != 0 {
+            let idx = task_id & !waker::STANDALONE_BIT;
+            if self.standalone_slab.wake(idx) {
+                self.ready_queue.push_back(task_id);
+                return true;
+            }
+        } else if self.task_slab.wake(task_id) {
+            self.ready_queue.push_back(task_id);
+            return true;
+        }
+        false
+    }
+
     /// Wake a task that was waiting for recv data.
+    ///
+    /// Resolves through `owner_task` so that outbound connections correctly
+    /// wake the task that owns them (which may differ from the conn_index).
     pub(crate) fn wake_recv(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         if idx < self.recv_waiters.len() && self.recv_waiters[idx] {
             self.recv_waiters[idx] = false;
-            if self.task_slab.wake(conn_index) {
-                self.ready_queue.push_back(conn_index);
-            }
+            let task_id = self.owner_task[idx].unwrap_or(conn_index);
+            self.wake_task(task_id);
         }
     }
 
@@ -206,9 +237,8 @@ impl Executor {
         if idx < self.send_waiters.len() && self.send_waiters[idx] {
             self.send_waiters[idx] = false;
             self.io_results[idx] = Some(IoResult::Send(result));
-            if self.task_slab.wake(conn_index) {
-                self.ready_queue.push_back(conn_index);
-            }
+            let task_id = self.owner_task[idx].unwrap_or(conn_index);
+            self.wake_task(task_id);
         }
     }
 
@@ -218,9 +248,8 @@ impl Executor {
         if idx < self.connect_waiters.len() && self.connect_waiters[idx] {
             self.connect_waiters[idx] = false;
             self.io_results[idx] = Some(IoResult::Connect(result));
-            if self.task_slab.wake(conn_index) {
-                self.ready_queue.push_back(conn_index);
-            }
+            let task_id = self.owner_task[idx].unwrap_or(conn_index);
+            self.wake_task(task_id);
         }
     }
 }
@@ -237,6 +266,7 @@ mod tests {
         assert_eq!(exec.send_waiters.len(), 16);
         assert_eq!(exec.connect_waiters.len(), 16);
         assert_eq!(exec.io_results.len(), 16);
+        assert_eq!(exec.owner_task.len(), 16);
     }
 
     #[test]
@@ -246,11 +276,118 @@ mod tests {
         exec.send_waiters[1] = true;
         exec.connect_waiters[1] = true;
         exec.io_results[1] = Some(IoResult::Send(Ok(42)));
+        exec.owner_task[1] = Some(0);
 
         exec.remove_connection(1);
         assert!(!exec.recv_waiters[1]);
         assert!(!exec.send_waiters[1]);
         assert!(!exec.connect_waiters[1]);
         assert!(exec.io_results[1].is_none());
+        assert!(exec.owner_task[1].is_none());
+    }
+
+    #[test]
+    fn wake_task_connection_task() {
+        let mut exec = Executor::new(4, 4, 4);
+        // Spawn a task at index 1 (simulated by setting it up as Ready then parking).
+        exec.task_slab.spawn(
+            1,
+            Box::pin(std::future::pending::<()>()),
+        );
+        let fut = exec.task_slab.take_ready(1).unwrap();
+        exec.task_slab.park(1, fut);
+
+        assert!(exec.wake_task(1));
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], 1);
+    }
+
+    #[test]
+    fn wake_task_standalone_task() {
+        let mut exec = Executor::new(4, 4, 4);
+        let idx = exec
+            .standalone_slab
+            .spawn(Box::pin(std::future::pending::<()>()))
+            .unwrap();
+        let fut = exec.standalone_slab.take_ready(idx).unwrap();
+        exec.standalone_slab.park(idx, fut);
+
+        let task_id = idx | waker::STANDALONE_BIT;
+        assert!(exec.wake_task(task_id));
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], task_id);
+    }
+
+    #[test]
+    fn owner_task_routes_recv_wakeup() {
+        let mut exec = Executor::new(16, 4, 4);
+
+        // Task at index 5 owns connection 12 (outbound connect scenario).
+        exec.task_slab.spawn(5, Box::pin(std::future::pending::<()>()));
+        let fut = exec.task_slab.take_ready(5).unwrap();
+        exec.task_slab.park(5, fut);
+
+        exec.owner_task[12] = Some(5);
+        exec.recv_waiters[12] = true;
+
+        exec.wake_recv(12);
+
+        // The task at index 5 should be woken, not index 12.
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], 5);
+        assert!(!exec.recv_waiters[12]);
+    }
+
+    #[test]
+    fn owner_task_routes_send_wakeup() {
+        let mut exec = Executor::new(16, 4, 4);
+
+        exec.task_slab.spawn(3, Box::pin(std::future::pending::<()>()));
+        let fut = exec.task_slab.take_ready(3).unwrap();
+        exec.task_slab.park(3, fut);
+
+        exec.owner_task[10] = Some(3);
+        exec.send_waiters[10] = true;
+
+        exec.wake_send(10, Ok(42));
+
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], 3);
+        assert!(!exec.send_waiters[10]);
+        assert!(matches!(exec.io_results[10], Some(IoResult::Send(Ok(42)))));
+    }
+
+    #[test]
+    fn owner_task_routes_connect_wakeup() {
+        let mut exec = Executor::new(16, 4, 4);
+
+        exec.task_slab.spawn(2, Box::pin(std::future::pending::<()>()));
+        let fut = exec.task_slab.take_ready(2).unwrap();
+        exec.task_slab.park(2, fut);
+
+        exec.owner_task[8] = Some(2);
+        exec.connect_waiters[8] = true;
+
+        exec.wake_connect(8, Ok(()));
+
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], 2);
+        assert!(!exec.connect_waiters[8]);
+    }
+
+    #[test]
+    fn owner_task_none_falls_back_to_conn_index() {
+        let mut exec = Executor::new(4, 4, 4);
+
+        // owner_task is None — should fall back to using conn_index directly.
+        exec.task_slab.spawn(1, Box::pin(std::future::pending::<()>()));
+        let fut = exec.task_slab.take_ready(1).unwrap();
+        exec.task_slab.park(1, fut);
+
+        exec.recv_waiters[1] = true;
+        exec.wake_recv(1);
+
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], 1);
     }
 }
