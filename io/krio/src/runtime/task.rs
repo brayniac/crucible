@@ -1,7 +1,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
-type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+/// Opaque handle for a standalone task spawned via [`spawn()`](crate::spawn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskId(pub(crate) u32);
 
 /// State of a single task slot.
 enum TaskSlot {
@@ -104,6 +108,92 @@ impl TaskSlab {
     }
 }
 
+/// Slab of standalone async tasks (not bound to connections).
+///
+/// Uses a free list for O(1) allocate/deallocate. Task indices are independent
+/// of connection indices — the executor distinguishes them via `STANDALONE_BIT`.
+pub(crate) struct StandaloneTaskSlab {
+    tasks: Vec<TaskSlot>,
+    free_list: Vec<u32>,
+}
+
+impl StandaloneTaskSlab {
+    /// Create a new standalone task slab with the given capacity.
+    pub(crate) fn new(capacity: u32) -> Self {
+        let mut tasks = Vec::with_capacity(capacity as usize);
+        let mut free_list = Vec::with_capacity(capacity as usize);
+        for i in 0..capacity {
+            tasks.push(TaskSlot::Empty);
+            free_list.push(i);
+        }
+        StandaloneTaskSlab { tasks, free_list }
+    }
+
+    /// Spawn a task. Returns the slot index, or None if the slab is full.
+    pub(crate) fn spawn(&mut self, future: BoxFuture) -> Option<u32> {
+        let idx = self.free_list.pop()?;
+        self.tasks[idx as usize] = TaskSlot::Ready(future);
+        Some(idx)
+    }
+
+    /// Take a Ready task out for polling.
+    pub(crate) fn take_ready(&mut self, task_idx: u32) -> Option<BoxFuture> {
+        let idx = task_idx as usize;
+        if idx >= self.tasks.len() {
+            return None;
+        }
+        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty) {
+            TaskSlot::Ready(fut) => Some(fut),
+            other => {
+                self.tasks[idx] = other;
+                None
+            }
+        }
+    }
+
+    /// Park a task back after Poll::Pending.
+    pub(crate) fn park(&mut self, task_idx: u32, future: BoxFuture) {
+        let idx = task_idx as usize;
+        debug_assert!(idx < self.tasks.len());
+        self.tasks[idx] = TaskSlot::Parked(future);
+    }
+
+    /// Mark a Parked task as Ready. Returns true if it was parked.
+    pub(crate) fn wake(&mut self, task_idx: u32) -> bool {
+        let idx = task_idx as usize;
+        if idx >= self.tasks.len() {
+            return false;
+        }
+        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty) {
+            TaskSlot::Parked(fut) => {
+                self.tasks[idx] = TaskSlot::Ready(fut);
+                true
+            }
+            TaskSlot::Ready(fut) => {
+                self.tasks[idx] = TaskSlot::Ready(fut);
+                false
+            }
+            TaskSlot::Empty => false,
+        }
+    }
+
+    /// Remove a completed or cancelled task, returning its slot to the free list.
+    pub(crate) fn remove(&mut self, task_idx: u32) {
+        let idx = task_idx as usize;
+        if idx < self.tasks.len() {
+            self.tasks[idx] = TaskSlot::Empty;
+            self.free_list.push(task_idx);
+        }
+    }
+
+    /// Check if a task exists at the given index.
+    #[allow(dead_code)]
+    pub(crate) fn has_task(&self, task_idx: u32) -> bool {
+        let idx = task_idx as usize;
+        idx < self.tasks.len() && !matches!(self.tasks[idx], TaskSlot::Empty)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +275,48 @@ mod tests {
 
         // Already ready — wake should return false (already queued).
         assert!(!slab.wake(0));
+    }
+
+    // ── StandaloneTaskSlab tests ──────────────────────────────────────
+
+    #[test]
+    fn standalone_spawn_and_take() {
+        let mut slab = StandaloneTaskSlab::new(4);
+        let idx = slab.spawn(Box::pin(CountdownFuture(2))).unwrap();
+        assert!(slab.has_task(idx));
+        let fut = slab.take_ready(idx);
+        assert!(fut.is_some());
+        assert!(!slab.has_task(idx));
+    }
+
+    #[test]
+    fn standalone_park_and_wake() {
+        let mut slab = StandaloneTaskSlab::new(4);
+        let idx = slab.spawn(Box::pin(CountdownFuture(1))).unwrap();
+        let fut = slab.take_ready(idx).unwrap();
+        slab.park(idx, fut);
+        assert!(slab.take_ready(idx).is_none());
+        assert!(slab.wake(idx));
+        assert!(slab.take_ready(idx).is_some());
+    }
+
+    #[test]
+    fn standalone_remove_returns_to_free_list() {
+        let mut slab = StandaloneTaskSlab::new(2);
+        let a = slab.spawn(Box::pin(CountdownFuture(0))).unwrap();
+        let b = slab.spawn(Box::pin(CountdownFuture(0))).unwrap();
+        // Slab is full.
+        assert!(slab.spawn(Box::pin(CountdownFuture(0))).is_none());
+        // Remove one — slot is reusable.
+        slab.remove(a);
+        assert!(slab.spawn(Box::pin(CountdownFuture(0))).is_some());
+        slab.remove(b);
+    }
+
+    #[test]
+    fn standalone_full_slab() {
+        let mut slab = StandaloneTaskSlab::new(1);
+        assert!(slab.spawn(Box::pin(CountdownFuture(0))).is_some());
+        assert!(slab.spawn(Box::pin(CountdownFuture(0))).is_none());
     }
 }

@@ -1,13 +1,18 @@
 use std::cell::Cell;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use crate::completion::{OpTag, UserData};
 use crate::driver::Driver;
 use crate::handler::ConnToken;
-use crate::runtime::{Executor, IoResult};
+use crate::runtime::task::TaskId;
+use crate::runtime::waker::STANDALONE_BIT;
+use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult, TimerSlotPool};
 
 /// Raw pointer to the driver + executor state, set before polling each task.
 ///
@@ -46,6 +51,28 @@ fn with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> R {
     let driver = unsafe { &mut *state.driver };
     let executor = unsafe { &mut *state.executor };
     f(driver, executor)
+}
+
+/// Spawn a standalone async task on the current worker thread.
+///
+/// Unlike connection tasks (which are 1:1 with connections), standalone tasks
+/// are not bound to any connection. They run on the same single-threaded
+/// executor and can use [`sleep()`](crate::sleep) and [`timeout()`](crate::timeout),
+/// but cannot perform connection I/O directly.
+///
+/// # Panics
+///
+/// Panics if the standalone task slab is full, or if called outside the
+/// krio async executor (i.e., outside a connection handler or standalone task).
+pub fn spawn(future: impl Future<Output = ()> + 'static) -> TaskId {
+    with_state(|_driver, executor| {
+        let idx = executor
+            .standalone_slab
+            .spawn(Box::pin(future))
+            .expect("standalone task slab exhausted");
+        executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        TaskId(idx)
+    })
 }
 
 /// The async equivalent of `ConnToken` + `DriverCtx`. Passed to the
@@ -165,6 +192,82 @@ impl ConnCtx {
             let mut ctx = driver.make_ctx();
             let token = ctx
                 .connect_with_timeout(addr, timeout_ms)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            executor.connect_waiters[token.index as usize] = true;
+            Ok(ConnectFuture {
+                conn_index: token.index,
+                generation: token.generation,
+            })
+        })
+    }
+
+    // ── Shutdown / cancel ─────────────────────────────────────────────
+
+    /// Shutdown the write side of the connection (half-close).
+    ///
+    /// Sends a TCP FIN to the peer. The read side remains open.
+    pub fn shutdown_write(&self) {
+        with_state(|driver, _| {
+            let mut ctx = driver.make_ctx();
+            ctx.shutdown_write(self.token());
+        })
+    }
+
+    /// Cancel pending I/O operations on this connection.
+    pub fn cancel(&self) -> io::Result<()> {
+        with_state(|driver, _| {
+            let mut ctx = driver.make_ctx();
+            ctx.cancel(self.token())
+        })
+    }
+
+    /// Request graceful shutdown of the worker event loop.
+    pub fn request_shutdown(&self) {
+        with_state(|driver, _| {
+            let mut ctx = driver.make_ctx();
+            ctx.request_shutdown();
+        })
+    }
+
+    // ── TLS ──────────────────────────────────────────────────────────
+
+    /// Query TLS session info for this connection.
+    #[cfg(feature = "tls")]
+    pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        with_state(|driver, _| {
+            let ctx = driver.make_ctx();
+            ctx.tls_info(self.token())
+        })
+    }
+
+    /// Initiate an outbound TLS connection and await the result.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls(&self, addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
+        with_state(|driver, executor| {
+            let mut ctx = driver.make_ctx();
+            let token = ctx
+                .connect_tls(addr, server_name)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            executor.connect_waiters[token.index as usize] = true;
+            Ok(ConnectFuture {
+                conn_index: token.index,
+                generation: token.generation,
+            })
+        })
+    }
+
+    /// Initiate an outbound TLS connection with a timeout and await the result.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls_with_timeout(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        timeout_ms: u64,
+    ) -> io::Result<ConnectFuture> {
+        with_state(|driver, executor| {
+            let mut ctx = driver.make_ctx();
+            let token = ctx
+                .connect_tls_with_timeout(addr, server_name, timeout_ms)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             executor.connect_waiters[token.index as usize] = true;
             Ok(ConnectFuture {
@@ -327,5 +430,162 @@ impl Future for ConnectFuture {
                 }
             }
         })
+    }
+}
+
+// ── Sleep ────────────────────────────────────────────────────────────
+
+/// Create a future that completes after the given duration.
+///
+/// Uses an io_uring timeout SQE internally — no busy-waiting, no timer
+/// thread. The timer fires on the same worker thread as the calling task.
+///
+/// # Panics
+///
+/// Panics if the timer slot pool is exhausted, or if called outside the
+/// krio async executor.
+pub fn sleep(duration: Duration) -> SleepFuture {
+    SleepFuture {
+        duration,
+        timer_slot: None,
+        generation: 0,
+    }
+}
+
+/// Future returned by [`sleep()`]. Completes after the configured duration.
+pub struct SleepFuture {
+    duration: Duration,
+    /// None until first poll, then Some(slot_index).
+    timer_slot: Option<u32>,
+    /// Generation when the slot was allocated.
+    generation: u16,
+}
+
+impl Future for SleepFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        with_state(|driver, executor| {
+            if let Some(slot) = self.timer_slot {
+                // Already submitted — check if fired.
+                if executor.timer_pool.is_fired(slot) {
+                    executor.timer_pool.release(slot);
+                    self.timer_slot = None;
+                    return Poll::Ready(());
+                }
+                return Poll::Pending;
+            }
+
+            // First poll — allocate slot, fill timespec, submit SQE.
+            let waker_id = CURRENT_TASK_ID.with(|c| c.get());
+            let (slot, generation) = executor
+                .timer_pool
+                .allocate(waker_id)
+                .expect("timer slot pool exhausted");
+
+            let secs = self.duration.as_secs();
+            let nsecs = self.duration.subsec_nanos();
+            executor.timer_pool.timespecs[slot as usize] =
+                io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
+
+            let payload = TimerSlotPool::encode_payload(slot, generation);
+            let ud = UserData::encode(OpTag::Timer, 0, payload);
+            let ts_ptr =
+                &executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+
+            if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
+                executor.timer_pool.release(slot);
+                // On SQE submission failure, complete immediately rather than hang.
+                return Poll::Ready(());
+            }
+
+            self.timer_slot = Some(slot);
+            self.generation = generation;
+            Poll::Pending
+        })
+    }
+}
+
+impl Drop for SleepFuture {
+    fn drop(&mut self) {
+        if let Some(slot) = self.timer_slot {
+            // Timer was submitted but not yet fired — try to cancel it.
+            let ptr = CURRENT_DRIVER.with(|c| c.get());
+            if ptr.is_null() {
+                return;
+            }
+            let state = unsafe { &mut *ptr };
+            let driver = unsafe { &mut *state.driver };
+            let executor = unsafe { &mut *state.executor };
+
+            if !executor.timer_pool.is_fired(slot) {
+                let payload = TimerSlotPool::encode_payload(slot, self.generation);
+                let target_ud = UserData::encode(OpTag::Timer, 0, payload);
+                let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
+            }
+            executor.timer_pool.release(slot);
+        }
+    }
+}
+
+// ── Timeout ──────────────────────────────────────────────────────────
+
+/// Error returned when a [`timeout()`] deadline expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Elapsed;
+
+impl fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("deadline has elapsed")
+    }
+}
+
+impl std::error::Error for Elapsed {}
+
+/// Wrap a future with a deadline. If the future does not complete within
+/// `duration`, returns `Err(Elapsed)`.
+///
+/// # Example
+///
+/// ```ignore
+/// match krio::timeout(Duration::from_secs(1), some_future).await {
+///     Ok(value) => { /* completed in time */ }
+///     Err(_elapsed) => { /* timed out */ }
+/// }
+/// ```
+pub fn timeout<F: Future>(duration: Duration, future: F) -> TimeoutFuture<F> {
+    TimeoutFuture {
+        future,
+        sleep: sleep(duration),
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`timeout()`].
+    pub struct TimeoutFuture<F> {
+        #[pin]
+        future: F,
+        #[pin]
+        sleep: SleepFuture,
+    }
+}
+
+impl<F: Future> Future for TimeoutFuture<F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        // Poll the inner future first.
+        if let Poll::Ready(output) = this.future.poll(cx) {
+            return Poll::Ready(Ok(output));
+        }
+
+        // Poll the sleep timer.
+        if let Poll::Ready(()) = this.sleep.poll(cx) {
+            return Poll::Ready(Err(Elapsed));
+        }
+
+        Poll::Pending
     }
 }

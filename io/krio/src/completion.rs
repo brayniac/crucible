@@ -19,6 +19,8 @@ pub enum OpTag {
     Cancel = 10,
     /// Periodic tick timeout to prevent submit_and_wait from blocking indefinitely.
     TickTimeout = 11,
+    /// Standalone timer (sleep/timeout) for async tasks.
+    Timer = 12,
 }
 
 impl OpTag {
@@ -36,6 +38,7 @@ impl OpTag {
             9 => Some(OpTag::Timeout),
             10 => Some(OpTag::Cancel),
             11 => Some(OpTag::TickTimeout),
+            12 => Some(OpTag::Timer),
             _ => None,
         }
     }

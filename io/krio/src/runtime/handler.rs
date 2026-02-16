@@ -40,10 +40,7 @@ use crate::runtime::io::ConnCtx;
 pub trait AsyncEventHandler: Send + 'static {
     /// Handle an accepted connection. Runs for the connection's lifetime.
     /// When the returned future completes, the connection is closed.
-    fn on_accept(
-        &self,
-        conn: ConnCtx,
-    ) -> Pin<Box<dyn Future<Output = ()> + 'static>>;
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>>;
 
     /// Periodic tick (synchronous, same as EventHandler::on_tick).
     fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {}

@@ -67,42 +67,58 @@ pub mod handler;
 
 // ── Re-exports: Callback API ────────────────────────────────────────────
 
-/// Trait for callback-driven event handlers.
-pub use handler::EventHandler;
+/// Builder for chained send parts.
+pub use handler::ChainPartsBuilder;
 /// Opaque connection handle.
 pub use handler::ConnToken;
 /// I/O context passed to [`EventHandler`] callbacks.
 pub use handler::DriverCtx;
+/// Trait for callback-driven event handlers.
+pub use handler::EventHandler;
 /// Builder for constructing a scatter-gather send.
 pub use handler::SendBuilder;
 /// Builder for IO_LINK chained sends.
 pub use handler::SendChainBuilder;
-/// Builder for chained send parts.
-pub use handler::ChainPartsBuilder;
 
 // ── Re-exports: Async API ───────────────────────────────────────────────
 
 /// Trait for async event handlers (one task per connection).
 pub use runtime::handler::AsyncEventHandler;
-/// Async connection context with send/recv futures.
-pub use runtime::io::ConnCtx;
-/// Future that provides received data.
-pub use runtime::io::WithDataFuture;
-/// Future that completes when a send finishes.
-pub use runtime::io::SendFuture;
-/// Future that completes when a connect finishes.
-pub use runtime::io::ConnectFuture;
 /// Async scatter-gather send builder.
 pub use runtime::io::AsyncSendBuilder;
+/// Async connection context with send/recv futures.
+pub use runtime::io::ConnCtx;
+/// Future that completes when a connect finishes.
+pub use runtime::io::ConnectFuture;
+/// Error returned when a [`timeout()`] expires.
+pub use runtime::io::Elapsed;
+/// Future that completes when a send finishes.
+pub use runtime::io::SendFuture;
+/// Future returned by [`sleep()`].
+pub use runtime::io::SleepFuture;
+/// Future returned by [`timeout()`].
+pub use runtime::io::TimeoutFuture;
+/// Future that provides received data.
+pub use runtime::io::WithDataFuture;
+/// Create a future that completes after a duration.
+pub use runtime::io::sleep;
+/// Spawn a standalone async task on the current worker.
+pub use runtime::io::spawn;
+/// Wrap a future with a deadline.
+pub use runtime::io::timeout;
+/// Opaque handle for a standalone spawned task.
+pub use runtime::task::TaskId;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
 
-/// Builder for launching krio workers.
-pub use worker::KrioBuilder;
-/// Handle for triggering graceful shutdown.
-pub use worker::ShutdownHandle;
-/// Convenience function to launch workers with a listener.
-pub use worker::launch;
+/// Memory region for io_uring fixed buffer registration.
+pub use buffer::fixed::MemoryRegion;
+/// Region identifier for [`SendGuard`] implementations.
+pub use buffer::fixed::RegionId;
+/// Maximum zero-copy guards per scatter-gather send.
+pub use buffer::send_slab::MAX_GUARDS;
+/// Maximum iovecs per scatter-gather send.
+pub use buffer::send_slab::MAX_IOVECS;
 /// Runtime configuration.
 pub use config::Config;
 /// Recv buffer ring configuration.
@@ -113,23 +129,21 @@ pub use config::WorkerConfig;
 pub use error::Error;
 /// Zero-copy send guard trait.
 pub use guard::{GuardBox, SendGuard};
-/// Memory region for io_uring fixed buffer registration.
-pub use buffer::fixed::MemoryRegion;
-/// Region identifier for [`SendGuard`] implementations.
-pub use buffer::fixed::RegionId;
-/// Maximum zero-copy guards per scatter-gather send.
-pub use buffer::send_slab::MAX_GUARDS;
-/// Maximum iovecs per scatter-gather send.
-pub use buffer::send_slab::MAX_IOVECS;
+/// Builder for launching krio workers.
+pub use worker::KrioBuilder;
+/// Handle for triggering graceful shutdown.
+pub use worker::ShutdownHandle;
+/// Convenience function to launch workers with a listener.
+pub use worker::launch;
 
 // ── Re-exports: TLS (feature-gated) ────────────────────────────────────
 
-/// Server-side TLS configuration.
-#[cfg(feature = "tls")]
-pub use config::TlsConfig;
 /// Client-side TLS configuration.
 #[cfg(feature = "tls")]
 pub use config::TlsClientConfig;
+/// Server-side TLS configuration.
+#[cfg(feature = "tls")]
+pub use config::TlsConfig;
 /// TLS session info (protocol version, cipher suite, etc.).
 #[cfg(feature = "tls")]
 pub use tls::TlsInfo;

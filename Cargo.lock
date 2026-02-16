@@ -1475,6 +1475,7 @@ dependencies = [
  "crossbeam-channel",
  "io-uring",
  "libc",
+ "pin-project-lite",
  "rustls",
 ]
 

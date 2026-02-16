@@ -57,7 +57,10 @@ impl<H: EventHandler> EventLoop<H> {
                 && let Some(ref ts) = self.driver.tick_timeout_ts
             {
                 let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-                let _ = self.driver.ring.submit_tick_timeout(ts as *const _, ud.raw());
+                let _ = self
+                    .driver
+                    .ring
+                    .submit_tick_timeout(ts as *const _, ud.raw());
                 self.driver.tick_timeout_armed = true;
             }
 
@@ -66,9 +69,7 @@ impl<H: EventHandler> EventLoop<H> {
             self.drain_completions();
 
             // Check for shutdown after processing completions.
-            if self.driver.shutdown_local
-                || self.driver.shutdown_flag.load(Ordering::Relaxed)
-            {
+            if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
                 self.driver.run_shutdown();
                 return Ok(());
             }
@@ -140,6 +141,7 @@ impl<H: EventHandler> EventLoop<H> {
             OpTag::TickTimeout => {
                 self.driver.tick_timeout_armed = false;
             }
+            OpTag::Timer => {} // only used in async event loop
         }
     }
 
@@ -337,10 +339,10 @@ impl<H: EventHandler> EventLoop<H> {
 
         // Re-arm eventfd read, unless shutdown was requested.
         if !self.driver.shutdown_flag.load(Ordering::Relaxed) {
-            let _ = self.driver.ring.submit_eventfd_read(
-                self.driver.eventfd,
-                self.driver.eventfd_buf.as_mut_ptr(),
-            );
+            let _ = self
+                .driver
+                .ring
+                .submit_eventfd_read(self.driver.eventfd, self.driver.eventfd_buf.as_mut_ptr());
         }
     }
 
@@ -364,10 +366,10 @@ impl<H: EventHandler> EventLoop<H> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
             {
-                let _ =
-                    self.driver
-                        .ring
-                        .submit_send_copied(conn_index, ptr, remaining, pool_slot);
+                let _ = self
+                    .driver
+                    .ring
+                    .submit_send_copied(conn_index, ptr, remaining, pool_slot);
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
@@ -458,10 +460,7 @@ impl<H: EventHandler> EventLoop<H> {
                     self.driver.send_copy_pool.release(ps);
                 }
             }
-            let event = self
-                .driver
-                .chain_table
-                .on_operation_cqe(conn_index, result);
+            let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
             if matches!(event, ChainEvent::Complete { .. }) {
                 self.fire_chain_complete(conn_index);
             }
@@ -758,10 +757,10 @@ impl<H: EventHandler> EventLoop<H> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
         {
-            let _ =
-                self.driver
-                    .ring
-                    .submit_tls_send(conn_index, ptr, remaining, pool_slot);
+            let _ = self
+                .driver
+                .ring
+                .submit_tls_send(conn_index, ptr, remaining, pool_slot);
             return;
         }
         self.driver.send_copy_pool.release(pool_slot);

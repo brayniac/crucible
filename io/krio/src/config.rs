@@ -75,6 +75,14 @@ pub struct Config {
     /// round-trips (one SQE at a time via on_send_complete).
     /// Default: 16.
     pub max_chain_length: u16,
+    /// Maximum number of standalone async tasks (not bound to connections)
+    /// per worker. Used with [`spawn()`](crate::spawn).
+    /// Default: 256.
+    pub standalone_task_capacity: u32,
+    /// Maximum number of concurrent timer slots per worker.
+    /// Used by [`sleep()`](crate::sleep) and [`timeout()`](crate::timeout).
+    /// Default: 256.
+    pub timer_slots: u32,
 }
 
 impl Default for Config {
@@ -101,6 +109,8 @@ impl Default for Config {
             tls_client: None,
             tcp_nodelay: true,
             max_chain_length: 16,
+            standalone_task_capacity: 256,
+            timer_slots: 256,
         }
     }
 }

@@ -8,6 +8,11 @@ thread_local! {
         const { std::cell::RefCell::new(VecDeque::new()) };
 }
 
+/// Bit flag that distinguishes standalone tasks from connection tasks
+/// in the ready queue. Connection indices use bits 0..23 (max 16M),
+/// so bit 31 is always free for connection tasks.
+pub(crate) const STANDALONE_BIT: u32 = 1 << 31;
+
 /// Create a [`Waker`] for the given connection index.
 ///
 /// When woken, the waker pushes `conn_index` onto the thread-local
@@ -19,10 +24,27 @@ thread_local! {
 /// Must only be used on the same thread where the executor runs
 /// (single-threaded, thread-per-core model).
 pub(crate) fn conn_waker(conn_index: u32) -> Waker {
+    debug_assert!(
+        conn_index & STANDALONE_BIT == 0,
+        "conn_index has standalone bit set"
+    );
     let data = conn_index as usize as *const ();
     // SAFETY: The vtable functions below follow the RawWaker contract.
     // The "data" is just a usize (conn_index) cast to a pointer — no
     // heap allocation, no lifetime concerns.
+    unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
+}
+
+/// Create a [`Waker`] for a standalone task (not bound to a connection).
+///
+/// The `task_idx` is OR'd with `STANDALONE_BIT` so the executor can
+/// distinguish it from connection wakeups.
+pub(crate) fn standalone_waker(task_idx: u32) -> Waker {
+    debug_assert!(
+        task_idx & STANDALONE_BIT == 0,
+        "task_idx already has standalone bit"
+    );
+    let data = (task_idx | STANDALONE_BIT) as usize as *const ();
     unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
 }
 

@@ -11,8 +11,8 @@ use crate::connection::RecvMode;
 use crate::driver::Driver;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, clear_driver_state, set_driver_state};
-use crate::runtime::waker::conn_waker;
-use crate::runtime::Executor;
+use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
+use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
 
 /// Async event loop that reuses `Driver` infrastructure with an `Executor`
 /// for polling connection futures instead of push-based callbacks.
@@ -32,7 +32,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, crate::error::Error> {
         let driver = Driver::new(config, accept_rx, eventfd, shutdown_flag)?;
-        let executor = Executor::new(config.max_connections);
+        let executor = Executor::new(
+            config.max_connections,
+            config.standalone_task_capacity,
+            config.timer_slots,
+        );
         Ok(AsyncEventLoop {
             driver,
             handler,
@@ -63,7 +67,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 && let Some(ref ts) = self.driver.tick_timeout_ts
             {
                 let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-                let _ = self.driver.ring.submit_tick_timeout(ts as *const _, ud.raw());
+                let _ = self
+                    .driver
+                    .ring
+                    .submit_tick_timeout(ts as *const _, ud.raw());
                 self.driver.tick_timeout_armed = true;
             }
 
@@ -97,7 +104,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Poll all tasks in the ready queue.
+    /// Poll all tasks in the ready queue (both connection and standalone tasks).
     fn poll_ready_tasks(&mut self) {
         // Set thread-local driver pointer once for the entire batch.
         let mut driver_state = DriverState {
@@ -108,21 +115,44 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let mut i = 0;
         while i < self.executor.ready_queue.len() {
-            let conn_index = self.executor.ready_queue[i];
+            let raw_id = self.executor.ready_queue[i];
             i += 1;
 
-            if let Some(mut fut) = self.executor.task_slab.take_ready(conn_index) {
-                let waker = conn_waker(conn_index);
-                let mut cx = Context::from_waker(&waker);
+            if raw_id & STANDALONE_BIT != 0 {
+                // Standalone task.
+                let task_idx = raw_id & !STANDALONE_BIT;
+                if let Some(mut fut) = self.executor.standalone_slab.take_ready(task_idx) {
+                    let waker = standalone_waker(task_idx);
+                    let mut cx = Context::from_waker(&waker);
 
-                match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(()) => {
-                        // Task completed — connection handler is done.
-                        self.driver.close_connection(conn_index);
-                        self.executor.remove_connection(conn_index);
+                    CURRENT_TASK_ID.with(|c| c.set(raw_id));
+                    match fut.as_mut().poll(&mut cx) {
+                        std::task::Poll::Ready(()) => {
+                            // Standalone task completed — just remove it.
+                            self.executor.standalone_slab.remove(task_idx);
+                        }
+                        std::task::Poll::Pending => {
+                            self.executor.standalone_slab.park(task_idx, fut);
+                        }
                     }
-                    std::task::Poll::Pending => {
-                        self.executor.task_slab.park(conn_index, fut);
+                }
+            } else {
+                // Connection task.
+                let conn_index = raw_id;
+                if let Some(mut fut) = self.executor.task_slab.take_ready(conn_index) {
+                    let waker = conn_waker(conn_index);
+                    let mut cx = Context::from_waker(&waker);
+
+                    CURRENT_TASK_ID.with(|c| c.set(conn_index));
+                    match fut.as_mut().poll(&mut cx) {
+                        std::task::Poll::Ready(()) => {
+                            // Task completed — connection handler is done.
+                            self.driver.close_connection(conn_index);
+                            self.executor.remove_connection(conn_index);
+                        }
+                        std::task::Poll::Pending => {
+                            self.executor.task_slab.park(conn_index, fut);
+                        }
                     }
                 }
             }
@@ -190,6 +220,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::TickTimeout => {
                 self.driver.tick_timeout_armed = false;
             }
+            OpTag::Timer => self.handle_timer(ud, result),
         }
     }
 
@@ -375,10 +406,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Re-arm eventfd read.
         if !self.driver.shutdown_flag.load(Ordering::Relaxed) {
-            let _ = self.driver.ring.submit_eventfd_read(
-                self.driver.eventfd,
-                self.driver.eventfd_buf.as_mut_ptr(),
-            );
+            let _ = self
+                .driver
+                .ring
+                .submit_eventfd_read(self.driver.eventfd, self.driver.eventfd_buf.as_mut_ptr());
         }
     }
 
@@ -402,10 +433,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
             {
-                let _ =
-                    self.driver
-                        .ring
-                        .submit_send_copied(conn_index, ptr, remaining, pool_slot);
+                let _ = self
+                    .driver
+                    .ring
+                    .submit_send_copied(conn_index, ptr, remaining, pool_slot);
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
@@ -468,10 +499,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.send_copy_pool.release(ps);
                 }
             }
-            let event = self
-                .driver
-                .chain_table
-                .on_operation_cqe(conn_index, result);
+            let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
             if matches!(event, ChainEvent::Complete { .. }) {
                 self.fire_chain_complete(conn_index);
             }
@@ -704,10 +732,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
         {
-            let _ =
-                self.driver
-                    .ring
-                    .submit_tls_send(conn_index, ptr, remaining, pool_slot);
+            let _ = self
+                .driver
+                .ring
+                .submit_tls_send(conn_index, ptr, remaining, pool_slot);
             return;
         }
         self.driver.send_copy_pool.release(pool_slot);
@@ -731,6 +759,30 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         self.executor.wake_send(conn_index, io_result);
+    }
+
+    fn handle_timer(&mut self, ud: UserData, result: i32) {
+        // Timer CQE: -ETIME means the timeout expired normally.
+        // -ECANCELED means it was cancelled (e.g., SleepFuture dropped).
+        if result != -libc::ETIME {
+            // Cancelled or error — the SleepFuture::drop already released the slot.
+            return;
+        }
+
+        let payload = ud.payload();
+        let (slot, generation) = TimerSlotPool::decode_payload(payload);
+
+        if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
+            // Wake the task that owns this timer.
+            if waker_id & STANDALONE_BIT != 0 {
+                let task_idx = waker_id & !STANDALONE_BIT;
+                if self.executor.standalone_slab.wake(task_idx) {
+                    self.executor.ready_queue.push_back(waker_id);
+                }
+            } else if self.executor.task_slab.wake(waker_id) {
+                self.executor.ready_queue.push_back(waker_id);
+            }
+        }
     }
 
     /// Spawn an async task for a newly accepted connection.

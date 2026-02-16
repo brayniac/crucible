@@ -1,28 +1,27 @@
 //! Benchmark comparing callback-based EventHandler vs async AsyncEventHandler
-//! for a minimal echo server. Measures throughput (ops/sec) and per-operation
-//! latency to detect any overhead from the async runtime.
+//! for a minimal echo server. Measures throughput (ops/sec), per-operation
+//! latency histograms (p50/p90/p99/p999/max), and CPU usage across a matrix
+//! of connection counts and message sizes.
 //!
 //! Usage:
-//!   cargo run --release --example echo_bench -- [OPTIONS]
+//!   cargo run --release -p krio --example echo_bench -- [OPTIONS]
 //!
 //! Options:
-//!   --duration <secs>    Test duration per mode (default: 5)
-//!   --clients <n>        Number of concurrent client threads (default: 4)
-//!   --msg-size <bytes>   Message size in bytes (default: 64)
+//!   --duration <secs>    Test duration per configuration (default: 3)
 //!   --workers <n>        Number of server worker threads (default: 1)
 //!   --port <n>           Base port (default: 17171)
+//!   --quick              Run a single config only (4 clients, 64B)
+//!   --gate <pct>         Overhead threshold for decision gate (default: 5.0)
 
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use krio::{
-    AsyncEventHandler, Config, ConnCtx, ConnToken, DriverCtx, EventHandler, KrioBuilder,
-};
+use krio::{AsyncEventHandler, Config, ConnCtx, ConnToken, DriverCtx, EventHandler, KrioBuilder};
 
 // ── Callback echo handler ────────────────────────────────────────────
 
@@ -36,7 +35,13 @@ impl EventHandler for CallbackEcho {
         data.len()
     }
 
-    fn on_send_complete(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _result: io::Result<u32>) {}
+    fn on_send_complete(
+        &mut self,
+        _ctx: &mut DriverCtx,
+        _conn: ConnToken,
+        _result: io::Result<u32>,
+    ) {
+    }
 
     fn on_close(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
 
@@ -71,17 +76,99 @@ impl AsyncEventHandler for AsyncEcho {
     }
 }
 
+// ── Latency histogram ───────────────────────────────────────────────
+
+struct LatencyHistogram {
+    samples: Vec<u64>, // nanoseconds per op
+}
+
+impl LatencyHistogram {
+    fn new() -> Self {
+        LatencyHistogram {
+            samples: Vec::with_capacity(1_000_000),
+        }
+    }
+
+    fn record(&mut self, ns: u64) {
+        self.samples.push(ns);
+    }
+
+    fn finalize(&mut self) -> LatencyStats {
+        self.samples.sort_unstable();
+        let n = self.samples.len();
+        if n == 0 {
+            return LatencyStats {
+                p50: 0,
+                p90: 0,
+                p99: 0,
+                p999: 0,
+                max: 0,
+                count: 0,
+            };
+        }
+        LatencyStats {
+            p50: self.samples[n * 50 / 100],
+            p90: self.samples[n * 90 / 100],
+            p99: self.samples[n * 99 / 100],
+            p999: self.samples[n.saturating_sub(1).min(n * 999 / 1000)],
+            max: self.samples[n - 1],
+            count: n as u64,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LatencyStats {
+    p50: u64,
+    p90: u64,
+    p99: u64,
+    p999: u64,
+    max: u64,
+    count: u64,
+}
+
+// ── CPU measurement ─────────────────────────────────────────────────
+
+fn process_cpu_time_ns() -> u64 {
+    let stat = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let fields: Vec<&str> = stat.split_whitespace().collect();
+    if fields.len() < 15 {
+        return 0;
+    }
+    let utime: u64 = fields[13].parse().unwrap_or(0);
+    let stime: u64 = fields[14].parse().unwrap_or(0);
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    if ticks_per_sec == 0 {
+        return 0;
+    }
+    (utime + stime) * 1_000_000_000 / ticks_per_sec
+}
+
 // ── Client ──────────────────────────────────────────────────────────
 
-fn run_client(addr: &str, msg_size: usize, stop: Arc<AtomicBool>, ops_counter: Arc<AtomicU64>) {
+struct ClientResult {
+    ops: u64,
+    histogram: LatencyHistogram,
+}
+
+fn run_client(
+    addr: &str,
+    msg_size: usize,
+    stop: Arc<AtomicBool>,
+    ops_counter: Arc<AtomicU64>,
+) -> ClientResult {
     let msg = vec![0xABu8; msg_size];
     let mut recv_buf = vec![0u8; msg_size];
+    let mut histogram = LatencyHistogram::new();
 
     let mut stream = match TcpStream::connect(addr) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("client connect failed: {e}");
-            return;
+            eprintln!("  client connect failed: {e}");
+            return ClientResult { ops: 0, histogram };
         }
     };
     stream.set_nodelay(true).ok();
@@ -89,6 +176,8 @@ fn run_client(addr: &str, msg_size: usize, stop: Arc<AtomicBool>, ops_counter: A
     let mut local_ops: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
+        let t0 = Instant::now();
+
         // Send
         if stream.write_all(&msg).is_err() {
             break;
@@ -98,47 +187,73 @@ fn run_client(addr: &str, msg_size: usize, stop: Arc<AtomicBool>, ops_counter: A
         let mut total_read = 0;
         while total_read < msg_size {
             match stream.read(&mut recv_buf[total_read..]) {
-                Ok(0) => return,
+                Ok(0) => {
+                    return ClientResult {
+                        ops: local_ops,
+                        histogram,
+                    };
+                }
                 Ok(n) => total_read += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
+                Err(_) => {
+                    return ClientResult {
+                        ops: local_ops,
+                        histogram,
+                    };
+                }
             }
         }
 
-        local_ops += 1;
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        histogram.record(elapsed_ns);
 
-        // Batch-update the shared counter every 256 ops to reduce contention.
+        local_ops += 1;
         if local_ops & 0xFF == 0 {
             ops_counter.fetch_add(256, Ordering::Relaxed);
         }
     }
 
-    // Flush remaining count.
     ops_counter.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
+    ClientResult {
+        ops: local_ops,
+        histogram,
+    }
 }
 
-// ── Benchmark runner ─────────────────────────────────────────────────
+// ── Benchmark runner ────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct BenchResult {
     ops_per_sec: f64,
     ns_per_op: f64,
+    latency: LatencyStats,
+    cpu_ns: u64,
 }
 
-fn make_config(workers: usize) -> Config {
+fn make_config(workers: usize, msg_size: usize) -> Config {
     let mut config = Config::default();
     config.worker.threads = workers;
     config.worker.pin_to_core = false;
     config.sq_entries = 256;
     config.recv_buffer.ring_size = 256;
-    config.recv_buffer.buffer_size = 8192;
+    config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
     config.max_connections = 4096;
-    config.send_copy_count = 256;
-    config.send_copy_slot_size = 8192;
+    config.send_copy_count = 512;
+    config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
     config
 }
 
+fn wait_for_server(addr: &str) {
+    for _ in 0..100 {
+        if TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("server did not start on {addr}");
+}
+
 fn run_bench(
-    mode: &str,
     addr: &str,
     num_clients: usize,
     msg_size: usize,
@@ -148,13 +263,7 @@ fn run_bench(
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
 
-    // Wait for the server to be ready.
-    for _ in 0..100 {
-        if TcpStream::connect(addr).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_server(addr);
 
     // Spawn client threads.
     let mut client_handles = Vec::with_capacity(num_clients);
@@ -163,7 +272,7 @@ fn run_bench(
         let stop = stop.clone();
         let ops = ops.clone();
         client_handles.push(std::thread::spawn(move || {
-            run_client(&addr, msg_size, stop, ops);
+            run_client(&addr, msg_size, stop, ops)
         }));
     }
 
@@ -172,14 +281,21 @@ fn run_bench(
     ops.store(0, Ordering::Relaxed);
 
     // Measurement phase.
+    let cpu_before = process_cpu_time_ns();
     let start = Instant::now();
     std::thread::sleep(duration);
     let elapsed = start.elapsed();
+    let cpu_after = process_cpu_time_ns();
     stop.store(true, Ordering::Relaxed);
 
     // Collect.
+    let mut merged = LatencyHistogram::new();
     for h in client_handles {
-        h.join().ok();
+        if let Ok(result) = h.join() {
+            for &sample in &result.histogram.samples {
+                merged.record(sample);
+            }
+        }
     }
 
     let total_ops = ops.load(Ordering::Relaxed);
@@ -190,27 +306,44 @@ fn run_bench(
         0.0
     };
 
-    eprintln!(
-        "  {mode}: {total_ops:>10} ops in {:.2}s = {ops_per_sec:>10.0} ops/sec  ({ns_per_op:.0} ns/op)",
-        elapsed.as_secs_f64()
-    );
-
     BenchResult {
         ops_per_sec,
         ns_per_op,
+        latency: merged.finalize(),
+        cpu_ns: cpu_after.saturating_sub(cpu_before),
     }
 }
 
-// ── Main ─────────────────────────────────────────────────────────────
+// ── Formatting helpers ──────────────────────────────────────────────
+
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1024 {
+        format!("{}KB", bytes / 1024)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn format_ns(ns: u64) -> String {
+    if ns >= 1_000_000 {
+        format!("{:.2}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.1}us", ns as f64 / 1_000.0)
+    } else {
+        format!("{}ns", ns)
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let mut duration_secs = 5u64;
-    let mut num_clients = 4usize;
-    let mut msg_size = 64usize;
+    let mut duration_secs = 3u64;
     let mut workers = 1usize;
     let mut base_port = 17171u16;
+    let mut quick = false;
+    let mut gate_pct = 5.0f64;
 
     let mut i = 1;
     while i < args.len() {
@@ -219,14 +352,6 @@ fn main() {
                 i += 1;
                 duration_secs = args[i].parse().unwrap();
             }
-            "--clients" => {
-                i += 1;
-                num_clients = args[i].parse().unwrap();
-            }
-            "--msg-size" => {
-                i += 1;
-                msg_size = args[i].parse().unwrap();
-            }
             "--workers" => {
                 i += 1;
                 workers = args[i].parse().unwrap();
@@ -234,6 +359,13 @@ fn main() {
             "--port" => {
                 i += 1;
                 base_port = args[i].parse().unwrap();
+            }
+            "--quick" => {
+                quick = true;
+            }
+            "--gate" => {
+                i += 1;
+                gate_pct = args[i].parse().unwrap();
             }
             _ => {
                 eprintln!("unknown arg: {}", args[i]);
@@ -246,72 +378,194 @@ fn main() {
     let duration = Duration::from_secs(duration_secs);
     let warmup = Duration::from_secs(1);
 
+    // Configuration matrix.
+    let client_counts: Vec<usize> = if quick { vec![4] } else { vec![1, 4, 16, 64] };
+    let msg_sizes: Vec<usize> = if quick {
+        vec![64]
+    } else {
+        vec![64, 512, 4096, 32768]
+    };
+
     eprintln!(
-        "Echo benchmark: {}B messages, {} clients, {} worker(s), {}s per test",
-        msg_size, num_clients, workers, duration_secs
+        "Echo benchmark: {} worker(s), {}s per config, gate={gate_pct}%",
+        workers, duration_secs
+    );
+    eprintln!("  clients: {:?}", client_counts);
+    eprintln!(
+        "  sizes:   {:?}",
+        msg_sizes
+            .iter()
+            .map(|s| format_size(*s))
+            .collect::<Vec<_>>()
     );
     eprintln!();
 
-    // ── Test 1: Callback mode ────────────────────────────────────────
-    let callback_addr = format!("127.0.0.1:{}", base_port);
-    eprintln!("Starting callback echo server on {callback_addr}...");
-
-    let config = make_config(workers);
-    let (shutdown, handles) = KrioBuilder::new(config)
-        .bind(&callback_addr)
-        .launch::<CallbackEcho>()
-        .expect("failed to launch callback server");
-
-    let callback_result = run_bench("callback", &callback_addr, num_clients, msg_size, warmup, duration);
-
-    shutdown.shutdown();
-    for h in handles {
-        h.join().ok();
+    struct Row {
+        clients: usize,
+        msg_size: usize,
+        callback: BenchResult,
+        r#async: BenchResult,
+        overhead_pct: f64,
     }
 
-    // Brief pause between tests to ensure port is released.
-    std::thread::sleep(Duration::from_millis(100));
-    eprintln!();
+    let mut results: Vec<Row> = Vec::new();
+    let mut port_offset = 0u16;
 
-    // ── Test 2: Async mode ───────────────────────────────────────────
-    let async_addr = format!("127.0.0.1:{}", base_port + 1);
-    eprintln!("Starting async echo server on {async_addr}...");
+    for &clients in &client_counts {
+        for &msg_size in &msg_sizes {
+            let cb_port = base_port + port_offset;
+            let async_port = base_port + port_offset + 1;
+            port_offset += 2;
 
-    let config = make_config(workers);
-    let (shutdown, handles) = KrioBuilder::new(config)
-        .bind(&async_addr)
-        .launch_async::<AsyncEcho>()
-        .expect("failed to launch async server");
+            let cb_addr = format!("127.0.0.1:{cb_port}");
+            let async_addr = format!("127.0.0.1:{async_port}");
 
-    let async_result = run_bench("async   ", &async_addr, num_clients, msg_size, warmup, duration);
+            eprintln!(
+                "  {clients} clients x {}: callback on :{cb_port}, async on :{async_port}",
+                format_size(msg_size)
+            );
 
-    shutdown.shutdown();
-    for h in handles {
-        h.join().ok();
-    }
+            // Callback mode.
+            let config = make_config(workers, msg_size);
+            let (cb_shutdown, cb_handles) = KrioBuilder::new(config)
+                .bind(&cb_addr)
+                .launch::<CallbackEcho>()
+                .expect("failed to launch callback server");
 
-    // ── Comparison ───────────────────────────────────────────────────
-    eprintln!();
-    eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!(
-        "  Callback: {:>10.0} ops/sec  ({:>6.0} ns/op)",
-        callback_result.ops_per_sec, callback_result.ns_per_op
-    );
-    eprintln!(
-        "  Async:    {:>10.0} ops/sec  ({:>6.0} ns/op)",
-        async_result.ops_per_sec, async_result.ns_per_op
-    );
+            let cb_result = run_bench(&cb_addr, clients, msg_size, warmup, duration);
 
-    if callback_result.ops_per_sec > 0.0 {
-        let ratio = async_result.ops_per_sec / callback_result.ops_per_sec;
-        let pct = (1.0 - ratio) * 100.0;
-        if pct.abs() < 0.5 {
-            eprintln!("  Diff:     within noise (<0.5%)");
-        } else if pct > 0.0 {
-            eprintln!("  Diff:     async is {pct:.2}% slower");
-        } else {
-            eprintln!("  Diff:     async is {:.2}% faster", -pct);
+            cb_shutdown.shutdown();
+            for h in cb_handles {
+                h.join().ok();
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Async mode.
+            let config = make_config(workers, msg_size);
+            let (async_shutdown, async_handles) = KrioBuilder::new(config)
+                .bind(&async_addr)
+                .launch_async::<AsyncEcho>()
+                .expect("failed to launch async server");
+
+            let async_result = run_bench(&async_addr, clients, msg_size, warmup, duration);
+
+            async_shutdown.shutdown();
+            for h in async_handles {
+                h.join().ok();
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            let overhead = if cb_result.ops_per_sec > 0.0 {
+                (1.0 - async_result.ops_per_sec / cb_result.ops_per_sec) * 100.0
+            } else {
+                0.0
+            };
+
+            eprintln!(
+                "    callback: {:>9.0} ops/s  async: {:>9.0} ops/s  overhead: {:>+.1}%",
+                cb_result.ops_per_sec, async_result.ops_per_sec, overhead
+            );
+
+            results.push(Row {
+                clients,
+                msg_size,
+                callback: cb_result,
+                r#async: async_result,
+                overhead_pct: overhead,
+            });
         }
     }
-    eprintln!("═══════════════════════════════════════════════════════════");
+
+    // ── Summary table ───────────────────────────────────────────────
+    eprintln!();
+    eprintln!("## Results");
+    eprintln!();
+    eprintln!(
+        "| Clients | MsgSize | CB ops/s   | Async ops/s | CB p50     | Async p50  | CB p99     | Async p99  | Overhead |"
+    );
+    eprintln!(
+        "|---------|---------|------------|-------------|------------|------------|------------|------------|----------|"
+    );
+
+    let mut any_fail = false;
+    for row in &results {
+        let overhead_str = format!("{:>+.1}%", row.overhead_pct);
+        let flag = if row.overhead_pct > gate_pct {
+            any_fail = true;
+            " **FAIL**"
+        } else {
+            ""
+        };
+
+        eprintln!(
+            "| {:>7} | {:>7} | {:>10.0} | {:>11.0} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8}{} |",
+            row.clients,
+            format_size(row.msg_size),
+            row.callback.ops_per_sec,
+            row.r#async.ops_per_sec,
+            format_ns(row.callback.latency.p50),
+            format_ns(row.r#async.latency.p50),
+            format_ns(row.callback.latency.p99),
+            format_ns(row.r#async.latency.p99),
+            overhead_str,
+            flag,
+        );
+    }
+
+    // ── Detailed latency table ──────────────────────────────────────
+    eprintln!();
+    eprintln!("## Latency Detail");
+    eprintln!();
+    eprintln!(
+        "| Config               | Mode     |     p50 |     p90 |     p99 |    p999 |      max |"
+    );
+    eprintln!(
+        "|----------------------|----------|---------|---------|---------|---------|----------|"
+    );
+
+    for row in &results {
+        let label = format!("{}c x {}", row.clients, format_size(row.msg_size));
+        eprintln!(
+            "| {:>20} | callback | {:>7} | {:>7} | {:>7} | {:>7} | {:>8} |",
+            label,
+            format_ns(row.callback.latency.p50),
+            format_ns(row.callback.latency.p90),
+            format_ns(row.callback.latency.p99),
+            format_ns(row.callback.latency.p999),
+            format_ns(row.callback.latency.max),
+        );
+        eprintln!(
+            "| {:>20} | async    | {:>7} | {:>7} | {:>7} | {:>7} | {:>8} |",
+            "",
+            format_ns(row.r#async.latency.p50),
+            format_ns(row.r#async.latency.p90),
+            format_ns(row.r#async.latency.p99),
+            format_ns(row.r#async.latency.p999),
+            format_ns(row.r#async.latency.max),
+        );
+    }
+
+    // ── CPU usage ───────────────────────────────────────────────────
+    eprintln!();
+    eprintln!("## CPU Usage (process total, test interval)");
+    eprintln!();
+    for row in &results {
+        let label = format!("{}c x {}", row.clients, format_size(row.msg_size));
+        eprintln!(
+            "  {label:>20}  callback: {:.1}ms  async: {:.1}ms",
+            row.callback.cpu_ns as f64 / 1_000_000.0,
+            row.r#async.cpu_ns as f64 / 1_000_000.0,
+        );
+    }
+
+    // ── Decision gate ───────────────────────────────────────────────
+    eprintln!();
+    if any_fail {
+        eprintln!("DECISION: FAIL — one or more configs exceed {gate_pct}% async overhead");
+        std::process::exit(1);
+    } else {
+        eprintln!("DECISION: PASS — all configs within {gate_pct}% async overhead");
+    }
 }
