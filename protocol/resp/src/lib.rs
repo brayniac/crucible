@@ -57,7 +57,7 @@ mod value;
 
 pub use command::Command;
 pub use error::ParseError;
-pub use request::Request;
+pub use request::{Request, SetRequest};
 pub use streaming::{ParseProgress, STREAMING_THRESHOLD, SetHeader, complete_set, parse_streaming};
 pub use value::{
     DEFAULT_MAX_BULK_STRING_LEN, DEFAULT_MAX_COLLECTION_ELEMENTS, DEFAULT_MAX_DEPTH,
