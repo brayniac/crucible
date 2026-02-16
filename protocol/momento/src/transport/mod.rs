@@ -95,7 +95,7 @@ pub trait MomentoTransport {
     /// Feed plaintext data directly, bypassing the Transport recv buffer.
     ///
     /// More efficient than `on_recv()` when TLS is handled externally
-    /// (e.g., by kompio's native TLS). Default delegates to `on_recv()`.
+    /// (e.g., by krio's native TLS). Default delegates to `on_recv()`.
     fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
         self.on_recv(data)
     }

@@ -5,7 +5,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Lightweight Momento cache protocol implementation for kompio-based applications"
+description = "Lightweight Momento cache protocol implementation for krio-based applications"
 
 [dependencies]
 bytes = { workspace = true }

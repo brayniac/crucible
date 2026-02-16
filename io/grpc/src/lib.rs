@@ -1,7 +1,7 @@
-//! grpc - gRPC implementation for kompio-based applications.
+//! grpc - gRPC implementation for krio-based applications.
 //!
 //! This crate provides gRPC framing on top of HTTP/2, designed to work
-//! with the kompio I/O framework. It does not use async/await or tokio.
+//! with the krio I/O framework. It does not use async/await or tokio.
 //!
 //! # Features
 //!

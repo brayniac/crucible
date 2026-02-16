@@ -1,9 +1,9 @@
-//! Native runtime server loop using kompio.
+//! Native runtime server loop using krio.
 
 use crate::config::Config;
 use crate::metrics::{WorkerStats, WorkerStatsSnapshot};
 use cache_core::Cache;
-use kompio::KompioBuilder;
+use krio::KrioBuilder;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -52,24 +52,24 @@ pub fn run<C: Cache + 'static>(
         None
     };
 
-    // Match kompio's default 16KB slot size. Large values are automatically
+    // Match krio's default 16KB slot size. Large values are automatically
     // chunked. Use more slots than the default to support many concurrent
     // connections sending responses in parallel.
     // Memory cost: 8192 slots × 16KB = 128MB per worker.
     let send_copy_slot_size = 16384u32;
     let send_copy_count = 8192u16;
 
-    // Build kompio config from server config
-    let kompio_config = kompio::Config {
+    // Build krio config from server config
+    let krio_config = krio::Config {
         sq_entries: config.uring.sq_depth,
         sqpoll: config.uring.sqpoll,
         sqpoll_idle_ms: config.uring.sqpoll_idle_ms,
-        recv_buffer: kompio::RecvBufferConfig {
+        recv_buffer: krio::RecvBufferConfig {
             ring_size: config.uring.buffer_count.next_power_of_two(),
             buffer_size: config.uring.buffer_size as u32,
             ..Default::default()
         },
-        worker: kompio::WorkerConfig {
+        worker: krio::WorkerConfig {
             threads: num_workers,
             pin_to_core: cpu_affinity.is_some(),
             core_offset: cpu_affinity.as_ref().map(|c| c[0]).unwrap_or(0),
@@ -104,7 +104,7 @@ pub fn run<C: Cache + 'static>(
     }
     init_config_channel(config_rx, num_workers);
 
-    let (shutdown_handle, handles) = KompioBuilder::new(kompio_config)
+    let (shutdown_handle, handles) = KrioBuilder::new(krio_config)
         .bind(&bind_addr.to_string())
         .launch::<ServerHandler<C>>()?;
 

@@ -1,7 +1,7 @@
 //! Single backend connection.
 
 use bytes::BytesMut;
-use kompio::ConnToken;
+use krio::ConnToken;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -42,7 +42,7 @@ pub struct InFlightRequest {
 
 /// A connection to a backend node.
 pub struct BackendConnection {
-    /// Connection token from kompio.
+    /// Connection token from krio.
     pub conn: ConnToken,
 
     /// Backend address.

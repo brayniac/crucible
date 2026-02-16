@@ -229,7 +229,7 @@ impl<T: Transport> Connection<T> {
     /// Feed plaintext data directly into the connection's frame buffer.
     ///
     /// More efficient than `on_recv()` when TLS is handled externally (e.g.,
-    /// by kompio's native TLS). Skips the Transport recv buffer entirely.
+    /// by krio's native TLS). Skips the Transport recv buffer entirely.
     pub fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
         self.read_buf.extend_from_slice(data);
         self.process_frames()

@@ -9,7 +9,7 @@ Crucible is a high-performance cache server and benchmarking toolkit written in 
 - **Cache Server** (`crucible-server`) - Multi-protocol cache server supporting Redis (RESP) and Memcache protocols
 - **Benchmark Tool** (`crucible-benchmark`) - Load generator with detailed latency metrics
 - **Cache Libraries** - Multiple cache implementations (Segcache, Slab, Heap)
-- **I/O Framework** (`kompio`) - Push-based io_uring event loop with callback-driven `EventHandler` trait
+- **I/O Framework** (`krio`) - Push-based io_uring event loop with callback-driven `EventHandler` trait
 
 ## Design Philosophy
 
@@ -19,7 +19,7 @@ Crucible is built for **performance-critical deployments where microseconds matt
 
 Tokio is an excellent general-purpose async runtime, but it abstracts away platform-specific capabilities that are essential for cache server performance:
 
-1. **Push-based callback model vs async/await**: Our `kompio` framework uses an `EventHandler` trait with callbacks (`on_data`, `on_accept`, `on_connect`, `on_send_complete`, `on_close`, `on_tick`) instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight event loop with predictable behavior.
+1. **Push-based callback model vs async/await**: Our `krio` framework uses an `EventHandler` trait with callbacks (`on_data`, `on_accept`, `on_connect`, `on_send_complete`, `on_close`, `on_tick`) instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight event loop with predictable behavior.
 
 2. **Direct access to io_uring features**: Tokio's abstractions hide advanced io_uring capabilities that we need:
    - **Multishot recv**: Single submission, multiple completions without re-submission overhead
@@ -35,7 +35,7 @@ Tokio is an excellent general-purpose async runtime, but it abstracts away platf
 
 4. **Thread-per-core with CPU pinning**: Workers are pinned to specific cores, keeping hot data in CPU cache. Tokio's work-stealing scheduler moves tasks between threads, invalidating caches and adding unpredictable latency.
 
-5. **Bundled infrastructure**: kompio manages acceptor threads, worker threads, connection lifecycle, and the io_uring submission/completion loop internally—consumers only implement the `EventHandler` trait.
+5. **Bundled infrastructure**: krio manages acceptor threads, worker threads, connection lifecycle, and the io_uring submission/completion loop internally—consumers only implement the `EventHandler` trait.
 
 ### Why The Benchmark Tool Doesn't Use Tokio
 
@@ -43,16 +43,16 @@ The benchmark needs to measure latency accurately without introducing measuremen
 
 - **Precise timing**: Direct `Instant::now()` calls at exact points in the event loop, not filtered through async task scheduling
 - **CPU pinning**: Threads pinned to cores for reproducible results across runs
-- **Same I/O advantages**: Uses `kompio` to leverage io_uring on Linux, matching the server's I/O characteristics
+- **Same I/O advantages**: Uses `krio` to leverage io_uring on Linux, matching the server's I/O characteristics
 - **Dual timestamp modes**: Supports both userspace timing and kernel SO_TIMESTAMPING for sub-microsecond accuracy
 
 The admin/metrics server within the benchmark *does* use Tokio—it's isolated on a separate thread where convenience matters more than latency.
 
 ### Runtime Architecture
 
-The server uses kompio's native io_uring runtime for all cache I/O. Tokio is only used for the admin/metrics HTTP server, which runs on a separate thread where convenience matters more than latency.
+The server uses krio's native io_uring runtime for all cache I/O. Tokio is only used for the admin/metrics HTTP server, which runs on a separate thread where convenience matters more than latency.
 
-| Aspect | Cache I/O (kompio) | Admin server (Tokio) |
+| Aspect | Cache I/O (krio) | Admin server (Tokio) |
 |--------|-------------------|---------------------|
 | Threading | Thread-per-core with CPU pinning | Single-threaded Tokio runtime |
 | I/O | io_uring (Linux 6.0+) | Tokio reactor (epoll) |
@@ -123,7 +123,7 @@ crucible/
     slab/       # Memcached-style slab allocator with slab-level eviction
     heap/       # Heap-allocated cache using system allocator
   io/
-    kompio/     # Push-based io_uring event loop (EventHandler trait)
+    krio/     # Push-based io_uring event loop (EventHandler trait)
     http2/      # HTTP/2 framing and Transport abstraction
     grpc/       # gRPC client implementation
   protocol/
@@ -131,15 +131,15 @@ crucible/
     memcache/   # Memcache ASCII and binary protocols
     momento/    # Momento cache protocol
     ping/       # Simple ping protocol for testing
-  server/       # Cache server binary (kompio/io_uring runtime)
+  server/       # Cache server binary (krio/io_uring runtime)
   benchmark/    # Benchmark tool binary
   xtask/        # Development tasks (fuzz-all, flamegraph)
   metrics/      # Metrics infrastructure
 ```
 
-### Kompio I/O Framework
+### Krio I/O Framework
 
-The `kompio` crate provides a push-based io_uring event loop. Applications implement the `EventHandler` trait:
+The `krio` crate provides a push-based io_uring event loop. Applications implement the `EventHandler` trait:
 
 ```rust
 // Applications implement EventHandler callbacks
@@ -154,7 +154,7 @@ impl EventHandler for MyHandler {
 }
 
 // Launch with builder pattern
-KompioBuilder::new(config).bind("0.0.0.0:6379").launch::<MyHandler>()?;
+KrioBuilder::new(config).bind("0.0.0.0:6379").launch::<MyHandler>()?;
 ```
 
 **Key features:**

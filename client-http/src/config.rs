@@ -1,7 +1,7 @@
 pub struct HttpClientConfig {
     /// HTTP/2 server addresses ("host:port").
     pub servers: Vec<String>,
-    /// Number of kompio worker threads (default: 1).
+    /// Number of krio worker threads (default: 1).
     pub workers: usize,
     /// Connections per server per worker (default: 1).
     pub connections_per_server: usize,

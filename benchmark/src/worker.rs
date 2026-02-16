@@ -1,6 +1,6 @@
-//! Worker implementation using kompio EventHandler.
+//! Worker implementation using krio EventHandler.
 //!
-//! Each worker runs inside a kompio event loop, using callbacks
+//! Each worker runs inside a krio event loop, using callbacks
 //! (`on_tick`, `on_connect`, `on_data`, `on_send_complete`, `on_close`)
 //! to drive the benchmark workload.
 
@@ -9,7 +9,7 @@ use crate::config::{Config, Protocol as CacheProtocol};
 use crate::metrics;
 use crate::ratelimit::DynamicRateLimiter;
 
-use kompio::{ConnToken, DriverCtx, EventHandler, GuardBox, RegionId, SendGuard};
+use krio::{ConnToken, DriverCtx, EventHandler, GuardBox, RegionId, SendGuard};
 
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -255,7 +255,7 @@ impl SendGuard for ValuePoolGuard {
 
 // ── BenchHandler ─────────────────────────────────────────────────────────
 
-/// Benchmark worker event handler for kompio.
+/// Benchmark worker event handler for krio.
 pub struct BenchHandler {
     id: usize,
     config: Config,
@@ -273,7 +273,7 @@ pub struct BenchHandler {
     /// Tracks sessions that are being connected (ConnToken::index() -> session index)
     pending_connects: HashMap<usize, usize>,
 
-    /// Momento connections (protocol state only, kompio handles I/O)
+    /// Momento connections (protocol state only, krio handles I/O)
     momento_conns: Vec<MomentoConn>,
     /// Maps ConnToken::index() -> momento connection index
     conn_to_momento: HashMap<usize, usize>,
@@ -408,7 +408,7 @@ impl BenchHandler {
         self.connections_initiated = true;
     }
 
-    /// Connect Momento sessions via kompio TLS.
+    /// Connect Momento sessions via krio TLS.
     fn connect_momento(&mut self, ctx: &mut DriverCtx) {
         // Resolve setup once per worker
         if self.momento_setup.is_none() {
@@ -535,7 +535,7 @@ impl BenchHandler {
         }
     }
 
-    /// Flush pending send data for a Momento connection via kompio.
+    /// Flush pending send data for a Momento connection via krio.
     fn flush_momento(&mut self, ctx: &mut DriverCtx, idx: usize) {
         let pending = self.momento_conns[idx].pending_send();
         if pending.is_empty() {
@@ -570,7 +570,7 @@ impl BenchHandler {
         None
     }
 
-    /// Handle Momento data received from kompio.
+    /// Handle Momento data received from krio.
     fn on_momento_data(
         &mut self,
         ctx: &mut DriverCtx,
@@ -922,7 +922,7 @@ impl BenchHandler {
         }
     }
 
-    /// Flush a session's send buffer via kompio.
+    /// Flush a session's send buffer via krio.
     fn flush_session(&mut self, ctx: &mut DriverCtx, idx: usize) {
         let conn_id = match self.sessions[idx].conn_id() {
             Some(id) => id,
@@ -1375,7 +1375,7 @@ impl EventHandler for BenchHandler {
         // Stamp TTFB on the first unstamped in-flight request
         session.stamp_first_byte(now);
 
-        // Zero-copy path: parse responses directly from kompio's buffer
+        // Zero-copy path: parse responses directly from krio's buffer
         self.results.clear();
         let mut buf = DataSlice::new(data);
         if let Err(e) = session.poll_responses_from(&mut buf, &mut self.results, now) {

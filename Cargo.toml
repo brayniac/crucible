@@ -11,7 +11,7 @@ members = [
 	# IO Framework and Transport
 	"io/grpc",
 	"io/http2",
-	"io/kompio",
+	"io/krio",
 
 	# Protocol Implementations
 	"protocol/momento",
@@ -90,7 +90,7 @@ tracing = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-kompio = { path = "io/kompio" }
+krio = { path = "io/krio" }
 http2 = { path = "io/http2" }
 grpc = { path = "io/grpc" }
 protocol-momento = { path = "protocol/momento" }

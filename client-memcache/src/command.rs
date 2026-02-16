@@ -4,7 +4,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
-use kompio::{GuardBox, RegionId, SendGuard};
+use krio::{GuardBox, RegionId, SendGuard};
 
 use crate::error::ClientError;
 
@@ -12,7 +12,7 @@ use crate::error::ClientError;
 /// Below this, the overhead of slab allocation + NOTIF CQE exceeds the copy cost.
 pub(crate) const ZC_THRESHOLD: usize = 512;
 
-/// Command sent from the async caller to a kompio worker.
+/// Command sent from the async caller to a krio worker.
 pub(crate) enum Command {
     Get {
         key: Bytes,

@@ -1,10 +1,10 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kompio::{Config, ConnToken, DriverCtx, EventHandler, KompioBuilder};
+use krio::{Config, ConnToken, DriverCtx, EventHandler, KrioBuilder};
 
 /// Demonstrates outbound `connect()`. On the first tick, connects to a remote
-/// echo server, sends "Hello from kompio!\n", prints the echoed response,
+/// echo server, sends "Hello from krio!\n", prints the echoed response,
 /// then shuts down.
 struct ConnectHandler {
     worker_id: usize,
@@ -24,7 +24,7 @@ impl EventHandler for ConnectHandler {
             Ok(()) => {
                 eprintln!("[worker {}] connected to {}", self.worker_id, self.target);
                 self.connected = true;
-                let msg = b"Hello from kompio!\n";
+                let msg = b"Hello from krio!\n";
                 if let Err(e) = ctx.send(conn, msg) {
                     eprintln!("[worker {}] send error: {e}", self.worker_id);
                     ctx.close(conn);
@@ -118,7 +118,7 @@ fn main() {
     eprintln!("starting connect_echo example (client-only mode)");
 
     // Client-only mode: no bind address, no acceptor thread.
-    let (_shutdown, handles) = KompioBuilder::new(config)
+    let (_shutdown, handles) = KrioBuilder::new(config)
         .launch::<ConnectHandler>()
         .expect("failed to launch workers");
 

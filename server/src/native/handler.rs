@@ -1,10 +1,10 @@
-//! Kompio EventHandler implementation for the cache server.
+//! Krio EventHandler implementation for the cache server.
 
 use crate::connection::{Connection, SliceRecvBuf};
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats};
 use bytes::Bytes;
 use cache_core::Cache;
-use kompio::{
+use krio::{
     ConnToken, DriverCtx, EventHandler, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
 };
 use std::io;
@@ -70,7 +70,7 @@ pub(crate) fn wait_for_workers() {
     }
 }
 
-/// Kompio event handler for the cache server.
+/// Krio event handler for the cache server.
 pub(crate) struct ServerHandler<C: Cache> {
     cache: Arc<C>,
     connections: Vec<Option<Connection>>,
@@ -197,13 +197,13 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
 }
 
 impl<C: Cache> ServerHandler<C> {
-    /// Close a connection: issue close to kompio and clean up state.
+    /// Close a connection: issue close to krio and clean up state.
     fn close_connection(&mut self, ctx: &mut DriverCtx, conn: ConnToken, reason: CloseReason) {
         ctx.close(conn);
         self.close_connection_state(conn, reason);
     }
 
-    /// Clean up connection state only (when kompio already reported close).
+    /// Clean up connection state only (when krio already reported close).
     fn close_connection_state(&mut self, conn: ConnToken, reason: CloseReason) {
         let idx = conn.index();
         if let Some(slot) = self.connections.get_mut(idx)
@@ -235,7 +235,7 @@ impl SendGuard for BytesGuard {
 
 /// Send ALL pending response data for a connection using scatter-gather.
 ///
-/// Loops to submit ALL pending batches. Kompio's per-connection send queue
+/// Loops to submit ALL pending batches. Krio's per-connection send queue
 /// ensures at most one SQE is in-flight at a time — excess sends are queued
 /// internally and submitted immediately from the CQE completion handler,
 /// with zero gap between consecutive sends.
@@ -303,7 +303,7 @@ fn send_pending(
         match builder.submit() {
             Ok(()) => {
                 conn.advance_write(total_advance);
-                // Loop to submit more batches — kompio queues if in-flight.
+                // Loop to submit more batches — krio queues if in-flight.
             }
             Err(e) if e.kind() == io::ErrorKind::Other => {
                 // Send pool or slab exhausted — stop, wait for on_send_complete.

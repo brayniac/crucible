@@ -13,7 +13,7 @@ use benchmark::{
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use kompio::KompioBuilder;
+use krio::KrioBuilder;
 use metriken::{AtomicHistogram, histogram::Histogram};
 use rand::RngCore;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -229,7 +229,7 @@ fn run_benchmark(
         Arc::new(pool)
     };
 
-    // Set up config channel for kompio workers
+    // Set up config channel for krio workers
     let (config_tx, config_rx) = crossbeam_channel::bounded::<BenchWorkerConfig>(num_threads);
     #[allow(clippy::needless_range_loop)]
     for id in 0..num_threads {
@@ -248,7 +248,7 @@ fn run_benchmark(
     }
     init_config_channel(config_rx);
 
-    // Build kompio config (client-only, no bind).
+    // Build krio config (client-only, no bind).
     // With guard-based sends for SET values, the copy pool only holds small
     // protocol framing data, so the default 16KB slot size is sufficient.
     let tls_client = if config.target.protocol == CacheProtocol::Momento {
@@ -257,21 +257,21 @@ fn run_benchmark(
             MomentoWireFormat::Protosocket => protocol_momento::WireFormat::Protosocket,
         };
         let tls_config = build_momento_tls_config(wire_format)?;
-        Some(kompio::TlsClientConfig {
+        Some(krio::TlsClientConfig {
             client_config: Arc::new(tls_config),
         })
     } else {
         None
     };
 
-    let kompio_config = kompio::Config {
-        recv_buffer: kompio::RecvBufferConfig {
+    let krio_config = krio::Config {
+        recv_buffer: krio::RecvBufferConfig {
             // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
             ring_size: 1024u16.next_power_of_two(),
             buffer_size: 256 * 1024,
             ..Default::default()
         },
-        worker: kompio::WorkerConfig {
+        worker: krio::WorkerConfig {
             threads: num_threads,
             pin_to_core: false, // We pin in create_for_worker instead
             core_offset: 0,
@@ -281,11 +281,11 @@ fn run_benchmark(
         ..Default::default()
     };
 
-    // Launch kompio workers (client-only, no bind)
-    tracing::debug!(num_threads, "launching kompio workers");
+    // Launch krio workers (client-only, no bind)
+    tracing::debug!(num_threads, "launching krio workers");
     let (shutdown_handle, handles) =
-        KompioBuilder::new(kompio_config).launch::<benchmark::worker::BenchHandler>()?;
-    tracing::debug!(workers = handles.len(), "kompio workers launched");
+        KrioBuilder::new(krio_config).launch::<benchmark::worker::BenchHandler>()?;
+    tracing::debug!(workers = handles.len(), "krio workers launched");
 
     // Start in prefill or warmup phase
     if prefill_enabled {
@@ -628,7 +628,7 @@ fn run_benchmark(
         return Err("prefill failed: timed out or stalled".into());
     }
 
-    // Shutdown kompio workers
+    // Shutdown krio workers
     shutdown_handle.shutdown();
 
     // Wait for workers to finish with timeout

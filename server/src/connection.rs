@@ -29,7 +29,7 @@ pub trait RecvBuf {
 
 /// Adapter that wraps a `&[u8]` slice as a `RecvBuf`.
 ///
-/// Used with kompio's `on_data` callback. Tracks consumed bytes
+/// Used with krio's `on_data` callback. Tracks consumed bytes
 /// so the caller can return the consumed count.
 pub struct SliceRecvBuf<'a> {
     data: &'a [u8],
@@ -64,7 +64,7 @@ impl RecvBuf for SliceRecvBuf<'_> {
     }
 
     fn shrink_if_oversized(&mut self) {
-        // No-op: the underlying slice is borrowed from kompio's accumulator
+        // No-op: the underlying slice is borrowed from krio's accumulator
     }
 }
 use protocol_memcache::binary::{

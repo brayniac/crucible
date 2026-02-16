@@ -4,7 +4,7 @@ use metriken::AtomicHistogram;
 ///
 /// One histogram per operation type, plus a combined `request` histogram
 /// that records every operation. Values are recorded in nanoseconds by
-/// the kompio worker as `sent_at.elapsed().as_nanos()`.
+/// the krio worker as `sent_at.elapsed().as_nanos()`.
 pub struct ClientLatency {
     request: AtomicHistogram,
     get: AtomicHistogram,

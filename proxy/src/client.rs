@@ -1,7 +1,7 @@
 //! Client connection handling.
 
 use bytes::BytesMut;
-use kompio::ConnToken;
+use krio::ConnToken;
 use std::net::SocketAddr;
 
 /// State of a client connection.
@@ -28,7 +28,7 @@ pub enum ClientState {
 
 /// A client connection.
 pub struct ClientConnection {
-    /// Connection token from kompio.
+    /// Connection token from krio.
     pub conn: ConnToken,
 
     /// Remote address.

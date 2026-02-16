@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use http2::PlainTransport;
-use kompio::{ConnToken, DriverCtx, EventHandler};
+use krio::{ConnToken, DriverCtx, EventHandler};
 use protocol_momento::{CacheClient, CacheValue, CompletedOp, Credential, WireFormat};
 
 use crate::command::MomentoCommand;
@@ -130,7 +130,7 @@ impl MomentoHandler {
             #[cfg(not(feature = "tls"))]
             {
                 let _ = sni;
-                Err(kompio::Error::RingSetup("TLS feature not enabled".into()))
+                Err(krio::Error::RingSetup("TLS feature not enabled".into()))
             }
         } else {
             ctx.connect_with_timeout(addr, self.connect_timeout_ms)

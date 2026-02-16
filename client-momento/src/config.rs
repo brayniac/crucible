@@ -7,7 +7,7 @@ pub struct MomentoClientConfig {
     pub credential: Credential,
     /// Cache name for all operations.
     pub cache_name: String,
-    /// Number of kompio worker threads (default: 1).
+    /// Number of krio worker threads (default: 1).
     pub workers: usize,
     /// Connections per server per worker (default: 1).
     pub connections_per_server: usize,

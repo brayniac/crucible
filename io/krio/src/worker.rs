@@ -12,7 +12,7 @@ use crate::event_loop::EventLoop;
 use crate::handler::EventHandler;
 use crate::runtime::handler::AsyncEventHandler;
 
-/// Result type for `launch` / `KompioBuilder::launch` to avoid type-complexity warnings.
+/// Result type for `launch` / `KrioBuilder::launch` to avoid type-complexity warnings.
 type LaunchResult = Result<
     (
         ShutdownHandle,
@@ -61,16 +61,16 @@ impl ShutdownHandle {
     }
 }
 
-/// Builder for launching kompio workers with optional listener/acceptor.
-pub struct KompioBuilder {
+/// Builder for launching krio workers with optional listener/acceptor.
+pub struct KrioBuilder {
     config: Config,
     bind_addr: Option<String>,
 }
 
-impl KompioBuilder {
+impl KrioBuilder {
     /// Create a new builder with the given config.
     pub fn new(config: Config) -> Self {
-        KompioBuilder {
+        KrioBuilder {
             config,
             bind_addr: None,
         }
@@ -172,7 +172,7 @@ impl KompioBuilder {
 
             let acceptor_closed = closed.clone();
             thread::Builder::new()
-                .name("kompio-acceptor".to_string())
+                .name("krio-acceptor".to_string())
                 .spawn(move || {
                     run_acceptor(acceptor_config);
                     if !acceptor_closed.swap(true, Ordering::AcqRel) {
@@ -202,7 +202,7 @@ impl KompioBuilder {
             let worker_fn = worker_fn.clone();
 
             let handle = thread::Builder::new()
-                .name(format!("kompio-worker-{worker_id}"))
+                .name(format!("krio-worker-{worker_id}"))
                 .spawn(move || {
                     if config.worker.pin_to_core {
                         let core = config.worker.core_offset + worker_id;
@@ -230,9 +230,9 @@ impl KompioBuilder {
 
 /// Launch worker threads with a centralized acceptor thread.
 ///
-/// This is a convenience wrapper around `KompioBuilder`.
+/// This is a convenience wrapper around `KrioBuilder`.
 pub fn launch<H: EventHandler>(config: Config, bind_addr: &str) -> LaunchResult {
-    KompioBuilder::new(config).bind(bind_addr).launch::<H>()
+    KrioBuilder::new(config).bind(bind_addr).launch::<H>()
 }
 
 /// Ensure RLIMIT_NOFILE is high enough for the io_uring fixed file table.

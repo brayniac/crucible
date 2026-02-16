@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use kompio::{ConnToken, DriverCtx, EventHandler};
+use krio::{ConnToken, DriverCtx, EventHandler};
 
 use crate::command::{
     Command, PendingResponse, ResponseKind, ZC_THRESHOLD, bytes_guard, encode_set_header,

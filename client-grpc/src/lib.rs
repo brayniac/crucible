@@ -24,7 +24,7 @@ use command::GrpcCommand;
 use handle::WorkerHandle;
 use worker::{GrpcHandler, GrpcWorkerConfig};
 
-/// Async gRPC client backed by kompio io_uring workers.
+/// Async gRPC client backed by krio io_uring workers.
 ///
 /// Clone-able, Send + Sync. All clones share the same worker pool.
 #[derive(Clone)]
@@ -35,15 +35,15 @@ pub struct GrpcClient {
 struct GrpcClientInner {
     workers: Box<[WorkerHandle]>,
     round_robin: AtomicU64,
-    shutdown: kompio::ShutdownHandle,
+    shutdown: krio::ShutdownHandle,
     latency: Arc<GrpcLatency>,
-    _threads: Vec<thread::JoinHandle<Result<(), kompio::Error>>>,
+    _threads: Vec<thread::JoinHandle<Result<(), krio::Error>>>,
 }
 
 impl GrpcClient {
-    /// Connect to one or more gRPC servers. Spawns kompio worker threads.
+    /// Connect to one or more gRPC servers. Spawns krio worker threads.
     ///
-    /// This is synchronous — it spawns kompio background threads and returns
+    /// This is synchronous — it spawns krio background threads and returns
     /// immediately. Connections are established asynchronously by the workers.
     pub fn connect(config: GrpcClientConfig) -> Result<Self, GrpcError> {
         let num_workers = if config.workers == 0 {
@@ -120,12 +120,12 @@ impl GrpcClient {
         }
         drop(config_tx);
 
-        // Build kompio config
-        let mut kompio_config = kompio::Config::default();
-        kompio_config.worker.threads = num_workers;
-        kompio_config.worker.pin_to_core = false;
-        kompio_config.tcp_nodelay = config.tcp_nodelay;
-        kompio_config.tick_timeout_us = 10_000; // 10ms tick for reconnects
+        // Build krio config
+        let mut krio_config = krio::Config::default();
+        krio_config.worker.threads = num_workers;
+        krio_config.worker.pin_to_core = false;
+        krio_config.tcp_nodelay = config.tcp_nodelay;
+        krio_config.tick_timeout_us = 10_000; // 10ms tick for reconnects
 
         // Configure TLS if enabled
         #[cfg(feature = "tls")]
@@ -137,7 +137,7 @@ impl GrpcClient {
                 .with_no_client_auth();
             tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
-            kompio_config.tls_client = Some(kompio::TlsClientConfig {
+            krio_config.tls_client = Some(krio::TlsClientConfig {
                 client_config: Arc::new(tls_config),
             });
         }
@@ -152,7 +152,7 @@ impl GrpcClient {
 
         // Launch without bind (client-only mode)
         let (shutdown, threads) =
-            kompio::KompioBuilder::new(kompio_config).launch::<GrpcHandler>()?;
+            krio::KrioBuilder::new(krio_config).launch::<GrpcHandler>()?;
 
         // Build WorkerHandle for each worker
         let eventfds = shutdown.worker_eventfds();

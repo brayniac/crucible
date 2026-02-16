@@ -1,6 +1,6 @@
-//! Integration tests for the io_uring (kompio) backend.
+//! Integration tests for the io_uring (krio) backend.
 //!
-//! These tests verify that the server works correctly with the native kompio
+//! These tests verify that the server works correctly with the native krio
 //! backend, including the zero-copy recv path.
 //!
 //! Test dimensions:
@@ -515,7 +515,7 @@ fn run_basic_test() {
 }
 
 // =============================================================================
-// io_uring (kompio) backend tests
+// io_uring (krio) backend tests
 // =============================================================================
 
 #[test]

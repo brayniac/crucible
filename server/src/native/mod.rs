@@ -1,4 +1,4 @@
-//! Native runtime server implementation using kompio (io_uring).
+//! Native runtime server implementation using krio (io_uring).
 
 mod handler;
 mod server;

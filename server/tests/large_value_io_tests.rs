@@ -1,4 +1,4 @@
-//! Comprehensive large value tests for the kompio (io_uring) backend.
+//! Comprehensive large value tests for the krio (io_uring) backend.
 //!
 //! These tests verify correct handling of large values (256KB to 64MB+):
 //! - Send modes: buffered, zerocopy, threshold

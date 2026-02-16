@@ -433,7 +433,7 @@ dependencies = [
  "include_dir",
  "itoa",
  "ketama",
- "kompio",
+ "krio",
  "libc",
  "metrics",
  "metriken",
@@ -849,7 +849,7 @@ dependencies = [
  "crossbeam-channel",
  "grpc",
  "http2",
- "kompio",
+ "krio",
  "libc",
  "metriken",
  "rustls",
@@ -865,7 +865,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "http2",
- "kompio",
+ "krio",
  "libc",
  "metriken",
  "rustls",
@@ -881,7 +881,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "ketama",
- "kompio",
+ "krio",
  "libc",
  "metriken",
  "protocol-memcache",
@@ -900,7 +900,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "http2",
- "kompio",
+ "krio",
  "libc",
  "metriken",
  "protocol-momento",
@@ -917,7 +917,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "ketama",
- "kompio",
+ "krio",
  "libc",
  "metriken",
  "protocol-resp",
@@ -1469,8 +1469,8 @@ name = "ketama"
 version = "0.3.5-alpha.0"
 
 [[package]]
-name = "kompio"
-version = "0.3.5-alpha.0"
+name = "krio"
+version = "0.1.0-alpha.0"
 dependencies = [
  "crossbeam-channel",
  "io-uring",
@@ -2258,7 +2258,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "ctrlc",
- "kompio",
+ "krio",
  "libc",
  "metrics",
  "metriken",
@@ -2702,7 +2702,7 @@ dependencies = [
  "ctrlc",
  "heap-cache",
  "itoa",
- "kompio",
+ "krio",
  "libc",
  "metrics",
  "metriken",

@@ -30,7 +30,7 @@ protocol-resp = { workspace = true, features = ["resp3"] }
 protocol-memcache = { workspace = true, features = ["full"] }
 
 # I/O driver (native runtime)
-kompio = { workspace = true }
+krio = { workspace = true }
 
 # Core utilities
 bytes = { workspace = true }

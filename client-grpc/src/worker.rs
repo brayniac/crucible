@@ -9,7 +9,7 @@ use std::time::Instant;
 use bytes::{Bytes, BytesMut};
 use grpc::{CallBuilder, CallEvent, Channel, Metadata};
 use http2::transport::PlainTransport;
-use kompio::{ConnToken, DriverCtx, EventHandler};
+use krio::{ConnToken, DriverCtx, EventHandler};
 
 use crate::command::GrpcCommand;
 use crate::error::GrpcError;
@@ -119,7 +119,7 @@ impl GrpcHandler {
             #[cfg(not(feature = "tls"))]
             {
                 let _ = sni;
-                Err(kompio::Error::RingSetup("TLS feature not enabled".into()))
+                Err(krio::Error::RingSetup("TLS feature not enabled".into()))
             }
         } else {
             ctx.connect_with_timeout(addr, self.connect_timeout_ms)

@@ -8,8 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **krio 0.1**: Renamed I/O framework from `kompio` to `krio`, establishing standalone identity
+  - Clean public API surface: internal modules (`acceptor`, `accumulator`, `buffer`, `completion`,
+    `connection`, `event_loop`, `ring`) now `pub(crate)` — only user-facing types re-exported
+  - Crate-level rustdoc with quick start example
+  - README.md with architecture overview, feature table, and comparison
+  - Integration test suite (echo server: callback + async, multiple connections, large messages,
+    connection lifecycle, graceful shutdown)
+  - Async echo server example (`echo_async_server`)
 
 ### Changed
+- `KompioBuilder` renamed to `KrioBuilder`
+- `kompio` crate renamed to `krio` (version reset to 0.1.0-alpha.0)
+- All workspace crates updated to reference `krio`
+- Thread names: `krio-acceptor`, `krio-worker-N`
 
 ### Fixed
 
@@ -24,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`backfill_set_count`, `backfill_set_latency`)
 - Configurable S3-FIFO small queue percent (`small_queue_percent` in `[cache]` config, default
   10, valid 1-50) for tuning the admission filter size in both segment and heap backends
-- Per-connection send queue in kompio: handlers call `send()`/`send_parts()` freely and kompio
+- Per-connection send queue in krio: handlers call `send()`/`send_parts()` freely and krio
   queues excess sends internally, submitting the next one immediately in the CQE completion
   handler to eliminate throughput gaps at deep pipeline depths
 
@@ -39,12 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Duplicate benchmark connections from `try_reconnect` during initial connect phase: sessions
   now marked with `reconnect_attempted` after creation to prevent double-connect
 - Prefill metrics, connection gauge, and per-session prefill timeout accuracy
-- Unnecessary i32 casts in kompio chain tests
+- Unnecessary i32 casts in krio chain tests
 
 ## [0.3.3] - 2026-02-13
 
 ### Fixed
-- Pipelined large-value response stall (kompio): when `process_from` hit write backpressure
+- Pipelined large-value response stall (krio): when `process_from` hit write backpressure
   (pending > 256KB), remaining commands sat in the recv accumulator with no mechanism to resume.
   Added `replay_accumulated()` to re-invoke `on_data` after send completions drain write capacity
 - Streaming recv CRLF livelock (server): when a large SET value's trailing `\r\n` was split across
@@ -78,7 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Segment leak race in non-blocking eviction (cache-core): last reader could drop between
   ref_count check and CAS to AwaitingRelease, leaving segment stuck forever. Re-check
   ref_count after CAS and call `release_condemned()` if zero
-- Event loop stall in client-only mode (kompio): tick timeout now armed to prevent indefinite
+- Event loop stall in client-only mode (krio): tick timeout now armed to prevent indefinite
   wait when no I/O completions arrive
 - Default max_connections lowered to fit typical RLIMIT_NOFILE on Linux
 - Server force-exits after drain timeout instead of hanging on shutdown
@@ -90,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-02-11
 
 ### Added
-- New `kompio` I/O framework replacing `io-driver`: push-based io_uring event loop with
+- New `krio` I/O framework replacing `io-driver`: push-based io_uring event loop with
   `EventHandler` trait callbacks, scatter-gather `send_parts()` API, `InFlightSendSlab` for
   zero-copy SendMsgZc sends, and bundled acceptor/worker thread management
 - Scatter-gather send for large value responses: header + value + trailer sent as a single
@@ -101,9 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cache-bench`: standalone cache benchmarking tool for direct cache library performance testing
 
 ### Changed
-- Server, benchmark, and proxy migrated from `io-driver` to `kompio` EventHandler trait
+- Server, benchmark, and proxy migrated from `io-driver` to `krio` EventHandler trait
 - Transport types (`TlsTransport`, `PlainTransport`) moved from `io-driver` to `http2` crate
-- CI test matrix reduced to Linux-only (macOS removed; kompio requires io_uring / Linux 6.0+)
+- CI test matrix reduced to Linux-only (macOS removed; krio requires io_uring / Linux 6.0+)
 
 ### Fixed
 - Non-blocking segment eviction under reader pressure in cache-core
@@ -112,7 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rustdoc invalid HTML tag warnings
 
 ### Removed
-- `io-driver` crate (replaced by `kompio`)
+- `io-driver` crate (replaced by `krio`)
 
 ## [0.2.18] - 2026-02-09
 

@@ -1,7 +1,7 @@
 //! End-to-end integration tests for crucible-memcache-client.
 //!
 //! Spawns a real crucible-server in a background thread and exercises the full
-//! path: Client::connect -> kompio workers -> io_uring -> server -> response ->
+//! path: Client::connect -> krio workers -> io_uring -> server -> response ->
 //! oneshot channel -> caller.
 //!
 //! All tests share a single server and client because the client's config

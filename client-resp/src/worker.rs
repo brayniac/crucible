@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use kompio::{ConnToken, DriverCtx, EventHandler};
+use krio::{ConnToken, DriverCtx, EventHandler};
 
 use crate::command::{
     Command, PendingResponse, ResponseKind, ZC_THRESHOLD, bytes_guard, encode_set_header,
@@ -363,7 +363,7 @@ impl EventHandler for ClientHandler {
         };
 
         // Parse directly from the accumulator slice — no intermediate buffer.
-        // Kompio keeps unconsumed bytes for the next on_data call.
+        // Krio keeps unconsumed bytes for the next on_data call.
         let mut consumed = 0;
         loop {
             match protocol_resp::Value::parse(&data[consumed..]) {

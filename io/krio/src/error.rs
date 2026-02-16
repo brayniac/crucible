@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 
-/// Errors returned by the kompio driver.
+/// Errors returned by the krio driver.
 #[derive(Debug)]
 pub enum Error {
     /// io_uring setup or operation failed.

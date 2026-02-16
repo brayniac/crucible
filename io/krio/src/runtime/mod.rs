@@ -1,4 +1,4 @@
-//! Async runtime for kompio: task executor, waker, and I/O primitives.
+//! Async runtime for krio: task executor, waker, and I/O primitives.
 //!
 //! # Portability boundary
 //!

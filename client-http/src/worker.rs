@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use bytes::BytesMut;
-use kompio::{ConnToken, DriverCtx, EventHandler};
+use krio::{ConnToken, DriverCtx, EventHandler};
 
 use http2::hpack::HeaderField;
 use http2::transport::PlainTransport;
@@ -122,7 +122,7 @@ impl HttpHandler {
             #[cfg(not(feature = "tls"))]
             {
                 let _ = sni;
-                Err(kompio::Error::RingSetup("TLS feature not enabled".into()))
+                Err(krio::Error::RingSetup("TLS feature not enabled".into()))
             }
         } else {
             ctx.connect_with_timeout(addr, self.connect_timeout_ms)

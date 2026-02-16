@@ -1,4 +1,4 @@
-# Kompio Roadmap
+# Krio Roadmap
 
 Deferred features and improvements, roughly ordered by priority.
 

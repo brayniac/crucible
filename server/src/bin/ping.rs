@@ -4,7 +4,7 @@
 //! No cache, no complex protocol handling - just pure I/O.
 
 use clap::Parser;
-use kompio::{ConnToken, DriverCtx, EventHandler, KompioBuilder};
+use krio::{ConnToken, DriverCtx, EventHandler, KrioBuilder};
 use protocol_ping::Response;
 use serde::Deserialize;
 use std::io;
@@ -255,15 +255,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Starting ping server on {}", listen);
 
-    let kompio_config = kompio::Config {
+    let krio_config = krio::Config {
         sq_entries: config.uring.sq_depth,
         sqpoll: config.uring.sqpoll,
-        recv_buffer: kompio::RecvBufferConfig {
+        recv_buffer: krio::RecvBufferConfig {
             ring_size: config.uring.buffer_count.next_power_of_two(),
             buffer_size: config.uring.buffer_size,
             ..Default::default()
         },
-        worker: kompio::WorkerConfig {
+        worker: krio::WorkerConfig {
             threads: if threads == 0 { 0 } else { threads },
             pin_to_core: false,
             core_offset: 0,
@@ -279,7 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("Listening on {} ({} workers)", listen, workers);
 
-    let (shutdown_handle, handles) = KompioBuilder::new(kompio_config)
+    let (shutdown_handle, handles) = KrioBuilder::new(krio_config)
         .bind(&listen.to_string())
         .launch::<PingHandler>()?;
 

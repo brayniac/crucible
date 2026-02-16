@@ -1,6 +1,6 @@
-//! Worker implementation using kompio EventHandler.
+//! Worker implementation using krio EventHandler.
 //!
-//! Each worker runs inside a kompio event loop, handling both client connections
+//! Each worker runs inside a krio event loop, handling both client connections
 //! (accepted) and backend connections (outbound via ctx.connect()).
 
 use crate::backend::{BackendConnection, BackendPool, InFlightRequest};
@@ -13,7 +13,7 @@ use crate::metrics::{
 };
 
 use ahash::AHashMap;
-use kompio::{ConnToken, DriverCtx, EventHandler, KompioBuilder};
+use krio::{ConnToken, DriverCtx, EventHandler, KrioBuilder};
 use protocol_resp::{Command, Value};
 use std::any::Any;
 use std::io;
@@ -61,7 +61,7 @@ fn recv_config() -> ProxyWorkerConfig {
 
 // ── ProxyHandler ────────────────────────────────────────────────────────
 
-/// Proxy worker event handler for kompio.
+/// Proxy worker event handler for krio.
 pub struct ProxyHandler {
     #[allow(dead_code)]
     worker_id: usize,
@@ -406,7 +406,7 @@ impl EventHandler for ProxyHandler {
         if idx >= self.clients.len() {
             self.clients.resize_with(idx + 1, || None);
         }
-        // We don't have the peer address from kompio's on_accept.
+        // We don't have the peer address from krio's on_accept.
         // Use a placeholder; the actual address can be fetched via ctx.peer_addr() if needed.
         let addr = "0.0.0.0:0".parse().unwrap();
         self.clients[idx] = Some(ClientConnection::new(conn, addr));
@@ -676,14 +676,14 @@ pub fn run(config: &Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn std
     }
     init_config_channel(config_rx);
 
-    // Build kompio config
-    let kompio_config = kompio::Config {
-        recv_buffer: kompio::RecvBufferConfig {
+    // Build krio config
+    let krio_config = krio::Config {
+        recv_buffer: krio::RecvBufferConfig {
             ring_size: config.uring.buffer_count.next_power_of_two(),
             buffer_size: config.uring.buffer_size as u32,
             ..Default::default()
         },
-        worker: kompio::WorkerConfig {
+        worker: krio::WorkerConfig {
             threads: num_workers,
             pin_to_core: false, // We pin in create_for_worker
             core_offset: 0,
@@ -693,8 +693,8 @@ pub fn run(config: &Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn std
         ..Default::default()
     };
 
-    // Launch kompio with accept on the listen address
-    let (shutdown_handle, handles) = KompioBuilder::new(kompio_config)
+    // Launch krio with accept on the listen address
+    let (shutdown_handle, handles) = KrioBuilder::new(krio_config)
         .bind(&listen_addr.to_string())
         .launch::<ProxyHandler>()?;
 
@@ -705,7 +705,7 @@ pub fn run(config: &Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn std
 
     info!("Shutdown signal received, stopping workers...");
 
-    // Shutdown kompio workers
+    // Shutdown krio workers
     shutdown_handle.shutdown();
 
     // Wait for all threads

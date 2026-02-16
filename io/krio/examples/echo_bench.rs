@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kompio::{
-    AsyncEventHandler, Config, ConnCtx, ConnToken, DriverCtx, EventHandler, KompioBuilder,
+use krio::{
+    AsyncEventHandler, Config, ConnCtx, ConnToken, DriverCtx, EventHandler, KrioBuilder,
 };
 
 // ── Callback echo handler ────────────────────────────────────────────
@@ -257,7 +257,7 @@ fn main() {
     eprintln!("Starting callback echo server on {callback_addr}...");
 
     let config = make_config(workers);
-    let (shutdown, handles) = KompioBuilder::new(config)
+    let (shutdown, handles) = KrioBuilder::new(config)
         .bind(&callback_addr)
         .launch::<CallbackEcho>()
         .expect("failed to launch callback server");
@@ -278,7 +278,7 @@ fn main() {
     eprintln!("Starting async echo server on {async_addr}...");
 
     let config = make_config(workers);
-    let (shutdown, handles) = KompioBuilder::new(config)
+    let (shutdown, handles) = KrioBuilder::new(config)
         .bind(&async_addr)
         .launch_async::<AsyncEcho>()
         .expect("failed to launch async server");

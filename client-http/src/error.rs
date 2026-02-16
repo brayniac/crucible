@@ -12,6 +12,6 @@ pub enum HttpError {
     StreamReset(u32),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("kompio error: {0}")]
-    Kompio(#[from] kompio::Error),
+    #[error("krio error: {0}")]
+    Krio(#[from] krio::Error),
 }
