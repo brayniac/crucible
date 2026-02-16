@@ -149,7 +149,12 @@ impl ConnCtx {
     ///
     /// The closure receives accumulated bytes and returns the number of bytes consumed.
     /// Resolves immediately when data is already buffered (cache-hit hot path).
-    pub fn with_data<F: FnOnce(&[u8]) -> usize>(&self, f: F) -> WithDataFuture<F> {
+    ///
+    /// If the closure returns 0 consumed bytes on non-empty data (incomplete
+    /// parse), the future parks and retries when more data arrives. This
+    /// prevents the caller from having to distinguish "no progress" from "EOF".
+    /// The closure must therefore be safe to call multiple times (`FnMut`).
+    pub fn with_data<F: FnMut(&[u8]) -> usize>(&self, f: F) -> WithDataFuture<F> {
         WithDataFuture {
             conn_index: self.conn_index,
             f: Some(f),
@@ -586,7 +591,7 @@ pub struct WithDataFuture<F> {
     f: Option<F>,
 }
 
-impl<F: FnOnce(&[u8]) -> usize + Unpin> Future for WithDataFuture<F> {
+impl<F: FnMut(&[u8]) -> usize + Unpin> Future for WithDataFuture<F> {
     type Output = usize;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
@@ -601,8 +606,9 @@ impl<F: FnOnce(&[u8]) -> usize + Unpin> Future for WithDataFuture<F> {
                     .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
                     .unwrap_or(true); // connection already released
                 if is_closed {
-                    let f = self.f.take().expect("WithDataFuture polled after Ready");
+                    let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
                     let consumed = f(&[]);
+                    self.f.take();
                     return Poll::Ready(consumed);
                 }
 
@@ -612,10 +618,29 @@ impl<F: FnOnce(&[u8]) -> usize + Unpin> Future for WithDataFuture<F> {
             }
 
             // Data available — call closure immediately (zero-overhead hot path).
-            let f = self.f.take().expect("WithDataFuture polled after Ready");
+            let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
             let consumed = f(data);
-            driver.accumulators.consume(self.conn_index, consumed);
-            Poll::Ready(consumed)
+            if consumed > 0 {
+                driver.accumulators.consume(self.conn_index, consumed);
+                self.f.take();
+                return Poll::Ready(consumed);
+            }
+
+            // consumed == 0 on non-empty data: incomplete parse.
+            // Check if the connection is closed (EOF with leftover partial data).
+            let is_closed = driver
+                .connections
+                .get(self.conn_index)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                self.f.take();
+                return Poll::Ready(0);
+            }
+
+            // Connection still open — wait for more data before retrying.
+            executor.recv_waiters[self.conn_index as usize] = true;
+            Poll::Pending
         })
     }
 }
