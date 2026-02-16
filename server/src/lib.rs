@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod affinity;
+pub mod async_native;
 pub mod banner;
 pub mod config;
 pub mod connection;
