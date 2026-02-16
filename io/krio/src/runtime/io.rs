@@ -156,6 +156,65 @@ impl ConnCtx {
         }
     }
 
+    /// Install a recv sink so that CQE data is written directly to the
+    /// target buffer instead of the per-connection accumulator.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `target` points to writable memory of at
+    /// least `len` bytes, and that the memory remains valid until
+    /// [`take_recv_sink()`](Self::take_recv_sink) is called. In practice this
+    /// is guaranteed because krio is single-threaded: the task sets the sink,
+    /// yields, and the CQE handler (same thread) writes to it before the task
+    /// resumes and clears the sink.
+    pub unsafe fn set_recv_sink(&self, target: *mut u8, len: usize) {
+        with_state(|_driver, executor| {
+            executor.recv_sinks[self.conn_index as usize] = Some(
+                crate::runtime::RecvSink {
+                    ptr: target,
+                    cap: len,
+                    pos: 0,
+                },
+            );
+        });
+    }
+
+    /// Remove the recv sink and return the number of bytes written to it.
+    /// Returns 0 if no sink was active.
+    pub fn take_recv_sink(&self) -> usize {
+        with_state(|_driver, executor| {
+            match executor.recv_sinks[self.conn_index as usize].take() {
+                Some(sink) => sink.pos,
+                None => 0,
+            }
+        })
+    }
+
+    /// Returns a future that becomes ready when any recv data is available
+    /// (in the accumulator, recv sink, or connection is closed).
+    ///
+    /// Use this with [`set_recv_sink()`](Self::set_recv_sink) to wait for
+    /// direct-to-buffer writes without processing accumulator data.
+    pub fn recv_ready(&self) -> RecvReadyFuture {
+        RecvReadyFuture {
+            conn_index: self.conn_index,
+        }
+    }
+
+    /// Non-blocking accumulator access. Calls `f` with buffered data if any,
+    /// returning `Some(consumed)`. Returns `None` if the accumulator is empty.
+    pub fn try_with_data<F: FnOnce(&[u8]) -> usize>(&self, f: F) -> Option<usize> {
+        with_state(|driver, _executor| {
+            let data = driver.accumulators.data(self.conn_index);
+            if data.is_empty() {
+                return None;
+            }
+            let consumed = f(data);
+            driver.accumulators.consume(self.conn_index, consumed);
+            Some(consumed)
+        })
+    }
+
     // ── Send (synchronous / fire-and-forget) ─────────────────────────
 
     /// Send data (fire-and-forget). Copies data into the send pool and submits
@@ -557,6 +616,50 @@ impl<F: FnOnce(&[u8]) -> usize + Unpin> Future for WithDataFuture<F> {
             let consumed = f(data);
             driver.accumulators.consume(self.conn_index, consumed);
             Poll::Ready(consumed)
+        })
+    }
+}
+
+// ── RecvReadyFuture ──────────────────────────────────────────────────
+
+/// Future returned by [`ConnCtx::recv_ready`]. Resolves when:
+/// 1. The recv sink has received data (`pos > 0`), OR
+/// 2. The accumulator has data, OR
+/// 3. The connection is closed.
+pub struct RecvReadyFuture {
+    conn_index: u32,
+}
+
+impl Future for RecvReadyFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        with_state(|driver, executor| {
+            // Check recv sink.
+            if let Some(sink) = &executor.recv_sinks[self.conn_index as usize]
+                && sink.pos > 0
+            {
+                return Poll::Ready(());
+            }
+
+            // Check accumulator.
+            if !driver.accumulators.data(self.conn_index).is_empty() {
+                return Poll::Ready(());
+            }
+
+            // Check if the connection is closed.
+            let is_closed = driver
+                .connections
+                .get(self.conn_index)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                return Poll::Ready(());
+            }
+
+            // Not ready — register as recv waiter and park.
+            executor.recv_waiters[self.conn_index as usize] = true;
+            Poll::Pending
         })
     }
 }

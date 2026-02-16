@@ -166,6 +166,31 @@ async fn handle_connection<C: Cache>(
             })
             .await;
 
+        // Streaming recv sink loop: if process_from entered a streaming state
+        // (large SET), bypass the accumulator by writing CQE data directly into
+        // the reservation's segment/vec memory.
+        while connection.is_streaming_recv() {
+            if let Some((ptr, remaining)) = connection.streaming_recv_target() {
+                unsafe {
+                    conn.set_recv_sink(ptr, remaining);
+                }
+            }
+            conn.recv_ready().await;
+            let sink_bytes = conn.take_recv_sink();
+            if sink_bytes > 0 {
+                connection.advance_streaming_recv(sink_bytes);
+            }
+            // Process any overflow data in the accumulator (trailing CRLF, next commands).
+            let processed = conn.try_with_data(|data| {
+                let mut buf = SliceRecvBuf::new(data);
+                connection.process_from(&mut buf, &*cache);
+                buf.consumed()
+            });
+            if sink_bytes == 0 && processed.unwrap_or(0) == 0 {
+                break; // no progress — connection closed
+            }
+        }
+
         // Drain pending responses.
         if connection.has_pending_write()
             && drain_pending(&conn, &mut connection, slot_size, false)

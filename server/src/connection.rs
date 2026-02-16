@@ -1398,6 +1398,141 @@ impl Connection {
         // Write the trailer into the fresh write_buf
         self.write_buf.extend_from_slice(trailer);
     }
+
+    // ── Recv sink helpers for async streaming SET ─────────────────────
+
+    /// Returns a pointer and remaining capacity for the active streaming
+    /// reservation, if any. Used by the async handler to install a recv sink
+    /// so CQE data bypasses the accumulator.
+    ///
+    /// Returns `None` when not streaming, draining, or the reservation is full
+    /// (awaiting trailing CRLF).
+    pub fn streaming_recv_target(&mut self) -> Option<(*mut u8, usize)> {
+        match &mut self.streaming_state {
+            StreamingState::ReceivingSegment {
+                reservation,
+                received,
+            } => {
+                let remaining = reservation.value_len() - *received;
+                if remaining == 0 {
+                    return None;
+                }
+                let ptr = reservation.value_mut()[*received..].as_mut_ptr();
+                Some((ptr, remaining))
+            }
+            StreamingState::ReceivingVec {
+                reservation,
+                received,
+            } => {
+                let remaining = reservation.value_len() - *received;
+                if remaining == 0 {
+                    return None;
+                }
+                let ptr = reservation.value_mut()[*received..].as_mut_ptr();
+                Some((ptr, remaining))
+            }
+            StreamingState::MemcacheAsciiSegment {
+                reservation,
+                received,
+                ..
+            } => {
+                let remaining = reservation.value_len() - *received;
+                if remaining == 0 {
+                    return None;
+                }
+                let ptr = reservation.value_mut()[*received..].as_mut_ptr();
+                Some((ptr, remaining))
+            }
+            StreamingState::MemcacheAsciiVec {
+                reservation,
+                received,
+                ..
+            } => {
+                let remaining = reservation.value_len() - *received;
+                if remaining == 0 {
+                    return None;
+                }
+                let ptr = reservation.value_mut()[*received..].as_mut_ptr();
+                Some((ptr, remaining))
+            }
+            StreamingState::MemcacheBinarySegment {
+                reservation,
+                received,
+                ..
+            } => {
+                let remaining = reservation.value_len() - *received;
+                if remaining == 0 {
+                    return None;
+                }
+                let ptr = reservation.value_mut()[*received..].as_mut_ptr();
+                Some((ptr, remaining))
+            }
+            StreamingState::MemcacheBinaryVec {
+                reservation,
+                received,
+                ..
+            } => {
+                let remaining = reservation.value_len() - *received;
+                if remaining == 0 {
+                    return None;
+                }
+                let ptr = reservation.value_mut()[*received..].as_mut_ptr();
+                Some((ptr, remaining))
+            }
+            StreamingState::None | StreamingState::Draining { .. } => None,
+        }
+    }
+
+    /// Advance the streaming receive position by `n` bytes (written via recv sink).
+    pub fn advance_streaming_recv(&mut self, n: usize) {
+        match &mut self.streaming_state {
+            StreamingState::ReceivingSegment { received, .. }
+            | StreamingState::ReceivingVec { received, .. }
+            | StreamingState::MemcacheAsciiSegment { received, .. }
+            | StreamingState::MemcacheAsciiVec { received, .. }
+            | StreamingState::MemcacheBinarySegment { received, .. }
+            | StreamingState::MemcacheBinaryVec { received, .. } => {
+                *received += n;
+            }
+            StreamingState::None | StreamingState::Draining { .. } => {}
+        }
+    }
+
+    /// Returns true if a streaming receive is active and has remaining value
+    /// bytes to receive (not yet full, not draining).
+    pub fn is_streaming_recv(&self) -> bool {
+        match &self.streaming_state {
+            StreamingState::ReceivingSegment {
+                reservation,
+                received,
+            } => *received < reservation.value_len(),
+            StreamingState::ReceivingVec {
+                reservation,
+                received,
+            } => *received < reservation.value_len(),
+            StreamingState::MemcacheAsciiSegment {
+                reservation,
+                received,
+                ..
+            } => *received < reservation.value_len(),
+            StreamingState::MemcacheAsciiVec {
+                reservation,
+                received,
+                ..
+            } => *received < reservation.value_len(),
+            StreamingState::MemcacheBinarySegment {
+                reservation,
+                received,
+                ..
+            } => *received < reservation.value_len(),
+            StreamingState::MemcacheBinaryVec {
+                reservation,
+                received,
+                ..
+            } => *received < reservation.value_len(),
+            StreamingState::None | StreamingState::Draining { .. } => false,
+        }
+    }
 }
 
 impl Default for Connection {

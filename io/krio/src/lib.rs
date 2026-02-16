@@ -111,6 +111,8 @@ pub use runtime::io::SleepFuture;
 pub use runtime::io::TimeoutFuture;
 /// Async context for a UDP socket.
 pub use runtime::io::UdpCtx;
+/// Future that resolves when recv data is available (sink, accumulator, or close).
+pub use runtime::io::RecvReadyFuture;
 /// Future returned by [`UdpCtx::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
 /// Future that provides received data.

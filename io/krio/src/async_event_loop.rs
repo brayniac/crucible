@@ -347,8 +347,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
         } else {
-            // Plaintext path: append data, wake recv waiter.
-            self.driver.accumulators.append(conn_index, data);
+            // Plaintext path: route through recv sink if active, else accumulator.
+            if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
+                let remaining_cap = sink.cap - sink.pos;
+                let to_sink = data.len().min(remaining_cap);
+                if to_sink > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            sink.ptr.add(sink.pos),
+                            to_sink,
+                        );
+                    }
+                    sink.pos += to_sink;
+                }
+                // Overflow (trailing CRLF, next commands) goes to accumulator.
+                if to_sink < data.len() {
+                    self.driver
+                        .accumulators
+                        .append(conn_index, &data[to_sink..]);
+                }
+            } else {
+                self.driver.accumulators.append(conn_index, data);
+            }
             self.executor.wake_recv(conn_index);
         }
 
