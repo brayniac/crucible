@@ -77,6 +77,7 @@ mod server {
             tcp_nodelay: true,
             send_copy_slot_size,
             send_copy_count,
+            send_slab_slots: 4096,
             ..Default::default()
         };
 
