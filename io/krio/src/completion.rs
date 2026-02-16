@@ -21,6 +21,10 @@ pub enum OpTag {
     TickTimeout = 11,
     /// Standalone timer (sleep/timeout) for async tasks.
     Timer = 12,
+    /// Single-shot recvmsg for UDP sockets.
+    RecvMsgUdp = 13,
+    /// Copying sendmsg for UDP sockets.
+    SendMsgUdp = 14,
 }
 
 impl OpTag {
@@ -39,6 +43,8 @@ impl OpTag {
             10 => Some(OpTag::Cancel),
             11 => Some(OpTag::TickTimeout),
             12 => Some(OpTag::Timer),
+            13 => Some(OpTag::RecvMsgUdp),
+            14 => Some(OpTag::SendMsgUdp),
             _ => None,
         }
     }

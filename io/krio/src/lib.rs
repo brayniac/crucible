@@ -57,6 +57,7 @@ pub(crate) mod ring;
 pub(crate) mod runtime;
 #[cfg(feature = "tls")]
 pub(crate) mod tls;
+pub(crate) mod metrics;
 pub(crate) mod worker;
 
 // ── Public modules ──────────────────────────────────────────────────────
@@ -79,6 +80,8 @@ pub use handler::EventHandler;
 pub use handler::SendBuilder;
 /// Builder for IO_LINK chained sends.
 pub use handler::SendChainBuilder;
+/// Opaque handle for a UDP socket.
+pub use handler::UdpToken;
 
 // ── Re-exports: Async API ───────────────────────────────────────────────
 
@@ -130,6 +133,28 @@ pub use runtime::select::Either3;
 pub use runtime::select::Select;
 /// Future returned by [`select3()`].
 pub use runtime::select::Select3;
+/// Poll two futures concurrently, returning both outputs when complete.
+pub use runtime::join::join;
+/// Poll three futures concurrently, returning all outputs when complete.
+pub use runtime::join::join3;
+/// Future returned by [`join()`].
+pub use runtime::join::Join;
+/// Future returned by [`join3()`].
+pub use runtime::join::Join3;
+/// A monotonic clock deadline for absolute timers.
+pub use runtime::io::Deadline;
+/// Create a future that completes at an absolute deadline.
+pub use runtime::io::sleep_until;
+/// Fallible sleep_until that returns an error if the timer pool is exhausted.
+pub use runtime::io::try_sleep_until;
+/// Wrap a future with an absolute deadline.
+pub use runtime::io::timeout_at;
+/// Fallible timeout_at that returns an error if the timer pool is exhausted.
+pub use runtime::io::try_timeout_at;
+/// Async context for a UDP socket.
+pub use runtime::io::UdpCtx;
+/// Future returned by [`UdpCtx::recv_from()`].
+pub use runtime::io::UdpRecvFuture;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
 

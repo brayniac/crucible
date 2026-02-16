@@ -19,6 +19,93 @@ use crate::connection::{ConnectionTable, RecvMode};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::ring::Ring;
 
+/// Per-worker UDP socket state.
+pub(crate) struct UdpSocketState {
+    /// Fixed file table index for this socket.
+    pub fd_index: u32,
+    /// Bound address.
+    pub local_addr: SocketAddr,
+    // ── Recv state (heap-allocated for stable addresses) ──
+    pub recv_buf: Box<[u8]>,
+    pub recv_addr: Box<libc::sockaddr_storage>,
+    pub recv_iov: Box<libc::iovec>,
+    pub recv_msghdr: Box<libc::msghdr>,
+    // ── Send state ──
+    pub send_addr: Box<libc::sockaddr_storage>,
+    pub send_iov: Box<libc::iovec>,
+    pub send_msghdr: Box<libc::msghdr>,
+    pub send_in_flight: bool,
+    pub send_pool_slot: u16,
+}
+
+impl UdpSocketState {
+    /// Reset msg_namelen before re-submitting recvmsg.
+    pub fn reset_recv_namelen(&mut self) {
+        self.recv_msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+    }
+}
+
+/// Convert a libc sockaddr_storage to a std SocketAddr.
+pub(crate) fn sockaddr_to_socket_addr(
+    addr: &libc::sockaddr_storage,
+    len: u32,
+) -> Option<SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    match addr.ss_family as libc::c_int {
+        libc::AF_INET
+            if len >= std::mem::size_of::<libc::sockaddr_in>() as u32 =>
+        {
+            let sa = unsafe { &*(addr as *const _ as *const libc::sockaddr_in) };
+            let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+            let port = u16::from_be(sa.sin_port);
+            Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        libc::AF_INET6
+            if len >= std::mem::size_of::<libc::sockaddr_in6>() as u32 =>
+        {
+            let sa = unsafe { &*(addr as *const _ as *const libc::sockaddr_in6) };
+            let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
+            let port = u16::from_be(sa.sin6_port);
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                port,
+                sa.sin6_flowinfo,
+                sa.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Write a SocketAddr into a sockaddr_storage, return the address length.
+pub(crate) fn socket_addr_to_sockaddr(
+    addr: SocketAddr,
+    storage: &mut libc::sockaddr_storage,
+) -> u32 {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sa = storage as *mut _ as *mut libc::sockaddr_in;
+            unsafe {
+                (*sa).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*sa).sin_port = v4.port().to_be();
+                (*sa).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            }
+            std::mem::size_of::<libc::sockaddr_in>() as u32
+        }
+        SocketAddr::V6(v6) => {
+            let sa = storage as *mut _ as *mut libc::sockaddr_in6;
+            unsafe {
+                (*sa).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*sa).sin6_port = v6.port().to_be();
+                (*sa).sin6_flowinfo = v6.flowinfo();
+                (*sa).sin6_addr.s6_addr = v6.ip().octets();
+                (*sa).sin6_scope_id = v6.scope_id();
+            }
+            std::mem::size_of::<libc::sockaddr_in6>() as u32
+        }
+    }
+}
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// [`EventLoop<H>`](crate::event_loop::EventLoop) is composed of a `Driver` + handler.
@@ -63,6 +150,8 @@ pub(crate) struct Driver {
     pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
     /// Whether a tick timeout SQE is currently in-flight.
     pub(crate) tick_timeout_armed: bool,
+    /// Per-worker UDP socket state.
+    pub(crate) udp_sockets: Vec<UdpSocketState>,
 }
 
 impl Driver {
@@ -83,9 +172,11 @@ impl Driver {
             config.recv_buffer.buffer_size,
         )?;
 
+        let udp_count = config.udp_bind.len() as u32;
+
         // Register resources with the kernel
         ring.register_buffers(&fixed_buffers)?;
-        ring.register_files_sparse(config.max_connections)?;
+        ring.register_files_sparse(config.max_connections + udp_count)?;
         ring.register_buf_ring(&provided_bufs)?;
 
         let connections = ConnectionTable::new(config.max_connections);
@@ -137,7 +228,16 @@ impl Driver {
             send_queues.push(ConnSendState::new());
         }
 
-        Ok(Driver {
+        // Set up UDP sockets.
+        let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
+        for (udp_idx, bind_addr) in config.udp_bind.iter().enumerate() {
+            let fd_index = config.max_connections + udp_idx as u32;
+            let state =
+                Self::setup_udp_socket(&ring, *bind_addr, fd_index)?;
+            udp_sockets.push(state);
+        }
+
+        let mut driver = Driver {
             ring,
             connections,
             fixed_buffers,
@@ -173,7 +273,19 @@ impl Driver {
                 None
             },
             tick_timeout_armed: false,
-        })
+            udp_sockets,
+        };
+
+        // Submit initial recvmsg for each UDP socket.
+        for udp_idx in 0..driver.udp_sockets.len() {
+            let ud = UserData::encode(OpTag::RecvMsgUdp, udp_idx as u32, 0);
+            let msghdr_ptr = &mut *driver.udp_sockets[udp_idx].recv_msghdr
+                as *mut libc::msghdr;
+            let fd_index = driver.udp_sockets[udp_idx].fd_index;
+            let _ = driver.ring.submit_recvmsg(fd_index, msghdr_ptr, ud);
+        }
+
+        Ok(driver)
     }
 
     /// Construct a [`DriverCtx`] by borrowing driver fields.
@@ -201,6 +313,7 @@ impl Driver {
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
             send_queues: &mut self.send_queues,
+            udp_sockets: &mut self.udp_sockets,
         }
     }
 
@@ -298,6 +411,173 @@ impl Driver {
         } else if pool_slot != u16::MAX {
             send_copy_pool.release(pool_slot);
         }
+    }
+
+    /// Create a UDP socket, bind with SO_REUSEPORT, register in fixed file table.
+    fn setup_udp_socket(
+        ring: &Ring,
+        bind_addr: SocketAddr,
+        fd_index: u32,
+    ) -> Result<UdpSocketState, crate::error::Error> {
+        let domain = if bind_addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+
+        let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
+        if fd < 0 {
+            return Err(crate::error::Error::Io(std::io::Error::last_os_error()));
+        }
+
+        // Set SO_REUSEPORT for multi-worker binding.
+        let optval: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        // Bind.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let addr_len = socket_addr_to_sockaddr(bind_addr, &mut storage);
+        let ret = unsafe {
+            libc::bind(
+                fd,
+                &storage as *const _ as *const libc::sockaddr,
+                addr_len,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd); }
+            return Err(crate::error::Error::Io(err));
+        }
+
+        // Register in the fixed file table, then close the original fd.
+        ring.register_files_update(fd_index, &[fd])?;
+        unsafe { libc::close(fd); }
+
+        // Allocate recv state.
+        let recv_buf = vec![0u8; 65536].into_boxed_slice();
+        let mut recv_addr: Box<libc::sockaddr_storage> =
+            Box::new(unsafe { std::mem::zeroed() });
+        let mut recv_iov = Box::new(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+        let mut recv_msghdr: Box<libc::msghdr> =
+            Box::new(unsafe { std::mem::zeroed() });
+
+        // Set up pointers (stable because everything is boxed).
+        recv_iov.iov_base = recv_buf.as_ptr() as *mut libc::c_void;
+        recv_iov.iov_len = recv_buf.len();
+        recv_msghdr.msg_name = &mut *recv_addr as *mut _ as *mut libc::c_void;
+        recv_msghdr.msg_namelen =
+            std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        recv_msghdr.msg_iov = &mut *recv_iov as *mut libc::iovec;
+        recv_msghdr.msg_iovlen = 1;
+
+        // Allocate send state.
+        let send_addr: Box<libc::sockaddr_storage> =
+            Box::new(unsafe { std::mem::zeroed() });
+        let send_iov = Box::new(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+        let mut send_msghdr: Box<libc::msghdr> =
+            Box::new(unsafe { std::mem::zeroed() });
+
+        send_msghdr.msg_name = Box::into_raw(send_addr) as *mut libc::c_void;
+        send_msghdr.msg_iov = Box::into_raw(send_iov) as *mut libc::iovec;
+        send_msghdr.msg_iovlen = 1;
+
+        // Reconstruct the Boxes from the raw pointers for ownership.
+        let send_addr =
+            unsafe { Box::from_raw(send_msghdr.msg_name as *mut libc::sockaddr_storage) };
+        let send_iov =
+            unsafe { Box::from_raw(send_msghdr.msg_iov) };
+
+        Ok(UdpSocketState {
+            fd_index,
+            local_addr: bind_addr,
+            recv_buf,
+            recv_addr,
+            recv_iov,
+            recv_msghdr,
+            send_addr,
+            send_iov,
+            send_msghdr,
+            send_in_flight: false,
+            send_pool_slot: u16::MAX,
+        })
+    }
+
+    /// Send a UDP datagram via the copy pool.
+    pub(crate) fn udp_send_to(
+        &mut self,
+        udp_index: u32,
+        peer: SocketAddr,
+        data: &[u8],
+    ) -> Result<(), std::io::Error> {
+        let idx = udp_index as usize;
+        if idx >= self.udp_sockets.len() {
+            return Err(std::io::Error::other("invalid UDP socket index"));
+        }
+        if self.udp_sockets[idx].send_in_flight {
+            return Err(std::io::Error::other("UDP send already in flight"));
+        }
+
+        // Copy data to the send pool.
+        let (pool_slot, ptr, len) = self
+            .send_copy_pool
+            .copy_in(data)
+            .ok_or_else(|| std::io::Error::other("send copy pool exhausted"))?;
+
+        // Set up destination address.
+        let addr_len = socket_addr_to_sockaddr(peer, &mut self.udp_sockets[idx].send_addr);
+
+        // Set up iovec.
+        self.udp_sockets[idx].send_iov.iov_base = ptr as *mut libc::c_void;
+        self.udp_sockets[idx].send_iov.iov_len = len as usize;
+
+        // Update msghdr.
+        self.udp_sockets[idx].send_msghdr.msg_namelen = addr_len;
+
+        let fd_index = self.udp_sockets[idx].fd_index;
+        let msghdr_ptr = &*self.udp_sockets[idx].send_msghdr as *const libc::msghdr;
+        let ud = UserData::encode(OpTag::SendMsgUdp, udp_index, pool_slot as u32);
+
+        match self.ring.submit_sendmsg(fd_index, msghdr_ptr, ud) {
+            Ok(()) => {
+                crate::metrics::UDP_DATAGRAMS_SENT.increment();
+                self.udp_sockets[idx].send_in_flight = true;
+                self.udp_sockets[idx].send_pool_slot = pool_slot;
+                Ok(())
+            }
+            Err(e) => {
+                self.send_copy_pool.release(pool_slot);
+                Err(e)
+            }
+        }
+    }
+
+    /// Re-submit recvmsg for a UDP socket after processing a datagram.
+    pub(crate) fn resubmit_udp_recvmsg(&mut self, udp_index: u32) {
+        let idx = udp_index as usize;
+        if idx >= self.udp_sockets.len() {
+            return;
+        }
+        self.udp_sockets[idx].reset_recv_namelen();
+        let ud = UserData::encode(OpTag::RecvMsgUdp, udp_index, 0);
+        let msghdr_ptr =
+            &mut *self.udp_sockets[idx].recv_msghdr as *mut libc::msghdr;
+        let fd_index = self.udp_sockets[idx].fd_index;
+        let _ = self.ring.submit_recvmsg(fd_index, msghdr_ptr, ud);
     }
 
     /// Shutdown: close all connections, drain remaining CQEs, close eventfd.

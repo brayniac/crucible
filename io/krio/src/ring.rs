@@ -232,6 +232,24 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit an absolute timeout SQE. The timespec contains absolute
+    /// `CLOCK_MONOTONIC` seconds/nanoseconds. The timespec must remain valid
+    /// until the CQE arrives.
+    pub fn submit_timeout_abs(
+        &mut self,
+        timespec: *const io_uring::types::Timespec,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Timeout::new(timespec)
+            .flags(io_uring::types::TimeoutFlags::ABS)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit an async cancel targeting a specific user_data value.
     pub fn submit_async_cancel(
         &mut self,
@@ -252,6 +270,38 @@ impl Ring {
     pub fn submit_shutdown(&mut self, conn_index: u32) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Shutdown, conn_index, 0);
         let entry = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_WR)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a recvmsg for a UDP socket (single-shot with pre-allocated buffer).
+    pub fn submit_recvmsg(
+        &mut self,
+        fd_index: u32,
+        msghdr: *mut libc::msghdr,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::RecvMsg::new(Fixed(fd_index), msghdr)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a sendmsg (copying) for a UDP socket with destination address.
+    pub fn submit_sendmsg(
+        &mut self,
+        fd_index: u32,
+        msghdr: *const libc::msghdr,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::SendMsg::new(Fixed(fd_index), msghdr)
             .build()
             .user_data(user_data.raw());
         unsafe {
@@ -298,10 +348,10 @@ impl Ring {
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
                 self.ring.submit()?;
-                self.ring
-                    .submission()
-                    .push(&entry)
-                    .map_err(|_| io::Error::other("SQ still full after submit"))?;
+                if self.ring.submission().push(&entry).is_err() {
+                    crate::metrics::SQE_SUBMIT_FAILURES.increment();
+                    return Err(io::Error::other("SQ still full after submit"));
+                }
             }
         }
         Ok(())

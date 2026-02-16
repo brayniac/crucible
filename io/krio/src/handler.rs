@@ -45,6 +45,20 @@ impl ConnToken {
     }
 }
 
+/// Opaque handle for a UDP socket.
+///
+/// Each worker that binds a UDP address gets its own socket (via `SO_REUSEPORT`).
+/// The token identifies a specific UDP socket within a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpToken(pub(crate) u32);
+
+impl UdpToken {
+    /// Returns the UDP socket index within this worker.
+    pub fn index(&self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// The context provided to EventHandler callbacks for issuing operations.
 ///
 /// This is a short-lived borrow into the driver's internal state.
@@ -70,6 +84,8 @@ pub struct DriverCtx<'a> {
     pub(crate) max_chain_length: u16,
     /// Per-connection send queues for serializing sends.
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
+    /// Per-worker UDP socket state.
+    pub(crate) udp_sockets: &'a mut Vec<crate::driver::UdpSocketState>,
 }
 
 impl<'a> DriverCtx<'a> {
@@ -260,6 +276,57 @@ impl<'a> DriverCtx<'a> {
                 return;
             }
             let _ = self.ring.submit_shutdown(conn.index);
+        }
+    }
+
+    /// Send a UDP datagram to the given peer address.
+    ///
+    /// Copies `data` into the send pool and submits a `sendmsg` SQE. Only one
+    /// send can be in-flight per UDP socket at a time.
+    pub fn send_to(&mut self, socket: UdpToken, peer: SocketAddr, data: &[u8]) -> io::Result<()> {
+        let idx = socket.0 as usize;
+        if idx >= self.udp_sockets.len() {
+            return Err(io::Error::other("invalid UDP socket index"));
+        }
+        if self.udp_sockets[idx].send_in_flight {
+            return Err(io::Error::other("UDP send already in flight"));
+        }
+
+        let (pool_slot, ptr, len) = self
+            .send_copy_pool
+            .copy_in(data)
+            .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+
+        // Set up destination address.
+        let addr_len =
+            crate::driver::socket_addr_to_sockaddr(peer, &mut self.udp_sockets[idx].send_addr);
+
+        // Set up iovec.
+        self.udp_sockets[idx].send_iov.iov_base = ptr as *mut libc::c_void;
+        self.udp_sockets[idx].send_iov.iov_len = len as usize;
+
+        // Update msghdr.
+        self.udp_sockets[idx].send_msghdr.msg_namelen = addr_len;
+
+        let fd_index = self.udp_sockets[idx].fd_index;
+        let msghdr_ptr = &*self.udp_sockets[idx].send_msghdr as *const libc::msghdr;
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::SendMsgUdp,
+            socket.0,
+            pool_slot as u32,
+        );
+
+        match self.ring.submit_sendmsg(fd_index, msghdr_ptr, ud) {
+            Ok(()) => {
+                crate::metrics::UDP_DATAGRAMS_SENT.increment();
+                self.udp_sockets[idx].send_in_flight = true;
+                self.udp_sockets[idx].send_pool_slot = pool_slot;
+                Ok(())
+            }
+            Err(e) => {
+                self.send_copy_pool.release(pool_slot);
+                Err(e)
+            }
         }
     }
 
@@ -1384,6 +1451,20 @@ pub trait EventHandler: Send + 'static {
 
     /// Called once per event loop iteration after all CQEs processed.
     fn on_tick(&mut self, _ctx: &mut DriverCtx) {}
+
+    /// Called when a UDP datagram is received.
+    ///
+    /// `socket` identifies which UDP socket received the datagram.
+    /// `data` contains the datagram payload. `peer` is the sender's address.
+    /// Default: no-op.
+    fn on_datagram(
+        &mut self,
+        _ctx: &mut DriverCtx,
+        _socket: UdpToken,
+        _data: &[u8],
+        _peer: SocketAddr,
+    ) {
+    }
 
     /// Called when the worker's eventfd is signaled by an external thread.
     /// Use this to drain command channels or respond to external wakeups.

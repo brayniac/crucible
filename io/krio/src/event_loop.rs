@@ -7,8 +7,9 @@ use io_uring::cqueue;
 use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
 use crate::connection::RecvMode;
-use crate::driver::Driver;
-use crate::handler::{ConnToken, DriverCtx, EventHandler};
+use crate::driver::{Driver, sockaddr_to_socket_addr};
+use crate::handler::{ConnToken, DriverCtx, EventHandler, UdpToken};
+use crate::metrics;
 
 /// The core event loop that drives io_uring and dispatches to the EventHandler.
 pub struct EventLoop<H: EventHandler> {
@@ -120,6 +121,7 @@ impl<H: EventHandler> EventLoop<H> {
     }
 
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
+        metrics::CQE_PROCESSED.increment();
         let ud = UserData(user_data_raw);
         let tag = match ud.tag() {
             Some(t) => t,
@@ -142,6 +144,8 @@ impl<H: EventHandler> EventLoop<H> {
                 self.driver.tick_timeout_armed = false;
             }
             OpTag::Timer => {} // only used in async event loop
+            OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result),
+            OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
         }
     }
 
@@ -164,6 +168,7 @@ impl<H: EventHandler> EventLoop<H> {
             }
             let errno = -result;
             if errno == libc::ENOBUFS {
+                metrics::BUFFER_RING_EMPTY.increment();
                 if !has_more {
                     let _ = self.driver.ring.submit_multishot_recv(conn_index);
                 }
@@ -183,6 +188,7 @@ impl<H: EventHandler> EventLoop<H> {
         };
 
         let bytes_received = result as u32;
+        metrics::BYTES_RECEIVED.add(bytes_received as u64);
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
 
         let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
@@ -324,6 +330,8 @@ impl<H: EventHandler> EventLoop<H> {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.established = true;
                 }
+                metrics::CONNECTIONS_ACCEPTED.increment();
+                metrics::CONNECTIONS_ACTIVE.increment();
                 let generation = self.driver.connections.generation(conn_index);
                 let token = ConnToken::new(conn_index, generation);
                 let mut ctx = self.driver.make_ctx();
@@ -373,6 +381,7 @@ impl<H: EventHandler> EventLoop<H> {
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
+            metrics::BYTES_SENT.add(total as u64);
             self.driver.send_copy_pool.release(pool_slot);
 
             // Submit next queued send immediately (before on_send_complete).
@@ -505,6 +514,7 @@ impl<H: EventHandler> EventLoop<H> {
 
         // Submit next queued send (or drain queue on error) before on_send_complete.
         if result >= 0 {
+            metrics::BYTES_SENT.add(total_len as u64);
             self.driver.submit_next_queued(conn_index);
         } else {
             self.driver.drain_conn_send_queue(conn_index);
@@ -715,6 +725,56 @@ impl<H: EventHandler> EventLoop<H> {
         self.driver.close_connection(conn_index);
     }
 
+    fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32) {
+        let udp_index = ud.conn_index();
+        let idx = udp_index as usize;
+
+        if idx >= self.driver.udp_sockets.len() {
+            return;
+        }
+
+        if result <= 0 {
+            // Error or empty — resubmit and move on.
+            self.driver.resubmit_udp_recvmsg(udp_index);
+            return;
+        }
+
+        let bytes = result as usize;
+        let peer = sockaddr_to_socket_addr(
+            &self.driver.udp_sockets[idx].recv_addr,
+            self.driver.udp_sockets[idx].recv_msghdr.msg_namelen,
+        );
+
+        // Copy datagram data to avoid borrow conflict with on_datagram callback.
+        let data = self.driver.udp_sockets[idx].recv_buf[..bytes].to_vec();
+
+        // Resubmit recvmsg before calling handler (to not miss datagrams).
+        self.driver.resubmit_udp_recvmsg(udp_index);
+
+        if let Some(peer) = peer {
+            metrics::UDP_DATAGRAMS_RECEIVED.increment();
+            let token = UdpToken(udp_index);
+            let mut ctx = self.driver.make_ctx();
+            self.handler.on_datagram(&mut ctx, token, &data, peer);
+        }
+    }
+
+    fn handle_send_msg_udp(&mut self, ud: UserData, result: i32) {
+        let udp_index = ud.conn_index();
+        let pool_slot = ud.payload() as u16;
+        let idx = udp_index as usize;
+
+        // Release the copy pool slot.
+        self.driver.send_copy_pool.release(pool_slot);
+
+        // Clear in-flight flag.
+        if idx < self.driver.udp_sockets.len() {
+            self.driver.udp_sockets[idx].send_in_flight = false;
+        }
+
+        let _ = result; // UDP send errors are silently dropped.
+    }
+
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
@@ -735,6 +795,9 @@ impl<H: EventHandler> EventLoop<H> {
             self.driver.connections.release(conn_index);
             return;
         }
+
+        metrics::CONNECTIONS_CLOSED.increment();
+        metrics::CONNECTIONS_ACTIVE.decrement();
 
         // Fire on_close BEFORE release so peer_addr() and other queries
         // still work inside the callback.
@@ -852,6 +915,7 @@ fn call_on_data<H: EventHandler>(
         chain_table: &mut driver.chain_table,
         max_chain_length: driver.max_chain_length,
         send_queues: &mut driver.send_queues,
+        udp_sockets: &mut driver.udp_sockets,
     };
     let consumed = handler.on_data(&mut ctx, token, data);
     driver.accumulators.consume(conn_index, consumed);

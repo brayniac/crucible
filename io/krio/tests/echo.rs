@@ -2296,3 +2296,480 @@ fn async_try_timeout_exhaustion() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Phase 5 tests: join, absolute timers, UDP
+// ═══════════════════════════════════════════════════════════════════
+
+// ── join / join3 ──────────────────────────────────────────────────
+
+/// Handler that joins two send_await calls and reports byte counts.
+struct JoinHandler;
+
+impl AsyncEventHandler for JoinHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            // Join two send_await calls.
+            let fut_a = async {
+                match conn.send_await(b"HELLO") {
+                    Ok(f) => f.await,
+                    Err(e) => Err(e),
+                }
+            };
+            let fut_b = async {
+                match conn.send_await(b"WORLD") {
+                    Ok(f) => f.await,
+                    Err(e) => Err(e),
+                }
+            };
+            let (a, b) = krio::join(fut_a, fut_b).await;
+            let msg = format!("JOIN:{}:{}", a.unwrap_or(0), b.unwrap_or(0));
+            let _ = conn.send(msg.as_bytes());
+
+            // Wait for send to drain before closing.
+            krio::sleep(Duration::from_millis(20)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        JoinHandler
+    }
+}
+
+#[test]
+fn async_join_basic() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<JoinHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 128];
+    let mut total = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.contains("JOIN:") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    // Both sends should report 5 bytes each: "HELLO" and "WORLD".
+    assert!(
+        result.contains("JOIN:5:5"),
+        "expected JOIN:5:5, got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that joins three futures: send_await + sleep + with_data.
+struct Join3Handler;
+
+impl AsyncEventHandler for Join3Handler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            let fut_a = async {
+                match conn.send_await(b"ABC") {
+                    Ok(f) => f.await.unwrap_or(0),
+                    Err(_) => 0,
+                }
+            };
+            let fut_b = async {
+                krio::sleep(Duration::from_millis(20)).await;
+                42u32
+            };
+            let fut_c = async {
+                // This will wait for new data from the client.
+                let n = conn.with_data(|data| data.len()).await;
+                n as u32
+            };
+
+            let (a, b, c) = krio::join3(fut_a, fut_b, fut_c).await;
+            let msg = format!("JOIN3:{a}:{b}:{c}");
+            let _ = conn.send(msg.as_bytes());
+
+            krio::sleep(Duration::from_millis(20)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        Join3Handler
+    }
+}
+
+#[test]
+fn async_join3_mixed() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<Join3Handler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // First write triggers the handler (consumed by initial with_data).
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    // Brief delay, then send second payload for the join3 with_data branch.
+    std::thread::sleep(Duration::from_millis(30));
+    stream.write_all(b"PAYLOAD").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 128];
+    let mut total = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.contains("JOIN3:") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    // a=3 (send "ABC"), b=42 (sleep completed), c=7 (with_data received "PAYLOAD")
+    // Note: "ABC" may appear before JOIN3 in the output since it's a real send.
+    assert!(
+        result.contains("JOIN3:3:42:7"),
+        "expected JOIN3:3:42:7, got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Absolute timers ───────────────────────────────────────────────
+
+/// Handler that uses sleep_until with a deadline.
+struct SleepUntilHandler;
+
+impl AsyncEventHandler for SleepUntilHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            let before = std::time::Instant::now();
+            let deadline = krio::Deadline::after(Duration::from_millis(50));
+            krio::sleep_until(deadline).await;
+            let elapsed = before.elapsed();
+
+            let msg = if elapsed >= Duration::from_millis(30) {
+                "SLEEP_UNTIL_OK"
+            } else {
+                "SLEEP_UNTIL_TOO_FAST"
+            };
+            let _ = conn.send(msg.as_bytes());
+            krio::sleep(Duration::from_millis(20)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SleepUntilHandler
+    }
+}
+
+#[test]
+fn async_sleep_until_basic() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<SleepUntilHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut total = 0;
+    let deadline_t = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline_t {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.contains("SLEEP_UNTIL") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(result, "SLEEP_UNTIL_OK", "got: {result}");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that uses timeout_at with a short deadline around a long sleep.
+struct TimeoutAtHandler;
+
+impl AsyncEventHandler for TimeoutAtHandler {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = conn.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            let deadline = krio::Deadline::after(Duration::from_millis(20));
+            let result = krio::timeout_at(deadline, krio::sleep(Duration::from_secs(10))).await;
+
+            let msg = match result {
+                Err(_elapsed) => "TIMEOUT_AT_EXPIRED",
+                Ok(()) => "TIMEOUT_AT_NOT_EXPIRED",
+            };
+            let _ = conn.send(msg.as_bytes());
+            krio::sleep(Duration::from_millis(20)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TimeoutAtHandler
+    }
+}
+
+#[test]
+fn async_timeout_at_expires() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<TimeoutAtHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut total = 0;
+    let deadline_t = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline_t {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.contains("TIMEOUT_AT") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(result, "TIMEOUT_AT_EXPIRED", "got: {result}");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── UDP ───────────────────────────────────────────────────────────
+
+/// Callback handler that echoes UDP datagrams.
+struct UdpEchoCallback;
+
+impl EventHandler for UdpEchoCallback {
+    fn on_accept(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
+    fn on_data(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _data: &[u8]) -> usize { 0 }
+    fn on_send_complete(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _r: io::Result<u32>) {}
+    fn on_close(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
+    fn on_datagram(
+        &mut self,
+        ctx: &mut DriverCtx,
+        socket: krio::UdpToken,
+        data: &[u8],
+        peer: std::net::SocketAddr,
+    ) {
+        let _ = ctx.send_to(socket, peer, data);
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        UdpEchoCallback
+    }
+}
+
+#[test]
+fn callback_udp_echo() {
+    let udp_port = free_port();
+    let udp_addr: std::net::SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+    let tcp_port = free_port();
+    let tcp_addr = format!("127.0.0.1:{tcp_port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&tcp_addr)
+        .bind_udp(udp_addr)
+        .launch::<UdpEchoCallback>()
+        .expect("launch failed");
+
+    wait_for_server(&tcp_addr);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let msg = b"UDP_ECHO_TEST";
+    client.send_to(msg, udp_addr).unwrap();
+
+    let mut buf = [0u8; 64];
+    let (n, _peer) = client.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..n], msg, "UDP echo mismatch");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Async handler that echoes UDP datagrams via UdpCtx.
+struct UdpEchoAsync;
+
+impl AsyncEventHandler for UdpEchoAsync {
+    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            loop {
+                let n = conn.with_data(|data| data.len()).await;
+                if n == 0 {
+                    break;
+                }
+            }
+        })
+    }
+    fn on_udp_bind(
+        &self,
+        udp: krio::UdpCtx,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async move {
+            loop {
+                let (data, peer) = udp.recv_from().await;
+                let _ = udp.send_to(peer, &data);
+            }
+        }))
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        UdpEchoAsync
+    }
+}
+
+#[test]
+fn async_udp_echo() {
+    let udp_port = free_port();
+    let udp_addr: std::net::SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+    let tcp_port = free_port();
+    let tcp_addr = format!("127.0.0.1:{tcp_port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&tcp_addr)
+        .bind_udp(udp_addr)
+        .launch_async::<UdpEchoAsync>()
+        .expect("launch failed");
+
+    wait_for_server(&tcp_addr);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let msg = b"ASYNC_UDP_ECHO";
+    client.send_to(msg, udp_addr).unwrap();
+
+    let mut buf = [0u8; 64];
+    let (n, _peer) = client.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..n], msg, "async UDP echo mismatch");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

@@ -568,16 +568,20 @@ pub fn sleep(duration: Duration) -> SleepFuture {
         duration,
         timer_slot: None,
         generation: 0,
+        absolute: None,
     }
 }
 
-/// Future returned by [`sleep()`]. Completes after the configured duration.
+/// Future returned by [`sleep()`] or [`sleep_until()`]. Completes after
+/// the configured duration or at the given deadline.
 pub struct SleepFuture {
     duration: Duration,
     /// None until first poll, then Some(slot_index).
     timer_slot: Option<u32>,
     /// Generation when the slot was allocated.
     generation: u16,
+    /// If Some, this is an absolute timer (sleep_until).
+    absolute: Option<Deadline>,
 }
 
 impl Future for SleepFuture {
@@ -602,17 +606,29 @@ impl Future for SleepFuture {
                 .allocate(waker_id)
                 .expect("timer slot pool exhausted");
 
-            let secs = self.duration.as_secs();
-            let nsecs = self.duration.subsec_nanos();
-            executor.timer_pool.timespecs[slot as usize] =
-                io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
+            let is_absolute = self.absolute.is_some();
+            if let Some(deadline) = self.absolute {
+                executor.timer_pool.timespecs[slot as usize] =
+                    io_uring::types::Timespec::new().sec(deadline.secs).nsec(deadline.nsecs);
+            } else {
+                let secs = self.duration.as_secs();
+                let nsecs = self.duration.subsec_nanos();
+                executor.timer_pool.timespecs[slot as usize] =
+                    io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
+            }
 
             let payload = TimerSlotPool::encode_payload(slot, generation);
             let ud = UserData::encode(OpTag::Timer, 0, payload);
             let ts_ptr =
                 &executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
 
-            if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
+            let submit_result = if is_absolute {
+                driver.ring.submit_timeout_abs(ts_ptr, ud)
+            } else {
+                driver.ring.submit_timeout(ts_ptr, ud)
+            };
+
+            if let Err(_e) = submit_result {
                 executor.timer_pool.release(slot);
                 // On SQE submission failure, complete immediately rather than hang.
                 return Poll::Ready(());
@@ -660,10 +676,10 @@ impl Drop for SleepFuture {
 pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
     with_state(|driver, executor| {
         let waker_id = CURRENT_TASK_ID.with(|c| c.get());
-        let (slot, generation) = executor
-            .timer_pool
-            .allocate(waker_id)
-            .ok_or(TimerExhausted)?;
+        let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
+            crate::metrics::TIMER_POOL_EXHAUSTED.increment();
+            TimerExhausted
+        })?;
 
         let secs = duration.as_secs();
         let nsecs = duration.subsec_nanos();
@@ -682,6 +698,7 @@ pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
                 duration,
                 timer_slot: None,
                 generation: 0,
+                absolute: None,
             });
         }
 
@@ -689,6 +706,129 @@ pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
             duration,
             timer_slot: Some(slot),
             generation,
+            absolute: None,
+        })
+    })
+}
+
+// ── Deadline (absolute timer support) ─────────────────────────────────
+
+/// A monotonic clock deadline for use with absolute timers.
+///
+/// Created via [`Deadline::after()`] or [`Deadline::now()`].
+/// Uses `CLOCK_MONOTONIC` to match io_uring's default clock.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Deadline {
+    pub(crate) secs: u64,
+    pub(crate) nsecs: u32,
+}
+
+impl Deadline {
+    /// Capture the current monotonic time.
+    pub fn now() -> Self {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // Safety: clock_gettime with CLOCK_MONOTONIC is safe.
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        Deadline {
+            secs: ts.tv_sec as u64,
+            nsecs: ts.tv_nsec as u32,
+        }
+    }
+
+    /// Create a deadline `duration` from now.
+    pub fn after(duration: Duration) -> Self {
+        let now = Self::now();
+        let mut secs = now.secs + duration.as_secs();
+        let mut nsecs = now.nsecs + duration.subsec_nanos();
+        if nsecs >= 1_000_000_000 {
+            nsecs -= 1_000_000_000;
+            secs += 1;
+        }
+        Deadline { secs, nsecs }
+    }
+
+    /// Duration remaining until this deadline (saturates at zero).
+    pub fn remaining(&self) -> Duration {
+        let now = Self::now();
+        if now.secs > self.secs || (now.secs == self.secs && now.nsecs >= self.nsecs) {
+            return Duration::ZERO;
+        }
+        let mut secs = self.secs - now.secs;
+        let nsecs = if self.nsecs >= now.nsecs {
+            self.nsecs - now.nsecs
+        } else {
+            secs -= 1;
+            1_000_000_000 + self.nsecs - now.nsecs
+        };
+        Duration::new(secs, nsecs)
+    }
+}
+
+/// Create a future that completes at the given absolute deadline.
+///
+/// Uses io_uring's `TIMEOUT_ABS` flag with `CLOCK_MONOTONIC` for
+/// precise deadline-based timing without accumulated drift.
+///
+/// # Panics
+///
+/// Panics if the timer slot pool is exhausted, or if called outside the
+/// krio async executor.
+pub fn sleep_until(deadline: Deadline) -> SleepFuture {
+    SleepFuture {
+        duration: Duration::ZERO, // unused for absolute timers
+        timer_slot: None,
+        generation: 0,
+        absolute: Some(deadline),
+    }
+}
+
+/// Create an absolute-deadline sleep, returning an error if the timer pool is exhausted.
+///
+/// Unlike [`sleep_until()`] which panics on pool exhaustion, this returns
+/// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
+///
+/// The timer slot is allocated eagerly (at call time, not on first poll).
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted> {
+    with_state(|driver, executor| {
+        let waker_id = CURRENT_TASK_ID.with(|c| c.get());
+        let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
+            crate::metrics::TIMER_POOL_EXHAUSTED.increment();
+            TimerExhausted
+        })?;
+
+        executor.timer_pool.timespecs[slot as usize] = io_uring::types::Timespec::new()
+            .sec(deadline.secs)
+            .nsec(deadline.nsecs);
+
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Timer, 0, payload);
+        let ts_ptr =
+            &executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+
+        if let Err(_e) = driver.ring.submit_timeout_abs(ts_ptr, ud) {
+            executor.timer_pool.release(slot);
+            return Ok(SleepFuture {
+                duration: Duration::ZERO,
+                timer_slot: None,
+                generation: 0,
+                absolute: Some(deadline),
+            });
+        }
+
+        Ok(SleepFuture {
+            duration: Duration::ZERO,
+            timer_slot: Some(slot),
+            generation,
+            absolute: Some(deadline),
         })
     })
 }
@@ -741,8 +881,39 @@ pub fn try_timeout<F: Future>(
     Ok(TimeoutFuture { future, sleep })
 }
 
+/// Wrap a future with an absolute deadline. If the future does not complete
+/// before `deadline`, returns `Err(Elapsed)`.
+///
+/// Uses io_uring's `TIMEOUT_ABS` flag with `CLOCK_MONOTONIC`.
+///
+/// # Panics
+///
+/// Panics if the timer slot pool is exhausted.
+pub fn timeout_at<F: Future>(deadline: Deadline, future: F) -> TimeoutFuture<F> {
+    TimeoutFuture {
+        future,
+        sleep: sleep_until(deadline),
+    }
+}
+
+/// Wrap a future with an absolute deadline, returning an error if the timer pool is full.
+///
+/// Unlike [`timeout_at()`] which panics on pool exhaustion, this returns
+/// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn try_timeout_at<F: Future>(
+    deadline: Deadline,
+    future: F,
+) -> Result<TimeoutFuture<F>, TimerExhausted> {
+    let sleep = try_sleep_until(deadline)?;
+    Ok(TimeoutFuture { future, sleep })
+}
+
 pin_project_lite::pin_project! {
-    /// Future returned by [`timeout()`].
+    /// Future returned by [`timeout()`] or [`timeout_at()`].
     pub struct TimeoutFuture<F> {
         #[pin]
         future: F,
@@ -768,5 +939,68 @@ impl<F: Future> Future for TimeoutFuture<F> {
         }
 
         Poll::Pending
+    }
+}
+
+// ── UDP async API ───────────────────────────────────────────────────
+
+/// Async context for a UDP socket.
+///
+/// Passed to [`AsyncEventHandler::on_udp_bind()`](crate::AsyncEventHandler::on_udp_bind)
+/// for each bound UDP socket. Provides async recv and fire-and-forget send.
+#[derive(Clone, Copy)]
+pub struct UdpCtx {
+    pub(crate) udp_index: u32,
+}
+
+impl UdpCtx {
+    /// Returns the UDP socket index within this worker.
+    pub fn index(&self) -> usize {
+        self.udp_index as usize
+    }
+
+    /// Receive a datagram, returning the payload and source address.
+    ///
+    /// Suspends until a datagram is available. Each call returns exactly one
+    /// datagram. The payload is copied into a `Vec<u8>` (datagrams are
+    /// typically small, so this is acceptable for the initial implementation).
+    pub fn recv_from(&self) -> UdpRecvFuture {
+        UdpRecvFuture {
+            udp_index: self.udp_index,
+        }
+    }
+
+    /// Send a datagram to the given peer (fire-and-forget, copying).
+    ///
+    /// Copies `data` into the send pool and submits a `sendmsg` SQE.
+    /// Only one send can be in-flight per UDP socket at a time.
+    pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> io::Result<()> {
+        with_state(|driver, _executor| driver.udp_send_to(self.udp_index, peer, data))
+    }
+}
+
+/// Future returned by [`UdpCtx::recv_from()`].
+pub struct UdpRecvFuture {
+    udp_index: u32,
+}
+
+impl Future for UdpRecvFuture {
+    type Output = (Vec<u8>, SocketAddr);
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|_driver, executor| {
+            let idx = self.udp_index as usize;
+            if idx < executor.udp_recv_queues.len() {
+                if let Some(datagram) = executor.udp_recv_queues[idx].pop_front() {
+                    return Poll::Ready(datagram);
+                }
+            }
+            // Register as waiter so the CQE handler wakes us.
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            if idx < executor.udp_recv_waiters.len() {
+                executor.udp_recv_waiters[idx] = Some(task_id);
+            }
+            Poll::Pending
+        })
     }
 }

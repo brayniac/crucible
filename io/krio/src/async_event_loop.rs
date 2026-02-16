@@ -10,7 +10,9 @@ use crate::completion::{OpTag, UserData};
 use crate::connection::RecvMode;
 use crate::driver::Driver;
 use crate::runtime::handler::AsyncEventHandler;
-use crate::runtime::io::{ConnCtx, DriverState, clear_driver_state, set_driver_state};
+use crate::driver::sockaddr_to_socket_addr;
+use crate::metrics;
+use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, clear_driver_state, set_driver_state};
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
 
@@ -36,6 +38,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config.max_connections,
             config.standalone_task_capacity,
             config.timer_slots,
+            config.udp_bind.len() as u32,
         );
         Ok(AsyncEventLoop {
             driver,
@@ -59,6 +62,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 &kick as *const u64 as *const libc::c_void,
                 8,
             );
+        }
+
+        // Spawn UDP handler tasks for each bound UDP socket.
+        for udp_idx in 0..self.driver.udp_sockets.len() {
+            let udp_ctx = UdpCtx {
+                udp_index: udp_idx as u32,
+            };
+            if let Some(future) = self.handler.on_udp_bind(udp_ctx) {
+                if let Some(idx) = self.executor.standalone_slab.spawn(future) {
+                    self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+                }
+            }
         }
 
         loop {
@@ -199,6 +214,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
+        metrics::CQE_PROCESSED.increment();
         let ud = UserData(user_data_raw);
         let tag = match ud.tag() {
             Some(t) => t,
@@ -221,6 +237,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.tick_timeout_armed = false;
             }
             OpTag::Timer => self.handle_timer(ud, result),
+            OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result),
+            OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
         }
     }
 
@@ -242,6 +260,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             let errno = -result;
             if errno == libc::ENOBUFS {
+                metrics::BUFFER_RING_EMPTY.increment();
                 if !has_more {
                     let _ = self.driver.ring.submit_multishot_recv(conn_index);
                 }
@@ -260,6 +279,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
 
         let bytes_received = result as u32;
+        metrics::BYTES_RECEIVED.add(bytes_received as u64);
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
         let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
 
@@ -308,6 +328,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                                 cs.established = true;
                             }
+                            metrics::CONNECTIONS_ACCEPTED.increment();
+                            metrics::CONNECTIONS_ACTIVE.increment();
                             // Spawn async task for accepted connection.
                             self.spawn_accept_task(conn_index);
                         }
@@ -396,6 +418,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.established = true;
                 }
+                metrics::CONNECTIONS_ACCEPTED.increment();
+                metrics::CONNECTIONS_ACTIVE.increment();
                 self.spawn_accept_task(conn_index);
             }
         }
@@ -442,6 +466,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
+            metrics::BYTES_SENT.add(total as u64);
             self.driver.send_copy_pool.release(pool_slot);
 
             self.driver.submit_next_queued(conn_index);
@@ -545,6 +570,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if result >= 0 {
+            metrics::BYTES_SENT.add(total_len as u64);
             self.driver.submit_next_queued(conn_index);
         } else {
             self.driver.drain_conn_send_queue(conn_index);
@@ -717,9 +743,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
+        let was_established = self
+            .driver
+            .connections
+            .get(conn_index)
+            .map(|c| c.established)
+            .unwrap_or(false);
+
         #[cfg(feature = "tls")]
         if let Some(ref mut tls_table) = self.driver.tls_table {
             tls_table.remove(conn_index);
+        }
+
+        if was_established {
+            metrics::CONNECTIONS_CLOSED.increment();
+            metrics::CONNECTIONS_ACTIVE.decrement();
         }
 
         // Remove the async task (drops the future).
@@ -781,6 +819,55 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
             self.executor.wake_task(waker_id);
         }
+    }
+
+    fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32) {
+        let udp_index = ud.conn_index();
+        let idx = udp_index as usize;
+
+        if idx >= self.driver.udp_sockets.len() {
+            return;
+        }
+
+        if result <= 0 {
+            self.driver.resubmit_udp_recvmsg(udp_index);
+            return;
+        }
+
+        let bytes = result as usize;
+        let peer = sockaddr_to_socket_addr(
+            &self.driver.udp_sockets[idx].recv_addr,
+            self.driver.udp_sockets[idx].recv_msghdr.msg_namelen,
+        );
+
+        // Copy datagram to avoid borrow conflict.
+        let data = self.driver.udp_sockets[idx].recv_buf[..bytes].to_vec();
+
+        // Resubmit recvmsg before waking task.
+        self.driver.resubmit_udp_recvmsg(udp_index);
+
+        if let Some(peer) = peer {
+            metrics::UDP_DATAGRAMS_RECEIVED.increment();
+            // Push to the async recv queue and wake waiting task.
+            if idx < self.executor.udp_recv_queues.len() {
+                self.executor.udp_recv_queues[idx].push_back((data, peer));
+                self.executor.wake_udp_recv(udp_index);
+            }
+        }
+    }
+
+    fn handle_send_msg_udp(&mut self, ud: UserData, result: i32) {
+        let udp_index = ud.conn_index();
+        let pool_slot = ud.payload() as u16;
+        let idx = udp_index as usize;
+
+        self.driver.send_copy_pool.release(pool_slot);
+
+        if idx < self.driver.udp_sockets.len() {
+            self.driver.udp_sockets[idx].send_in_flight = false;
+        }
+
+        let _ = result;
     }
 
     /// Spawn an async task for a newly accepted connection.

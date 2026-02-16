@@ -83,6 +83,15 @@ impl KrioBuilder {
         self
     }
 
+    /// Bind a UDP socket on each worker (with `SO_REUSEPORT`).
+    ///
+    /// Can be called multiple times to bind multiple UDP addresses.
+    /// Each worker creates its own socket per address.
+    pub fn bind_udp(mut self, addr: SocketAddr) -> Self {
+        self.config.udp_bind.push(addr);
+        self
+    }
+
     /// Launch worker threads with the callback-based `EventHandler`.
     ///
     /// If `bind()` was called, creates a listener + acceptor thread.
@@ -208,6 +217,8 @@ impl KrioBuilder {
                         let core = config.worker.core_offset + worker_id;
                         pin_to_core(core)?;
                     }
+
+                    ::metrics::set_thread_shard(worker_id);
 
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
                     worker_fn(worker_id, config, accept_rx, eventfd, shutdown_flag)

@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use crate::buffer::fixed::MemoryRegion;
 
 /// TLS configuration. Pass a pre-built rustls ServerConfig.
@@ -83,6 +85,9 @@ pub struct Config {
     /// Used by [`sleep()`](crate::sleep) and [`timeout()`](crate::timeout).
     /// Default: 256.
     pub timer_slots: u32,
+    /// UDP bind addresses. Each worker creates its own socket with SO_REUSEPORT.
+    /// Empty = no UDP sockets.
+    pub udp_bind: Vec<SocketAddr>,
 }
 
 impl Default for Config {
@@ -111,6 +116,7 @@ impl Default for Config {
             max_chain_length: 16,
             standalone_task_capacity: 256,
             timer_slots: 256,
+            udp_bind: Vec::new(),
         }
     }
 }
