@@ -453,6 +453,70 @@ impl AsyncSendBuilder {
             Ok(SendFuture { conn_index })
         })
     }
+
+    /// Submit a scatter-gather send from pre-classified [`SendPart`]s.
+    ///
+    /// This avoids the lifetime constraints of the closure-based [`build()`](Self::build),
+    /// allowing callers to mix copy and guard parts in a single SQE from borrowed data.
+    /// Parts are consumed in order up to [`MAX_IOVECS`] total or [`MAX_GUARDS`] guards.
+    ///
+    /// Returns the number of parts consumed on success.
+    pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
+        use crate::handler::SendPart;
+        with_state(|driver, _| {
+            let mut ctx = driver.make_ctx();
+            let mut builder = ctx.send_parts(self.token);
+            let mut consumed = 0usize;
+            for part in parts {
+                match part {
+                    SendPart::Copy(data) => {
+                        builder = builder.copy(data);
+                    }
+                    SendPart::Guard(guard) => {
+                        builder = builder.guard(guard);
+                    }
+                }
+                consumed += 1;
+            }
+            if consumed == 0 {
+                return Ok(0);
+            }
+            builder.submit()?;
+            Ok(consumed)
+        })
+    }
+
+    /// Like [`submit_batch`](Self::submit_batch) but returns a [`SendFuture`]
+    /// for backpressure / yield.
+    pub fn submit_batch_await(
+        self,
+        parts: Vec<crate::handler::SendPart<'_>>,
+    ) -> io::Result<(usize, SendFuture)> {
+        use crate::handler::SendPart;
+        with_state(|driver, executor| {
+            let mut ctx = driver.make_ctx();
+            let mut builder = ctx.send_parts(self.token);
+            let mut consumed = 0usize;
+            for part in parts {
+                match part {
+                    SendPart::Copy(data) => {
+                        builder = builder.copy(data);
+                    }
+                    SendPart::Guard(guard) => {
+                        builder = builder.guard(guard);
+                    }
+                }
+                consumed += 1;
+            }
+            if consumed == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty batch"));
+            }
+            builder.submit()?;
+            let conn_index = self.token.index;
+            executor.send_waiters[conn_index as usize] = true;
+            Ok((consumed, SendFuture { conn_index }))
+        })
+    }
 }
 
 // ── WithDataFuture ───────────────────────────────────────────────────

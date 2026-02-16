@@ -637,6 +637,17 @@ pub(crate) struct BuiltSend {
     pub total_len: u32,
 }
 
+/// A pre-classified part for [`AsyncSendBuilder::submit_batch`].
+///
+/// Used to build mixed scatter-gather sends in the async API without the
+/// lifetime constraints of the closure-based [`AsyncSendBuilder::build`].
+pub enum SendPart<'a> {
+    /// Data to be copied into the send pool on submit.
+    Copy(&'a [u8]),
+    /// Zero-copy guard — ownership is transferred to the kernel on submit.
+    Guard(GuardBox),
+}
+
 /// Part type in a scatter-gather send.
 #[derive(Clone, Copy)]
 enum PartSlot {

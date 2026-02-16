@@ -9,7 +9,10 @@ use crate::connection::{Connection, SliceRecvBuf};
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, WorkerStats};
 use bytes::Bytes;
 use cache_core::Cache;
-use krio::{AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, RegionId, SendGuard};
+use krio::{
+    AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
+    SendPart,
+};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -204,23 +207,21 @@ impl SendGuard for BytesGuard {
 
 /// Drain all pending response data for a connection.
 ///
-/// Small parts (< 1KB protocol framing) use fire-and-forget copy sends via the
-/// copy pool. Large parts (≥ 1KB values) are batched into scatter-gather sends
-/// (up to 4 guards per SQE) and submitted fire-and-forget via `build()`. This
-/// matches the callback handler's zero-copy send path with no per-send yield.
+/// Batches consecutive parts into scatter-gather SQEs with mixed copy + guard
+/// parts, exactly matching the callback handler's `send_pending` path. Small
+/// parts (< 1KB) are copy iovecs; large parts (≥ 1KB) are zero-copy guards.
+/// Up to MAX_IOVECS parts and MAX_GUARDS guards per SQE.
 ///
-/// If the send slab is exhausted (4096 slots, rare under normal load), the
-/// fallback copies the data via `send_await()` which yields to the event loop,
-/// allowing CQE processing to free slab entries.
-///
-/// When `must_yield` is true (backpressure path), the first send is awaitable
-/// to guarantee at least one yield so the event loop can process CQEs.
+/// When `must_yield` is true (backpressure path), the first SQE uses
+/// `submit_batch_await` to guarantee at least one yield.
 async fn drain_pending(
     conn: &ConnCtx,
     connection: &mut Connection,
     slot_size: usize,
     must_yield: bool,
 ) -> Result<(), ()> {
+    let mut need_yield = must_yield;
+
     loop {
         if !connection.has_pending_write() {
             return Ok(());
@@ -232,82 +233,74 @@ async fn drain_pending(
         }
 
         let mut advanced = 0usize;
-        let mut yielded = false;
-        // When must_yield is set (backpressure), the first send operation is
-        // made awaitable so we yield to the event loop for CQE processing.
-        let mut need_yield = must_yield;
-        let mut guard_batch: Vec<Bytes> = Vec::new();
+        let mut part_idx = 0;
 
-        for part in &parts {
-            if part.len() >= GUARD_MIN_SIZE {
-                guard_batch.push(part.clone()); // Arc refcount bump only
-                if guard_batch.len() >= MAX_GUARDS {
-                    let batch_len: usize = guard_batch.iter().map(|b| b.len()).sum();
-                    let force_await = need_yield;
-                    match flush_guard_batch(
-                        conn,
-                        &mut guard_batch,
-                        slot_size,
-                        &mut yielded,
-                        force_await,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            advanced += batch_len;
-                            if force_await {
-                                need_yield = false;
+        while part_idx < parts.len() {
+            // Fast path: single small part — simple copy send.
+            if parts.len() - part_idx == 1 && parts[part_idx].len() <= slot_size {
+                let data = &parts[part_idx];
+                if need_yield {
+                    match conn.send_await(data) {
+                        Ok(fut) => {
+                            need_yield = false;
+                            if fut.await.is_err() {
+                                connection.advance_write(advanced);
+                                return Err(());
                             }
                         }
-                        Err(true) => {
-                            connection.advance_write(advanced);
-                            return Err(());
-                        }
-                        Err(false) => {
+                        Err(e) if e.kind() == io::ErrorKind::Other => {
                             connection.advance_write(advanced);
                             return Ok(());
                         }
+                        Err(_) => return Err(()),
                     }
-                }
-            } else {
-                // Flush pending guard batch before small part.
-                if !guard_batch.is_empty() {
-                    let batch_len: usize = guard_batch.iter().map(|b| b.len()).sum();
-                    let force_await = need_yield;
-                    match flush_guard_batch(
-                        conn,
-                        &mut guard_batch,
-                        slot_size,
-                        &mut yielded,
-                        force_await,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            advanced += batch_len;
-                            if force_await {
-                                need_yield = false;
-                            }
-                        }
-                        Err(true) => {
-                            connection.advance_write(advanced);
-                            return Err(());
-                        }
-                        Err(false) => {
+                } else {
+                    match conn.send(data) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::Other => {
                             connection.advance_write(advanced);
                             return Ok(());
                         }
+                        Err(_) => return Err(()),
                     }
                 }
+                advanced += data.len();
+                part_idx += 1;
+                continue;
+            }
 
-                // Small part: copy send (awaitable if we still need to yield).
+            // Scatter-gather path: batch mixed copy + guard parts into one SQE.
+            let mut batch = Vec::with_capacity(MAX_IOVECS.min(parts.len() - part_idx));
+            let mut copy_budget = slot_size;
+            let mut guard_count = 0usize;
+            let mut batch_bytes = 0usize;
+
+            for part in &parts[part_idx..] {
+                if batch.len() >= MAX_IOVECS {
+                    break;
+                }
+                if part.len() >= GUARD_MIN_SIZE && guard_count < MAX_GUARDS {
+                    batch.push(SendPart::Guard(GuardBox::new(BytesGuard(part.clone()))));
+                    guard_count += 1;
+                } else if part.len() <= copy_budget {
+                    batch.push(SendPart::Copy(part));
+                    copy_budget -= part.len();
+                } else {
+                    break;
+                }
+                batch_bytes += part.len();
+            }
+
+            if batch.is_empty() {
+                // Can't fit anything (single part too large for copy, guard limit hit).
+                // Fall back to copy send with chunking.
+                let part = &parts[part_idx];
                 let mut offset = 0;
                 while offset < part.len() {
                     let end = (offset + slot_size).min(part.len());
                     if need_yield {
                         match conn.send_await(&part[offset..end]) {
                             Ok(fut) => {
-                                yielded = true;
                                 need_yield = false;
                                 if fut.await.is_err() {
                                     connection.advance_write(advanced + offset);
@@ -333,109 +326,47 @@ async fn drain_pending(
                     }
                 }
                 advanced += part.len();
+                part_idx += 1;
+                continue;
             }
-        }
 
-        // Flush remaining guard batch.
-        if !guard_batch.is_empty() {
-            let batch_len: usize = guard_batch.iter().map(|b| b.len()).sum();
-            let force_await = need_yield;
-            match flush_guard_batch(conn, &mut guard_batch, slot_size, &mut yielded, force_await)
-                .await
-            {
-                Ok(()) => advanced += batch_len,
-                Err(true) => {
-                    connection.advance_write(advanced);
-                    return Err(());
+            let batch_count = batch.len();
+
+            let result = if need_yield {
+                match conn.send_parts().submit_batch_await(batch) {
+                    Ok((_, fut)) => {
+                        need_yield = false;
+                        if fut.await.is_err() {
+                            connection.advance_write(advanced);
+                            return Err(());
+                        }
+                        Ok(())
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Other => {
+                        connection.advance_write(advanced);
+                        return Ok(());
+                    }
+                    Err(_) => Err(()),
                 }
-                Err(false) => {
-                    connection.advance_write(advanced);
-                    return Ok(());
+            } else {
+                match conn.send_parts().submit_batch(batch) {
+                    Ok(_) => Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::Other => {
+                        connection.advance_write(advanced);
+                        return Ok(());
+                    }
+                    Err(_) => Err(()),
                 }
+            };
+
+            if result.is_err() {
+                return Err(());
             }
+
+            advanced += batch_bytes;
+            part_idx += batch_count;
         }
 
         connection.advance_write(advanced);
     }
-}
-
-/// Flush a batch of large parts as a guard scatter-gather send.
-///
-/// When `force_await` is true (backpressure path), uses `build_await()` for an
-/// awaitable scatter-gather send that yields to the event loop. Otherwise uses
-/// fire-and-forget `build()`.
-///
-/// On slab exhaustion, falls back to copying the data via `send_await()` which
-/// yields to the event loop (setting `*yielded = true`).
-///
-/// Returns `Ok(())` on success, `Err(true)` on fatal error, `Err(false)` on
-/// pool exhaustion (caller should advance and retry later).
-async fn flush_guard_batch(
-    conn: &ConnCtx,
-    batch: &mut Vec<Bytes>,
-    slot_size: usize,
-    yielded: &mut bool,
-    force_await: bool,
-) -> Result<(), bool> {
-    let parts = std::mem::take(batch);
-    // Clone cheaply (Arc bumps) in case we need the copy fallback.
-    let fallback = parts.clone();
-
-    if force_await {
-        // Awaitable guard scatter-gather — yields to the event loop.
-        let result = conn.send_parts().build_await(move |mut b| {
-            for part in &parts {
-                b = b.guard(GuardBox::new(BytesGuard(part.clone())));
-            }
-            b.submit()
-        });
-        match result {
-            Ok(fut) => {
-                *yielded = true;
-                if fut.await.is_err() {
-                    return Err(true);
-                }
-                return Ok(());
-            }
-            Err(e) if e.kind() == io::ErrorKind::Other => {
-                // Slab exhausted — fall through to copy fallback.
-            }
-            Err(_) => return Err(true),
-        }
-    } else {
-        // Fire-and-forget guard scatter-gather (no yield, no copy).
-        let result = conn.send_parts().build(move |mut b| {
-            for part in &parts {
-                b = b.guard(GuardBox::new(BytesGuard(part.clone())));
-            }
-            b.submit()
-        });
-        match result {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::Other => {
-                // Slab exhausted — fall through to copy fallback.
-            }
-            Err(_) => return Err(true),
-        }
-    }
-
-    // Slab exhausted — fall back to copy sends with await for yield.
-    for part in &fallback {
-        let mut offset = 0;
-        while offset < part.len() {
-            let end = (offset + slot_size).min(part.len());
-            match conn.send_await(&part[offset..end]) {
-                Ok(fut) => {
-                    *yielded = true;
-                    if fut.await.is_err() {
-                        return Err(true);
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::Other => return Err(false),
-                Err(_) => return Err(true),
-            }
-            offset = end;
-        }
-    }
-    Ok(())
 }

@@ -78,6 +78,8 @@ pub use handler::DriverCtx;
 pub use handler::EventHandler;
 /// Builder for constructing a scatter-gather send.
 pub use handler::SendBuilder;
+/// Pre-classified part for [`AsyncSendBuilder::submit_batch`].
+pub use handler::SendPart;
 /// Builder for IO_LINK chained sends.
 pub use handler::SendChainBuilder;
 /// Opaque handle for a UDP socket.
