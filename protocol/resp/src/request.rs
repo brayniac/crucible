@@ -255,6 +255,66 @@ impl<'a> SetRequest<'a> {
         self
     }
 
+    /// Encode this SET request as `(prefix, suffix)` for scatter-gather sends.
+    ///
+    /// The caller supplies the value bytes separately. The full RESP encoding is
+    /// `[prefix, value, suffix].concat()`.
+    ///
+    /// - **prefix**: array header + SET bulk string + key bulk string + value length header (`$Lv\r\n`)
+    /// - **suffix**: `\r\n` after the value + any option bulk strings (EX/PX/NX/XX)
+    pub fn encode_parts(&self) -> (Vec<u8>, Vec<u8>) {
+        let mut ex_str = itoa::Buffer::new();
+        let mut px_str = itoa::Buffer::new();
+
+        // Count total args: SET + key + value + options
+        let mut arg_count: usize = 3;
+        if self.ex.is_some() || self.px.is_some() {
+            arg_count += 2;
+        }
+        if self.nx || self.xx {
+            arg_count += 1;
+        }
+
+        // Build prefix: *<count>\r\n $3\r\nSET\r\n $<klen>\r\n<key>\r\n $<vlen>\r\n
+        let mut prefix = Vec::new();
+        let mut count_buf = itoa::Buffer::new();
+        write!(prefix, "*{}\r\n", count_buf.format(arg_count)).unwrap();
+        // SET bulk string
+        write!(prefix, "$3\r\nSET\r\n").unwrap();
+        // Key bulk string
+        let mut klen_buf = itoa::Buffer::new();
+        write!(prefix, "${}\r\n", klen_buf.format(self.key.len())).unwrap();
+        prefix.extend_from_slice(self.key);
+        write!(prefix, "\r\n").unwrap();
+        // Value length header (value data supplied by caller)
+        let mut vlen_buf = itoa::Buffer::new();
+        write!(prefix, "${}\r\n", vlen_buf.format(self.value.len())).unwrap();
+
+        // Build suffix: \r\n + option bulk strings
+        let mut suffix = Vec::new();
+        write!(suffix, "\r\n").unwrap();
+        if let Some(seconds) = self.ex {
+            let s = ex_str.format(seconds);
+            let mut slen_buf = itoa::Buffer::new();
+            write!(suffix, "$2\r\nEX\r\n${}\r\n", slen_buf.format(s.len())).unwrap();
+            suffix.extend_from_slice(s.as_bytes());
+            write!(suffix, "\r\n").unwrap();
+        } else if let Some(millis) = self.px {
+            let s = px_str.format(millis);
+            let mut slen_buf = itoa::Buffer::new();
+            write!(suffix, "$2\r\nPX\r\n${}\r\n", slen_buf.format(s.len())).unwrap();
+            suffix.extend_from_slice(s.as_bytes());
+            write!(suffix, "\r\n").unwrap();
+        }
+        if self.nx {
+            write!(suffix, "$2\r\nNX\r\n").unwrap();
+        } else if self.xx {
+            write!(suffix, "$2\r\nXX\r\n").unwrap();
+        }
+
+        (prefix, suffix)
+    }
+
     /// Encode this SET request into a buffer.
     ///
     /// Returns the number of bytes written.
@@ -580,6 +640,39 @@ mod tests {
             estimated_len, actual_len,
             "encoded_len() should match for large values"
         );
+    }
+
+    #[test]
+    fn test_encode_parts_matches_encode() {
+        let configs: Vec<SetRequest<'_>> = vec![
+            Request::set(b"mykey", b"myvalue"),
+            Request::set(b"k", b"v").ex(3600),
+            Request::set(b"key", b"val").px(1000),
+            Request::set(b"key", b"val").nx(),
+            Request::set(b"key", b"val").xx(),
+            Request::set(b"key", b"val").ex(86400).nx(),
+            Request::set(b"key", b"val").px(500).xx(),
+        ];
+
+        for config in &configs {
+            // Full encode
+            let mut buf = vec![0u8; 512];
+            let len = config.encode(&mut buf);
+            let full = &buf[..len];
+
+            // Parts encode
+            let (prefix, suffix) = config.encode_parts();
+            let mut assembled = Vec::new();
+            assembled.extend_from_slice(&prefix);
+            assembled.extend_from_slice(config.value);
+            assembled.extend_from_slice(&suffix);
+
+            assert_eq!(
+                assembled, full,
+                "encode_parts concat must match encode() for {:?}",
+                config
+            );
+        }
     }
 
     #[test]

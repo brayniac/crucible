@@ -93,11 +93,15 @@ impl Client {
     }
 
     /// Read and parse a single RESP value from the connection.
+    ///
+    /// Uses zero-copy parsing via `with_bytes` + `Value::parse_bytes`:
+    /// bulk string values are `Bytes::slice()` references into the
+    /// accumulator's buffer rather than freshly allocated `Vec<u8>`.
     pub(crate) async fn read_value(&self) -> Result<Value, Error> {
         let mut result: Option<Result<Value, Error>> = None;
         let n = self
             .conn
-            .with_data(|data| match Value::parse(data) {
+            .with_bytes(|bytes| match Value::parse_bytes(bytes) {
                 Ok((value, consumed)) => {
                     result = Some(Ok(value));
                     consumed
@@ -113,6 +117,24 @@ impl Client {
             return result.unwrap_or(Err(Error::ConnectionClosed));
         }
         result.unwrap()
+    }
+
+    /// Send a SET command via scatter-gather (prefix + value + suffix as
+    /// separate iovecs) and read the response.
+    async fn execute_set(
+        &self,
+        set_req: &protocol_resp::SetRequest<'_>,
+        value: &[u8],
+    ) -> Result<Value, Error> {
+        let (prefix, suffix) = set_req.encode_parts();
+        self.conn.send_parts().build(|b| {
+            b.copy(&prefix).copy(value).copy(&suffix).submit()
+        })?;
+        let resp = self.read_value().await?;
+        if let Value::Error(ref msg) = resp {
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+        }
+        Ok(resp)
     }
 
     /// Send an encoded command and read the response, converting Redis
@@ -148,7 +170,7 @@ impl Client {
     async fn execute_bulk(&self, encoded: &[u8]) -> Result<Option<Bytes>, Error> {
         let value = self.execute(encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
@@ -183,8 +205,7 @@ impl Client {
     pub async fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Self::encode_set_request(&Request::set(key, value));
-        let resp = self.execute(&encoded).await?;
+        let resp = self.execute_set(&Request::set(key, value), value).await?;
         match resp {
             Value::SimpleString(_) | Value::Null => Ok(()),
             _ => Err(Error::UnexpectedResponse),
@@ -200,8 +221,13 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Self::encode_set_request(&Request::set(key, value).ex(ttl_secs));
-        self.execute_ok(&encoded).await
+        let resp = self
+            .execute_set(&Request::set(key, value).ex(ttl_secs), value)
+            .await?;
+        match resp {
+            Value::SimpleString(_) => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
     }
 
     /// Set a key-value pair with TTL in milliseconds.
@@ -213,8 +239,13 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Self::encode_set_request(&Request::set(key, value).px(ttl_ms));
-        self.execute_ok(&encoded).await
+        let resp = self
+            .execute_set(&Request::set(key, value).px(ttl_ms), value)
+            .await?;
+        match resp {
+            Value::SimpleString(_) => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
     }
 
     /// Set a key only if it does not already exist. Returns true if the key was set.
@@ -225,8 +256,9 @@ impl Client {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Self::encode_set_request(&Request::set(key, value).nx());
-        let resp = self.execute(&encoded).await?;
+        let resp = self
+            .execute_set(&Request::set(key, value).nx(), value)
+            .await?;
         match resp {
             Value::SimpleString(_) => Ok(true),
             Value::Null => Ok(false),
@@ -255,7 +287,7 @@ impl Client {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -438,7 +470,7 @@ impl Client {
                     let val = iter.next().ok_or(Error::UnexpectedResponse)?;
                     match (field, val) {
                         (Value::BulkString(f), Value::BulkString(v)) => {
-                            result.push((Bytes::from(f), Bytes::from(v)));
+                            result.push((f, v));
                         }
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -466,7 +498,7 @@ impl Client {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -891,7 +923,7 @@ impl Client {
                     let v = iter.next().ok_or(Error::UnexpectedResponse)?;
                     match (k, v) {
                         (Value::BulkString(kk), Value::BulkString(vv)) => {
-                            result.push((Bytes::from(kk), Bytes::from(vv)));
+                            result.push((kk, vv));
                         }
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -1034,7 +1066,7 @@ pub(crate) fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
             let mut result = Vec::with_capacity(arr.len());
             for v in arr {
                 match v {
-                    Value::BulkString(data) => result.push(Bytes::from(data)),
+                    Value::BulkString(data) => result.push(data),
                     _ => return Err(Error::UnexpectedResponse),
                 }
             }
