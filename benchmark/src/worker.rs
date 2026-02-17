@@ -761,12 +761,6 @@ impl BenchHandler {
         }
 
         loop {
-            if let Some(ref rl) = self.ratelimiter
-                && !rl.try_acquire()
-            {
-                break;
-            }
-
             let key_id = self.rng.random_range(0..key_count);
             write_key(&mut self.key_buf, key_id);
 
@@ -775,6 +769,12 @@ impl BenchHandler {
                 Some(idx) => idx,
                 None => break,
             };
+
+            if let Some(ref rl) = self.ratelimiter
+                && !rl.try_acquire()
+            {
+                break;
+            }
 
             let roll = self.rng.random_range(0..100);
             if roll < get_ratio {
@@ -841,12 +841,6 @@ impl BenchHandler {
     ) {
         let mut i = 0;
         while i < self.backfill_queue.len() {
-            if let Some(ref rl) = self.ratelimiter
-                && !rl.try_acquire()
-            {
-                return;
-            }
-
             let key_id = self.backfill_queue[i];
             write_key(&mut self.key_buf, key_id);
 
@@ -858,6 +852,12 @@ impl BenchHandler {
                     continue;
                 }
             };
+
+            if let Some(ref rl) = self.ratelimiter
+                && !rl.try_acquire()
+            {
+                return;
+            }
 
             self.backfill_queue.swap_remove(i);
 
