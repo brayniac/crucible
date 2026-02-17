@@ -23,7 +23,9 @@
 //! }
 //! ```
 
+pub mod cluster;
 pub mod pool;
+pub use cluster::{ClusterClient, ClusterConfig};
 pub use pool::{Pool, PoolConfig};
 
 use std::io;
@@ -60,6 +62,10 @@ pub enum Error {
     /// All connections in the pool are down and reconnection failed.
     #[error("all connections failed")]
     AllConnectionsFailed,
+
+    /// Too many MOVED/ASK redirects for a single command.
+    #[error("too many redirects")]
+    TooManyRedirects,
 }
 
 // ── Client ──────────────────────────────────────────────────────────────
@@ -85,7 +91,7 @@ impl Client {
     }
 
     /// Read and parse a single RESP value from the connection.
-    async fn read_value(&self) -> Result<Value, Error> {
+    pub(crate) async fn read_value(&self) -> Result<Value, Error> {
         let mut result: Option<Result<Value, Error>> = None;
         let n = self
             .conn
@@ -147,7 +153,7 @@ impl Client {
     }
 
     /// Encode a `Request` into a `Vec<u8>`.
-    fn encode_request(req: &Request<'_>) -> Vec<u8> {
+    pub(crate) fn encode_request(req: &Request<'_>) -> Vec<u8> {
         let len = req.encoded_len();
         let mut buf = vec![0u8; len];
         req.encode(&mut buf);
@@ -155,7 +161,7 @@ impl Client {
     }
 
     /// Encode a `SetRequest` into a `Vec<u8>`.
-    fn encode_set_request(req: &protocol_resp::SetRequest<'_>) -> Vec<u8> {
+    pub(crate) fn encode_set_request(req: &protocol_resp::SetRequest<'_>) -> Vec<u8> {
         let len = req.encoded_len();
         let mut buf = vec![0u8; len];
         req.encode(&mut buf);
@@ -977,7 +983,7 @@ impl Pipeline {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
+pub(crate) fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
     match value {
         Value::Array(arr) => {
             let mut result = Vec::with_capacity(arr.len());
