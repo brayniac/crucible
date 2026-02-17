@@ -82,7 +82,7 @@ impl QuicEndpoint {
 
     /// Feed an incoming UDP datagram to the QUIC state machine.
     ///
-    /// Call this from [`EventHandler::on_datagram`].
+    /// Call this from your `EventHandler::on_datagram` callback.
     pub fn handle_datagram(&mut self, now: Instant, data: &[u8], peer: SocketAddr) {
         let data = BytesMut::from(data);
         let event = self.endpoint.handle(
@@ -131,7 +131,7 @@ impl QuicEndpoint {
 
     /// Fire expired per-connection timeouts.
     ///
-    /// Call this from [`EventHandler::on_tick`].
+    /// Call this from your `EventHandler::on_tick` callback.
     pub fn drive_timers(&mut self, now: Instant) {
         // Collect keys to avoid borrow conflict with poll_connection.
         let keys: Vec<u32> = self.connections.iter().map(|(k, _)| k as u32).collect();

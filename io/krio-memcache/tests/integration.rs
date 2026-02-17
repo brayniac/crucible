@@ -298,9 +298,7 @@ fn test_set_get_with_options() {
         Box::pin(async move {
             // set_with_options should store the value (flags/exptime are sent
             // but the server may not round-trip flags in GET responses).
-            client
-                .set_with_options("mc:sgf:key", "data", 42, 0)
-                .await?;
+            client.set_with_options("mc:sgf:key", "data", 42, 0).await?;
 
             let val = client.get("mc:sgf:key").await?;
             let val = val.expect("expected hit");

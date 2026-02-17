@@ -78,8 +78,7 @@ impl ShardedClient {
         let pool_size = config.pool_size.max(1);
 
         let server_ids: Vec<String> = config.servers.iter().map(|a| a.to_string()).collect();
-        let ring =
-            ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let ring = ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
         let shards = config
             .servers
@@ -317,11 +316,7 @@ impl ShardedClient {
 
     /// Increment a numeric value by delta. Returns the new value after incrementing.
     /// Returns `None` if the key does not exist.
-    pub async fn incr(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        delta: u64,
-    ) -> Result<Option<u64>, Error> {
+    pub async fn incr(&mut self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
         let encoded = encode_request(&McRequest::incr(key, delta));
         let response = self.route_command(key, &encoded).await?;
@@ -334,11 +329,7 @@ impl ShardedClient {
 
     /// Decrement a numeric value by delta. Returns the new value after decrementing.
     /// Returns `None` if the key does not exist.
-    pub async fn decr(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        delta: u64,
-    ) -> Result<Option<u64>, Error> {
+    pub async fn decr(&mut self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
         let encoded = encode_request(&McRequest::decr(key, delta));
         let response = self.route_command(key, &encoded).await?;

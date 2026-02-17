@@ -346,7 +346,14 @@ impl<'a> ReplaceRequest<'a> {
     /// Returns the number of bytes written.
     #[inline]
     pub fn encode(&self, buf: &mut [u8]) -> usize {
-        encode_storage(buf, b"replace", self.key, self.value, self.flags, self.exptime)
+        encode_storage(
+            buf,
+            b"replace",
+            self.key,
+            self.value,
+            self.flags,
+            self.exptime,
+        )
     }
 }
 
@@ -449,7 +456,15 @@ fn encode_cas(
 
     // <flags> <exptime> <bytes> <cas_unique>\r\n
     let mut cursor = std::io::Cursor::new(&mut buf[pos..]);
-    write!(cursor, "{} {} {} {}\r\n", flags, exptime, value.len(), cas_unique).unwrap();
+    write!(
+        cursor,
+        "{} {} {} {}\r\n",
+        flags,
+        exptime,
+        value.len(),
+        cas_unique
+    )
+    .unwrap();
     pos += cursor.position() as usize;
 
     // <data>\r\n

@@ -40,7 +40,7 @@ impl MemcacheCodec {
 
     /// Encodes a multi-GET command (more efficient than multiple single GETs).
     ///
-    /// Format: `get <key1> <key2> ... <keyN>\r\n`
+    /// Format: `gets <key1> <key2> ... <keyN>\r\n`
     /// Response: `VALUE <key> <flags> <bytes>\r\n<data>\r\n... END\r\n`
     pub fn encode_multi_get(&mut self, buf: &mut Buffer, keys: &[&[u8]]) -> usize {
         if keys.is_empty() {
@@ -248,7 +248,7 @@ mod tests {
         let mut buf = Buffer::with_capacity(1024);
 
         codec.encode_multi_get(&mut buf, &[b"key1", b"key2", b"key3"]);
-        assert_eq!(buf.as_slice(), b"get key1 key2 key3\r\n");
+        assert_eq!(buf.as_slice(), b"gets key1 key2 key3\r\n");
         assert_eq!(codec.pending_responses(), 1);
     }
 

@@ -191,7 +191,10 @@ impl QuicClient {
 
     /// Receive the HTTP/3 response from a stream.
     /// Returns (status_code, response_headers, body).
-    fn recv_response(&mut self, stream: quinn_proto::StreamId) -> (u16, Vec<http3::HeaderField>, Vec<u8>) {
+    fn recv_response(
+        &mut self,
+        stream: quinn_proto::StreamId,
+    ) -> (u16, Vec<http3::HeaderField>, Vec<u8>) {
         let mut raw = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
 
@@ -247,8 +250,11 @@ impl QuicClient {
                     offset += consumed;
                     match frame {
                         http3::Frame::Headers { encoded } => {
-                            println!("  HEADERS frame: {} bytes, first bytes: {:02x?}",
-                                encoded.len(), &encoded[..encoded.len().min(32)]);
+                            println!(
+                                "  HEADERS frame: {} bytes, first bytes: {:02x?}",
+                                encoded.len(),
+                                &encoded[..encoded.len().min(32)]
+                            );
                             match http3::qpack::decode(&encoded) {
                                 Ok(h) => headers = h,
                                 Err(e) => println!("  QPACK decode error: {e}"),
@@ -269,7 +275,12 @@ impl QuicClient {
         let status = headers
             .iter()
             .find(|h| h.name == b":status")
-            .map(|h| std::str::from_utf8(&h.value).unwrap().parse::<u16>().unwrap())
+            .map(|h| {
+                std::str::from_utf8(&h.value)
+                    .unwrap()
+                    .parse::<u16>()
+                    .unwrap()
+            })
             .unwrap_or(0);
 
         (status, headers, body)
@@ -324,7 +335,10 @@ fn h3_google() {
         println!("{}", String::from_utf8_lossy(&body));
     }
 
-    assert!(status == 200 || status == 301 || status == 302, "unexpected status {status}");
+    assert!(
+        status == 200 || status == 301 || status == 302,
+        "unexpected status {status}"
+    );
     assert!(!body.is_empty(), "empty body");
 
     client.close();
@@ -355,7 +369,10 @@ fn h3_cloudflare() {
     }
     println!("Body: {} bytes", body.len());
 
-    assert!(status == 200 || status == 301 || status == 302 || status == 403, "unexpected status {status}");
+    assert!(
+        status == 200 || status == 301 || status == 302 || status == 403,
+        "unexpected status {status}"
+    );
 
     client.close();
     println!("Done!");

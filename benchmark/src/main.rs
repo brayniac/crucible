@@ -134,9 +134,7 @@ fn run_benchmark(
         match config.target.protocol {
             CacheProtocol::Resp | CacheProtocol::Resp3 => {}
             other => {
-                return Err(
-                    format!("cluster mode requires resp protocol, got {:?}", other).into(),
-                );
+                return Err(format!("cluster mode requires resp protocol, got {:?}", other).into());
             }
         }
         let (endpoints, table) = benchmark::cluster::discover_topology(&config.target.endpoints)?;

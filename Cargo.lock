@@ -418,7 +418,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "benchmark"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "arrow",
  "axum",
@@ -534,7 +534,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cache-bench"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "cache-core",
  "clap",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "cache-core"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "ahash",
  "bytes",
@@ -843,7 +843,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crucible-grpc-client"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-http-client"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-memcache-client"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-momento-client"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-resp-client"
-version = "0.4.0-alpha.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "ketama",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "grpc"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "http2",
@@ -1195,7 +1195,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "heap-cache"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "http2"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "rustls",
@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "http3"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "krio",
@@ -1480,11 +1480,11 @@ dependencies = [
 
 [[package]]
 name = "ketama"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 
 [[package]]
 name = "krio"
-version = "0.1.0-alpha.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -1498,7 +1498,7 @@ dependencies = [
 
 [[package]]
 name = "krio-memcache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ketama",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "krio-quic"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "krio",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "krio-redis"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ketama",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "metriken",
 ]
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-memcache"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "itoa",
  "memchr",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-momento"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "grpc",
@@ -2309,14 +2309,14 @@ dependencies = [
 
 [[package]]
 name = "protocol-ping"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "protocol-resp"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "itoa",
@@ -2327,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "ahash",
  "axum",
@@ -2689,7 +2689,7 @@ checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "segcache"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "cache-core",
  "clocksource",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "axum",
  "bytes",
@@ -2882,7 +2882,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slab-cache"
-version = "0.3.5-alpha.0"
+version = "0.3.5"
 dependencies = [
  "cache-core",
  "clocksource",

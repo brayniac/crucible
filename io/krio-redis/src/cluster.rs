@@ -31,9 +31,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use protocol_resp::{
-    Request, RedirectKind, SlotMap, Value, hash_slot, parse_redirect,
-};
+use protocol_resp::{RedirectKind, Request, SlotMap, Value, hash_slot, parse_redirect};
 
 use crate::{Client, Error, parse_bytes_array};
 
@@ -113,8 +111,7 @@ impl ClusterClient {
 
     /// Query CLUSTER SLOTS from any reachable node and rebuild the slot map.
     async fn refresh_topology(&mut self) -> Result<(), Error> {
-        let cluster_slots_cmd =
-            Client::encode_request(&Request::cmd(b"CLUSTER").arg(b"SLOTS"));
+        let cluster_slots_cmd = Client::encode_request(&Request::cmd(b"CLUSTER").arg(b"SLOTS"));
 
         // Try existing connected nodes first.
         let connected_addrs: Vec<String> = self
@@ -210,8 +207,7 @@ impl ClusterClient {
                             .insert(addr_str.clone(), NodeState::Connected(client));
                     }
                     Err(_) => {
-                        self.nodes
-                            .insert(addr_str.clone(), NodeState::Disconnected);
+                        self.nodes.insert(addr_str.clone(), NodeState::Disconnected);
                     }
                 }
             }
@@ -301,9 +297,7 @@ impl ClusterClient {
                             .slot_map
                             .lookup(slot)
                             .map(|r| r.primary.address.clone())
-                            .ok_or_else(|| {
-                                Error::Redis(format!("no node for slot {slot}"))
-                            })?;
+                            .ok_or_else(|| Error::Redis(format!("no node for slot {slot}")))?;
                         continue;
                     }
                     return Err(Error::AllConnectionsFailed);
@@ -323,9 +317,7 @@ impl ClusterClient {
                             .slot_map
                             .lookup(slot)
                             .map(|r| r.primary.address.clone())
-                            .ok_or_else(|| {
-                                Error::Redis(format!("no node for slot {slot}"))
-                            })?;
+                            .ok_or_else(|| Error::Redis(format!("no node for slot {slot}")))?;
                         continue;
                     }
                     return Err(Error::ConnectionClosed);
@@ -343,17 +335,14 @@ impl ClusterClient {
                             .slot_map
                             .lookup(slot)
                             .map(|r| r.primary.address.clone())
-                            .ok_or_else(|| {
-                                Error::Redis(format!("no node for slot {slot}"))
-                            })?;
+                            .ok_or_else(|| Error::Redis(format!("no node for slot {slot}")))?;
                         continue;
                     }
                     RedirectKind::Ask => {
                         // One-time redirect: send ASKING then retry on target.
                         let ask_addr = redirect.address;
                         let ask_client = self.client_for_addr(&ask_addr).await?;
-                        let asking_cmd =
-                            Client::encode_request(&Request::cmd(b"ASKING"));
+                        let asking_cmd = Client::encode_request(&Request::cmd(b"ASKING"));
                         ask_client.conn().send(&asking_cmd)?;
                         // Read and discard the ASKING response.
                         let _ = ask_client.read_value().await?;
@@ -362,9 +351,7 @@ impl ClusterClient {
                         let ask_value = ask_client.read_value().await?;
                         // Check the ASK target's response for errors.
                         if let Value::Error(ref msg) = ask_value {
-                            return Err(Error::Redis(
-                                String::from_utf8_lossy(msg).into_owned(),
-                            ));
+                            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
                         }
                         return Ok(ask_value);
                     }
@@ -373,9 +360,7 @@ impl ClusterClient {
 
             // Non-redirect error.
             if let Value::Error(ref msg) = value {
-                return Err(Error::Redis(
-                    String::from_utf8_lossy(msg).into_owned(),
-                ));
+                return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
             }
 
             return Ok(value);
@@ -403,11 +388,7 @@ impl ClusterClient {
     }
 
     /// Route and expect a bulk string or null.
-    async fn route_bulk(
-        &mut self,
-        key: &[u8],
-        encoded: &[u8],
-    ) -> Result<Option<Bytes>, Error> {
+    async fn route_bulk(&mut self, key: &[u8], encoded: &[u8]) -> Result<Option<Bytes>, Error> {
         let value = self.route_command(key, encoded).await?;
         match value {
             Value::BulkString(data) => Ok(Some(data)),
@@ -557,9 +538,7 @@ impl ClusterClient {
         let delta_str = delta.to_string();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"INCRBY").arg(key).arg(delta_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"INCRBY").arg(key).arg(delta_str.as_bytes())),
         )
         .await
     }
@@ -570,9 +549,7 @@ impl ClusterClient {
         let delta_str = delta.to_string();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"DECRBY").arg(key).arg(delta_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"DECRBY").arg(key).arg(delta_str.as_bytes())),
         )
         .await
     }
@@ -611,9 +588,7 @@ impl ClusterClient {
         let secs_str = seconds.to_string();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"EXPIRE").arg(key).arg(secs_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"EXPIRE").arg(key).arg(secs_str.as_bytes())),
         )
         .await
         .map(|n| n == 1)
@@ -622,11 +597,8 @@ impl ClusterClient {
     /// Get the TTL of a key in seconds.
     pub async fn ttl(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
-        self.route_int(
-            key,
-            &Client::encode_request(&Request::cmd(b"TTL").arg(key)),
-        )
-        .await
+        self.route_int(key, &Client::encode_request(&Request::cmd(b"TTL").arg(key)))
+            .await
     }
 
     /// Get the TTL of a key in milliseconds.
@@ -706,9 +678,7 @@ impl ClusterClient {
         let value = value.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"HSET").arg(key).arg(field).arg(value),
-            ),
+            &Client::encode_request(&Request::cmd(b"HSET").arg(key).arg(field).arg(value)),
         )
         .await
         .map(|n| n > 0)
@@ -730,10 +700,7 @@ impl ClusterClient {
     }
 
     /// Get all fields and values in a hash.
-    pub async fn hgetall(
-        &mut self,
-        key: impl AsRef<[u8]>,
-    ) -> Result<Vec<(Bytes, Bytes)>, Error> {
+    pub async fn hgetall(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
         let key = key.as_ref();
         let value = self
             .route_command(
@@ -791,11 +758,7 @@ impl ClusterClient {
     }
 
     /// Delete fields from a hash. Returns the number of fields removed.
-    pub async fn hdel(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        fields: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn hdel(&mut self, key: impl AsRef<[u8]>, fields: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"HDEL").arg(key);
         for field in fields {
@@ -814,9 +777,7 @@ impl ClusterClient {
         let field = field.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"HEXISTS").arg(key).arg(field),
-            ),
+            &Client::encode_request(&Request::cmd(b"HEXISTS").arg(key).arg(field)),
         )
         .await
         .map(|n| n == 1)
@@ -890,9 +851,7 @@ impl ClusterClient {
         let value = value.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"HSETNX").arg(key).arg(field).arg(value),
-            ),
+            &Client::encode_request(&Request::cmd(b"HSETNX").arg(key).arg(field).arg(value)),
         )
         .await
         .map(|n| n == 1)
@@ -901,11 +860,7 @@ impl ClusterClient {
     // ── List commands ───────────────────────────────────────────────────
 
     /// Push values to the head of a list. Returns the list length.
-    pub async fn lpush(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        values: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn lpush(&mut self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"LPUSH").arg(key);
         for v in values {
@@ -915,11 +870,7 @@ impl ClusterClient {
     }
 
     /// Push values to the tail of a list. Returns the list length.
-    pub async fn rpush(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        values: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn rpush(&mut self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"RPUSH").arg(key);
         for v in values {
@@ -968,9 +919,7 @@ impl ClusterClient {
         let idx_str = index.to_string();
         self.route_bulk(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"LINDEX").arg(key).arg(idx_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"LINDEX").arg(key).arg(idx_str.as_bytes())),
         )
         .await
     }
@@ -1076,11 +1025,7 @@ impl ClusterClient {
     // ── Set commands ────────────────────────────────────────────────────
 
     /// Add members to a set. Returns the number of members added.
-    pub async fn sadd(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        members: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn sadd(&mut self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"SADD").arg(key);
         for m in members {
@@ -1090,11 +1035,7 @@ impl ClusterClient {
     }
 
     /// Remove members from a set. Returns the number of members removed.
-    pub async fn srem(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        members: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn srem(&mut self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"SREM").arg(key);
         for m in members {
@@ -1135,9 +1076,7 @@ impl ClusterClient {
         let member = member.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"SISMEMBER").arg(key).arg(member),
-            ),
+            &Client::encode_request(&Request::cmd(b"SISMEMBER").arg(key).arg(member)),
         )
         .await
         .map(|n| n == 1)
@@ -1225,9 +1164,7 @@ impl ClusterClient {
         client.conn().send(&ping_cmd)?;
         let value = client.read_value().await?;
         if let Value::Error(ref msg) = value {
-            return Err(Error::Redis(
-                String::from_utf8_lossy(msg).into_owned(),
-            ));
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
         }
         match value {
             Value::SimpleString(_) => Ok(()),
@@ -1252,11 +1189,7 @@ impl ClusterClient {
     ///
     /// This skips Request construction and encoding — use when you already
     /// have the raw RESP wire bytes (e.g. proxying from a client).
-    pub async fn route_raw(
-        &mut self,
-        key: &[u8],
-        encoded: &[u8],
-    ) -> Result<Value, Error> {
+    pub async fn route_raw(&mut self, key: &[u8], encoded: &[u8]) -> Result<Value, Error> {
         self.route_command(key, encoded).await
     }
 

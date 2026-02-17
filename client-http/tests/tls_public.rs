@@ -122,11 +122,11 @@ async fn test_tls_latency_recorded() {
         "request latency should be recorded"
     );
     assert!(lat.get().load().is_some(), "GET latency should be recorded");
-    if let Some(snap) = lat.request().load() {
-        if let Ok(Some(pcts)) = snap.percentiles(&[50.0, 99.0]) {
-            let p50 = pcts.get(0).map(|(_, b)| b.end() as f64).unwrap_or(0.0);
-            let p99 = pcts.get(1).map(|(_, b)| b.end() as f64).unwrap_or(0.0);
-            println!("Latency: p50={:.1}ms p99={:.1}ms", p50 / 1e6, p99 / 1e6);
-        }
+    if let Some(snap) = lat.request().load()
+        && let Ok(Some(pcts)) = snap.percentiles(&[50.0, 99.0])
+    {
+        let p50 = pcts.first().map(|(_, b)| b.end() as f64).unwrap_or(0.0);
+        let p99 = pcts.get(1).map(|(_, b)| b.end() as f64).unwrap_or(0.0);
+        println!("Latency: p50={:.1}ms p99={:.1}ms", p50 / 1e6, p99 / 1e6);
     }
 }
