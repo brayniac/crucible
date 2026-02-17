@@ -662,11 +662,11 @@ impl AsyncSendBuilder {
         })
     }
 
-    /// Submit a scatter-gather send from pre-classified [`SendPart`]s.
+    /// Submit a scatter-gather send from pre-classified `SendPart`s.
     ///
     /// This avoids the lifetime constraints of the closure-based [`build()`](Self::build),
     /// allowing callers to mix copy and guard parts in a single SQE from borrowed data.
-    /// Parts are consumed in order up to [`MAX_IOVECS`] total or [`MAX_GUARDS`] guards.
+    /// Parts are consumed in order up to `MAX_IOVECS` total or `MAX_GUARDS` guards.
     ///
     /// Returns the number of parts consumed on success.
     pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
