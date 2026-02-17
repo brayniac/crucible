@@ -841,9 +841,7 @@ impl<F: FnMut(Bytes) -> usize + Unpin> Future for WithBytesFuture<F> {
 
             // consumed == 0 on non-empty data: incomplete parse.
             // Put everything back.
-            driver
-                .accumulators
-                .prepend(self.conn_index, &frozen[..]);
+            driver.accumulators.prepend(self.conn_index, &frozen[..]);
 
             let is_closed = driver
                 .connections

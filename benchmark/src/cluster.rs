@@ -99,11 +99,10 @@ fn build_topology(
         std::collections::HashMap::new();
 
     for range in slot_map.ranges() {
-        let addr: SocketAddr = range
-            .primary
-            .address
-            .parse()
-            .map_err(|e| format!("invalid primary address '{}': {}", range.primary.address, e))?;
+        let addr: SocketAddr =
+            range.primary.address.parse().map_err(|e| {
+                format!("invalid primary address '{}': {}", range.primary.address, e)
+            })?;
         addr_to_idx.entry(addr).or_insert_with(|| {
             let idx = endpoints.len();
             endpoints.push(addr);

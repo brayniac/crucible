@@ -20,8 +20,8 @@
 //! - Push: `><len>\r\n<elem>...`
 //! - Attribute: `|<len>\r\n<attrs>...<value>`
 
-use bytes::Bytes;
 use crate::error::ParseError;
+use bytes::Bytes;
 use std::io::Write;
 
 /// Default maximum key length in bytes.
@@ -939,7 +939,10 @@ fn parse_error_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
 }
 
 /// Parse a bulk string zero-copy: $6\r\nfoobar\r\n or $-1\r\n
-fn parse_bulk_string_bytes(data: &Bytes, options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+fn parse_bulk_string_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+) -> Result<(Value, usize), ParseError> {
     let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
@@ -1018,8 +1021,7 @@ fn parse_array_bytes(
             return Err(ParseError::Incomplete);
         }
         let sub = data.slice(pos..);
-        let (value, consumed) =
-            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        let (value, consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
         elements.push(value);
         pos += consumed;
     }
@@ -1037,7 +1039,10 @@ fn parse_big_number_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
 
 /// Parse RESP3 bulk error zero-copy: !<len>\r\n<error>\r\n
 #[cfg(feature = "resp3")]
-fn parse_bulk_error_bytes(data: &Bytes, options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+fn parse_bulk_error_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+) -> Result<(Value, usize), ParseError> {
     let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
@@ -1219,8 +1224,7 @@ fn parse_set_bytes(
             return Err(ParseError::Incomplete);
         }
         let sub = data.slice(pos..);
-        let (value, consumed) =
-            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        let (value, consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
         elements.push(value);
         pos += consumed;
     }
@@ -1266,8 +1270,7 @@ fn parse_push_bytes(
             return Err(ParseError::Incomplete);
         }
         let sub = data.slice(pos..);
-        let (value, consumed) =
-            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        let (value, consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
         elements.push(value);
         pos += consumed;
     }
@@ -1336,8 +1339,7 @@ fn parse_attribute_bytes(
         return Err(ParseError::Incomplete);
     }
     let sub = data.slice(pos..);
-    let (value, val_consumed) =
-        Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+    let (value, val_consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
     pos += val_consumed;
 
     Ok((
@@ -1994,7 +1996,10 @@ mod tests {
     #[test]
     fn test_parse_error() {
         let (value, consumed) = Value::parse(b"-ERR unknown command\r\n").unwrap();
-        assert_eq!(value, Value::Error(Bytes::from_static(b"ERR unknown command")));
+        assert_eq!(
+            value,
+            Value::Error(Bytes::from_static(b"ERR unknown command"))
+        );
         assert_eq!(consumed, 22);
     }
 
@@ -2351,7 +2356,10 @@ mod tests {
     fn test_binary_bulk_string() {
         // Bulk string with binary data including null bytes
         let (value, _) = Value::parse(b"$5\r\n\x00\x01\x02\x03\x04\r\n").unwrap();
-        assert_eq!(value, Value::BulkString(Bytes::from_static(&[0, 1, 2, 3, 4])));
+        assert_eq!(
+            value,
+            Value::BulkString(Bytes::from_static(&[0, 1, 2, 3, 4]))
+        );
     }
 
     // ========================================================================
@@ -2408,14 +2416,20 @@ mod tests {
         #[test]
         fn test_parse_big_number() {
             let (value, consumed) = Value::parse(b"(12345678901234567890\r\n").unwrap();
-            assert_eq!(value, Value::BigNumber(Bytes::from_static(b"12345678901234567890")));
+            assert_eq!(
+                value,
+                Value::BigNumber(Bytes::from_static(b"12345678901234567890"))
+            );
             assert_eq!(consumed, 23);
         }
 
         #[test]
         fn test_parse_bulk_error() {
             let (value, consumed) = Value::parse(b"!21\r\nSYNTAX invalid syntax\r\n").unwrap();
-            assert_eq!(value, Value::BulkError(Bytes::from_static(b"SYNTAX invalid syntax")));
+            assert_eq!(
+                value,
+                Value::BulkError(Bytes::from_static(b"SYNTAX invalid syntax"))
+            );
             assert_eq!(consumed, 28);
         }
 
@@ -2441,8 +2455,14 @@ mod tests {
             assert_eq!(
                 value,
                 Value::Map(vec![
-                    (Value::SimpleString(Bytes::from_static(b"first")), Value::Integer(1)),
-                    (Value::SimpleString(Bytes::from_static(b"second")), Value::Integer(2)),
+                    (
+                        Value::SimpleString(Bytes::from_static(b"first")),
+                        Value::Integer(1)
+                    ),
+                    (
+                        Value::SimpleString(Bytes::from_static(b"second")),
+                        Value::Integer(2)
+                    ),
                 ])
             );
             assert_eq!(consumed, 29);

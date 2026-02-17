@@ -86,8 +86,7 @@ impl ShardedClient {
         let pool_size = config.pool_size.max(1);
 
         let server_ids: Vec<String> = config.servers.iter().map(|a| a.to_string()).collect();
-        let ring =
-            ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let ring = ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
         let shards = config
             .servers
@@ -173,15 +172,13 @@ impl ShardedClient {
             let idx = (shard.next + attempt) % size;
             let client = match &shard.conns[idx] {
                 ShardConn::Connected(c) => *c,
-                ShardConn::Disconnected => {
-                    match do_connect(shard.addr, &opts).await {
-                        Ok(c) => {
-                            shard.conns[idx] = ShardConn::Connected(c);
-                            c
-                        }
-                        Err(_) => continue,
+                ShardConn::Disconnected => match do_connect(shard.addr, &opts).await {
+                    Ok(c) => {
+                        shard.conns[idx] = ShardConn::Connected(c);
+                        c
                     }
-                }
+                    Err(_) => continue,
+                },
             };
 
             client.conn().send(encoded)?;
@@ -191,9 +188,7 @@ impl ShardedClient {
                     shard.next = (idx + 1) % size;
 
                     if let Value::Error(ref msg) = value {
-                        return Err(Error::Redis(
-                            String::from_utf8_lossy(msg).into_owned(),
-                        ));
+                        return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
                     }
                     return Ok(value);
                 }
@@ -227,11 +222,7 @@ impl ShardedClient {
     }
 
     /// Route and expect a bulk string or null.
-    async fn route_bulk(
-        &mut self,
-        key: &[u8],
-        encoded: &[u8],
-    ) -> Result<Option<Bytes>, Error> {
+    async fn route_bulk(&mut self, key: &[u8], encoded: &[u8]) -> Result<Option<Bytes>, Error> {
         let value = self.route_command(key, encoded).await?;
         match value {
             Value::BulkString(data) => Ok(Some(data)),
@@ -381,9 +372,7 @@ impl ShardedClient {
         let delta_str = delta.to_string();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"INCRBY").arg(key).arg(delta_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"INCRBY").arg(key).arg(delta_str.as_bytes())),
         )
         .await
     }
@@ -394,9 +383,7 @@ impl ShardedClient {
         let delta_str = delta.to_string();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"DECRBY").arg(key).arg(delta_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"DECRBY").arg(key).arg(delta_str.as_bytes())),
         )
         .await
     }
@@ -435,9 +422,7 @@ impl ShardedClient {
         let secs_str = seconds.to_string();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"EXPIRE").arg(key).arg(secs_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"EXPIRE").arg(key).arg(secs_str.as_bytes())),
         )
         .await
         .map(|n| n == 1)
@@ -446,11 +431,8 @@ impl ShardedClient {
     /// Get the TTL of a key in seconds.
     pub async fn ttl(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
-        self.route_int(
-            key,
-            &Client::encode_request(&Request::cmd(b"TTL").arg(key)),
-        )
-        .await
+        self.route_int(key, &Client::encode_request(&Request::cmd(b"TTL").arg(key)))
+            .await
     }
 
     /// Get the TTL of a key in milliseconds.
@@ -530,9 +512,7 @@ impl ShardedClient {
         let value = value.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"HSET").arg(key).arg(field).arg(value),
-            ),
+            &Client::encode_request(&Request::cmd(b"HSET").arg(key).arg(field).arg(value)),
         )
         .await
         .map(|n| n > 0)
@@ -554,10 +534,7 @@ impl ShardedClient {
     }
 
     /// Get all fields and values in a hash.
-    pub async fn hgetall(
-        &mut self,
-        key: impl AsRef<[u8]>,
-    ) -> Result<Vec<(Bytes, Bytes)>, Error> {
+    pub async fn hgetall(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
         let key = key.as_ref();
         let value = self
             .route_command(
@@ -615,11 +592,7 @@ impl ShardedClient {
     }
 
     /// Delete fields from a hash. Returns the number of fields removed.
-    pub async fn hdel(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        fields: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn hdel(&mut self, key: impl AsRef<[u8]>, fields: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"HDEL").arg(key);
         for field in fields {
@@ -638,9 +611,7 @@ impl ShardedClient {
         let field = field.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"HEXISTS").arg(key).arg(field),
-            ),
+            &Client::encode_request(&Request::cmd(b"HEXISTS").arg(key).arg(field)),
         )
         .await
         .map(|n| n == 1)
@@ -714,9 +685,7 @@ impl ShardedClient {
         let value = value.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"HSETNX").arg(key).arg(field).arg(value),
-            ),
+            &Client::encode_request(&Request::cmd(b"HSETNX").arg(key).arg(field).arg(value)),
         )
         .await
         .map(|n| n == 1)
@@ -725,11 +694,7 @@ impl ShardedClient {
     // ── List commands ───────────────────────────────────────────────────
 
     /// Push values to the head of a list. Returns the list length.
-    pub async fn lpush(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        values: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn lpush(&mut self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"LPUSH").arg(key);
         for v in values {
@@ -739,11 +704,7 @@ impl ShardedClient {
     }
 
     /// Push values to the tail of a list. Returns the list length.
-    pub async fn rpush(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        values: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn rpush(&mut self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"RPUSH").arg(key);
         for v in values {
@@ -792,9 +753,7 @@ impl ShardedClient {
         let idx_str = index.to_string();
         self.route_bulk(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"LINDEX").arg(key).arg(idx_str.as_bytes()),
-            ),
+            &Client::encode_request(&Request::cmd(b"LINDEX").arg(key).arg(idx_str.as_bytes())),
         )
         .await
     }
@@ -900,11 +859,7 @@ impl ShardedClient {
     // ── Set commands ────────────────────────────────────────────────────
 
     /// Add members to a set. Returns the number of members added.
-    pub async fn sadd(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        members: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn sadd(&mut self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"SADD").arg(key);
         for m in members {
@@ -914,11 +869,7 @@ impl ShardedClient {
     }
 
     /// Remove members from a set. Returns the number of members removed.
-    pub async fn srem(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        members: &[&[u8]],
-    ) -> Result<i64, Error> {
+    pub async fn srem(&mut self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"SREM").arg(key);
         for m in members {
@@ -959,9 +910,7 @@ impl ShardedClient {
         let member = member.as_ref();
         self.route_int(
             key,
-            &Client::encode_request(
-                &Request::cmd(b"SISMEMBER").arg(key).arg(member),
-            ),
+            &Client::encode_request(&Request::cmd(b"SISMEMBER").arg(key).arg(member)),
         )
         .await
         .map(|n| n == 1)
@@ -1037,9 +986,7 @@ impl ShardedClient {
                 client.conn().send(&ping_cmd)?;
                 let value = client.read_value().await?;
                 if let Value::Error(ref msg) = value {
-                    return Err(Error::Redis(
-                        String::from_utf8_lossy(msg).into_owned(),
-                    ));
+                    return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
                 }
                 return match value {
                     Value::SimpleString(_) => Ok(()),
