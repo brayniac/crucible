@@ -195,6 +195,18 @@ impl<'a> Command<'a> {
                 }
             }
 
+            b"gets" | b"GETS" => {
+                // gets always returns CAS tokens — maps to Command::Gets
+                let keys: Vec<&[u8]> = parts.filter(|k| !k.is_empty()).collect();
+                if keys.is_empty() {
+                    return Err(ParseError::Protocol("gets requires key"));
+                }
+                if keys.len() > options.max_keys {
+                    return Err(ParseError::Protocol("too many keys"));
+                }
+                Ok((Command::Gets { keys }, line_end + 2))
+            }
+
             b"set" | b"SET" => {
                 let key = parts
                     .next()

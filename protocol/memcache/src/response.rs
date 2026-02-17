@@ -19,6 +19,8 @@ pub struct Value {
     pub key: Vec<u8>,
     pub flags: u32,
     pub data: Vec<u8>,
+    /// CAS unique token, present when the response is from a `gets` command.
+    pub cas: Option<u64>,
 }
 
 /// A parsed Memcache response.
@@ -36,6 +38,10 @@ pub enum Response {
     NotFound,
     /// EXISTS response from CAS
     Exists,
+    /// OK response (from flush_all, touch, etc.)
+    Ok,
+    /// Numeric response from INCR/DECR (the new value after the operation).
+    Numeric(u64),
     /// VERSION response
     Version(Vec<u8>),
     /// Generic error
@@ -75,6 +81,18 @@ impl Response {
         Response::NotFound
     }
 
+    /// Create an OK response.
+    #[inline]
+    pub fn ok() -> Self {
+        Response::Ok
+    }
+
+    /// Create a numeric response (from INCR/DECR).
+    #[inline]
+    pub fn numeric(value: u64) -> Self {
+        Response::Numeric(value)
+    }
+
     /// Create an empty VALUES response (cache miss).
     #[inline]
     pub fn miss() -> Self {
@@ -88,6 +106,7 @@ impl Response {
             key: key.to_vec(),
             flags,
             data: data.to_vec(),
+            cas: None,
         }])
     }
 
@@ -171,6 +190,9 @@ impl Response {
             // Empty GET response (miss)
             return Ok((Response::Values(vec![]), line_end + 2));
         }
+        if line == b"OK" {
+            return Ok((Response::Ok, line_end + 2));
+        }
         if line == b"ERROR" {
             return Ok((Response::Error, line_end + 2));
         }
@@ -190,6 +212,12 @@ impl Response {
         // Check for VALUE response
         if line.starts_with(b"VALUE ") {
             return parse_value_response(data);
+        }
+
+        // Check for numeric response (INCR/DECR returns `<number>\r\n`)
+        if !line.is_empty() && line.iter().all(|&b| b.is_ascii_digit()) {
+            let value = parse_u64(line)?;
+            return Ok((Response::Numeric(value), line_end + 2));
         }
 
         Err(ParseError::Protocol("unknown response"))
@@ -223,6 +251,15 @@ impl Response {
             Response::Exists => {
                 buf[..8].copy_from_slice(b"EXISTS\r\n");
                 8
+            }
+            Response::Ok => {
+                buf[..4].copy_from_slice(b"OK\r\n");
+                4
+            }
+            Response::Numeric(value) => {
+                let mut cursor = std::io::Cursor::new(&mut buf[..]);
+                write!(cursor, "{}\r\n", value).unwrap();
+                cursor.position() as usize
             }
             Response::Error => {
                 buf[..7].copy_from_slice(b"ERROR\r\n");
@@ -369,6 +406,14 @@ impl Response {
         8
     }
 
+    /// Encode a numeric response directly to buffer (INCR/DECR result).
+    #[inline]
+    pub fn encode_numeric(buf: &mut [u8], value: u64) -> usize {
+        let mut cursor = std::io::Cursor::new(&mut buf[..]);
+        write!(cursor, "{}\r\n", value).unwrap();
+        cursor.position() as usize
+    }
+
     /// Encode a SERVER_ERROR response directly to buffer.
     #[inline]
     pub fn encode_server_error(buf: &mut [u8], msg: &[u8]) -> usize {
@@ -423,6 +468,11 @@ fn parse_value_response(data: &[u8]) -> Result<(Response, usize), ParseError> {
         let key = parts[0].to_vec();
         let flags = parse_u32(parts[1])?;
         let bytes = parse_usize(parts[2])?;
+        let cas = if parts.len() >= 4 {
+            Some(parse_u64(parts[3])?)
+        } else {
+            None
+        };
 
         // Move past the VALUE line
         pos += line_end + 2;
@@ -445,6 +495,7 @@ fn parse_value_response(data: &[u8]) -> Result<(Response, usize), ParseError> {
             key,
             flags,
             data: value_data,
+            cas,
         });
     }
 
@@ -456,7 +507,7 @@ fn encode_values(buf: &mut [u8], values: &[Value]) -> usize {
     let mut pos = 0;
 
     for value in values {
-        // VALUE <key> <flags> <bytes>\r\n
+        // VALUE <key> <flags> <bytes> [<cas>]\r\n
         buf[pos..pos + 6].copy_from_slice(b"VALUE ");
         pos += 6;
         buf[pos..pos + value.key.len()].copy_from_slice(&value.key);
@@ -465,7 +516,11 @@ fn encode_values(buf: &mut [u8], values: &[Value]) -> usize {
         pos += 1;
 
         let mut cursor = std::io::Cursor::new(&mut buf[pos..]);
-        write!(cursor, "{} {}\r\n", value.flags, value.data.len()).unwrap();
+        if let Some(cas) = value.cas {
+            write!(cursor, "{} {} {}\r\n", value.flags, value.data.len(), cas).unwrap();
+        } else {
+            write!(cursor, "{} {}\r\n", value.flags, value.data.len()).unwrap();
+        }
         pos += cursor.position() as usize;
 
         // <data>\r\n
@@ -482,6 +537,14 @@ fn encode_values(buf: &mut [u8], values: &[Value]) -> usize {
 
 /// Parse a u32 from ASCII decimal.
 fn parse_u32(data: &[u8]) -> Result<u32, ParseError> {
+    std::str::from_utf8(data)
+        .map_err(|_| ParseError::InvalidNumber)?
+        .parse()
+        .map_err(|_| ParseError::InvalidNumber)
+}
+
+/// Parse a u64 from ASCII decimal.
+fn parse_u64(data: &[u8]) -> Result<u64, ParseError> {
     std::str::from_utf8(data)
         .map_err(|_| ParseError::InvalidNumber)?
         .parse()
@@ -640,6 +703,10 @@ mod tests {
             Response::not_stored(),
             Response::deleted(),
             Response::not_found(),
+            Response::ok(),
+            Response::numeric(0),
+            Response::numeric(42),
+            Response::numeric(18446744073709551615),
             Response::error(),
             Response::miss(),
         ];
@@ -754,6 +821,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ok() {
+        let (resp, consumed) = Response::parse(b"OK\r\n").unwrap();
+        assert_eq!(resp, Response::Ok);
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_encode_ok() {
+        let mut buf = [0u8; 64];
+        let len = Response::ok().encode(&mut buf);
+        assert_eq!(&buf[..len], b"OK\r\n");
+    }
+
+    #[test]
+    fn test_parse_numeric() {
+        let (resp, consumed) = Response::parse(b"42\r\n").unwrap();
+        assert_eq!(resp, Response::Numeric(42));
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_parse_numeric_zero() {
+        let (resp, consumed) = Response::parse(b"0\r\n").unwrap();
+        assert_eq!(resp, Response::Numeric(0));
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn test_parse_numeric_large() {
+        let (resp, consumed) = Response::parse(b"18446744073709551615\r\n").unwrap();
+        assert_eq!(resp, Response::Numeric(u64::MAX));
+        assert_eq!(consumed, 22);
+    }
+
+    #[test]
+    fn test_encode_numeric() {
+        let mut buf = [0u8; 64];
+        let len = Response::numeric(42).encode(&mut buf);
+        assert_eq!(&buf[..len], b"42\r\n");
+    }
+
+    #[test]
+    fn test_encode_numeric_zero() {
+        let mut buf = [0u8; 64];
+        let len = Response::numeric(0).encode(&mut buf);
+        assert_eq!(&buf[..len], b"0\r\n");
+    }
+
+    #[test]
+    fn test_direct_encode_numeric() {
+        let mut buf = [0u8; 64];
+        let len = Response::encode_numeric(&mut buf, 12345);
+        assert_eq!(&buf[..len], b"12345\r\n");
+    }
+
+    #[test]
     fn test_is_error_variants() {
         assert!(Response::Error.is_error());
         assert!(Response::ClientError(b"msg".to_vec()).is_error());
@@ -763,6 +886,8 @@ mod tests {
         assert!(!Response::Deleted.is_error());
         assert!(!Response::NotFound.is_error());
         assert!(!Response::Exists.is_error());
+        assert!(!Response::Ok.is_error());
+        assert!(!Response::Numeric(42).is_error());
         assert!(!Response::Values(vec![]).is_error());
         assert!(!Response::Version(b"1.0".to_vec()).is_error());
     }
@@ -779,12 +904,15 @@ mod tests {
                 key: b"k".to_vec(),
                 flags: 0,
                 data: b"v".to_vec(),
+                cas: None,
             }])
             .is_miss()
         );
         // Other responses are not misses
         assert!(!Response::Stored.is_miss());
         assert!(!Response::Deleted.is_miss());
+        assert!(!Response::Ok.is_miss());
+        assert!(!Response::Numeric(0).is_miss());
         assert!(!Response::Error.is_miss());
     }
 
@@ -861,11 +989,13 @@ mod tests {
                 key: b"k1".to_vec(),
                 flags: 0,
                 data: b"v1".to_vec(),
+                cas: None,
             },
             Value {
                 key: b"k2".to_vec(),
                 flags: 1,
                 data: b"v2".to_vec(),
+                cas: None,
             },
         ]);
         let len = resp.encode(&mut buf);
@@ -953,6 +1083,7 @@ mod tests {
             key: b"k".to_vec(),
             flags: 0,
             data: b"v".to_vec(),
+            cas: None,
         };
         let debug_str = format!("{:?}", v);
         assert!(debug_str.contains("Value"));
@@ -964,6 +1095,7 @@ mod tests {
             key: b"k".to_vec(),
             flags: 42,
             data: b"v".to_vec(),
+            cas: None,
         };
         let v2 = v1.clone();
         assert_eq!(v1, v2);
@@ -1010,5 +1142,63 @@ mod tests {
             result,
             Err(ParseError::Protocol("value data too large"))
         ));
+    }
+
+    #[test]
+    fn test_parse_value_with_cas() {
+        let data = b"VALUE mykey 0 5 12345\r\nhello\r\nEND\r\n";
+        let (resp, consumed) = Response::parse(data).unwrap();
+        assert_eq!(consumed, data.len());
+        match resp {
+            Response::Values(values) => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].key, b"mykey");
+                assert_eq!(values[0].data, b"hello");
+                assert_eq!(values[0].cas, Some(12345));
+            }
+            _ => panic!("expected Values"),
+        }
+    }
+
+    #[test]
+    fn test_parse_value_without_cas() {
+        let data = b"VALUE mykey 0 5\r\nhello\r\nEND\r\n";
+        let (resp, _) = Response::parse(data).unwrap();
+        match resp {
+            Response::Values(values) => {
+                assert_eq!(values[0].cas, None);
+            }
+            _ => panic!("expected Values"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_value_with_cas() {
+        let mut buf = [0u8; 256];
+        let original = Response::Values(vec![Value {
+            key: b"testkey".to_vec(),
+            flags: 0,
+            data: b"testvalue".to_vec(),
+            cas: Some(98765),
+        }]);
+        let len = original.encode(&mut buf);
+        let (parsed, consumed) = Response::parse(&buf[..len]).unwrap();
+        assert_eq!(original, parsed);
+        assert_eq!(len, consumed);
+    }
+
+    #[test]
+    fn test_parse_multi_value_with_cas() {
+        let data = b"VALUE k1 0 2 100\r\nv1\r\nVALUE k2 0 2 200\r\nv2\r\nEND\r\n";
+        let (resp, consumed) = Response::parse(data).unwrap();
+        assert_eq!(consumed, data.len());
+        match resp {
+            Response::Values(values) => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0].cas, Some(100));
+                assert_eq!(values[1].cas, Some(200));
+            }
+            _ => panic!("expected Values"),
+        }
     }
 }

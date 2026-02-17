@@ -1,0 +1,17 @@
+[package]
+name = "krio-memcache"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+ketama = { workspace = true }
+krio = { workspace = true, features = ["tls"] }
+protocol-memcache = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+server = { path = "../../server" }
+segcache = { workspace = true }
+toml = { workspace = true }

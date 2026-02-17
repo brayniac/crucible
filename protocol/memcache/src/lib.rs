@@ -74,7 +74,7 @@ pub use command::{
 };
 pub use error::ParseError;
 #[cfg(feature = "ascii")]
-pub use request::Request;
+pub use request::{AddRequest, ReplaceRequest, Request};
 #[cfg(feature = "ascii")]
 pub use response::{Response, Value};
 #[cfg(feature = "ascii")]

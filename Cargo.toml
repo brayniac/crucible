@@ -13,6 +13,7 @@ members = [
 	"io/http2",
 	"io/krio",
 	"io/krio-redis",
+	"io/krio-memcache",
 
 	# Protocol Implementations
 	"protocol/momento",
@@ -93,6 +94,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # Internal crates
 krio = { path = "io/krio" }
 krio-redis = { path = "io/krio-redis" }
+krio-memcache = { path = "io/krio-memcache" }
 http2 = { path = "io/http2" }
 grpc = { path = "io/grpc" }
 protocol-momento = { path = "protocol/momento" }
