@@ -7,6 +7,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::completion::{OpTag, UserData};
 use crate::driver::Driver;
 use crate::error::{SpawnError, TimerExhausted};
@@ -285,6 +287,21 @@ impl ConnCtx {
     /// The closure must therefore be safe to call multiple times (`FnMut`).
     pub fn with_data<F: FnMut(&[u8]) -> usize>(&self, f: F) -> WithDataFuture<F> {
         WithDataFuture {
+            conn_index: self.conn_index,
+            f: Some(f),
+        }
+    }
+
+    /// Wait until recv data is available, then provide it as zero-copy `Bytes`.
+    ///
+    /// Like [`with_data()`](Self::with_data), but the closure receives a `Bytes`
+    /// handle that can be sliced (O(1), refcounted) instead of copied. The
+    /// closure returns the number of bytes consumed.
+    ///
+    /// This enables zero-copy RESP parsing: the parser can call `bytes.slice()`
+    /// to extract sub-ranges without allocating.
+    pub fn with_bytes<F: FnMut(Bytes) -> usize>(&self, f: F) -> WithBytesFuture<F> {
+        WithBytesFuture {
             conn_index: self.conn_index,
             f: Some(f),
         }
@@ -766,6 +783,78 @@ impl<F: FnMut(&[u8]) -> usize + Unpin> Future for WithDataFuture<F> {
             }
 
             // Connection still open — wait for more data before retrying.
+            executor.recv_waiters[self.conn_index as usize] = true;
+            Poll::Pending
+        })
+    }
+}
+
+// ── WithBytesFuture ──────────────────────────────────────────────────
+
+/// Future returned by [`ConnCtx::with_bytes`].
+pub struct WithBytesFuture<F> {
+    conn_index: u32,
+    f: Option<F>,
+}
+
+impl<F: FnMut(Bytes) -> usize + Unpin> Future for WithBytesFuture<F> {
+    type Output = usize;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+        with_state(|driver, executor| {
+            let data = driver.accumulators.data(self.conn_index);
+            if data.is_empty() {
+                // Check if the connection has been closed — return 0 (EOF).
+                let is_closed = driver
+                    .connections
+                    .get(self.conn_index)
+                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .unwrap_or(true);
+                if is_closed {
+                    let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
+                    let consumed = f(Bytes::new());
+                    self.f.take();
+                    return Poll::Ready(consumed);
+                }
+
+                executor.recv_waiters[self.conn_index as usize] = true;
+                return Poll::Pending;
+            }
+
+            // Detach accumulator as frozen Bytes (O(1)).
+            let frozen = driver.accumulators.take_frozen(self.conn_index);
+            let len = frozen.len();
+
+            let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
+            let consumed = f(frozen.clone());
+
+            if consumed > 0 {
+                // Put back unconsumed remainder (if any).
+                if consumed < len {
+                    driver
+                        .accumulators
+                        .prepend(self.conn_index, &frozen[consumed..]);
+                }
+                self.f.take();
+                return Poll::Ready(consumed);
+            }
+
+            // consumed == 0 on non-empty data: incomplete parse.
+            // Put everything back.
+            driver
+                .accumulators
+                .prepend(self.conn_index, &frozen[..]);
+
+            let is_closed = driver
+                .connections
+                .get(self.conn_index)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                self.f.take();
+                return Poll::Ready(0);
+            }
+
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })

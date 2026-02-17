@@ -7,6 +7,7 @@ edition = "2024"
 tls = ["rustls"]
 
 [dependencies]
+bytes = { workspace = true }
 crossbeam-channel = "0.5"
 io-uring = "0.7"
 libc = "0.2"

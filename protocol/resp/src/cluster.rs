@@ -287,6 +287,8 @@ fn parse_node_info(value: &Value) -> Option<NodeInfo> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
 
     // ====================================================================
@@ -351,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_parse_redirect_moved() {
-        let value = Value::Error(b"MOVED 3999 127.0.0.1:6380".to_vec());
+        let value = Value::Error(Bytes::from_static(b"MOVED 3999 127.0.0.1:6380"));
         let r = parse_redirect(&value).unwrap();
         assert_eq!(r.kind, RedirectKind::Moved);
         assert_eq!(r.slot, 3999);
@@ -360,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_parse_redirect_ask() {
-        let value = Value::Error(b"ASK 100 10.0.0.1:7000".to_vec());
+        let value = Value::Error(Bytes::from_static(b"ASK 100 10.0.0.1:7000"));
         let r = parse_redirect(&value).unwrap();
         assert_eq!(r.kind, RedirectKind::Ask);
         assert_eq!(r.slot, 100);
@@ -369,25 +371,25 @@ mod tests {
 
     #[test]
     fn test_parse_redirect_non_error() {
-        let value = Value::SimpleString(b"OK".to_vec());
+        let value = Value::SimpleString(Bytes::from_static(b"OK"));
         assert!(parse_redirect(&value).is_none());
     }
 
     #[test]
     fn test_parse_redirect_non_redirect_error() {
-        let value = Value::Error(b"ERR unknown command".to_vec());
+        let value = Value::Error(Bytes::from_static(b"ERR unknown command"));
         assert!(parse_redirect(&value).is_none());
     }
 
     #[test]
     fn test_parse_redirect_malformed_missing_address() {
-        let value = Value::Error(b"MOVED 3999".to_vec());
+        let value = Value::Error(Bytes::from_static(b"MOVED 3999"));
         assert!(parse_redirect(&value).is_none());
     }
 
     #[test]
     fn test_parse_redirect_malformed_bad_slot() {
-        let value = Value::Error(b"MOVED abc 127.0.0.1:6380".to_vec());
+        let value = Value::Error(Bytes::from_static(b"MOVED abc 127.0.0.1:6380"));
         assert!(parse_redirect(&value).is_none());
     }
 
@@ -397,11 +399,11 @@ mod tests {
 
     fn make_node(ip: &str, port: i64, node_id: Option<&str>) -> Value {
         let mut arr = vec![
-            Value::BulkString(ip.as_bytes().to_vec()),
+            Value::BulkString(Bytes::copy_from_slice(ip.as_bytes())),
             Value::Integer(port),
         ];
         if let Some(id) = node_id {
-            arr.push(Value::BulkString(id.as_bytes().to_vec()));
+            arr.push(Value::BulkString(Bytes::copy_from_slice(id.as_bytes())));
         }
         Value::Array(arr)
     }
@@ -473,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_slot_map_non_array() {
-        let resp = Value::SimpleString(b"OK".to_vec());
+        let resp = Value::SimpleString(Bytes::from_static(b"OK"));
         assert!(SlotMap::from_cluster_slots(&resp).is_none());
     }
 

@@ -201,7 +201,7 @@ impl Client {
         let encoded = Self::encode_request(&Request::get(key));
         let value = self.execute(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -282,7 +282,7 @@ impl Client {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(ClientError::UnexpectedResponse),
                     }
@@ -448,7 +448,7 @@ impl Client {
         let encoded = Self::encode_request(&Request::cmd(b"HGET").arg(key).arg(field));
         let value = self.execute(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -466,7 +466,7 @@ impl Client {
                     let val = iter.next().ok_or(ClientError::UnexpectedResponse)?;
                     match (field, val) {
                         (Value::BulkString(f), Value::BulkString(v)) => {
-                            result.push((Bytes::from(f), Bytes::from(v)));
+                            result.push((f, v));
                         }
                         _ => return Err(ClientError::UnexpectedResponse),
                     }
@@ -494,7 +494,7 @@ impl Client {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(ClientError::UnexpectedResponse),
                     }
@@ -619,7 +619,7 @@ impl Client {
         let encoded = Self::encode_request(&Request::cmd(b"LPOP").arg(key));
         let value = self.execute(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -630,7 +630,7 @@ impl Client {
         let encoded = Self::encode_request(&Request::cmd(b"RPOP").arg(key));
         let value = self.execute(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -653,7 +653,7 @@ impl Client {
             Self::encode_request(&Request::cmd(b"LINDEX").arg(key).arg(idx_str.as_bytes()));
         let value = self.execute(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -820,7 +820,7 @@ impl Client {
         let encoded = Self::encode_request(&Request::cmd(b"SPOP").arg(key));
         let value = self.execute(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -845,7 +845,7 @@ impl Client {
         let encoded = Self::encode_request(&Request::ping());
         let value = self.execute_unkeyed(encoded).await?;
         match value {
-            Value::SimpleString(ref s) if s == b"PONG" => Ok(()),
+            Value::SimpleString(ref s) if s.as_ref() == b"PONG" => Ok(()),
             Value::SimpleString(_) => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -893,7 +893,7 @@ impl Client {
                     let v = iter.next().ok_or(ClientError::UnexpectedResponse)?;
                     match (k, v) {
                         (Value::BulkString(kk), Value::BulkString(vv)) => {
-                            result.push((Bytes::from(kk), Bytes::from(vv)));
+                            result.push((kk, vv));
                         }
                         _ => return Err(ClientError::UnexpectedResponse),
                     }
@@ -937,7 +937,7 @@ impl Client {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Bytes::from(data)),
+                        Value::BulkString(data) => result.push(data),
                         _ => return Err(ClientError::UnexpectedResponse),
                     }
                 }

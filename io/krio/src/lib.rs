@@ -115,6 +115,8 @@ pub use runtime::io::TimeoutFuture;
 pub use runtime::io::UdpCtx;
 /// Future returned by [`UdpCtx::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
+/// Future that provides received data as zero-copy `Bytes`.
+pub use runtime::io::WithBytesFuture;
 /// Future that provides received data.
 pub use runtime::io::WithDataFuture;
 /// Initiate an outbound TCP connection from any async task.

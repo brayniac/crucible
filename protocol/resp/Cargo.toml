@@ -12,6 +12,9 @@ default = []
 resp3 = ["dep:ryu"]
 
 [dependencies]
+# For zero-copy value slicing
+bytes = { workspace = true }
+
 # For efficient CRLF scanning
 memchr = { workspace = true }
 

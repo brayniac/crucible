@@ -41,6 +41,7 @@ use crate::{Client, Error, parse_bytes_array};
 const MAX_REDIRECTS: usize = 5;
 
 /// Configuration for a cluster client.
+#[derive(Clone)]
 pub struct ClusterConfig {
     /// Initial seed nodes to discover the cluster topology.
     pub seeds: Vec<SocketAddr>,
@@ -409,7 +410,7 @@ impl ClusterClient {
     ) -> Result<Option<Bytes>, Error> {
         let value = self.route_command(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
@@ -519,7 +520,7 @@ impl ClusterClient {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -748,7 +749,7 @@ impl ClusterClient {
                     let val = iter.next().ok_or(Error::UnexpectedResponse)?;
                     match (field, val) {
                         (Value::BulkString(f), Value::BulkString(v)) => {
-                            result.push((Bytes::from(f), Bytes::from(v)));
+                            result.push((f, v));
                         }
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -778,7 +779,7 @@ impl ClusterClient {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -1245,6 +1246,18 @@ impl ClusterClient {
         let key = key.as_ref();
         self.route_command(key, &Client::encode_request(request))
             .await
+    }
+
+    /// Route pre-encoded RESP command bytes to the node owning `key`.
+    ///
+    /// This skips Request construction and encoding — use when you already
+    /// have the raw RESP wire bytes (e.g. proxying from a client).
+    pub async fn route_raw(
+        &mut self,
+        key: &[u8],
+        encoded: &[u8],
+    ) -> Result<Value, Error> {
+        self.route_command(key, encoded).await
     }
 
     /// Get a [`Client`] for a specific node address (for node-level commands

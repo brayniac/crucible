@@ -20,6 +20,7 @@
 //! - Push: `><len>\r\n<elem>...`
 //! - Attribute: `|<len>\r\n<attrs>...<value>`
 
+use bytes::Bytes;
 use crate::error::ParseError;
 use std::io::Write;
 
@@ -149,13 +150,13 @@ impl ParseOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// Simple string: `+OK\r\n`
-    SimpleString(Vec<u8>),
+    SimpleString(Bytes),
     /// Error: `-ERR message\r\n`
-    Error(Vec<u8>),
+    Error(Bytes),
     /// Integer: `:1000\r\n`
     Integer(i64),
     /// Bulk string: `$6\r\nfoobar\r\n`
-    BulkString(Vec<u8>),
+    BulkString(Bytes),
     /// Null value.
     /// RESP2: `$-1\r\n` or `*-1\r\n`
     /// RESP3: `_\r\n`
@@ -175,10 +176,10 @@ pub enum Value {
     /// Big number (arbitrary precision): `(12345678901234567890\r\n`
     /// Stored as the raw decimal string representation.
     #[cfg(feature = "resp3")]
-    BigNumber(Vec<u8>),
+    BigNumber(Bytes),
     /// Bulk error: `!<len>\r\n<error>\r\n`
     #[cfg(feature = "resp3")]
-    BulkError(Vec<u8>),
+    BulkError(Bytes),
     /// Verbatim string: `=<len>\r\ntxt:<data>\r\n`
     /// The format is a 3-byte encoding type (e.g., "txt", "mkd").
     #[cfg(feature = "resp3")]
@@ -186,7 +187,7 @@ pub enum Value {
         /// 3-byte format identifier (e.g., b"txt", b"mkd")
         format: [u8; 3],
         /// The actual data
-        data: Vec<u8>,
+        data: Bytes,
     },
     /// Map: `%<len>\r\n<key><val>...`
     #[cfg(feature = "resp3")]
@@ -215,13 +216,13 @@ impl Value {
     /// Create a simple string value.
     #[inline]
     pub fn simple_string(s: &[u8]) -> Self {
-        Value::SimpleString(s.to_vec())
+        Value::SimpleString(Bytes::copy_from_slice(s))
     }
 
     /// Create an error value.
     #[inline]
     pub fn error(msg: &[u8]) -> Self {
-        Value::Error(msg.to_vec())
+        Value::Error(Bytes::copy_from_slice(msg))
     }
 
     /// Create an integer value.
@@ -233,7 +234,7 @@ impl Value {
     /// Create a bulk string value.
     #[inline]
     pub fn bulk_string(data: &[u8]) -> Self {
-        Value::BulkString(data.to_vec())
+        Value::BulkString(Bytes::copy_from_slice(data))
     }
 
     /// Create a null value.
@@ -268,14 +269,14 @@ impl Value {
     #[cfg(feature = "resp3")]
     #[inline]
     pub fn big_number(num: &[u8]) -> Self {
-        Value::BigNumber(num.to_vec())
+        Value::BigNumber(Bytes::copy_from_slice(num))
     }
 
     /// Create a bulk error value (RESP3).
     #[cfg(feature = "resp3")]
     #[inline]
     pub fn bulk_error(msg: &[u8]) -> Self {
-        Value::BulkError(msg.to_vec())
+        Value::BulkError(Bytes::copy_from_slice(msg))
     }
 
     /// Create a verbatim string value (RESP3).
@@ -284,7 +285,7 @@ impl Value {
     pub fn verbatim_string(format: [u8; 3], data: &[u8]) -> Self {
         Value::VerbatimString {
             format,
-            data: data.to_vec(),
+            data: Bytes::copy_from_slice(data),
         }
     }
 
@@ -556,6 +557,66 @@ impl Value {
         Self::parse_internal(data, options, 0, &mut total_items)
     }
 
+    /// Parse a RESP value zero-copy from a `Bytes` buffer.
+    ///
+    /// String variants (`BulkString`, `SimpleString`, etc.) are returned as
+    /// `Bytes::slice()` references into the input — no allocation or copy.
+    /// Returns the parsed value and the number of bytes consumed.
+    #[inline]
+    pub fn parse_bytes(data: Bytes) -> Result<(Self, usize), ParseError> {
+        Self::parse_bytes_with_options(data, &ParseOptions::default())
+    }
+
+    /// Parse a RESP value zero-copy from a `Bytes` buffer with custom options.
+    pub fn parse_bytes_with_options(
+        data: Bytes,
+        options: &ParseOptions,
+    ) -> Result<(Self, usize), ParseError> {
+        let mut total_items = 0;
+        Self::parse_bytes_internal(&data, options, 0, &mut total_items)
+    }
+
+    /// Internal zero-copy parsing function.
+    fn parse_bytes_internal(
+        data: &Bytes,
+        options: &ParseOptions,
+        depth: usize,
+        total_items: &mut usize,
+    ) -> Result<(Self, usize), ParseError> {
+        if data.is_empty() {
+            return Err(ParseError::Incomplete);
+        }
+
+        match data[0] {
+            b'+' => parse_simple_string_bytes(data),
+            b'-' => parse_error_bytes(data),
+            b':' => parse_integer(&data[..]),
+            b'$' => parse_bulk_string_bytes(data, options),
+            b'*' => parse_array_bytes(data, options, depth, total_items),
+            #[cfg(feature = "resp3")]
+            b'_' => parse_null(&data[..]),
+            #[cfg(feature = "resp3")]
+            b'#' => parse_boolean(&data[..]),
+            #[cfg(feature = "resp3")]
+            b',' => parse_double(&data[..]),
+            #[cfg(feature = "resp3")]
+            b'(' => parse_big_number_bytes(data),
+            #[cfg(feature = "resp3")]
+            b'!' => parse_bulk_error_bytes(data, options),
+            #[cfg(feature = "resp3")]
+            b'=' => parse_verbatim_string_bytes(data, options),
+            #[cfg(feature = "resp3")]
+            b'%' => parse_map_bytes(data, options, depth, total_items),
+            #[cfg(feature = "resp3")]
+            b'~' => parse_set_bytes(data, options, depth, total_items),
+            #[cfg(feature = "resp3")]
+            b'>' => parse_push_bytes(data, options, depth, total_items),
+            #[cfg(feature = "resp3")]
+            b'|' => parse_attribute_bytes(data, options, depth, total_items),
+            other => Err(ParseError::InvalidPrefix(other)),
+        }
+    }
+
     /// Internal parsing function that tracks nesting depth and total items.
     fn parse_internal(
         data: &[u8],
@@ -745,14 +806,14 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
 /// Parse a simple string: +OK\r\n
 fn parse_simple_string(data: &[u8]) -> Result<(Value, usize), ParseError> {
     let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
-    let content = data[1..end].to_vec();
+    let content = Bytes::copy_from_slice(&data[1..end]);
     Ok((Value::SimpleString(content), end + 2))
 }
 
 /// Parse an error: -ERR message\r\n
 fn parse_error(data: &[u8]) -> Result<(Value, usize), ParseError> {
     let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
-    let content = data[1..end].to_vec();
+    let content = Bytes::copy_from_slice(&data[1..end]);
     Ok((Value::Error(content), end + 2))
 }
 
@@ -803,7 +864,7 @@ fn parse_bulk_string(data: &[u8], options: &ParseOptions) -> Result<(Value, usiz
         return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
     }
 
-    let content = data[data_start..data_end].to_vec();
+    let content = Bytes::copy_from_slice(&data[data_start..data_end]);
     Ok((Value::BulkString(content), total_end))
 }
 
@@ -857,6 +918,435 @@ fn parse_array(
     }
 
     Ok((Value::Array(elements), pos))
+}
+
+// ============================================================================
+// Zero-copy (Bytes) parsing helpers
+// ============================================================================
+
+/// Parse a simple string zero-copy: +OK\r\n
+fn parse_simple_string_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let content = data.slice(1..end);
+    Ok((Value::SimpleString(content), end + 2))
+}
+
+/// Parse an error zero-copy: -ERR message\r\n
+fn parse_error_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let content = data.slice(1..end);
+    Ok((Value::Error(content), end + 2))
+}
+
+/// Parse a bulk string zero-copy: $6\r\nfoobar\r\n or $-1\r\n
+fn parse_bulk_string_bytes(data: &Bytes, options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: i64 = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len < 0 {
+        return Ok((Value::Null, len_end + 2));
+    }
+
+    let len = len as usize;
+    if len > options.max_bulk_string_len {
+        return Err(ParseError::Protocol("bulk string too large".to_string()));
+    }
+
+    let data_start = len_end + 2;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let total_end = data_end
+        .checked_add(2)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+
+    if data.len() < total_end {
+        return Err(ParseError::Incomplete);
+    }
+
+    if data[data_end] != b'\r' || data[data_end + 1] != b'\n' {
+        return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
+    }
+
+    let content = data.slice(data_start..data_end);
+    Ok((Value::BulkString(content), total_end))
+}
+
+/// Parse an array zero-copy: *2\r\n...
+fn parse_array_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<(Value, usize), ParseError> {
+    if depth >= options.max_depth {
+        return Err(ParseError::NestingTooDeep(depth));
+    }
+
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: i64 = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len < 0 {
+        return Ok((Value::Null, len_end + 2));
+    }
+
+    let len = len as usize;
+    if len > options.max_collection_elements {
+        return Err(ParseError::CollectionTooLarge(len));
+    }
+
+    *total_items = total_items
+        .checked_add(len)
+        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+    if *total_items > options.max_total_items {
+        return Err(ParseError::CollectionTooLarge(*total_items));
+    }
+
+    let mut pos = len_end + 2;
+    let mut elements = Vec::with_capacity(len);
+
+    for _ in 0..len {
+        if pos >= data.len() {
+            return Err(ParseError::Incomplete);
+        }
+        let sub = data.slice(pos..);
+        let (value, consumed) =
+            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        elements.push(value);
+        pos += consumed;
+    }
+
+    Ok((Value::Array(elements), pos))
+}
+
+/// Parse RESP3 big number zero-copy: (12345678901234567890\r\n
+#[cfg(feature = "resp3")]
+fn parse_big_number_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let content = data.slice(1..end);
+    Ok((Value::BigNumber(content), end + 2))
+}
+
+/// Parse RESP3 bulk error zero-copy: !<len>\r\n<error>\r\n
+#[cfg(feature = "resp3")]
+fn parse_bulk_error_bytes(data: &Bytes, options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len > options.max_bulk_string_len {
+        return Err(ParseError::Protocol("bulk error too large".to_string()));
+    }
+
+    let data_start = len_end + 2;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let total_end = data_end
+        .checked_add(2)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+
+    if data.len() < total_end {
+        return Err(ParseError::Incomplete);
+    }
+
+    if data[data_end] != b'\r' || data[data_end + 1] != b'\n' {
+        return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
+    }
+
+    let content = data.slice(data_start..data_end);
+    Ok((Value::BulkError(content), total_end))
+}
+
+/// Parse RESP3 verbatim string zero-copy: =<len>\r\ntxt:<data>\r\n
+#[cfg(feature = "resp3")]
+fn parse_verbatim_string_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+) -> Result<(Value, usize), ParseError> {
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len > options.max_bulk_string_len {
+        return Err(ParseError::Protocol(
+            "verbatim string too large".to_string(),
+        ));
+    }
+
+    let data_start = len_end + 2;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let total_end = data_end
+        .checked_add(2)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+
+    if data.len() < total_end {
+        return Err(ParseError::Incomplete);
+    }
+
+    if len < 4 || data[data_start + 3] != b':' {
+        return Err(ParseError::InvalidVerbatimFormat);
+    }
+
+    if data[data_end] != b'\r' || data[data_end + 1] != b'\n' {
+        return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
+    }
+
+    let format: [u8; 3] = data[data_start..data_start + 3]
+        .try_into()
+        .map_err(|_| ParseError::InvalidVerbatimFormat)?;
+    let content = data.slice(data_start + 4..data_end);
+
+    Ok((
+        Value::VerbatimString {
+            format,
+            data: content,
+        },
+        total_end,
+    ))
+}
+
+/// Parse RESP3 map zero-copy: %<len>\r\n<key><val>...
+#[cfg(feature = "resp3")]
+fn parse_map_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<(Value, usize), ParseError> {
+    if depth >= options.max_depth {
+        return Err(ParseError::NestingTooDeep(depth));
+    }
+
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len > options.max_collection_elements {
+        return Err(ParseError::CollectionTooLarge(len));
+    }
+
+    let items_to_add = len
+        .checked_mul(2)
+        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+    *total_items = total_items
+        .checked_add(items_to_add)
+        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+    if *total_items > options.max_total_items {
+        return Err(ParseError::CollectionTooLarge(*total_items));
+    }
+
+    let mut pos = len_end + 2;
+    let mut entries = Vec::with_capacity(len);
+
+    for _ in 0..len {
+        if pos >= data.len() {
+            return Err(ParseError::Incomplete);
+        }
+        let sub = data.slice(pos..);
+        let (key, key_consumed) =
+            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        pos += key_consumed;
+
+        if pos >= data.len() {
+            return Err(ParseError::Incomplete);
+        }
+        let sub = data.slice(pos..);
+        let (value, val_consumed) =
+            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        pos += val_consumed;
+
+        entries.push((key, value));
+    }
+
+    Ok((Value::Map(entries), pos))
+}
+
+/// Parse RESP3 set zero-copy: ~<len>\r\n<elem>...
+#[cfg(feature = "resp3")]
+fn parse_set_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<(Value, usize), ParseError> {
+    if depth >= options.max_depth {
+        return Err(ParseError::NestingTooDeep(depth));
+    }
+
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len > options.max_collection_elements {
+        return Err(ParseError::CollectionTooLarge(len));
+    }
+
+    *total_items = total_items
+        .checked_add(len)
+        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+    if *total_items > options.max_total_items {
+        return Err(ParseError::CollectionTooLarge(*total_items));
+    }
+
+    let mut pos = len_end + 2;
+    let mut elements = Vec::with_capacity(len);
+
+    for _ in 0..len {
+        if pos >= data.len() {
+            return Err(ParseError::Incomplete);
+        }
+        let sub = data.slice(pos..);
+        let (value, consumed) =
+            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        elements.push(value);
+        pos += consumed;
+    }
+
+    Ok((Value::Set(elements), pos))
+}
+
+/// Parse RESP3 push message zero-copy: ><len>\r\n<elem>...
+#[cfg(feature = "resp3")]
+fn parse_push_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<(Value, usize), ParseError> {
+    if depth >= options.max_depth {
+        return Err(ParseError::NestingTooDeep(depth));
+    }
+
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len > options.max_collection_elements {
+        return Err(ParseError::CollectionTooLarge(len));
+    }
+
+    *total_items = total_items
+        .checked_add(len)
+        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+    if *total_items > options.max_total_items {
+        return Err(ParseError::CollectionTooLarge(*total_items));
+    }
+
+    let mut pos = len_end + 2;
+    let mut elements = Vec::with_capacity(len);
+
+    for _ in 0..len {
+        if pos >= data.len() {
+            return Err(ParseError::Incomplete);
+        }
+        let sub = data.slice(pos..);
+        let (value, consumed) =
+            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        elements.push(value);
+        pos += consumed;
+    }
+
+    Ok((Value::Push(elements), pos))
+}
+
+/// Parse RESP3 attribute zero-copy: |<len>\r\n<attrs>...<value>
+#[cfg(feature = "resp3")]
+fn parse_attribute_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<(Value, usize), ParseError> {
+    if depth >= options.max_depth {
+        return Err(ParseError::NestingTooDeep(depth));
+    }
+
+    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..len_end])
+        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+
+    if len > options.max_collection_elements {
+        return Err(ParseError::CollectionTooLarge(len));
+    }
+
+    let items_to_add = len
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+    *total_items = total_items
+        .checked_add(items_to_add)
+        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+    if *total_items > options.max_total_items {
+        return Err(ParseError::CollectionTooLarge(*total_items));
+    }
+
+    let mut pos = len_end + 2;
+    let mut attrs = Vec::with_capacity(len);
+
+    for _ in 0..len {
+        if pos >= data.len() {
+            return Err(ParseError::Incomplete);
+        }
+        let sub = data.slice(pos..);
+        let (key, key_consumed) =
+            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        pos += key_consumed;
+
+        if pos >= data.len() {
+            return Err(ParseError::Incomplete);
+        }
+        let sub = data.slice(pos..);
+        let (val, val_consumed) =
+            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        pos += val_consumed;
+
+        attrs.push((key, val));
+    }
+
+    if pos >= data.len() {
+        return Err(ParseError::Incomplete);
+    }
+    let sub = data.slice(pos..);
+    let (value, val_consumed) =
+        Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+    pos += val_consumed;
+
+    Ok((
+        Value::Attribute {
+            attrs,
+            value: Box::new(value),
+        },
+        pos,
+    ))
 }
 
 // ============================================================================
@@ -979,7 +1469,7 @@ fn parse_double(data: &[u8]) -> Result<(Value, usize), ParseError> {
 #[cfg(feature = "resp3")]
 fn parse_big_number(data: &[u8]) -> Result<(Value, usize), ParseError> {
     let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
-    let content = data[1..end].to_vec();
+    let content = Bytes::copy_from_slice(&data[1..end]);
     Ok((Value::BigNumber(content), end + 2))
 }
 
@@ -1013,7 +1503,7 @@ fn parse_bulk_error(data: &[u8], options: &ParseOptions) -> Result<(Value, usize
         return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
     }
 
-    let content = data[data_start..data_end].to_vec();
+    let content = Bytes::copy_from_slice(&data[data_start..data_end]);
     Ok((Value::BulkError(content), total_end))
 }
 
@@ -1060,7 +1550,7 @@ fn parse_verbatim_string(
     let format: [u8; 3] = data[data_start..data_start + 3]
         .try_into()
         .map_err(|_| ParseError::InvalidVerbatimFormat)?;
-    let content = data[data_start + 4..data_end].to_vec();
+    let content = Bytes::copy_from_slice(&data[data_start + 4..data_end]);
 
     Ok((
         Value::VerbatimString {
@@ -1497,14 +1987,14 @@ mod tests {
     #[test]
     fn test_parse_simple_string() {
         let (value, consumed) = Value::parse(b"+OK\r\n").unwrap();
-        assert_eq!(value, Value::SimpleString(b"OK".to_vec()));
+        assert_eq!(value, Value::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(consumed, 5);
     }
 
     #[test]
     fn test_parse_error() {
         let (value, consumed) = Value::parse(b"-ERR unknown command\r\n").unwrap();
-        assert_eq!(value, Value::Error(b"ERR unknown command".to_vec()));
+        assert_eq!(value, Value::Error(Bytes::from_static(b"ERR unknown command")));
         assert_eq!(consumed, 22);
     }
 
@@ -1521,7 +2011,7 @@ mod tests {
     #[test]
     fn test_parse_bulk_string() {
         let (value, consumed) = Value::parse(b"$6\r\nfoobar\r\n").unwrap();
-        assert_eq!(value, Value::BulkString(b"foobar".to_vec()));
+        assert_eq!(value, Value::BulkString(Bytes::from_static(b"foobar")));
         assert_eq!(consumed, 12);
     }
 
@@ -1538,8 +2028,8 @@ mod tests {
         assert_eq!(
             value,
             Value::Array(vec![
-                Value::BulkString(b"foo".to_vec()),
-                Value::BulkString(b"bar".to_vec()),
+                Value::BulkString(Bytes::from_static(b"foo")),
+                Value::BulkString(Bytes::from_static(b"bar")),
             ])
         );
         assert_eq!(consumed, 22);
@@ -1853,7 +2343,7 @@ mod tests {
     #[test]
     fn test_empty_bulk_string() {
         let (value, consumed) = Value::parse(b"$0\r\n\r\n").unwrap();
-        assert_eq!(value, Value::BulkString(vec![]));
+        assert_eq!(value, Value::BulkString(Bytes::new()));
         assert_eq!(consumed, 6);
     }
 
@@ -1861,7 +2351,7 @@ mod tests {
     fn test_binary_bulk_string() {
         // Bulk string with binary data including null bytes
         let (value, _) = Value::parse(b"$5\r\n\x00\x01\x02\x03\x04\r\n").unwrap();
-        assert_eq!(value, Value::BulkString(vec![0, 1, 2, 3, 4]));
+        assert_eq!(value, Value::BulkString(Bytes::from_static(&[0, 1, 2, 3, 4])));
     }
 
     // ========================================================================
@@ -1918,14 +2408,14 @@ mod tests {
         #[test]
         fn test_parse_big_number() {
             let (value, consumed) = Value::parse(b"(12345678901234567890\r\n").unwrap();
-            assert_eq!(value, Value::BigNumber(b"12345678901234567890".to_vec()));
+            assert_eq!(value, Value::BigNumber(Bytes::from_static(b"12345678901234567890")));
             assert_eq!(consumed, 23);
         }
 
         #[test]
         fn test_parse_bulk_error() {
             let (value, consumed) = Value::parse(b"!21\r\nSYNTAX invalid syntax\r\n").unwrap();
-            assert_eq!(value, Value::BulkError(b"SYNTAX invalid syntax".to_vec()));
+            assert_eq!(value, Value::BulkError(Bytes::from_static(b"SYNTAX invalid syntax")));
             assert_eq!(consumed, 28);
         }
 
@@ -1936,7 +2426,7 @@ mod tests {
                 value,
                 Value::VerbatimString {
                     format: *b"txt",
-                    data: b"Hello World".to_vec(),
+                    data: Bytes::from_static(b"Hello World"),
                 }
             );
             assert_eq!(consumed, 22);
@@ -1951,8 +2441,8 @@ mod tests {
             assert_eq!(
                 value,
                 Value::Map(vec![
-                    (Value::SimpleString(b"first".to_vec()), Value::Integer(1)),
-                    (Value::SimpleString(b"second".to_vec()), Value::Integer(2)),
+                    (Value::SimpleString(Bytes::from_static(b"first")), Value::Integer(1)),
+                    (Value::SimpleString(Bytes::from_static(b"second")), Value::Integer(2)),
                 ])
             );
             assert_eq!(consumed, 29);
@@ -1979,8 +2469,8 @@ mod tests {
             assert_eq!(
                 value,
                 Value::Push(vec![
-                    Value::SimpleString(b"message".to_vec()),
-                    Value::SimpleString(b"hello".to_vec()),
+                    Value::SimpleString(Bytes::from_static(b"message")),
+                    Value::SimpleString(Bytes::from_static(b"hello")),
                 ])
             );
             assert_eq!(consumed, 22);
@@ -1995,10 +2485,10 @@ mod tests {
                 value,
                 Value::Attribute {
                     attrs: vec![(
-                        Value::SimpleString(b"key".to_vec()),
-                        Value::SimpleString(b"value".to_vec())
+                        Value::SimpleString(Bytes::from_static(b"key")),
+                        Value::SimpleString(Bytes::from_static(b"value"))
                     )],
-                    value: Box::new(Value::SimpleString(b"actual".to_vec())),
+                    value: Box::new(Value::SimpleString(Bytes::from_static(b"actual"))),
                 }
             );
             assert_eq!(consumed, 27);

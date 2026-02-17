@@ -234,7 +234,7 @@ impl ShardedClient {
     ) -> Result<Option<Bytes>, Error> {
         let value = self.route_command(key, encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
+            Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
@@ -344,7 +344,7 @@ impl ShardedClient {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -573,7 +573,7 @@ impl ShardedClient {
                     let val = iter.next().ok_or(Error::UnexpectedResponse)?;
                     match (field, val) {
                         (Value::BulkString(f), Value::BulkString(v)) => {
-                            result.push((Bytes::from(f), Bytes::from(v)));
+                            result.push((f, v));
                         }
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -603,7 +603,7 @@ impl ShardedClient {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
+                        Value::BulkString(data) => result.push(Some(data)),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
