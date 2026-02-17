@@ -1,4 +1,4 @@
-//! Integration tests for krio-client.
+//! Integration tests for krio-redis.
 //!
 //! Each test starts a real crucible-server, launches krio in client-only mode
 //! via `on_start()`, runs commands, asserts results, and shuts down.
@@ -114,13 +114,13 @@ static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run an async test function inside krio's on_start().
 ///
-/// The test function receives a connected `krio_client::Client` and should
+/// The test function receives a connected `krio_redis::Client` and should
 /// return `Ok(())` on success. Errors are captured and reported.
 fn run_client_test<F>(test_fn: F)
 where
     F: FnOnce(
-            krio_client::Client,
-        ) -> Pin<Box<dyn Future<Output = Result<(), krio_client::Error>> + 'static>>
+            krio_redis::Client,
+        ) -> Pin<Box<dyn Future<Output = Result<(), krio_redis::Error>> + 'static>>
         + Send
         + 'static,
 {
@@ -132,9 +132,9 @@ where
 
     type TestFn = Box<
         dyn FnOnce(
-                krio_client::Client,
+                krio_redis::Client,
             )
-                -> Pin<Box<dyn Future<Output = Result<(), krio_client::Error>> + 'static>>
+                -> Pin<Box<dyn Future<Output = Result<(), krio_redis::Error>> + 'static>>
             + Send,
     >;
     type TestState = Option<(
@@ -161,7 +161,7 @@ where
                 let result = match krio::connect(addr) {
                     Ok(fut) => match fut.await {
                         Ok(conn) => {
-                            let client = krio_client::Client::new(conn);
+                            let client = krio_redis::Client::new(conn);
                             test_fn(client).await.map_err(|e| e.to_string())
                         }
                         Err(e) => Err(format!("connect failed: {e}")),
@@ -180,6 +180,77 @@ where
 
     let (_shutdown, handles) = KrioBuilder::new(krio_config())
         .launch_async::<Handler>()
+        .expect("krio launch failed");
+
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("test failed: {e}"),
+        Err(_) => panic!("test timed out"),
+    }
+}
+
+/// Run an async test function inside krio's on_start(), passing the server
+/// address so the test can create its own connections or pools.
+fn run_pool_test<F>(test_fn: F)
+where
+    F: FnOnce(SocketAddr) -> Pin<Box<dyn Future<Output = Result<(), krio_redis::Error>> + 'static>>
+        + Send
+        + 'static,
+{
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let addr = server_addr();
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    type TestFn = Box<
+        dyn FnOnce(
+                SocketAddr,
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), krio_redis::Error>> + 'static>>
+            + Send,
+    >;
+    type TestState = Option<(
+        std::sync::mpsc::Sender<Result<(), String>>,
+        SocketAddr,
+        TestFn,
+    )>;
+
+    use std::sync::Mutex;
+    static NEXT_POOL_TEST: Mutex<TestState> = Mutex::new(None);
+
+    *NEXT_POOL_TEST.lock().unwrap() = Some((tx, addr, Box::new(test_fn)));
+
+    struct PoolHandler;
+
+    impl AsyncEventHandler for PoolHandler {
+        fn on_accept(&self, _conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+            Box::pin(async {})
+        }
+
+        fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+            let (tx, addr, test_fn) = NEXT_POOL_TEST
+                .lock()
+                .unwrap()
+                .take()
+                .expect("no test state");
+            Some(Box::pin(async move {
+                let result = test_fn(addr).await.map_err(|e| e.to_string());
+                let _ = tx.send(result);
+                krio::request_shutdown();
+            }))
+        }
+
+        fn create_for_worker(_id: usize) -> Self {
+            PoolHandler
+        }
+    }
+
+    let (_shutdown, handles) = KrioBuilder::new(krio_config())
+        .launch_async::<PoolHandler>()
         .expect("krio launch failed");
 
     for h in handles {
@@ -379,7 +450,7 @@ fn test_connection_closed() {
             // Connect a second time, close it, and try to read
             let addr = server_addr();
             let conn2 = krio::connect(addr).unwrap().await.unwrap();
-            let client2 = krio_client::Client::new(conn2);
+            let client2 = krio_redis::Client::new(conn2);
 
             // Verify it works
             client2.ping().await?;
@@ -390,10 +461,126 @@ fn test_connection_closed() {
             // Next command should fail with ConnectionClosed
             let result = client2.ping().await;
             assert!(
-                matches!(result, Err(krio_client::Error::ConnectionClosed)),
+                matches!(result, Err(krio_redis::Error::ConnectionClosed)),
                 "expected ConnectionClosed, got: {result:?}"
             );
 
+            Ok(())
+        })
+    });
+}
+
+// ── Pool tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_pool_basic() {
+    run_pool_test(|addr| {
+        Box::pin(async move {
+            let mut pool = krio_redis::Pool::new(krio_redis::PoolConfig {
+                addr,
+                pool_size: 2,
+                connect_timeout_ms: 0,
+            });
+
+            pool.connect_all().await?;
+            assert_eq!(pool.connected_count(), 2);
+            assert_eq!(pool.pool_size(), 2);
+
+            // Set via one client(), get via another (round-robin).
+            pool.client().await?.set("kc:pool:k1", "v1").await?;
+            let val = pool.client().await?.get("kc:pool:k1").await?;
+            assert_eq!(val.as_deref(), Some(b"v1".as_ref()));
+
+            pool.close_all();
+            assert_eq!(pool.connected_count(), 0);
+
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn test_pool_lazy_connect() {
+    run_pool_test(|addr| {
+        Box::pin(async move {
+            let mut pool = krio_redis::Pool::new(krio_redis::PoolConfig {
+                addr,
+                pool_size: 2,
+                connect_timeout_ms: 0,
+            });
+
+            // No connect_all — starts fully disconnected.
+            assert_eq!(pool.connected_count(), 0);
+
+            // First client() triggers a lazy connect.
+            pool.client().await?.ping().await?;
+            assert_eq!(pool.connected_count(), 1);
+
+            // Second call connects a different slot.
+            pool.client().await?.ping().await?;
+            assert_eq!(pool.connected_count(), 2);
+
+            pool.close_all();
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn test_pool_reconnect() {
+    run_pool_test(|addr| {
+        Box::pin(async move {
+            let mut pool = krio_redis::Pool::new(krio_redis::PoolConfig {
+                addr,
+                pool_size: 2,
+                connect_timeout_ms: 0,
+            });
+            pool.connect_all().await?;
+
+            // Get a client and mark it disconnected.
+            let client = pool.client().await?;
+            client.ping().await?;
+            pool.mark_disconnected(client);
+            assert_eq!(pool.connected_count(), 1);
+
+            // Next client() call should lazily reconnect the dead slot.
+            // We call client() twice to hit both slots (round-robin).
+            pool.client().await?.ping().await?;
+            pool.client().await?.ping().await?;
+            assert_eq!(pool.connected_count(), 2);
+
+            pool.close_all();
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn test_pool_pipeline() {
+    run_pool_test(|addr| {
+        Box::pin(async move {
+            let mut pool = krio_redis::Pool::new(krio_redis::PoolConfig {
+                addr,
+                pool_size: 1,
+                connect_timeout_ms: 0,
+            });
+            pool.connect_all().await?;
+
+            let results = pool
+                .pipeline()
+                .await?
+                .set(b"kc:pp:k1", b"v1")
+                .set(b"kc:pp:k2", b"v2")
+                .get(b"kc:pp:k1")
+                .execute()
+                .await?;
+
+            assert_eq!(results.len(), 3);
+            assert!(results[0].is_simple_string());
+            assert!(results[1].is_simple_string());
+            assert_eq!(results[2].as_bytes(), Some(b"v1".as_ref()));
+
+            pool.close_all();
             Ok(())
         })
     });

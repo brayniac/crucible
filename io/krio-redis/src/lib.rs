@@ -12,9 +12,9 @@
 //!
 //! ```no_run
 //! use krio::ConnCtx;
-//! use krio_client::Client;
+//! use krio_redis::Client;
 //!
-//! async fn example(conn: ConnCtx) -> Result<(), krio_client::Error> {
+//! async fn example(conn: ConnCtx) -> Result<(), krio_redis::Error> {
 //!     let client = Client::new(conn);
 //!     client.set("hello", "world").await?;
 //!     let val = client.get("hello").await?;
@@ -22,6 +22,9 @@
 //!     Ok(())
 //! }
 //! ```
+
+pub mod pool;
+pub use pool::{Pool, PoolConfig};
 
 use std::io;
 
@@ -53,6 +56,10 @@ pub enum Error {
     /// I/O error during send.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+
+    /// All connections in the pool are down and reconnection failed.
+    #[error("all connections failed")]
+    AllConnectionsFailed,
 }
 
 // ── Client ──────────────────────────────────────────────────────────────
@@ -70,6 +77,11 @@ impl Client {
     /// Create a new client wrapping an established connection.
     pub fn new(conn: ConnCtx) -> Self {
         Self { conn }
+    }
+
+    /// Returns the underlying connection context.
+    pub fn conn(&self) -> ConnCtx {
+        self.conn
     }
 
     /// Read and parse a single RESP value from the connection.
@@ -876,8 +888,8 @@ impl Client {
 ///
 /// ```no_run
 /// # use krio::ConnCtx;
-/// # use krio_client::Client;
-/// # async fn example(conn: ConnCtx) -> Result<(), krio_client::Error> {
+/// # use krio_redis::Client;
+/// # async fn example(conn: ConnCtx) -> Result<(), krio_redis::Error> {
 /// let client = Client::new(conn);
 /// let results = client.pipeline()
 ///     .set(b"k1", b"v1")
