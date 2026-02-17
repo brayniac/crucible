@@ -14,8 +14,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use krio::{AsyncEventHandler, Config, ConnCtx, KrioBuilder};
