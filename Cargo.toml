@@ -14,6 +14,8 @@ members = [
 	"io/krio",
 	"io/krio-redis",
 	"io/krio-memcache",
+	"io/krio-quic",
+	"io/http3",
 
 	# Protocol Implementations
 	"protocol/momento",
@@ -76,8 +78,11 @@ memmap2 = "0.9"
 metriken = "0.7"
 num_cpus = "1.16"
 parking_lot = "0.12"
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 rand = "0.9"
+rcgen = "0.13"
 rustls = { version = "0.23", default-features = false }
+rustls-pki-types = "1"
 ryu = "1.0"
 serde = "1"
 slab = "0.4"
@@ -95,7 +100,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 krio = { path = "io/krio" }
 krio-redis = { path = "io/krio-redis" }
 krio-memcache = { path = "io/krio-memcache" }
+krio-quic = { path = "io/krio-quic" }
 http2 = { path = "io/http2" }
+http3 = { path = "io/http3" }
 grpc = { path = "io/grpc" }
 protocol-momento = { path = "protocol/momento" }
 protocol-ping = { path = "protocol/ping" }
