@@ -76,6 +76,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
+        // Spawn on_start task (client-only entry point).
+        if let Some(future) = self.handler.on_start()
+            && let Some(idx) = self.executor.standalone_slab.spawn(future)
+        {
+            self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        }
+
         loop {
             // Arm a tick timeout before blocking.
             if !self.driver.tick_timeout_armed

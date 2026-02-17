@@ -57,6 +57,19 @@ pub trait AsyncEventHandler: Send + 'static {
     /// Eventfd notification (synchronous).
     fn on_notify(&mut self, _ctx: &mut DriverCtx<'_>) {}
 
+    /// Async entry point called once during worker startup.
+    ///
+    /// Return `Some(future)` to spawn a standalone task that runs before the
+    /// event loop begins accepting connections. This is useful for client-only
+    /// applications (no `.bind()`) that need to initiate outbound connections
+    /// via [`connect()`](crate::connect).
+    ///
+    /// The future can call [`request_shutdown()`](crate::request_shutdown) to
+    /// stop the worker when done. Return `None` (the default) to skip.
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        None
+    }
+
     /// Create per-worker instance.
     fn create_for_worker(worker_id: usize) -> Self
     where

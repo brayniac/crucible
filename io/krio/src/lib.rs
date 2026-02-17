@@ -117,6 +117,12 @@ pub use runtime::io::UdpCtx;
 pub use runtime::io::UdpRecvFuture;
 /// Future that provides received data.
 pub use runtime::io::WithDataFuture;
+/// Initiate an outbound TCP connection from any async task.
+pub use runtime::io::connect;
+/// Initiate an outbound TCP connection with a timeout from any async task.
+pub use runtime::io::connect_with_timeout;
+/// Request graceful shutdown from any async task.
+pub use runtime::io::request_shutdown;
 /// Create a future that completes after a duration.
 pub use runtime::io::sleep;
 /// Create a future that completes at an absolute deadline.

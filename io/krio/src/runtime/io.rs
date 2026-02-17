@@ -113,6 +113,73 @@ impl TaskId {
     }
 }
 
+/// Initiate an outbound TCP connection from any async task (connection or standalone).
+///
+/// This is the free-function equivalent of [`ConnCtx::connect()`] — it can be
+/// called from standalone tasks spawned via [`spawn()`] or from an
+/// [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start) future,
+/// where no `ConnCtx` is available.
+///
+/// Returns a [`ConnectFuture`] that resolves with a [`ConnCtx`] for the new connection.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn connect(addr: SocketAddr) -> io::Result<ConnectFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let token = ctx
+            .connect(addr)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+        executor.owner_task[token.index as usize] = Some(calling_task);
+        executor.connect_waiters[token.index as usize] = true;
+        Ok(ConnectFuture {
+            conn_index: token.index,
+            generation: token.generation,
+        })
+    })
+}
+
+/// Initiate an outbound TCP connection with a timeout from any async task.
+///
+/// Free-function equivalent of [`ConnCtx::connect_with_timeout()`].
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn connect_with_timeout(addr: SocketAddr, timeout_ms: u64) -> io::Result<ConnectFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let token = ctx
+            .connect_with_timeout(addr, timeout_ms)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+        executor.owner_task[token.index as usize] = Some(calling_task);
+        executor.connect_waiters[token.index as usize] = true;
+        Ok(ConnectFuture {
+            conn_index: token.index,
+            generation: token.generation,
+        })
+    })
+}
+
+/// Request graceful shutdown of the worker event loop from any async task.
+///
+/// This is the free-function equivalent of [`ConnCtx::request_shutdown()`] —
+/// it can be called from standalone tasks or [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start)
+/// futures where no `ConnCtx` is available.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn request_shutdown() {
+    with_state(|driver, _| {
+        let mut ctx = driver.make_ctx();
+        ctx.request_shutdown();
+    })
+}
+
 /// The async equivalent of `ConnToken` + `DriverCtx`. Passed to the
 /// connection's async fn, provides I/O methods.
 ///

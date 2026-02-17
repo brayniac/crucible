@@ -2856,3 +2856,340 @@ fn async_udp_echo() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Free connect() + on_start() tests
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Standalone task using free connect() ─────────────────────────
+
+/// Handler where on_accept spawns a standalone task that uses the free
+/// krio::connect() (not ConnCtx::connect) to reach a backend echo server.
+struct StandaloneConnectHandler;
+
+static STANDALONE_CONNECT_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for StandaloneConnectHandler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        let backend_addr = *STANDALONE_CONNECT_BACKEND
+            .get()
+            .expect("backend addr not set");
+        Box::pin(async move {
+            // Wait for trigger from client.
+            let n = client.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            // Spawn a standalone task that connects to the backend.
+            // ConnCtx is Copy — standalone tasks can use it for send().
+            krio::spawn(async move {
+                let backend = match krio::connect(backend_addr) {
+                    Ok(fut) => match fut.await {
+                        Ok(ctx) => ctx,
+                        Err(e) => {
+                            let _ = client.send(format!("CONNECT_ERR:{e}").as_bytes());
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let _ = client.send(format!("SUBMIT_ERR:{e}").as_bytes());
+                        return;
+                    }
+                };
+
+                // Send data to backend, read echo.
+                if backend.send(b"STANDALONE").is_err() {
+                    return;
+                }
+
+                let mut echo = Vec::new();
+                while echo.len() < 10 {
+                    let remaining = 10 - echo.len();
+                    let got = backend
+                        .with_data(|data| {
+                            let take = data.len().min(remaining);
+                            echo.extend_from_slice(&data[..take]);
+                            take
+                        })
+                        .await;
+                    if got == 0 {
+                        break;
+                    }
+                }
+
+                // Report to client.
+                let _ = client.send(&echo);
+            });
+
+            // Keep connection alive so standalone task can send.
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        StandaloneConnectHandler
+    }
+}
+
+#[test]
+fn async_standalone_connect() {
+    // Start backend echo server.
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+    let (b_shutdown, b_handles) = KrioBuilder::new(test_config())
+        .bind(&backend_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend launch failed");
+    wait_for_server(&backend_addr);
+
+    STANDALONE_CONNECT_BACKEND
+        .set(backend_addr.parse().unwrap())
+        .ok();
+
+    // Start the handler server.
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<StandaloneConnectHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if total >= 10 {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let result = std::str::from_utf8(&buf[..total]).unwrap();
+    assert_eq!(
+        result, "STANDALONE",
+        "expected STANDALONE echo, got: {result}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    b_shutdown.shutdown();
+    for h in b_handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Client-only mode via on_start() ─────────────────────────────
+
+/// Handler that uses on_start() for client-only mode: connects to a
+/// backend, sends data, reads echo, then shuts down.
+struct OnStartClientHandler;
+
+static ON_START_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+static ON_START_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for OnStartClientHandler {
+    fn on_accept(&self, _conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        // No inbound connections expected in client-only mode.
+        Box::pin(async {})
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let backend_addr = *ON_START_BACKEND_ADDR.get().expect("backend addr not set");
+        Some(Box::pin(async move {
+            let backend = match krio::connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        ON_START_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
+                        krio::request_shutdown();
+                        return;
+                    }
+                },
+                Err(e) => {
+                    ON_START_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    krio::request_shutdown();
+                    return;
+                }
+            };
+
+            if backend.send(b"ON_START").is_err() {
+                ON_START_RESULT.set("SEND_ERR".to_string()).ok();
+                krio::request_shutdown();
+                return;
+            }
+
+            let mut echo = Vec::new();
+            while echo.len() < 8 {
+                let remaining = 8 - echo.len();
+                let got = backend
+                    .with_data(|data| {
+                        let take = data.len().min(remaining);
+                        echo.extend_from_slice(&data[..take]);
+                        take
+                    })
+                    .await;
+                if got == 0 {
+                    break;
+                }
+            }
+
+            ON_START_RESULT
+                .set(String::from_utf8_lossy(&echo).to_string())
+                .ok();
+            krio::request_shutdown();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        OnStartClientHandler
+    }
+}
+
+#[test]
+fn async_on_start_client_only() {
+    // Start backend echo server.
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+    let (b_shutdown, b_handles) = KrioBuilder::new(test_config())
+        .bind(&backend_addr)
+        .launch_async::<AsyncEcho>()
+        .expect("backend launch failed");
+    wait_for_server(&backend_addr);
+
+    ON_START_BACKEND_ADDR
+        .set(backend_addr.parse().unwrap())
+        .ok();
+
+    // Launch client-only (no .bind()).
+    let (_shutdown, handles) = KrioBuilder::new(test_config())
+        .launch_async::<OnStartClientHandler>()
+        .expect("launch failed");
+
+    // Wait for the on_start task to complete and shut down the worker.
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let result = ON_START_RESULT.get().expect("on_start did not set result");
+    assert_eq!(result, "ON_START", "expected ON_START echo, got: {result}");
+
+    b_shutdown.shutdown();
+    for h in b_handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Free connect() to dead port returns error ────────────────────
+
+/// Handler where on_accept spawns a standalone task that tries to
+/// connect to a dead port via krio::connect().
+struct StandaloneConnectRefusedHandler;
+
+static STANDALONE_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
+
+impl AsyncEventHandler for StandaloneConnectRefusedHandler {
+    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(async move {
+            let n = client.with_data(|data| data.len()).await;
+            if n == 0 {
+                return;
+            }
+
+            let port = STANDALONE_REFUSED_PORT.load(Ordering::SeqCst);
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+            krio::spawn(async move {
+                let result = match krio::connect(addr) {
+                    Ok(fut) => match fut.await {
+                        Ok(_) => "CONNECTED".to_string(),
+                        Err(e) => format!("ERR:{}", e.kind()),
+                    },
+                    Err(e) => format!("SUBMIT_ERR:{e}"),
+                };
+
+                let _ = client.send(result.as_bytes());
+            });
+
+            krio::sleep(Duration::from_secs(5)).await;
+        })
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        StandaloneConnectRefusedHandler
+    }
+}
+
+#[test]
+fn async_standalone_connect_refused() {
+    // Bind to a port then drop it so nothing is listening.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    STANDALONE_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = KrioBuilder::new(test_config())
+        .bind(&addr)
+        .launch_async::<StandaloneConnectRefusedHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 128];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if s.starts_with("ERR:")
+                    || s.starts_with("CONNECTED")
+                    || s.starts_with("SUBMIT_ERR:")
+                {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let response = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        response.starts_with("ERR:"),
+        "expected connect error, got: {response}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
