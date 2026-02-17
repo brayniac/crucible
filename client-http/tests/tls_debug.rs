@@ -50,7 +50,7 @@ async fn debug_tls_get_with_body() {
                 );
                 let body_str = String::from_utf8_lossy(resp.body());
                 println!("body: {}", &body_str[..body_str.len().min(200)]);
-                assert!(resp.body().len() > 0, "expected non-empty body");
+                assert!(!resp.body().is_empty(), "expected non-empty body");
                 return;
             }
             Err(e) => {
