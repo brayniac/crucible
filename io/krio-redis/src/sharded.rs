@@ -1,49 +1,50 @@
-//! Redis Cluster client for krio-redis.
+//! Ketama-sharded client for krio-redis.
 //!
-//! Routes commands to the correct cluster node based on hash slot,
-//! handles MOVED/ASK redirects transparently, and refreshes the
-//! cluster topology when slots move.
+//! Routes commands to independent Redis instances using consistent hashing
+//! (ketama). Unlike [`ClusterClient`](crate::ClusterClient), which relies on
+//! server-side slot management, `ShardedClient` performs client-side sharding
+//! across standalone Redis servers.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use krio_redis::{ClusterClient, ClusterConfig};
+//! use krio_redis::{ShardedClient, ShardedConfig};
 //!
 //! async fn example() -> Result<(), krio_redis::Error> {
-//!     let config = ClusterConfig {
-//!         seeds: vec!["127.0.0.1:7000".parse().unwrap()],
+//!     let config = ShardedConfig {
+//!         servers: vec![
+//!             "127.0.0.1:6379".parse().unwrap(),
+//!             "127.0.0.1:6380".parse().unwrap(),
+//!         ],
+//!         pool_size: 2,
 //!         connect_timeout_ms: 1000,
 //!         tls_server_name: None,
 //!         password: None,
 //!         username: None,
 //!     };
-//!     let mut cluster = ClusterClient::new(config);
-//!     cluster.connect().await?;
-//!     cluster.set("hello", "world").await?;
-//!     let val = cluster.get("hello").await?;
+//!     let mut sharded = ShardedClient::new(config);
+//!     sharded.connect_all().await?;
+//!     sharded.set("hello", "world").await?;
+//!     let val = sharded.get("hello").await?;
 //!     assert_eq!(val.as_deref(), Some(&b"world"[..]));
-//!     cluster.close_all();
+//!     sharded.close_all();
 //!     Ok(())
 //! }
 //! ```
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use protocol_resp::{
-    Request, RedirectKind, SlotMap, Value, hash_slot, parse_redirect,
-};
+use protocol_resp::{Request, Value};
 
 use crate::{Client, Error, parse_bytes_array};
 
-/// Maximum number of MOVED/ASK redirect hops before giving up.
-const MAX_REDIRECTS: usize = 5;
-
-/// Configuration for a cluster client.
-pub struct ClusterConfig {
-    /// Initial seed nodes to discover the cluster topology.
-    pub seeds: Vec<SocketAddr>,
+/// Configuration for a ketama-sharded client.
+pub struct ShardedConfig {
+    /// List of independent Redis server addresses.
+    pub servers: Vec<SocketAddr>,
+    /// Number of connections per server (default: 1).
+    pub pool_size: usize,
     /// Connect timeout in milliseconds. 0 means no timeout.
     pub connect_timeout_ms: u64,
     /// TLS server name (SNI) for outbound connections. `None` means plain TCP.
@@ -54,39 +55,59 @@ pub struct ClusterConfig {
     pub username: Option<String>,
 }
 
-enum NodeState {
+enum ShardConn {
     Connected(Client),
     Disconnected,
 }
 
-/// A Redis Cluster client that routes commands by hash slot.
+struct Shard {
+    addr: SocketAddr,
+    conns: Vec<ShardConn>,
+    next: usize,
+}
+
+/// A ketama-sharded Redis client.
 ///
-/// Commands are routed to the correct primary node using the cluster
-/// slot map. MOVED and ASK redirects are handled transparently with
-/// automatic topology refresh.
-pub struct ClusterClient {
-    /// Map from "host:port" → node state.
-    nodes: HashMap<String, NodeState>,
-    slot_map: SlotMap,
-    seeds: Vec<SocketAddr>,
+/// Commands are routed to independent Redis instances using consistent
+/// hashing. Each server has a pool of connections with round-robin
+/// dispatch and lazy reconnection.
+pub struct ShardedClient {
+    shards: Vec<Shard>,
+    ring: ketama::Ring,
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
     password: Option<String>,
     username: Option<String>,
 }
 
-impl ClusterClient {
-    /// Create a new cluster client. Call [`connect()`](Self::connect) to
-    /// discover the topology and connect to cluster primaries.
-    pub fn new(config: ClusterConfig) -> Self {
-        // Build an empty SlotMap from an empty array.
-        let empty = Value::Array(vec![]);
-        let slot_map = SlotMap::from_cluster_slots(&empty).unwrap();
+impl ShardedClient {
+    /// Create a new sharded client. All connections start disconnected.
+    pub fn new(config: ShardedConfig) -> Self {
+        let pool_size = config.pool_size.max(1);
+
+        let server_ids: Vec<String> = config.servers.iter().map(|a| a.to_string()).collect();
+        let ring =
+            ketama::Ring::build(&server_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
+        let shards = config
+            .servers
+            .iter()
+            .map(|&addr| {
+                let mut conns = Vec::with_capacity(pool_size);
+                for _ in 0..pool_size {
+                    conns.push(ShardConn::Disconnected);
+                }
+                Shard {
+                    addr,
+                    conns,
+                    next: 0,
+                }
+            })
+            .collect();
 
         Self {
-            nodes: HashMap::new(),
-            slot_map,
-            seeds: config.seeds,
+            shards,
+            ring,
             connect_timeout_ms: config.connect_timeout_ms,
             tls_server_name: config.tls_server_name,
             password: config.password,
@@ -94,293 +115,97 @@ impl ClusterClient {
         }
     }
 
-    /// Discover the cluster topology and connect to all primary nodes.
-    pub async fn connect(&mut self) -> Result<(), Error> {
-        self.refresh_topology().await
-    }
-
-    /// Close all node connections.
-    pub fn close_all(&mut self) {
-        for (_, state) in self.nodes.drain() {
-            if let NodeState::Connected(client) = state {
-                client.conn().close();
+    /// Eagerly connect all connections on all shards.
+    pub async fn connect_all(&mut self) -> Result<(), Error> {
+        let opts = self.connect_opts();
+        for shard in &mut self.shards {
+            for conn in &mut shard.conns {
+                let client = do_connect(shard.addr, &opts).await?;
+                *conn = ShardConn::Connected(client);
             }
         }
-    }
-
-    // ── Topology ────────────────────────────────────────────────────────
-
-    /// Query CLUSTER SLOTS from any reachable node and rebuild the slot map.
-    async fn refresh_topology(&mut self) -> Result<(), Error> {
-        let cluster_slots_cmd =
-            Client::encode_request(&Request::cmd(b"CLUSTER").arg(b"SLOTS"));
-
-        // Try existing connected nodes first.
-        let connected_addrs: Vec<String> = self
-            .nodes
-            .iter()
-            .filter_map(|(addr, state)| {
-                if matches!(state, NodeState::Connected(_)) {
-                    Some(addr.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut slots_value = None;
-
-        for addr in &connected_addrs {
-            if let Some(NodeState::Connected(client)) = self.nodes.get(addr) {
-                client.conn().send(&cluster_slots_cmd)?;
-                match client.read_value().await {
-                    Ok(value) => {
-                        slots_value = Some(value);
-                        break;
-                    }
-                    Err(_) => {
-                        // Mark as disconnected and try next.
-                        if let Some(state) = self.nodes.get_mut(addr) {
-                            if let NodeState::Connected(client) = state {
-                                client.conn().close();
-                            }
-                            *state = NodeState::Disconnected;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fall back to seeds if no existing node responded.
-        if slots_value.is_none() {
-            for &seed_addr in &self.seeds {
-                match self.do_connect(seed_addr).await {
-                    Ok(client) => {
-                        client.conn().send(&cluster_slots_cmd)?;
-                        match client.read_value().await {
-                            Ok(value) => {
-                                let key = seed_addr.to_string();
-                                self.nodes.insert(key, NodeState::Connected(client));
-                                slots_value = Some(value);
-                                break;
-                            }
-                            Err(_) => {
-                                client.conn().close();
-                            }
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
-
-        let value = slots_value.ok_or(Error::AllConnectionsFailed)?;
-        let new_map = SlotMap::from_cluster_slots(&value)
-            .ok_or_else(|| Error::Redis("invalid CLUSTER SLOTS response".into()))?;
-
-        // Collect addresses of primaries in the new map.
-        let mut new_primaries: HashMap<String, ()> = HashMap::new();
-        for range in new_map.ranges() {
-            new_primaries.insert(range.primary.address.clone(), ());
-        }
-
-        // Close nodes that are no longer primaries.
-        self.nodes.retain(|addr, state| {
-            if new_primaries.contains_key(addr) {
-                true
-            } else {
-                if let NodeState::Connected(client) = state {
-                    client.conn().close();
-                }
-                false
-            }
-        });
-
-        // Connect to new primaries we don't have yet.
-        for addr_str in new_primaries.keys() {
-            if !self.nodes.contains_key(addr_str) {
-                let parsed: SocketAddr = match addr_str.parse() {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                match self.do_connect(parsed).await {
-                    Ok(client) => {
-                        self.nodes
-                            .insert(addr_str.clone(), NodeState::Connected(client));
-                    }
-                    Err(_) => {
-                        self.nodes
-                            .insert(addr_str.clone(), NodeState::Disconnected);
-                    }
-                }
-            }
-        }
-
-        self.slot_map = new_map;
         Ok(())
     }
 
-    /// Get or reconnect a client for the given "host:port" address.
-    async fn client_for_addr(&mut self, addr: &str) -> Result<Client, Error> {
-        // Check if already connected.
-        if let Some(NodeState::Connected(client)) = self.nodes.get(addr) {
-            return Ok(*client);
-        }
-
-        // Parse and reconnect.
-        let parsed: SocketAddr = addr
-            .parse()
-            .map_err(|e: std::net::AddrParseError| Error::Redis(e.to_string()))?;
-        let client = self.do_connect(parsed).await?;
-        self.nodes
-            .insert(addr.to_string(), NodeState::Connected(client));
-        Ok(client)
-    }
-
-    async fn do_connect(&self, addr: SocketAddr) -> Result<Client, Error> {
-        let conn = if let Some(sni) = &self.tls_server_name {
-            let fut = if self.connect_timeout_ms > 0 {
-                krio::connect_tls_with_timeout(addr, sni, self.connect_timeout_ms)?
-            } else {
-                krio::connect_tls(addr, sni)?
-            };
-            fut.await?
-        } else {
-            let fut = if self.connect_timeout_ms > 0 {
-                krio::connect_with_timeout(addr, self.connect_timeout_ms)?
-            } else {
-                krio::connect(addr)?
-            };
-            fut.await?
-        };
-
-        let client = Client::new(conn);
-        client
-            .maybe_auth(self.password.as_deref(), self.username.as_deref())
-            .await?;
-        Ok(client)
-    }
-
-    /// Mark a node as disconnected (e.g. after ConnectionClosed).
-    fn mark_disconnected(&mut self, addr: &str) {
-        if let Some(state) = self.nodes.get_mut(addr) {
-            if let NodeState::Connected(client) = state {
-                client.conn().close();
+    /// Close all connections on all shards.
+    pub fn close_all(&mut self) {
+        for shard in &mut self.shards {
+            for conn in &mut shard.conns {
+                if let ShardConn::Connected(client) = conn {
+                    client.conn().close();
+                }
+                *conn = ShardConn::Disconnected;
             }
-            *state = NodeState::Disconnected;
         }
+    }
+
+    /// Number of shards (servers).
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    fn connect_opts(&self) -> ConnectOpts {
+        ConnectOpts {
+            connect_timeout_ms: self.connect_timeout_ms,
+            tls_server_name: self.tls_server_name.clone(),
+            password: self.password.clone(),
+            username: self.username.clone(),
+        }
+    }
+
+    /// Get a [`Client`] for a specific shard by index (for node-level commands).
+    pub async fn shard_client(&mut self, index: usize) -> Result<Client, Error> {
+        let opts = self.connect_opts();
+        let shard = &mut self.shards[index];
+        get_client(shard, &opts).await
     }
 
     // ── Core routing ────────────────────────────────────────────────────
 
-    /// Route an encoded command to the node owning `key`, handling redirects.
+    /// Route an encoded command to the shard owning `key`.
     async fn route_command(&mut self, key: &[u8], encoded: &[u8]) -> Result<Value, Error> {
-        let slot = hash_slot(key);
+        let opts = self.connect_opts();
+        let shard_idx = self.ring.route(key);
+        let shard = &mut self.shards[shard_idx];
+        let size = shard.conns.len();
 
-        // Determine initial target node.
-        let initial_addr = self
-            .slot_map
-            .lookup(slot)
-            .map(|r| r.primary.address.clone())
-            .ok_or_else(|| Error::Redis(format!("no node for slot {slot}")))?;
-
-        let mut target_addr = initial_addr;
-        let mut retried_after_refresh = false;
-
-        for _ in 0..MAX_REDIRECTS {
-            let client = match self.client_for_addr(&target_addr).await {
-                Ok(c) => c,
-                Err(Error::ConnectionClosed | Error::Io(_)) => {
-                    if !retried_after_refresh {
-                        retried_after_refresh = true;
-                        self.mark_disconnected(&target_addr);
-                        self.refresh_topology().await?;
-                        // Re-lookup after refresh.
-                        target_addr = self
-                            .slot_map
-                            .lookup(slot)
-                            .map(|r| r.primary.address.clone())
-                            .ok_or_else(|| {
-                                Error::Redis(format!("no node for slot {slot}"))
-                            })?;
-                        continue;
+        for attempt in 0..size {
+            let idx = (shard.next + attempt) % size;
+            let client = match &shard.conns[idx] {
+                ShardConn::Connected(c) => *c,
+                ShardConn::Disconnected => {
+                    match do_connect(shard.addr, &opts).await {
+                        Ok(c) => {
+                            shard.conns[idx] = ShardConn::Connected(c);
+                            c
+                        }
+                        Err(_) => continue,
                     }
-                    return Err(Error::AllConnectionsFailed);
                 }
-                Err(e) => return Err(e),
             };
 
             client.conn().send(encoded)?;
-            let value = match client.read_value().await {
-                Ok(v) => v,
-                Err(Error::ConnectionClosed) => {
-                    if !retried_after_refresh {
-                        retried_after_refresh = true;
-                        self.mark_disconnected(&target_addr);
-                        self.refresh_topology().await?;
-                        target_addr = self
-                            .slot_map
-                            .lookup(slot)
-                            .map(|r| r.primary.address.clone())
-                            .ok_or_else(|| {
-                                Error::Redis(format!("no node for slot {slot}"))
-                            })?;
-                        continue;
+            match client.read_value().await {
+                Ok(value) => {
+                    // Advance round-robin past the connection we used.
+                    shard.next = (idx + 1) % size;
+
+                    if let Value::Error(ref msg) = value {
+                        return Err(Error::Redis(
+                            String::from_utf8_lossy(msg).into_owned(),
+                        ));
                     }
-                    return Err(Error::ConnectionClosed);
+                    return Ok(value);
+                }
+                Err(Error::ConnectionClosed) => {
+                    shard.conns[idx] = ShardConn::Disconnected;
+                    continue;
                 }
                 Err(e) => return Err(e),
-            };
-
-            // Check for redirects.
-            if let Some(redirect) = parse_redirect(&value) {
-                match redirect.kind {
-                    RedirectKind::Moved => {
-                        // Topology changed — refresh and retry.
-                        self.refresh_topology().await?;
-                        target_addr = self
-                            .slot_map
-                            .lookup(slot)
-                            .map(|r| r.primary.address.clone())
-                            .ok_or_else(|| {
-                                Error::Redis(format!("no node for slot {slot}"))
-                            })?;
-                        continue;
-                    }
-                    RedirectKind::Ask => {
-                        // One-time redirect: send ASKING then retry on target.
-                        let ask_addr = redirect.address;
-                        let ask_client = self.client_for_addr(&ask_addr).await?;
-                        let asking_cmd =
-                            Client::encode_request(&Request::cmd(b"ASKING"));
-                        ask_client.conn().send(&asking_cmd)?;
-                        // Read and discard the ASKING response.
-                        let _ = ask_client.read_value().await?;
-                        // Send the actual command.
-                        ask_client.conn().send(encoded)?;
-                        let ask_value = ask_client.read_value().await?;
-                        // Check the ASK target's response for errors.
-                        if let Value::Error(ref msg) = ask_value {
-                            return Err(Error::Redis(
-                                String::from_utf8_lossy(msg).into_owned(),
-                            ));
-                        }
-                        return Ok(ask_value);
-                    }
-                }
             }
-
-            // Non-redirect error.
-            if let Value::Error(ref msg) = value {
-                return Err(Error::Redis(
-                    String::from_utf8_lossy(msg).into_owned(),
-                ));
-            }
-
-            return Ok(value);
         }
 
-        Err(Error::TooManyRedirects)
+        Err(Error::AllConnectionsFailed)
     }
 
     /// Route and expect +OK.
@@ -415,19 +240,19 @@ impl ClusterClient {
         }
     }
 
-    // ── Helpers for multi-key slot validation ───────────────────────────
+    // ── Multi-key shard validation ──────────────────────────────────────
 
-    /// Verify all keys hash to the same slot. Returns the common slot.
-    fn require_same_slot(keys: &[&[u8]]) -> Result<u16, Error> {
-        let first_slot = hash_slot(keys[0]);
+    /// Verify all keys route to the same shard. Returns the common shard index.
+    fn require_same_shard(&self, keys: &[&[u8]]) -> Result<usize, Error> {
+        let first = self.ring.route(keys[0]);
         for key in &keys[1..] {
-            if hash_slot(key) != first_slot {
+            if self.ring.route(key) != first {
                 return Err(Error::Redis(
-                    "CROSSSLOT Keys in request don't hash to the same slot".into(),
+                    "keys in request don't route to the same shard".into(),
                 ));
             }
         }
-        Ok(first_slot)
+        Ok(first)
     }
 
     // ── String commands ─────────────────────────────────────────────────
@@ -506,12 +331,12 @@ impl ClusterClient {
             .map(|n| n as u64)
     }
 
-    /// Get values for multiple keys. All keys must hash to the same slot.
+    /// Get values for multiple keys. All keys must route to the same shard.
     pub async fn mget(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>, Error> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        Self::require_same_slot(keys)?;
+        self.require_same_shard(keys)?;
         let encoded = Client::encode_request(&Request::mget(keys));
         let value = self.route_command(keys[0], &encoded).await?;
         match value {
@@ -664,7 +489,7 @@ impl ClusterClient {
         }
     }
 
-    /// Rename a key. Both keys must hash to the same slot.
+    /// Rename a key. Both keys must route to the same shard.
     pub async fn rename(
         &mut self,
         key: impl AsRef<[u8]>,
@@ -672,7 +497,7 @@ impl ClusterClient {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let new_key = new_key.as_ref();
-        Self::require_same_slot(&[key, new_key])?;
+        self.require_same_shard(&[key, new_key])?;
         self.route_ok(
             key,
             &Client::encode_request(&Request::cmd(b"RENAME").arg(key).arg(new_key)),
@@ -1204,34 +1029,25 @@ impl ClusterClient {
 
     // ── Server commands ─────────────────────────────────────────────────
 
-    /// Ping any connected node.
+    /// Ping any connected shard.
     pub async fn ping(&mut self) -> Result<(), Error> {
         let ping_cmd = Client::encode_request(&Request::ping());
-        // Find any connected node to ping.
-        let addr = self
-            .nodes
-            .iter()
-            .find_map(|(addr, state)| {
-                if matches!(state, NodeState::Connected(_)) {
-                    Some(addr.clone())
-                } else {
-                    None
+        for shard in &mut self.shards {
+            if let Some(client) = get_connected_client(shard) {
+                client.conn().send(&ping_cmd)?;
+                let value = client.read_value().await?;
+                if let Value::Error(ref msg) = value {
+                    return Err(Error::Redis(
+                        String::from_utf8_lossy(msg).into_owned(),
+                    ));
                 }
-            })
-            .ok_or(Error::AllConnectionsFailed)?;
-
-        let client = self.client_for_addr(&addr).await?;
-        client.conn().send(&ping_cmd)?;
-        let value = client.read_value().await?;
-        if let Value::Error(ref msg) = value {
-            return Err(Error::Redis(
-                String::from_utf8_lossy(msg).into_owned(),
-            ));
+                return match value {
+                    Value::SimpleString(_) => Ok(()),
+                    _ => Err(Error::UnexpectedResponse),
+                };
+            }
         }
-        match value {
-            Value::SimpleString(_) => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
-        }
+        Err(Error::AllConnectionsFailed)
     }
 
     // ── Custom command routing ──────────────────────────────────────────
@@ -1246,61 +1062,187 @@ impl ClusterClient {
         self.route_command(key, &Client::encode_request(request))
             .await
     }
+}
 
-    /// Get a [`Client`] for a specific node address (for node-level commands
-    /// like CONFIG, CLUSTER INFO, etc.).
-    pub async fn node_client(&mut self, addr: &str) -> Result<Client, Error> {
-        self.client_for_addr(addr).await
+/// Connection options cloned from config to avoid borrow conflicts.
+#[derive(Clone)]
+struct ConnectOpts {
+    connect_timeout_ms: u64,
+    tls_server_name: Option<String>,
+    password: Option<String>,
+    username: Option<String>,
+}
+
+/// Get the first connected client from a shard without reconnecting.
+fn get_connected_client(shard: &Shard) -> Option<Client> {
+    for conn in &shard.conns {
+        if let ShardConn::Connected(client) = conn {
+            return Some(*client);
+        }
     }
+    None
+}
+
+/// Get a client from a shard, lazily reconnecting if needed.
+async fn get_client(shard: &mut Shard, opts: &ConnectOpts) -> Result<Client, Error> {
+    let size = shard.conns.len();
+    for _ in 0..size {
+        let idx = shard.next;
+        shard.next = (shard.next + 1) % size;
+
+        match &shard.conns[idx] {
+            ShardConn::Connected(c) => return Ok(*c),
+            ShardConn::Disconnected => {
+                if let Ok(client) = do_connect(shard.addr, opts).await {
+                    shard.conns[idx] = ShardConn::Connected(client);
+                    return Ok(client);
+                }
+            }
+        }
+    }
+    Err(Error::AllConnectionsFailed)
+}
+
+async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
+    let conn = if let Some(ref sni) = opts.tls_server_name {
+        let fut = if opts.connect_timeout_ms > 0 {
+            krio::connect_tls_with_timeout(addr, sni, opts.connect_timeout_ms)?
+        } else {
+            krio::connect_tls(addr, sni)?
+        };
+        fut.await?
+    } else {
+        let fut = if opts.connect_timeout_ms > 0 {
+            krio::connect_with_timeout(addr, opts.connect_timeout_ms)?
+        } else {
+            krio::connect(addr)?
+        };
+        fut.await?
+    };
+
+    let client = Client::new(conn);
+    client
+        .maybe_auth(opts.password.as_deref(), opts.username.as_deref())
+        .await?;
+    Ok(client)
 }
 
 #[cfg(test)]
 mod tests {
-    use protocol_resp::hash_slot;
-
     use super::*;
 
     #[test]
-    fn test_require_same_slot_matching() {
-        // Keys with same hash tag should pass.
-        let keys: &[&[u8]] = &[b"{user}.name", b"{user}.email", b"{user}.age"];
-        assert!(ClusterClient::require_same_slot(keys).is_ok());
-    }
-
-    #[test]
-    fn test_require_same_slot_mismatch() {
-        // Keys with different hash tags should fail.
-        let keys: &[&[u8]] = &[b"{a}.key", b"{b}.key"];
-        let err = ClusterClient::require_same_slot(keys).unwrap_err();
-        assert!(matches!(err, Error::Redis(msg) if msg.contains("CROSSSLOT")));
-    }
-
-    #[test]
-    fn test_require_same_slot_single_key() {
-        let keys: &[&[u8]] = &[b"anykey"];
-        assert!(ClusterClient::require_same_slot(keys).is_ok());
-    }
-
-    #[test]
-    fn test_cluster_config_defaults() {
-        let config = ClusterConfig {
-            seeds: vec!["127.0.0.1:7000".parse().unwrap()],
+    fn test_single_server_always_routes_to_zero() {
+        let config = ShardedConfig {
+            servers: vec!["127.0.0.1:6379".parse().unwrap()],
+            pool_size: 1,
             connect_timeout_ms: 0,
             tls_server_name: None,
             password: None,
             username: None,
         };
-        let client = ClusterClient::new(config);
-        assert!(client.slot_map.is_empty());
-        assert!(client.nodes.is_empty());
+        let client = ShardedClient::new(config);
+        assert_eq!(client.ring.route(b"any-key"), 0);
+        assert_eq!(client.ring.route(b"another-key"), 0);
+        assert_eq!(client.ring.route(b""), 0);
     }
 
     #[test]
-    fn test_hash_slot_routing_consistency() {
-        // Verify that hash_slot is consistent for routing.
-        let slot1 = hash_slot(b"mykey");
-        let slot2 = hash_slot(b"mykey");
-        assert_eq!(slot1, slot2);
-        assert!(slot1 < 16384);
+    fn test_deterministic_routing() {
+        let config = ShardedConfig {
+            servers: vec![
+                "127.0.0.1:6379".parse().unwrap(),
+                "127.0.0.1:6380".parse().unwrap(),
+                "127.0.0.1:6381".parse().unwrap(),
+            ],
+            pool_size: 1,
+            connect_timeout_ms: 0,
+            tls_server_name: None,
+            password: None,
+            username: None,
+        };
+        let client = ShardedClient::new(config);
+
+        let a = client.ring.route(b"test-key");
+        let b = client.ring.route(b"test-key");
+        assert_eq!(a, b);
+
+        let c = client.ring.route(b"other-key");
+        let d = client.ring.route(b"other-key");
+        assert_eq!(c, d);
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let config = ShardedConfig {
+            servers: vec![
+                "127.0.0.1:6379".parse().unwrap(),
+                "127.0.0.1:6380".parse().unwrap(),
+            ],
+            pool_size: 4,
+            connect_timeout_ms: 500,
+            tls_server_name: None,
+            password: None,
+            username: None,
+        };
+        let client = ShardedClient::new(config);
+        assert_eq!(client.shard_count(), 2);
+        assert_eq!(client.ring.node_count(), 2);
+        // Each shard should have pool_size connections.
+        assert_eq!(client.shards[0].conns.len(), 4);
+        assert_eq!(client.shards[1].conns.len(), 4);
+    }
+
+    #[test]
+    fn test_pool_size_minimum() {
+        let config = ShardedConfig {
+            servers: vec!["127.0.0.1:6379".parse().unwrap()],
+            pool_size: 0,
+            connect_timeout_ms: 0,
+            tls_server_name: None,
+            password: None,
+            username: None,
+        };
+        let client = ShardedClient::new(config);
+        // pool_size of 0 should be clamped to 1.
+        assert_eq!(client.shards[0].conns.len(), 1);
+    }
+
+    #[test]
+    fn test_require_same_shard_matching() {
+        let config = ShardedConfig {
+            servers: vec![
+                "127.0.0.1:6379".parse().unwrap(),
+                "127.0.0.1:6380".parse().unwrap(),
+            ],
+            pool_size: 1,
+            connect_timeout_ms: 0,
+            tls_server_name: None,
+            password: None,
+            username: None,
+        };
+        let client = ShardedClient::new(config);
+
+        // Same key always routes to same shard.
+        let keys: &[&[u8]] = &[b"same-key", b"same-key"];
+        assert!(client.require_same_shard(keys).is_ok());
+    }
+
+    #[test]
+    fn test_require_same_shard_single_key() {
+        let config = ShardedConfig {
+            servers: vec![
+                "127.0.0.1:6379".parse().unwrap(),
+                "127.0.0.1:6380".parse().unwrap(),
+            ],
+            pool_size: 1,
+            connect_timeout_ms: 0,
+            tls_server_name: None,
+            password: None,
+            username: None,
+        };
+        let client = ShardedClient::new(config);
+        let keys: &[&[u8]] = &[b"anykey"];
+        assert!(client.require_same_shard(keys).is_ok());
     }
 }

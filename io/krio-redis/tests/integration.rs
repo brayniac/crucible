@@ -480,6 +480,9 @@ fn test_pool_basic() {
                 addr,
                 pool_size: 2,
                 connect_timeout_ms: 0,
+                tls_server_name: None,
+                password: None,
+                username: None,
             });
 
             pool.connect_all().await?;
@@ -507,6 +510,9 @@ fn test_pool_lazy_connect() {
                 addr,
                 pool_size: 2,
                 connect_timeout_ms: 0,
+                tls_server_name: None,
+                password: None,
+                username: None,
             });
 
             // No connect_all — starts fully disconnected.
@@ -534,6 +540,9 @@ fn test_pool_reconnect() {
                 addr,
                 pool_size: 2,
                 connect_timeout_ms: 0,
+                tls_server_name: None,
+                password: None,
+                username: None,
             });
             pool.connect_all().await?;
 
@@ -563,6 +572,9 @@ fn test_pool_pipeline() {
                 addr,
                 pool_size: 1,
                 connect_timeout_ms: 0,
+                tls_server_name: None,
+                password: None,
+                username: None,
             });
             pool.connect_all().await?;
 

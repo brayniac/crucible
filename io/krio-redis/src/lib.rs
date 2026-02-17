@@ -25,8 +25,10 @@
 
 pub mod cluster;
 pub mod pool;
+pub mod sharded;
 pub use cluster::{ClusterClient, ClusterConfig};
 pub use pool::{Pool, PoolConfig};
+pub use sharded::{ShardedClient, ShardedConfig};
 
 use std::io;
 
@@ -799,6 +801,49 @@ impl Client {
             ))
             .await?;
         parse_bytes_array(value)
+    }
+
+    // ── Auth commands ────────────────────────────────────────────────────
+
+    /// Authenticate with a password (`AUTH password`).
+    pub async fn auth(&self, password: impl AsRef<[u8]>) -> Result<(), Error> {
+        let password = password.as_ref();
+        self.execute_ok(&Self::encode_request(
+            &Request::cmd(b"AUTH").arg(password),
+        ))
+        .await
+    }
+
+    /// Authenticate with a username and password (`AUTH username password`).
+    ///
+    /// Requires Redis 6.0+ with ACL support.
+    pub async fn auth_username(
+        &self,
+        username: impl AsRef<[u8]>,
+        password: impl AsRef<[u8]>,
+    ) -> Result<(), Error> {
+        let username = username.as_ref();
+        let password = password.as_ref();
+        self.execute_ok(&Self::encode_request(
+            &Request::cmd(b"AUTH").arg(username).arg(password),
+        ))
+        .await
+    }
+
+    /// Send AUTH if credentials are provided. Used internally after connect.
+    pub(crate) async fn maybe_auth(
+        &self,
+        password: Option<&str>,
+        username: Option<&str>,
+    ) -> Result<(), Error> {
+        if let Some(password) = password {
+            match username {
+                Some(username) => self.auth_username(username, password).await,
+                None => self.auth(password).await,
+            }
+        } else {
+            Ok(())
+        }
     }
 
     // ── Server commands ─────────────────────────────────────────────────

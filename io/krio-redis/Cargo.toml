@@ -6,7 +6,8 @@ license.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-krio = { workspace = true }
+ketama = { workspace = true }
+krio = { workspace = true, features = ["tls"] }
 protocol-resp = { workspace = true }
 thiserror = { workspace = true }
 

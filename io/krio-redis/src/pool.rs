@@ -14,6 +14,9 @@
 //!     addr: "127.0.0.1:6379".parse().unwrap(),
 //!     pool_size: 4,
 //!     connect_timeout_ms: 0,
+//!     tls_server_name: None,
+//!     password: None,
+//!     username: None,
 //! };
 //! let mut pool = Pool::new(config);
 //! pool.connect_all().await?;
@@ -36,6 +39,12 @@ pub struct PoolConfig {
     pub pool_size: usize,
     /// Connect timeout in milliseconds. 0 means no timeout.
     pub connect_timeout_ms: u64,
+    /// TLS server name (SNI) for outbound connections. `None` means plain TCP.
+    pub tls_server_name: Option<String>,
+    /// Password for AUTH after connect. `None` skips authentication.
+    pub password: Option<String>,
+    /// Username for ACL-based AUTH (Redis 6.0+). Only used when `password` is set.
+    pub username: Option<String>,
 }
 
 enum Slot {
@@ -52,6 +61,9 @@ pub struct Pool {
     slots: Vec<Slot>,
     next: usize,
     connect_timeout_ms: u64,
+    tls_server_name: Option<String>,
+    password: Option<String>,
+    username: Option<String>,
 }
 
 impl Pool {
@@ -66,6 +78,9 @@ impl Pool {
             slots,
             next: 0,
             connect_timeout_ms: config.connect_timeout_ms,
+            tls_server_name: config.tls_server_name,
+            password: config.password,
+            username: config.username,
         }
     }
 
@@ -149,11 +164,26 @@ impl Pool {
     }
 
     async fn do_connect(&self) -> Result<ConnCtx, Error> {
-        let fut = if self.connect_timeout_ms > 0 {
-            krio::connect_with_timeout(self.addr, self.connect_timeout_ms)?
+        let conn = if let Some(sni) = &self.tls_server_name {
+            let fut = if self.connect_timeout_ms > 0 {
+                krio::connect_tls_with_timeout(self.addr, sni, self.connect_timeout_ms)?
+            } else {
+                krio::connect_tls(self.addr, sni)?
+            };
+            fut.await?
         } else {
-            krio::connect(self.addr)?
+            let fut = if self.connect_timeout_ms > 0 {
+                krio::connect_with_timeout(self.addr, self.connect_timeout_ms)?
+            } else {
+                krio::connect(self.addr)?
+            };
+            fut.await?
         };
-        Ok(fut.await?)
+
+        Client::new(conn)
+            .maybe_auth(self.password.as_deref(), self.username.as_deref())
+            .await?;
+
+        Ok(conn)
     }
 }

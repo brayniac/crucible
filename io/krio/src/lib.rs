@@ -119,6 +119,12 @@ pub use runtime::io::UdpRecvFuture;
 pub use runtime::io::WithDataFuture;
 /// Initiate an outbound TCP connection from any async task.
 pub use runtime::io::connect;
+/// Initiate an outbound TLS connection from any async task.
+#[cfg(feature = "tls")]
+pub use runtime::io::connect_tls;
+/// Initiate an outbound TLS connection with a timeout from any async task.
+#[cfg(feature = "tls")]
+pub use runtime::io::connect_tls_with_timeout;
 /// Initiate an outbound TCP connection with a timeout from any async task.
 pub use runtime::io::connect_with_timeout;
 /// Request graceful shutdown from any async task.

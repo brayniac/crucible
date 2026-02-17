@@ -164,6 +164,68 @@ pub fn connect_with_timeout(addr: SocketAddr, timeout_ms: u64) -> io::Result<Con
     })
 }
 
+/// Initiate an outbound TLS connection from any async task (connection or standalone).
+///
+/// This is the free-function equivalent of [`ConnCtx::connect_tls()`] — it can be
+/// called from standalone tasks spawned via [`spawn()`] or from an
+/// [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start) future,
+/// where no `ConnCtx` is available.
+///
+/// `server_name` is the SNI hostname for the TLS handshake.
+///
+/// Returns a [`ConnectFuture`] that resolves with a [`ConnCtx`] for the new connection
+/// once both the TCP and TLS handshakes complete.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+#[cfg(feature = "tls")]
+pub fn connect_tls(addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let token = ctx
+            .connect_tls(addr, server_name)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+        executor.owner_task[token.index as usize] = Some(calling_task);
+        executor.connect_waiters[token.index as usize] = true;
+        Ok(ConnectFuture {
+            conn_index: token.index,
+            generation: token.generation,
+        })
+    })
+}
+
+/// Initiate an outbound TLS connection with a timeout from any async task.
+///
+/// Free-function equivalent of [`ConnCtx::connect_tls_with_timeout()`].
+///
+/// `server_name` is the SNI hostname for the TLS handshake.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+#[cfg(feature = "tls")]
+pub fn connect_tls_with_timeout(
+    addr: SocketAddr,
+    server_name: &str,
+    timeout_ms: u64,
+) -> io::Result<ConnectFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let token = ctx
+            .connect_tls_with_timeout(addr, server_name, timeout_ms)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+        executor.owner_task[token.index as usize] = Some(calling_task);
+        executor.connect_waiters[token.index as usize] = true;
+        Ok(ConnectFuture {
+            conn_index: token.index,
+            generation: token.generation,
+        })
+    })
+}
+
 /// Request graceful shutdown of the worker event loop from any async task.
 ///
 /// This is the free-function equivalent of [`ConnCtx::request_shutdown()`] —
