@@ -198,6 +198,22 @@ fn find_static_name(name: &[u8]) -> Option<usize> {
 
 // ── Encoder ─────────────────────────────────────────────────────────
 
+/// Encode a string literal with optional Huffman compression.
+/// Uses Huffman when it produces shorter output.
+/// Format: H bit (bit 7) + 7-bit prefix length + data.
+fn encode_string_literal(buf: &mut Vec<u8>, data: &[u8]) {
+    let huf_len = crate::huffman::encoded_len(data);
+    if huf_len < data.len() {
+        // Huffman is shorter — set H bit (0x80).
+        encode_prefix_int(buf, huf_len as u64, 7, 0x80);
+        crate::huffman::encode(data, buf);
+    } else {
+        // Raw is shorter or equal — no H bit (0x00).
+        encode_prefix_int(buf, data.len() as u64, 7, 0x00);
+        buf.extend_from_slice(data);
+    }
+}
+
 /// Encode a list of headers into a QPACK header block (static table only).
 ///
 /// Writes the Required Insert Count (0) and Delta Base (0) prefix,
@@ -218,17 +234,19 @@ pub fn encode(headers: &[HeaderField], buf: &mut Vec<u8>) {
             // Literal field line with name reference (RFC 9204 Section 4.5.4):
             // Pattern 0 1 N=0 T=1 (0x50), 4-bit name index.
             encode_prefix_int(buf, name_index as u64, 4, 0x50);
-            // Value: 8-bit prefix with no Huffman (0x00 pattern).
-            encode_prefix_int(buf, header.value.len() as u64, 7, 0x00);
-            buf.extend_from_slice(&header.value);
+            encode_string_literal(buf, &header.value);
         } else {
             // Literal field line with literal name (RFC 9204 Section 4.5.6):
-            // Pattern 0 0 1 N=0 (0x20), 3-bit name length.
-            encode_prefix_int(buf, header.name.len() as u64, 3, 0x20);
-            buf.extend_from_slice(&header.name);
-            // Value: 8-bit prefix with no Huffman (0x00 pattern).
-            encode_prefix_int(buf, header.value.len() as u64, 7, 0x00);
-            buf.extend_from_slice(&header.value);
+            // Name: H bit is bit 3 → pattern 0x28 (H=1) or 0x20 (H=0), 3-bit prefix.
+            let huf_len = crate::huffman::encoded_len(&header.name);
+            if huf_len < header.name.len() {
+                encode_prefix_int(buf, huf_len as u64, 3, 0x28);
+                crate::huffman::encode(&header.name, buf);
+            } else {
+                encode_prefix_int(buf, header.name.len() as u64, 3, 0x20);
+                buf.extend_from_slice(&header.name);
+            }
+            encode_string_literal(buf, &header.value);
         }
     }
 }

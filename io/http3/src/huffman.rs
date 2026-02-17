@@ -336,6 +336,40 @@ fn build_decode_tree() -> Vec<Node> {
 
 // ── Public API ───────────────────────────────────────────────────────
 
+/// Return the Huffman-encoded length of `data` in bytes.
+pub(crate) fn encoded_len(data: &[u8]) -> usize {
+    let mut bits = 0usize;
+    for &byte in data {
+        bits += HUFFMAN_TABLE[byte as usize].bits as usize;
+    }
+    bits.div_ceil(8)
+}
+
+/// Huffman-encode `data` and append to `out`.
+pub(crate) fn encode(data: &[u8], out: &mut Vec<u8>) {
+    let mut bits: u64 = 0;
+    let mut bit_count = 0u8;
+
+    for &byte in data {
+        let entry = &HUFFMAN_TABLE[byte as usize];
+        bits <<= entry.bits;
+        bits |= entry.code as u64;
+        bit_count += entry.bits;
+
+        while bit_count >= 8 {
+            bit_count -= 8;
+            out.push((bits >> bit_count) as u8);
+        }
+    }
+
+    // Pad with EOS prefix (all 1s) to complete the last byte.
+    if bit_count > 0 {
+        bits <<= 8 - bit_count;
+        bits |= (1u64 << (8 - bit_count)) - 1;
+        out.push(bits as u8);
+    }
+}
+
 /// Decode a Huffman-encoded byte slice into plaintext.
 pub(crate) fn decode(data: &[u8]) -> Result<Vec<u8>, H3Error> {
     let tree = decode_tree();
@@ -412,8 +446,6 @@ mod tests {
 
     #[test]
     fn roundtrip_simple_strings() {
-        // We only have a decoder, so manually encode using the table
-        // and verify decode produces the original.
         let test_cases: &[&[u8]] = &[
             b"",
             b"a",
@@ -424,7 +456,8 @@ mod tests {
         ];
 
         for &input in test_cases {
-            let encoded = encode_for_test(input);
+            let mut encoded = Vec::new();
+            encode(input, &mut encoded);
             let decoded = decode(&encoded).unwrap();
             assert_eq!(
                 input, decoded.as_slice(),
@@ -434,30 +467,20 @@ mod tests {
         }
     }
 
-    /// Simple encoder for tests only.
-    fn encode_for_test(data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut bits: u64 = 0;
-        let mut bit_count = 0u8;
+    #[test]
+    fn encoded_len_matches() {
+        let data = b"Mon, 21 Oct 2013 20:13:21 GMT";
+        let mut encoded = Vec::new();
+        encode(data, &mut encoded);
+        assert_eq!(encoded_len(data), encoded.len());
+    }
 
-        for &byte in data {
-            let entry = &HUFFMAN_TABLE[byte as usize];
-            bits <<= entry.bits;
-            bits |= entry.code as u64;
-            bit_count += entry.bits;
-
-            while bit_count >= 8 {
-                bit_count -= 8;
-                out.push((bits >> bit_count) as u8);
-            }
-        }
-
-        if bit_count > 0 {
-            bits <<= 8 - bit_count;
-            bits |= (1u64 << (8 - bit_count)) - 1;
-            out.push(bits as u8);
-        }
-
-        out
+    #[test]
+    fn all_bytes_roundtrip() {
+        let input: Vec<u8> = (0..=255).collect();
+        let mut encoded = Vec::new();
+        encode(&input, &mut encoded);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(input, decoded);
     }
 }
