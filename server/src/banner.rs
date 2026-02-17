@@ -18,8 +18,8 @@ pub struct BannerConfig<'a> {
     pub small_queue_percent: u8,
     /// Number of worker threads
     pub workers: usize,
-    /// Protocol listeners
-    pub listeners: &'a [(Protocol, SocketAddr)],
+    /// Protocol listeners (protocol, address, tls_enabled)
+    pub listeners: &'a [(Protocol, SocketAddr, bool)],
     /// Metrics address
     pub metrics_address: SocketAddr,
     /// Cache heap size in bytes
@@ -86,13 +86,17 @@ pub fn print_banner(config: &BannerConfig) {
 
     // Listeners
     writeln!(output, "Listeners:").unwrap();
-    for (protocol, addr) in config.listeners {
+    for (protocol, addr, tls) in config.listeners {
         let proto_str = match protocol {
             Protocol::Resp => "RESP",
             Protocol::Memcache => "Memcache",
             Protocol::Momento => "Momento",
         };
-        writeln!(output, "  {}: {}", proto_str, addr).unwrap();
+        if *tls {
+            writeln!(output, "  {}: {} (TLS)", proto_str, addr).unwrap();
+        } else {
+            writeln!(output, "  {}: {}", proto_str, addr).unwrap();
+        }
     }
     writeln!(output, "  Metrics: {}", config.metrics_address).unwrap();
 

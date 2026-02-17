@@ -81,6 +81,16 @@ mod server {
             ..Default::default()
         };
 
+        // Load TLS config if configured
+        let krio_config = if let Some(ref tls_cfg) = config.listener[0].tls {
+            let mut c = krio_config;
+            c.tls = Some(crate::tls::load_server_config(tls_cfg)?);
+            info!("TLS enabled");
+            c
+        } else {
+            krio_config
+        };
+
         let bind_addr = config.listener[0].address;
 
         let _launch_guard = launch_lock();

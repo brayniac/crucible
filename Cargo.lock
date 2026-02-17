@@ -1482,6 +1482,7 @@ name = "krio-redis"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ketama",
  "krio",
  "protocol-resp",
  "segcache",
@@ -2723,6 +2724,7 @@ dependencies = [
  "protocol-memcache",
  "protocol-ping",
  "protocol-resp",
+ "rustls",
  "segcache",
  "serde",
  "slab",

@@ -30,7 +30,7 @@ protocol-resp = { workspace = true, features = ["resp3"] }
 protocol-memcache = { workspace = true, features = ["full"] }
 
 # I/O driver (native runtime)
-krio = { workspace = true }
+krio = { workspace = true, features = ["tls"] }
 
 # Core utilities
 bytes = { workspace = true }
@@ -66,6 +66,9 @@ tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
 
 # Jemalloc allocator (optional)
 tikv-jemallocator = { workspace = true, optional = true }
+
+# TLS
+rustls = { workspace = true, features = ["std", "ring"] }
 
 [[bin]]
 name = "crucible-server"
