@@ -717,10 +717,18 @@ impl Session {
 
             let response = match &mut self.codec {
                 ProtocolCodec::Resp(codec) => match codec.decode_response(&mut self.buffers.recv) {
-                    Ok(Some(v)) => Some(ResponseInfo {
-                        is_error: v.is_error(),
-                        is_null: v.is_null(),
-                    }),
+                    Ok(Some(v)) => {
+                        let redirect = if v.is_error() {
+                            protocol_resp::parse_redirect(v.inner())
+                        } else {
+                            None
+                        };
+                        Some(ResponseInfo {
+                            is_error: v.is_error(),
+                            is_null: v.is_null(),
+                            redirect,
+                        })
+                    }
                     Ok(None) => None,
                     Err(e) => return Err(SessionError::Resp(e)),
                 },
@@ -729,6 +737,7 @@ impl Session {
                         Ok(Some(v)) => Some(ResponseInfo {
                             is_error: v.is_error(),
                             is_null: v.is_miss(),
+                            redirect: None,
                         }),
                         Ok(None) => None,
                         Err(e) => return Err(SessionError::Memcache(e)),
@@ -739,6 +748,7 @@ impl Session {
                         Ok(Some(v)) => Some(ResponseInfo {
                             is_error: v.is_error(),
                             is_null: v.is_miss(),
+                            redirect: None,
                         }),
                         Ok(None) => None,
                         Err(e) => return Err(SessionError::MemcacheBinary(e)),
@@ -748,6 +758,7 @@ impl Session {
                     Ok(Some(v)) => Some(ResponseInfo {
                         is_error: v.is_error(),
                         is_null: false,
+                        redirect: None,
                     }),
                     Ok(None) => None,
                     Err(e) => return Err(SessionError::Ping(e)),
@@ -773,16 +784,18 @@ impl Session {
                             None
                         };
 
+                        let is_redirect = resp.redirect.is_some();
                         results.push(RequestResult {
                             id: req.id,
-                            success: !resp.is_error,
-                            is_error_response: resp.is_error,
+                            success: !resp.is_error || is_redirect,
+                            is_error_response: resp.is_error && !is_redirect,
                             latency_ns,
                             ttfb_ns,
                             request_type: req.request_type,
                             hit,
                             key_id: req.key_id,
                             backfill: req.backfill,
+                            redirect: resp.redirect,
                         });
                         count += 1;
                     } else {
@@ -856,11 +869,17 @@ impl Session {
                 ProtocolCodec::Resp(codec) => {
                     match RespValueParser::parse_with_options(data, &resp_parse_options()) {
                         Ok((value, consumed)) => {
+                            let redirect = if value.is_error() {
+                                protocol_resp::parse_redirect(&value)
+                            } else {
+                                None
+                            };
                             recv_buf.consume(consumed);
                             codec.increment_parsed();
                             Some(ResponseInfo {
                                 is_error: value.is_error(),
                                 is_null: value.is_null(),
+                                redirect,
                             })
                         }
                         Err(protocol_resp::ParseError::Incomplete) => None,
@@ -873,6 +892,7 @@ impl Session {
                         Some(ResponseInfo {
                             is_error: value.is_error(),
                             is_null: value.is_miss(),
+                            redirect: None,
                         })
                     }
                     Err(protocol_memcache::ParseError::Incomplete) => None,
@@ -897,6 +917,7 @@ impl Session {
                             Some(ResponseInfo {
                                 is_error,
                                 is_null: is_miss,
+                                redirect: None,
                             })
                         }
                         Err(protocol_memcache::ParseError::Incomplete) => None,
@@ -915,6 +936,7 @@ impl Session {
                             Some(ResponseInfo {
                                 is_error: false, // PONG is never an error
                                 is_null: false,
+                                redirect: None,
                             })
                         }
                         Err(protocol_ping::ParseError::Incomplete) => None,
@@ -945,16 +967,18 @@ impl Session {
                             "matched response"
                         );
 
+                        let is_redirect = resp.redirect.is_some();
                         results.push(RequestResult {
                             id: req.id,
-                            success: !resp.is_error,
-                            is_error_response: resp.is_error,
+                            success: !resp.is_error || is_redirect,
+                            is_error_response: resp.is_error && !is_redirect,
                             latency_ns,
                             ttfb_ns,
                             request_type: req.request_type,
                             hit,
                             key_id: req.key_id,
                             backfill: req.backfill,
+                            redirect: resp.redirect,
                         });
                         count += 1;
                     } else {
@@ -1057,6 +1081,8 @@ impl Session {
 struct ResponseInfo {
     is_error: bool,
     is_null: bool,
+    /// Cluster redirect parsed from RESP error (MOVED/ASK).
+    redirect: Option<protocol_resp::Redirect>,
 }
 
 /// Session error type.

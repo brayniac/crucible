@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod buffer;
 pub mod client;
+pub mod cluster;
 pub mod config;
 pub mod metrics;
 pub mod output;

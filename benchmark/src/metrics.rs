@@ -141,6 +141,20 @@ pub static DISCONNECTS_CONNECT_FAILED: Counter =
 )]
 pub static TARGET_RATE: Gauge = Gauge::new();
 
+// Cluster metrics
+static CLUSTER: CounterGroup = CounterGroup::new();
+
+/// Counter slot indices for cluster metrics.
+pub mod cluster {
+    pub const REDIRECTS: usize = 0;
+}
+
+#[metric(
+    name = "cluster_redirects",
+    description = "Total MOVED/ASK redirects received"
+)]
+pub static CLUSTER_REDIRECTS: Counter = Counter::new(&CLUSTER, cluster::REDIRECTS);
+
 // Latency histograms (kept as metriken AtomicHistogram)
 #[metric(
     name = "response_latency",

@@ -124,11 +124,28 @@ fn run_benchmark_cli(config_path: &PathBuf, cli: &Cli) -> Result<(), Box<dyn std
 }
 
 fn run_benchmark(
-    config: Config,
+    mut config: Config,
     cpu_ids: Option<Vec<usize>>,
     formatter: Box<dyn OutputFormatter>,
     running: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Cluster mode: discover topology and replace endpoints with primaries
+    let slot_table = if config.target.cluster {
+        match config.target.protocol {
+            CacheProtocol::Resp | CacheProtocol::Resp3 => {}
+            other => {
+                return Err(
+                    format!("cluster mode requires resp protocol, got {:?}", other).into(),
+                );
+            }
+        }
+        let (endpoints, table) = benchmark::cluster::discover_topology(&config.target.endpoints)?;
+        config.target.endpoints = endpoints;
+        Some(table)
+    } else {
+        None
+    };
+
     let num_threads = config.general.threads;
     let warmup = config.general.warmup;
     let duration = config.general.duration;
@@ -243,6 +260,7 @@ fn run_benchmark(
                 prefill_range: prefill_ranges[id].clone(),
                 cpu_ids: cpu_ids.clone(),
                 value_pool: Arc::clone(&value_pool),
+                slot_table: slot_table.clone(),
             })
             .expect("failed to queue worker config");
     }

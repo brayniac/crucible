@@ -227,6 +227,7 @@ impl MomentoConn {
                     hit,
                     key_id: None,
                     backfill: false,
+                    redirect: None,
                 });
             }
         }

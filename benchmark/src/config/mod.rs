@@ -71,6 +71,10 @@ pub struct Target {
     pub protocol: Protocol,
     #[serde(default)]
     pub tls: bool,
+    /// Enable Redis Cluster mode: discover topology via CLUSTER SLOTS and route
+    /// by hash slot instead of ketama consistent hashing.
+    #[serde(default)]
+    pub cluster: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

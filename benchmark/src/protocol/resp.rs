@@ -166,6 +166,11 @@ impl Default for RespCodec {
 pub struct RespValue(Value);
 
 impl RespValue {
+    /// Returns a reference to the inner protocol_resp::Value.
+    pub fn inner(&self) -> &Value {
+        &self.0
+    }
+
     /// Returns true if this is a null value.
     pub fn is_null(&self) -> bool {
         self.0.is_null()

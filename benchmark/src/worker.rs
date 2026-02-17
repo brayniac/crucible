@@ -168,6 +168,8 @@ pub struct BenchWorkerConfig {
     pub cpu_ids: Option<Vec<usize>>,
     /// Shared 1GB random value pool (all workers share the same Arc).
     pub value_pool: Arc<Vec<u8>>,
+    /// Cluster mode: slot → endpoint index (16384 entries). None = ketama routing.
+    pub slot_table: Option<Vec<u16>>,
 }
 
 // ── Config channel (same pattern as server) ──────────────────────────────
@@ -327,6 +329,8 @@ pub struct BenchHandler {
 
     /// Ketama consistent hash ring for key routing.
     ring: ketama::Ring,
+    /// Cluster mode: slot → endpoint index (16384 entries). None = ketama routing.
+    slot_table: Option<Vec<u16>>,
     /// Maps endpoint_idx -> list of session indices connected to that endpoint.
     endpoint_sessions: Vec<Vec<usize>>,
     /// Per-endpoint round-robin counter for session selection.
@@ -665,14 +669,60 @@ impl BenchHandler {
         }
     }
 
-    /// Route a key to an endpoint index. Skips the hash when there is only one endpoint.
+    /// Route a key to an endpoint index.
+    ///
+    /// In cluster mode, uses CRC16 hash slot routing. Otherwise uses ketama
+    /// consistent hashing (or direct index for single endpoints).
     #[inline]
     fn route_key(&self, key: &[u8]) -> usize {
-        if self.endpoints.len() == 1 {
+        if let Some(ref table) = self.slot_table {
+            let slot = protocol_resp::hash_slot(key);
+            table[slot as usize] as usize
+        } else if self.endpoints.len() == 1 {
             0
         } else {
             self.ring.route(key)
         }
+    }
+
+    /// Find an existing endpoint or add a new one and initiate a connection.
+    ///
+    /// Used in cluster mode when a MOVED redirect points to a node not in the
+    /// original topology. Returns the endpoint index.
+    fn find_or_add_endpoint(&mut self, ctx: &mut DriverCtx, addr: SocketAddr) -> usize {
+        if let Some(idx) = self.endpoints.iter().position(|a| *a == addr) {
+            return idx;
+        }
+
+        let endpoint_idx = self.endpoints.len();
+        self.endpoints.push(addr);
+        self.endpoint_sessions.push(Vec::new());
+        self.endpoint_next.push(0);
+
+        // Create one session and initiate connection
+        if let Ok(session) = Session::from_config(addr, &self.config) {
+            let idx = self.sessions.len();
+            self.sessions.push(session);
+            self.prefill_in_flight
+                .push(std::collections::VecDeque::new());
+            self.prefill_session_last_progress
+                .push(std::time::Instant::now());
+            self.endpoint_sessions[endpoint_idx].push(idx);
+            self.sessions[idx].reconnect_attempted(true);
+            if let Ok(token) = ctx.connect(addr) {
+                self.conn_tokens.insert(token.index(), token);
+                self.pending_connects.insert(token.index(), idx);
+            }
+        }
+
+        tracing::info!(
+            worker = self.id,
+            addr = %addr,
+            endpoint_idx,
+            "added new cluster endpoint"
+        );
+
+        endpoint_idx
     }
 
     /// Pick a connected session with available pipeline capacity for the given endpoint.
@@ -1219,6 +1269,7 @@ impl EventHandler for BenchHandler {
         };
 
         let backfill_on_miss = cfg.config.workload.backfill_on_miss;
+        let slot_table = cfg.slot_table;
 
         // Build ketama consistent hash ring from endpoint addresses
         let server_ids: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
@@ -1259,6 +1310,7 @@ impl EventHandler for BenchHandler {
             backfill_queue: Vec::new(),
             backfill_on_miss,
             ring,
+            slot_table,
             endpoint_sessions,
             endpoint_next,
             tick_count: 0,
@@ -1412,6 +1464,33 @@ impl EventHandler for BenchHandler {
                 {
                     self.backfill_queue.push(key_id);
                 }
+            }
+        }
+
+        // Handle cluster redirects (MOVED/ASK)
+        // Note: can't use `if let Some(ref mut)` here because find_or_add_endpoint
+        // borrows &mut self, so we check is_some() and unwrap after the call.
+        #[allow(clippy::unnecessary_unwrap)]
+        if self.slot_table.is_some() {
+            let redirects: Vec<_> = self
+                .results
+                .iter()
+                .filter_map(|r| {
+                    r.redirect
+                        .as_ref()
+                        .map(|rd| (rd.kind, rd.slot, rd.address.clone()))
+                })
+                .collect();
+            for (kind, slot, address) in redirects {
+                metrics::CLUSTER_REDIRECTS.increment();
+                if kind == protocol_resp::RedirectKind::Moved
+                    && let Ok(addr) = address.parse::<SocketAddr>()
+                {
+                    let endpoint_idx = self.find_or_add_endpoint(ctx, addr);
+                    // Safe: checked is_some() above, find_or_add_endpoint doesn't touch slot_table
+                    self.slot_table.as_mut().unwrap()[slot as usize] = endpoint_idx as u16;
+                }
+                // ASK: count but don't update slot table (migration in progress)
             }
         }
 
@@ -1667,7 +1746,9 @@ impl EventHandler for BenchHandler {
 /// Record counter metrics for a completed request result (always called).
 fn record_counters(result: &RequestResult) {
     metrics::RESPONSES_RECEIVED.increment();
-    if result.is_error_response {
+    if result.redirect.is_some() {
+        // Redirects are counted via CLUSTER_REDIRECTS in on_data, not as errors
+    } else if result.is_error_response {
         metrics::REQUEST_ERRORS.increment();
     }
     if let Some(hit) = result.hit {

@@ -25,6 +25,8 @@ pub struct RequestResult {
     pub key_id: Option<usize>,
     /// True if this SET was triggered by a miss (backfill)
     pub backfill: bool,
+    /// Cluster redirect (MOVED/ASK), if the response was a redirect error.
+    pub redirect: Option<protocol_resp::Redirect>,
 }
 
 /// Type of request for metrics categorization.
