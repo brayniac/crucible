@@ -5,6 +5,9 @@
 //! parsing. It is designed for single-threaded, single-connection use within
 //! krio's `AsyncEventHandler::on_start()` or connection tasks.
 //!
+//! All key and value parameters accept `impl AsRef<[u8]>`, so you can pass
+//! `&str`, `String`, `&[u8]`, `Vec<u8>`, `Bytes`, etc.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -13,15 +16,16 @@
 //!
 //! async fn example(conn: ConnCtx) -> Result<(), krio_client::Error> {
 //!     let client = Client::new(conn);
-//!     client.set(b"hello", b"world").await?;
-//!     let val = client.get(b"hello").await?;
-//!     assert_eq!(val.as_deref(), Some(b"world".as_ref()));
+//!     client.set("hello", "world").await?;
+//!     let val = client.get("hello").await?;
+//!     assert_eq!(val.as_deref(), Some(&b"world"[..]));
 //!     Ok(())
 //! }
 //! ```
 
 use std::io;
 
+use bytes::Bytes;
 use krio::ConnCtx;
 use protocol_resp::{Request, Value};
 
@@ -121,10 +125,10 @@ impl Client {
     }
 
     /// Execute a command and expect a BulkString or Null response.
-    async fn execute_bulk(&self, encoded: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    async fn execute_bulk(&self, encoded: &[u8]) -> Result<Option<Bytes>, Error> {
         let value = self.execute(encoded).await?;
         match value {
-            Value::BulkString(data) => Ok(Some(data)),
+            Value::BulkString(data) => Ok(Some(Bytes::from(data))),
             Value::Null => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
@@ -149,13 +153,16 @@ impl Client {
     // ── String commands ─────────────────────────────────────────────────
 
     /// Get the value of a key.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+        let key = key.as_ref();
         self.execute_bulk(&Self::encode_request(&Request::get(key)))
             .await
     }
 
     /// Set a key-value pair.
-    pub async fn set(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+    pub async fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<(), Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         let encoded = Self::encode_set_request(&Request::set(key, value));
         let resp = self.execute(&encoded).await?;
         match resp {
@@ -165,19 +172,39 @@ impl Client {
     }
 
     /// Set a key-value pair with TTL in seconds.
-    pub async fn set_ex(&self, key: &[u8], value: &[u8], ttl_secs: u64) -> Result<(), Error> {
+    pub async fn set_ex(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_secs: u64,
+    ) -> Result<(), Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         let encoded = Self::encode_set_request(&Request::set(key, value).ex(ttl_secs));
         self.execute_ok(&encoded).await
     }
 
     /// Set a key-value pair with TTL in milliseconds.
-    pub async fn set_px(&self, key: &[u8], value: &[u8], ttl_ms: u64) -> Result<(), Error> {
+    pub async fn set_px(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_ms: u64,
+    ) -> Result<(), Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         let encoded = Self::encode_set_request(&Request::set(key, value).px(ttl_ms));
         self.execute_ok(&encoded).await
     }
 
     /// Set a key only if it does not already exist. Returns true if the key was set.
-    pub async fn set_nx(&self, key: &[u8], value: &[u8]) -> Result<bool, Error> {
+    pub async fn set_nx(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<bool, Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         let encoded = Self::encode_set_request(&Request::set(key, value).nx());
         let resp = self.execute(&encoded).await?;
         match resp {
@@ -188,14 +215,15 @@ impl Client {
     }
 
     /// Delete a key. Returns the number of keys deleted.
-    pub async fn del(&self, key: &[u8]) -> Result<u64, Error> {
+    pub async fn del(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::del(key)))
             .await
             .map(|n| n as u64)
     }
 
     /// Get values for multiple keys.
-    pub async fn mget(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Error> {
+    pub async fn mget(&self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>, Error> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -207,7 +235,7 @@ impl Client {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(data)),
+                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -219,19 +247,22 @@ impl Client {
     }
 
     /// Increment the integer value of a key by 1.
-    pub async fn incr(&self, key: &[u8]) -> Result<i64, Error> {
+    pub async fn incr(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"INCR").arg(key)))
             .await
     }
 
     /// Decrement the integer value of a key by 1.
-    pub async fn decr(&self, key: &[u8]) -> Result<i64, Error> {
+    pub async fn decr(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"DECR").arg(key)))
             .await
     }
 
     /// Increment the integer value of a key by a given amount.
-    pub async fn incrby(&self, key: &[u8], delta: i64) -> Result<i64, Error> {
+    pub async fn incrby(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
+        let key = key.as_ref();
         let delta_str = delta.to_string();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"INCRBY").arg(key).arg(delta_str.as_bytes()),
@@ -240,7 +271,8 @@ impl Client {
     }
 
     /// Decrement the integer value of a key by a given amount.
-    pub async fn decrby(&self, key: &[u8], delta: i64) -> Result<i64, Error> {
+    pub async fn decrby(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
+        let key = key.as_ref();
         let delta_str = delta.to_string();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"DECRBY").arg(key).arg(delta_str.as_bytes()),
@@ -249,7 +281,13 @@ impl Client {
     }
 
     /// Append a value to a key. Returns the length of the string after the append.
-    pub async fn append(&self, key: &[u8], value: &[u8]) -> Result<i64, Error> {
+    pub async fn append(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<i64, Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"APPEND").arg(key).arg(value),
         ))
@@ -259,14 +297,16 @@ impl Client {
     // ── Key commands ────────────────────────────────────────────────────
 
     /// Check if a key exists.
-    pub async fn exists(&self, key: &[u8]) -> Result<bool, Error> {
+    pub async fn exists(&self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"EXISTS").arg(key)))
             .await
             .map(|n| n > 0)
     }
 
     /// Set a timeout on a key in seconds.
-    pub async fn expire(&self, key: &[u8], seconds: u64) -> Result<bool, Error> {
+    pub async fn expire(&self, key: impl AsRef<[u8]>, seconds: u64) -> Result<bool, Error> {
+        let key = key.as_ref();
         let secs_str = seconds.to_string();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"EXPIRE").arg(key).arg(secs_str.as_bytes()),
@@ -276,26 +316,30 @@ impl Client {
     }
 
     /// Get the TTL of a key in seconds.
-    pub async fn ttl(&self, key: &[u8]) -> Result<i64, Error> {
+    pub async fn ttl(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"TTL").arg(key)))
             .await
     }
 
     /// Get the TTL of a key in milliseconds.
-    pub async fn pttl(&self, key: &[u8]) -> Result<i64, Error> {
+    pub async fn pttl(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"PTTL").arg(key)))
             .await
     }
 
     /// Remove the existing timeout on a key.
-    pub async fn persist(&self, key: &[u8]) -> Result<bool, Error> {
+    pub async fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"PERSIST").arg(key)))
             .await
             .map(|n| n == 1)
     }
 
     /// Get the type of a key.
-    pub async fn key_type(&self, key: &[u8]) -> Result<String, Error> {
+    pub async fn key_type(&self, key: impl AsRef<[u8]>) -> Result<String, Error> {
+        let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"TYPE").arg(key)))
             .await?;
@@ -306,7 +350,13 @@ impl Client {
     }
 
     /// Rename a key.
-    pub async fn rename(&self, key: &[u8], new_key: &[u8]) -> Result<(), Error> {
+    pub async fn rename(
+        &self,
+        key: impl AsRef<[u8]>,
+        new_key: impl AsRef<[u8]>,
+    ) -> Result<(), Error> {
+        let key = key.as_ref();
+        let new_key = new_key.as_ref();
         self.execute_ok(&Self::encode_request(
             &Request::cmd(b"RENAME").arg(key).arg(new_key),
         ))
@@ -314,7 +364,8 @@ impl Client {
     }
 
     /// Delete keys without blocking. Returns the number of keys removed.
-    pub async fn unlink(&self, key: &[u8]) -> Result<u64, Error> {
+    pub async fn unlink(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"UNLINK").arg(key)))
             .await
             .map(|n| n as u64)
@@ -323,7 +374,15 @@ impl Client {
     // ── Hash commands ───────────────────────────────────────────────────
 
     /// Set a field in a hash. Returns true if the field is new.
-    pub async fn hset(&self, key: &[u8], field: &[u8], value: &[u8]) -> Result<bool, Error> {
+    pub async fn hset(
+        &self,
+        key: impl AsRef<[u8]>,
+        field: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<bool, Error> {
+        let key = key.as_ref();
+        let field = field.as_ref();
+        let value = value.as_ref();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"HSET").arg(key).arg(field).arg(value),
         ))
@@ -332,7 +391,13 @@ impl Client {
     }
 
     /// Get the value of a hash field.
-    pub async fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    pub async fn hget(
+        &self,
+        key: impl AsRef<[u8]>,
+        field: impl AsRef<[u8]>,
+    ) -> Result<Option<Bytes>, Error> {
+        let key = key.as_ref();
+        let field = field.as_ref();
         self.execute_bulk(&Self::encode_request(
             &Request::cmd(b"HGET").arg(key).arg(field),
         ))
@@ -340,7 +405,8 @@ impl Client {
     }
 
     /// Get all fields and values in a hash.
-    pub async fn hgetall(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+    pub async fn hgetall(&self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
+        let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"HGETALL").arg(key)))
             .await?;
@@ -352,7 +418,7 @@ impl Client {
                     let val = iter.next().ok_or(Error::UnexpectedResponse)?;
                     match (field, val) {
                         (Value::BulkString(f), Value::BulkString(v)) => {
-                            result.push((f, v));
+                            result.push((Bytes::from(f), Bytes::from(v)));
                         }
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -364,7 +430,12 @@ impl Client {
     }
 
     /// Get values for multiple hash fields.
-    pub async fn hmget(&self, key: &[u8], fields: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Error> {
+    pub async fn hmget(
+        &self,
+        key: impl AsRef<[u8]>,
+        fields: &[&[u8]],
+    ) -> Result<Vec<Option<Bytes>>, Error> {
+        let key = key.as_ref();
         let mut req = Request::cmd(b"HMGET").arg(key);
         for field in fields {
             req = req.arg(field);
@@ -375,7 +446,7 @@ impl Client {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
-                        Value::BulkString(data) => result.push(Some(data)),
+                        Value::BulkString(data) => result.push(Some(Bytes::from(data))),
                         Value::Null => result.push(None),
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -387,7 +458,8 @@ impl Client {
     }
 
     /// Delete fields from a hash. Returns the number of fields removed.
-    pub async fn hdel(&self, key: &[u8], fields: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn hdel(&self, key: impl AsRef<[u8]>, fields: &[&[u8]]) -> Result<i64, Error> {
+        let key = key.as_ref();
         let mut req = Request::cmd(b"HDEL").arg(key);
         for field in fields {
             req = req.arg(field);
@@ -396,7 +468,13 @@ impl Client {
     }
 
     /// Check if a field exists in a hash.
-    pub async fn hexists(&self, key: &[u8], field: &[u8]) -> Result<bool, Error> {
+    pub async fn hexists(
+        &self,
+        key: impl AsRef<[u8]>,
+        field: impl AsRef<[u8]>,
+    ) -> Result<bool, Error> {
+        let key = key.as_ref();
+        let field = field.as_ref();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"HEXISTS").arg(key).arg(field),
         ))
@@ -405,13 +483,15 @@ impl Client {
     }
 
     /// Get the number of fields in a hash.
-    pub async fn hlen(&self, key: &[u8]) -> Result<i64, Error> {
+    pub async fn hlen(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"HLEN").arg(key)))
             .await
     }
 
     /// Get all field names in a hash.
-    pub async fn hkeys(&self, key: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    pub async fn hkeys(&self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
+        let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"HKEYS").arg(key)))
             .await?;
@@ -419,7 +499,8 @@ impl Client {
     }
 
     /// Get all values in a hash.
-    pub async fn hvals(&self, key: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    pub async fn hvals(&self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
+        let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"HVALS").arg(key)))
             .await?;
@@ -427,7 +508,14 @@ impl Client {
     }
 
     /// Increment the integer value of a hash field.
-    pub async fn hincrby(&self, key: &[u8], field: &[u8], delta: i64) -> Result<i64, Error> {
+    pub async fn hincrby(
+        &self,
+        key: impl AsRef<[u8]>,
+        field: impl AsRef<[u8]>,
+        delta: i64,
+    ) -> Result<i64, Error> {
+        let key = key.as_ref();
+        let field = field.as_ref();
         let delta_str = delta.to_string();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"HINCRBY")
@@ -439,7 +527,15 @@ impl Client {
     }
 
     /// Set a hash field only if it does not exist.
-    pub async fn hsetnx(&self, key: &[u8], field: &[u8], value: &[u8]) -> Result<bool, Error> {
+    pub async fn hsetnx(
+        &self,
+        key: impl AsRef<[u8]>,
+        field: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<bool, Error> {
+        let key = key.as_ref();
+        let field = field.as_ref();
+        let value = value.as_ref();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"HSETNX").arg(key).arg(field).arg(value),
         ))
@@ -450,7 +546,8 @@ impl Client {
     // ── List commands ───────────────────────────────────────────────────
 
     /// Push values to the head of a list. Returns the list length.
-    pub async fn lpush(&self, key: &[u8], values: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn lpush(&self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
+        let key = key.as_ref();
         let mut req = Request::cmd(b"LPUSH").arg(key);
         for v in values {
             req = req.arg(v);
@@ -459,7 +556,8 @@ impl Client {
     }
 
     /// Push values to the tail of a list. Returns the list length.
-    pub async fn rpush(&self, key: &[u8], values: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn rpush(&self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
+        let key = key.as_ref();
         let mut req = Request::cmd(b"RPUSH").arg(key);
         for v in values {
             req = req.arg(v);
@@ -468,25 +566,29 @@ impl Client {
     }
 
     /// Remove and return the first element of a list.
-    pub async fn lpop(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    pub async fn lpop(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+        let key = key.as_ref();
         self.execute_bulk(&Self::encode_request(&Request::cmd(b"LPOP").arg(key)))
             .await
     }
 
     /// Remove and return the last element of a list.
-    pub async fn rpop(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    pub async fn rpop(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+        let key = key.as_ref();
         self.execute_bulk(&Self::encode_request(&Request::cmd(b"RPOP").arg(key)))
             .await
     }
 
     /// Get the length of a list.
-    pub async fn llen(&self, key: &[u8]) -> Result<i64, Error> {
+    pub async fn llen(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"LLEN").arg(key)))
             .await
     }
 
     /// Get an element from a list by index.
-    pub async fn lindex(&self, key: &[u8], index: i64) -> Result<Option<Vec<u8>>, Error> {
+    pub async fn lindex(&self, key: impl AsRef<[u8]>, index: i64) -> Result<Option<Bytes>, Error> {
+        let key = key.as_ref();
         let idx_str = index.to_string();
         self.execute_bulk(&Self::encode_request(
             &Request::cmd(b"LINDEX").arg(key).arg(idx_str.as_bytes()),
@@ -495,7 +597,13 @@ impl Client {
     }
 
     /// Get a range of elements from a list.
-    pub async fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Vec<u8>>, Error> {
+    pub async fn lrange(
+        &self,
+        key: impl AsRef<[u8]>,
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<Bytes>, Error> {
+        let key = key.as_ref();
         let start_str = start.to_string();
         let stop_str = stop.to_string();
         let value = self
@@ -510,7 +618,8 @@ impl Client {
     }
 
     /// Trim a list to a specified range.
-    pub async fn ltrim(&self, key: &[u8], start: i64, stop: i64) -> Result<(), Error> {
+    pub async fn ltrim(&self, key: impl AsRef<[u8]>, start: i64, stop: i64) -> Result<(), Error> {
+        let key = key.as_ref();
         let start_str = start.to_string();
         let stop_str = stop.to_string();
         self.execute_ok(&Self::encode_request(
@@ -523,7 +632,14 @@ impl Client {
     }
 
     /// Set the value of an element by index.
-    pub async fn lset(&self, key: &[u8], index: i64, value: &[u8]) -> Result<(), Error> {
+    pub async fn lset(
+        &self,
+        key: impl AsRef<[u8]>,
+        index: i64,
+        value: impl AsRef<[u8]>,
+    ) -> Result<(), Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         let idx_str = index.to_string();
         self.execute_ok(&Self::encode_request(
             &Request::cmd(b"LSET")
@@ -535,7 +651,13 @@ impl Client {
     }
 
     /// Push a value to the head of a list only if the list exists. Returns the list length.
-    pub async fn lpushx(&self, key: &[u8], value: &[u8]) -> Result<i64, Error> {
+    pub async fn lpushx(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<i64, Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"LPUSHX").arg(key).arg(value),
         ))
@@ -543,7 +665,13 @@ impl Client {
     }
 
     /// Push a value to the tail of a list only if the list exists. Returns the list length.
-    pub async fn rpushx(&self, key: &[u8], value: &[u8]) -> Result<i64, Error> {
+    pub async fn rpushx(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<i64, Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"RPUSHX").arg(key).arg(value),
         ))
@@ -553,7 +681,8 @@ impl Client {
     // ── Set commands ────────────────────────────────────────────────────
 
     /// Add members to a set. Returns the number of members added.
-    pub async fn sadd(&self, key: &[u8], members: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn sadd(&self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
+        let key = key.as_ref();
         let mut req = Request::cmd(b"SADD").arg(key);
         for m in members {
             req = req.arg(m);
@@ -562,7 +691,8 @@ impl Client {
     }
 
     /// Remove members from a set. Returns the number of members removed.
-    pub async fn srem(&self, key: &[u8], members: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn srem(&self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
+        let key = key.as_ref();
         let mut req = Request::cmd(b"SREM").arg(key);
         for m in members {
             req = req.arg(m);
@@ -571,7 +701,8 @@ impl Client {
     }
 
     /// Get all members of a set.
-    pub async fn smembers(&self, key: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    pub async fn smembers(&self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
+        let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"SMEMBERS").arg(key)))
             .await?;
@@ -579,13 +710,20 @@ impl Client {
     }
 
     /// Get the number of members in a set.
-    pub async fn scard(&self, key: &[u8]) -> Result<i64, Error> {
+    pub async fn scard(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+        let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"SCARD").arg(key)))
             .await
     }
 
     /// Check if a member exists in a set.
-    pub async fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool, Error> {
+    pub async fn sismember(
+        &self,
+        key: impl AsRef<[u8]>,
+        member: impl AsRef<[u8]>,
+    ) -> Result<bool, Error> {
+        let key = key.as_ref();
+        let member = member.as_ref();
         self.execute_int(&Self::encode_request(
             &Request::cmd(b"SISMEMBER").arg(key).arg(member),
         ))
@@ -594,7 +732,12 @@ impl Client {
     }
 
     /// Check if multiple members exist in a set.
-    pub async fn smismember(&self, key: &[u8], members: &[&[u8]]) -> Result<Vec<bool>, Error> {
+    pub async fn smismember(
+        &self,
+        key: impl AsRef<[u8]>,
+        members: &[&[u8]],
+    ) -> Result<Vec<bool>, Error> {
+        let key = key.as_ref();
         let mut req = Request::cmd(b"SMISMEMBER").arg(key);
         for m in members {
             req = req.arg(m);
@@ -616,13 +759,19 @@ impl Client {
     }
 
     /// Remove and return a random member from a set.
-    pub async fn spop(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    pub async fn spop(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+        let key = key.as_ref();
         self.execute_bulk(&Self::encode_request(&Request::cmd(b"SPOP").arg(key)))
             .await
     }
 
     /// Get random members from a set.
-    pub async fn srandmember(&self, key: &[u8], count: i64) -> Result<Vec<Vec<u8>>, Error> {
+    pub async fn srandmember(
+        &self,
+        key: impl AsRef<[u8]>,
+        count: i64,
+    ) -> Result<Vec<Bytes>, Error> {
+        let key = key.as_ref();
         let count_str = count.to_string();
         let value = self
             .execute(&Self::encode_request(
@@ -666,7 +815,8 @@ impl Client {
     }
 
     /// Get configuration parameter values.
-    pub async fn config_get(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+    pub async fn config_get(&self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
+        let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::config_get(key)))
             .await?;
@@ -678,7 +828,7 @@ impl Client {
                     let v = iter.next().ok_or(Error::UnexpectedResponse)?;
                     match (k, v) {
                         (Value::BulkString(kk), Value::BulkString(vv)) => {
-                            result.push((kk, vv));
+                            result.push((Bytes::from(kk), Bytes::from(vv)));
                         }
                         _ => return Err(Error::UnexpectedResponse),
                     }
@@ -690,7 +840,13 @@ impl Client {
     }
 
     /// Set a configuration parameter.
-    pub async fn config_set(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+    pub async fn config_set(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<(), Error> {
+        let key = key.as_ref();
+        let value = value.as_ref();
         self.execute_ok(&Self::encode_request(&Request::config_set(key, value)))
             .await
     }
@@ -809,13 +965,13 @@ impl Pipeline {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn parse_bytes_array(value: Value) -> Result<Vec<Vec<u8>>, Error> {
+fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
     match value {
         Value::Array(arr) => {
             let mut result = Vec::with_capacity(arr.len());
             for v in arr {
                 match v {
-                    Value::BulkString(data) => result.push(data),
+                    Value::BulkString(data) => result.push(Bytes::from(data)),
                     _ => return Err(Error::UnexpectedResponse),
                 }
             }

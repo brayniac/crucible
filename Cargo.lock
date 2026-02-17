@@ -1481,6 +1481,7 @@ dependencies = [
 name = "krio-client"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "krio",
  "protocol-resp",
  "segcache",

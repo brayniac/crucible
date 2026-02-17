@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 krio = { workspace = true }
 protocol-resp = { workspace = true }
 thiserror = { workspace = true }

@@ -109,6 +109,9 @@ fn krio_config() -> Config {
 
 // ── Test runner helper ──────────────────────────────────────────────────
 
+// Serialize tests — NEXT_TEST can only hold one test's state at a time.
+static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run an async test function inside krio's on_start().
 ///
 /// The test function receives a connected `krio_client::Client` and should
@@ -121,6 +124,7 @@ where
         + Send
         + 'static,
 {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let addr = server_addr();
 
     // Channel to send result from on_start back to test thread.
