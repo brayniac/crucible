@@ -14,3 +14,4 @@ quinn-proto = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["std", "ring"] }
 rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }

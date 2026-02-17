@@ -49,6 +49,7 @@
 pub mod connection;
 pub mod error;
 pub mod frame;
+mod huffman;
 pub mod qpack;
 pub mod settings;
 mod stream;

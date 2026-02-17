@@ -297,7 +297,8 @@ pub fn decode(buf: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
                 .get(name_index as usize)
                 .ok_or(H3Error::QpackDecodingFailed)?;
 
-            // Decode value.
+            // Decode value (bit 7 = Huffman flag).
+            let huffman_value = pos < buf.len() && buf[pos] & 0x80 != 0;
             let (value_len, n) =
                 decode_prefix_int(&buf[pos..], 7).ok_or(H3Error::QpackDecodingFailed)?;
             pos += n;
@@ -305,7 +306,11 @@ pub fn decode(buf: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
             if pos + value_len > buf.len() {
                 return Err(H3Error::QpackDecodingFailed);
             }
-            let value = buf[pos..pos + value_len].to_vec();
+            let value = if huffman_value {
+                crate::huffman::decode(&buf[pos..pos + value_len])?
+            } else {
+                buf[pos..pos + value_len].to_vec()
+            };
             pos += value_len;
 
             headers.push(HeaderField {
@@ -315,11 +320,8 @@ pub fn decode(buf: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
         } else if first & 0x20 != 0 {
             // Literal with literal name (Section 4.5.6): pattern 001xxxxx
             // Bit 4 (N): never-index (ignored).
-            // Bit 3 (H): Huffman-encoded name (we only support non-Huffman).
+            // Bit 3 (H): Huffman-encoded name.
             let huffman_name = first & 0x08 != 0;
-            if huffman_name {
-                return Err(H3Error::QpackDecodingFailed);
-            }
             let (name_len, n) =
                 decode_prefix_int(&buf[pos..], 3).ok_or(H3Error::QpackDecodingFailed)?;
             pos += n;
@@ -327,14 +329,15 @@ pub fn decode(buf: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
             if pos + name_len > buf.len() {
                 return Err(H3Error::QpackDecodingFailed);
             }
-            let name = buf[pos..pos + name_len].to_vec();
+            let name = if huffman_name {
+                crate::huffman::decode(&buf[pos..pos + name_len])?
+            } else {
+                buf[pos..pos + name_len].to_vec()
+            };
             pos += name_len;
 
-            // Decode value.
+            // Decode value (bit 7 = Huffman flag).
             let huffman_value = pos < buf.len() && buf[pos] & 0x80 != 0;
-            if huffman_value {
-                return Err(H3Error::QpackDecodingFailed);
-            }
             let (value_len, n) =
                 decode_prefix_int(&buf[pos..], 7).ok_or(H3Error::QpackDecodingFailed)?;
             pos += n;
@@ -342,7 +345,11 @@ pub fn decode(buf: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
             if pos + value_len > buf.len() {
                 return Err(H3Error::QpackDecodingFailed);
             }
-            let value = buf[pos..pos + value_len].to_vec();
+            let value = if huffman_value {
+                crate::huffman::decode(&buf[pos..pos + value_len])?
+            } else {
+                buf[pos..pos + value_len].to_vec()
+            };
             pos += value_len;
 
             headers.push(HeaderField { name, value });

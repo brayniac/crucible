@@ -125,7 +125,8 @@ impl H3Connection {
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
         quic.stream_send(conn, stream, &buf)?;
-        quic.stream_finish(conn, stream)?;
+        // Note: do NOT call stream_finish on the control stream.
+        // RFC 9114 Section 6.2.1: closing the control stream is a connection error.
 
         self.settings_sent = true;
         Ok(())
@@ -143,18 +144,19 @@ impl H3Connection {
             QuicEvent::NewConnection(conn) => {
                 self.accept(quic, *conn)?;
             }
-            QuicEvent::StreamOpened {
-                conn: _,
-                stream,
-                bidi,
-            } => {
+            QuicEvent::StreamOpened { conn, stream, bidi } => {
                 if *bidi {
                     // New bidirectional stream = new HTTP request.
                     self.request_streams
                         .insert(u64::from(*stream), RequestStream::new());
+                    // Proactively try to read — data may have arrived in the
+                    // same QUIC packet that opened the stream, in which case
+                    // quinn-proto won't fire a separate StreamReadable event.
+                    self.read_request_stream(quic, *conn, *stream)?;
                 } else {
                     // Unidirectional stream — need to read the type byte.
-                    self.pending_uni_streams.push(*stream);
+                    // Try to identify immediately (data may already be available).
+                    self.identify_uni_stream(quic, *conn, *stream)?;
                 }
             }
             QuicEvent::StreamReadable { conn, stream } => {

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use http3::{H3Connection, H3Event, HeaderField, Settings};
 use krio::{Config, ConnToken, DriverCtx, EventHandler, KrioBuilder, UdpToken};
-use krio_quic::{QuicConfig, QuicEndpoint, QuicEvent};
+use krio_quic::{QuicConfig, QuicEndpoint};
 use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event,
     ServerConfig,
@@ -101,15 +101,11 @@ impl H3Server {
         let mut quic = self.quic.take().unwrap();
 
         while let Some(event) = quic.poll_event() {
-            eprintln!("[H3Server] QUIC event: {event:?}");
-            if let Err(e) = self.h3.handle_quic_event(&mut quic, &event) {
-                eprintln!("[H3Server] handle_quic_event error: {e}");
-            }
+            let _ = self.h3.handle_quic_event(&mut quic, &event);
         }
 
         // Process H3 events: echo back responses.
         while let Some(event) = self.h3.poll_event() {
-            eprintln!("[H3Server] H3 event: {event:?}");
             match event {
                 H3Event::Request {
                     stream_id,
@@ -118,13 +114,11 @@ impl H3Server {
                 } => {
                     // Check if it's a GET (no body expected) or POST.
                     let method = headers.iter().find(|h| h.name == b":method");
-                    let is_get =
-                        method.is_some_and(|m| m.value == b"GET");
+                    let is_get = method.is_some_and(|m| m.value == b"GET");
 
                     if is_get || end_stream {
                         // Send 200 response with "hello" body.
-                        let response_headers =
-                            vec![HeaderField::new(b":status", b"200")];
+                        let response_headers = vec![HeaderField::new(b":status", b"200")];
                         let _ =
                             self.h3
                                 .send_response(&mut quic, stream_id, &response_headers, false);
@@ -139,8 +133,7 @@ impl H3Server {
                 } => {
                     if end_stream {
                         // Echo the body back.
-                        let response_headers =
-                            vec![HeaderField::new(b":status", b"200")];
+                        let response_headers = vec![HeaderField::new(b":status", b"200")];
                         let _ =
                             self.h3
                                 .send_response(&mut quic, stream_id, &response_headers, false);
@@ -255,11 +248,8 @@ impl H3TestClient {
         http3::frame::encode_varint(&mut buf, 0x00);
         // SETTINGS frame with defaults (empty payload).
         http3::Frame::Settings(Settings::default()).encode(&mut buf);
-        self.conn
-            .send_stream(control_stream)
-            .write(&buf)
-            .unwrap();
-        self.conn.send_stream(control_stream).finish().unwrap();
+        self.conn.send_stream(control_stream).write(&buf).unwrap();
+        // Do NOT finish the control stream — RFC 9114 requires it stays open.
         self.flush_transmits();
     }
 
@@ -368,10 +358,7 @@ impl H3TestClient {
             .encode(&mut frame_buf);
         }
 
-        self.conn
-            .send_stream(stream)
-            .write(&frame_buf)
-            .unwrap();
+        self.conn.send_stream(stream).write(&frame_buf).unwrap();
         self.conn.send_stream(stream).finish().unwrap();
         self.flush_transmits();
         stream

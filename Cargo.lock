@@ -1280,6 +1280,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
