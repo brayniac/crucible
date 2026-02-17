@@ -4,6 +4,10 @@
 //! 1. A krio backend that speaks RESP (simple echo of raw bytes)
 //! 2. An async proxy connected to that backend
 //! 3. A TCP client that sends RESP commands to the proxy
+//!
+//! Tests are serialized via `TEST_MUTEX` because `run_async` uses a global
+//! config channel (`ASYNC_CONFIG_CHANNEL`) that would be clobbered by
+//! concurrent test execution.
 
 use std::future::Future;
 use std::io::{Read, Write};
@@ -11,10 +15,14 @@ use std::net::TcpStream;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use krio::{AsyncEventHandler, Config, ConnCtx, KrioBuilder};
 use proxy::async_worker::run_async;
+
+/// Serialize all async proxy tests to prevent global config channel races.
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 // ── RESP backend handler ────────────────────────────────────────────
 
@@ -194,6 +202,7 @@ fn start_async_proxy(
 
 #[test]
 fn async_proxy_ping() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
     let proxy_port = free_port();
@@ -225,6 +234,7 @@ fn async_proxy_ping() {
 
 #[test]
 fn async_proxy_set_get() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
     let proxy_port = free_port();
@@ -268,6 +278,7 @@ fn async_proxy_set_get() {
 
 #[test]
 fn async_proxy_cache_hit() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
     let proxy_port = free_port();
@@ -310,6 +321,7 @@ fn async_proxy_cache_hit() {
 
 #[test]
 fn async_proxy_backend_disconnect() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
     let proxy_port = free_port();
@@ -351,6 +363,7 @@ fn async_proxy_backend_disconnect() {
 
 #[test]
 fn async_proxy_multiple_clients() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
     let proxy_port = free_port();
@@ -384,6 +397,7 @@ fn async_proxy_multiple_clients() {
 
 #[test]
 fn async_proxy_idle_backend_disconnect() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // Start backend and proxy.
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
