@@ -178,6 +178,7 @@ fn create_segment(
                     segment_count,
                     block_size: 4096,
                     promotion_threshold: disk_config.promotion_threshold,
+                    max_item_read_size: config.cache.max_value_size + 1024,
                 };
                 builder = builder.io_uring_disk_tier(io_uring_tier);
             }

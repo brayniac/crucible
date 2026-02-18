@@ -1463,6 +1463,59 @@ pub fn nvme_read(
     })
 }
 
+/// Submit a Direct I/O write and return a future for the result.
+///
+/// Writes `len` bytes from `buf` at `offset` on the file.
+/// The returned future completes when the io_uring CQE arrives.
+///
+/// # Safety
+///
+/// `buf` must point to aligned, readable memory of at least `len` bytes
+/// that remains valid until the future completes.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub unsafe fn direct_io_write(
+    file: crate::direct_io::DirectIoFile,
+    offset: u64,
+    buf: *const u8,
+    len: u32,
+) -> io::Result<DiskIoFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.disk_io_waiters.insert(seq, task_id);
+        Ok(DiskIoFuture { seq })
+    })
+}
+
+/// Submit an NVMe write and return a future for the result.
+///
+/// Writes `num_blocks` logical blocks starting at `lba` from the buffer
+/// at `buf_addr` with length `buf_len`. The returned future completes
+/// when the io_uring CQE arrives.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn nvme_write(
+    device: crate::nvme::NvmeDevice,
+    lba: u64,
+    num_blocks: u16,
+    buf_addr: u64,
+    buf_len: u32,
+) -> io::Result<DiskIoFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let seq = ctx.nvme_write(device, lba, num_blocks, buf_addr, buf_len)?;
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.disk_io_waiters.insert(seq, task_id);
+        Ok(DiskIoFuture { seq })
+    })
+}
+
 // ── UDP async API ───────────────────────────────────────────────────
 
 /// Async context for a UDP socket.

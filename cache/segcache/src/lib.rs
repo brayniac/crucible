@@ -269,6 +269,12 @@ pub struct IoUringDiskTierConfig {
     pub block_size: u32,
     /// Frequency threshold for promoting items from disk to RAM.
     pub promotion_threshold: u8,
+    /// Maximum read size for disk reads.
+    ///
+    /// Determines how many bytes are read from disk per item lookup.
+    /// Must be large enough to cover the largest item (header + key + value).
+    /// Default: 0 (auto = segment_size).
+    pub max_item_read_size: usize,
 }
 
 impl Default for IoUringDiskTierConfig {
@@ -277,6 +283,7 @@ impl Default for IoUringDiskTierConfig {
             segment_count: 128,
             block_size: 4096,
             promotion_threshold: 2,
+            max_item_read_size: 0,
         }
     }
 }
@@ -580,14 +587,18 @@ impl SegCacheBuilder {
                 .with_ghosts(self.enable_ghosts)
                 .with_eviction_strategy(EvictionStrategy::Random);
 
-            let io_uring_layer = IoUringDiskLayerBuilder::new()
+            let mut io_uring_builder = IoUringDiskLayerBuilder::new()
                 .layer_id(1)
                 .pool_id(2)
                 .config(disk_layer_config)
                 .segment_size(self.segment_size)
                 .segment_count(io_uring_config.segment_count)
-                .block_size(io_uring_config.block_size)
-                .build();
+                .block_size(io_uring_config.block_size);
+            if io_uring_config.max_item_read_size > 0 {
+                io_uring_builder =
+                    io_uring_builder.max_read_size(io_uring_config.max_item_read_size as u32);
+            }
+            let io_uring_layer = io_uring_builder.build();
 
             builder = builder.with_io_uring_disk_layer(io_uring_layer);
         }
@@ -690,14 +701,18 @@ impl SegCacheBuilder {
                 .with_ghosts(true)
                 .with_eviction_strategy(EvictionStrategy::Random);
 
-            let io_uring_layer = IoUringDiskLayerBuilder::new()
+            let mut io_uring_builder = IoUringDiskLayerBuilder::new()
                 .layer_id(2)
                 .pool_id(2)
                 .config(disk_layer_config)
                 .segment_size(self.segment_size)
                 .segment_count(io_uring_config.segment_count)
-                .block_size(io_uring_config.block_size)
-                .build();
+                .block_size(io_uring_config.block_size);
+            if io_uring_config.max_item_read_size > 0 {
+                io_uring_builder =
+                    io_uring_builder.max_read_size(io_uring_config.max_item_read_size as u32);
+            }
+            let io_uring_layer = io_uring_builder.build();
 
             builder = builder.with_io_uring_disk_layer(io_uring_layer);
         }
@@ -724,6 +739,18 @@ impl Cache for SegCache {
 
     fn lookup(&self, key: &[u8]) -> LookupResult {
         self.inner.lookup(key)
+    }
+
+    fn take_disk_flush_requests(&self) -> Vec<cache_core::disk::FlushRequest> {
+        self.inner.take_disk_flush_requests()
+    }
+
+    fn complete_disk_flush(&self, segment_id: u32) {
+        self.inner.complete_disk_flush(segment_id);
+    }
+
+    fn release_disk_read(&self, segment_id: u32, pool_id: u8) {
+        self.inner.release_disk_read(segment_id, pool_id);
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {

@@ -56,7 +56,7 @@ fn send_get(stream: &mut TcpStream, key: &str) -> Option<String> {
         return None;
     }
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 16384];
     let mut total_read = 0;
     let start = Instant::now();
 
@@ -144,6 +144,7 @@ fn start_disk_test_server_callback(
                 segment_count,
                 block_size: 4096,
                 promotion_threshold: 2,
+                max_item_read_size: config.cache.max_value_size + 1024,
             })
             .build()
             .unwrap();
@@ -199,6 +200,7 @@ fn start_disk_test_server_async(port: u16, disk_path: &std::path::Path) -> threa
                 segment_count,
                 block_size: 4096,
                 promotion_threshold: 2,
+                max_item_read_size: config.cache.max_value_size + 1024,
             })
             .build()
             .unwrap();
@@ -216,14 +218,82 @@ fn make_value(key_id: usize, size: usize) -> String {
     seed.chars().cycle().take(size).collect()
 }
 
+/// Run a simple RAM-only test first: write 50 small keys that fit in RAM.
+fn run_ram_sanity_check(addr: SocketAddr) {
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    // Write 50 small items that easily fit in RAM (no eviction)
+    let num_keys = 50;
+    for i in 0..num_keys {
+        let key = format!("sanity:{}", i);
+        let value = format!("val_{}", i);
+        assert!(
+            send_set(&mut stream, &key, &value),
+            "Sanity SET failed for key {}",
+            i
+        );
+    }
+
+    // Read them back — all should be found
+    let mut hits = 0;
+    for i in 0..num_keys {
+        let key = format!("sanity:{}", i);
+        if send_get(&mut stream, &key).is_some() {
+            hits += 1;
+        }
+    }
+
+    eprintln!("RAM sanity check: {} hits out of {} keys", hits, num_keys);
+    assert_eq!(
+        hits, num_keys,
+        "RAM sanity check failed: expected {} hits, got {}",
+        num_keys, hits
+    );
+    drop(stream);
+}
+
 /// Run the disk tier test: fill RAM, trigger demotion, read back demoted keys.
 fn run_disk_tier_test(port: u16, addr: SocketAddr) {
-    // 4MB RAM with 1MB segments = 4 segments.
-    // With S3-FIFO (10% small queue), effective capacity is ~3.6 segments.
-    // Each item is ~256B, so ~14000 items per segment, ~50000 total in RAM.
-    // We write far more than that to guarantee demotion to disk.
+    // First run a sanity check to verify basic SET/GET works
+    run_ram_sanity_check(addr);
 
-    let value_size = 256;
+    // Second sanity check: 2000 small keys (all fit in RAM, no eviction)
+    {
+        let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+        stream.set_nodelay(true).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+
+        let num = 2000;
+        for i in 0..num {
+            let key = format!("small:{}", i);
+            let value = format!("v{}", i);
+            assert!(send_set(&mut stream, &key, &value), "Small SET failed for key {}", i);
+        }
+        let mut small_hits = 0;
+        for i in 0..num {
+            let key = format!("small:{}", i);
+            if send_get(&mut stream, &key).is_some() {
+                small_hits += 1;
+            }
+        }
+        eprintln!("Small value check: {} hits out of {} keys", small_hits, num);
+        drop(stream);
+    }
+
+    // 4MB RAM with 1MB segments = 4 segments.
+    // Each item is ~8KB, so ~128 items per segment, ~500 total in RAM.
+    // 2000 keys × 8KB = 16MB total >> 4MB RAM → forces eviction/demotion.
+    // Disk tier (8MB) can hold ~1000 items after demotion.
+
+    let value_size = 8192;
     let num_keys = 2000;
 
     let mut stream = TcpStream::connect(addr).expect("Failed to connect");
@@ -266,10 +336,12 @@ fn run_disk_tier_test(port: u16, addr: SocketAddr) {
         num_keys, hits, correct, port
     );
 
-    // We expect at least some hits (RAM + disk) and all hits should have correct values.
+    // RAM can hold ~500 items (4MB / 8KB). With disk tier, hits should be well above that.
+    // We expect at least 600 hits to prove disk reads are working.
     assert!(
-        hits > 0,
-        "Expected at least some hits from RAM + disk, got 0"
+        hits > 600,
+        "Expected hits from disk tier, got only {} (RAM-only would be ~500)",
+        hits
     );
     assert_eq!(
         hits, correct,

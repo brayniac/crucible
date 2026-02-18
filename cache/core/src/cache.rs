@@ -858,7 +858,7 @@ impl<H: Hashtable> TieredCache<H> {
                     return LookupResult::Hit(vr);
                 }
                 // Need async disk read
-                match disk_layer.prepare_read(item_loc, disk_layer.pool().block_size()) {
+                match disk_layer.prepare_read(item_loc, disk_layer.max_read_size()) {
                     Some(params) => LookupResult::DiskRead(params),
                     None => LookupResult::Miss,
                 }
@@ -1458,6 +1458,44 @@ impl<H: Hashtable> TieredCache<H> {
         }
 
         CacheKeyVerifier { pools }
+    }
+
+    /// Drain the io_uring disk layer's flush queue.
+    ///
+    /// Returns sealed segments that need to be flushed to disk via io_uring.
+    /// Returns an empty vec if no io_uring disk layer is configured.
+    pub fn take_disk_flush_requests(&self) -> Vec<crate::disk::FlushRequest> {
+        for layer in &self.layers {
+            if let CacheLayer::IoUringDisk(disk_layer) = layer {
+                return disk_layer.take_flush_queue();
+            }
+        }
+        vec![]
+    }
+
+    /// Complete a disk flush operation on the io_uring disk layer.
+    ///
+    /// Called when an io_uring write completes. Detaches the write buffer
+    /// from the segment and returns it to the buffer pool.
+    pub fn complete_disk_flush(&self, segment_id: u32) {
+        for layer in &self.layers {
+            if let CacheLayer::IoUringDisk(disk_layer) = layer {
+                disk_layer.complete_flush(segment_id);
+                return;
+            }
+        }
+    }
+
+    /// Release a disk segment's ref_count after a read completes.
+    ///
+    /// Called when the server handler finishes processing a disk read.
+    pub fn release_disk_read(&self, segment_id: u32, _pool_id: u8) {
+        for layer in &self.layers {
+            if let CacheLayer::IoUringDisk(disk_layer) = layer {
+                disk_layer.release_read(segment_id);
+                return;
+            }
+        }
     }
 
     /// Flush all items from the cache.

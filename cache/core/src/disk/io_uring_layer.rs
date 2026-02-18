@@ -120,6 +120,17 @@ pub struct IoUringDiskLayer {
 
     /// Queue of sealed segments pending flush to disk.
     flush_queue: Mutex<Vec<FlushRequest>>,
+
+    /// Write buffer pool for staging segment data before flush.
+    buffer_pool: Mutex<AlignedBufferPool>,
+
+    /// Maximum read size for disk reads.
+    ///
+    /// When `prepare_read()` is called, this determines how many bytes
+    /// to read from disk starting at the item's position. Must be large
+    /// enough to cover the largest item (header + key + value + padding).
+    /// Defaults to `segment_size`.
+    max_read_size: u32,
 }
 
 impl IoUringDiskLayer {
@@ -136,6 +147,15 @@ impl IoUringDiskLayer {
     /// Get the TTL buckets.
     pub fn buckets(&self) -> &TtlBuckets {
         &self.buckets
+    }
+
+    /// Maximum bytes to read per disk read operation.
+    ///
+    /// This determines the `read_size` parameter for `prepare_read()`.
+    /// The server must allocate read buffers at least this large
+    /// (plus one block for alignment).
+    pub fn max_read_size(&self) -> u32 {
+        self.max_read_size
     }
 
     /// Get current time as coarse seconds.
@@ -353,12 +373,12 @@ impl IoUringDiskLayer {
     /// Complete a flush operation.
     ///
     /// Called when an io_uring write completes. Detaches the write buffer
-    /// from the segment and returns it to the provided buffer pool.
-    pub fn complete_flush(&self, segment_id: u32, buffer_pool: &mut AlignedBufferPool) {
+    /// from the segment and returns it to the internal buffer pool.
+    pub fn complete_flush(&self, segment_id: u32) {
         if let Some(segment) = self.pool.get(segment_id)
             && let Some(buf) = segment.detach_write_buffer()
         {
-            buffer_pool.release(buf);
+            self.buffer_pool.lock().unwrap().release(buf);
         }
     }
 
@@ -653,15 +673,13 @@ impl Layer for IoUringDiskLayer {
 
     fn write_item(
         &self,
-        _key: &[u8],
-        _value: &[u8],
-        _optional: &[u8],
-        _ttl: Duration,
+        key: &[u8],
+        value: &[u8],
+        optional: &[u8],
+        ttl: Duration,
     ) -> CacheResult<ItemLocation> {
-        // Use write_item_with_buffers() instead — this requires a buffer pool.
-        // This method exists to satisfy the Layer trait but shouldn't be called
-        // directly for IoUringDiskLayer.
-        Err(CacheError::Unsupported)
+        let mut pool = self.buffer_pool.lock().unwrap();
+        self.write_item_with_buffers(key, value, optional, ttl, &mut pool)
     }
 
     fn get_item(&self, location: ItemLocation, key: &[u8]) -> Option<Self::Guard<'_>> {
@@ -809,6 +827,8 @@ pub struct IoUringDiskLayerBuilder {
     segment_size: usize,
     segment_count: usize,
     block_size: u32,
+    write_buffer_count: Option<usize>,
+    max_read_size: Option<u32>,
 }
 
 impl IoUringDiskLayerBuilder {
@@ -823,6 +843,8 @@ impl IoUringDiskLayerBuilder {
             segment_size: 8 * 1024 * 1024, // 8MB
             segment_count: 128,
             block_size: 4096,
+            write_buffer_count: None,
+            max_read_size: None,
         }
     }
 
@@ -862,6 +884,27 @@ impl IoUringDiskLayerBuilder {
         self
     }
 
+    /// Set the number of write buffers.
+    ///
+    /// Defaults to `min(segment_count, 32).max(4)`.
+    pub fn write_buffer_count(mut self, count: usize) -> Self {
+        self.write_buffer_count = Some(count);
+        self
+    }
+
+    /// Set the maximum read size for disk reads.
+    ///
+    /// This determines how many bytes are read from disk for each item.
+    /// Must be large enough to cover the largest possible item
+    /// (header + key + value + padding). Defaults to `segment_size`.
+    ///
+    /// The server must allocate read buffers at least `max_read_size + block_size`
+    /// bytes to account for block alignment.
+    pub fn max_read_size(mut self, size: u32) -> Self {
+        self.max_read_size = Some(size);
+        self
+    }
+
     /// Build the IoUringDiskLayer.
     pub fn build(self) -> IoUringDiskLayer {
         let pool = IoUringPool::new(
@@ -876,6 +919,16 @@ impl IoUringDiskLayerBuilder {
 
         let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 
+        let write_buffer_count = self
+            .write_buffer_count
+            .unwrap_or_else(|| self.segment_count.clamp(4, 32));
+        let buffer_pool =
+            AlignedBufferPool::new(write_buffer_count, self.segment_size, self.block_size as usize);
+
+        let max_read_size = self
+            .max_read_size
+            .unwrap_or(self.segment_size as u32);
+
         IoUringDiskLayer {
             layer_id: self.layer_id,
             config: self.config,
@@ -883,6 +936,8 @@ impl IoUringDiskLayerBuilder {
             buckets,
             current_write_segments,
             flush_queue: Mutex::new(Vec::new()),
+            buffer_pool: Mutex::new(buffer_pool),
+            max_read_size,
         }
     }
 }

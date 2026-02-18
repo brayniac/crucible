@@ -575,6 +575,38 @@ pub trait Cache: Send + Sync + 'static {
         Err(CacheError::Unsupported)
     }
 
+    /// Drain the disk layer's flush queue.
+    ///
+    /// Returns sealed segments that need to be flushed to disk via io_uring.
+    /// Called by the server handler on each tick.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns an empty vec (no disk tier).
+    fn take_disk_flush_requests(&self) -> Vec<crate::disk::FlushRequest> {
+        vec![]
+    }
+
+    /// Complete a disk flush operation.
+    ///
+    /// Called when an io_uring write completes. Detaches the write buffer
+    /// from the segment and returns it to the buffer pool.
+    ///
+    /// # Default Implementation
+    ///
+    /// No-op (no disk tier).
+    fn complete_disk_flush(&self, _segment_id: u32) {}
+
+    /// Release a disk segment's ref_count after a read completes.
+    ///
+    /// Called when the server handler finishes processing a disk read.
+    /// Decrements the segment ref_count that was incremented by `prepare_read()`.
+    ///
+    /// # Default Implementation
+    ///
+    /// No-op (no disk tier).
+    fn release_disk_read(&self, _segment_id: u32, _pool_id: u8) {}
+
     /// Look up a key, returning either an immediate hit or disk read params.
     ///
     /// For items in RAM (or in a disk segment's write buffer), returns

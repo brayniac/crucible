@@ -241,6 +241,16 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
     fn on_tick(&mut self, ctx: &mut DriverCtx) {
         self.stats[self.worker_id].inc_poll();
 
+        // Drain disk flush queue and submit io_uring writes.
+        if self.disk_io.is_some() {
+            let flush_requests = self.cache.take_disk_flush_requests();
+            for req in flush_requests {
+                if let Err(e) = self.submit_disk_flush(ctx, req) {
+                    tracing::warn!("Disk flush submit failed: {e}");
+                }
+            }
+        }
+
         if self.shutdown.load(Ordering::Relaxed) {
             let active = self.connections.iter().filter(|c| c.is_some()).count();
             if active == 0 {
@@ -317,6 +327,39 @@ impl<C: Cache> ServerHandler<C> {
         Ok(DiskIoState::new(backend, read_buffer_pool, 256))
     }
 
+    /// Submit a disk flush (write) via io_uring.
+    fn submit_disk_flush(
+        &mut self,
+        ctx: &mut DriverCtx,
+        req: cache_core::FlushRequest,
+    ) -> io::Result<()> {
+        let disk_io = self.disk_io.as_mut().ok_or_else(|| {
+            io::Error::other("disk I/O not initialized")
+        })?;
+
+        let seq = match &disk_io.backend {
+            DiskBackend::Nvme { device, block_size } => {
+                let lba = req.disk_offset / *block_size as u64;
+                let num_blocks = (req.buffer_len / *block_size) as u16;
+                // buffer_ptr points to the write buffer's stable allocation
+                let buf_addr = req.buffer_ptr as u64;
+                ctx.nvme_write(*device, lba, num_blocks, buf_addr, req.buffer_len)?
+            }
+            DiskBackend::DirectIo { file, .. } => unsafe {
+                ctx.direct_io_write(*file, req.disk_offset, req.buffer_ptr, req.buffer_len)?
+            },
+        };
+
+        disk_io.store_pending_flush(
+            seq,
+            crate::disk_io::PendingFlush {
+                segment_id: req.segment_id,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Submit a disk read via io_uring.
     fn submit_disk_read(
         ctx: &mut DriverCtx,
@@ -376,6 +419,10 @@ impl<C: Cache> ServerHandler<C> {
             return;
         };
 
+        // Save params for release_disk_read before moving pending
+        let segment_id = pending.params.segment_id;
+        let pool_id = pending.params.pool_id;
+
         let conn_idx = pending.conn.index();
         let conn_opt = self.connections.get_mut(conn_idx).and_then(|c| c.as_mut());
 
@@ -386,9 +433,8 @@ impl<C: Cache> ServerHandler<C> {
                 c.pending_disk_read = None;
                 let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
             }
-            // Release read buffer and segment ref_count
             disk_io.release_read_buffer(pending.buffer);
-            // TODO: release_read on the IoUringDiskLayer
+            self.cache.release_disk_read(segment_id, pool_id);
             return;
         }
 
@@ -406,6 +452,7 @@ impl<C: Cache> ServerHandler<C> {
                 let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
             }
             disk_io.release_read_buffer(pending.buffer);
+            self.cache.release_disk_read(segment_id, pool_id);
             return;
         }
 
@@ -419,6 +466,7 @@ impl<C: Cache> ServerHandler<C> {
                 let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
             }
             disk_io.release_read_buffer(pending.buffer);
+            self.cache.release_disk_read(segment_id, pool_id);
             return;
         }
 
@@ -437,6 +485,7 @@ impl<C: Cache> ServerHandler<C> {
                 let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
             }
             disk_io.release_read_buffer(pending.buffer);
+            self.cache.release_disk_read(segment_id, pool_id);
             return;
         }
 
@@ -451,9 +500,9 @@ impl<C: Cache> ServerHandler<C> {
             let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
         }
 
-        // Release read buffer
+        // Release read buffer and disk segment ref_count
         disk_io.release_read_buffer(pending.buffer);
-        // TODO: release_read on the IoUringDiskLayer to decrement ref_count
+        self.cache.release_disk_read(segment_id, pool_id);
     }
 
     /// Handle a disk flush (write) completion.
@@ -462,16 +511,18 @@ impl<C: Cache> ServerHandler<C> {
             return;
         };
 
-        let Some(_pending) = disk_io.take_pending_flush(seq) else {
+        let Some(pending) = disk_io.take_pending_flush(seq) else {
             return;
         };
 
         if !success {
-            tracing::warn!("Disk flush failed for seq={seq}");
+            tracing::warn!(
+                "Disk flush failed for seq={seq}, segment={}",
+                pending.segment_id
+            );
         }
 
-        // TODO: call IoUringDiskLayer::complete_flush(segment_id, buffer_pool)
-        // to detach the write buffer and return it to the pool.
+        self.cache.complete_disk_flush(pending.segment_id);
     }
 }
 

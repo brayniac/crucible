@@ -115,7 +115,14 @@ mod server {
             _ => {}
         }
 
-        // Build disk I/O worker config
+        // Build disk I/O worker config.
+        // Read buffers must be large enough for max_value_size + header + alignment.
+        let block_size: u32 = 4096;
+        let disk_read_buffer_size = {
+            let raw = config.cache.max_value_size + 2 * block_size as usize;
+            (raw + block_size as usize - 1) & !(block_size as usize - 1)
+        };
+
         let disk_io_worker_config: Option<DiskIoWorkerConfig> = match disk_io_backend {
             Some(DiskIoBackendConfig::DirectIo) => {
                 let disk_config = config.cache.disk.as_ref().unwrap();
@@ -123,8 +130,8 @@ mod server {
                     backend: cache_core::DiskIoBackend::DirectIo,
                     path: disk_config.path.to_string_lossy().into_owned(),
                     read_buffer_count: 64,
-                    read_buffer_size: 4096,
-                    block_size: 4096,
+                    read_buffer_size: disk_read_buffer_size,
+                    block_size,
                 })
             }
             Some(DiskIoBackendConfig::Nvme) => {
@@ -140,8 +147,8 @@ mod server {
                     backend: cache_core::DiskIoBackend::Nvme { device_path, nsid },
                     path: String::new(),
                     read_buffer_count: 64,
-                    read_buffer_size: 4096,
-                    block_size: 4096,
+                    read_buffer_size: disk_read_buffer_size,
+                    block_size,
                 })
             }
             _ => None,

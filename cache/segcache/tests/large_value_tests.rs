@@ -961,3 +961,91 @@ fn test_disk_tier_1000_5mb_values() {
 
     println!("Found {} of {} sampled items", found, num_items / 10);
 }
+
+// =============================================================================
+// io_uring Disk Tier Diagnostic Tests
+// =============================================================================
+
+#[test]
+fn test_io_uring_disk_tier_demotion_diagnostic() {
+    use cache_core::{Cache, LookupResult};
+    use segcache::IoUringDiskTierConfig;
+
+    let cache = SegCacheBuilder::new()
+        .heap_size(4 * 1024 * 1024) // 4MB RAM
+        .segment_size(1 * 1024 * 1024) // 1MB segments
+        .hashtable_power(14)
+        .io_uring_disk_tier(IoUringDiskTierConfig {
+            segment_count: 8, // 8MB disk (8 × 1MB)
+            block_size: 4096,
+            promotion_threshold: 2,
+            max_item_read_size: 0, // auto = segment_size
+        })
+        .build()
+        .expect("Failed to create cache");
+
+    let value_size = 8192;
+    let num_keys = 2000; // 2000 × 8KB = 16MB >> 4MB RAM → forces heavy eviction
+
+    // Phase 1: Write keys (should fill RAM and trigger demotion)
+    let mut set_ok = 0;
+    let mut set_err = 0;
+    for i in 0..num_keys {
+        let key = format!("dkey:{}", i);
+        let value: String = format!("val_{}_", i).chars().cycle().take(value_size).collect();
+        match cache.set(key.as_bytes(), value.as_bytes(), Duration::from_secs(3600)) {
+            Ok(()) => set_ok += 1,
+            Err(e) => {
+                set_err += 1;
+                if set_err <= 5 {
+                    eprintln!("SET failed for key {}: {:?}", i, e);
+                }
+            }
+        }
+    }
+    eprintln!("SET: {} ok, {} errors out of {}", set_ok, set_err, num_keys);
+
+    // Phase 2: Read back with get() (synchronous — only works for RAM + write buffer items)
+    let mut get_hits = 0;
+    for i in 0..num_keys {
+        let key = format!("dkey:{}", i);
+        if cache.get(key.as_bytes()).is_some() {
+            get_hits += 1;
+        }
+    }
+    eprintln!("get(): {} hits out of {}", get_hits, num_keys);
+
+    // Phase 3: Read back with lookup() (handles disk tier properly)
+    let mut lookup_hits = 0;
+    let mut lookup_disk_reads = 0;
+    let mut lookup_misses = 0;
+    for i in 0..num_keys {
+        let key = format!("dkey:{}", i);
+        match cache.lookup(key.as_bytes()) {
+            LookupResult::Hit(_) => lookup_hits += 1,
+            LookupResult::DiskRead(_) => lookup_disk_reads += 1,
+            LookupResult::Miss => lookup_misses += 1,
+        }
+    }
+    eprintln!(
+        "lookup(): {} hits, {} disk_reads, {} misses out of {}",
+        lookup_hits, lookup_disk_reads, lookup_misses, num_keys
+    );
+
+    // Phase 4: Check flush queue
+    let flush_reqs = cache.take_disk_flush_requests();
+    eprintln!("Pending flush requests: {}", flush_reqs.len());
+
+    // With 4MB RAM + 8MB disk write buffers, we expect:
+    // ~500 items in RAM + ~1000 items in disk write buffers = ~1500 hits via lookup
+    // Some items beyond total capacity are discarded
+    assert!(
+        lookup_hits > 600,
+        "Expected >600 hits from RAM + disk write buffers, got only {} (get_hits={}, disk_reads={}, misses={})",
+        lookup_hits, get_hits, lookup_disk_reads, lookup_misses
+    );
+    eprintln!(
+        "Summary: {} items accessible via get(), {} via lookup() (Hit), {} need disk read",
+        get_hits, lookup_hits, lookup_disk_reads
+    );
+}

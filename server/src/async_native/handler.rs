@@ -115,7 +115,7 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
         // task to run can initialize it inside the executor context.
         let pending_disk_io_config = self.disk_io_config.lock().unwrap().take();
 
-        let cache = Arc::clone(&self.cache);
+        let cache: Arc<C> = Arc::clone(&self.cache);
         let max_value_size = self.max_value_size;
         let allow_flush = self.allow_flush;
         let slot_size = self.send_copy_slot_size;
@@ -132,9 +132,9 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
         ))
     }
 
-    fn on_tick(&mut self, ctx: &mut DriverCtx<'_>) {
+    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
         if self.shutdown.load(Ordering::Relaxed) {
-            ctx.request_shutdown();
+            _ctx.request_shutdown();
         }
     }
 
@@ -285,6 +285,7 @@ async fn handle_connection<C: Cache>(
                     &mut connection,
                     pending_info,
                     slot_size,
+                    &*cache,
                 )
                 .await
                 {
@@ -297,6 +298,9 @@ async fn handle_connection<C: Cache>(
                 connection.write_miss_response();
             }
         }
+
+        // Drain disk flush queue — submit writes and await completions.
+        drain_flush_queue(&disk_io, &*cache).await;
 
         // Drain pending responses.
         if connection.has_pending_write()
@@ -324,13 +328,18 @@ async fn handle_connection<C: Cache>(
 ///
 /// On success, parses the item from the read buffer and writes the protocol
 /// response. On failure, writes a miss response.
-async fn submit_and_await_disk_read(
+async fn submit_and_await_disk_read<C: Cache>(
     disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
     conn: &ConnCtx,
     connection: &mut Connection,
     pending_info: PendingDiskReadInfo,
     slot_size: usize,
+    cache: &C,
 ) -> Result<(), ()> {
+    // Save params for release_disk_read (must happen in ALL exit paths).
+    let segment_id = pending_info.params.segment_id;
+    let pool_id = pending_info.params.pool_id;
+
     // 1. Allocate aligned read buffer.
     let mut buffer: cache_core::disk::AlignedBuffer = {
         let mut dio = disk_io.lock().unwrap();
@@ -339,6 +348,7 @@ async fn submit_and_await_disk_read(
             Some(buf) => buf,
             None => {
                 connection.write_miss_response();
+                cache.release_disk_read(segment_id, pool_id);
                 return Ok(());
             }
         }
@@ -388,6 +398,7 @@ async fn submit_and_await_disk_read(
             .unwrap()
             .read_buffer_pool
             .release(buffer);
+        cache.release_disk_read(segment_id, pool_id);
         return Ok(());
     }
 
@@ -404,6 +415,7 @@ async fn submit_and_await_disk_read(
             .unwrap()
             .read_buffer_pool
             .release(buffer);
+        cache.release_disk_read(segment_id, pool_id);
         return Ok(());
     }
 
@@ -419,6 +431,7 @@ async fn submit_and_await_disk_read(
             .unwrap()
             .read_buffer_pool
             .release(buffer);
+        cache.release_disk_read(segment_id, pool_id);
         return Ok(());
     }
 
@@ -436,6 +449,7 @@ async fn submit_and_await_disk_read(
             .unwrap()
             .read_buffer_pool
             .release(buffer);
+        cache.release_disk_read(segment_id, pool_id);
         return Ok(());
     }
 
@@ -456,7 +470,72 @@ async fn submit_and_await_disk_read(
         .unwrap()
         .read_buffer_pool
         .release(buffer);
+    cache.release_disk_read(segment_id, pool_id);
     Ok(())
+}
+
+/// Drain pending disk flush requests and submit io_uring writes.
+///
+/// Takes any sealed segments from the cache's flush queue, submits them
+/// as io_uring writes, awaits completion, and calls `complete_disk_flush`
+/// to recycle the write buffers.
+async fn drain_flush_queue<C: Cache>(
+    disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
+    cache: &C,
+) {
+    let flush_requests = cache.take_disk_flush_requests();
+    if flush_requests.is_empty() {
+        return;
+    }
+
+    let has_disk_io = disk_io.lock().unwrap().is_some();
+    if !has_disk_io {
+        return;
+    }
+
+    for req in flush_requests {
+        let future = {
+            let dio = disk_io.lock().unwrap();
+            let dio = dio.as_ref().unwrap();
+            match &dio.backend {
+                DiskBackend::DirectIo { file, .. } => unsafe {
+                    krio::direct_io_write(
+                        *file,
+                        req.disk_offset,
+                        req.buffer_ptr,
+                        req.buffer_len,
+                    )
+                },
+                DiskBackend::Nvme { device, block_size } => {
+                    let lba = req.disk_offset / *block_size as u64;
+                    let num_blocks = (req.buffer_len / *block_size) as u16;
+                    let buf_addr = req.buffer_ptr as u64;
+                    krio::nvme_write(*device, lba, num_blocks, buf_addr, req.buffer_len)
+                }
+            }
+        };
+
+        match future {
+            Ok(fut) => {
+                let result = fut.await;
+                if let Err(e) = result {
+                    tracing::warn!(
+                        "Disk flush failed for segment={}: {e}",
+                        req.segment_id
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Disk flush submit failed for segment={}: {e}",
+                    req.segment_id
+                );
+            }
+        }
+
+        // Recycle write buffer regardless of success/failure.
+        cache.complete_disk_flush(req.segment_id);
+    }
 }
 
 // ── Send helpers ────────────────────────────────────────────────────────
