@@ -150,6 +150,7 @@ impl<H: EventHandler> EventLoop<H> {
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
+            OpTag::DirectIo => self.handle_direct_io(ud, result),
         }
     }
 
@@ -194,6 +195,50 @@ impl<H: EventHandler> EventLoop<H> {
 
         let mut ctx = self.driver.make_ctx();
         self.handler.on_nvme_complete(&mut ctx, completion);
+    }
+
+    fn handle_direct_io(&mut self, ud: UserData, result: i32) {
+        let slab_idx = ud.payload() as u16;
+
+        let cmd_slab = match self.driver.direct_io_cmd_slab {
+            Some(ref mut s) => s,
+            None => return,
+        };
+
+        if !cmd_slab.in_use(slab_idx) {
+            return;
+        }
+
+        let (file_index, op) = cmd_slab.release(slab_idx);
+
+        // Decrement in-flight count.
+        if let Some(ref mut files) = self.driver.direct_io_files
+            && let Some(f) = files.get_mut(file_index)
+        {
+            f.in_flight = f.in_flight.saturating_sub(1);
+        }
+
+        // Build completion and fire callback.
+        let generation = self
+            .driver
+            .direct_io_files
+            .as_ref()
+            .and_then(|f| f.get(file_index))
+            .map(|f| f.generation)
+            .unwrap_or(0);
+
+        let completion = crate::direct_io::DirectIoCompletion {
+            file: crate::direct_io::DirectIoFile {
+                index: file_index,
+                generation,
+            },
+            op,
+            seq: slab_idx as u32,
+            result,
+        };
+
+        let mut ctx = self.driver.make_ctx();
+        self.handler.on_direct_io_complete(&mut ctx, completion);
     }
 
     fn handle_recv_multi(&mut self, ud: UserData, result: i32, flags: u32) {
@@ -966,6 +1011,9 @@ fn call_on_data<H: EventHandler>(
         nvme_devices: &mut driver.nvme_devices,
         nvme_cmd_slab: &mut driver.nvme_cmd_slab,
         nvme_fd_base: driver.nvme_fd_base,
+        direct_io_files: &mut driver.direct_io_files,
+        direct_io_cmd_slab: &mut driver.direct_io_cmd_slab,
+        direct_io_fd_base: driver.direct_io_fd_base,
     };
     let consumed = handler.on_data(&mut ctx, token, data);
     driver.accumulators.consume(conn_index, consumed);

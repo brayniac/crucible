@@ -462,4 +462,75 @@ impl Ring {
         }
         Ok(())
     }
+
+    /// Submit a direct I/O read via `IORING_OP_READ`.
+    ///
+    /// The `fd_index` must be a fixed file table index pointing to a file
+    /// opened with `O_DIRECT`.
+    ///
+    /// # Safety
+    /// The buffer at `buf` with length `len` must remain valid and properly
+    /// aligned until the CQE arrives. For `O_DIRECT`, the buffer address,
+    /// length, and file offset must all be aligned to the logical block size.
+    pub unsafe fn submit_direct_read(
+        &mut self,
+        fd_index: u32,
+        buf: *mut u8,
+        len: u32,
+        offset: u64,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Read::new(Fixed(fd_index), buf, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a direct I/O write via `IORING_OP_WRITE`.
+    ///
+    /// The `fd_index` must be a fixed file table index pointing to a file
+    /// opened with `O_DIRECT`.
+    ///
+    /// # Safety
+    /// The buffer at `buf` with length `len` must remain valid and properly
+    /// aligned until the CQE arrives. For `O_DIRECT`, the buffer address,
+    /// length, and file offset must all be aligned to the logical block size.
+    pub unsafe fn submit_direct_write(
+        &mut self,
+        fd_index: u32,
+        buf: *const u8,
+        len: u32,
+        offset: u64,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Write::new(Fixed(fd_index), buf, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit an fsync via `IORING_OP_FSYNC`.
+    ///
+    /// The `fd_index` must be a fixed file table index pointing to an opened file.
+    pub fn submit_direct_fsync(
+        &mut self,
+        fd_index: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Fsync::new(Fixed(fd_index))
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
 }

@@ -250,6 +250,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
+            OpTag::DirectIo => self.handle_direct_io(ud, result),
         }
     }
 
@@ -925,6 +926,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // TODO: wire up NVMe async futures / waker for async API.
         let _ = (device_index, result);
+    }
+
+    fn handle_direct_io(&mut self, ud: UserData, result: i32) {
+        let slab_idx = ud.payload() as u16;
+
+        let cmd_slab = match self.driver.direct_io_cmd_slab {
+            Some(ref mut s) => s,
+            None => return,
+        };
+
+        if !cmd_slab.in_use(slab_idx) {
+            return;
+        }
+
+        let (file_index, _op) = cmd_slab.release(slab_idx);
+
+        // Decrement in-flight count.
+        if let Some(ref mut files) = self.driver.direct_io_files
+            && let Some(f) = files.get_mut(file_index)
+        {
+            f.in_flight = f.in_flight.saturating_sub(1);
+        }
+
+        // TODO: wire up direct I/O async futures / waker for async API.
+        let _ = (file_index, result);
     }
 
     /// Spawn an async task for a newly accepted connection.

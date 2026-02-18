@@ -158,6 +158,12 @@ pub(crate) struct Driver {
     /// Base offset in the fixed file table for NVMe device fds.
     /// NVMe devices are registered at `nvme_fd_base + device_index`.
     pub(crate) nvme_fd_base: u32,
+    /// Direct I/O file tracking table. `None` when direct I/O is not configured.
+    pub(crate) direct_io_files: Option<crate::direct_io::DirectIoFileTable>,
+    /// Direct I/O command slab for tracking in-flight commands. `None` when not configured.
+    pub(crate) direct_io_cmd_slab: Option<crate::direct_io::DirectIoCmdSlab>,
+    /// Base offset in the fixed file table for direct I/O file fds.
+    pub(crate) direct_io_fd_base: u32,
 }
 
 impl Driver {
@@ -184,10 +190,17 @@ impl Driver {
             .as_ref()
             .map(|n| n.max_devices as u32)
             .unwrap_or(0);
+        let direct_io_max = config
+            .direct_io
+            .as_ref()
+            .map(|d| d.max_files as u32)
+            .unwrap_or(0);
 
         // Register resources with the kernel
         ring.register_buffers(&fixed_buffers)?;
-        ring.register_files_sparse(config.max_connections + udp_count + nvme_max)?;
+        ring.register_files_sparse(
+            config.max_connections + udp_count + nvme_max + direct_io_max,
+        )?;
         ring.register_buf_ring(&provided_bufs)?;
 
         let connections = ConnectionTable::new(config.max_connections);
@@ -293,6 +306,15 @@ impl Driver {
                 .as_ref()
                 .map(|n| crate::nvme::NvmeCmdSlab::new(n.max_commands_in_flight)),
             nvme_fd_base: config.max_connections + udp_count,
+            direct_io_files: config
+                .direct_io
+                .as_ref()
+                .map(|d| crate::direct_io::DirectIoFileTable::new(d.max_files)),
+            direct_io_cmd_slab: config
+                .direct_io
+                .as_ref()
+                .map(|d| crate::direct_io::DirectIoCmdSlab::new(d.max_commands_in_flight)),
+            direct_io_fd_base: config.max_connections + udp_count + nvme_max,
         };
 
         // Submit initial recvmsg for each UDP socket.
@@ -335,6 +357,9 @@ impl Driver {
             nvme_devices: &mut self.nvme_devices,
             nvme_cmd_slab: &mut self.nvme_cmd_slab,
             nvme_fd_base: self.nvme_fd_base,
+            direct_io_files: &mut self.direct_io_files,
+            direct_io_cmd_slab: &mut self.direct_io_cmd_slab,
+            direct_io_fd_base: self.direct_io_fd_base,
         }
     }
 
