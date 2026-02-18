@@ -6,11 +6,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use crate::acceptor::{AcceptorConfig, run_acceptor};
-use crate::async_event_loop::AsyncEventLoop;
 use crate::config::Config;
+
+#[cfg(feature = "io_uring")]
+use crate::async_event_loop::AsyncEventLoop;
+#[cfg(feature = "io_uring")]
 use crate::event_loop::EventLoop;
+#[cfg(feature = "io_uring")]
 use crate::handler::EventHandler;
+#[cfg(feature = "io_uring")]
 use crate::runtime::handler::AsyncEventHandler;
+
+#[cfg(feature = "mio_backend")]
+use crate::mio_backend::ctx::EventHandler;
+#[cfg(feature = "mio_backend")]
+use crate::mio_backend::event_loop::MioEventLoop;
 
 /// Result type for `launch` / `KrioBuilder::launch` to avoid type-complexity warnings.
 type LaunchResult = Result<
@@ -99,9 +109,18 @@ impl KrioBuilder {
     pub fn launch<H: EventHandler>(self) -> LaunchResult {
         self.launch_inner(|worker_id, config, accept_rx, eventfd, shutdown_flag| {
             let handler = H::create_for_worker(worker_id);
-            let mut event_loop =
-                EventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
-            event_loop.run()?;
+            #[cfg(feature = "io_uring")]
+            {
+                let mut event_loop =
+                    EventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
+                event_loop.run()?;
+            }
+            #[cfg(feature = "mio_backend")]
+            {
+                let mut event_loop =
+                    MioEventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
+                event_loop.run()?;
+            }
             Ok(())
         })
     }
@@ -110,6 +129,9 @@ impl KrioBuilder {
     ///
     /// Each accepted connection gets a long-lived async task. The executor
     /// polls futures on the same thread-per-core model as the callback API.
+    ///
+    /// Only available with the `io_uring` backend.
+    #[cfg(feature = "io_uring")]
     pub fn launch_async<A: AsyncEventHandler>(self) -> LaunchResult {
         self.launch_inner(|worker_id, config, accept_rx, eventfd, shutdown_flag| {
             let handler = A::create_for_worker(worker_id);

@@ -4,15 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-tls = ["rustls"]
+default = ["io_uring"]
+io_uring = ["dep:io-uring"]
+mio_backend = ["dep:mio"]
+tls = ["rustls", "io_uring"]
 
 [dependencies]
 bytes = { workspace = true }
 crossbeam-channel = "0.5"
-io-uring = "0.7"
+io-uring = { version = "0.7", optional = true }
 libc = "0.2"
 metrics = { workspace = true }
 metriken = { workspace = true }
+mio = { version = "1", optional = true, features = ["net", "os-poll", "os-ext"] }
 pin-project-lite = "0.2"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring"] }
 

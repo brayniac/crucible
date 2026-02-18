@@ -1,13 +1,16 @@
-//! krio — io_uring-native async I/O runtime for Linux.
+//! krio — high-performance I/O runtime for Linux.
 //!
-//! krio is a push-based, thread-per-core I/O framework built directly on
-//! io_uring. It provides two APIs for building high-performance network
-//! applications:
+//! krio is a push-based, thread-per-core I/O framework. It supports two
+//! backends selected via Cargo features:
 //!
-//! - **Callback API** ([`EventHandler`]) — zero-overhead callbacks driven by
-//!   io_uring completions. Ideal for latency-critical servers.
-//! - **Async API** ([`AsyncEventHandler`]) — async/await ergonomics on the
-//!   same thread-per-core event loop with no work-stealing.
+//! - **`io_uring`** (default) — built directly on io_uring (Linux 6.0+).
+//!   Provides zero-copy sends, ring-provided recv buffers, fixed file table,
+//!   and NVMe passthrough. Both the callback API ([`EventHandler`]) and the
+//!   async API are available.
+//!
+//! - **`mio_backend`** — epoll-based fallback via mio. Works on any Linux
+//!   kernel that supports epoll. Only the callback API is available; sends
+//!   always copy through the kernel (no zero-copy).
 //!
 //! # Quick Start (Callback API)
 //!
@@ -40,191 +43,219 @@
 //!
 //! # Platform
 //!
-//! Linux 6.0+ only. Requires io_uring with multishot recv, ring-provided
-//! buffers, SendMsgZc, and fixed file table support.
+//! Linux only. The io_uring backend requires Linux 6.0+; the mio backend
+//! works on any Linux version with epoll support.
 
-// ── Internal modules ────────────────────────────────────────────────────
+// Compile-time check: io_uring and mio_backend are mutually exclusive.
+#[cfg(all(feature = "io_uring", feature = "mio_backend"))]
+compile_error!(
+    "features `io_uring` and `mio_backend` are mutually exclusive — \
+     enable one or the other, not both"
+);
+
+#[cfg(not(any(feature = "io_uring", feature = "mio_backend")))]
+compile_error!(
+    "either feature `io_uring` or `mio_backend` must be enabled"
+);
+
+// ── Internal modules (always compiled) ───────────────────────────────
 pub(crate) mod acceptor;
 pub(crate) mod accumulator;
-pub(crate) mod async_event_loop;
-pub(crate) mod buffer;
-pub(crate) mod chain;
-pub(crate) mod completion;
 pub(crate) mod connection;
-pub mod direct_io;
-pub(crate) mod driver;
-pub(crate) mod event_loop;
 pub(crate) mod metrics;
-pub mod nvme;
-pub(crate) mod ring;
-pub(crate) mod runtime;
-#[cfg(feature = "tls")]
-pub(crate) mod tls;
 pub(crate) mod worker;
 
-// ── Public modules ──────────────────────────────────────────────────────
+// ── Public modules (always compiled) ─────────────────────────────────
 pub mod config;
+pub mod direct_io;
 pub mod error;
 pub mod guard;
+pub mod nvme;
+
+// ── Buffer modules ───────────────────────────────────────────────────
+pub(crate) mod buffer {
+    pub mod fixed;
+    pub mod send_copy;
+
+    #[cfg(feature = "io_uring")]
+    pub mod provided;
+    #[cfg(feature = "io_uring")]
+    pub mod send_slab;
+}
+
+// ── io_uring-only internal modules ───────────────────────────────────
+#[cfg(feature = "io_uring")]
+pub(crate) mod async_event_loop;
+#[cfg(feature = "io_uring")]
+pub(crate) mod chain;
+#[cfg(feature = "io_uring")]
+pub(crate) mod completion;
+#[cfg(feature = "io_uring")]
+pub(crate) mod driver;
+#[cfg(feature = "io_uring")]
+pub(crate) mod event_loop;
+#[cfg(feature = "io_uring")]
 pub mod handler;
+#[cfg(feature = "io_uring")]
+pub(crate) mod ring;
+#[cfg(feature = "io_uring")]
+pub(crate) mod runtime;
+#[cfg(all(feature = "io_uring", feature = "tls"))]
+pub(crate) mod tls;
 
-// ── Re-exports: Callback API ────────────────────────────────────────────
+// ── mio fallback module ──────────────────────────────────────────────
+#[cfg(feature = "mio_backend")]
+pub(crate) mod mio_backend;
 
-/// Builder for chained send parts.
+// ══════════════════════════════════════════════════════════════════════
+// Re-exports: Callback API
+// ══════════════════════════════════════════════════════════════════════
+
+// io_uring backend re-exports
+#[cfg(feature = "io_uring")]
 pub use handler::ChainPartsBuilder;
-/// Opaque connection handle.
+#[cfg(feature = "io_uring")]
 pub use handler::ConnToken;
-/// I/O context passed to [`EventHandler`] callbacks.
+#[cfg(feature = "io_uring")]
 pub use handler::DriverCtx;
-/// Trait for callback-driven event handlers.
+#[cfg(feature = "io_uring")]
 pub use handler::EventHandler;
-/// Builder for constructing a scatter-gather send.
+#[cfg(feature = "io_uring")]
 pub use handler::SendBuilder;
-/// Builder for IO_LINK chained sends.
+#[cfg(feature = "io_uring")]
 pub use handler::SendChainBuilder;
-/// Pre-classified part for [`AsyncSendBuilder::submit_batch`].
+#[cfg(feature = "io_uring")]
 pub use handler::SendPart;
-/// Opaque handle for a UDP socket.
+#[cfg(feature = "io_uring")]
 pub use handler::UdpToken;
 
-// ── Re-exports: Async API ───────────────────────────────────────────────
+// mio backend re-exports (same names, different implementations)
+#[cfg(feature = "mio_backend")]
+pub use mio_backend::ctx::ConnToken;
+#[cfg(feature = "mio_backend")]
+pub use mio_backend::ctx::DriverCtx;
+#[cfg(feature = "mio_backend")]
+pub use mio_backend::ctx::EventHandler;
+#[cfg(feature = "mio_backend")]
+pub use mio_backend::ctx::SendBuilder;
+#[cfg(feature = "mio_backend")]
+pub use mio_backend::ctx::SendPart;
+#[cfg(feature = "mio_backend")]
+pub use mio_backend::ctx::UdpToken;
 
-/// Error returned by [`try_spawn()`] when the standalone task slab is full.
+// ── Re-exports: Async API (io_uring only) ────────────────────────────
+#[cfg(feature = "io_uring")]
 pub use error::SpawnError;
-/// Error returned by [`try_sleep()`] and [`try_timeout()`] when the timer pool is full.
+#[cfg(feature = "io_uring")]
 pub use error::TimerExhausted;
-/// Trait for async event handlers (one task per connection).
+#[cfg(feature = "io_uring")]
 pub use runtime::handler::AsyncEventHandler;
-/// Async scatter-gather send builder.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::AsyncSendBuilder;
-/// Async connection context with send/recv futures.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::ConnCtx;
-/// Future that completes when a connect finishes.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::ConnectFuture;
-/// A monotonic clock deadline for absolute timers.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::Deadline;
-/// Error returned when a [`timeout()`] expires.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::Elapsed;
-/// Future that resolves when recv data is available (sink, accumulator, or close).
+#[cfg(feature = "io_uring")]
 pub use runtime::io::RecvReadyFuture;
-/// Future that completes when a send finishes.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::SendFuture;
-/// Future returned by [`sleep()`].
+#[cfg(feature = "io_uring")]
 pub use runtime::io::SleepFuture;
-/// Future returned by [`timeout()`].
+#[cfg(feature = "io_uring")]
 pub use runtime::io::TimeoutFuture;
-/// Async context for a UDP socket.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::UdpCtx;
-/// Future returned by [`UdpCtx::recv_from()`].
+#[cfg(feature = "io_uring")]
 pub use runtime::io::UdpRecvFuture;
-/// Future that provides received data as zero-copy `Bytes`.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::WithBytesFuture;
-/// Future that provides received data.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::WithDataFuture;
-/// Initiate an outbound TCP connection from any async task.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::connect;
-/// Initiate an outbound TLS connection from any async task.
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "io_uring", feature = "tls"))]
 pub use runtime::io::connect_tls;
-/// Initiate an outbound TLS connection with a timeout from any async task.
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "io_uring", feature = "tls"))]
 pub use runtime::io::connect_tls_with_timeout;
-/// Initiate an outbound TCP connection with a timeout from any async task.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::connect_with_timeout;
-/// Request graceful shutdown from any async task.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::request_shutdown;
-/// Create a future that completes after a duration.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::sleep;
-/// Create a future that completes at an absolute deadline.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::sleep_until;
-/// Spawn a standalone async task on the current worker.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::spawn;
-/// Wrap a future with a deadline.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::timeout;
-/// Wrap a future with an absolute deadline.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::timeout_at;
-/// Fallible sleep that returns an error if the timer pool is exhausted.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::try_sleep;
-/// Fallible sleep_until that returns an error if the timer pool is exhausted.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::try_sleep_until;
-/// Spawn a standalone task, returning an error if the slab is full.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::try_spawn;
-/// Fallible timeout that returns an error if the timer pool is exhausted.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::try_timeout;
-/// Fallible timeout_at that returns an error if the timer pool is exhausted.
+#[cfg(feature = "io_uring")]
 pub use runtime::io::try_timeout_at;
-/// Future returned by [`join()`].
+#[cfg(feature = "io_uring")]
 pub use runtime::join::Join;
-/// Future returned by [`join3()`].
+#[cfg(feature = "io_uring")]
 pub use runtime::join::Join3;
-/// Poll two futures concurrently, returning both outputs when complete.
+#[cfg(feature = "io_uring")]
 pub use runtime::join::join;
-/// Poll three futures concurrently, returning all outputs when complete.
+#[cfg(feature = "io_uring")]
 pub use runtime::join::join3;
-/// Result of [`select()`] — which branch completed.
+#[cfg(feature = "io_uring")]
 pub use runtime::select::Either;
-/// Result of [`select3()`] — which branch completed.
+#[cfg(feature = "io_uring")]
 pub use runtime::select::Either3;
-/// Future returned by [`select()`].
+#[cfg(feature = "io_uring")]
 pub use runtime::select::Select;
-/// Future returned by [`select3()`].
+#[cfg(feature = "io_uring")]
 pub use runtime::select::Select3;
-/// Poll two futures concurrently, returning whichever completes first.
+#[cfg(feature = "io_uring")]
 pub use runtime::select::select;
-/// Poll three futures concurrently, returning whichever completes first.
+#[cfg(feature = "io_uring")]
 pub use runtime::select::select3;
-/// Opaque handle for a standalone spawned task.
+#[cfg(feature = "io_uring")]
 pub use runtime::task::TaskId;
 
-// ── Re-exports: Shared types ────────────────────────────────────────────
+// ── Re-exports: Shared types ─────────────────────────────────────────
 
-/// Memory region for io_uring fixed buffer registration.
 pub use buffer::fixed::MemoryRegion;
-/// Region identifier for [`SendGuard`] implementations.
 pub use buffer::fixed::RegionId;
-/// Maximum zero-copy guards per scatter-gather send.
+#[cfg(feature = "io_uring")]
 pub use buffer::send_slab::MAX_GUARDS;
-/// Maximum iovecs per scatter-gather send.
+#[cfg(feature = "io_uring")]
 pub use buffer::send_slab::MAX_IOVECS;
-/// Runtime configuration.
 pub use config::Config;
-/// Recv buffer ring configuration.
 pub use config::RecvBufferConfig;
-/// Worker thread configuration.
 pub use config::WorkerConfig;
-/// Direct I/O completion result.
 pub use direct_io::DirectIoCompletion;
-/// Direct I/O configuration.
 pub use direct_io::DirectIoConfig;
-/// Direct I/O file handle.
 pub use direct_io::DirectIoFile;
-/// Direct I/O operation type.
 pub use direct_io::DirectIoOp;
-/// Runtime errors.
 pub use error::Error;
-/// Zero-copy send guard trait.
 pub use guard::{GuardBox, SendGuard};
-/// NVMe passthrough completion result.
 pub use nvme::NvmeCompletion;
-/// NVMe passthrough configuration.
 pub use nvme::NvmeConfig;
-/// NVMe passthrough device handle.
 pub use nvme::NvmeDevice;
-/// Builder for launching krio workers.
 pub use worker::KrioBuilder;
-/// Handle for triggering graceful shutdown.
 pub use worker::ShutdownHandle;
-/// Convenience function to launch workers with a listener.
 pub use worker::launch;
 
-// ── Re-exports: TLS (feature-gated) ────────────────────────────────────
-
-/// Client-side TLS configuration.
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "io_uring", feature = "tls"))]
 pub use config::TlsClientConfig;
-/// Server-side TLS configuration.
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "io_uring", feature = "tls"))]
 pub use config::TlsConfig;
-/// TLS session info (protocol version, cipher suite, etc.).
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "io_uring", feature = "tls"))]
 pub use tls::TlsInfo;
