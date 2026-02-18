@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-02-18
+
+### Added
+- **io_uring disk tier** for segcache: Direct I/O and NVMe io_uring passthrough backends for
+  segment demotion/promotion, with block-aligned reads, lock-free disk segment pool, and
+  configurable promotion threshold
+- **krio async disk I/O API**: `open_direct_io_file()`, `direct_io_read()`, `open_nvme_device()`,
+  `nvme_read()` free functions with `DiskIoFuture` for awaitable io_uring disk operations
+- Async server integration tests (7 tests mirroring callback server test suite)
+- Disk tier integration tests for both callback and async servers with DirectIo backend
+- CI smoketest configs for async server and DirectIo disk tier
+
+### Fixed
+- Async server binary (`crucible-server-async`) now correctly uses `IoUringDiskTierConfig` for
+  DirectIo/NVMe backends instead of mmap-based `DiskTierConfig`
+- Async server disk I/O initialization moved from `on_accept()` (outside executor context) to
+  `handle_connection()` (inside executor context) to prevent "called outside executor" panic
+- `BasicHeader::from_bytes_unchecked()` calls replaced with `from_bytes()` for `--all-features`
+  compatibility (the unchecked variant is `#[cfg(not(feature = "validation"))]`)
+- `IoUringPool` unit tests gated with `#[cfg(not(feature = "loom"))]` to prevent loom scheduler
+  panics from crossbeam-deque atomics outside `loom::model`
+- Broken rustdoc link to `IoUringDiskLayer` in `server::disk_io`
+- Clippy warnings: manual `abs_diff` pattern, unused `spare_queue` field
+
 ## [0.3.5] - 2026-02-17
 
 ### Added
