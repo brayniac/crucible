@@ -54,14 +54,22 @@
 //!     .build()?;
 //! ```
 
+mod aligned_buffer;
 mod config;
 mod disk_layer;
+mod disk_segment_meta;
 mod file_pool;
 mod file_segment;
+mod io_uring_layer;
+mod io_uring_pool;
 mod recovery;
 
-pub use config::{DiskConfig, SyncMode};
+pub use aligned_buffer::{AlignedBuffer, AlignedBufferPool, ReadBufferPool};
+pub use config::{DiskConfig, DiskIoBackend, SyncMode};
 pub use disk_layer::{DiskLayer, DiskLayerBuilder};
+pub use disk_segment_meta::DiskSegmentMeta;
 pub use file_pool::{FilePool, FilePoolBuilder, FilePoolHeader};
 pub use file_segment::FileSegment;
+pub use io_uring_layer::{DiskReadParams, FlushRequest, IoUringDiskLayer, IoUringDiskLayerBuilder};
+pub use io_uring_pool::IoUringPool;
 pub use recovery::{RecoveryStats, WarmStats};

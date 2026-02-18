@@ -109,6 +109,7 @@ pub fn run<C: Cache + 'static>(
                 max_value_size: config.cache.max_value_size,
                 allow_flush,
                 send_copy_slot_size: send_copy_slot_size as usize,
+                disk_io_config: None, // TODO: populate from disk config when io_uring disk tier is enabled
             })
             .expect("failed to queue handler config");
     }

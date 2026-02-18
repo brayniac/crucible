@@ -1,6 +1,7 @@
 //! Krio EventHandler implementation for the cache server.
 
 use crate::connection::{Connection, SliceRecvBuf};
+use crate::disk_io::{DiskBackend, DiskIoState, PendingDiskRead};
 use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats};
 use bytes::Bytes;
 use cache_core::Cache;
@@ -19,6 +20,21 @@ pub(crate) struct HandlerConfig<C: Cache> {
     pub max_value_size: usize,
     pub allow_flush: bool,
     pub send_copy_slot_size: usize,
+    /// Disk I/O configuration. When set, workers open the device/file
+    /// in `create_for_worker` and enable disk read/write support.
+    pub disk_io_config: Option<DiskIoWorkerConfig>,
+}
+
+/// Configuration for per-worker disk I/O initialization.
+pub(crate) struct DiskIoWorkerConfig {
+    /// Backend type and path.
+    pub backend: cache_core::DiskIoBackend,
+    /// Number of read buffers per worker.
+    pub read_buffer_count: usize,
+    /// Size of each read buffer (typically one block = 4096).
+    pub read_buffer_size: usize,
+    /// Block size for alignment.
+    pub block_size: u32,
 }
 
 // Global channel for distributing HandlerConfigs to worker threads.
@@ -80,6 +96,10 @@ pub(crate) struct ServerHandler<C: Cache> {
     max_value_size: usize,
     allow_flush: bool,
     send_copy_slot_size: usize,
+    /// Per-worker disk I/O state. None if disk tier is not configured.
+    disk_io: Option<DiskIoState>,
+    /// Saved config for deferred disk I/O initialization in create_for_worker.
+    disk_io_config: Option<DiskIoWorkerConfig>,
 }
 
 impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
@@ -98,13 +118,29 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
             max_value_size: config.max_value_size,
             allow_flush: config.allow_flush,
             send_copy_slot_size: config.send_copy_slot_size,
+            disk_io: None,
+            disk_io_config: config.disk_io_config,
         }
     }
 
-    fn on_accept(&mut self, _ctx: &mut DriverCtx, conn: ConnToken) {
+    fn on_accept(&mut self, ctx: &mut DriverCtx, conn: ConnToken) {
         CONNECTIONS_ACCEPTED.increment();
         CONNECTIONS_ACTIVE.increment();
         self.stats[self.worker_id].inc_accepts();
+
+        // Lazy-initialize disk I/O on first accept (needs DriverCtx for device open)
+        if self.disk_io.is_none()
+            && let Some(dio_config) = self.disk_io_config.take()
+        {
+            match Self::init_disk_io(ctx, dio_config) {
+                Ok(state) => {
+                    self.disk_io = Some(state);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize disk I/O: {e}");
+                }
+            }
+        }
 
         let idx = conn.index();
         if idx >= self.connections.len() {
@@ -143,6 +179,22 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
             if c.should_close() {
                 self.close_connection(ctx, conn, CloseReason::ProtocolClose);
                 return buf.consumed();
+            }
+
+            // Check if a disk read is pending — submit io_uring read
+            if c.pending_disk_read.is_some() {
+                if let Some(disk_io) = &mut self.disk_io {
+                    let pending_info = c.pending_disk_read.take().unwrap();
+                    if let Err(e) = Self::submit_disk_read(ctx, disk_io, conn, pending_info) {
+                        tracing::warn!("Disk read submit failed: {e}");
+                        // Send miss response since we can't do the disk read
+                        c.write_miss_response();
+                    }
+                } else {
+                    // No disk I/O configured but got DiskRead result — treat as miss
+                    c.pending_disk_read.take();
+                    c.write_miss_response();
+                }
             }
 
             // Send pending response data
@@ -194,6 +246,29 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
             }
         }
     }
+
+    fn on_nvme_complete(&mut self, ctx: &mut DriverCtx, completion: krio::NvmeCompletion) {
+        self.handle_disk_read_complete(ctx, completion.seq, completion.is_success());
+    }
+
+    fn on_direct_io_complete(
+        &mut self,
+        ctx: &mut DriverCtx,
+        completion: krio::DirectIoCompletion,
+    ) {
+        use krio::DirectIoOp;
+        match completion.op {
+            DirectIoOp::Read => {
+                self.handle_disk_read_complete(ctx, completion.seq, completion.is_success());
+            }
+            DirectIoOp::Write => {
+                self.handle_disk_flush_complete(completion.seq, completion.is_success());
+            }
+            DirectIoOp::Fsync => {
+                // No action needed for fsync completions
+            }
+        }
+    }
 }
 
 impl<C: Cache> ServerHandler<C> {
@@ -212,6 +287,200 @@ impl<C: Cache> ServerHandler<C> {
             CONNECTIONS_ACTIVE.decrement();
             self.stats[self.worker_id].inc_close(reason);
         }
+    }
+
+    /// Initialize disk I/O for this worker.
+    ///
+    /// Opens the NVMe device or Direct I/O file and creates the read buffer pool.
+    fn init_disk_io(ctx: &mut DriverCtx, config: DiskIoWorkerConfig) -> io::Result<DiskIoState> {
+        let backend = match &config.backend {
+            cache_core::DiskIoBackend::Nvme { device_path, nsid } => {
+                let device = ctx.open_nvme_device(device_path, *nsid)?;
+                DiskBackend::Nvme {
+                    device,
+                    block_size: config.block_size,
+                }
+            }
+            cache_core::DiskIoBackend::DirectIo => {
+                // For Direct I/O, the path is passed via the cache config, not here.
+                // The file should already be created/opened by the cache layer.
+                // We need the path from somewhere — for now, we open it via the
+                // standard disk config path.
+                return Err(io::Error::other(
+                    "Direct I/O path must be provided in DiskIoWorkerConfig",
+                ));
+            }
+        };
+
+        let read_buffer_pool = cache_core::AlignedBufferPool::new(
+            config.read_buffer_count,
+            config.read_buffer_size,
+            config.block_size as usize,
+        );
+
+        Ok(DiskIoState::new(backend, read_buffer_pool, 256))
+    }
+
+    /// Submit a disk read via io_uring.
+    fn submit_disk_read(
+        ctx: &mut DriverCtx,
+        disk_io: &mut DiskIoState,
+        conn: ConnToken,
+        pending_info: crate::connection::PendingDiskReadInfo,
+    ) -> io::Result<()> {
+        // Allocate a read buffer
+        let mut buffer = disk_io
+            .read_buffer_pool
+            .allocate()
+            .ok_or_else(|| io::Error::other("read buffer pool exhausted"))?;
+
+        let seq = match &disk_io.backend {
+            DiskBackend::Nvme { device, block_size } => {
+                let lba = pending_info.params.disk_offset / *block_size as u64;
+                let num_blocks = (pending_info.params.read_len / *block_size) as u16;
+                ctx.nvme_read(
+                    *device,
+                    lba,
+                    num_blocks,
+                    buffer.addr(),
+                    pending_info.params.read_len,
+                )?
+            }
+            DiskBackend::DirectIo { file, .. } => unsafe {
+                ctx.direct_io_read(
+                    *file,
+                    pending_info.params.disk_offset,
+                    buffer.as_mut_ptr(),
+                    pending_info.params.read_len,
+                )?
+            },
+        };
+
+        // Store pending read for completion correlation
+        disk_io.store_pending_read(
+            seq,
+            PendingDiskRead {
+                conn,
+                buffer,
+                params: pending_info.params,
+                response_ctx: pending_info.response_ctx,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Handle a disk read completion (from NVMe or Direct I/O).
+    fn handle_disk_read_complete(&mut self, ctx: &mut DriverCtx, seq: u32, success: bool) {
+        let Some(disk_io) = &mut self.disk_io else {
+            return;
+        };
+
+        let Some(pending) = disk_io.take_pending_read(seq) else {
+            return;
+        };
+
+        let conn_idx = pending.conn.index();
+        let conn_opt = self.connections.get_mut(conn_idx).and_then(|c| c.as_mut());
+
+        if !success {
+            // Disk read failed — send miss response and resume
+            if let Some(c) = conn_opt {
+                c.write_miss_response();
+                c.pending_disk_read = None;
+                let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
+            }
+            // Release read buffer and segment ref_count
+            disk_io.release_read_buffer(pending.buffer);
+            // TODO: release_read on the IoUringDiskLayer
+            return;
+        }
+
+        // Parse item from read buffer
+        let item_offset = pending.params.item_offset as usize;
+        let buf_slice = unsafe {
+            pending
+                .buffer
+                .as_slice(pending.params.read_len as usize)
+        };
+
+        // Parse the BasicHeader at the item offset
+        let header_size = cache_core::BasicHeader::SIZE;
+        if item_offset + header_size > buf_slice.len() {
+            // Invalid offset — send miss
+            if let Some(c) = conn_opt {
+                c.write_miss_response();
+                c.pending_disk_read = None;
+                let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
+            }
+            disk_io.release_read_buffer(pending.buffer);
+            return;
+        }
+
+        let header = cache_core::BasicHeader::from_bytes_unchecked(
+            &buf_slice[item_offset..item_offset + header_size],
+        );
+
+        if header.is_deleted() {
+            if let Some(c) = conn_opt {
+                c.write_miss_response();
+                c.pending_disk_read = None;
+                let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
+            }
+            disk_io.release_read_buffer(pending.buffer);
+            return;
+        }
+
+        // Extract value from the read buffer
+        let key_start = item_offset + header_size + header.optional_len() as usize;
+        let value_start = key_start + header.key_len() as usize;
+        let value_len = header.value_len() as usize;
+        let value_end = value_start + value_len;
+
+        if value_end > buf_slice.len() {
+            // Item spans beyond our read buffer — would need a second read.
+            // For now, treat as miss (TODO: implement multi-block reads).
+            if let Some(c) = conn_opt {
+                c.write_miss_response();
+                c.pending_disk_read = None;
+                let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
+            }
+            disk_io.release_read_buffer(pending.buffer);
+            return;
+        }
+
+        let value_bytes = &buf_slice[value_start..value_end];
+
+        // Build protocol response
+        if let Some(c) = conn_opt {
+            c.write_disk_read_response(&pending.response_ctx, value_bytes);
+            c.pending_disk_read = None;
+
+            // Resume sending and processing
+            let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
+        }
+
+        // Release read buffer
+        disk_io.release_read_buffer(pending.buffer);
+        // TODO: release_read on the IoUringDiskLayer to decrement ref_count
+    }
+
+    /// Handle a disk flush (write) completion.
+    fn handle_disk_flush_complete(&mut self, seq: u32, success: bool) {
+        let Some(disk_io) = &mut self.disk_io else {
+            return;
+        };
+
+        let Some(_pending) = disk_io.take_pending_flush(seq) else {
+            return;
+        };
+
+        if !success {
+            tracing::warn!("Disk flush failed for seq={seq}");
+        }
+
+        // TODO: call IoUringDiskLayer::complete_flush(segment_id, buffer_pool)
+        // to detach the write buffer and return it to the pool.
     }
 }
 

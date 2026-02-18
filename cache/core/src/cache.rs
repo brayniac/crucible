@@ -8,7 +8,7 @@
 
 use crate::cas::CasToken;
 use crate::config::LayerConfig;
-use crate::disk::{DiskLayer, FilePool};
+use crate::disk::{DiskLayer, FilePool, IoUringDiskLayer, IoUringPool};
 use crate::error::{CacheError, CacheResult};
 use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::item::ItemGuard;
@@ -31,8 +31,10 @@ pub enum CacheLayer {
     Fifo(FifoLayer),
     /// TTL bucket-organized layer (for main cache storage).
     Ttl(TtlLayer),
-    /// Disk-backed layer (for extended capacity beyond RAM).
+    /// Disk-backed layer (for extended capacity beyond RAM, mmap-based).
     Disk(DiskLayer),
+    /// io_uring disk-backed layer (for extended capacity beyond RAM).
+    IoUringDisk(IoUringDiskLayer),
 }
 
 impl CacheLayer {
@@ -42,6 +44,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.config(),
             CacheLayer::Ttl(layer) => layer.config(),
             CacheLayer::Disk(layer) => layer.config(),
+            CacheLayer::IoUringDisk(layer) => layer.config(),
         }
     }
 
@@ -51,6 +54,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.layer_id(),
             CacheLayer::Ttl(layer) => layer.layer_id(),
             CacheLayer::Disk(layer) => layer.layer_id(),
+            CacheLayer::IoUringDisk(layer) => layer.layer_id(),
         }
     }
 
@@ -66,6 +70,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.write_item(key, value, optional, ttl),
             CacheLayer::Ttl(layer) => layer.write_item(key, value, optional, ttl),
             CacheLayer::Disk(layer) => layer.write_item(key, value, optional, ttl),
+            CacheLayer::IoUringDisk(layer) => layer.write_item(key, value, optional, ttl),
         }
     }
 
@@ -80,6 +85,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.get_item(location, key).map(|guard| f(&guard)),
             CacheLayer::Ttl(layer) => layer.get_item(location, key).map(|guard| f(&guard)),
             CacheLayer::Disk(layer) => layer.get_item(location, key).map(|guard| f(&guard)),
+            CacheLayer::IoUringDisk(layer) => layer.get_item(location, key).map(|guard| f(&guard)),
         }
     }
 
@@ -139,6 +145,9 @@ impl CacheLayer {
                 }
                 segment.get_value_ref_raw(location.offset(), key).ok()
             }
+            // io_uring disk layer doesn't support direct value ref for committed
+            // segments; use read_from_buffer instead.
+            CacheLayer::IoUringDisk(_) => None,
         }
     }
 
@@ -148,6 +157,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.mark_deleted(location),
             CacheLayer::Ttl(layer) => layer.mark_deleted(location),
             CacheLayer::Disk(layer) => layer.mark_deleted(location),
+            CacheLayer::IoUringDisk(layer) => layer.mark_deleted(location),
         }
     }
 
@@ -160,6 +170,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.mark_deleted_and_compact(location, hashtable),
             CacheLayer::Ttl(layer) => layer.mark_deleted_and_compact(location, hashtable),
             CacheLayer::Disk(layer) => layer.mark_deleted_and_compact(location, hashtable),
+            CacheLayer::IoUringDisk(layer) => layer.mark_deleted_and_compact(location, hashtable),
         }
     }
 
@@ -169,6 +180,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.item_ttl(location),
             CacheLayer::Ttl(layer) => layer.item_ttl(location),
             CacheLayer::Disk(layer) => layer.item_ttl(location),
+            CacheLayer::IoUringDisk(layer) => layer.item_ttl(location),
         }
     }
 
@@ -178,6 +190,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.evict(hashtable),
             CacheLayer::Ttl(layer) => layer.evict(hashtable),
             CacheLayer::Disk(layer) => layer.evict(hashtable),
+            CacheLayer::IoUringDisk(layer) => layer.evict(hashtable),
         }
     }
 
@@ -194,6 +207,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.evict_with_demoter(hashtable, demoter),
             CacheLayer::Ttl(layer) => layer.evict_with_demoter(hashtable, demoter),
             CacheLayer::Disk(layer) => layer.evict_with_demoter(hashtable, demoter),
+            CacheLayer::IoUringDisk(layer) => layer.evict_with_demoter(hashtable, demoter),
         }
     }
 
@@ -204,6 +218,14 @@ impl CacheLayer {
             CacheLayer::Ttl(layer) => layer.evict_nonblocking(hashtable),
             // Disk layer: fall back to regular evict (disk segments rarely have readers)
             CacheLayer::Disk(layer) => {
+                if layer.evict(hashtable) {
+                    EvictResult::Freed
+                } else {
+                    EvictResult::NoCandidate
+                }
+            }
+            // IoUringDisk layer: fall back to regular evict (disk segments rarely have readers)
+            CacheLayer::IoUringDisk(layer) => {
                 if layer.evict(hashtable) {
                     EvictResult::Freed
                 } else {
@@ -229,6 +251,13 @@ impl CacheLayer {
                     EvictResult::NoCandidate
                 }
             }
+            CacheLayer::IoUringDisk(layer) => {
+                if layer.evict_with_demoter(hashtable, demoter) {
+                    EvictResult::Freed
+                } else {
+                    EvictResult::NoCandidate
+                }
+            }
         }
     }
 
@@ -239,6 +268,7 @@ impl CacheLayer {
             CacheLayer::Ttl(layer) => layer.try_emergency_evict(hashtable),
             // Disk layer doesn't support emergency eviction
             CacheLayer::Disk(_) => false,
+            CacheLayer::IoUringDisk(_) => false,
         }
     }
 
@@ -248,6 +278,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.expire(hashtable),
             CacheLayer::Ttl(layer) => layer.expire(hashtable),
             CacheLayer::Disk(layer) => layer.expire(hashtable),
+            CacheLayer::IoUringDisk(layer) => layer.expire(hashtable),
         }
     }
 
@@ -257,6 +288,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.free_segment_count(),
             CacheLayer::Ttl(layer) => layer.free_segment_count(),
             CacheLayer::Disk(layer) => layer.free_segment_count(),
+            CacheLayer::IoUringDisk(layer) => layer.free_segment_count(),
         }
     }
 
@@ -266,6 +298,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.total_segment_count(),
             CacheLayer::Ttl(layer) => layer.total_segment_count(),
             CacheLayer::Disk(layer) => layer.total_segment_count(),
+            CacheLayer::IoUringDisk(layer) => layer.total_segment_count(),
         }
     }
 
@@ -275,6 +308,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.used_segment_count(),
             CacheLayer::Ttl(layer) => layer.used_segment_count(),
             CacheLayer::Disk(layer) => layer.used_segment_count(),
+            CacheLayer::IoUringDisk(layer) => layer.used_segment_count(),
         }
     }
 
@@ -287,6 +321,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.pool().get(segment_id),
             CacheLayer::Ttl(layer) => layer.pool().get(segment_id),
             CacheLayer::Disk(_) => None, // Disk segments have different type
+            CacheLayer::IoUringDisk(_) => None, // Disk segments have different type
         }
     }
 
@@ -300,22 +335,36 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.pool(),
             CacheLayer::Ttl(layer) => layer.pool(),
             CacheLayer::Disk(_) => panic!("Cannot get MemoryPool from disk layer; use disk_pool()"),
+            CacheLayer::IoUringDisk(_) => {
+                panic!("Cannot get MemoryPool from disk layer; use disk_pool()")
+            }
         }
     }
 
     /// Get the disk pool for this layer (disk layers only).
     ///
-    /// Returns `None` for RAM layers.
+    /// Returns `None` for RAM layers and IoUringDisk layers.
     pub fn disk_pool(&self) -> Option<&FilePool> {
         match self {
             CacheLayer::Fifo(_) | CacheLayer::Ttl(_) => None,
             CacheLayer::Disk(layer) => Some(layer.pool()),
+            CacheLayer::IoUringDisk(_) => None,
+        }
+    }
+
+    /// Get the io_uring disk pool for this layer.
+    ///
+    /// Returns `None` for RAM layers and mmap disk layers.
+    pub fn io_uring_disk_pool(&self) -> Option<&IoUringPool> {
+        match self {
+            CacheLayer::IoUringDisk(layer) => Some(layer.pool()),
+            _ => None,
         }
     }
 
     /// Check if this is a disk layer.
     pub fn is_disk(&self) -> bool {
-        matches!(self, CacheLayer::Disk(_))
+        matches!(self, CacheLayer::Disk(_) | CacheLayer::IoUringDisk(_))
     }
 
     /// Get the pool ID for this layer.
@@ -324,6 +373,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.pool().pool_id(),
             CacheLayer::Ttl(layer) => layer.pool().pool_id(),
             CacheLayer::Disk(layer) => layer.pool().pool_id(),
+            CacheLayer::IoUringDisk(layer) => layer.pool().pool_id(),
         }
     }
 
@@ -339,6 +389,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.begin_write_item(key, value_len, optional, ttl),
             CacheLayer::Ttl(layer) => layer.begin_write_item(key, value_len, optional, ttl),
             CacheLayer::Disk(layer) => layer.begin_write_item(key, value_len, optional, ttl),
+            CacheLayer::IoUringDisk(layer) => layer.begin_write_item(key, value_len, optional, ttl),
         }
     }
 
@@ -348,6 +399,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.finalize_write_item(location, item_size),
             CacheLayer::Ttl(layer) => layer.finalize_write_item(location, item_size),
             CacheLayer::Disk(layer) => layer.finalize_write_item(location, item_size),
+            CacheLayer::IoUringDisk(layer) => layer.finalize_write_item(location, item_size),
         }
     }
 
@@ -357,6 +409,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.cancel_write_item(location),
             CacheLayer::Ttl(layer) => layer.cancel_write_item(location),
             CacheLayer::Disk(layer) => layer.cancel_write_item(location),
+            CacheLayer::IoUringDisk(layer) => layer.cancel_write_item(location),
         }
     }
 
@@ -368,6 +421,7 @@ impl CacheLayer {
             CacheLayer::Fifo(layer) => layer.pool().reset_all(),
             CacheLayer::Ttl(layer) => layer.pool().reset_all(),
             CacheLayer::Disk(layer) => layer.pool().reset_all(),
+            CacheLayer::IoUringDisk(layer) => layer.pool().reset_all(),
         }
     }
 }
@@ -750,6 +804,79 @@ impl<H: Hashtable> TieredCache<H> {
                 segment_id,
             )
         })
+    }
+
+    /// Look up a key, returning either an immediate hit or disk read params.
+    ///
+    /// For items in RAM (or in a disk segment's write buffer), returns
+    /// [`crate::cache_trait::LookupResult::Hit`] with a zero-copy `ValueRef`.
+    /// For items on committed disk segments, returns
+    /// [`crate::cache_trait::LookupResult::DiskRead`] with parameters for
+    /// submitting an io_uring read.
+    /// Returns [`crate::cache_trait::LookupResult::Miss`] if not found.
+    pub fn lookup(&self, key: &[u8]) -> crate::cache_trait::LookupResult {
+        use crate::cache_trait::LookupResult;
+
+        let verifier = self.create_key_verifier();
+
+        // Lookup in hashtable
+        let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) else {
+            return LookupResult::Miss;
+        };
+        let item_loc = ItemLocation::from_location(location);
+
+        // Find the layer containing this item
+        let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id()) else {
+            return LookupResult::Miss;
+        };
+        let Some(layer) = self.layers.get(layer_idx) else {
+            return LookupResult::Miss;
+        };
+
+        match layer {
+            CacheLayer::IoUringDisk(disk_layer) => {
+                // Try synchronous read from write buffer first
+                if let Some((ref_count_ptr, value_ptr, value_len, metadata_ptr, free_queue_ptr, segment_id)) =
+                    disk_layer.read_from_buffer(item_loc, key)
+                {
+                    let vr = unsafe {
+                        crate::cache_trait::ValueRef::new(
+                            ref_count_ptr,
+                            value_ptr,
+                            value_len,
+                            metadata_ptr,
+                            free_queue_ptr,
+                            segment_id,
+                        )
+                    };
+                    return LookupResult::Hit(vr);
+                }
+                // Need async disk read
+                match disk_layer.prepare_read(item_loc, disk_layer.pool().block_size()) {
+                    Some(params) => LookupResult::DiskRead(params),
+                    None => LookupResult::Miss,
+                }
+            }
+            _ => {
+                // RAM layers (and mmap disk): existing zero-copy path
+                match layer.get_value_ref_raw(item_loc, key) {
+                    Some((ref_count_ptr, value_ptr, value_len, metadata_ptr, free_queue_ptr, segment_id)) => {
+                        let vr = unsafe {
+                            crate::cache_trait::ValueRef::new(
+                                ref_count_ptr,
+                                value_ptr,
+                                value_len,
+                                metadata_ptr,
+                                free_queue_ptr,
+                                segment_id,
+                            )
+                        };
+                        LookupResult::Hit(vr)
+                    }
+                    None => LookupResult::Miss,
+                }
+            }
+        }
     }
 
     /// Get an item from the cache with a CAS token.
@@ -1308,6 +1435,11 @@ impl<H: Hashtable> TieredCache<H> {
                         // Disk pools always use segment-level TTL
                         pools[pool_id] = Some((PoolRef::Disk(pool), false));
                     }
+                    CacheLayer::IoUringDisk(l) => {
+                        let pool = l.pool();
+                        // IoUringDisk pools always use segment-level TTL
+                        pools[pool_id] = Some((PoolRef::IoUring(pool), false));
+                    }
                 }
             }
         }
@@ -1337,6 +1469,7 @@ impl<H: Hashtable> TieredCache<H> {
 enum PoolRef<'a> {
     Memory(&'a MemoryPool),
     Disk(&'a FilePool),
+    IoUring(&'a IoUringPool),
 }
 
 /// Key verifier for TieredCache.
@@ -1373,6 +1506,15 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
                     return;
                 };
                 unsafe { segment.data_ptr().add(offset as usize) }
+            }
+            PoolRef::IoUring(pool) => {
+                let Some(meta) = pool.get_meta(segment_id) else {
+                    return;
+                };
+                let Some(data_ptr) = meta.write_buffer_ptr() else {
+                    return;
+                };
+                unsafe { data_ptr.add(offset as usize) }
             }
         };
 
@@ -1429,6 +1571,12 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
                 };
                 segment.verify_key_at_offset(offset, key, allow_deleted)
             }
+            PoolRef::IoUring(pool) => {
+                let Some(meta) = pool.get_meta(segment_id) else {
+                    return false;
+                };
+                meta.verify_key_at_offset(offset, key, allow_deleted)
+            }
         }
     }
 }
@@ -1481,6 +1629,17 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
         let pool_id = layer.pool().pool_id();
         let layer_idx = self.layers.len();
         self.layers.push(CacheLayer::Disk(layer));
+        if pool_id < 4 {
+            self.pool_map[pool_id as usize] = Some(layer_idx);
+        }
+        self
+    }
+
+    /// Add an io_uring disk layer (extended capacity tier).
+    pub fn with_io_uring_disk_layer(mut self, layer: IoUringDiskLayer) -> Self {
+        let pool_id = layer.pool().pool_id();
+        let layer_idx = self.layers.len();
+        self.layers.push(CacheLayer::IoUringDisk(layer));
         if pool_id < 4 {
             self.pool_map[pool_id as usize] = Some(layer_idx);
         }

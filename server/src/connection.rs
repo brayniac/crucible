@@ -167,6 +167,17 @@ enum StreamingState {
     },
 }
 
+/// Info saved when a GET hits a committed disk segment and needs async I/O.
+///
+/// The handler uses this to submit an io_uring read and build the response
+/// when the read completes.
+pub struct PendingDiskReadInfo {
+    /// Disk read parameters from the cache layer.
+    pub params: cache_core::DiskReadParams,
+    /// Protocol context for building the response on completion.
+    pub response_ctx: crate::disk_io::DiskReadResponseCtx,
+}
+
 /// Per-connection state for the cache server.
 ///
 /// The connection no longer owns a read buffer - instead, data is accessed
@@ -193,6 +204,10 @@ pub struct Connection {
     streaming_state: StreamingState,
     /// Whether flush commands are allowed on this connection
     allow_flush: bool,
+    /// When set, a disk read is pending for this connection.
+    /// The handler must submit an io_uring read and resume processing
+    /// when it completes.
+    pub(crate) pending_disk_read: Option<PendingDiskReadInfo>,
 }
 
 impl Connection {
@@ -216,6 +231,7 @@ impl Connection {
             memcache_parse_options: MemcacheParseOptions::new().max_value_len(max_value_size),
             streaming_state: StreamingState::None,
             allow_flush,
+            pending_disk_read: None,
         }
     }
 
@@ -224,10 +240,12 @@ impl Connection {
     pub const MAX_PENDING_WRITE: usize = 256 * 1024; // 256KB
 
     /// Check if we should accept more data from the socket.
-    /// Returns false when we have too much pending write data (backpressure).
+    /// Returns false when we have too much pending write data (backpressure)
+    /// or when a disk read is pending (pipeline stalling).
     #[inline]
     pub fn should_read(&self) -> bool {
-        self.pending_write_len() <= Self::MAX_PENDING_WRITE
+        self.pending_disk_read.is_none()
+            && self.pending_write_len() <= Self::MAX_PENDING_WRITE
     }
 
     /// Get the amount of pending write data (send queue + write buffer).
@@ -315,30 +333,44 @@ impl Connection {
                     // Intercept GET for zero-copy path
                     if let RespCommand::Get { key } = cmd {
                         use crate::metrics::{GETS, HITS, MISSES};
+                        use cache_core::LookupResult;
                         GETS.increment();
 
-                        if let Some(value_ref) = cache.get_value_ref(key) {
-                            HITS.increment();
-                            buf.consume(consumed);
-                            // Write RESP header: $<len>\r\n
-                            self.write_buf.extend_from_slice(b"$");
-                            let mut len_buf = itoa::Buffer::new();
-                            self.write_buf
-                                .extend_from_slice(len_buf.format(value_ref.len()).as_bytes());
-                            self.write_buf.extend_from_slice(b"\r\n");
-                            // Queue value with CRLF trailer
-                            self.queue_zero_copy_value(value_ref, b"\r\n");
-                            continue;
+                        match cache.lookup(key) {
+                            LookupResult::Hit(value_ref) => {
+                                HITS.increment();
+                                buf.consume(consumed);
+                                // Write RESP header: $<len>\r\n
+                                self.write_buf.extend_from_slice(b"$");
+                                let mut len_buf = itoa::Buffer::new();
+                                self.write_buf
+                                    .extend_from_slice(len_buf.format(value_ref.len()).as_bytes());
+                                self.write_buf.extend_from_slice(b"\r\n");
+                                // Queue value with CRLF trailer
+                                self.queue_zero_copy_value(value_ref, b"\r\n");
+                                continue;
+                            }
+                            LookupResult::DiskRead(params) => {
+                                HITS.increment();
+                                buf.consume(consumed);
+                                // Stall pipeline: save params for handler to submit io_uring read
+                                self.pending_disk_read = Some(PendingDiskReadInfo {
+                                    params,
+                                    response_ctx: crate::disk_io::DiskReadResponseCtx::Resp,
+                                });
+                                break;
+                            }
+                            LookupResult::Miss => {
+                                MISSES.increment();
+                                if self.resp_version == RespVersion::Resp3 {
+                                    self.write_buf.extend_from_slice(b"_\r\n");
+                                } else {
+                                    self.write_buf.extend_from_slice(b"$-1\r\n");
+                                }
+                                buf.consume(consumed);
+                                continue;
+                            }
                         }
-
-                        MISSES.increment();
-                        if self.resp_version == RespVersion::Resp3 {
-                            self.write_buf.extend_from_slice(b"_\r\n");
-                        } else {
-                            self.write_buf.extend_from_slice(b"$-1\r\n");
-                        }
-                        buf.consume(consumed);
-                        continue;
                     }
 
                     execute_resp(
@@ -640,22 +672,37 @@ impl Connection {
                     // Intercept GET for zero-copy path
                     if let protocol_memcache::Command::Get { key } = cmd {
                         use crate::metrics::{GETS, HITS, MISSES};
+                        use cache_core::LookupResult;
                         GETS.increment();
-                        if let Some(value_ref) = cache.get_value_ref(key) {
-                            HITS.increment();
-                            // Header: VALUE <key> 0 <len>\r\n
-                            self.write_buf.extend_from_slice(b"VALUE ");
-                            self.write_buf.extend_from_slice(key);
-                            self.write_buf.extend_from_slice(b" 0 ");
-                            let mut len_buf = itoa::Buffer::new();
-                            self.write_buf
-                                .extend_from_slice(len_buf.format(value_ref.len()).as_bytes());
-                            self.write_buf.extend_from_slice(b"\r\n");
-                            // Queue value with trailer \r\nEND\r\n
-                            self.queue_zero_copy_value(value_ref, b"\r\nEND\r\n");
-                        } else {
-                            MISSES.increment();
-                            self.write_buf.extend_from_slice(b"END\r\n");
+                        match cache.lookup(key) {
+                            LookupResult::Hit(value_ref) => {
+                                HITS.increment();
+                                // Header: VALUE <key> 0 <len>\r\n
+                                self.write_buf.extend_from_slice(b"VALUE ");
+                                self.write_buf.extend_from_slice(key);
+                                self.write_buf.extend_from_slice(b" 0 ");
+                                let mut len_buf = itoa::Buffer::new();
+                                self.write_buf
+                                    .extend_from_slice(len_buf.format(value_ref.len()).as_bytes());
+                                self.write_buf.extend_from_slice(b"\r\n");
+                                // Queue value with trailer \r\nEND\r\n
+                                self.queue_zero_copy_value(value_ref, b"\r\nEND\r\n");
+                            }
+                            LookupResult::DiskRead(params) => {
+                                HITS.increment();
+                                self.pending_disk_read = Some(PendingDiskReadInfo {
+                                    params,
+                                    response_ctx: crate::disk_io::DiskReadResponseCtx::MemcacheAscii {
+                                        key: key.to_vec(),
+                                    },
+                                });
+                                buf.consume(consumed);
+                                break;
+                            }
+                            LookupResult::Miss => {
+                                MISSES.increment();
+                                self.write_buf.extend_from_slice(b"END\r\n");
+                            }
                         }
                         buf.consume(consumed);
                         continue;
@@ -933,60 +980,84 @@ impl Connection {
                             );
                             let opaque = *opaque;
 
-                            if let Some(value_ref) = cache.get_value_ref(key) {
-                                HITS.increment();
-                                let opcode = match &cmd {
-                                    BinaryCommand::Get { .. } => Opcode::Get,
-                                    BinaryCommand::GetK { .. } => Opcode::GetK,
-                                    BinaryCommand::GetQ { .. } => Opcode::GetQ,
-                                    BinaryCommand::GetKQ { .. } => Opcode::GetKQ,
-                                    _ => unreachable!(),
-                                };
-                                let extras_len: usize = 4;
-                                let key_len = if is_getk { key.len() } else { 0 };
-                                let total_body = extras_len + key_len + value_ref.len();
+                            match cache.lookup(key) {
+                                cache_core::LookupResult::Hit(value_ref) => {
+                                    HITS.increment();
+                                    let opcode = match &cmd {
+                                        BinaryCommand::Get { .. } => Opcode::Get,
+                                        BinaryCommand::GetK { .. } => Opcode::GetK,
+                                        BinaryCommand::GetQ { .. } => Opcode::GetQ,
+                                        BinaryCommand::GetKQ { .. } => Opcode::GetKQ,
+                                        _ => unreachable!(),
+                                    };
+                                    let extras_len: usize = 4;
+                                    let key_len = if is_getk { key.len() } else { 0 };
+                                    let total_body = extras_len + key_len + value_ref.len();
 
-                                // Write response header + extras + key into write_buf
-                                let header_total = HEADER_SIZE + extras_len + key_len;
-                                let start = self.write_buf.len();
-                                self.write_buf.reserve(header_total);
-                                // Safety: we just reserved enough capacity
-                                unsafe {
-                                    self.write_buf.set_len(start + header_total);
-                                }
-                                let mut header = ResponseHeader::new(opcode, Status::NoError);
-                                header.extras_length = extras_len as u8;
-                                if is_getk {
-                                    header.key_length = key.len() as u16;
-                                }
-                                header.total_body_length = total_body as u32;
-                                header.opaque = opaque;
-                                header.encode(&mut self.write_buf[start..]);
-                                // Flags (always 0)
-                                self.write_buf[start + HEADER_SIZE..start + HEADER_SIZE + 4]
-                                    .copy_from_slice(&0u32.to_be_bytes());
-                                // Key (for GetK/GetKQ only)
-                                if is_getk {
-                                    let key_start = start + HEADER_SIZE + extras_len;
-                                    self.write_buf[key_start..key_start + key.len()]
-                                        .copy_from_slice(key);
-                                }
-                                // Queue value (no trailer for binary protocol)
-                                self.queue_zero_copy_value(value_ref, b"");
-                            } else {
-                                MISSES.increment();
-                                if !is_quiet {
+                                    // Write response header + extras + key into write_buf
+                                    let header_total = HEADER_SIZE + extras_len + key_len;
                                     let start = self.write_buf.len();
-                                    self.write_buf.reserve(HEADER_SIZE + 32);
+                                    self.write_buf.reserve(header_total);
+                                    // Safety: we just reserved enough capacity
                                     unsafe {
-                                        self.write_buf.set_len(start + HEADER_SIZE + 32);
+                                        self.write_buf.set_len(start + header_total);
                                     }
-                                    let len = BinaryResponse::encode_not_found(
-                                        &mut self.write_buf[start..],
-                                        Opcode::Get,
-                                        opaque,
-                                    );
-                                    self.write_buf.truncate(start + len);
+                                    let mut header = ResponseHeader::new(opcode, Status::NoError);
+                                    header.extras_length = extras_len as u8;
+                                    if is_getk {
+                                        header.key_length = key.len() as u16;
+                                    }
+                                    header.total_body_length = total_body as u32;
+                                    header.opaque = opaque;
+                                    header.encode(&mut self.write_buf[start..]);
+                                    // Flags (always 0)
+                                    self.write_buf[start + HEADER_SIZE..start + HEADER_SIZE + 4]
+                                        .copy_from_slice(&0u32.to_be_bytes());
+                                    // Key (for GetK/GetKQ only)
+                                    if is_getk {
+                                        let key_start = start + HEADER_SIZE + extras_len;
+                                        self.write_buf[key_start..key_start + key.len()]
+                                            .copy_from_slice(key);
+                                    }
+                                    // Queue value (no trailer for binary protocol)
+                                    self.queue_zero_copy_value(value_ref, b"");
+                                }
+                                cache_core::LookupResult::DiskRead(params) => {
+                                    HITS.increment();
+                                    let opcode_byte = match &cmd {
+                                        BinaryCommand::Get { .. } => Opcode::Get as u8,
+                                        BinaryCommand::GetK { .. } => Opcode::GetK as u8,
+                                        BinaryCommand::GetQ { .. } => Opcode::GetQ as u8,
+                                        BinaryCommand::GetKQ { .. } => Opcode::GetKQ as u8,
+                                        _ => unreachable!(),
+                                    };
+                                    self.pending_disk_read = Some(PendingDiskReadInfo {
+                                        params,
+                                        response_ctx: crate::disk_io::DiskReadResponseCtx::MemcacheBinary {
+                                            key: key.to_vec(),
+                                            opcode: opcode_byte,
+                                            opaque,
+                                            quiet: is_quiet,
+                                        },
+                                    });
+                                    buf.consume(consumed);
+                                    break;
+                                }
+                                cache_core::LookupResult::Miss => {
+                                    MISSES.increment();
+                                    if !is_quiet {
+                                        let start = self.write_buf.len();
+                                        self.write_buf.reserve(HEADER_SIZE + 32);
+                                        unsafe {
+                                            self.write_buf.set_len(start + HEADER_SIZE + 32);
+                                        }
+                                        let len = BinaryResponse::encode_not_found(
+                                            &mut self.write_buf[start..],
+                                            Opcode::Get,
+                                            opaque,
+                                        );
+                                        self.write_buf.truncate(start + len);
+                                    }
                                 }
                             }
                             buf.consume(consumed);
@@ -1531,6 +1602,110 @@ impl Connection {
                 ..
             } => *received < reservation.value_len(),
             StreamingState::None | StreamingState::Draining { .. } => false,
+        }
+    }
+}
+
+impl Connection {
+    /// Write a miss response in the detected protocol format.
+    ///
+    /// Called when a disk read fails or the item is invalid.
+    pub(crate) fn write_miss_response(&mut self) {
+        match self.protocol {
+            DetectedProtocol::Resp => {
+                if self.resp_version == RespVersion::Resp3 {
+                    self.write_buf.extend_from_slice(b"_\r\n");
+                } else {
+                    self.write_buf.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            DetectedProtocol::MemcacheAscii => {
+                self.write_buf.extend_from_slice(b"END\r\n");
+            }
+            DetectedProtocol::MemcacheBinary | DetectedProtocol::Unknown => {
+                // For binary protocol, we'd need the opaque from the pending context.
+                // For Unknown, nothing to do.
+            }
+        }
+    }
+
+    /// Write a disk read response in the appropriate protocol format.
+    pub(crate) fn write_disk_read_response(
+        &mut self,
+        response_ctx: &crate::disk_io::DiskReadResponseCtx,
+        value: &[u8],
+    ) {
+        use crate::disk_io::DiskReadResponseCtx;
+
+        match response_ctx {
+            DiskReadResponseCtx::Resp => {
+                // $<len>\r\n<value>\r\n
+                self.write_buf.extend_from_slice(b"$");
+                let mut len_buf = itoa::Buffer::new();
+                self.write_buf
+                    .extend_from_slice(len_buf.format(value.len()).as_bytes());
+                self.write_buf.extend_from_slice(b"\r\n");
+                self.write_buf.extend_from_slice(value);
+                self.write_buf.extend_from_slice(b"\r\n");
+            }
+            DiskReadResponseCtx::MemcacheAscii { key } => {
+                // VALUE <key> 0 <len>\r\n<value>\r\nEND\r\n
+                self.write_buf.extend_from_slice(b"VALUE ");
+                self.write_buf.extend_from_slice(key);
+                self.write_buf.extend_from_slice(b" 0 ");
+                let mut len_buf = itoa::Buffer::new();
+                self.write_buf
+                    .extend_from_slice(len_buf.format(value.len()).as_bytes());
+                self.write_buf.extend_from_slice(b"\r\n");
+                self.write_buf.extend_from_slice(value);
+                self.write_buf.extend_from_slice(b"\r\nEND\r\n");
+            }
+            DiskReadResponseCtx::MemcacheBinary {
+                key,
+                opcode,
+                opaque,
+                quiet: _,
+            } => {
+                use protocol_memcache::binary::{
+                    HEADER_SIZE, Opcode, ResponseHeader, Status,
+                };
+                // Map the saved opcode byte back to the Opcode enum
+                let opcode = match *opcode {
+                    x if x == Opcode::Get as u8 => Opcode::Get,
+                    x if x == Opcode::GetK as u8 => Opcode::GetK,
+                    x if x == Opcode::GetQ as u8 => Opcode::GetQ,
+                    x if x == Opcode::GetKQ as u8 => Opcode::GetKQ,
+                    _ => Opcode::Get,
+                };
+                let is_getk = matches!(opcode, Opcode::GetK | Opcode::GetKQ);
+                let extras_len: usize = 4;
+                let key_len = if is_getk { key.len() } else { 0 };
+                let total_body = extras_len + key_len + value.len();
+
+                let header_total = HEADER_SIZE + extras_len + key_len;
+                let start = self.write_buf.len();
+                self.write_buf.reserve(header_total + value.len());
+                unsafe {
+                    self.write_buf.set_len(start + header_total);
+                }
+                let mut header = ResponseHeader::new(opcode, Status::NoError);
+                header.extras_length = extras_len as u8;
+                if is_getk {
+                    header.key_length = key.len() as u16;
+                }
+                header.total_body_length = total_body as u32;
+                header.opaque = *opaque;
+                header.encode(&mut self.write_buf[start..]);
+                // Flags (always 0)
+                self.write_buf[start + HEADER_SIZE..start + HEADER_SIZE + 4]
+                    .copy_from_slice(&0u32.to_be_bytes());
+                if is_getk {
+                    let key_start = start + HEADER_SIZE + extras_len;
+                    self.write_buf[key_start..key_start + key.len()]
+                        .copy_from_slice(key);
+                }
+                self.write_buf.extend_from_slice(value);
+            }
         }
     }
 }

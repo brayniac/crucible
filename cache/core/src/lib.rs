@@ -154,10 +154,14 @@ pub mod disk;
 
 // Phase 10 re-exports
 pub use disk::{DiskConfig, DiskLayer, DiskLayerBuilder, FilePool, FilePoolBuilder, SyncMode};
+pub use disk::{
+    AlignedBuffer, AlignedBufferPool, DiskIoBackend, DiskReadParams, DiskSegmentMeta,
+    FlushRequest, IoUringDiskLayer, IoUringDiskLayerBuilder, IoUringPool, ReadBufferPool,
+};
 
 // Cache trait for server compatibility
 mod cache_trait;
-pub use cache_trait::{Cache, DEFAULT_TTL, OwnedGuard, ValueRef};
+pub use cache_trait::{Cache, DEFAULT_TTL, LookupResult, OwnedGuard, ValueRef};
 
 // Redis-like data structure traits
 mod hash_cache;

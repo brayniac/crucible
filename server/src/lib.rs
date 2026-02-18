@@ -9,6 +9,7 @@ pub mod async_native;
 pub mod banner;
 pub mod config;
 pub mod connection;
+pub mod disk_io;
 pub mod execute;
 pub mod logging;
 pub mod metrics;

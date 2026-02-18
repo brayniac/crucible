@@ -574,10 +574,50 @@ pub trait Cache: Send + Sync + 'static {
     fn prepend(&self, _key: &[u8], _data: &[u8]) -> Result<usize, CacheError> {
         Err(CacheError::Unsupported)
     }
+
+    /// Look up a key, returning either an immediate hit or disk read params.
+    ///
+    /// For items in RAM (or in a disk segment's write buffer), returns
+    /// [`LookupResult::Hit`] with a zero-copy [`ValueRef`].
+    /// For items on committed disk segments, returns [`LookupResult::DiskRead`]
+    /// with the parameters needed to submit an io_uring read.
+    /// Returns [`LookupResult::Miss`] if the key is not found.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `get_value_ref()` — returns Hit or Miss only (no disk path).
+    fn lookup(&self, key: &[u8]) -> LookupResult {
+        match self.get_value_ref(key) {
+            Some(vr) => LookupResult::Hit(vr),
+            None => LookupResult::Miss,
+        }
+    }
 }
 
 /// Default TTL used when None is provided (1 hour).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
+
+/// Result of a cache lookup that may require async I/O.
+///
+/// For items in RAM (or in a disk segment's write buffer), the lookup
+/// returns an immediate [`LookupResult::Hit`] with a zero-copy [`ValueRef`].
+/// For items on committed disk segments (write buffer already flushed),
+/// returns [`LookupResult::DiskRead`] with parameters for submitting
+/// an io_uring read.
+pub enum LookupResult {
+    /// Item found in RAM or disk write buffer — immediately available.
+    Hit(ValueRef),
+    /// Item is on a committed disk segment — async I/O required.
+    ///
+    /// The caller should:
+    /// 1. Allocate a read buffer
+    /// 2. Submit an io_uring read using the provided parameters
+    /// 3. Parse the item from the read buffer on completion
+    /// 4. Call `release_read()` on the disk layer when done
+    DiskRead(crate::disk::DiskReadParams),
+    /// Item not found in any layer.
+    Miss,
+}
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {

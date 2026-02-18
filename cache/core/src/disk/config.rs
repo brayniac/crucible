@@ -106,6 +106,27 @@ impl DiskConfig {
     }
 }
 
+/// I/O backend for disk-backed storage.
+///
+/// Selects how disk reads and writes are submitted:
+/// - **NVMe passthrough**: Uses `IORING_OP_URING_CMD` for direct NVMe commands
+///   via `/dev/ng*` character devices. Lowest latency, requires NVMe hardware.
+/// - **Direct I/O**: Uses `O_DIRECT` with `IORING_OP_READ/WRITE`. Portable
+///   fallback that works with any block device or filesystem.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DiskIoBackend {
+    /// NVMe passthrough via `/dev/ng*` character device.
+    Nvme {
+        /// Path to the NVMe generic character device (e.g., `/dev/ng0n1`).
+        device_path: String,
+        /// NVMe namespace ID.
+        nsid: u32,
+    },
+    /// `O_DIRECT` via regular file.
+    #[default]
+    DirectIo,
+}
+
 /// Synchronization mode for disk writes.
 ///
 /// Controls how aggressively data is flushed to disk, trading off
