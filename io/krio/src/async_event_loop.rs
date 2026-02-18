@@ -195,16 +195,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             let cq = self.driver.ring.ring.completion();
             for cqe in cq {
-                self.driver
-                    .cqe_batch
-                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
+                self.driver.cqe_batch.push((
+                    cqe.user_data(),
+                    cqe.result(),
+                    cqe.flags(),
+                    *cqe.big_cqe(),
+                ));
             }
         }
 
         if let Some(interval) = self.driver.flush_interval {
             let mut last_flush = Instant::now();
             for i in 0..self.driver.cqe_batch.len() {
-                let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
+                let (user_data_raw, result, flags, _big_cqe) = self.driver.cqe_batch[i];
                 self.dispatch_cqe(user_data_raw, result, flags);
                 let now = Instant::now();
                 if now.duration_since(last_flush) >= interval {
@@ -214,7 +217,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         } else {
             for i in 0..self.driver.cqe_batch.len() {
-                let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
+                let (user_data_raw, result, flags, _big_cqe) = self.driver.cqe_batch[i];
                 self.dispatch_cqe(user_data_raw, result, flags);
             }
         }
@@ -246,6 +249,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Timer => self.handle_timer(ud, result),
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
+            OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
         }
     }
 
@@ -896,6 +900,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let _ = result;
+    }
+
+    fn handle_nvme_cmd(&mut self, ud: UserData, result: i32) {
+        let slab_idx = ud.payload() as u16;
+
+        let nvme_cmd_slab = match self.driver.nvme_cmd_slab {
+            Some(ref mut s) => s,
+            None => return,
+        };
+
+        if !nvme_cmd_slab.in_use(slab_idx) {
+            return;
+        }
+
+        let device_index = nvme_cmd_slab.release(slab_idx);
+
+        // Decrement in-flight count.
+        if let Some(ref mut devices) = self.driver.nvme_devices
+            && let Some(dev) = devices.get_mut(device_index)
+        {
+            dev.in_flight = dev.in_flight.saturating_sub(1);
+        }
+
+        // TODO: wire up NVMe async futures / waker for async API.
+        let _ = (device_index, result);
     }
 
     /// Spawn an async task for a newly accepted connection.

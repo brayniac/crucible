@@ -54,6 +54,7 @@ pub(crate) mod connection;
 pub(crate) mod driver;
 pub(crate) mod event_loop;
 pub(crate) mod metrics;
+pub mod nvme;
 pub(crate) mod ring;
 pub(crate) mod runtime;
 #[cfg(feature = "tls")]
@@ -194,6 +195,12 @@ pub use config::WorkerConfig;
 pub use error::Error;
 /// Zero-copy send guard trait.
 pub use guard::{GuardBox, SendGuard};
+/// NVMe passthrough completion result.
+pub use nvme::NvmeCompletion;
+/// NVMe passthrough configuration.
+pub use nvme::NvmeConfig;
+/// NVMe passthrough device handle.
+pub use nvme::NvmeDevice;
 /// Builder for launching krio workers.
 pub use worker::KrioBuilder;
 /// Handle for triggering graceful shutdown.

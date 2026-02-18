@@ -86,6 +86,12 @@ pub struct DriverCtx<'a> {
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: &'a mut Vec<crate::driver::UdpSocketState>,
+    /// NVMe device table. `None` when NVMe is not configured.
+    pub(crate) nvme_devices: &'a mut Option<crate::nvme::NvmeDeviceTable>,
+    /// NVMe command slab. `None` when NVMe is not configured.
+    pub(crate) nvme_cmd_slab: &'a mut Option<crate::nvme::NvmeCmdSlab>,
+    /// Base offset in the fixed file table for NVMe device fds.
+    pub(crate) nvme_fd_base: u32,
 }
 
 impl<'a> DriverCtx<'a> {
@@ -571,6 +577,232 @@ impl<'a> DriverCtx<'a> {
         let target_ud = crate::completion::UserData::encode(target_tag, conn.index, 0);
         self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
         Ok(())
+    }
+
+    // ── NVMe passthrough methods ──────────────────────────────────────────
+
+    /// Open an NVMe device for passthrough I/O.
+    ///
+    /// `path` must be an NVMe-generic character device (e.g., `/dev/ng0n1`).
+    /// `nsid` is the NVMe namespace ID (usually 1).
+    ///
+    /// The device fd is registered in the io_uring fixed file table. Returns
+    /// an [`NvmeDevice`](crate::nvme::NvmeDevice) handle for subsequent operations.
+    pub fn open_nvme_device(
+        &mut self,
+        path: &str,
+        nsid: u32,
+    ) -> io::Result<crate::nvme::NvmeDevice> {
+        let devices = self
+            .nvme_devices
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+
+        let index = devices
+            .allocate()
+            .ok_or_else(|| io::Error::other("NVMe device table full"))?;
+
+        // Open the NVMe-generic character device.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid device path"))?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            devices.release(index);
+            return Err(io::Error::last_os_error());
+        }
+
+        // Register in the fixed file table.
+        let fd_index = self.nvme_fd_base + index as u32;
+        if self.ring.register_files_update(fd_index, &[fd]).is_err() {
+            devices.release(index);
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(io::Error::other("failed to register NVMe fd"));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+
+        // Store device state.
+        if let Some(dev) = devices.get_mut(index) {
+            dev.fd_index = fd_index;
+            dev.nsid = nsid;
+        }
+
+        let generation = devices.get(index).map(|d| d.generation).unwrap_or(0);
+        Ok(crate::nvme::NvmeDevice { index, generation })
+    }
+
+    /// Submit an NVMe read command.
+    ///
+    /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
+    /// at `buf_addr` with length `buf_len`. The buffer must remain valid
+    /// until [`on_nvme_complete`](EventHandler::on_nvme_complete) fires.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    pub fn nvme_read(
+        &mut self,
+        device: crate::nvme::NvmeDevice,
+        lba: u64,
+        num_blocks: u16,
+        buf_addr: u64,
+        buf_len: u32,
+    ) -> io::Result<u32> {
+        let (fd_index, nsid) = self.validate_nvme_device(device)?;
+
+        let slab = self
+            .nvme_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let slab_idx = slab
+            .allocate(device.index)
+            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+
+        let cmd = crate::nvme::NvmeUringCmd::read(nsid, lba, num_blocks, buf_addr, buf_len);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::NvmeCmd,
+            device.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+            Ok(()) => {
+                if let Some(devices) = self.nvme_devices.as_mut()
+                    && let Some(dev) = devices.get_mut(device.index)
+                {
+                    dev.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit an NVMe write command.
+    ///
+    /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
+    /// at `buf_addr` with length `buf_len`. The buffer must remain valid
+    /// until [`on_nvme_complete`](EventHandler::on_nvme_complete) fires.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    pub fn nvme_write(
+        &mut self,
+        device: crate::nvme::NvmeDevice,
+        lba: u64,
+        num_blocks: u16,
+        buf_addr: u64,
+        buf_len: u32,
+    ) -> io::Result<u32> {
+        let (fd_index, nsid) = self.validate_nvme_device(device)?;
+
+        let slab = self
+            .nvme_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let slab_idx = slab
+            .allocate(device.index)
+            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+
+        let cmd = crate::nvme::NvmeUringCmd::write(nsid, lba, num_blocks, buf_addr, buf_len);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::NvmeCmd,
+            device.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+            Ok(()) => {
+                if let Some(devices) = self.nvme_devices.as_mut()
+                    && let Some(dev) = devices.get_mut(device.index)
+                {
+                    dev.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit an NVMe flush command.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    pub fn nvme_flush(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<u32> {
+        let (fd_index, nsid) = self.validate_nvme_device(device)?;
+
+        let slab = self
+            .nvme_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let slab_idx = slab
+            .allocate(device.index)
+            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+
+        let cmd = crate::nvme::NvmeUringCmd::flush(nsid);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::NvmeCmd,
+            device.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+            Ok(()) => {
+                if let Some(devices) = self.nvme_devices.as_mut()
+                    && let Some(dev) = devices.get_mut(device.index)
+                {
+                    dev.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Close an NVMe device.
+    pub fn close_nvme_device(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<()> {
+        let (fd_index, _nsid) = self.validate_nvme_device(device)?;
+
+        // Unregister from the fixed file table.
+        let _ = self.ring.register_files_update(fd_index, &[-1i32]);
+
+        if let Some(devices) = self.nvme_devices.as_mut() {
+            devices.release(device.index);
+        }
+
+        Ok(())
+    }
+
+    /// Validate an NVMe device handle and return (fd_index, nsid).
+    fn validate_nvme_device(
+        &self,
+        device: crate::nvme::NvmeDevice,
+    ) -> io::Result<(u32, u32)> {
+        let devices = self
+            .nvme_devices
+            .as_ref()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let dev = devices
+            .get(device.index)
+            .ok_or_else(|| io::Error::other("invalid NVMe device handle"))?;
+        if dev.generation != device.generation {
+            return Err(io::Error::other("stale NVMe device handle"));
+        }
+        Ok((dev.fd_index, dev.nsid))
     }
 
     /// Arm a connect timeout for the given connection index.
@@ -1475,6 +1707,14 @@ pub trait EventHandler: Send + 'static {
         _data: &[u8],
         _peer: SocketAddr,
     ) {
+    }
+
+    /// Called when an NVMe passthrough command completes.
+    ///
+    /// The [`NvmeCompletion`](crate::nvme::NvmeCompletion) contains the device
+    /// handle, command sequence number, and result code.
+    /// Default: no-op.
+    fn on_nvme_complete(&mut self, _ctx: &mut DriverCtx, _completion: crate::nvme::NvmeCompletion) {
     }
 
     /// Called when the worker's eventfd is signaled by an external thread.

@@ -88,6 +88,9 @@ pub struct Config {
     /// UDP bind addresses. Each worker creates its own socket with SO_REUSEPORT.
     /// Empty = no UDP sockets.
     pub udp_bind: Vec<SocketAddr>,
+    /// Optional NVMe passthrough configuration. When set, enables NVMe device
+    /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.
+    pub nvme: Option<crate::nvme::NvmeConfig>,
 }
 
 impl Default for Config {
@@ -117,6 +120,7 @@ impl Default for Config {
             standalone_task_capacity: 256,
             timer_slots: 256,
             udp_bind: Vec::new(),
+            nvme: None,
         }
     }
 }

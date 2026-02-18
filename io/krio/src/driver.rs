@@ -133,7 +133,9 @@ pub(crate) struct Driver {
     /// Pre-allocated timespec storage for connect timeouts.
     pub(crate) connect_timespecs: Vec<io_uring::types::Timespec>,
     /// Pre-allocated batch buffer for draining CQEs.
-    pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
+    /// Tuple: (user_data, result, flags, big_cqe). The big_cqe field
+    /// contains the extra 16 bytes from Entry32 CQEs (used by NVMe passthrough).
+    pub(crate) cqe_batch: Vec<(u64, i32, u32, [u64; 2])>,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
     /// Per-connection send chain tracking for IOSQE_IO_LINK chains.
@@ -149,6 +151,13 @@ pub(crate) struct Driver {
     pub(crate) tick_timeout_armed: bool,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
+    /// NVMe device tracking table. `None` when NVMe is not configured.
+    pub(crate) nvme_devices: Option<crate::nvme::NvmeDeviceTable>,
+    /// NVMe command slab for tracking in-flight commands. `None` when NVMe is not configured.
+    pub(crate) nvme_cmd_slab: Option<crate::nvme::NvmeCmdSlab>,
+    /// Base offset in the fixed file table for NVMe device fds.
+    /// NVMe devices are registered at `nvme_fd_base + device_index`.
+    pub(crate) nvme_fd_base: u32,
 }
 
 impl Driver {
@@ -170,10 +179,15 @@ impl Driver {
         )?;
 
         let udp_count = config.udp_bind.len() as u32;
+        let nvme_max = config
+            .nvme
+            .as_ref()
+            .map(|n| n.max_devices as u32)
+            .unwrap_or(0);
 
         // Register resources with the kernel
         ring.register_buffers(&fixed_buffers)?;
-        ring.register_files_sparse(config.max_connections + udp_count)?;
+        ring.register_files_sparse(config.max_connections + udp_count + nvme_max)?;
         ring.register_buf_ring(&provided_bufs)?;
 
         let connections = ConnectionTable::new(config.max_connections);
@@ -270,6 +284,15 @@ impl Driver {
             },
             tick_timeout_armed: false,
             udp_sockets,
+            nvme_devices: config
+                .nvme
+                .as_ref()
+                .map(|n| crate::nvme::NvmeDeviceTable::new(n.max_devices)),
+            nvme_cmd_slab: config
+                .nvme
+                .as_ref()
+                .map(|n| crate::nvme::NvmeCmdSlab::new(n.max_commands_in_flight)),
+            nvme_fd_base: config.max_connections + udp_count,
         };
 
         // Submit initial recvmsg for each UDP socket.
@@ -309,6 +332,9 @@ impl Driver {
             max_chain_length: self.max_chain_length,
             send_queues: &mut self.send_queues,
             udp_sockets: &mut self.udp_sockets,
+            nvme_devices: &mut self.nvme_devices,
+            nvme_cmd_slab: &mut self.nvme_cmd_slab,
+            nvme_fd_base: self.nvme_fd_base,
         }
     }
 
@@ -596,13 +622,17 @@ impl Driver {
             {
                 let cq = self.ring.ring.completion();
                 for cqe in cq {
-                    self.cqe_batch
-                        .push((cqe.user_data(), cqe.result(), cqe.flags()));
+                    self.cqe_batch.push((
+                        cqe.user_data(),
+                        cqe.result(),
+                        cqe.flags(),
+                        *cqe.big_cqe(),
+                    ));
                 }
             }
 
             for i in 0..self.cqe_batch.len() {
-                let (user_data_raw, _result, flags) = self.cqe_batch[i];
+                let (user_data_raw, _result, flags, _big_cqe) = self.cqe_batch[i];
                 let ud = UserData(user_data_raw);
                 let tag = match ud.tag() {
                     Some(t) => t,
