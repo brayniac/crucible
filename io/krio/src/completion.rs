@@ -25,6 +25,10 @@ pub enum OpTag {
     RecvMsgUdp = 13,
     /// Copying sendmsg for UDP sockets.
     SendMsgUdp = 14,
+    /// NVMe passthrough command (read, write, flush via IORING_OP_URING_CMD).
+    NvmeCmd = 15,
+    /// Direct I/O command (read, write, fsync via O_DIRECT + IORING_OP_READ/WRITE).
+    DirectIo = 16,
 }
 
 impl OpTag {
@@ -45,6 +49,8 @@ impl OpTag {
             12 => Some(OpTag::Timer),
             13 => Some(OpTag::RecvMsgUdp),
             14 => Some(OpTag::SendMsgUdp),
+            15 => Some(OpTag::NvmeCmd),
+            16 => Some(OpTag::DirectIo),
             _ => None,
         }
     }

@@ -86,6 +86,18 @@ pub struct DriverCtx<'a> {
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: &'a mut Vec<crate::driver::UdpSocketState>,
+    /// NVMe device table. `None` when NVMe is not configured.
+    pub(crate) nvme_devices: &'a mut Option<crate::nvme::NvmeDeviceTable>,
+    /// NVMe command slab. `None` when NVMe is not configured.
+    pub(crate) nvme_cmd_slab: &'a mut Option<crate::nvme::NvmeCmdSlab>,
+    /// Base offset in the fixed file table for NVMe device fds.
+    pub(crate) nvme_fd_base: u32,
+    /// Direct I/O file table. `None` when direct I/O is not configured.
+    pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
+    /// Direct I/O command slab. `None` when direct I/O is not configured.
+    pub(crate) direct_io_cmd_slab: &'a mut Option<crate::direct_io::DirectIoCmdSlab>,
+    /// Base offset in the fixed file table for direct I/O file fds.
+    pub(crate) direct_io_fd_base: u32,
 }
 
 impl<'a> DriverCtx<'a> {
@@ -571,6 +583,456 @@ impl<'a> DriverCtx<'a> {
         let target_ud = crate::completion::UserData::encode(target_tag, conn.index, 0);
         self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
         Ok(())
+    }
+
+    // ── NVMe passthrough methods ──────────────────────────────────────────
+
+    /// Open an NVMe device for passthrough I/O.
+    ///
+    /// `path` must be an NVMe-generic character device (e.g., `/dev/ng0n1`).
+    /// `nsid` is the NVMe namespace ID (usually 1).
+    ///
+    /// The device fd is registered in the io_uring fixed file table. Returns
+    /// an [`NvmeDevice`](crate::nvme::NvmeDevice) handle for subsequent operations.
+    pub fn open_nvme_device(
+        &mut self,
+        path: &str,
+        nsid: u32,
+    ) -> io::Result<crate::nvme::NvmeDevice> {
+        let devices = self
+            .nvme_devices
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+
+        let index = devices
+            .allocate()
+            .ok_or_else(|| io::Error::other("NVMe device table full"))?;
+
+        // Open the NVMe-generic character device.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid device path"))?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            devices.release(index);
+            return Err(io::Error::last_os_error());
+        }
+
+        // Register in the fixed file table.
+        let fd_index = self.nvme_fd_base + index as u32;
+        if self.ring.register_files_update(fd_index, &[fd]).is_err() {
+            devices.release(index);
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(io::Error::other("failed to register NVMe fd"));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+
+        // Store device state.
+        if let Some(dev) = devices.get_mut(index) {
+            dev.fd_index = fd_index;
+            dev.nsid = nsid;
+        }
+
+        let generation = devices.get(index).map(|d| d.generation).unwrap_or(0);
+        Ok(crate::nvme::NvmeDevice { index, generation })
+    }
+
+    /// Submit an NVMe read command.
+    ///
+    /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
+    /// at `buf_addr` with length `buf_len`. The buffer must remain valid
+    /// until [`on_nvme_complete`](EventHandler::on_nvme_complete) fires.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    pub fn nvme_read(
+        &mut self,
+        device: crate::nvme::NvmeDevice,
+        lba: u64,
+        num_blocks: u16,
+        buf_addr: u64,
+        buf_len: u32,
+    ) -> io::Result<u32> {
+        let (fd_index, nsid) = self.validate_nvme_device(device)?;
+
+        let slab = self
+            .nvme_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let slab_idx = slab
+            .allocate(device.index)
+            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+
+        let cmd = crate::nvme::NvmeUringCmd::read(nsid, lba, num_blocks, buf_addr, buf_len);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::NvmeCmd,
+            device.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+            Ok(()) => {
+                if let Some(devices) = self.nvme_devices.as_mut()
+                    && let Some(dev) = devices.get_mut(device.index)
+                {
+                    dev.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit an NVMe write command.
+    ///
+    /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
+    /// at `buf_addr` with length `buf_len`. The buffer must remain valid
+    /// until [`on_nvme_complete`](EventHandler::on_nvme_complete) fires.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    pub fn nvme_write(
+        &mut self,
+        device: crate::nvme::NvmeDevice,
+        lba: u64,
+        num_blocks: u16,
+        buf_addr: u64,
+        buf_len: u32,
+    ) -> io::Result<u32> {
+        let (fd_index, nsid) = self.validate_nvme_device(device)?;
+
+        let slab = self
+            .nvme_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let slab_idx = slab
+            .allocate(device.index)
+            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+
+        let cmd = crate::nvme::NvmeUringCmd::write(nsid, lba, num_blocks, buf_addr, buf_len);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::NvmeCmd,
+            device.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+            Ok(()) => {
+                if let Some(devices) = self.nvme_devices.as_mut()
+                    && let Some(dev) = devices.get_mut(device.index)
+                {
+                    dev.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit an NVMe flush command.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    pub fn nvme_flush(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<u32> {
+        let (fd_index, nsid) = self.validate_nvme_device(device)?;
+
+        let slab = self
+            .nvme_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let slab_idx = slab
+            .allocate(device.index)
+            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+
+        let cmd = crate::nvme::NvmeUringCmd::flush(nsid);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::NvmeCmd,
+            device.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+            Ok(()) => {
+                if let Some(devices) = self.nvme_devices.as_mut()
+                    && let Some(dev) = devices.get_mut(device.index)
+                {
+                    dev.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Close an NVMe device.
+    pub fn close_nvme_device(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<()> {
+        let (fd_index, _nsid) = self.validate_nvme_device(device)?;
+
+        // Unregister from the fixed file table.
+        let _ = self.ring.register_files_update(fd_index, &[-1i32]);
+
+        if let Some(devices) = self.nvme_devices.as_mut() {
+            devices.release(device.index);
+        }
+
+        Ok(())
+    }
+
+    /// Validate an NVMe device handle and return (fd_index, nsid).
+    fn validate_nvme_device(&self, device: crate::nvme::NvmeDevice) -> io::Result<(u32, u32)> {
+        let devices = self
+            .nvme_devices
+            .as_ref()
+            .ok_or_else(|| io::Error::other("NVMe not configured"))?;
+        let dev = devices
+            .get(device.index)
+            .ok_or_else(|| io::Error::other("invalid NVMe device handle"))?;
+        if dev.generation != device.generation {
+            return Err(io::Error::other("stale NVMe device handle"));
+        }
+        Ok((dev.fd_index, dev.nsid))
+    }
+
+    // ── Direct I/O methods ────────────────────────────────────────────────
+
+    /// Open a file for direct I/O (O_DIRECT).
+    ///
+    /// `path` can be any file or block device path. The file is opened with
+    /// `O_RDWR | O_DIRECT`. The fd is registered in the io_uring fixed file table.
+    ///
+    /// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle for
+    /// subsequent operations.
+    pub fn open_direct_io_file(
+        &mut self,
+        path: &str,
+    ) -> io::Result<crate::direct_io::DirectIoFile> {
+        let files = self
+            .direct_io_files
+            .as_mut()
+            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
+
+        let index = files
+            .allocate()
+            .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
+
+        // Open with O_DIRECT | O_RDWR.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
+        if fd < 0 {
+            files.release(index);
+            return Err(io::Error::last_os_error());
+        }
+
+        // Register in the fixed file table.
+        let fd_index = self.direct_io_fd_base + index as u32;
+        if self.ring.register_files_update(fd_index, &[fd]).is_err() {
+            files.release(index);
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(io::Error::other("failed to register direct I/O fd"));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+
+        // Store file state.
+        if let Some(f) = files.get_mut(index) {
+            f.fd_index = fd_index;
+        }
+
+        let generation = files.get(index).map(|f| f.generation).unwrap_or(0);
+        Ok(crate::direct_io::DirectIoFile { index, generation })
+    }
+
+    /// Submit a direct I/O read.
+    ///
+    /// Reads `len` bytes from `offset` into the buffer at `buf`.
+    /// The buffer must be aligned to the logical block size and remain valid
+    /// until [`on_direct_io_complete`](EventHandler::on_direct_io_complete) fires.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    ///
+    /// # Safety
+    /// `buf` must point to valid, aligned memory of at least `len` bytes
+    /// that remains valid until the completion callback fires.
+    pub unsafe fn direct_io_read(
+        &mut self,
+        file: crate::direct_io::DirectIoFile,
+        offset: u64,
+        buf: *mut u8,
+        len: u32,
+    ) -> io::Result<u32> {
+        let fd_index = self.validate_direct_io_file(file)?;
+
+        let slab = self
+            .direct_io_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(file.index, crate::direct_io::DirectIoOp::Read)
+            .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
+
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::DirectIo,
+            file.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
+            Ok(()) => {
+                if let Some(files) = self.direct_io_files.as_mut()
+                    && let Some(f) = files.get_mut(file.index)
+                {
+                    f.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit a direct I/O write.
+    ///
+    /// Writes `len` bytes from the buffer at `buf` to `offset`.
+    /// The buffer must be aligned to the logical block size and remain valid
+    /// until [`on_direct_io_complete`](EventHandler::on_direct_io_complete) fires.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    ///
+    /// # Safety
+    /// `buf` must point to valid, aligned memory of at least `len` bytes
+    /// that remains valid until the completion callback fires.
+    pub unsafe fn direct_io_write(
+        &mut self,
+        file: crate::direct_io::DirectIoFile,
+        offset: u64,
+        buf: *const u8,
+        len: u32,
+    ) -> io::Result<u32> {
+        let fd_index = self.validate_direct_io_file(file)?;
+
+        let slab = self
+            .direct_io_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(file.index, crate::direct_io::DirectIoOp::Write)
+            .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
+
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::DirectIo,
+            file.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe {
+            self.ring
+                .submit_direct_write(fd_index, buf, len, offset, ud)
+        } {
+            Ok(()) => {
+                if let Some(files) = self.direct_io_files.as_mut()
+                    && let Some(f) = files.get_mut(file.index)
+                {
+                    f.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit an fsync for a direct I/O file.
+    ///
+    /// Returns the command slab index (sequence number) for correlation.
+    pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
+        let fd_index = self.validate_direct_io_file(file)?;
+
+        let slab = self
+            .direct_io_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(file.index, crate::direct_io::DirectIoOp::Fsync)
+            .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
+
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::DirectIo,
+            file.index as u32,
+            slab_idx as u32,
+        );
+
+        match self.ring.submit_direct_fsync(fd_index, ud) {
+            Ok(()) => {
+                if let Some(files) = self.direct_io_files.as_mut()
+                    && let Some(f) = files.get_mut(file.index)
+                {
+                    f.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Close a direct I/O file.
+    pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
+        let fd_index = self.validate_direct_io_file(file)?;
+
+        // Unregister from the fixed file table.
+        let _ = self.ring.register_files_update(fd_index, &[-1i32]);
+
+        if let Some(files) = self.direct_io_files.as_mut() {
+            files.release(file.index);
+        }
+
+        Ok(())
+    }
+
+    /// Validate a direct I/O file handle and return the fd_index.
+    fn validate_direct_io_file(&self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
+        let files = self
+            .direct_io_files
+            .as_ref()
+            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
+        let f = files
+            .get(file.index)
+            .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
+        if f.generation != file.generation {
+            return Err(io::Error::other("stale direct I/O file handle"));
+        }
+        Ok(f.fd_index)
     }
 
     /// Arm a connect timeout for the given connection index.
@@ -1474,6 +1936,27 @@ pub trait EventHandler: Send + 'static {
         _socket: UdpToken,
         _data: &[u8],
         _peer: SocketAddr,
+    ) {
+    }
+
+    /// Called when an NVMe passthrough command completes.
+    ///
+    /// The [`NvmeCompletion`](crate::nvme::NvmeCompletion) contains the device
+    /// handle, command sequence number, and result code.
+    /// Default: no-op.
+    fn on_nvme_complete(&mut self, _ctx: &mut DriverCtx, _completion: crate::nvme::NvmeCompletion) {
+    }
+
+    /// Called when a direct I/O command completes (read, write, or fsync).
+    ///
+    /// The [`DirectIoCompletion`](crate::direct_io::DirectIoCompletion) contains
+    /// the file handle, operation type, sequence number, and result code.
+    /// For read/write, a positive result is the number of bytes transferred.
+    /// Default: no-op.
+    fn on_direct_io_complete(
+        &mut self,
+        _ctx: &mut DriverCtx,
+        _completion: crate::direct_io::DirectIoCompletion,
     ) {
     }
 
