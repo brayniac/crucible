@@ -225,7 +225,7 @@ impl RamPool for IoUringPool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
 
