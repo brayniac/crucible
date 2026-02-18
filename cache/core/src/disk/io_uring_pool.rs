@@ -63,7 +63,10 @@ impl IoUringPool {
         assert!(pool_id <= 3, "pool_id must be 0-3");
         assert!(segment_count > 0, "segment_count must be > 0");
         assert!(segment_size > 0, "segment_size must be > 0");
-        assert!(block_size > 0 && block_size.is_power_of_two(), "block_size must be a power of two");
+        assert!(
+            block_size > 0 && block_size.is_power_of_two(),
+            "block_size must be a power of two"
+        );
 
         let free_queue = Box::new(crossbeam_deque::Injector::new());
         let spare_queue = Box::new(crossbeam_deque::Injector::new());

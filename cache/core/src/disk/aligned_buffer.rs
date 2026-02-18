@@ -325,7 +325,11 @@ mod tests {
         let b2 = pool.allocate().unwrap();
 
         // Each buffer should have a distinct, non-overlapping pointer
-        let ptrs = [b0.as_ptr() as usize, b1.as_ptr() as usize, b2.as_ptr() as usize];
+        let ptrs = [
+            b0.as_ptr() as usize,
+            b1.as_ptr() as usize,
+            b2.as_ptr() as usize,
+        ];
         for i in 0..3 {
             for j in (i + 1)..3 {
                 let diff = ptrs[i].abs_diff(ptrs[j]);

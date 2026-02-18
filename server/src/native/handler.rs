@@ -253,11 +253,7 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
         self.handle_disk_read_complete(ctx, completion.seq, completion.is_success());
     }
 
-    fn on_direct_io_complete(
-        &mut self,
-        ctx: &mut DriverCtx,
-        completion: krio::DirectIoCompletion,
-    ) {
+    fn on_direct_io_complete(&mut self, ctx: &mut DriverCtx, completion: krio::DirectIoCompletion) {
         use krio::DirectIoOp;
         match completion.op {
             DirectIoOp::Read => {
@@ -398,11 +394,7 @@ impl<C: Cache> ServerHandler<C> {
 
         // Parse item from read buffer
         let item_offset = pending.params.item_offset as usize;
-        let buf_slice = unsafe {
-            pending
-                .buffer
-                .as_slice(pending.params.read_len as usize)
-        };
+        let buf_slice = unsafe { pending.buffer.as_slice(pending.params.read_len as usize) };
 
         // Parse the BasicHeader at the item offset
         let header_size = cache_core::BasicHeader::SIZE;
@@ -417,9 +409,8 @@ impl<C: Cache> ServerHandler<C> {
             return;
         }
 
-        let header = cache_core::BasicHeader::from_bytes(
-            &buf_slice[item_offset..item_offset + header_size],
-        );
+        let header =
+            cache_core::BasicHeader::from_bytes(&buf_slice[item_offset..item_offset + header_size]);
 
         if header.is_deleted() {
             if let Some(c) = conn_opt {

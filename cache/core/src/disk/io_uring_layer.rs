@@ -180,8 +180,7 @@ impl IoUringDiskLayer {
                 // Reset cached write segment for this bucket
                 let bucket_index = self.buckets.get_bucket_index(ttl);
                 if bucket_index < self.current_write_segments.len() {
-                    self.current_write_segments[bucket_index]
-                        .store(u32::MAX, Ordering::Release);
+                    self.current_write_segments[bucket_index].store(u32::MAX, Ordering::Release);
                 }
             }
 
@@ -197,11 +196,7 @@ impl IoUringDiskLayer {
     /// Returns the raw value reference components if the segment has a
     /// write buffer attached (i.e., it hasn't been flushed to disk yet).
     /// Returns `None` if the segment has no write buffer (data is on disk).
-    pub fn read_from_buffer(
-        &self,
-        location: ItemLocation,
-        key: &[u8],
-    ) -> Option<ValueRefRaw> {
+    pub fn read_from_buffer(&self, location: ItemLocation, key: &[u8]) -> Option<ValueRefRaw> {
         if location.pool_id() != self.pool.pool_id() {
             return None;
         }
@@ -268,8 +263,9 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        let stored_key =
-            unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), header.key_len() as usize) };
+        let stored_key = unsafe {
+            std::slice::from_raw_parts(data_ptr.add(key_start), header.key_len() as usize)
+        };
         if stored_key != key {
             unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
             return None;
@@ -299,11 +295,7 @@ impl IoUringDiskLayer {
     /// # Parameters
     /// - `location`: Item location from hashtable
     /// - `read_size`: How many bytes to read (typically one block)
-    pub fn prepare_read(
-        &self,
-        location: ItemLocation,
-        read_size: u32,
-    ) -> Option<DiskReadParams> {
+    pub fn prepare_read(&self, location: ItemLocation, read_size: u32) -> Option<DiskReadParams> {
         if location.pool_id() != self.pool.pool_id() {
             return None;
         }
@@ -338,7 +330,8 @@ impl IoUringDiskLayer {
 
         // Compute block-aligned read range
         let (disk_offset, read_len, item_offset) =
-            self.pool.item_disk_range(location.segment_id(), location.offset(), read_size);
+            self.pool
+                .item_disk_range(location.segment_id(), location.offset(), read_size);
 
         Some(DiskReadParams {
             disk_offset,
@@ -442,8 +435,7 @@ impl IoUringDiskLayer {
         match bucket.append_segment(segment_id, &self.pool) {
             Ok(()) => {
                 if bucket_index < self.current_write_segments.len() {
-                    self.current_write_segments[bucket_index]
-                        .store(segment_id, Ordering::Release);
+                    self.current_write_segments[bucket_index].store(segment_id, Ordering::Release);
                 }
                 Ok(segment_id)
             }
@@ -469,8 +461,7 @@ impl IoUringDiskLayer {
 
         // Check cached write segment first
         if bucket_index < self.current_write_segments.len() {
-            let cached_id = self.current_write_segments[bucket_index]
-                .load(Ordering::Acquire);
+            let cached_id = self.current_write_segments[bucket_index].load(Ordering::Acquire);
             if cached_id != u32::MAX
                 && let Some(segment) = self.pool.get(cached_id)
                 && segment.state() == State::Live
@@ -487,8 +478,7 @@ impl IoUringDiskLayer {
             && segment.has_write_buffer()
         {
             if bucket_index < self.current_write_segments.len() {
-                self.current_write_segments[bucket_index]
-                    .store(tail_id, Ordering::Release);
+                self.current_write_segments[bucket_index].store(tail_id, Ordering::Release);
             }
             return Ok(tail_id);
         }
@@ -826,7 +816,9 @@ impl IoUringDiskLayerBuilder {
     pub fn new() -> Self {
         Self {
             layer_id: 2,
-            config: LayerConfig::new().with_ghosts(true).with_demotion_threshold(2),
+            config: LayerConfig::new()
+                .with_ghosts(true)
+                .with_demotion_threshold(2),
             pool_id: 2,
             segment_size: 8 * 1024 * 1024, // 8MB
             segment_count: 128,
@@ -882,9 +874,7 @@ impl IoUringDiskLayerBuilder {
         let num_buckets = crate::organization::MAX_TTL_BUCKETS;
         let buckets = TtlBuckets::new();
 
-        let current_write_segments = (0..num_buckets)
-            .map(|_| AtomicU32::new(u32::MAX))
-            .collect();
+        let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 
         IoUringDiskLayer {
             layer_id: self.layer_id,

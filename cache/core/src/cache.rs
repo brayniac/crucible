@@ -836,8 +836,14 @@ impl<H: Hashtable> TieredCache<H> {
         match layer {
             CacheLayer::IoUringDisk(disk_layer) => {
                 // Try synchronous read from write buffer first
-                if let Some((ref_count_ptr, value_ptr, value_len, metadata_ptr, free_queue_ptr, segment_id)) =
-                    disk_layer.read_from_buffer(item_loc, key)
+                if let Some((
+                    ref_count_ptr,
+                    value_ptr,
+                    value_len,
+                    metadata_ptr,
+                    free_queue_ptr,
+                    segment_id,
+                )) = disk_layer.read_from_buffer(item_loc, key)
                 {
                     let vr = unsafe {
                         crate::cache_trait::ValueRef::new(
@@ -860,7 +866,14 @@ impl<H: Hashtable> TieredCache<H> {
             _ => {
                 // RAM layers (and mmap disk): existing zero-copy path
                 match layer.get_value_ref_raw(item_loc, key) {
-                    Some((ref_count_ptr, value_ptr, value_len, metadata_ptr, free_queue_ptr, segment_id)) => {
+                    Some((
+                        ref_count_ptr,
+                        value_ptr,
+                        value_len,
+                        metadata_ptr,
+                        free_queue_ptr,
+                        segment_id,
+                    )) => {
                         let vr = unsafe {
                             crate::cache_trait::ValueRef::new(
                                 ref_count_ptr,

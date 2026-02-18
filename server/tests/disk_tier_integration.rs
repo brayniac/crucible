@@ -69,8 +69,7 @@ fn send_get(stream: &mut TcpStream, key: &str) -> Option<String> {
                 if total_read >= 5 && &buf[..3] == b"$-1" {
                     return None; // null bulk string (miss)
                 }
-                if total_read >= 2 && buf[total_read - 2] == b'\r' && buf[total_read - 1] == b'\n'
-                {
+                if total_read >= 2 && buf[total_read - 2] == b'\r' && buf[total_read - 1] == b'\n' {
                     let resp = String::from_utf8_lossy(&buf[..total_read]);
                     // Parse bulk string: $<len>\r\n<data>\r\n
                     if resp.starts_with('$')
@@ -83,9 +82,7 @@ fn send_get(stream: &mut TcpStream, key: &str) -> Option<String> {
                         let body_start = header_end + 2;
                         let needed = body_start + len as usize + 2;
                         if total_read >= needed {
-                            return Some(
-                                resp[body_start..body_start + len as usize].to_string(),
-                            );
+                            return Some(resp[body_start..body_start + len as usize].to_string());
                         }
                     }
                 }
@@ -159,10 +156,7 @@ fn start_disk_test_server_callback(
 }
 
 /// Start an async server with a small RAM heap + Direct I/O disk tier.
-fn start_disk_test_server_async(
-    port: u16,
-    disk_path: &std::path::Path,
-) -> thread::JoinHandle<()> {
+fn start_disk_test_server_async(port: u16, disk_path: &std::path::Path) -> thread::JoinHandle<()> {
     let disk_path = disk_path.to_path_buf();
     thread::spawn(move || {
         let config_str = format!(
@@ -292,7 +286,8 @@ struct TempDiskFile {
 
 impl TempDiskFile {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("crucible-test-{}-{}.dat", name, std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("crucible-test-{}-{}.dat", name, std::process::id()));
         // Pre-create the file
         let file = std::fs::OpenOptions::new()
             .read(true)

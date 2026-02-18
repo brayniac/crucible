@@ -279,7 +279,15 @@ async fn handle_connection<C: Cache>(
             let has_disk_io = disk_io.lock().unwrap().is_some();
             if has_disk_io {
                 let pending_info = connection.pending_disk_read.take().unwrap();
-                match submit_and_await_disk_read(&disk_io, &conn, &mut connection, pending_info, slot_size).await {
+                match submit_and_await_disk_read(
+                    &disk_io,
+                    &conn,
+                    &mut connection,
+                    pending_info,
+                    slot_size,
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(()) => break,
                 }
@@ -354,7 +362,13 @@ async fn submit_and_await_disk_read(
             DiskBackend::Nvme { device, block_size } => {
                 let lba = pending_info.params.disk_offset / *block_size as u64;
                 let num_blocks = (pending_info.params.read_len / *block_size) as u16;
-                krio::nvme_read(*device, lba, num_blocks, buffer.addr(), pending_info.params.read_len)
+                krio::nvme_read(
+                    *device,
+                    lba,
+                    num_blocks,
+                    buffer.addr(),
+                    pending_info.params.read_len,
+                )
             }
         }
     };
@@ -367,7 +381,13 @@ async fn submit_and_await_disk_read(
     // 3. Parse result and write response (same logic as native/handler.rs).
     if result.is_err() {
         connection.write_miss_response();
-        disk_io.lock().unwrap().as_mut().unwrap().read_buffer_pool.release(buffer);
+        disk_io
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .read_buffer_pool
+            .release(buffer);
         return Ok(());
     }
 
@@ -377,17 +397,28 @@ async fn submit_and_await_disk_read(
 
     if item_offset + header_size > buf_slice.len() {
         connection.write_miss_response();
-        disk_io.lock().unwrap().as_mut().unwrap().read_buffer_pool.release(buffer);
+        disk_io
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .read_buffer_pool
+            .release(buffer);
         return Ok(());
     }
 
-    let header = cache_core::BasicHeader::from_bytes(
-        &buf_slice[item_offset..item_offset + header_size],
-    );
+    let header =
+        cache_core::BasicHeader::from_bytes(&buf_slice[item_offset..item_offset + header_size]);
 
     if header.is_deleted() {
         connection.write_miss_response();
-        disk_io.lock().unwrap().as_mut().unwrap().read_buffer_pool.release(buffer);
+        disk_io
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .read_buffer_pool
+            .release(buffer);
         return Ok(());
     }
 
@@ -398,7 +429,13 @@ async fn submit_and_await_disk_read(
 
     if value_end > buf_slice.len() {
         connection.write_miss_response();
-        disk_io.lock().unwrap().as_mut().unwrap().read_buffer_pool.release(buffer);
+        disk_io
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .read_buffer_pool
+            .release(buffer);
         return Ok(());
     }
 
@@ -407,10 +444,18 @@ async fn submit_and_await_disk_read(
 
     // 4. Drain the response.
     if connection.has_pending_write() {
-        drain_pending(conn, connection, slot_size, false).await.map_err(|_| ())?;
+        drain_pending(conn, connection, slot_size, false)
+            .await
+            .map_err(|_| ())?;
     }
 
-    disk_io.lock().unwrap().as_mut().unwrap().read_buffer_pool.release(buffer);
+    disk_io
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .read_buffer_pool
+        .release(buffer);
     Ok(())
 }
 

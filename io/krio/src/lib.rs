@@ -103,6 +103,8 @@ pub use runtime::io::ConnCtx;
 pub use runtime::io::ConnectFuture;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
+/// Future that awaits a disk I/O completion (NVMe or Direct I/O).
+pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
 /// Future that resolves when recv data is available (sink, accumulator, or close).
@@ -117,16 +119,6 @@ pub use runtime::io::TimeoutFuture;
 pub use runtime::io::UdpCtx;
 /// Future returned by [`UdpCtx::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
-/// Future that awaits a disk I/O completion (NVMe or Direct I/O).
-pub use runtime::io::DiskIoFuture;
-/// Open a Direct I/O file from any async task.
-pub use runtime::io::open_direct_io_file;
-/// Open an NVMe device from any async task.
-pub use runtime::io::open_nvme_device;
-/// Submit a Direct I/O read and return a future for the result.
-pub use runtime::io::direct_io_read;
-/// Submit an NVMe read and return a future for the result.
-pub use runtime::io::nvme_read;
 /// Future that provides received data as zero-copy `Bytes`.
 pub use runtime::io::WithBytesFuture;
 /// Future that provides received data.
@@ -141,6 +133,14 @@ pub use runtime::io::connect_tls;
 pub use runtime::io::connect_tls_with_timeout;
 /// Initiate an outbound TCP connection with a timeout from any async task.
 pub use runtime::io::connect_with_timeout;
+/// Submit a Direct I/O read and return a future for the result.
+pub use runtime::io::direct_io_read;
+/// Submit an NVMe read and return a future for the result.
+pub use runtime::io::nvme_read;
+/// Open a Direct I/O file from any async task.
+pub use runtime::io::open_direct_io_file;
+/// Open an NVMe device from any async task.
+pub use runtime::io::open_nvme_device;
 /// Request graceful shutdown from any async task.
 pub use runtime::io::request_shutdown;
 /// Create a future that completes after a duration.

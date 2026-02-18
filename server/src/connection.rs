@@ -244,8 +244,7 @@ impl Connection {
     /// or when a disk read is pending (pipeline stalling).
     #[inline]
     pub fn should_read(&self) -> bool {
-        self.pending_disk_read.is_none()
-            && self.pending_write_len() <= Self::MAX_PENDING_WRITE
+        self.pending_disk_read.is_none() && self.pending_write_len() <= Self::MAX_PENDING_WRITE
     }
 
     /// Get the amount of pending write data (send queue + write buffer).
@@ -692,9 +691,10 @@ impl Connection {
                                 HITS.increment();
                                 self.pending_disk_read = Some(PendingDiskReadInfo {
                                     params,
-                                    response_ctx: crate::disk_io::DiskReadResponseCtx::MemcacheAscii {
-                                        key: key.to_vec(),
-                                    },
+                                    response_ctx:
+                                        crate::disk_io::DiskReadResponseCtx::MemcacheAscii {
+                                            key: key.to_vec(),
+                                        },
                                 });
                                 buf.consume(consumed);
                                 break;
@@ -1033,12 +1033,13 @@ impl Connection {
                                     };
                                     self.pending_disk_read = Some(PendingDiskReadInfo {
                                         params,
-                                        response_ctx: crate::disk_io::DiskReadResponseCtx::MemcacheBinary {
-                                            key: key.to_vec(),
-                                            opcode: opcode_byte,
-                                            opaque,
-                                            quiet: is_quiet,
-                                        },
+                                        response_ctx:
+                                            crate::disk_io::DiskReadResponseCtx::MemcacheBinary {
+                                                key: key.to_vec(),
+                                                opcode: opcode_byte,
+                                                opaque,
+                                                quiet: is_quiet,
+                                            },
                                     });
                                     buf.consume(consumed);
                                     break;
@@ -1666,9 +1667,7 @@ impl Connection {
                 opaque,
                 quiet: _,
             } => {
-                use protocol_memcache::binary::{
-                    HEADER_SIZE, Opcode, ResponseHeader, Status,
-                };
+                use protocol_memcache::binary::{HEADER_SIZE, Opcode, ResponseHeader, Status};
                 // Map the saved opcode byte back to the Opcode enum
                 let opcode = match *opcode {
                     x if x == Opcode::Get as u8 => Opcode::Get,
@@ -1701,8 +1700,7 @@ impl Connection {
                     .copy_from_slice(&0u32.to_be_bytes());
                 if is_getk {
                     let key_start = start + HEADER_SIZE + extras_len;
-                    self.write_buf[key_start..key_start + key.len()]
-                        .copy_from_slice(key);
+                    self.write_buf[key_start..key_start + key.len()].copy_from_slice(key);
                 }
                 self.write_buf.extend_from_slice(value);
             }

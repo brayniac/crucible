@@ -153,11 +153,11 @@ pub use metrics::{
 pub mod disk;
 
 // Phase 10 re-exports
-pub use disk::{DiskConfig, DiskLayer, DiskLayerBuilder, FilePool, FilePoolBuilder, SyncMode};
 pub use disk::{
-    AlignedBuffer, AlignedBufferPool, DiskIoBackend, DiskReadParams, DiskSegmentMeta,
-    FlushRequest, IoUringDiskLayer, IoUringDiskLayerBuilder, IoUringPool, ReadBufferPool,
+    AlignedBuffer, AlignedBufferPool, DiskIoBackend, DiskReadParams, DiskSegmentMeta, FlushRequest,
+    IoUringDiskLayer, IoUringDiskLayerBuilder, IoUringPool, ReadBufferPool,
 };
+pub use disk::{DiskConfig, DiskLayer, DiskLayerBuilder, FilePool, FilePoolBuilder, SyncMode};
 
 // Cache trait for server compatibility
 mod cache_trait;

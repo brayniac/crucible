@@ -170,11 +170,7 @@ impl DiskSegmentMeta {
     ///
     /// Returns `None` if no write buffer is attached.
     pub fn write_buffer_ptr(&self) -> Option<*const u8> {
-        unsafe {
-            (*self.write_buffer.get())
-                .as_ref()
-                .map(|buf| buf.as_ptr())
-        }
+        unsafe { (*self.write_buffer.get()).as_ref().map(|buf| buf.as_ptr()) }
     }
 
     /// Get a mutable pointer to the write buffer data (if present).
@@ -630,9 +626,8 @@ impl Segment for DiskSegmentMeta {
             return Err(CacheError::InvalidOffset);
         }
 
-        let header_bytes = unsafe {
-            std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE)
-        };
+        let header_bytes =
+            unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
         let header = BasicHeader::from_bytes(header_bytes);
 
         if header.is_deleted() {
@@ -646,8 +641,7 @@ impl Segment for DiskSegmentMeta {
             return Err(CacheError::InvalidOffset);
         }
 
-        let stored_key =
-            unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key.len()) };
+        let stored_key = unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key.len()) };
         if stored_key != key {
             return Err(CacheError::KeyMismatch);
         }
