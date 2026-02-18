@@ -24,7 +24,11 @@ fuzz_target!(|data: &[u8]| {
             | Response::Deleted
             | Response::NotFound
             | Response::Exists
+            | Response::Ok
             | Response::Error => {}
+            Response::Numeric(n) => {
+                let _ = n;
+            }
             Response::Version(v) => {
                 let _ = v;
             }
@@ -40,6 +44,8 @@ fuzz_target!(|data: &[u8]| {
             | Response::Deleted
             | Response::NotFound
             | Response::Exists
+            | Response::Ok
+            | Response::Numeric(_)
             | Response::Error => {
                 let mut buf = vec![0u8; 256];
                 let len = response.encode(&mut buf);

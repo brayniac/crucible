@@ -211,11 +211,7 @@ impl Client {
 
     /// Store a key only if it does not already exist (ADD command).
     /// Returns `true` if stored, `false` if the key already exists.
-    pub async fn add(
-        &self,
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
-    ) -> Result<bool, Error> {
+    pub async fn add(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
         let encoded = encode_add(key, value);
@@ -252,11 +248,7 @@ impl Client {
 
     /// Increment a numeric value by delta. Returns the new value after incrementing.
     /// Returns `None` if the key does not exist.
-    pub async fn incr(
-        &self,
-        key: impl AsRef<[u8]>,
-        delta: u64,
-    ) -> Result<Option<u64>, Error> {
+    pub async fn incr(&self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
         let encoded = encode_request(&McRequest::incr(key, delta));
         let response = self.execute(&encoded).await?;
@@ -269,11 +261,7 @@ impl Client {
 
     /// Decrement a numeric value by delta. Returns the new value after decrementing.
     /// Returns `None` if the key does not exist.
-    pub async fn decr(
-        &self,
-        key: impl AsRef<[u8]>,
-        delta: u64,
-    ) -> Result<Option<u64>, Error> {
+    pub async fn decr(&self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
         let encoded = encode_request(&McRequest::decr(key, delta));
         let response = self.execute(&encoded).await?;

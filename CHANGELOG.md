@@ -7,25 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-02-17
+
 ### Added
 - **krio 0.1**: Renamed I/O framework from `kompio` to `krio`, establishing standalone identity
-  - Clean public API surface: internal modules (`acceptor`, `accumulator`, `buffer`, `completion`,
-    `connection`, `event_loop`, `ring`) now `pub(crate)` — only user-facing types re-exported
-  - Crate-level rustdoc with quick start example
-  - README.md with architecture overview, feature table, and comparison
+  - Clean public API surface: internal modules now `pub(crate)` — only user-facing types re-exported
+  - Async runtime with `AsyncEventHandler`: `spawn`, `sleep`, `timeout`, `select` combinators,
+    awaitable sends, resilient timers, UDP foundation, and join combinators
   - Integration test suite (echo server: callback + async, multiple connections, large messages,
     connection lifecycle, graceful shutdown)
-  - Async echo server example (`echo_async_server`)
+  - Free `connect()` and `on_start()` in async API
+- **krio-redis**: Native RESP client crate with TLS, AUTH, ketama-sharded client, and Redis
+  Cluster support (renamed from `krio-client`)
+- **krio-memcache**: Native memcache client with full ASCII protocol support
+- **krio-quic**: QUIC transport layer
+- **http3**: HTTP/3 framing crate with Huffman encoding/decoding and QPACK support
+- **crucible-http-client**: Async HTTP/2 client with TLS support
+- **crucible-grpc-client**: Async gRPC client with e2e integration tests
+- **crucible-momento-client**: Async Momento cache client with e2e integration tests
+- **crucible-memcache-client**: Async Memcache client with e2e integration tests
+- Async server handler for A/B benchmarking against callback handler
+- Async proxy with ketama consistent hashing
+- Benchmark Redis Cluster support with ketama key routing
+- TLS support in `crucible-server`
+- Zero-copy RESP parsing with `Bytes`-backed `Value` type
+- Huffman encoding in QPACK encoder for smaller header blocks
+- Redis Cluster protocol support in `protocol-resp`
 
 ### Changed
 - `KompioBuilder` renamed to `KrioBuilder`
-- `kompio` crate renamed to `krio` (version reset to 0.1.0-alpha.0)
-- All workspace crates updated to reference `krio`
-- Thread names: `krio-acceptor`, `krio-worker-N`
+- `kompio` crate renamed to `krio`
+- `krio-client` renamed to `krio-redis`
+- `crucible-resp-client` (client-resp) rewritten as pure Tokio async Redis client
+- krio-redis uses `Bytes` returns and `AsRef<[u8]>` params
+- Scatter-gather SET sends in krio-redis to eliminate extra value copy
 
 ### Fixed
-
-### Removed
+- Rate limiter token waste when no session has pipeline capacity
+- `WithDataFuture` retries incomplete parses instead of signaling EOF
+- Hybrid zero-copy sends for async server slab exhaustion
+- Clippy warnings across workspace
 
 ## [0.3.4] - 2026-02-14
 

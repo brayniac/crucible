@@ -6,9 +6,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 
 /// Load PEM certificate and key files from `tls` config and build a [`krio::TlsConfig`].
-pub fn load_server_config(
-    tls: &TlsConfig,
-) -> Result<krio::TlsConfig, Box<dyn std::error::Error>> {
+pub fn load_server_config(tls: &TlsConfig) -> Result<krio::TlsConfig, Box<dyn std::error::Error>> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&tls.cert)
         .map_err(|e| format!("failed to read cert file '{}': {e}", tls.cert))?
         .collect::<Result<Vec<_>, _>>()

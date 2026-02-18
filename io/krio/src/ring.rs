@@ -1,6 +1,8 @@
 use std::io;
 use std::os::fd::RawFd;
 
+use io_uring::cqueue;
+use io_uring::squeue;
 use io_uring::types::{Fd, Fixed};
 use io_uring::{IoUring, opcode};
 
@@ -8,10 +10,20 @@ use crate::buffer::fixed::FixedBufferRegistry;
 use crate::buffer::provided::ProvidedBufRing;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
+use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
 
 /// Wrapper around IoUring providing high-level SQE submission helpers.
+///
+/// The ring uses 128-byte SQEs and 32-byte CQEs (`IoUring<Entry128, Entry32>`)
+/// to support NVMe passthrough via `IORING_OP_URING_CMD` / `UringCmd80`.
+/// Standard network opcodes produce 64-byte `Entry` values which are
+/// automatically converted to `Entry128` (zero-padded) via `Into`.
+///
+/// Memory overhead of Big SQE/CQE: +32 KB per worker with default config
+/// (256 SQ × 64B extra + 1024 CQ × 16B extra), negligible relative to the
+/// ~20 MB of buffer pools allocated per worker.
 pub struct Ring {
-    pub(crate) ring: IoUring,
+    pub(crate) ring: IoUring<squeue::Entry128, cqueue::Entry32>,
     /// Recv buffer group ID for multishot recv.
     bgid: u16,
 }
@@ -24,7 +36,7 @@ impl Ring {
             .checked_mul(4)
             .unwrap_or(config.sq_entries);
 
-        let mut builder = IoUring::builder();
+        let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
         builder.setup_cqsize(cq_entries);
         builder.setup_coop_taskrun();
         builder.setup_single_issuer();
@@ -339,11 +351,29 @@ impl Ring {
         Ok(())
     }
 
-    /// Push an SQE to the submission queue.
+    /// Push a standard SQE to the submission queue.
+    ///
+    /// The 64-byte `Entry` is automatically converted to `Entry128` (zero-padded)
+    /// for the Big SQE ring.
     ///
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
-    pub(crate) unsafe fn push_sqe(&mut self, entry: io_uring::squeue::Entry) -> io::Result<()> {
+    pub(crate) unsafe fn push_sqe(&mut self, entry: squeue::Entry) -> io::Result<()> {
+        let entry128: squeue::Entry128 = entry.into();
+        unsafe {
+            self.push_sqe128(entry128)?;
+        }
+        Ok(())
+    }
+
+    /// Push a 128-byte SQE to the submission queue.
+    ///
+    /// Used directly for NVMe passthrough (`UringCmd80`) which produces
+    /// `Entry128` natively.
+    ///
+    /// # Safety
+    /// The SQE must reference valid memory for the lifetime of the operation.
+    pub(crate) unsafe fn push_sqe128(&mut self, entry: squeue::Entry128) -> io::Result<()> {
         // Try to push; if SQ is full, submit first to make room.
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
@@ -367,7 +397,7 @@ impl Ring {
     /// All SQEs must reference valid memory for the lifetime of their operations.
     pub(crate) unsafe fn push_sqe_chain(
         &mut self,
-        entries: &mut [io_uring::squeue::Entry],
+        entries: &mut [squeue::Entry],
     ) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -382,14 +412,17 @@ impl Ring {
             *entry = entry.clone().flags(io_uring::squeue::Flags::IO_LINK);
         }
 
+        // Convert to Entry128 for the Big SQ ring.
+        let entries128: Vec<squeue::Entry128> = entries.iter().map(|e| e.clone().into()).collect();
+
         // Ensure enough room in the SQ for the entire chain.
         {
             let sq = self.ring.submission();
-            if sq.capacity() - sq.len() < entries.len() {
+            if sq.capacity() - sq.len() < entries128.len() {
                 drop(sq);
                 self.ring.submit()?;
                 let sq = self.ring.submission();
-                if sq.capacity() - sq.len() < entries.len() {
+                if sq.capacity() - sq.len() < entries128.len() {
                     return Err(io::Error::other("SQ too small for chain"));
                 }
             }
@@ -399,8 +432,100 @@ impl Ring {
         unsafe {
             self.ring
                 .submission()
-                .push_multiple(entries)
+                .push_multiple(&entries128)
                 .map_err(|_| io::Error::other("SQ full after flush for chain"))?;
+        }
+        Ok(())
+    }
+
+    /// Submit an NVMe passthrough command via `IORING_OP_URING_CMD`.
+    ///
+    /// The `fd_index` must be a fixed file table index pointing to an opened
+    /// NVMe-generic character device (`/dev/ng<X>n<Y>`).
+    ///
+    /// # Safety
+    /// The buffer referenced by `cmd.addr` / `cmd.data_len` must remain valid
+    /// until the CQE arrives.
+    pub unsafe fn submit_nvme_cmd(
+        &mut self,
+        fd_index: u32,
+        cmd: &NvmeUringCmd,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let cmd_bytes = cmd.to_bytes();
+        let entry = opcode::UringCmd80::new(Fixed(fd_index), NVME_URING_CMD_IO)
+            .cmd(cmd_bytes)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe128(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a direct I/O read via `IORING_OP_READ`.
+    ///
+    /// The `fd_index` must be a fixed file table index pointing to a file
+    /// opened with `O_DIRECT`.
+    ///
+    /// # Safety
+    /// The buffer at `buf` with length `len` must remain valid and properly
+    /// aligned until the CQE arrives. For `O_DIRECT`, the buffer address,
+    /// length, and file offset must all be aligned to the logical block size.
+    pub unsafe fn submit_direct_read(
+        &mut self,
+        fd_index: u32,
+        buf: *mut u8,
+        len: u32,
+        offset: u64,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Read::new(Fixed(fd_index), buf, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a direct I/O write via `IORING_OP_WRITE`.
+    ///
+    /// The `fd_index` must be a fixed file table index pointing to a file
+    /// opened with `O_DIRECT`.
+    ///
+    /// # Safety
+    /// The buffer at `buf` with length `len` must remain valid and properly
+    /// aligned until the CQE arrives. For `O_DIRECT`, the buffer address,
+    /// length, and file offset must all be aligned to the logical block size.
+    pub unsafe fn submit_direct_write(
+        &mut self,
+        fd_index: u32,
+        buf: *const u8,
+        len: u32,
+        offset: u64,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Write::new(Fixed(fd_index), buf, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit an fsync via `IORING_OP_FSYNC`.
+    ///
+    /// The `fd_index` must be a fixed file table index pointing to an opened file.
+    pub fn submit_direct_fsync(&mut self, fd_index: u32, user_data: UserData) -> io::Result<()> {
+        let entry = opcode::Fsync::new(Fixed(fd_index))
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
         }
         Ok(())
     }

@@ -95,16 +95,19 @@ impl<H: EventHandler> EventLoop<H> {
         {
             let cq = self.driver.ring.ring.completion();
             for cqe in cq {
-                self.driver
-                    .cqe_batch
-                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
+                self.driver.cqe_batch.push((
+                    cqe.user_data(),
+                    cqe.result(),
+                    cqe.flags(),
+                    *cqe.big_cqe(),
+                ));
             }
         }
 
         if let Some(interval) = self.driver.flush_interval {
             let mut last_flush = Instant::now();
             for i in 0..self.driver.cqe_batch.len() {
-                let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
+                let (user_data_raw, result, flags, _big_cqe) = self.driver.cqe_batch[i];
                 self.dispatch_cqe(user_data_raw, result, flags);
                 let now = Instant::now();
                 if now.duration_since(last_flush) >= interval {
@@ -114,7 +117,7 @@ impl<H: EventHandler> EventLoop<H> {
             }
         } else {
             for i in 0..self.driver.cqe_batch.len() {
-                let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
+                let (user_data_raw, result, flags, _big_cqe) = self.driver.cqe_batch[i];
                 self.dispatch_cqe(user_data_raw, result, flags);
             }
         }
@@ -146,7 +149,96 @@ impl<H: EventHandler> EventLoop<H> {
             OpTag::Timer => {} // only used in async event loop
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
+            OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
+            OpTag::DirectIo => self.handle_direct_io(ud, result),
         }
+    }
+
+    fn handle_nvme_cmd(&mut self, ud: UserData, result: i32) {
+        let slab_idx = ud.payload() as u16;
+
+        let nvme_cmd_slab = match self.driver.nvme_cmd_slab {
+            Some(ref mut s) => s,
+            None => return,
+        };
+
+        if !nvme_cmd_slab.in_use(slab_idx) {
+            return;
+        }
+
+        let device_index = nvme_cmd_slab.release(slab_idx);
+
+        // Decrement in-flight count.
+        if let Some(ref mut devices) = self.driver.nvme_devices
+            && let Some(dev) = devices.get_mut(device_index)
+        {
+            dev.in_flight = dev.in_flight.saturating_sub(1);
+        }
+
+        // Build completion and fire callback.
+        let generation = self
+            .driver
+            .nvme_devices
+            .as_ref()
+            .and_then(|d| d.get(device_index))
+            .map(|d| d.generation)
+            .unwrap_or(0);
+
+        let completion = crate::nvme::NvmeCompletion {
+            device: crate::nvme::NvmeDevice {
+                index: device_index,
+                generation,
+            },
+            seq: slab_idx as u32,
+            result,
+        };
+
+        let mut ctx = self.driver.make_ctx();
+        self.handler.on_nvme_complete(&mut ctx, completion);
+    }
+
+    fn handle_direct_io(&mut self, ud: UserData, result: i32) {
+        let slab_idx = ud.payload() as u16;
+
+        let cmd_slab = match self.driver.direct_io_cmd_slab {
+            Some(ref mut s) => s,
+            None => return,
+        };
+
+        if !cmd_slab.in_use(slab_idx) {
+            return;
+        }
+
+        let (file_index, op) = cmd_slab.release(slab_idx);
+
+        // Decrement in-flight count.
+        if let Some(ref mut files) = self.driver.direct_io_files
+            && let Some(f) = files.get_mut(file_index)
+        {
+            f.in_flight = f.in_flight.saturating_sub(1);
+        }
+
+        // Build completion and fire callback.
+        let generation = self
+            .driver
+            .direct_io_files
+            .as_ref()
+            .and_then(|f| f.get(file_index))
+            .map(|f| f.generation)
+            .unwrap_or(0);
+
+        let completion = crate::direct_io::DirectIoCompletion {
+            file: crate::direct_io::DirectIoFile {
+                index: file_index,
+                generation,
+            },
+            op,
+            seq: slab_idx as u32,
+            result,
+        };
+
+        let mut ctx = self.driver.make_ctx();
+        self.handler.on_direct_io_complete(&mut ctx, completion);
     }
 
     fn handle_recv_multi(&mut self, ud: UserData, result: i32, flags: u32) {
@@ -916,6 +1008,12 @@ fn call_on_data<H: EventHandler>(
         max_chain_length: driver.max_chain_length,
         send_queues: &mut driver.send_queues,
         udp_sockets: &mut driver.udp_sockets,
+        nvme_devices: &mut driver.nvme_devices,
+        nvme_cmd_slab: &mut driver.nvme_cmd_slab,
+        nvme_fd_base: driver.nvme_fd_base,
+        direct_io_files: &mut driver.direct_io_files,
+        direct_io_cmd_slab: &mut driver.direct_io_cmd_slab,
+        direct_io_fd_base: driver.direct_io_fd_base,
     };
     let consumed = handler.on_data(&mut ctx, token, data);
     driver.accumulators.consume(conn_index, consumed);

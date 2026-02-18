@@ -51,9 +51,11 @@ pub(crate) mod buffer;
 pub(crate) mod chain;
 pub(crate) mod completion;
 pub(crate) mod connection;
+pub mod direct_io;
 pub(crate) mod driver;
 pub(crate) mod event_loop;
 pub(crate) mod metrics;
+pub mod nvme;
 pub(crate) mod ring;
 pub(crate) mod runtime;
 #[cfg(feature = "tls")]
@@ -190,10 +192,24 @@ pub use config::Config;
 pub use config::RecvBufferConfig;
 /// Worker thread configuration.
 pub use config::WorkerConfig;
+/// Direct I/O completion result.
+pub use direct_io::DirectIoCompletion;
+/// Direct I/O configuration.
+pub use direct_io::DirectIoConfig;
+/// Direct I/O file handle.
+pub use direct_io::DirectIoFile;
+/// Direct I/O operation type.
+pub use direct_io::DirectIoOp;
 /// Runtime errors.
 pub use error::Error;
 /// Zero-copy send guard trait.
 pub use guard::{GuardBox, SendGuard};
+/// NVMe passthrough completion result.
+pub use nvme::NvmeCompletion;
+/// NVMe passthrough configuration.
+pub use nvme::NvmeConfig;
+/// NVMe passthrough device handle.
+pub use nvme::NvmeDevice;
 /// Builder for launching krio workers.
 pub use worker::KrioBuilder;
 /// Handle for triggering graceful shutdown.

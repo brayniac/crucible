@@ -127,9 +127,9 @@ impl Client {
         value: &[u8],
     ) -> Result<Value, Error> {
         let (prefix, suffix) = set_req.encode_parts();
-        self.conn.send_parts().build(|b| {
-            b.copy(&prefix).copy(value).copy(&suffix).submit()
-        })?;
+        self.conn
+            .send_parts()
+            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
         let resp = self.read_value().await?;
         if let Value::Error(ref msg) = resp {
             return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
@@ -840,10 +840,8 @@ impl Client {
     /// Authenticate with a password (`AUTH password`).
     pub async fn auth(&self, password: impl AsRef<[u8]>) -> Result<(), Error> {
         let password = password.as_ref();
-        self.execute_ok(&Self::encode_request(
-            &Request::cmd(b"AUTH").arg(password),
-        ))
-        .await
+        self.execute_ok(&Self::encode_request(&Request::cmd(b"AUTH").arg(password)))
+            .await
     }
 
     /// Authenticate with a username and password (`AUTH username password`).
