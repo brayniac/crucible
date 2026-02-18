@@ -31,7 +31,7 @@ pub enum DirectIoOp {
 
 /// Opaque handle to an opened direct I/O file.
 ///
-/// Returned by [`DriverCtx::open_direct_io_file`] and used to identify the
+/// Returned by [`crate::DriverCtx::open_direct_io_file`] and used to identify the
 /// file in subsequent read/write/fsync/close calls. The handle includes a
 /// generation counter for stale-handle detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +170,7 @@ impl DirectIoCmdSlab {
 
 /// Result of a direct I/O command completion.
 ///
-/// Delivered to [`EventHandler::on_direct_io_complete`].
+/// Delivered to [`crate::EventHandler::on_direct_io_complete`].
 #[derive(Debug, Clone)]
 pub struct DirectIoCompletion {
     /// The file this command was submitted to.
