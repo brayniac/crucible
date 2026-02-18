@@ -794,10 +794,7 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Validate an NVMe device handle and return (fd_index, nsid).
-    fn validate_nvme_device(
-        &self,
-        device: crate::nvme::NvmeDevice,
-    ) -> io::Result<(u32, u32)> {
+    fn validate_nvme_device(&self, device: crate::nvme::NvmeDevice) -> io::Result<(u32, u32)> {
         let devices = self
             .nvme_devices
             .as_ref()
@@ -950,7 +947,10 @@ impl<'a> DriverCtx<'a> {
             slab_idx as u32,
         );
 
-        match unsafe { self.ring.submit_direct_write(fd_index, buf, len, offset, ud) } {
+        match unsafe {
+            self.ring
+                .submit_direct_write(fd_index, buf, len, offset, ud)
+        } {
             Ok(()) => {
                 if let Some(files) = self.direct_io_files.as_mut()
                     && let Some(f) = files.get_mut(file.index)
@@ -971,10 +971,7 @@ impl<'a> DriverCtx<'a> {
     /// Submit an fsync for a direct I/O file.
     ///
     /// Returns the command slab index (sequence number) for correlation.
-    pub fn direct_io_fsync(
-        &mut self,
-        file: crate::direct_io::DirectIoFile,
-    ) -> io::Result<u32> {
+    pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
         let fd_index = self.validate_direct_io_file(file)?;
 
         let slab = self
@@ -1010,10 +1007,7 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Close a direct I/O file.
-    pub fn close_direct_io_file(
-        &mut self,
-        file: crate::direct_io::DirectIoFile,
-    ) -> io::Result<()> {
+    pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
         let fd_index = self.validate_direct_io_file(file)?;
 
         // Unregister from the fixed file table.
@@ -1027,10 +1021,7 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Validate a direct I/O file handle and return the fd_index.
-    fn validate_direct_io_file(
-        &self,
-        file: crate::direct_io::DirectIoFile,
-    ) -> io::Result<u32> {
+    fn validate_direct_io_file(&self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
         let files = self
             .direct_io_files
             .as_ref()

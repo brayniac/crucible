@@ -520,11 +520,7 @@ impl Ring {
     /// Submit an fsync via `IORING_OP_FSYNC`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened file.
-    pub fn submit_direct_fsync(
-        &mut self,
-        fd_index: u32,
-        user_data: UserData,
-    ) -> io::Result<()> {
+    pub fn submit_direct_fsync(&mut self, fd_index: u32, user_data: UserData) -> io::Result<()> {
         let entry = opcode::Fsync::new(Fixed(fd_index))
             .build()
             .user_data(user_data.raw());

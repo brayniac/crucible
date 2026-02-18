@@ -51,10 +51,10 @@ pub(crate) mod buffer;
 pub(crate) mod chain;
 pub(crate) mod completion;
 pub(crate) mod connection;
+pub mod direct_io;
 pub(crate) mod driver;
 pub(crate) mod event_loop;
 pub(crate) mod metrics;
-pub mod direct_io;
 pub mod nvme;
 pub(crate) mod ring;
 pub(crate) mod runtime;
@@ -192,10 +192,6 @@ pub use config::Config;
 pub use config::RecvBufferConfig;
 /// Worker thread configuration.
 pub use config::WorkerConfig;
-/// Runtime errors.
-pub use error::Error;
-/// Zero-copy send guard trait.
-pub use guard::{GuardBox, SendGuard};
 /// Direct I/O completion result.
 pub use direct_io::DirectIoCompletion;
 /// Direct I/O configuration.
@@ -204,6 +200,10 @@ pub use direct_io::DirectIoConfig;
 pub use direct_io::DirectIoFile;
 /// Direct I/O operation type.
 pub use direct_io::DirectIoOp;
+/// Runtime errors.
+pub use error::Error;
+/// Zero-copy send guard trait.
+pub use guard::{GuardBox, SendGuard};
 /// NVMe passthrough completion result.
 pub use nvme::NvmeCompletion;
 /// NVMe passthrough configuration.

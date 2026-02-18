@@ -198,9 +198,7 @@ impl Driver {
 
         // Register resources with the kernel
         ring.register_buffers(&fixed_buffers)?;
-        ring.register_files_sparse(
-            config.max_connections + udp_count + nvme_max + direct_io_max,
-        )?;
+        ring.register_files_sparse(config.max_connections + udp_count + nvme_max + direct_io_max)?;
         ring.register_buf_ring(&provided_bufs)?;
 
         let connections = ConnectionTable::new(config.max_connections);

@@ -11,10 +11,12 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use krio::{Config, ConnToken, DirectIoCompletion, DirectIoOp, DriverCtx, EventHandler, KrioBuilder};
+use krio::{
+    Config, ConnToken, DirectIoCompletion, DirectIoOp, DriverCtx, EventHandler, KrioBuilder,
+};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -183,8 +185,8 @@ impl EventHandler for RoundtripHandler {
         match self.state.phase {
             RoundtripPhase::WaitingWrite => {
                 if !completion.is_success() {
-                    let _ = ROUNDTRIP_ERR
-                        .set(format!("write failed: result={}", completion.result));
+                    let _ =
+                        ROUNDTRIP_ERR.set(format!("write failed: result={}", completion.result));
                     ROUNDTRIP_DONE.store(true, Ordering::Release);
                     ctx.request_shutdown();
                     return;
@@ -205,8 +207,8 @@ impl EventHandler for RoundtripHandler {
             }
             RoundtripPhase::WaitingFsync => {
                 if !completion.is_success() {
-                    let _ = ROUNDTRIP_ERR
-                        .set(format!("fsync failed: result={}", completion.result));
+                    let _ =
+                        ROUNDTRIP_ERR.set(format!("fsync failed: result={}", completion.result));
                     ROUNDTRIP_DONE.store(true, Ordering::Release);
                     ctx.request_shutdown();
                     return;
@@ -233,8 +235,7 @@ impl EventHandler for RoundtripHandler {
             }
             RoundtripPhase::WaitingRead => {
                 if !completion.is_success() {
-                    let _ = ROUNDTRIP_ERR
-                        .set(format!("read failed: result={}", completion.result));
+                    let _ = ROUNDTRIP_ERR.set(format!("read failed: result={}", completion.result));
                     ROUNDTRIP_DONE.store(true, Ordering::Release);
                     ctx.request_shutdown();
                     return;
@@ -261,7 +262,9 @@ impl EventHandler for RoundtripHandler {
     }
 
     fn on_accept(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
-    fn on_data(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _data: &[u8]) -> usize { 0 }
+    fn on_data(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _data: &[u8]) -> usize {
+        0
+    }
     fn on_send_complete(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _r: io::Result<u32>) {}
     fn on_close(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
 }
@@ -383,9 +386,9 @@ impl EventHandler for MultiFileHandler {
 
         // Submit writes to all files.
         for (i, file) in self.state.files.iter().copied().enumerate() {
-            if let Err(e) = unsafe {
-                ctx.direct_io_write(file, 0, self.state.bufs[i].as_ptr(), 4096)
-            } {
+            if let Err(e) =
+                unsafe { ctx.direct_io_write(file, 0, self.state.bufs[i].as_ptr(), 4096) }
+            {
                 let _ = MULTI_FILE_ERR.set(format!("write {i} failed: {e}"));
                 MULTI_FILE_DONE.store(true, Ordering::Release);
                 ctx.request_shutdown();
@@ -419,7 +422,9 @@ impl EventHandler for MultiFileHandler {
     }
 
     fn on_accept(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
-    fn on_data(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _data: &[u8]) -> usize { 0 }
+    fn on_data(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _data: &[u8]) -> usize {
+        0
+    }
     fn on_send_complete(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken, _r: io::Result<u32>) {}
     fn on_close(&mut self, _ctx: &mut DriverCtx, _conn: ConnToken) {}
 }
