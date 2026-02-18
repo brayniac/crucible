@@ -10,6 +10,11 @@ use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Duration;
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 /// Get an available port for testing.
 fn get_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -81,6 +86,10 @@ fn send_resp_command(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
 /// ConnId/index mismatches after connections were closed and new ones opened.
 #[test]
 fn test_connection_id_tracking() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let _server = start_test_server(port);
 
@@ -194,6 +203,10 @@ fn test_connection_id_tracking() {
 /// Test rapid connection open/close cycles.
 #[test]
 fn test_rapid_connection_cycles() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let _server = start_test_server(port);
 

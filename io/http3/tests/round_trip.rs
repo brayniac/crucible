@@ -445,8 +445,17 @@ impl H3TestClient {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 #[test]
 fn h3_request_response() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
@@ -504,6 +513,10 @@ fn h3_request_response() {
 
 #[test]
 fn h3_request_with_body() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
@@ -559,6 +572,10 @@ fn h3_request_with_body() {
 
 #[test]
 fn h3_multiple_requests() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);

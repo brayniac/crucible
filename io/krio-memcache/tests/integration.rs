@@ -263,10 +263,21 @@ where
     }
 }
 
+// ── io_uring availability check ──────────────────────────────────────────
+
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[test]
 fn test_version() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             let version = client.version().await?;
@@ -278,6 +289,10 @@ fn test_version() {
 
 #[test]
 fn test_set_get() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             client.set("mc:sg:key", "hello").await?;
@@ -294,6 +309,10 @@ fn test_set_get() {
 
 #[test]
 fn test_set_get_with_options() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // set_with_options should store the value (flags/exptime are sent
@@ -311,6 +330,10 @@ fn test_set_get_with_options() {
 
 #[test]
 fn test_get_miss() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             let val = client.get("mc:miss:nonexistent").await?;
@@ -322,6 +345,10 @@ fn test_get_miss() {
 
 #[test]
 fn test_delete() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             client.set("mc:del:key", "value").await?;
@@ -342,6 +369,10 @@ fn test_delete() {
 
 #[test]
 fn test_delete_miss() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             let deleted = client.delete("mc:delmiss:nonexistent").await?;
@@ -353,6 +384,10 @@ fn test_delete_miss() {
 
 #[test]
 fn test_add() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Should succeed — key doesn't exist
@@ -374,6 +409,10 @@ fn test_add() {
 
 #[test]
 fn test_replace() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Replace on non-existent key should fail
@@ -396,6 +435,10 @@ fn test_replace() {
 
 #[test]
 fn test_incr() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Set a numeric value
@@ -420,6 +463,10 @@ fn test_incr() {
 
 #[test]
 fn test_incr_miss() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             let val = client.incr("mc:incrmiss:nonexistent", 1).await?;
@@ -431,6 +478,10 @@ fn test_incr_miss() {
 
 #[test]
 fn test_decr() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Set a numeric value
@@ -455,6 +506,10 @@ fn test_decr() {
 
 #[test]
 fn test_decr_underflow() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Set a value of 5
@@ -471,6 +526,10 @@ fn test_decr_underflow() {
 
 #[test]
 fn test_decr_miss() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             let val = client.decr("mc:decrmiss:nonexistent", 1).await?;
@@ -482,6 +541,10 @@ fn test_decr_miss() {
 
 #[test]
 fn test_append() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Append on non-existent key should fail
@@ -504,6 +567,10 @@ fn test_append() {
 
 #[test]
 fn test_prepend() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Prepend on non-existent key should fail
@@ -526,6 +593,10 @@ fn test_prepend() {
 
 #[test]
 fn test_cas() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Set a value, then get it with CAS token via gets
@@ -559,6 +630,10 @@ fn test_cas() {
 
 #[test]
 fn test_cas_not_found() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // CAS on non-existent key should return error
@@ -571,6 +646,10 @@ fn test_cas_not_found() {
 
 #[test]
 fn test_gets_returns_cas() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             client.set("mc:grc:k1", "v1").await?;
@@ -591,6 +670,10 @@ fn test_gets_returns_cas() {
 
 #[test]
 fn test_multi_get() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             client.set("mc:mg:k1", "v1").await?;
@@ -613,6 +696,10 @@ fn test_multi_get() {
 
 #[test]
 fn test_flush_all() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             client.set("mc:flush:key", "value").await?;
@@ -629,6 +716,10 @@ fn test_flush_all() {
 
 #[test]
 fn test_connection_closed() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_client_test(|client| {
         Box::pin(async move {
             // Verify connection works
@@ -658,6 +749,10 @@ fn test_connection_closed() {
 
 #[test]
 fn test_pool_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_pool_test(|addr| {
         Box::pin(async move {
             let mut pool = krio_memcache::Pool::new(krio_memcache::PoolConfig {
@@ -685,6 +780,10 @@ fn test_pool_basic() {
 
 #[test]
 fn test_pool_lazy_connect() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_pool_test(|addr| {
         Box::pin(async move {
             let mut pool = krio_memcache::Pool::new(krio_memcache::PoolConfig {
@@ -710,6 +809,10 @@ fn test_pool_lazy_connect() {
 
 #[test]
 fn test_pool_reconnect() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_pool_test(|addr| {
         Box::pin(async move {
             let mut pool = krio_memcache::Pool::new(krio_memcache::PoolConfig {
@@ -739,6 +842,10 @@ fn test_pool_reconnect() {
 
 #[test]
 fn test_sharded_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_pool_test(|addr| {
         Box::pin(async move {
             let mut sharded = krio_memcache::ShardedClient::new(krio_memcache::ShardedConfig {

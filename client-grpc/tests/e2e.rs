@@ -17,6 +17,15 @@ use bytes::Bytes;
 use crucible_grpc_client::{Code, GrpcClient, GrpcClientConfig, Metadata};
 use grpc::{Server, Status};
 
+// ── Platform check ──────────────────────────────────────────────────────
+
+/// Check if io_uring is supported on this kernel.
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    // EFAULT (bad params pointer) means the syscall exists; ENOSYS means it doesn't.
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 // ── Shared test environment ─────────────────────────────────────────────
 
 struct TestEnv {
@@ -24,7 +33,12 @@ struct TestEnv {
     _server_handle: thread::JoinHandle<()>,
 }
 
-static ENV: LazyLock<TestEnv> = LazyLock::new(|| {
+static ENV: LazyLock<Option<TestEnv>> = LazyLock::new(|| {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return None;
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -47,10 +61,10 @@ static ENV: LazyLock<TestEnv> = LazyLock::new(|| {
     })
     .expect("GrpcClient::connect failed");
 
-    TestEnv {
+    Some(TestEnv {
         client,
         _server_handle: server_handle,
-    }
+    })
 });
 
 // ── Test gRPC server ────────────────────────────────────────────────────
@@ -179,6 +193,19 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
     false
 }
 
+/// Return the test client, or skip (return) if io_uring is unavailable.
+macro_rules! require_env {
+    () => {
+        match ENV.as_ref() {
+            Some(env) => &env.client,
+            None => {
+                eprintln!("SKIP: io_uring not supported");
+                return;
+            }
+        }
+    };
+}
+
 /// Wait for the client to establish its gRPC connection.
 async fn wait_for_client(client: &GrpcClient) {
     let start = std::time::Instant::now();
@@ -196,7 +223,7 @@ async fn wait_for_client(client: &GrpcClient) {
 
 #[tokio::test]
 async fn test_unary_echo() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     let resp = client
@@ -209,7 +236,7 @@ async fn test_unary_echo() {
 
 #[tokio::test]
 async fn test_unary_echo_large() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     // 2KB body — exercises flow control
@@ -224,7 +251,7 @@ async fn test_unary_echo_large() {
 
 #[tokio::test]
 async fn test_error_status() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     let resp = client.call("/test.Echo/Error", Bytes::new()).await.unwrap();
@@ -234,7 +261,7 @@ async fn test_error_status() {
 
 #[tokio::test]
 async fn test_custom_metadata() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     let mut metadata = Metadata::new();
@@ -250,7 +277,7 @@ async fn test_custom_metadata() {
 
 #[tokio::test]
 async fn test_call_convenience() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     let resp = client
@@ -263,7 +290,7 @@ async fn test_call_convenience() {
 
 #[tokio::test]
 async fn test_concurrent_calls() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     // Send multiple requests in parallel (HTTP/2 multiplexing)
@@ -288,7 +315,7 @@ async fn test_concurrent_calls() {
 
 #[tokio::test]
 async fn test_latency_histograms() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     // Perform a call to populate histograms

@@ -23,12 +23,23 @@ use protocol_momento::{
 
 // ── Shared test environment ─────────────────────────────────────────────
 
+/// Check if io_uring is supported on this kernel.
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 struct TestEnv {
     client: MomentoClient,
     _server_handle: thread::JoinHandle<()>,
 }
 
-static ENV: LazyLock<TestEnv> = LazyLock::new(|| {
+static ENV: LazyLock<Option<TestEnv>> = LazyLock::new(|| {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return None;
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -57,11 +68,23 @@ static ENV: LazyLock<TestEnv> = LazyLock::new(|| {
     })
     .expect("MomentoClient::connect failed");
 
-    TestEnv {
+    Some(TestEnv {
         client,
         _server_handle: server_handle,
-    }
+    })
 });
+
+macro_rules! require_env {
+    () => {
+        match ENV.as_ref() {
+            Some(env) => &env.client,
+            None => {
+                eprintln!("SKIP: io_uring not supported");
+                return;
+            }
+        }
+    };
+}
 
 // ── Test Momento server ────────────────────────────────────────────────────
 
@@ -216,7 +239,7 @@ async fn wait_for_client(client: &MomentoClient) {
 
 #[tokio::test]
 async fn test_set_get_roundtrip() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     client
@@ -231,7 +254,7 @@ async fn test_set_get_roundtrip() {
 
 #[tokio::test]
 async fn test_get_miss() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     let result = client.get(b"nonexistent-key-12345").await.unwrap();
@@ -240,7 +263,7 @@ async fn test_get_miss() {
 
 #[tokio::test]
 async fn test_delete() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     client.set(b"delete-key", b"delete-value").await.unwrap();
@@ -263,7 +286,7 @@ async fn test_delete() {
 
 #[tokio::test]
 async fn test_large_value() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     // 2KB+ value for flow control testing
@@ -277,7 +300,7 @@ async fn test_large_value() {
 
 #[tokio::test]
 async fn test_concurrent_operations() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     // Send multiple requests in parallel
@@ -302,7 +325,7 @@ async fn test_concurrent_operations() {
 
 #[tokio::test]
 async fn test_latency_histograms() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     // Perform operations to populate histograms
@@ -328,7 +351,7 @@ async fn test_latency_histograms() {
 
 #[tokio::test]
 async fn test_set_with_ttl() {
-    let client = &ENV.client;
+    let client = require_env!();
     wait_for_client(client).await;
 
     // TTL is not enforced by the test server, just verify the API works

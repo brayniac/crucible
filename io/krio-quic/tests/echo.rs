@@ -393,8 +393,17 @@ impl QuicTestClient {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 #[test]
 fn quic_echo() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
@@ -441,6 +450,10 @@ fn quic_echo() {
 
 #[test]
 fn quic_multi_stream() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
@@ -494,6 +507,10 @@ fn quic_multi_stream() {
 
 #[test]
 fn quic_large_message() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);

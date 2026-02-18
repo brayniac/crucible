@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 /// Get an available port for testing.
 fn get_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -90,6 +95,10 @@ fn send_ping(stream: &mut TcpStream) -> bool {
 /// Test that server responds before shutdown.
 #[test]
 fn test_server_responds_before_shutdown() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let cache_port = get_available_port();
     let admin_port = get_available_port();
 
@@ -129,6 +138,10 @@ fn test_server_responds_before_shutdown() {
 /// Test that shutdown happens within the configured timeout.
 #[test]
 fn test_shutdown_timeout() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let cache_port = get_available_port();
     let admin_port = get_available_port();
 

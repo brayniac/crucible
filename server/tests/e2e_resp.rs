@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 /// Get an available port for testing.
 fn get_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -123,6 +128,10 @@ fn del_cmd(key: &str) -> Vec<u8> {
 /// Test basic PING command.
 #[test]
 fn test_ping() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
@@ -146,6 +155,10 @@ fn test_ping() {
 /// Test SET and GET cycle.
 #[test]
 fn test_set_get() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
@@ -173,6 +186,10 @@ fn test_set_get() {
 /// Test GET on non-existent key.
 #[test]
 fn test_get_nonexistent() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
@@ -195,6 +212,10 @@ fn test_get_nonexistent() {
 /// Test DEL command.
 #[test]
 fn test_del() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 
@@ -226,6 +247,10 @@ fn test_del() {
 /// Test multiple concurrent connections.
 #[test]
 fn test_concurrent_connections() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
 

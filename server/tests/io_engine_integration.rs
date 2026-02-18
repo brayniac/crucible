@@ -15,6 +15,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 /// Test configuration for parameterized tests.
 #[derive(Clone, Debug)]
 struct TestConfig {
@@ -520,89 +525,157 @@ fn run_basic_test() {
 
 #[test]
 fn test_uring_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_basic_test();
 }
 
 #[test]
 fn test_uring_1conn_p1_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(1, 1, 64));
 }
 
 #[test]
 fn test_uring_1conn_p1_medium() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(1, 1, 1024));
 }
 
 #[test]
 fn test_uring_1conn_p1_large() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(1, 1, 16384));
 }
 
 #[test]
 fn test_uring_8conn_p1_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(8, 1, 64));
 }
 
 #[test]
 fn test_uring_8conn_p8_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(8, 8, 64));
 }
 
 #[test]
 fn test_uring_8conn_p64_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(8, 64, 64));
 }
 
 #[test]
 fn test_uring_8conn_p8_medium() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(8, 8, 1024));
 }
 
 #[test]
 fn test_uring_8conn_p8_large() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(8, 8, 16384));
 }
 
 #[test]
 fn test_uring_64conn_p1_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(64, 1, 64));
 }
 
 #[test]
 fn test_uring_64conn_p8_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(64, 8, 64));
 }
 
 #[test]
 fn test_uring_64conn_p64_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(64, 64, 64));
 }
 
 #[test]
 fn test_uring_64conn_p8_medium() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(64, 8, 1024));
 }
 
 #[test]
 fn test_uring_64conn_p8_large() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(64, 8, 16384));
 }
 
 #[test]
 #[ignore] // Expensive test, run with --ignored
 fn test_uring_256conn_p1_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(256, 1, 64));
 }
 
 #[test]
 #[ignore] // Expensive test, run with --ignored
 fn test_uring_256conn_p8_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(256, 8, 64));
 }
 
 #[test]
 #[ignore] // Expensive test, run with --ignored
 fn test_uring_256conn_p64_small() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(256, 64, 64));
 }
 
@@ -612,6 +685,10 @@ fn test_uring_256conn_p64_small() {
 
 #[test]
 fn test_uring_large_objects() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -650,6 +727,10 @@ fn test_uring_large_objects() {
 
 #[test]
 fn test_uring_connection_churn() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -685,6 +766,10 @@ fn test_uring_connection_churn() {
 
 #[test]
 fn test_uring_deep_pipeline() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -727,6 +812,10 @@ fn test_uring_deep_pipeline() {
 
 #[test]
 fn test_uring_pipelined_large_sets_diagnostic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -793,23 +882,39 @@ fn test_uring_pipelined_large_sets_diagnostic() {
 
 #[test]
 fn test_uring_1conn_p8_60k() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_parameterized_test(TestConfig::new(1, 8, 60_000));
 }
 
 #[test]
 fn test_uring_1conn_p8_65535() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Just below streaming threshold (65536)
     run_parameterized_test(TestConfig::new(1, 8, 65_535));
 }
 
 #[test]
 fn test_uring_1conn_p8_65536() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Exactly at streaming threshold
     run_parameterized_test(TestConfig::new(1, 8, 65_536));
 }
 
 #[test]
 fn test_uring_1conn_p8_100k() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Above streaming threshold
     run_parameterized_test(TestConfig::new(1, 8, 100_000));
 }

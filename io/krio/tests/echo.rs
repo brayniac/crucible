@@ -107,10 +107,19 @@ fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
     buf
 }
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[test]
 fn callback_echo_small_message() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -133,6 +142,10 @@ fn callback_echo_small_message() {
 
 #[test]
 fn callback_echo_large_message() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -156,6 +169,10 @@ fn callback_echo_large_message() {
 
 #[test]
 fn callback_echo_multiple_connections() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -187,6 +204,10 @@ fn callback_echo_multiple_connections() {
 
 #[test]
 fn callback_echo_sequential_sends() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -228,6 +249,10 @@ fn callback_echo_sequential_sends() {
 
 #[test]
 fn async_echo_small_message() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -250,6 +275,10 @@ fn async_echo_small_message() {
 
 #[test]
 fn async_echo_large_message() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -272,6 +301,10 @@ fn async_echo_large_message() {
 
 #[test]
 fn async_echo_multiple_connections() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -303,6 +336,10 @@ fn async_echo_multiple_connections() {
 
 #[test]
 fn connection_close_on_client_disconnect() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -335,6 +372,10 @@ fn connection_close_on_client_disconnect() {
 
 #[test]
 fn graceful_shutdown() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -388,6 +429,10 @@ impl AsyncEventHandler for ShutdownWriteEcho {
 
 #[test]
 fn async_shutdown_write_triggers_eof() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -459,6 +504,10 @@ impl AsyncEventHandler for RequestShutdownHandler {
 
 #[test]
 fn async_request_shutdown_exits_cleanly() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -512,6 +561,10 @@ impl AsyncEventHandler for SpawnTestHandler {
 
 #[test]
 fn async_spawn_standalone_task() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Reset counter.
     SPAWN_COUNTER.store(0, Ordering::SeqCst);
 
@@ -578,6 +631,10 @@ impl AsyncEventHandler for SleepEchoHandler {
 
 #[test]
 fn async_sleep_completes() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -663,6 +720,10 @@ impl AsyncEventHandler for TimeoutTestHandler {
 
 #[test]
 fn async_timeout_ok() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -702,6 +763,10 @@ fn async_timeout_ok() {
 
 #[test]
 fn async_timeout_expires() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -824,6 +889,10 @@ impl AsyncEventHandler for ForwarderHandler {
 
 #[test]
 fn async_outbound_connect_and_echo() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // 1. Start a backend echo server.
     let backend_port = free_port();
     let backend_addr = format!("127.0.0.1:{backend_port}");
@@ -905,6 +974,10 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 
 #[test]
 fn async_outbound_connect_refused() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Bind to a port, then drop the listener so nothing is listening.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dead_port = listener.local_addr().unwrap().port();
@@ -1059,6 +1132,10 @@ impl AsyncEventHandler for MultiOutboundHandler {
 
 #[test]
 fn async_multiple_outbound_from_one_task() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Start backend echo server.
     let backend_port = free_port();
     let backend_addr = format!("127.0.0.1:{backend_port}");
@@ -1207,6 +1284,10 @@ impl AsyncEventHandler for SelectTwoHandler {
 
 #[test]
 fn async_select_two_connections() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Start two backend echo servers.
     let backend1_port = free_port();
     let backend1_addr = format!("127.0.0.1:{backend1_port}");
@@ -1364,6 +1445,10 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
 
 #[test]
 fn async_select_second_wins() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let b1_port = free_port();
     let b1_addr = format!("127.0.0.1:{b1_port}");
     let (b1_shutdown, b1_handles) = KrioBuilder::new(test_config())
@@ -1479,6 +1564,10 @@ impl AsyncEventHandler for SelectSleepHandler {
 
 #[test]
 fn async_select_with_sleep() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -1602,6 +1691,10 @@ impl AsyncEventHandler for Select3Handler {
 
 #[test]
 fn async_select3_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let b_port = free_port();
     let b_addr = format!("127.0.0.1:{b_port}");
     let (b_shutdown, b_handles) = KrioBuilder::new(test_config())
@@ -1709,6 +1802,10 @@ impl AsyncEventHandler for TrySpawnHandler {
 
 #[test]
 fn async_try_spawn_failure() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -1799,6 +1896,10 @@ impl AsyncEventHandler for CancelTaskHandler {
 
 #[test]
 fn async_cancel_running_task() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -1880,6 +1981,10 @@ impl AsyncEventHandler for CancelCompletedHandler {
 
 #[test]
 fn async_cancel_completed_task() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -1937,6 +2042,10 @@ fn multi_worker_config(threads: usize) -> Config {
 
 #[test]
 fn multi_worker_callback_echo() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -1962,6 +2071,10 @@ fn multi_worker_callback_echo() {
 
 #[test]
 fn multi_worker_async_echo() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -1987,6 +2100,10 @@ fn multi_worker_async_echo() {
 
 #[test]
 fn multi_worker_graceful_shutdown() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2051,6 +2168,10 @@ impl AsyncEventHandler for SendAwaitHandler {
 
 #[test]
 fn async_send_await_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2146,6 +2267,10 @@ impl AsyncEventHandler for SendChainAwaitHandler {
 
 #[test]
 fn async_send_chain_await_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2241,6 +2366,10 @@ impl AsyncEventHandler for TrySleepHandler {
 
 #[test]
 fn async_try_sleep_exhaustion() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2328,6 +2457,10 @@ impl AsyncEventHandler for TryTimeoutHandler {
 
 #[test]
 fn async_try_timeout_exhaustion() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2423,6 +2556,10 @@ impl AsyncEventHandler for JoinHandler {
 
 #[test]
 fn async_join_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2515,6 +2652,10 @@ impl AsyncEventHandler for Join3Handler {
 
 #[test]
 fn async_join3_mixed() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2608,6 +2749,10 @@ impl AsyncEventHandler for SleepUntilHandler {
 
 #[test]
 fn async_sleep_until_basic() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2684,6 +2829,10 @@ impl AsyncEventHandler for TimeoutAtHandler {
 
 #[test]
 fn async_timeout_at_expires() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -2759,6 +2908,10 @@ impl EventHandler for UdpEchoCallback {
 
 #[test]
 fn callback_udp_echo() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let udp_port = free_port();
     let udp_addr: std::net::SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
 
@@ -2824,6 +2977,10 @@ impl AsyncEventHandler for UdpEchoAsync {
 
 #[test]
 fn async_udp_echo() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let udp_port = free_port();
     let udp_addr: std::net::SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
 
@@ -2933,6 +3090,10 @@ impl AsyncEventHandler for StandaloneConnectHandler {
 
 #[test]
 fn async_standalone_connect() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Start backend echo server.
     let backend_port = free_port();
     let backend_addr = format!("127.0.0.1:{backend_port}");
@@ -3064,6 +3225,10 @@ impl AsyncEventHandler for OnStartClientHandler {
 
 #[test]
 fn async_on_start_client_only() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Start backend echo server.
     let backend_port = free_port();
     let backend_addr = format!("127.0.0.1:{backend_port}");
@@ -3137,6 +3302,10 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 
 #[test]
 fn async_standalone_connect_refused() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     // Bind to a port then drop it so nothing is listening.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dead_port = listener.local_addr().unwrap().port();

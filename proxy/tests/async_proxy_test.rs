@@ -200,8 +200,17 @@ fn start_async_proxy(
 
 // ── Tests ───────────────────────────────────────────────────────────
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 #[test]
 fn async_proxy_ping() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
@@ -234,6 +243,10 @@ fn async_proxy_ping() {
 
 #[test]
 fn async_proxy_set_get() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
@@ -278,6 +291,10 @@ fn async_proxy_set_get() {
 
 #[test]
 fn async_proxy_cache_hit() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
@@ -321,6 +338,10 @@ fn async_proxy_cache_hit() {
 
 #[test]
 fn async_proxy_backend_disconnect() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
@@ -363,6 +384,10 @@ fn async_proxy_backend_disconnect() {
 
 #[test]
 fn async_proxy_multiple_clients() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();
 
@@ -397,6 +422,10 @@ fn async_proxy_multiple_clients() {
 
 #[test]
 fn async_proxy_idle_backend_disconnect() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // Start backend and proxy.
     let (backend_addr, backend_shutdown, backend_handles) = start_backend();

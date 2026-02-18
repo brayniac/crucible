@@ -12,6 +12,7 @@ protocol-memcache = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 server = { path = "../../server" }
 segcache = { workspace = true }
 toml = { workspace = true }

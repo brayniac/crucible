@@ -10,6 +10,7 @@ krio-quic = { workspace = true }
 
 [dev-dependencies]
 krio = { workspace = true }
+libc = { workspace = true }
 quinn-proto = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["std", "ring"] }

@@ -32,3 +32,4 @@ optional = true
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 protocol-momento = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }

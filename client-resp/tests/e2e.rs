@@ -15,6 +15,12 @@ use std::time::Duration;
 
 use crucible_resp_client::{Client, ClientConfig};
 
+/// Check if io_uring is supported on this kernel.
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 // ── Shared test environment ─────────────────────────────────────────────
 
 struct TestEnv {
@@ -26,7 +32,14 @@ struct TestEnv {
 /// Shared test environment: one server + one tokio runtime + one client.
 /// The runtime persists for the entire test process so spawned connection
 /// tasks don't get dropped between tests.
-static ENV: LazyLock<TestEnv> = LazyLock::new(|| {
+///
+/// Returns `None` when io_uring is not available (e.g. old kernels, containers).
+static ENV: LazyLock<Option<TestEnv>> = LazyLock::new(|| {
+    if !io_uring_supported() {
+        eprintln!("io_uring not supported on this kernel — skipping e2e tests");
+        return None;
+    }
+
     let port = get_available_port();
     let (_handle, shutdown) = start_test_server(port);
 
@@ -57,11 +70,11 @@ static ENV: LazyLock<TestEnv> = LazyLock::new(|| {
         wait_for_client(&client).await;
     });
 
-    TestEnv {
+    Some(TestEnv {
         client,
         rt,
         _shutdown: shutdown,
-    }
+    })
 });
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -133,116 +146,147 @@ async fn wait_for_client(client: &Client) {
     panic!("Client failed to connect within timeout");
 }
 
-/// Run an async block on the shared runtime.
-fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
-    ENV.rt.block_on(f)
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[test]
 fn test_ping() {
-    run(async {
-        ENV.client.ping().await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.ping().await.unwrap();
     });
 }
 
 #[test]
 fn test_set_get() {
-    run(async {
-        ENV.client.set(b"e2e:sg:key", b"hello").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.set(b"e2e:sg:key", b"hello").await.unwrap();
 
-        let val = ENV.client.get(b"e2e:sg:key").await.unwrap();
+        let val = env.client.get(b"e2e:sg:key").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"hello".as_ref()));
     });
 }
 
 #[test]
 fn test_set_get_large_value() {
-    run(async {
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
         let large_value = vec![0xABu8; 1024];
 
-        ENV.client
+        env.client
             .set(b"e2e:lg:key", &large_value[..])
             .await
             .unwrap();
 
-        let val = ENV.client.get(b"e2e:lg:key").await.unwrap();
+        let val = env.client.get(b"e2e:lg:key").await.unwrap();
         assert_eq!(val.as_deref(), Some(large_value.as_ref()));
     });
 }
 
 #[test]
 fn test_get_nonexistent() {
-    run(async {
-        let val = ENV.client.get(b"e2e:nx:missing").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        let val = env.client.get(b"e2e:nx:missing").await.unwrap();
         assert_eq!(val, None);
     });
 }
 
 #[test]
 fn test_del() {
-    run(async {
-        ENV.client.set(b"e2e:del:key", b"value").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.set(b"e2e:del:key", b"value").await.unwrap();
 
-        let count = ENV.client.del(b"e2e:del:key").await.unwrap();
+        let count = env.client.del(b"e2e:del:key").await.unwrap();
         assert_eq!(count, 1);
 
-        let val = ENV.client.get(b"e2e:del:key").await.unwrap();
+        let val = env.client.get(b"e2e:del:key").await.unwrap();
         assert_eq!(val, None);
     });
 }
 
 #[test]
 fn test_set_overwrite() {
-    run(async {
-        ENV.client.set(b"e2e:ow:key", b"first").await.unwrap();
-        ENV.client.set(b"e2e:ow:key", b"second").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.set(b"e2e:ow:key", b"first").await.unwrap();
+        env.client.set(b"e2e:ow:key", b"second").await.unwrap();
 
-        let val = ENV.client.get(b"e2e:ow:key").await.unwrap();
+        let val = env.client.get(b"e2e:ow:key").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"second".as_ref()));
     });
 }
 
 #[test]
 fn test_incr_decr() {
-    run(async {
-        ENV.client.set(b"e2e:id:counter", b"10").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.set(b"e2e:id:counter", b"10").await.unwrap();
 
-        let val = ENV.client.incr(b"e2e:id:counter").await.unwrap();
+        let val = env.client.incr(b"e2e:id:counter").await.unwrap();
         assert_eq!(val, 11);
 
-        let val = ENV.client.decr(b"e2e:id:counter").await.unwrap();
+        let val = env.client.decr(b"e2e:id:counter").await.unwrap();
         assert_eq!(val, 10);
 
-        let val = ENV.client.incrby(b"e2e:id:counter", 5).await.unwrap();
+        let val = env.client.incrby(b"e2e:id:counter", 5).await.unwrap();
         assert_eq!(val, 15);
 
-        let val = ENV.client.decrby(b"e2e:id:counter", 3).await.unwrap();
+        let val = env.client.decrby(b"e2e:id:counter", 3).await.unwrap();
         assert_eq!(val, 12);
     });
 }
 
 #[test]
 fn test_append() {
-    run(async {
-        ENV.client.set(b"e2e:ap:key", b"hello").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.set(b"e2e:ap:key", b"hello").await.unwrap();
 
-        let len = ENV.client.append(b"e2e:ap:key", b" world").await.unwrap();
+        let len = env.client.append(b"e2e:ap:key", b" world").await.unwrap();
         assert_eq!(len, 11);
 
-        let val = ENV.client.get(b"e2e:ap:key").await.unwrap();
+        let val = env.client.get(b"e2e:ap:key").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"hello world".as_ref()));
     });
 }
 
 #[test]
 fn test_mget() {
-    run(async {
-        ENV.client.set(b"e2e:mg:k1", b"v1").await.unwrap();
-        ENV.client.set(b"e2e:mg:k2", b"v2").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.set(b"e2e:mg:k1", b"v1").await.unwrap();
+        env.client.set(b"e2e:mg:k2", b"v2").await.unwrap();
 
-        let vals = ENV
+        let vals = env
             .client
             .mget(&[b"e2e:mg:k1", b"e2e:mg:k2", b"e2e:mg:missing"])
             .await
@@ -257,31 +301,39 @@ fn test_mget() {
 
 #[test]
 fn test_set_nx() {
-    run(async {
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
         // Should succeed — key doesn't exist
-        let set = ENV.client.set_nx(b"e2e:snx:key", b"first").await.unwrap();
+        let set = env.client.set_nx(b"e2e:snx:key", b"first").await.unwrap();
         assert!(set);
 
         // Should fail — key exists
-        let set = ENV.client.set_nx(b"e2e:snx:key", b"second").await.unwrap();
+        let set = env.client.set_nx(b"e2e:snx:key", b"second").await.unwrap();
         assert!(!set);
 
         // Value should still be "first"
-        let val = ENV.client.get(b"e2e:snx:key").await.unwrap();
+        let val = env.client.get(b"e2e:snx:key").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"first".as_ref()));
     });
 }
 
 #[test]
 fn test_key_type() {
-    run(async {
-        ENV.client.set(b"e2e:type:str", b"val").await.unwrap();
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        env.client.set(b"e2e:type:str", b"val").await.unwrap();
 
-        let t = ENV.client.key_type(b"e2e:type:str").await.unwrap();
+        let t = env.client.key_type(b"e2e:type:str").await.unwrap();
         assert_eq!(t, "string");
 
         // Non-existent key
-        let t = ENV.client.key_type(b"e2e:type:missing").await.unwrap();
+        let t = env.client.key_type(b"e2e:type:missing").await.unwrap();
         assert_eq!(t, "none");
     });
 }
@@ -293,8 +345,12 @@ fn test_key_type() {
 
 #[test]
 fn test_pipeline() {
-    run(async {
-        let results = ENV
+    let Some(env) = ENV.as_ref() else {
+        eprintln!("SKIP: io_uring not supported");
+        return;
+    };
+    env.rt.block_on(async {
+        let results = env
             .client
             .pipeline()
             .set(b"e2e:pipe:k1", b"v1")

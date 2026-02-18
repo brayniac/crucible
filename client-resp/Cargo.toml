@@ -17,3 +17,4 @@ segcache = { path = "../cache/segcache" }
 toml = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+libc = { workspace = true }

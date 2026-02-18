@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn io_uring_supported() -> bool {
+    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
+    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 /// Large value test sizes.
 /// These sizes are chosen to stress different parts of the buffer system:
 /// - 256KB: Spans ~16 ring buffers (16KB each)
@@ -485,11 +490,19 @@ fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
 
 #[test]
 fn test_uring_large_values_256k_to_1m() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_large_value_test(LargeValueTestConfig::default());
 }
 
 #[test]
 fn test_uring_large_values_4m_to_16m() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_large_value_test(LargeValueTestConfig {
         sizes: VERY_LARGE_SIZES,
         heap_size_mb: 512,
@@ -501,6 +514,10 @@ fn test_uring_large_values_4m_to_16m() {
 #[test]
 #[ignore] // Expensive test
 fn test_uring_large_values_64m() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_large_value_test(LargeValueTestConfig {
         sizes: EXTREME_SIZES,
         heap_size_mb: 1024,
@@ -511,12 +528,20 @@ fn test_uring_large_values_64m() {
 
 #[test]
 fn test_uring_concurrent_large_values_1m() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_concurrent_large_value_test(8, 1024 * 1024);
 }
 
 #[test]
 #[ignore] // Expensive test
 fn test_uring_concurrent_large_values_4m() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     run_concurrent_large_value_test(4, 4 * 1024 * 1024);
 }
 
@@ -527,6 +552,10 @@ fn test_uring_concurrent_large_values_4m() {
 /// Test rapid large value SET/GET cycles to stress buffer recycling.
 #[test]
 fn test_uring_rapid_large_value_cycles() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -567,6 +596,10 @@ fn test_uring_rapid_large_value_cycles() {
 /// This stresses coalesce buffer growth.
 #[test]
 fn test_uring_increasing_value_sizes() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -622,6 +655,10 @@ fn test_uring_increasing_value_sizes() {
 /// This tests buffer shrink/grow behavior.
 #[test]
 fn test_uring_alternating_value_sizes() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -666,6 +703,10 @@ fn test_uring_alternating_value_sizes() {
 /// Ring buffers are 16KB, so test around that boundary.
 #[test]
 fn test_uring_buffer_boundary_sizes() {
+    if !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
