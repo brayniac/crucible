@@ -27,8 +27,10 @@ pub(crate) struct HandlerConfig<C: Cache> {
 
 /// Configuration for per-worker disk I/O initialization.
 pub(crate) struct DiskIoWorkerConfig {
-    /// Backend type and path.
+    /// Backend type.
     pub backend: cache_core::DiskIoBackend,
+    /// Path to the disk file (used by DirectIo backend).
+    pub path: String,
     /// Number of read buffers per worker.
     pub read_buffer_count: usize,
     /// Size of each read buffer (typically one block = 4096).
@@ -302,13 +304,11 @@ impl<C: Cache> ServerHandler<C> {
                 }
             }
             cache_core::DiskIoBackend::DirectIo => {
-                // For Direct I/O, the path is passed via the cache config, not here.
-                // The file should already be created/opened by the cache layer.
-                // We need the path from somewhere — for now, we open it via the
-                // standard disk config path.
-                return Err(io::Error::other(
-                    "Direct I/O path must be provided in DiskIoWorkerConfig",
-                ));
+                let file = ctx.open_direct_io_file(&config.path)?;
+                DiskBackend::DirectIo {
+                    file,
+                    block_size: config.block_size,
+                }
             }
         };
 

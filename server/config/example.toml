@@ -66,14 +66,17 @@ hashtable_power = 16
 
 # Disk tier - extend cache capacity beyond RAM (optional)
 # When enabled, evicted items are demoted to disk instead of discarded.
+# See disk-tier.toml for a full example with all options.
 # Uncomment to enable:
 # [cache.disk]
 # enabled = true
-# path = "/var/cache/crucible/disk.dat"
+# io_backend = "directio"           # "directio" (default), "nvme", or "mmap"
+# path = "/var/cache/crucible/disk.dat"  # File path (directio/mmap)
 # size = "100GB"
-# promotion_threshold = 2    # Promote items accessed > N times to RAM
-# sync_mode = "async"        # "sync", "async", or "none"
-# recover_on_startup = true  # Recover disk cache on restart
+# promotion_threshold = 2           # Promote items accessed > N times to RAM
+# # NVMe passthrough (when io_backend = "nvme"):
+# # nvme_device = "/dev/ng0n1"
+# # nvme_nsid = 1
 
 # RESP protocol listener (Redis-compatible)
 [[listener]]

@@ -1,0 +1,33 @@
+# Direct I/O Disk Tier Test Configuration
+#
+# Uses io_uring O_DIRECT for disk tier I/O, bypassing the page cache.
+# For local testing: items evicted from 64MB RAM tier are demoted to 32MB disk.
+
+[logging]
+level = "info"
+format = "pretty"
+
+[workers]
+threads = 2
+
+[cache]
+backend = "segment"
+policy = "s3fifo"
+heap_size = "64MB"
+segment_size = "1MB"
+max_value_size = "512KB"
+hashtable_power = 16
+
+[cache.disk]
+enabled = true
+path = "/tmp/crucible-disk-test.dat"
+size = "32MB"
+io_backend = "directio"
+promotion_threshold = 2
+
+[[listener]]
+protocol = "resp"
+address = "0.0.0.0:6379"
+
+[metrics]
+address = "0.0.0.0:9090"

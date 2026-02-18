@@ -3,6 +3,15 @@
 # This configuration enables disk tiering to extend cache capacity
 # beyond available RAM. Items evicted from RAM are demoted to disk
 # storage instead of being discarded.
+#
+# Three I/O backends are available:
+#   "directio" (default) — io_uring with O_DIRECT on a regular file.
+#       Works on any filesystem. Bypasses the page cache for predictable latency.
+#   "nvme" — io_uring NVMe passthrough via /dev/ng* character devices.
+#       Lowest latency. Requires NVMe hardware and the nvme-generic kernel module.
+#       The server needs read/write access to the character device (root or
+#       appropriate udev rules).
+#   "mmap" — memory-mapped file using the OS page cache (legacy).
 
 
 [workers]
@@ -15,31 +24,40 @@ backend = "segment"
 policy = "s3fifo"
 heap_size = "4GB"
 segment_size = "1MB"
+max_value_size = "512KB"
 hashtable_power = 26
 hugepage = "none"
 
-# Disk tier configuration
+# Disk tier configuration — Direct I/O (default)
 [cache.disk]
 enabled = true
-# Path to the disk cache file
-# The directory must exist and be writable
+# I/O backend: "directio" (default), "nvme", or "mmap"
+io_backend = "directio"
+# Path to the disk cache file (used by directio and mmap backends)
 path = "/var/cache/crucible/disk.dat"
 # Total size of disk storage
-# This should typically be larger than heap_size for meaningful extension
 size = "100GB"
 # Frequency threshold for promotion from disk to RAM
 # Items accessed more than this many times while on disk will be promoted
-# Higher values = fewer promotions, more stable disk tier
-# Lower values = more promotions, faster access for hot items
 promotion_threshold = 2
-# Synchronization mode:
+# Synchronization mode (mmap backend only):
 #   "sync"  - fsync after each write (safest, slowest)
 #   "async" - periodic background fsync (balanced, recommended)
 #   "none"  - OS handles flushing (fastest, may lose data on crash)
 sync_mode = "async"
-# Attempt to recover existing disk cache on startup
-# Set to false to always start with a fresh disk cache
+# Recover existing disk cache on startup (mmap backend only)
 recover_on_startup = true
+
+# --- Alternative: NVMe passthrough ---
+# Uncomment and replace the [cache.disk] section above to use NVMe:
+#
+# [cache.disk]
+# enabled = true
+# io_backend = "nvme"
+# nvme_device = "/dev/ng0n1"    # NVMe generic character device
+# nvme_nsid = 1                 # NVMe namespace ID
+# size = "100GB"
+# promotion_threshold = 2
 
 [[listener]]
 protocol = "resp"

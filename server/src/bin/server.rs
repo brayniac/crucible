@@ -7,7 +7,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::Parser;
 use server::admin::{self, AdminConfig};
 use server::banner::{BannerConfig, print_banner};
-use server::config::{CacheBackend, Config, EvictionPolicy, HugepageConfig};
+use server::config::{CacheBackend, Config, DiskIoBackendConfig, EvictionPolicy, HugepageConfig};
 use server::{logging, signal};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -135,8 +135,8 @@ fn create_segment(
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
     use segcache::{
-        DiskTierConfig, EvictionPolicy as SegEvictionPolicy, HugepageSize, MergeConfig, SegCache,
-        SyncMode,
+        DiskTierConfig, EvictionPolicy as SegEvictionPolicy, HugepageSize, IoUringDiskTierConfig,
+        MergeConfig, SegCache, SyncMode,
     };
 
     let hugepage_size = match config.cache.hugepage {
@@ -175,18 +175,34 @@ fn create_segment(
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let sync_mode = match disk_config.sync_mode {
-            server::config::DiskSyncMode::Sync => SyncMode::Sync,
-            server::config::DiskSyncMode::Async => SyncMode::Async,
-            server::config::DiskSyncMode::None => SyncMode::None,
-        };
+        match disk_config.io_backend {
+            DiskIoBackendConfig::DirectIo | DiskIoBackendConfig::Nvme => {
+                // Both DirectIo and NVMe use the io_uring disk layer with
+                // in-memory segment metadata. The actual I/O backend (O_DIRECT
+                // file vs NVMe passthrough) is selected at the krio level.
+                let segment_count = disk_config.size / config.cache.segment_size;
+                let io_uring_tier = IoUringDiskTierConfig {
+                    segment_count,
+                    block_size: 4096,
+                    promotion_threshold: disk_config.promotion_threshold,
+                };
+                builder = builder.io_uring_disk_tier(io_uring_tier);
+            }
+            DiskIoBackendConfig::Mmap => {
+                let sync_mode = match disk_config.sync_mode {
+                    server::config::DiskSyncMode::Sync => SyncMode::Sync,
+                    server::config::DiskSyncMode::Async => SyncMode::Async,
+                    server::config::DiskSyncMode::None => SyncMode::None,
+                };
 
-        let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
-            .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(sync_mode)
-            .recover_on_startup(disk_config.recover_on_startup);
+                let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+                    .promotion_threshold(disk_config.promotion_threshold)
+                    .sync_mode(sync_mode)
+                    .recover_on_startup(disk_config.recover_on_startup);
 
-        builder = builder.disk_tier(disk_tier);
+                builder = builder.disk_tier(disk_tier);
+            }
+        }
     }
 
     let cache = builder.build()?;
@@ -349,14 +365,20 @@ hugepage = "none"
 # numa_node = 0
 
 # Disk tier configuration (optional)
-# When enabled, items evicted from RAM are demoted to disk instead of being discarded
+# When enabled, items evicted from RAM are demoted to disk instead of being discarded.
+# See server/config/disk-tier.toml for a full example.
 # [cache.disk]
 # enabled = true
-# path = "/var/cache/crucible/disk.dat"
+# io_backend = "directio"           # "directio" (default), "nvme", or "mmap"
+# path = "/var/cache/crucible/disk.dat"  # File path (directio/mmap backends)
 # size = "100GB"
-# promotion_threshold = 2       # Promote items with freq > threshold to RAM
-# sync_mode = "async"           # "sync", "async", or "none"
-# recover_on_startup = true     # Recover existing disk cache on startup
+# promotion_threshold = 2           # Promote items with freq > threshold to RAM
+# # For mmap backend only:
+# # sync_mode = "async"             # "sync", "async", or "none"
+# # recover_on_startup = true
+# # For NVMe passthrough (io_backend = "nvme"):
+# # nvme_device = "/dev/ng0n1"      # NVMe generic character device
+# # nvme_nsid = 1                   # NVMe namespace ID
 
 # Protocol listeners - configure one or more
 [[listener]]

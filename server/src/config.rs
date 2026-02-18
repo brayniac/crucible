@@ -113,6 +113,25 @@ pub struct CacheConfig {
     pub disk: Option<DiskConfig>,
 }
 
+/// Disk I/O backend selection.
+///
+/// Controls how the disk tier performs I/O operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskIoBackendConfig {
+    /// io_uring O_DIRECT — bypasses the page cache for predictable latency.
+    /// Uses `IORING_OP_READ/WRITE` with `O_DIRECT` on a regular file.
+    /// Works with any filesystem or block device. Default for new deployments.
+    #[default]
+    DirectIo,
+    /// NVMe passthrough — lowest latency, uses `IORING_OP_URING_CMD` for
+    /// direct NVMe commands via `/dev/ng*` character devices.
+    /// Requires NVMe hardware and the `nvme-generic` kernel module.
+    Nvme,
+    /// Memory-mapped file — uses the OS page cache (legacy).
+    Mmap,
+}
+
 /// Disk tier configuration.
 ///
 /// When enabled, the cache extends its capacity using disk storage.
@@ -150,6 +169,20 @@ pub struct DiskConfig {
     /// Default: true
     #[serde(default = "default_true")]
     pub recover_on_startup: bool,
+
+    /// I/O backend: "directio" (default), "nvme", or "mmap" (legacy).
+    #[serde(default)]
+    pub io_backend: DiskIoBackendConfig,
+
+    /// NVMe generic character device path (e.g., "/dev/ng0n1").
+    /// Required when io_backend = "nvme".
+    #[serde(default)]
+    pub nvme_device: Option<String>,
+
+    /// NVMe namespace ID. Required when io_backend = "nvme".
+    /// Usually 1 for single-namespace devices.
+    #[serde(default)]
+    pub nvme_nsid: Option<u32>,
 }
 
 fn default_disk_path() -> std::path::PathBuf {

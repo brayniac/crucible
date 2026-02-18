@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::handler::{
-    HandlerConfig, ServerHandler, init_config_channel, launch_lock, wait_for_workers,
+    DiskIoWorkerConfig, HandlerConfig, ServerHandler, init_config_channel, launch_lock,
+    wait_for_workers,
 };
 
 /// Run the native runtime server.
@@ -59,8 +60,30 @@ pub fn run<C: Cache + 'static>(
     let send_copy_slot_size = 16384u32;
     let send_copy_count = 8192u16;
 
+    // Determine disk I/O backend
+    use crate::config::DiskIoBackendConfig;
+    let disk_io_backend = config
+        .cache
+        .disk
+        .as_ref()
+        .filter(|d| d.enabled)
+        .map(|d| d.io_backend);
+
+    // Pre-create disk file before krio launch (workers need it for O_DIRECT open)
+    if disk_io_backend == Some(DiskIoBackendConfig::DirectIo) {
+        let disk_config = config.cache.disk.as_ref().unwrap();
+        if let Err(e) = ensure_disk_file(&disk_config.path, disk_config.size) {
+            return Err(format!("Failed to create disk file: {e}").into());
+        }
+        info!(
+            path = %disk_config.path.display(),
+            size = disk_config.size,
+            "Pre-created disk file for Direct I/O"
+        );
+    }
+
     // Build krio config from server config
-    let krio_config = krio::Config {
+    let mut krio_config = krio::Config {
         sq_entries: config.uring.sq_depth,
         sqpoll: config.uring.sqpoll,
         sqpoll_idle_ms: config.uring.sqpoll_idle_ms,
@@ -80,6 +103,17 @@ pub fn run<C: Cache + 'static>(
         ..Default::default()
     };
 
+    // Enable krio's disk I/O subsystem based on backend
+    match disk_io_backend {
+        Some(DiskIoBackendConfig::DirectIo) => {
+            krio_config.direct_io = Some(krio::direct_io::DirectIoConfig::default());
+        }
+        Some(DiskIoBackendConfig::Nvme) => {
+            krio_config.nvme = Some(krio::nvme::NvmeConfig::default());
+        }
+        _ => {}
+    }
+
     // Load TLS config if configured
     let krio_config = if let Some(ref tls_cfg) = config.listener[0].tls {
         let mut c = krio_config;
@@ -97,6 +131,38 @@ pub fn run<C: Cache + 'static>(
     // races when multiple server instances run in the same process (e.g., tests).
     let _launch_guard = launch_lock();
 
+    // Build disk I/O config for workers when io_uring-based backend is enabled
+    let disk_io_worker_config: Option<DiskIoWorkerConfig> = match disk_io_backend {
+        Some(DiskIoBackendConfig::DirectIo) => {
+            let disk_config = config.cache.disk.as_ref().unwrap();
+            Some(DiskIoWorkerConfig {
+                backend: cache_core::DiskIoBackend::DirectIo,
+                path: disk_config.path.to_string_lossy().into_owned(),
+                read_buffer_count: 64,
+                read_buffer_size: 4096,
+                block_size: 4096,
+            })
+        }
+        Some(DiskIoBackendConfig::Nvme) => {
+            let disk_config = config.cache.disk.as_ref().unwrap();
+            let device_path = disk_config
+                .nvme_device
+                .clone()
+                .expect("nvme_device is required when io_backend = nvme");
+            let nsid = disk_config
+                .nvme_nsid
+                .expect("nvme_nsid is required when io_backend = nvme");
+            Some(DiskIoWorkerConfig {
+                backend: cache_core::DiskIoBackend::Nvme { device_path, nsid },
+                path: String::new(),
+                read_buffer_count: 64,
+                read_buffer_size: 4096,
+                block_size: 4096,
+            })
+        }
+        _ => None,
+    };
+
     // Distribute HandlerConfigs to workers via a crossbeam channel.
     // Each worker's create_for_worker() receives one config from the channel.
     let (config_tx, config_rx) = crossbeam_channel::bounded::<HandlerConfig<C>>(num_workers);
@@ -109,7 +175,13 @@ pub fn run<C: Cache + 'static>(
                 max_value_size: config.cache.max_value_size,
                 allow_flush,
                 send_copy_slot_size: send_copy_slot_size as usize,
-                disk_io_config: None, // TODO: populate from disk config when io_uring disk tier is enabled
+                disk_io_config: disk_io_worker_config.as_ref().map(|c| DiskIoWorkerConfig {
+                    backend: c.backend.clone(),
+                    path: c.path.clone(),
+                    read_buffer_count: c.read_buffer_count,
+                    read_buffer_size: c.read_buffer_size,
+                    block_size: c.block_size,
+                }),
             })
             .expect("failed to queue handler config");
     }
@@ -239,6 +311,25 @@ fn run_diagnostics(stats: Arc<Vec<WorkerStats>>, shutdown: Arc<AtomicBool>) {
             last_report = Instant::now();
         }
     }
+}
+
+/// Ensure the disk file exists and is pre-allocated to the required size.
+///
+/// Creates parent directories and the file if they don't exist, then
+/// sets the file length. This must run before krio launch because
+/// workers will open the file with O_DIRECT.
+fn ensure_disk_file(path: &std::path::Path, size: usize) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.set_len(size as u64)?;
+    Ok(())
 }
 
 fn format_bytes(bytes: u64) -> String {

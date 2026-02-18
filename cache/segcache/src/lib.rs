@@ -46,8 +46,8 @@
 #![warn(clippy::all)]
 
 use cache_core::{
-    CacheLayer, CasToken, DiskLayerBuilder, FifoLayerBuilder, ItemGuard, LayerConfig,
-    MultiChoiceHashtable, TieredCache, TieredCacheBuilder, TtlLayerBuilder,
+    CacheLayer, CasToken, DiskLayerBuilder, FifoLayerBuilder, IoUringDiskLayerBuilder, ItemGuard,
+    LayerConfig, MultiChoiceHashtable, TieredCache, TieredCacheBuilder, TtlLayerBuilder,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,7 +57,7 @@ use std::time::Duration;
 pub use cache_core::{
     AtomicCounters, BasicItemGuard, Cache, CacheError, CacheMetrics, CacheResult, CounterSnapshot,
     DEFAULT_TTL, EvictionStrategy, FrequencyDecay, HugepageSize, ItemLocation, LayerMetrics,
-    MergeConfig, OwnedGuard, PoolMetrics, SyncMode, ValueRef,
+    LookupResult, MergeConfig, OwnedGuard, PoolMetrics, SyncMode, ValueRef,
 };
 
 /// Eviction policy for the segmented cache.
@@ -256,6 +256,31 @@ pub struct DiskTierConfig {
     pub recover_on_startup: bool,
 }
 
+/// Configuration for the io_uring-based disk tier (Direct I/O).
+///
+/// Unlike [`DiskTierConfig`] which uses mmap, this tier performs I/O through
+/// io_uring with O_DIRECT, bypassing the page cache entirely.
+/// Segment metadata is managed in-memory by [`cache_core::IoUringDiskLayer`].
+#[derive(Debug, Clone)]
+pub struct IoUringDiskTierConfig {
+    /// Number of disk segments.
+    pub segment_count: usize,
+    /// I/O block size (default 4096).
+    pub block_size: u32,
+    /// Frequency threshold for promoting items from disk to RAM.
+    pub promotion_threshold: u8,
+}
+
+impl Default for IoUringDiskTierConfig {
+    fn default() -> Self {
+        Self {
+            segment_count: 128,
+            block_size: 4096,
+            promotion_threshold: 2,
+        }
+    }
+}
+
 impl DiskTierConfig {
     /// Create a new disk tier configuration.
     pub fn new(path: impl Into<PathBuf>, size: usize) -> Self {
@@ -323,8 +348,11 @@ pub struct SegCacheBuilder {
     /// Eviction policy for the cache.
     eviction_policy: EvictionPolicy,
 
-    /// Disk tier configuration (optional).
+    /// Disk tier configuration (optional, mmap-based).
     disk_tier: Option<DiskTierConfig>,
+
+    /// io_uring disk tier configuration (optional, Direct I/O).
+    io_uring_disk_tier: Option<IoUringDiskTierConfig>,
 }
 
 impl Default for SegCacheBuilder {
@@ -352,6 +380,7 @@ impl SegCacheBuilder {
             numa_node: None,
             eviction_policy: EvictionPolicy::Random,
             disk_tier: None,
+            io_uring_disk_tier: None,
         }
     }
 
@@ -454,6 +483,17 @@ impl SegCacheBuilder {
         self
     }
 
+    /// Enable io_uring-based disk tier with Direct I/O.
+    ///
+    /// Unlike [`disk_tier`](Self::disk_tier) which uses mmap, this tier
+    /// performs all I/O through io_uring with O_DIRECT. Segment metadata
+    /// is managed in-memory; the server handler submits reads/writes via
+    /// krio's Direct I/O API.
+    pub fn io_uring_disk_tier(mut self, config: IoUringDiskTierConfig) -> Self {
+        self.io_uring_disk_tier = Some(config);
+        self
+    }
+
     /// Build the SegCache.
     ///
     /// # Errors
@@ -495,7 +535,8 @@ impl SegCacheBuilder {
             .with_ghosts(self.enable_ghosts)
             .with_eviction_strategy(eviction_strategy);
 
-        if self.disk_tier.is_some() {
+        let has_disk = self.disk_tier.is_some() || self.io_uring_disk_tier.is_some();
+        if has_disk {
             // Demote to disk layer (layer 1) with demotion threshold of 1
             // (demote items that have been accessed at least once)
             layer_config = layer_config.with_next_layer(1).with_demotion_threshold(1);
@@ -534,6 +575,21 @@ impl SegCacheBuilder {
                 .build()?;
 
             builder = builder.with_disk_layer(disk_layer);
+        } else if let Some(io_uring_config) = self.io_uring_disk_tier {
+            let disk_layer_config = LayerConfig::new()
+                .with_ghosts(self.enable_ghosts)
+                .with_eviction_strategy(EvictionStrategy::Random);
+
+            let io_uring_layer = IoUringDiskLayerBuilder::new()
+                .layer_id(1)
+                .pool_id(2)
+                .config(disk_layer_config)
+                .segment_size(self.segment_size)
+                .segment_count(io_uring_config.segment_count)
+                .block_size(io_uring_config.block_size)
+                .build();
+
+            builder = builder.with_io_uring_disk_layer(io_uring_layer);
         }
 
         Ok(builder.build())
@@ -588,7 +644,8 @@ impl SegCacheBuilder {
             .with_ghosts(true)
             .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default()));
 
-        if self.disk_tier.is_some() {
+        let has_disk = self.disk_tier.is_some() || self.io_uring_disk_tier.is_some();
+        if has_disk {
             // Demote to disk layer (layer 2) with demotion threshold of 1
             layer1_config = layer1_config.with_next_layer(2).with_demotion_threshold(1);
         }
@@ -628,6 +685,21 @@ impl SegCacheBuilder {
                 .build()?;
 
             builder = builder.with_disk_layer(disk_layer);
+        } else if let Some(io_uring_config) = self.io_uring_disk_tier {
+            let disk_layer_config = LayerConfig::new()
+                .with_ghosts(true)
+                .with_eviction_strategy(EvictionStrategy::Random);
+
+            let io_uring_layer = IoUringDiskLayerBuilder::new()
+                .layer_id(2)
+                .pool_id(2)
+                .config(disk_layer_config)
+                .segment_size(self.segment_size)
+                .segment_count(io_uring_config.segment_count)
+                .block_size(io_uring_config.block_size)
+                .build();
+
+            builder = builder.with_io_uring_disk_layer(io_uring_layer);
         }
 
         Ok(builder.build())
@@ -648,6 +720,10 @@ impl Cache for SegCache {
 
     fn get_value_ref(&self, key: &[u8]) -> Option<ValueRef> {
         self.inner.get_value_ref(key)
+    }
+
+    fn lookup(&self, key: &[u8]) -> LookupResult {
+        self.inner.lookup(key)
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
