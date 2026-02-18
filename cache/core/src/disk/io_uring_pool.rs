@@ -33,6 +33,7 @@ pub struct IoUringPool {
     /// Lock-free free queue for segment allocation.
     free_queue: Box<crossbeam_deque::Injector<u32>>,
     /// Spare queue for segments that need special handling.
+    #[allow(dead_code)]
     spare_queue: Box<crossbeam_deque::Injector<u32>>,
     /// Pool ID (0-3).
     pool_id: u8,

@@ -381,7 +381,7 @@ async fn submit_and_await_disk_read(
         return Ok(());
     }
 
-    let header = cache_core::BasicHeader::from_bytes_unchecked(
+    let header = cache_core::BasicHeader::from_bytes(
         &buf_slice[item_offset..item_offset + header_size],
     );
 

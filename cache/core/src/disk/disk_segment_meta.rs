@@ -221,7 +221,7 @@ impl SegmentKeyVerify for DiskSegmentMeta {
         let header_bytes =
             unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
 
-        let header = BasicHeader::from_bytes_unchecked(header_bytes);
+        let header = BasicHeader::from_bytes(header_bytes);
 
         if !allow_deleted && header.is_deleted() {
             return false;
@@ -252,7 +252,7 @@ impl SegmentKeyVerify for DiskSegmentMeta {
         let header_bytes =
             unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
 
-        let header = BasicHeader::from_bytes_unchecked(header_bytes);
+        let header = BasicHeader::from_bytes(header_bytes);
 
         if !allow_deleted && header.is_deleted() {
             return None;
@@ -633,7 +633,7 @@ impl Segment for DiskSegmentMeta {
         let header_bytes = unsafe {
             std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE)
         };
-        let header = BasicHeader::from_bytes_unchecked(header_bytes);
+        let header = BasicHeader::from_bytes(header_bytes);
 
         if header.is_deleted() {
             return Ok(false); // Already deleted

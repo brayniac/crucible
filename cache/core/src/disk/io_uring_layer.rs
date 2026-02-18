@@ -247,7 +247,7 @@ impl IoUringDiskLayer {
 
         let header_bytes =
             unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
-        let header = BasicHeader::from_bytes_unchecked(header_bytes);
+        let header = BasicHeader::from_bytes(header_bytes);
 
         if header.is_deleted() {
             unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };

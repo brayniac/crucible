@@ -1,7 +1,7 @@
 //! Per-worker disk I/O state for io_uring-based disk reads and flushes.
 //!
 //! This module provides the server-side orchestration for disk-backed cache
-//! operations. The cache layer ([`IoUringDiskLayer`]) manages segment metadata
+//! operations. The cache layer ([`cache_core::disk::IoUringDiskLayer`]) manages segment metadata
 //! and decides what to read; this module handles the actual I/O submission
 //! and completion via krio's NVMe or Direct I/O APIs.
 

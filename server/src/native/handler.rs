@@ -417,7 +417,7 @@ impl<C: Cache> ServerHandler<C> {
             return;
         }
 
-        let header = cache_core::BasicHeader::from_bytes_unchecked(
+        let header = cache_core::BasicHeader::from_bytes(
             &buf_slice[item_offset..item_offset + header_size],
         );
 
