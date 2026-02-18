@@ -1,6 +1,6 @@
 //! Native runtime server implementation using krio (io_uring).
 
-mod handler;
+pub(crate) mod handler;
 mod server;
 
 pub use server::run;

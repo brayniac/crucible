@@ -97,6 +97,8 @@ jobs:
           - slab-lra
           - slab-lrc
           - slab-random
+          - async-segment-s3fifo
+          - segment-s3fifo-directio
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -114,8 +116,15 @@ jobs:
           echo "Testing configuration: $CONFIG"
           echo "Using debug build with validation feature (checksums + assertions)"
 
+          # Select binary based on config name (async-* uses async server)
+          if [[ "${{ matrix.config }}" == async-* ]]; then
+            SERVER_BIN=./target/debug/crucible-server-async
+          else
+            SERVER_BIN=./target/debug/crucible-server
+          fi
+
           # Start server (debug build)
-          ./target/debug/crucible-server "$CONFIG" &
+          $SERVER_BIN "$CONFIG" &
           SERVER_PID=$!
           sleep 3  # Debug builds start slower
 

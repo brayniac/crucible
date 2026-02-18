@@ -11,7 +11,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::Parser;
 use server::admin::{self, AdminConfig};
 use server::banner::{BannerConfig, print_banner};
-use server::config::{CacheBackend, Config, EvictionPolicy, HugepageConfig};
+use server::config::{CacheBackend, Config, DiskIoBackendConfig, EvictionPolicy, HugepageConfig};
 use server::{logging, signal};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -134,8 +134,8 @@ fn create_segment(
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
     use segcache::{
-        DiskTierConfig, EvictionPolicy as SegEvictionPolicy, HugepageSize, MergeConfig, SegCache,
-        SyncMode,
+        DiskTierConfig, EvictionPolicy as SegEvictionPolicy, HugepageSize, IoUringDiskTierConfig,
+        MergeConfig, SegCache, SyncMode,
     };
 
     let hugepage_size = match config.cache.hugepage {
@@ -171,18 +171,31 @@ fn create_segment(
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let sync_mode = match disk_config.sync_mode {
-            server::config::DiskSyncMode::Sync => SyncMode::Sync,
-            server::config::DiskSyncMode::Async => SyncMode::Async,
-            server::config::DiskSyncMode::None => SyncMode::None,
-        };
+        match disk_config.io_backend {
+            DiskIoBackendConfig::DirectIo | DiskIoBackendConfig::Nvme => {
+                let segment_count = disk_config.size / config.cache.segment_size;
+                let io_uring_tier = IoUringDiskTierConfig {
+                    segment_count,
+                    block_size: 4096,
+                    promotion_threshold: disk_config.promotion_threshold,
+                };
+                builder = builder.io_uring_disk_tier(io_uring_tier);
+            }
+            DiskIoBackendConfig::Mmap => {
+                let sync_mode = match disk_config.sync_mode {
+                    server::config::DiskSyncMode::Sync => SyncMode::Sync,
+                    server::config::DiskSyncMode::Async => SyncMode::Async,
+                    server::config::DiskSyncMode::None => SyncMode::None,
+                };
 
-        let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
-            .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(sync_mode)
-            .recover_on_startup(disk_config.recover_on_startup);
+                let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
+                    .promotion_threshold(disk_config.promotion_threshold)
+                    .sync_mode(sync_mode)
+                    .recover_on_startup(disk_config.recover_on_startup);
 
-        builder = builder.disk_tier(disk_tier);
+                builder = builder.disk_tier(disk_tier);
+            }
+        }
     }
 
     let cache = builder.build()?;

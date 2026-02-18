@@ -1349,6 +1349,120 @@ impl<F: Future> Future for TimeoutFuture<F> {
     }
 }
 
+// ── Disk I/O async API ──────────────────────────────────────────────
+
+/// Future that awaits a disk I/O completion (NVMe or Direct I/O).
+///
+/// The io_uring SQE was submitted before this future was created.
+/// On completion, the CQE handler stores the result and wakes the task.
+pub struct DiskIoFuture {
+    seq: u32,
+}
+
+impl Future for DiskIoFuture {
+    type Output = io::Result<i32>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
+        with_state(|_driver, executor| {
+            match executor.disk_io_results.remove(&self.seq) {
+                Some(result) if result < 0 => {
+                    Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
+                }
+                Some(result) => Poll::Ready(Ok(result)),
+                None => {
+                    // Re-register waiter (polled before CQE arrived or after spurious wake).
+                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                    executor.disk_io_waiters.insert(self.seq, task_id);
+                    Poll::Pending
+                }
+            }
+        })
+    }
+}
+
+/// Open a Direct I/O file from any async task.
+///
+/// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle
+/// for use with [`direct_io_read()`].
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn open_direct_io_file(path: &str) -> io::Result<crate::direct_io::DirectIoFile> {
+    with_state(|driver, _| {
+        let mut ctx = driver.make_ctx();
+        ctx.open_direct_io_file(path)
+    })
+}
+
+/// Open an NVMe device from any async task.
+///
+/// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle
+/// for use with [`nvme_read()`].
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn open_nvme_device(path: &str, nsid: u32) -> io::Result<crate::nvme::NvmeDevice> {
+    with_state(|driver, _| {
+        let mut ctx = driver.make_ctx();
+        ctx.open_nvme_device(path, nsid)
+    })
+}
+
+/// Submit a Direct I/O read and return a future for the result.
+///
+/// Reads `len` bytes from `offset` into the buffer at `buf`.
+/// The returned future completes when the io_uring CQE arrives.
+///
+/// # Safety
+///
+/// `buf` must point to aligned, writable memory of at least `len` bytes
+/// that remains valid until the future completes.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub unsafe fn direct_io_read(
+    file: crate::direct_io::DirectIoFile,
+    offset: u64,
+    buf: *mut u8,
+    len: u32,
+) -> io::Result<DiskIoFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let seq = unsafe { ctx.direct_io_read(file, offset, buf, len)? };
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.disk_io_waiters.insert(seq, task_id);
+        Ok(DiskIoFuture { seq })
+    })
+}
+
+/// Submit an NVMe read and return a future for the result.
+///
+/// Reads `num_blocks` logical blocks starting at `lba` into the buffer
+/// at `buf_addr` with length `buf_len`. The returned future completes
+/// when the io_uring CQE arrives.
+///
+/// # Panics
+///
+/// Panics if called outside the krio async executor.
+pub fn nvme_read(
+    device: crate::nvme::NvmeDevice,
+    lba: u64,
+    num_blocks: u16,
+    buf_addr: u64,
+    buf_len: u32,
+) -> io::Result<DiskIoFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let seq = ctx.nvme_read(device, lba, num_blocks, buf_addr, buf_len)?;
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.disk_io_waiters.insert(seq, task_id);
+        Ok(DiskIoFuture { seq })
+    })
+}
+
 // ── UDP async API ───────────────────────────────────────────────────
 
 /// Async context for a UDP socket.

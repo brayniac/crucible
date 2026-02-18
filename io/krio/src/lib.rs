@@ -117,6 +117,16 @@ pub use runtime::io::TimeoutFuture;
 pub use runtime::io::UdpCtx;
 /// Future returned by [`UdpCtx::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
+/// Future that awaits a disk I/O completion (NVMe or Direct I/O).
+pub use runtime::io::DiskIoFuture;
+/// Open a Direct I/O file from any async task.
+pub use runtime::io::open_direct_io_file;
+/// Open an NVMe device from any async task.
+pub use runtime::io::open_nvme_device;
+/// Submit a Direct I/O read and return a future for the result.
+pub use runtime::io::direct_io_read;
+/// Submit an NVMe read and return a future for the result.
+pub use runtime::io::nvme_read;
 /// Future that provides received data as zero-copy `Bytes`.
 pub use runtime::io::WithBytesFuture;
 /// Future that provides received data.

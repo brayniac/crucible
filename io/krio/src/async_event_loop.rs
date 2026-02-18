@@ -924,8 +924,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             dev.in_flight = dev.in_flight.saturating_sub(1);
         }
 
-        // TODO: wire up NVMe async futures / waker for async API.
-        let _ = (device_index, result);
+        // Wake the async task waiting for this NVMe completion.
+        self.executor.wake_disk_io(slab_idx as u32, result);
     }
 
     fn handle_direct_io(&mut self, ud: UserData, result: i32) {
@@ -949,8 +949,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             f.in_flight = f.in_flight.saturating_sub(1);
         }
 
-        // TODO: wire up direct I/O async futures / waker for async API.
-        let _ = (file_index, result);
+        // Wake the async task waiting for this Direct I/O completion.
+        self.executor.wake_disk_io(slab_idx as u32, result);
     }
 
     /// Spawn an async task for a newly accepted connection.

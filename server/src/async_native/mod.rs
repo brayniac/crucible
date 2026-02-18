@@ -9,8 +9,9 @@ mod handler;
 pub use server::run;
 
 mod server {
-    use crate::config::Config;
+    use crate::config::{Config, DiskIoBackendConfig};
     use crate::metrics::{WorkerStats, WorkerStatsSnapshot};
+    use crate::native::handler::DiskIoWorkerConfig;
     use cache_core::Cache;
     use krio::KrioBuilder;
     use std::sync::Arc;
@@ -60,6 +61,27 @@ mod server {
         let send_copy_slot_size = 16384u32;
         let send_copy_count = 8192u16;
 
+        // Determine disk I/O backend
+        let disk_io_backend = config
+            .cache
+            .disk
+            .as_ref()
+            .filter(|d| d.enabled)
+            .map(|d| d.io_backend);
+
+        // Pre-create disk file before krio launch (workers need it for O_DIRECT open)
+        if disk_io_backend == Some(DiskIoBackendConfig::DirectIo) {
+            let disk_config = config.cache.disk.as_ref().unwrap();
+            if let Err(e) = ensure_disk_file(&disk_config.path, disk_config.size) {
+                return Err(format!("Failed to create disk file: {e}").into());
+            }
+            info!(
+                path = %disk_config.path.display(),
+                size = disk_config.size,
+                "Pre-created disk file for Direct I/O (async)"
+            );
+        }
+
         let krio_config = krio::Config {
             sq_entries: config.uring.sq_depth,
             sqpoll: config.uring.sqpoll,
@@ -79,6 +101,50 @@ mod server {
             send_copy_count,
             send_slab_slots: 4096,
             ..Default::default()
+        };
+
+        // Enable krio's disk I/O subsystem based on backend
+        let mut krio_config = krio_config;
+        match disk_io_backend {
+            Some(DiskIoBackendConfig::DirectIo) => {
+                krio_config.direct_io = Some(krio::direct_io::DirectIoConfig::default());
+            }
+            Some(DiskIoBackendConfig::Nvme) => {
+                krio_config.nvme = Some(krio::nvme::NvmeConfig::default());
+            }
+            _ => {}
+        }
+
+        // Build disk I/O worker config
+        let disk_io_worker_config: Option<DiskIoWorkerConfig> = match disk_io_backend {
+            Some(DiskIoBackendConfig::DirectIo) => {
+                let disk_config = config.cache.disk.as_ref().unwrap();
+                Some(DiskIoWorkerConfig {
+                    backend: cache_core::DiskIoBackend::DirectIo,
+                    path: disk_config.path.to_string_lossy().into_owned(),
+                    read_buffer_count: 64,
+                    read_buffer_size: 4096,
+                    block_size: 4096,
+                })
+            }
+            Some(DiskIoBackendConfig::Nvme) => {
+                let disk_config = config.cache.disk.as_ref().unwrap();
+                let device_path = disk_config
+                    .nvme_device
+                    .clone()
+                    .expect("nvme_device is required when io_backend = nvme");
+                let nsid = disk_config
+                    .nvme_nsid
+                    .expect("nvme_nsid is required when io_backend = nvme");
+                Some(DiskIoWorkerConfig {
+                    backend: cache_core::DiskIoBackend::Nvme { device_path, nsid },
+                    path: String::new(),
+                    read_buffer_count: 64,
+                    read_buffer_size: 4096,
+                    block_size: 4096,
+                })
+            }
+            _ => None,
         };
 
         // Load TLS config if configured
@@ -105,6 +171,13 @@ mod server {
                     max_value_size: config.cache.max_value_size,
                     allow_flush,
                     send_copy_slot_size: send_copy_slot_size as usize,
+                    disk_io_config: disk_io_worker_config.as_ref().map(|c| DiskIoWorkerConfig {
+                        backend: c.backend.clone(),
+                        path: c.path.clone(),
+                        read_buffer_count: c.read_buffer_count,
+                        read_buffer_size: c.read_buffer_size,
+                        block_size: c.block_size,
+                    }),
                 })
                 .expect("failed to queue handler config");
         }
@@ -244,6 +317,21 @@ mod server {
         } else {
             format!("{}B", bytes)
         }
+    }
+
+    /// Ensure the disk file exists and is pre-allocated to the required size.
+    fn ensure_disk_file(path: &std::path::Path, size: usize) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.set_len(size as u64)?;
+        Ok(())
     }
 }
 

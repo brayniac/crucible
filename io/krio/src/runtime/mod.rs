@@ -26,7 +26,7 @@ pub(crate) mod task;
 pub(crate) mod waker;
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io as stdio;
 
 use self::task::{StandaloneTaskSlab, TaskSlab};
@@ -176,6 +176,10 @@ pub(crate) struct Executor {
     pub(crate) udp_recv_queues: Vec<VecDeque<(Vec<u8>, std::net::SocketAddr)>>,
     /// Per-UDP-socket: task ID waiting for recv_from (None = no waiter).
     pub(crate) udp_recv_waiters: Vec<Option<u32>>,
+    /// Disk I/O: maps command slab_idx → task_id to wake on completion.
+    pub(crate) disk_io_waiters: HashMap<u32, u32>,
+    /// Disk I/O: maps command slab_idx → i32 result from CQE.
+    pub(crate) disk_io_results: HashMap<u32, i32>,
 }
 
 impl Executor {
@@ -213,6 +217,8 @@ impl Executor {
             },
             udp_recv_queues: (0..udp).map(|_| VecDeque::new()).collect(),
             udp_recv_waiters: vec![None; udp],
+            disk_io_waiters: HashMap::new(),
+            disk_io_results: HashMap::new(),
         }
     }
 
@@ -300,6 +306,19 @@ impl Executor {
             self.connect_waiters[idx] = false;
             self.io_results[idx] = Some(IoResult::Connect(result));
             let task_id = self.owner_task[idx].unwrap_or(conn_index);
+            self.wake_task(task_id);
+        }
+    }
+
+    /// Wake a task that was waiting for a disk I/O completion.
+    ///
+    /// Stores the CQE result and wakes the task if one is registered.
+    /// Disk I/O waiters are keyed by slab_idx (not conn_index), so
+    /// `remove_connection()` does not need to clear them — the task
+    /// holds the `DiskIoFuture` and will consume the result.
+    pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
+        self.disk_io_results.insert(seq, result);
+        if let Some(task_id) = self.disk_io_waiters.remove(&seq) {
             self.wake_task(task_id);
         }
     }
