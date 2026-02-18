@@ -115,11 +115,7 @@ impl EventHandler for RoundtripHandler {
     fn create_for_worker(_id: usize) -> Self {
         let path = temp_file_path(".krio_direct_io_roundtrip_test");
 
-        // Pre-create the file with 4096 bytes so read doesn't hit EOF.
-        std::fs::write(&path, [0u8; 4096]).unwrap();
-
         let mut write_buf = aligned_buf(4096);
-        // Fill with a known pattern.
         for (i, byte) in write_buf.iter_mut().enumerate() {
             *byte = (i % 251) as u8; // prime modulus for non-repeating pattern
         }
@@ -138,6 +134,14 @@ impl EventHandler for RoundtripHandler {
 
     fn on_tick(&mut self, ctx: &mut DriverCtx) {
         if self.state.phase != RoundtripPhase::Init {
+            return;
+        }
+
+        // Create the file with 4096 bytes so read doesn't hit EOF.
+        if let Err(e) = std::fs::write(&self.state.path, [0u8; 4096]) {
+            let _ = ROUNDTRIP_ERR.set(format!("file create failed: {e}"));
+            ROUNDTRIP_DONE.store(true, Ordering::Release);
+            ctx.request_shutdown();
             return;
         }
 
@@ -327,7 +331,6 @@ impl EventHandler for MultiFileHandler {
         let mut bufs = Vec::new();
         for i in 0..3 {
             let path = temp_file_path(&format!(".krio_direct_io_multi_{i}"));
-            std::fs::write(&path, [0u8; 4096]).unwrap();
             paths.push(path);
 
             let mut buf = aligned_buf(4096);
@@ -353,6 +356,16 @@ impl EventHandler for MultiFileHandler {
             return;
         }
         self.state.started = true;
+
+        // Create the files.
+        for path in &self.state.paths {
+            if let Err(e) = std::fs::write(path, [0u8; 4096]) {
+                let _ = MULTI_FILE_ERR.set(format!("file create failed: {e}"));
+                MULTI_FILE_DONE.store(true, Ordering::Release);
+                ctx.request_shutdown();
+                return;
+            }
+        }
 
         // Open all files.
         for path in &self.state.paths {
