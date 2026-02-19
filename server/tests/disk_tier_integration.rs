@@ -144,6 +144,7 @@ fn start_disk_test_server_callback(
                 segment_count,
                 block_size: 4096,
                 promotion_threshold: 2,
+                ..Default::default()
             })
             .build()
             .unwrap();
@@ -199,6 +200,7 @@ fn start_disk_test_server_async(port: u16, disk_path: &std::path::Path) -> threa
                 segment_count,
                 block_size: 4096,
                 promotion_threshold: 2,
+                ..Default::default()
             })
             .build()
             .unwrap();

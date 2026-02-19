@@ -185,6 +185,7 @@ fn create_segment(
                     segment_count,
                     block_size: 4096,
                     promotion_threshold: disk_config.promotion_threshold,
+                    ..Default::default()
                 };
                 builder = builder.io_uring_disk_tier(io_uring_tier);
             }

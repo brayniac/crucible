@@ -269,6 +269,9 @@ pub struct IoUringDiskTierConfig {
     pub block_size: u32,
     /// Frequency threshold for promoting items from disk to RAM.
     pub promotion_threshold: u8,
+    /// Number of write buffers for staging segment data before disk flush.
+    /// Under pressure, demotion degrades to discard. Default: 16.
+    pub write_buffer_count: usize,
 }
 
 impl Default for IoUringDiskTierConfig {
@@ -277,6 +280,7 @@ impl Default for IoUringDiskTierConfig {
             segment_count: 128,
             block_size: 4096,
             promotion_threshold: 2,
+            write_buffer_count: 16,
         }
     }
 }
@@ -587,6 +591,7 @@ impl SegCacheBuilder {
                 .segment_size(self.segment_size)
                 .segment_count(io_uring_config.segment_count)
                 .block_size(io_uring_config.block_size)
+                .write_buffer_count(io_uring_config.write_buffer_count)
                 .build();
 
             builder = builder.with_io_uring_disk_layer(io_uring_layer);
@@ -697,6 +702,7 @@ impl SegCacheBuilder {
                 .segment_size(self.segment_size)
                 .segment_count(io_uring_config.segment_count)
                 .block_size(io_uring_config.block_size)
+                .write_buffer_count(io_uring_config.write_buffer_count)
                 .build();
 
             builder = builder.with_io_uring_disk_layer(io_uring_layer);

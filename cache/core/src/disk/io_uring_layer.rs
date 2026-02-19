@@ -823,6 +823,7 @@ pub struct IoUringDiskLayerBuilder {
     segment_size: usize,
     segment_count: usize,
     block_size: u32,
+    write_buffer_count: usize,
 }
 
 impl IoUringDiskLayerBuilder {
@@ -837,6 +838,7 @@ impl IoUringDiskLayerBuilder {
             segment_size: 8 * 1024 * 1024, // 8MB
             segment_count: 128,
             block_size: 4096,
+            write_buffer_count: 16,
         }
     }
 
@@ -876,6 +878,18 @@ impl IoUringDiskLayerBuilder {
         self
     }
 
+    /// Set the number of write buffers.
+    ///
+    /// Write buffers are segment-sized RAM allocations used to stage data
+    /// before flushing to disk. One buffer is needed per active write segment
+    /// plus any sealed segments awaiting flush. Under pressure, demotion
+    /// degrades gracefully to discard (items dropped instead of written to
+    /// disk). Default: 16.
+    pub fn write_buffer_count(mut self, count: usize) -> Self {
+        self.write_buffer_count = count;
+        self
+    }
+
     /// Build the IoUringDiskLayer.
     pub fn build(self) -> IoUringDiskLayer {
         let pool = IoUringPool::new(
@@ -890,9 +904,10 @@ impl IoUringDiskLayerBuilder {
 
         let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 
-        // Write buffer pool: one slot per segment, segment-sized, block-aligned.
+        // Write buffer pool: segment-sized, block-aligned.
+        // Under pressure, demotion degrades to discard rather than stalling.
         let buffer_pool = AlignedBufferPool::new(
-            self.segment_count,
+            self.write_buffer_count,
             self.segment_size,
             self.block_size as usize,
         );
