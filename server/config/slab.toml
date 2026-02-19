@@ -34,6 +34,10 @@ hugepage = "none"
 # NUMA node binding (Linux only, optional)
 # numa_node = 0
 
+# SET eviction retry timeout in microseconds (async server only).
+# 0 = disable, default: 1000 (1ms).
+# set_retry_timeout_us = 1000
+
 # Disk tier - extend cache capacity beyond RAM (optional)
 # When enabled, evicted items are demoted to disk instead of discarded.
 # Uncomment to enable:

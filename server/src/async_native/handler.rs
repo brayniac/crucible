@@ -33,6 +33,9 @@ pub(crate) struct HandlerConfig<C: Cache> {
     pub max_value_size: usize,
     pub allow_flush: bool,
     pub send_copy_slot_size: usize,
+    /// Maximum time (in microseconds) to retry a SET that failed due to
+    /// eviction pressure. 0 disables retry.
+    pub set_retry_timeout_us: u64,
     /// Disk I/O configuration. When set, workers open the device/file
     /// lazily on first accept and enable disk read support.
     pub disk_io_config: Option<DiskIoWorkerConfig>,
@@ -98,6 +101,7 @@ pub(crate) struct AsyncServerHandler<C: Cache> {
     max_value_size: usize,
     allow_flush: bool,
     send_copy_slot_size: usize,
+    set_retry_timeout_us: u64,
     /// Shared disk I/O state, lazily initialized on first accept.
     /// Uses `Arc<Mutex<...>>` because `AsyncEventHandler` requires `Send`.
     /// The Mutex is never contended (krio is single-threaded per worker).
@@ -116,17 +120,18 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
         let pending_disk_io_config = self.disk_io_config.lock().unwrap().take();
 
         let cache = Arc::clone(&self.cache);
-        let max_value_size = self.max_value_size;
-        let allow_flush = self.allow_flush;
-        let slot_size = self.send_copy_slot_size;
+        let cfg = ConnConfig {
+            max_value_size: self.max_value_size,
+            allow_flush: self.allow_flush,
+            slot_size: self.send_copy_slot_size,
+            set_retry_timeout_us: self.set_retry_timeout_us,
+        };
         let disk_io = Arc::clone(&self.disk_io);
 
         Box::pin(handle_connection(
             conn,
             cache,
-            max_value_size,
-            allow_flush,
-            slot_size,
+            cfg,
             disk_io,
             pending_disk_io_config,
         ))
@@ -151,6 +156,7 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
             max_value_size: config.max_value_size,
             allow_flush: config.allow_flush,
             send_copy_slot_size: config.send_copy_slot_size,
+            set_retry_timeout_us: config.set_retry_timeout_us,
             disk_io: Arc::new(Mutex::new(None)),
             disk_io_config: Mutex::new(config.disk_io_config),
         }
@@ -193,6 +199,15 @@ fn init_async_disk_io(config: DiskIoWorkerConfig) -> io::Result<AsyncDiskIo> {
 
 // ── Per-connection async task ───────────────────────────────────────────
 
+/// Per-connection configuration cloned into each async task.
+#[derive(Clone, Copy)]
+struct ConnConfig {
+    max_value_size: usize,
+    allow_flush: bool,
+    slot_size: usize,
+    set_retry_timeout_us: u64,
+}
+
 /// Handle a single connection's lifetime as an async task.
 ///
 /// Loops reading data via `with_data`, processing commands through the shared
@@ -200,9 +215,7 @@ fn init_async_disk_io(config: DiskIoWorkerConfig) -> io::Result<AsyncDiskIo> {
 async fn handle_connection<C: Cache>(
     conn: ConnCtx,
     cache: Arc<C>,
-    max_value_size: usize,
-    allow_flush: bool,
-    slot_size: usize,
+    cfg: ConnConfig,
     disk_io: Arc<Mutex<Option<AsyncDiskIo>>>,
     pending_disk_io_config: Option<DiskIoWorkerConfig>,
 ) {
@@ -223,12 +236,16 @@ async fn handle_connection<C: Cache>(
         }
     }
 
-    let mut connection = Connection::with_options(max_value_size, allow_flush);
+    let mut connection = if cfg.set_retry_timeout_us > 0 {
+        Connection::with_retry(cfg.max_value_size, cfg.allow_flush)
+    } else {
+        Connection::with_options(cfg.max_value_size, cfg.allow_flush)
+    };
 
     loop {
         // Backpressure: if write queue is full, await a send completion first.
         if !connection.should_read() && connection.has_pending_write() {
-            if drain_pending(&conn, &mut connection, slot_size, true)
+            if drain_pending(&conn, &mut connection, cfg.slot_size, true)
                 .await
                 .is_err()
             {
@@ -284,7 +301,7 @@ async fn handle_connection<C: Cache>(
                     &conn,
                     &mut connection,
                     pending_info,
-                    slot_size,
+                    cfg.slot_size,
                 )
                 .await
                 {
@@ -300,11 +317,39 @@ async fn handle_connection<C: Cache>(
 
         // Drain pending responses.
         if connection.has_pending_write()
-            && drain_pending(&conn, &mut connection, slot_size, false)
+            && drain_pending(&conn, &mut connection, cfg.slot_size, false)
                 .await
                 .is_err()
         {
             break;
+        }
+
+        // Retry eviction loop for SET that failed with OutOfMemory.
+        if connection.has_pending_retry() {
+            use crate::metrics::SET_RETRIES;
+            use std::time::Duration;
+
+            SET_RETRIES.increment();
+            let deadline =
+                krio::Deadline::after(Duration::from_micros(cfg.set_retry_timeout_us));
+            loop {
+                krio::sleep(Duration::from_micros(50)).await;
+                if connection.retry_set(&*cache) {
+                    break; // succeeded or gave up on non-retryable error
+                }
+                if deadline.remaining().is_zero() {
+                    connection.abandon_retry(); // silent drop + SET_ERRORS
+                    break;
+                }
+            }
+            // Drain the retry's response.
+            if connection.has_pending_write()
+                && drain_pending(&conn, &mut connection, cfg.slot_size, false)
+                    .await
+                    .is_err()
+            {
+                break;
+            }
         }
 
         if consumed == 0 {

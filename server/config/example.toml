@@ -64,6 +64,13 @@ max_value_size = "1MB"
 #   2^24 = 16M buckets, good for ~8M items
 hashtable_power = 16
 
+# Maximum time (microseconds) to retry a SET that failed due to eviction
+# pressure. Only applies to the async server (crucible-server-async).
+# When the cache is full and readers hold pinned segments, the async handler
+# can sleep and retry instead of silently dropping the item.
+# Set to 0 to disable (silent drop immediately). Default: 1000 (1ms).
+# set_retry_timeout_us = 1000
+
 # Disk tier - extend cache capacity beyond RAM (optional)
 # When enabled, evicted items are demoted to disk instead of discarded.
 # See disk-tier.toml for a full example with all options.

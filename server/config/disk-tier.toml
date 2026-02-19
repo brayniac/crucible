@@ -28,6 +28,10 @@ max_value_size = "512KB"
 hashtable_power = 26
 hugepage = "none"
 
+# SET eviction retry timeout in microseconds (async server only).
+# 0 = disable, default: 1000 (1ms).
+# set_retry_timeout_us = 1000
+
 # Disk tier configuration — Direct I/O (default)
 [cache.disk]
 enabled = true

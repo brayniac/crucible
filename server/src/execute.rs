@@ -9,6 +9,21 @@ use std::time::Duration;
 
 use crate::metrics::{DELETES, FLUSHES, GETS, HITS, MISSES, SET_ERRORS, SETS};
 
+/// Saved SET parameters for eviction retry in the async handler.
+///
+/// When the cache is full and `cache.set()` fails with `OutOfMemory`, the async
+/// handler can sleep and retry instead of silently dropping the item. This struct
+/// holds the SET parameters so the retry can be attempted after a short delay.
+pub struct PendingSetRetry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub ttl: Option<Duration>,
+    /// Opaque value for memcache binary response (0 for other protocols).
+    pub opaque: u32,
+    /// Whether the memcache binary command was quiet (no response needed).
+    pub quiet: bool,
+}
+
 // RESP error responses
 const RESP_ERR_CACHE: &[u8] = b"-ERR cache error\r\n";
 const RESP_ERR_WRONGTYPE: &[u8] =
@@ -65,6 +80,10 @@ unsafe fn write_bulk_string(buf: &mut [u8], value: &[u8]) -> usize {
 }
 
 /// Execute a Redis RESP command against the cache.
+///
+/// When `retry_on_eviction` is true and a SET fails with `OutOfMemory`/`HashTableFull`,
+/// returns `Some(PendingSetRetry)` instead of writing a response, allowing the async
+/// handler to sleep and retry.
 #[inline]
 pub fn execute_resp<C: Cache>(
     cmd: &RespCommand<'_>,
@@ -72,7 +91,8 @@ pub fn execute_resp<C: Cache>(
     write_buf: &mut BytesMut,
     version: &mut RespVersion,
     allow_flush: bool,
-) {
+    retry_on_eviction: bool,
+) -> Option<PendingSetRetry> {
     match cmd {
         RespCommand::Ping => {
             write_buf.extend_from_slice(b"+PONG\r\n");
@@ -140,7 +160,22 @@ pub fn execute_resp<C: Cache>(
                         write_buf.extend_from_slice(b"$-1\r\n");
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    if retry_on_eviction
+                        && matches!(
+                            e,
+                            cache_core::CacheError::OutOfMemory
+                                | cache_core::CacheError::HashTableFull
+                        )
+                    {
+                        return Some(PendingSetRetry {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                            ttl,
+                            opaque: 0,
+                            quiet: false,
+                        });
+                    }
                     // Silent drop: cache is best-effort storage. Return OK even
                     // when the cache is full — the item would be evicted soon
                     // anyway. This matches Redis behavior with eviction enabled
@@ -450,6 +485,7 @@ pub fn execute_resp<C: Cache>(
             write_buf.extend_from_slice(b"*0\r\n");
         }
     }
+    None
 }
 
 /// Execute data structure commands (hash, list, set) for the heap backend.
@@ -1195,8 +1231,9 @@ pub fn execute_memcache<C: Cache>(
     cache: &C,
     write_buf: &mut BytesMut,
     allow_flush: bool,
-) -> bool {
-    match cmd {
+    retry_on_eviction: bool,
+) -> (bool, Option<PendingSetRetry>) {
+    let close = match cmd {
         MemcacheCommand::Get { key } => {
             GETS.increment();
             let hit = cache.with_value(key, |value| {
@@ -1258,7 +1295,25 @@ pub fn execute_memcache<C: Cache>(
 
             match cache.set(key, data, ttl) {
                 Ok(()) => {}
-                Err(_) => {
+                Err(e) => {
+                    if retry_on_eviction
+                        && matches!(
+                            e,
+                            cache_core::CacheError::OutOfMemory
+                                | cache_core::CacheError::HashTableFull
+                        )
+                    {
+                        return (
+                            false,
+                            Some(PendingSetRetry {
+                                key: key.to_vec(),
+                                value: data.to_vec(),
+                                ttl,
+                                opaque: 0,
+                                quiet: false,
+                            }),
+                        );
+                    }
                     SET_ERRORS.increment();
                 }
             }
@@ -1371,7 +1426,9 @@ pub fn execute_memcache<C: Cache>(
             write_buf.extend_from_slice(b"VERSION crucible-server\r\n");
             false
         }
-        MemcacheCommand::Quit => true,
+        MemcacheCommand::Quit => {
+            return (true, None);
+        }
         MemcacheCommand::Incr {
             key,
             delta,
@@ -1468,7 +1525,8 @@ pub fn execute_memcache<C: Cache>(
             }
             false
         }
-    }
+    };
+    (close, None)
 }
 
 /// Execute a Memcache binary protocol command against the cache.
@@ -1479,7 +1537,8 @@ pub fn execute_memcache_binary<C: Cache>(
     cache: &C,
     write_buf: &mut BytesMut,
     allow_flush: bool,
-) -> bool {
+    retry_on_eviction: bool,
+) -> (bool, Option<PendingSetRetry>) {
     write_buf.reserve(256);
     let buf = write_buf.spare_capacity_mut();
     let buf = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len()) };
@@ -1549,17 +1608,39 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            if cache.set(key, value, ttl).is_err() {
-                SET_ERRORS.increment();
+            match cache.set(key, value, ttl) {
+                Ok(()) => {}
+                Err(e) => {
+                    if retry_on_eviction
+                        && matches!(
+                            e,
+                            cache_core::CacheError::OutOfMemory
+                                | cache_core::CacheError::HashTableFull
+                        )
+                    {
+                        return (
+                            false,
+                            Some(PendingSetRetry {
+                                key: key.to_vec(),
+                                value: value.to_vec(),
+                                ttl,
+                                opaque: *opaque,
+                                quiet: false,
+                            }),
+                        );
+                    }
+                    SET_ERRORS.increment();
+                }
             }
             let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
             unsafe { write_buf.set_len(write_buf.len() + len) };
-            return false;
+            return (false, None);
         }
         BinaryCommand::SetQ {
             key,
             value,
             expiration,
+            opaque,
             ..
         } => {
             SETS.increment();
@@ -1569,10 +1650,31 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            if cache.set(key, value, ttl).is_err() {
-                SET_ERRORS.increment();
+            match cache.set(key, value, ttl) {
+                Ok(()) => {}
+                Err(e) => {
+                    if retry_on_eviction
+                        && matches!(
+                            e,
+                            cache_core::CacheError::OutOfMemory
+                                | cache_core::CacheError::HashTableFull
+                        )
+                    {
+                        return (
+                            false,
+                            Some(PendingSetRetry {
+                                key: key.to_vec(),
+                                value: value.to_vec(),
+                                ttl,
+                                opaque: *opaque,
+                                quiet: true,
+                            }),
+                        );
+                    }
+                    SET_ERRORS.increment();
+                }
             }
-            return false;
+            return (false, None);
         }
         BinaryCommand::Add {
             key,
@@ -1652,7 +1754,7 @@ pub fn execute_memcache_binary<C: Cache>(
             BinaryResponse::encode_version(buf, *opaque, b"crucible-server")
         }
         BinaryCommand::Quit { .. } => {
-            return true;
+            return (true, None);
         }
         BinaryCommand::Stat { opaque, .. } => BinaryResponse::encode_stat_end(buf, *opaque),
         BinaryCommand::Increment {
@@ -1720,5 +1822,5 @@ pub fn execute_memcache_binary<C: Cache>(
     if len > 0 {
         unsafe { write_buf.set_len(write_buf.len() + len) };
     }
-    false
+    (false, None)
 }

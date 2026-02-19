@@ -171,6 +171,7 @@ mod server {
                     max_value_size: config.cache.max_value_size,
                     allow_flush,
                     send_copy_slot_size: send_copy_slot_size as usize,
+                    set_retry_timeout_us: config.cache.set_retry_timeout_us,
                     disk_io_config: disk_io_worker_config.as_ref().map(|c| DiskIoWorkerConfig {
                         backend: c.backend.clone(),
                         path: c.path.clone(),

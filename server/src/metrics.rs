@@ -33,6 +33,7 @@ pub mod cache {
 pub mod error {
     pub const SET_ERRORS: usize = 0;
     pub const PROTOCOL_ERRORS: usize = 1;
+    pub const SET_RETRIES: usize = 2;
 }
 
 // Connection metrics
@@ -77,6 +78,12 @@ pub static SET_ERRORS: Counter = Counter::new(&ERROR, error::SET_ERRORS);
 
 #[metric(name = "protocol_errors", description = "Total protocol parse errors")]
 pub static PROTOCOL_ERRORS: Counter = Counter::new(&ERROR, error::PROTOCOL_ERRORS);
+
+#[metric(
+    name = "cache_set_retries",
+    description = "Total SET retry attempts (async handler eviction retry)"
+)]
+pub static SET_RETRIES: Counter = Counter::new(&ERROR, error::SET_RETRIES);
 
 /// Reason for closing a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

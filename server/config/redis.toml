@@ -53,6 +53,10 @@ max_value_size = "1MB"
 # Example: 1M keys -> 2^21 = 2M buckets
 hashtable_power = 21
 
+# Maximum time (microseconds) to retry a SET that failed due to eviction
+# pressure (async server only). 0 = disable, default: 1000 (1ms).
+# set_retry_timeout_us = 1000
+
 # Disk tier - extend cache capacity beyond RAM (optional)
 # When enabled, evicted items are demoted to disk instead of discarded.
 # Uncomment to enable:

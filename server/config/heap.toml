@@ -24,6 +24,10 @@ heap_size = "1GB"
 # Should be sized for expected item count (aim for <50% load factor)
 hashtable_power = 24
 
+# SET eviction retry timeout in microseconds (async server only).
+# 0 = disable, default: 1000 (1ms).
+# set_retry_timeout_us = 1000
+
 # Note: segment_size and max_value_size are not used by heap backend
 # but won't cause errors if present
 

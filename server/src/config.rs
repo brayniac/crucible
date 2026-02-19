@@ -98,6 +98,17 @@ pub struct CacheConfig {
     #[serde(default = "default_small_queue_percent")]
     pub small_queue_percent: u8,
 
+    /// Maximum time (in microseconds) to retry a SET that failed due to eviction
+    /// pressure (OutOfMemory / HashTableFull). Only applies to the async server.
+    ///
+    /// When the cache is full and eviction fails because readers hold segment
+    /// references, the async handler can sleep and retry instead of silently
+    /// dropping the item. Set to 0 to disable retry (silent drop immediately).
+    ///
+    /// Default: 1000 (1ms). The handler sleeps ~50us between attempts.
+    #[serde(default = "default_set_retry_timeout_us")]
+    pub set_retry_timeout_us: u64,
+
     /// Hugepage size preference: "none", "2mb", or "1gb"
     #[serde(default)]
     pub hugepage: HugepageConfig,
@@ -234,6 +245,7 @@ impl Default for CacheConfig {
             max_value_size: default_max_value_size(),
             hashtable_power: default_hashtable_power(),
             small_queue_percent: default_small_queue_percent(),
+            set_retry_timeout_us: default_set_retry_timeout_us(),
             hugepage: HugepageConfig::default(),
             numa_node: None,
             disk: None,
@@ -597,6 +609,10 @@ fn default_hashtable_power() -> u8 {
 
 fn default_small_queue_percent() -> u8 {
     10
+}
+
+fn default_set_retry_timeout_us() -> u64 {
+    1000 // 1ms
 }
 
 fn default_metrics_address() -> SocketAddr {

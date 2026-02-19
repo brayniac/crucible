@@ -81,7 +81,9 @@ use protocol_resp::{
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::execute::{RespVersion, execute_memcache, execute_memcache_binary, execute_resp};
+use crate::execute::{
+    PendingSetRetry, RespVersion, execute_memcache, execute_memcache_binary, execute_resp,
+};
 use crate::metrics::PROTOCOL_ERRORS;
 
 /// Minimum value size for the zero-copy send queue path.
@@ -208,6 +210,11 @@ pub struct Connection {
     /// The handler must submit an io_uring read and resume processing
     /// when it completes.
     pub(crate) pending_disk_read: Option<PendingDiskReadInfo>,
+    /// Saved SET parameters awaiting eviction retry (async handler only).
+    pub(crate) pending_retry: Option<PendingSetRetry>,
+    /// Whether this connection should signal SET eviction failures for retry
+    /// instead of silently dropping. Enabled for the async handler.
+    retry_on_eviction: bool,
 }
 
 impl Connection {
@@ -232,7 +239,16 @@ impl Connection {
             streaming_state: StreamingState::None,
             allow_flush,
             pending_disk_read: None,
+            pending_retry: None,
+            retry_on_eviction: false,
         }
+    }
+
+    /// Create a new connection with eviction retry enabled (async handler).
+    pub fn with_retry(max_value_size: usize, allow_flush: bool) -> Self {
+        let mut conn = Self::with_options(max_value_size, allow_flush);
+        conn.retry_on_eviction = true;
+        conn
     }
 
     /// Maximum pending write buffer size before applying backpressure.
@@ -251,6 +267,75 @@ impl Connection {
     #[inline]
     pub fn pending_write_len(&self) -> usize {
         self.send_queue_bytes + self.write_buf.len().saturating_sub(self.write_pos)
+    }
+
+    /// Check if there is a pending SET retry awaiting eviction.
+    #[inline]
+    pub fn has_pending_retry(&self) -> bool {
+        self.pending_retry.is_some()
+    }
+
+    /// Retry a pending SET operation against the cache.
+    ///
+    /// Returns `true` if done (succeeded or non-retryable error — give up).
+    /// Returns `false` if still `OutOfMemory`/`HashTableFull` (worth retrying).
+    pub fn retry_set<C: Cache>(&mut self, cache: &C) -> bool {
+        let retry = self.pending_retry.as_ref().unwrap();
+        match cache.set(&retry.key, &retry.value, retry.ttl) {
+            Ok(()) => {
+                self.write_set_success_response();
+                self.pending_retry = None;
+                true
+            }
+            Err(
+                cache_core::CacheError::OutOfMemory | cache_core::CacheError::HashTableFull,
+            ) => false,
+            Err(_) => {
+                // Non-retryable error, give up
+                self.abandon_retry();
+                true
+            }
+        }
+    }
+
+    /// Abandon a pending SET retry: write a success response (silent drop)
+    /// and increment SET_ERRORS.
+    pub fn abandon_retry(&mut self) {
+        use crate::metrics::SET_ERRORS;
+        SET_ERRORS.increment();
+        self.write_set_success_response();
+        self.pending_retry = None;
+    }
+
+    /// Write the protocol-appropriate success response for a SET operation.
+    fn write_set_success_response(&mut self) {
+        match self.protocol {
+            DetectedProtocol::Resp | DetectedProtocol::Unknown => {
+                self.write_buf.extend_from_slice(b"+OK\r\n");
+            }
+            DetectedProtocol::MemcacheAscii => {
+                self.write_buf.extend_from_slice(b"STORED\r\n");
+            }
+            DetectedProtocol::MemcacheBinary => {
+                if let Some(retry) = &self.pending_retry
+                    && !retry.quiet
+                {
+                    use protocol_memcache::binary::{BinaryResponse, Opcode};
+                    let start = self.write_buf.len();
+                    self.write_buf.reserve(32);
+                    unsafe {
+                        self.write_buf.set_len(start + 32);
+                    }
+                    let len = BinaryResponse::encode_stored(
+                        &mut self.write_buf[start..],
+                        Opcode::Set,
+                        retry.opaque,
+                        0,
+                    );
+                    self.write_buf.truncate(start + len);
+                }
+            }
+        }
     }
 
     /// Detect protocol from the first byte of data.
@@ -372,13 +457,18 @@ impl Connection {
                         }
                     }
 
-                    execute_resp(
+                    if let Some(retry) = execute_resp(
                         &cmd,
                         cache,
                         &mut self.write_buf,
                         &mut self.resp_version,
                         self.allow_flush,
-                    );
+                        self.retry_on_eviction,
+                    ) {
+                        buf.consume(consumed);
+                        self.pending_retry = Some(retry);
+                        break;
+                    }
                     buf.consume(consumed);
                 }
                 Ok(ParseProgress::NeedValue {
@@ -708,10 +798,21 @@ impl Connection {
                         continue;
                     }
 
-                    if execute_memcache(&cmd, cache, &mut self.write_buf, self.allow_flush) {
+                    let (close, retry) = execute_memcache(
+                        &cmd,
+                        cache,
+                        &mut self.write_buf,
+                        self.allow_flush,
+                        self.retry_on_eviction,
+                    );
+                    if close {
                         self.should_close = true;
                     }
                     buf.consume(consumed);
+                    if let Some(r) = retry {
+                        self.pending_retry = Some(r);
+                        break;
+                    }
                 }
                 Ok(MemcacheParseProgress::NeedValue {
                     header,
@@ -1067,10 +1168,21 @@ impl Connection {
                         _ => {}
                     }
 
-                    if execute_memcache_binary(&cmd, cache, &mut self.write_buf, self.allow_flush) {
+                    let (close, retry) = execute_memcache_binary(
+                        &cmd,
+                        cache,
+                        &mut self.write_buf,
+                        self.allow_flush,
+                        self.retry_on_eviction,
+                    );
+                    if close {
                         self.should_close = true;
                     }
                     buf.consume(consumed);
+                    if let Some(r) = retry {
+                        self.pending_retry = Some(r);
+                        break;
+                    }
                 }
                 Ok(BinaryParseProgress::NeedValue {
                     header,
