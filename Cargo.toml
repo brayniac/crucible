@@ -32,13 +32,6 @@ members = [
 	# Consistent Hashing
 	"ketama",
 
-	# Client Libraries
-	"client-resp",
-	"client-memcache",
-	"client-http",
-	"client-grpc",
-	"client-momento",
-
 	# Benchmark Tool
 	"benchmark",
 
@@ -114,11 +107,6 @@ slab-cache = { path = "cache/slab" }
 heap-cache = { path = "cache/heap" }
 metrics = { path = "metrics" }
 ketama = { path = "ketama" }
-crucible-resp-client = { path = "client-resp" }
-crucible-http-client = { path = "client-http" }
-crucible-grpc-client = { path = "client-grpc" }
-crucible-memcache-client = { path = "client-memcache" }
-crucible-momento-client = { path = "client-momento" }
 
 
 # Jemalloc allocator
