@@ -393,6 +393,10 @@ impl IoUringDiskLayer {
             // Check if this was the last reader and segment is condemned
             if prev == 1 {
                 fence(Ordering::Acquire);
+                // Clean up write buffer before releasing condemned segment
+                if let Some(buf) = segment.detach_write_buffer() {
+                    self.buffer_pool.lock().unwrap().release(buf);
+                }
                 segment.release_condemned();
             }
         }
@@ -561,6 +565,9 @@ impl IoUringDiskLayer {
 
             // Re-check ref_count after CAS to handle race
             if segment.ref_count() == 0 {
+                if let Some(buf) = segment.detach_write_buffer() {
+                    self.buffer_pool.lock().unwrap().release(buf);
+                }
                 segment.release_condemned();
             }
             return;
@@ -610,6 +617,11 @@ impl IoUringDiskLayer {
                     break;
                 }
             }
+        }
+
+        // Detach write buffer before releasing segment to avoid buffer leak
+        if let Some(buf) = segment.detach_write_buffer() {
+            self.buffer_pool.lock().unwrap().release(buf);
         }
 
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
