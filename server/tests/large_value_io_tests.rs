@@ -47,8 +47,18 @@ fn get_available_port() -> u16 {
 fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
-            return true;
+        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            // Send PING and wait for PONG to confirm a worker is processing
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            if stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
+                let mut buf = [0u8; 32];
+                if let Ok(n) = stream.read(&mut buf)
+                    && n >= 5
+                    && &buf[..5] == b"+PONG"
+                {
+                    return true;
+                }
+            }
         }
         thread::sleep(Duration::from_millis(10));
     }
