@@ -1303,6 +1303,10 @@ impl<H: Hashtable> TieredCache<H> {
     }
 
     /// Ensure Layer 0 has space for a new item.
+    ///
+    /// Uses cascading eviction: before evicting from a layer that demotes to a
+    /// downstream layer, ensure the downstream layer has free space first.
+    /// This works bottom-up: disk → Layer 1 → Layer 0.
     fn ensure_space(&self) -> CacheResult<()> {
         let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
 
@@ -1311,17 +1315,35 @@ impl<H: Hashtable> TieredCache<H> {
             return Ok(());
         }
 
-        // Find disk layer for demotion (if any)
+        // Find disk layer index
         let disk_layer_idx = self.layers.iter().position(|l| l.is_disk());
 
         // Try to evict until we have enough space
         for _ in 0..self.max_eviction_attempts {
-            let evicted = self.evict_from_layer(0, disk_layer_idx);
+            // Cascading: ensure downstream layers have space (bottom-up)
+            // 1. Evict from disk if full (frees disk segments)
+            if let Some(disk_idx) = disk_layer_idx
+                && let Some(disk) = self.layers.get(disk_idx)
+                && disk.free_segment_count() == 0
+            {
+                self.evict_from_layer(disk_idx);
+            }
+
+            // 2. Evict from Layer 1 if full (demotes to disk)
+            if self.layers.len() > 2
+                && let Some(layer1) = self.layers.get(1)
+                && layer1.free_segment_count() == 0
+            {
+                self.evict_from_layer(1);
+            }
+
+            // 3. Evict from Layer 0 (demotes to Layer 1)
+            let evicted = self.evict_from_layer(0);
 
             if !evicted {
-                // Can't evict from Layer 0, try Layer 1 if it exists
+                // Layer 0 eviction failed, try Layer 1 directly
                 if self.layers.len() > 1 {
-                    self.evict_from_layer(1, disk_layer_idx);
+                    self.evict_from_layer(1);
                 }
             }
 
@@ -1334,37 +1356,36 @@ impl<H: Hashtable> TieredCache<H> {
         Err(CacheError::OutOfMemory)
     }
 
-    /// Evict from a specific layer, optionally demoting to disk.
+    /// Evict from a specific layer, demoting items to the layer's configured `next_layer`.
     ///
     /// Uses non-blocking eviction: if the policy-selected segment has active readers,
     /// it is deferred (AwaitingRelease) and an emergency eviction of a different
     /// ref_count==0 segment is attempted instead.
-    fn evict_from_layer(&self, layer_idx: usize, disk_layer_idx: Option<usize>) -> bool {
+    fn evict_from_layer(&self, layer_idx: usize) -> bool {
         let layer = match self.layers.get(layer_idx) {
             Some(l) => l,
             None => return false,
         };
 
-        // If we have a disk layer and this isn't the disk layer, use demotion
-        if let Some(disk_idx) = disk_layer_idx
-            && layer_idx != disk_idx
-            && let Some(disk_layer) = self.layers.get(disk_idx)
+        // Use the layer's configured next_layer as demotion target
+        if let Some(next_idx) = layer.config().next_layer
+            && let Some(target_layer) = self.layers.get(next_idx as usize)
         {
             let hashtable = self.hashtable.as_ref();
 
-            // Create demoter callback that writes to disk and updates hashtable
+            // Create demoter callback that writes to target layer and updates hashtable
             let demoter = |key: &[u8],
                            value: &[u8],
                            optional: &[u8],
                            ttl: Duration,
                            old_location: Location| {
-                // Write item to disk layer
-                if let Ok(new_location) = disk_layer.write_item(key, value, optional, ttl) {
-                    // Atomically update hashtable to point to disk location
+                // Write item to target layer
+                if let Ok(new_location) = target_layer.write_item(key, value, optional, ttl) {
+                    // Atomically update hashtable to point to new location
                     // preserve_freq=true to keep the frequency counter
                     hashtable.cas_location(key, old_location, new_location.to_location(), true);
                 } else {
-                    // Disk write failed, just remove from hashtable
+                    // Target write failed, just remove from hashtable
                     hashtable.remove(key, old_location);
                 }
             };
@@ -1379,7 +1400,7 @@ impl<H: Hashtable> TieredCache<H> {
             };
         }
 
-        // No disk layer or this is the disk layer - use non-blocking eviction
+        // No next layer — just evict (discard items)
         match layer.evict_nonblocking(self.hashtable.as_ref()) {
             EvictResult::Freed => true,
             EvictResult::Deferred => {
