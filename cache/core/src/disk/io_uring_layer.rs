@@ -421,11 +421,7 @@ impl IoUringDiskLayer {
     }
 
     /// Allocate a new segment and add it to the specified bucket.
-    fn allocate_segment_for_bucket(
-        &self,
-        bucket_index: usize,
-        ttl: Duration,
-    ) -> CacheResult<u32> {
+    fn allocate_segment_for_bucket(&self, bucket_index: usize, ttl: Duration) -> CacheResult<u32> {
         let segment_id = self.pool.reserve().ok_or(CacheError::OutOfMemory)?;
 
         let segment = self.pool.get(segment_id).ok_or(CacheError::OutOfMemory)?;

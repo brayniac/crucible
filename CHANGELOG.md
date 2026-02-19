@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-02-19
+
+### Fixed
+- **S3-FIFO promotion path**: `evict_from_layer()` now uses each layer's configured `next_layer`
+  for demotion instead of always targeting the disk layer. Layer 0 correctly demotes to Layer 1
+  (main queue), Layer 1 demotes to disk, fixing empty main queue segments.
+- **Cascading eviction**: `ensure_space()` ensures downstream layers have free segments before
+  demoting (bottom-up: disk → Layer 1 → Layer 0), preventing demotion failures from full targets.
+- **Disk segment eviction**: Disk layer segments can now be evicted and recycled when full,
+  preventing `OutOfMemory` after all disk segments are allocated.
+- **Write buffer leaks**: `process_evicted_segment()` and `release_read()` now properly return
+  write buffers to the pool when evicting unflushed segments or releasing condemned segments.
+- **Write buffer pool ownership**: `AlignedBufferPool` moved into `IoUringDiskLayer` struct so
+  all code paths (eviction, condemned cleanup, flush completion) can return buffers. Previously
+  broke `--all-features` builds.
+
+### Changed
+- `IoUringDiskLayer::write_item()` now works via the `Layer` trait (was returning `Unsupported`)
+- `IoUringDiskLayer::complete_flush()` no longer takes a `buffer_pool` parameter
+- `IoUringDiskLayer::write_item_with_buffers()` no longer takes a `buffer_pool` parameter
+
+### Added
+- `write_buffer_count` config for `IoUringDiskLayerBuilder` and `IoUringDiskTierConfig`
+  (default: 16). Controls RAM usage for disk write staging buffers. Under pressure, demotion
+  degrades gracefully to discard.
+
 ## [0.3.6] - 2026-02-18
 
 ### Added
