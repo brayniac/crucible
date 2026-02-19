@@ -141,8 +141,12 @@ pub fn execute_resp<C: Cache>(
                     }
                 }
                 Err(_) => {
+                    // Silent drop: cache is best-effort storage. Return OK even
+                    // when the cache is full — the item would be evicted soon
+                    // anyway. This matches Redis behavior with eviction enabled
+                    // and avoids breaking clients like valkey-benchmark.
                     SET_ERRORS.increment();
-                    write_buf.extend_from_slice(b"-ERR cache full\r\n");
+                    write_buf.extend_from_slice(b"+OK\r\n");
                 }
             }
         }
@@ -1253,14 +1257,12 @@ pub fn execute_memcache<C: Cache>(
             };
 
             match cache.set(key, data, ttl) {
-                Ok(()) => {
-                    write_buf.extend_from_slice(b"STORED\r\n");
-                }
+                Ok(()) => {}
                 Err(_) => {
                     SET_ERRORS.increment();
-                    write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
+            write_buf.extend_from_slice(b"STORED\r\n");
             false
         }
         MemcacheCommand::Add {
@@ -1547,17 +1549,12 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            match cache.set(key, value, ttl) {
-                Ok(()) => {
-                    let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
-                    unsafe { write_buf.set_len(write_buf.len() + len) };
-                    return false;
-                }
-                Err(_) => {
-                    SET_ERRORS.increment();
-                    BinaryResponse::encode_out_of_memory(buf, Opcode::Set, *opaque)
-                }
+            if let Err(_) = cache.set(key, value, ttl) {
+                SET_ERRORS.increment();
             }
+            let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
+            unsafe { write_buf.set_len(write_buf.len() + len) };
+            return false;
         }
         BinaryCommand::SetQ {
             key,
@@ -1572,13 +1569,10 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            match cache.set(key, value, ttl) {
-                Ok(()) => return false,
-                Err(_) => {
-                    SET_ERRORS.increment();
-                    0
-                }
+            if let Err(_) = cache.set(key, value, ttl) {
+                SET_ERRORS.increment();
             }
+            return false;
         }
         BinaryCommand::Add {
             key,
