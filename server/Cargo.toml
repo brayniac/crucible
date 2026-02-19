@@ -72,10 +72,6 @@ rustls = { workspace = true, features = ["std", "ring"] }
 
 [[bin]]
 name = "crucible-server"
-path = "src/bin/server.rs"
-
-[[bin]]
-name = "crucible-server-async"
 path = "src/bin/server_async.rs"
 
 [[bin]]
