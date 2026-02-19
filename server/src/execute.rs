@@ -1549,7 +1549,7 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            if let Err(_) = cache.set(key, value, ttl) {
+            if cache.set(key, value, ttl).is_err() {
                 SET_ERRORS.increment();
             }
             let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
@@ -1569,7 +1569,7 @@ pub fn execute_memcache_binary<C: Cache>(
                 Some(Duration::from_secs(*expiration as u64))
             };
 
-            if let Err(_) = cache.set(key, value, ttl) {
+            if cache.set(key, value, ttl).is_err() {
                 SET_ERRORS.increment();
             }
             return false;
