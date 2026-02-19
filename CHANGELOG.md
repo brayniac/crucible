@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-02-19
+
+### Fixed
+- **Silent drop on cache full**: SET commands now return success instead of `-ERR cache full`
+  when the cache is full and eviction fails. A cache is best-effort storage — silently dropping
+  the item matches Redis behavior with eviction enabled and fixes compatibility with clients
+  like valkey-benchmark. The `SET_ERRORS` metric is still incremented for observability. Applies
+  to all three protocol handlers: RESP, Memcache ASCII, and Memcache binary.
+
 ## [0.3.7] - 2026-02-19
 
 ### Fixed
