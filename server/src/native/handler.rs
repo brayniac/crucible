@@ -470,7 +470,7 @@ impl<C: Cache> ServerHandler<C> {
             tracing::warn!("Disk flush failed for seq={seq}");
         }
 
-        // TODO: call IoUringDiskLayer::complete_flush(segment_id, buffer_pool)
+        // TODO: call IoUringDiskLayer::complete_flush(segment_id)
         // to detach the write buffer and return it to the pool.
     }
 }

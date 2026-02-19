@@ -120,6 +120,13 @@ pub struct IoUringDiskLayer {
 
     /// Queue of sealed segments pending flush to disk.
     flush_queue: Mutex<Vec<FlushRequest>>,
+
+    /// Write buffer pool for segment I/O.
+    ///
+    /// Buffers are attached to segments during writes and detached on flush
+    /// completion or eviction. Stored here so eviction and condemned-segment
+    /// cleanup paths can return buffers to the pool.
+    buffer_pool: Mutex<AlignedBufferPool>,
 }
 
 impl IoUringDiskLayer {
@@ -149,15 +156,13 @@ impl IoUringDiskLayer {
     ///
     /// Writes to the current write segment's RAM buffer. If the segment
     /// is full, seals it (pushes to flush queue) and allocates a new one.
-    ///
-    /// The `buffer_pool` is used to allocate write buffers for new segments.
+    /// Write buffers are allocated from the internal buffer pool.
     pub fn write_item_with_buffers(
         &self,
         key: &[u8],
         value: &[u8],
         optional: &[u8],
         ttl: Duration,
-        buffer_pool: &mut AlignedBufferPool,
     ) -> CacheResult<ItemLocation> {
         if key.len() > BasicHeader::MAX_KEY_LEN {
             return Err(CacheError::KeyTooLong);
@@ -167,7 +172,7 @@ impl IoUringDiskLayer {
         }
 
         loop {
-            let segment_id = self.get_or_allocate_write_segment(ttl, buffer_pool)?;
+            let segment_id = self.get_or_allocate_write_segment(ttl)?;
 
             if let Some(segment) = self.pool.get(segment_id) {
                 if let Some(offset) = segment.append_item(key, value, optional) {
@@ -187,7 +192,7 @@ impl IoUringDiskLayer {
             // Loop will allocate a new segment on next iteration
             let bucket_index = self.buckets.get_bucket_index(ttl);
             let bucket = self.buckets.get_bucket_by_index(bucket_index);
-            self.allocate_segment_for_bucket(bucket_index, bucket.ttl(), buffer_pool)?;
+            self.allocate_segment_for_bucket(bucket_index, bucket.ttl())?;
         }
     }
 
@@ -353,12 +358,12 @@ impl IoUringDiskLayer {
     /// Complete a flush operation.
     ///
     /// Called when an io_uring write completes. Detaches the write buffer
-    /// from the segment and returns it to the provided buffer pool.
-    pub fn complete_flush(&self, segment_id: u32, buffer_pool: &mut AlignedBufferPool) {
+    /// from the segment and returns it to the internal buffer pool.
+    pub fn complete_flush(&self, segment_id: u32) {
         if let Some(segment) = self.pool.get(segment_id)
             && let Some(buf) = segment.detach_write_buffer()
         {
-            buffer_pool.release(buf);
+            self.buffer_pool.lock().unwrap().release(buf);
         }
     }
 
@@ -373,10 +378,10 @@ impl IoUringDiskLayer {
             // Check if this was the last reader and segment is condemned
             if prev == 1 {
                 fence(Ordering::Acquire);
-                // Detach write buffer before releasing condemned segment.
-                // The buffer is dropped (slot leaked) since we don't have pool access here;
-                // this is a rare edge case for segments condemned while still holding buffers.
-                let _ = segment.detach_write_buffer();
+                // Return write buffer to pool before releasing condemned segment
+                if let Some(buf) = segment.detach_write_buffer() {
+                    self.buffer_pool.lock().unwrap().release(buf);
+                }
                 segment.release_condemned();
             }
         }
@@ -420,14 +425,18 @@ impl IoUringDiskLayer {
         &self,
         bucket_index: usize,
         ttl: Duration,
-        buffer_pool: &mut AlignedBufferPool,
     ) -> CacheResult<u32> {
         let segment_id = self.pool.reserve().ok_or(CacheError::OutOfMemory)?;
 
         let segment = self.pool.get(segment_id).ok_or(CacheError::OutOfMemory)?;
 
         // Attach a write buffer
-        let buf = buffer_pool.allocate().ok_or(CacheError::OutOfMemory)?;
+        let buf = self
+            .buffer_pool
+            .lock()
+            .unwrap()
+            .allocate()
+            .ok_or(CacheError::OutOfMemory)?;
         segment.attach_write_buffer(buf);
 
         // Set segment expiration time
@@ -446,7 +455,7 @@ impl IoUringDiskLayer {
             Err(_) => {
                 // Return write buffer and release segment
                 if let Some(buf) = segment.detach_write_buffer() {
-                    buffer_pool.release(buf);
+                    self.buffer_pool.lock().unwrap().release(buf);
                 }
                 self.pool.release(segment_id);
                 Err(CacheError::OutOfMemory)
@@ -455,11 +464,7 @@ impl IoUringDiskLayer {
     }
 
     /// Get or allocate the write segment for a TTL.
-    fn get_or_allocate_write_segment(
-        &self,
-        ttl: Duration,
-        buffer_pool: &mut AlignedBufferPool,
-    ) -> CacheResult<u32> {
+    fn get_or_allocate_write_segment(&self, ttl: Duration) -> CacheResult<u32> {
         let bucket_index = self.buckets.get_bucket_index(ttl);
         let bucket = self.buckets.get_bucket_by_index(bucket_index);
 
@@ -488,7 +493,7 @@ impl IoUringDiskLayer {
         }
 
         // Need to allocate new segment
-        self.allocate_segment_for_bucket(bucket_index, bucket.ttl(), buffer_pool)
+        self.allocate_segment_for_bucket(bucket_index, bucket.ttl())
     }
 
     /// Remove all hashtable entries for items in a segment.
@@ -545,7 +550,9 @@ impl IoUringDiskLayer {
 
             // Re-check ref_count after CAS to handle race
             if segment.ref_count() == 0 {
-                let _ = segment.detach_write_buffer();
+                if let Some(buf) = segment.detach_write_buffer() {
+                    self.buffer_pool.lock().unwrap().release(buf);
+                }
                 segment.release_condemned();
             }
             return;
@@ -597,10 +604,10 @@ impl IoUringDiskLayer {
             }
         }
 
-        // Detach write buffer before releasing segment to prevent debug_assert
-        // panic on reuse. Buffer slot is leaked since we don't have pool access;
-        // this only happens for unflushed segments being evicted (rare path).
-        let _ = segment.detach_write_buffer();
+        // Return write buffer to pool before releasing segment
+        if let Some(buf) = segment.detach_write_buffer() {
+            self.buffer_pool.lock().unwrap().release(buf);
+        }
 
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
         self.pool.release(segment_id);
@@ -663,15 +670,12 @@ impl Layer for IoUringDiskLayer {
 
     fn write_item(
         &self,
-        _key: &[u8],
-        _value: &[u8],
-        _optional: &[u8],
-        _ttl: Duration,
+        key: &[u8],
+        value: &[u8],
+        optional: &[u8],
+        ttl: Duration,
     ) -> CacheResult<ItemLocation> {
-        // Use write_item_with_buffers() instead — this requires a buffer pool.
-        // This method exists to satisfy the Layer trait but shouldn't be called
-        // directly for IoUringDiskLayer.
-        Err(CacheError::Unsupported)
+        self.write_item_with_buffers(key, value, optional, ttl)
     }
 
     fn get_item(&self, location: ItemLocation, key: &[u8]) -> Option<Self::Guard<'_>> {
@@ -886,6 +890,13 @@ impl IoUringDiskLayerBuilder {
 
         let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 
+        // Write buffer pool: one slot per segment, segment-sized, block-aligned.
+        let buffer_pool = AlignedBufferPool::new(
+            self.segment_count,
+            self.segment_size,
+            self.block_size as usize,
+        );
+
         IoUringDiskLayer {
             layer_id: self.layer_id,
             config: self.config,
@@ -893,6 +904,7 @@ impl IoUringDiskLayerBuilder {
             buckets,
             current_write_segments,
             flush_queue: Mutex::new(Vec::new()),
+            buffer_pool: Mutex::new(buffer_pool),
         }
     }
 }
