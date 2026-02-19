@@ -47,10 +47,11 @@ fn wait_for_server(addr: SocketAddr, timeout: Duration) -> bool {
             stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
             if stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
                 let mut buf = [0u8; 32];
-                if let Ok(n) = stream.read(&mut buf) {
-                    if n >= 5 && &buf[..5] == b"+PONG" {
-                        return true;
-                    }
+                if let Ok(n) = stream.read(&mut buf)
+                    && n >= 5
+                    && &buf[..5] == b"+PONG"
+                {
+                    return true;
                 }
             }
         }
