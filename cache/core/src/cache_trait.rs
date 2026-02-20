@@ -649,6 +649,8 @@ pub struct CacheInternalStats {
     pub demotions: u64,
     /// Segments evicted entirely (items discarded, not demoted).
     pub evictions: u64,
+    /// Items that failed to demote (staging pool exhausted, discarded instead).
+    pub demotion_failures: u64,
 }
 
 /// Result of a cache lookup that may require async I/O.

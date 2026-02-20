@@ -147,12 +147,16 @@ pub fn run_shared<C: Cache + 'static>(
     let disk_io_worker_config: Option<DiskIoWorkerConfig> = match disk_io_backend {
         Some(DiskIoBackendConfig::DirectIo) => {
             let disk_config = config.cache.disk.as_ref().unwrap();
+            let block_size = 4096u32;
             Some(DiskIoWorkerConfig {
                 backend: cache_core::DiskIoBackend::DirectIo,
                 path: disk_config.path.to_string_lossy().into_owned(),
                 read_buffer_count: 64,
-                read_buffer_size: 4096,
-                block_size: 4096,
+                // Must be >= 2 * block_size to handle items at non-block-aligned
+                // offsets. item_disk_range() returns up to read_size + block_size
+                // bytes when the item straddles a block boundary.
+                read_buffer_size: block_size as usize * 2,
+                block_size,
             })
         }
         Some(DiskIoBackendConfig::Nvme) => {
@@ -164,12 +168,13 @@ pub fn run_shared<C: Cache + 'static>(
             let nsid = disk_config
                 .nvme_nsid
                 .expect("nvme_nsid is required when io_backend = nvme");
+            let block_size = 4096u32;
             Some(DiskIoWorkerConfig {
                 backend: cache_core::DiskIoBackend::Nvme { device_path, nsid },
                 path: String::new(),
                 read_buffer_count: 64,
-                read_buffer_size: 4096,
-                block_size: 4096,
+                read_buffer_size: block_size as usize * 2,
+                block_size,
             })
         }
         _ => None,

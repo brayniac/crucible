@@ -434,6 +434,8 @@ pub struct CacheStats {
     pub demotions: AtomicU64,
     /// Segments evicted entirely (items discarded).
     pub evictions: AtomicU64,
+    /// Items that failed to demote (staging pool exhausted, discarded instead).
+    pub demotion_failures: AtomicU64,
 }
 
 impl CacheStats {
@@ -442,6 +444,7 @@ impl CacheStats {
         Self {
             demotions: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            demotion_failures: AtomicU64::new(0),
         }
     }
 
@@ -450,6 +453,7 @@ impl CacheStats {
         CacheInternalStats {
             demotions: self.demotions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            demotion_failures: self.demotion_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -1429,7 +1433,8 @@ impl<H: Hashtable> TieredCache<H> {
                     hashtable.cas_location(key, old_location, new_location.to_location(), true);
                     stats.demotions.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    // Target write failed, just remove from hashtable
+                    // Target write failed (staging pool exhausted), discard item
+                    stats.demotion_failures.fetch_add(1, Ordering::Relaxed);
                     hashtable.remove(key, old_location);
                 }
             };

@@ -334,7 +334,7 @@ impl<C: Cache> ServerHandler<C> {
         ctx: &mut DriverCtx,
         disk_io: &mut DiskIoState,
         conn: ConnToken,
-        pending_info: crate::connection::PendingDiskReadInfo,
+        mut pending_info: crate::connection::PendingDiskReadInfo,
     ) -> io::Result<()> {
         // Allocate a read buffer
         let mut buffer = disk_io
@@ -342,24 +342,24 @@ impl<C: Cache> ServerHandler<C> {
             .allocate()
             .ok_or_else(|| io::Error::other("read buffer pool exhausted"))?;
 
+        // Clamp read_len to buffer capacity to prevent overflow.
+        // item_disk_range may request up to read_size + block_size bytes
+        // when the item straddles a block boundary.
+        let read_len = pending_info.params.read_len.min(buffer.capacity() as u32);
+        pending_info.params.read_len = read_len;
+
         let seq = match &disk_io.backend {
             DiskBackend::Nvme { device, block_size } => {
                 let lba = pending_info.params.disk_offset / *block_size as u64;
-                let num_blocks = (pending_info.params.read_len / *block_size) as u16;
-                ctx.nvme_read(
-                    *device,
-                    lba,
-                    num_blocks,
-                    buffer.addr(),
-                    pending_info.params.read_len,
-                )?
+                let num_blocks = (read_len / *block_size) as u16;
+                ctx.nvme_read(*device, lba, num_blocks, buffer.addr(), read_len)?
             }
             DiskBackend::DirectIo { file, .. } => unsafe {
                 ctx.direct_io_read(
                     *file,
                     pending_info.params.disk_offset,
                     buffer.as_mut_ptr(),
-                    pending_info.params.read_len,
+                    read_len,
                 )?
             },
         };
