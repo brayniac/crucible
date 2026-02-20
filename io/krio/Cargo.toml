@@ -11,7 +11,6 @@ bytes = { workspace = true }
 crossbeam-channel = "0.5"
 io-uring = "0.7"
 libc = "0.2"
-metrics = { workspace = true }
 metriken = { workspace = true }
 pin-project-lite = "0.2"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring"] }

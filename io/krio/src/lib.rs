@@ -50,6 +50,7 @@ pub(crate) mod async_event_loop;
 pub(crate) mod buffer;
 pub(crate) mod chain;
 pub(crate) mod completion;
+pub(crate) mod counter;
 pub(crate) mod connection;
 pub mod direct_io;
 pub(crate) mod driver;

@@ -4,7 +4,7 @@
 //! exhaustion. Automatically exposed via Prometheus when registered with
 //! the admin server.
 
-use metrics::{Counter, CounterGroup};
+use crate::counter::{Counter, CounterGroup};
 use metriken::{Gauge, metric};
 
 // Counter groups (sharded storage — one shard per worker, no false sharing).

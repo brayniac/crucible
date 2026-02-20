@@ -218,7 +218,7 @@ impl KrioBuilder {
                         pin_to_core(core)?;
                     }
 
-                    ::metrics::set_thread_shard(worker_id);
+                    crate::counter::set_thread_shard(worker_id);
 
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
                     worker_fn(worker_id, config, accept_rx, eventfd, shutdown_flag)
