@@ -424,6 +424,8 @@ impl<C: Cache> ServerHandler<C> {
                 let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
             }
             disk_io.release_read_buffer(pending.buffer);
+            self.cache
+                .release_disk_read(pending.params.segment_id, pending.params.pool_id);
             return;
         }
 
@@ -439,6 +441,8 @@ impl<C: Cache> ServerHandler<C> {
                 let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
             }
             disk_io.release_read_buffer(pending.buffer);
+            self.cache
+                .release_disk_read(pending.params.segment_id, pending.params.pool_id);
             return;
         }
 
@@ -459,6 +463,8 @@ impl<C: Cache> ServerHandler<C> {
                 let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
             }
             disk_io.release_read_buffer(pending.buffer);
+            self.cache
+                .release_disk_read(pending.params.segment_id, pending.params.pool_id);
             return;
         }
 
