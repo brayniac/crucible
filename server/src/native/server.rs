@@ -21,7 +21,19 @@ pub fn run<C: Cache + 'static>(
     shutdown: Arc<AtomicBool>,
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cache = Arc::new(cache);
+    run_shared(config, Arc::new(cache), shutdown, drain_timeout)
+}
+
+/// Run the native runtime server with a pre-shared cache Arc.
+///
+/// Use this when the cache needs to be shared with other components
+/// (e.g., the admin server's stats closure) before launching krio.
+pub fn run_shared<C: Cache + 'static>(
+    config: &Config,
+    cache: Arc<C>,
+    shutdown: Arc<AtomicBool>,
+    drain_timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let num_workers = config.threads();
     let cpu_affinity = config.cpu_affinity();
 

@@ -7,7 +7,10 @@
 
 use crate::connection::{Connection, PendingDiskReadInfo, SliceRecvBuf};
 use crate::disk_io::DiskBackend;
-use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, WorkerStats};
+use crate::metrics::{
+    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_READS, DISK_READ_ERRORS, DISK_READ_HITS,
+    DISK_READ_MISSES, HITS, MISSES, WorkerStats,
+};
 use crate::native::handler::DiskIoWorkerConfig;
 use bytes::Bytes;
 use cache_core::Cache;
@@ -311,6 +314,8 @@ async fn handle_connection<C: Cache>(
             } else {
                 // No disk I/O configured — treat as miss.
                 connection.pending_disk_read.take();
+                DISK_READ_ERRORS.increment();
+                MISSES.increment();
                 connection.write_miss_response();
             }
         }
@@ -383,6 +388,8 @@ async fn submit_and_await_disk_read(
         match dio.read_buffer_pool.allocate() {
             Some(buf) => buf,
             None => {
+                DISK_READ_ERRORS.increment();
+                MISSES.increment();
                 connection.write_miss_response();
                 return Ok(());
             }
@@ -418,6 +425,8 @@ async fn submit_and_await_disk_read(
         }
     };
 
+    DISK_READS.increment();
+
     let result = match future {
         Ok(fut) => fut.await,
         Err(e) => Err(e),
@@ -425,6 +434,8 @@ async fn submit_and_await_disk_read(
 
     // 3. Parse result and write response (same logic as native/handler.rs).
     if result.is_err() {
+        DISK_READ_ERRORS.increment();
+        MISSES.increment();
         connection.write_miss_response();
         disk_io
             .lock()
@@ -441,6 +452,8 @@ async fn submit_and_await_disk_read(
     let header_size = cache_core::BasicHeader::SIZE;
 
     if item_offset + header_size > buf_slice.len() {
+        DISK_READ_MISSES.increment();
+        MISSES.increment();
         connection.write_miss_response();
         disk_io
             .lock()
@@ -456,6 +469,8 @@ async fn submit_and_await_disk_read(
         cache_core::BasicHeader::from_bytes(&buf_slice[item_offset..item_offset + header_size]);
 
     if header.is_deleted() {
+        DISK_READ_MISSES.increment();
+        MISSES.increment();
         connection.write_miss_response();
         disk_io
             .lock()
@@ -473,6 +488,8 @@ async fn submit_and_await_disk_read(
     let value_end = value_start + value_len;
 
     if value_end > buf_slice.len() {
+        DISK_READ_MISSES.increment();
+        MISSES.increment();
         connection.write_miss_response();
         disk_io
             .lock()
@@ -485,6 +502,8 @@ async fn submit_and_await_disk_read(
     }
 
     let value_bytes = &buf_slice[value_start..value_end];
+    DISK_READ_HITS.increment();
+    HITS.increment();
     connection.write_disk_read_response(&pending_info.response_ctx, value_bytes);
 
     // 4. Drain the response.

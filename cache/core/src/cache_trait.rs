@@ -575,6 +575,13 @@ pub trait Cache: Send + Sync + 'static {
         Err(CacheError::Unsupported)
     }
 
+    /// Get internal cache statistics (demotions, evictions).
+    ///
+    /// Returns `None` if the implementation does not track internal stats.
+    fn internal_stats(&self) -> Option<CacheInternalStats> {
+        None
+    }
+
     /// Look up a key, returning either an immediate hit or disk read params.
     ///
     /// For items in RAM (or in a disk segment's write buffer), returns
@@ -596,6 +603,18 @@ pub trait Cache: Send + Sync + 'static {
 
 /// Default TTL used when None is provided (1 hour).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
+
+/// Internal cache statistics for observability.
+///
+/// Provides counters for demotion and eviction events that are tracked
+/// inside the cache layers.
+#[derive(Debug, Clone, Default)]
+pub struct CacheInternalStats {
+    /// Items demoted from one layer to another (e.g., RAM to disk).
+    pub demotions: u64,
+    /// Segments evicted entirely (items discarded, not demoted).
+    pub evictions: u64,
+}
 
 /// Result of a cache lookup that may require async I/O.
 ///

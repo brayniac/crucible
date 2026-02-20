@@ -26,6 +26,7 @@ fn start_admin_server(admin_port: u16) -> (thread::JoinHandle<()>, Arc<AtomicBoo
         let admin_handle = server::admin::start(server::admin::AdminConfig {
             address: addr,
             shutdown: shutdown_clone.clone(),
+            cache_stats_fn: None,
         })
         .unwrap();
 

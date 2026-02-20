@@ -6,6 +6,7 @@
 //! - `GET /metrics` - Prometheus-formatted metrics
 
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
+use cache_core::CacheInternalStats;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +31,8 @@ pub struct AdminConfig {
     pub address: SocketAddr,
     /// Shared shutdown flag to check if server is shutting down.
     pub shutdown: Arc<AtomicBool>,
+    /// Optional closure to fetch cache-internal stats (demotions, evictions).
+    pub cache_stats_fn: Option<Arc<dyn Fn() -> Option<CacheInternalStats> + Send + Sync>>,
 }
 
 /// Start the admin server in a dedicated thread.
@@ -48,6 +51,7 @@ pub fn start(config: AdminConfig) -> std::io::Result<AdminHandle> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let address = config.address;
     let shutdown = config.shutdown;
+    let cache_stats_fn = config.cache_stats_fn;
 
     let join_handle = std::thread::Builder::new()
         .name("admin".to_string())
@@ -59,7 +63,7 @@ pub fn start(config: AdminConfig) -> std::io::Result<AdminHandle> {
                 .expect("Failed to create admin runtime");
 
             rt.block_on(async move {
-                run_admin_server(address, shutdown, shutdown_rx).await;
+                run_admin_server(address, shutdown, cache_stats_fn, shutdown_rx).await;
             });
         })?;
 
@@ -69,11 +73,17 @@ pub fn start(config: AdminConfig) -> std::io::Result<AdminHandle> {
     })
 }
 
+/// Type alias for the cache stats function.
+type CacheStatsFn = Option<Arc<dyn Fn() -> Option<CacheInternalStats> + Send + Sync>>;
+
 async fn run_admin_server(
     address: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    cache_stats_fn: CacheStatsFn,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
+    let cache_stats_fn: Arc<CacheStatsFn> = Arc::new(cache_stats_fn);
+
     // Build the router
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -84,7 +94,13 @@ async fn run_admin_server(
                 move || ready_handler(shutdown.clone())
             }),
         )
-        .route("/metrics", get(metrics_handler));
+        .route(
+            "/metrics",
+            get({
+                let cache_stats_fn = Arc::clone(&cache_stats_fn);
+                move || metrics_handler(Arc::clone(&cache_stats_fn))
+            }),
+        );
 
     // Bind and serve
     let listener = match tokio::net::TcpListener::bind(address).await {
@@ -136,8 +152,8 @@ async fn ready_handler(shutdown: Arc<AtomicBool>) -> impl IntoResponse {
 /// Metrics handler (Prometheus format).
 ///
 /// Exposes all registered metrics in Prometheus text format.
-async fn metrics_handler() -> impl IntoResponse {
-    let output = generate_prometheus_output();
+async fn metrics_handler(cache_stats_fn: Arc<CacheStatsFn>) -> impl IntoResponse {
+    let output = generate_prometheus_output(cache_stats_fn.as_ref());
     (
         StatusCode::OK,
         [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -146,7 +162,7 @@ async fn metrics_handler() -> impl IntoResponse {
 }
 
 /// Generate Prometheus-formatted metrics output.
-fn generate_prometheus_output() -> String {
+fn generate_prometheus_output(cache_stats_fn: &CacheStatsFn) -> String {
     let mut output = String::with_capacity(4096);
 
     // Iterate over all registered metrics
@@ -226,6 +242,16 @@ fn generate_prometheus_output() -> String {
 
         // Add empty line between metrics for readability
         output.push('\n');
+    }
+
+    // Append cache-internal stats if available
+    if let Some(stats_fn) = cache_stats_fn
+        && let Some(stats) = stats_fn()
+    {
+        output.push_str("# TYPE cache_demotions counter\n");
+        output.push_str(&format!("cache_demotions {}\n\n", stats.demotions));
+        output.push_str("# TYPE cache_evictions counter\n");
+        output.push_str(&format!("cache_evictions {}\n\n", stats.evictions));
     }
 
     output

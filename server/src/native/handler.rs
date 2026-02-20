@@ -2,7 +2,10 @@
 
 use crate::connection::{Connection, SliceRecvBuf};
 use crate::disk_io::{DiskBackend, DiskIoState, PendingDiskRead};
-use crate::metrics::{CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, WorkerStats};
+use crate::metrics::{
+    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, CloseReason, DISK_FLUSHES, DISK_FLUSH_ERRORS,
+    DISK_READS, DISK_READ_ERRORS, DISK_READ_HITS, DISK_READ_MISSES, HITS, MISSES, WorkerStats,
+};
 use bytes::Bytes;
 use cache_core::Cache;
 use krio::{
@@ -189,12 +192,16 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
                     let pending_info = c.pending_disk_read.take().unwrap();
                     if let Err(e) = Self::submit_disk_read(ctx, disk_io, conn, pending_info) {
                         tracing::warn!("Disk read submit failed: {e}");
+                        DISK_READ_ERRORS.increment();
+                        MISSES.increment();
                         // Send miss response since we can't do the disk read
                         c.write_miss_response();
                     }
                 } else {
                     // No disk I/O configured but got DiskRead result — treat as miss
                     c.pending_disk_read.take();
+                    DISK_READ_ERRORS.increment();
+                    MISSES.increment();
                     c.write_miss_response();
                 }
             }
@@ -363,6 +370,7 @@ impl<C: Cache> ServerHandler<C> {
             },
         );
 
+        DISK_READS.increment();
         Ok(())
     }
 
@@ -381,6 +389,8 @@ impl<C: Cache> ServerHandler<C> {
 
         if !success {
             // Disk read failed — send miss response and resume
+            DISK_READ_ERRORS.increment();
+            MISSES.increment();
             if let Some(c) = conn_opt {
                 c.write_miss_response();
                 c.pending_disk_read = None;
@@ -400,6 +410,8 @@ impl<C: Cache> ServerHandler<C> {
         let header_size = cache_core::BasicHeader::SIZE;
         if item_offset + header_size > buf_slice.len() {
             // Invalid offset — send miss
+            DISK_READ_MISSES.increment();
+            MISSES.increment();
             if let Some(c) = conn_opt {
                 c.write_miss_response();
                 c.pending_disk_read = None;
@@ -413,6 +425,8 @@ impl<C: Cache> ServerHandler<C> {
             cache_core::BasicHeader::from_bytes(&buf_slice[item_offset..item_offset + header_size]);
 
         if header.is_deleted() {
+            DISK_READ_MISSES.increment();
+            MISSES.increment();
             if let Some(c) = conn_opt {
                 c.write_miss_response();
                 c.pending_disk_read = None;
@@ -431,6 +445,8 @@ impl<C: Cache> ServerHandler<C> {
         if value_end > buf_slice.len() {
             // Item spans beyond our read buffer — would need a second read.
             // For now, treat as miss (TODO: implement multi-block reads).
+            DISK_READ_MISSES.increment();
+            MISSES.increment();
             if let Some(c) = conn_opt {
                 c.write_miss_response();
                 c.pending_disk_read = None;
@@ -442,7 +458,9 @@ impl<C: Cache> ServerHandler<C> {
 
         let value_bytes = &buf_slice[value_start..value_end];
 
-        // Build protocol response
+        // Build protocol response — disk read succeeded
+        DISK_READ_HITS.increment();
+        HITS.increment();
         if let Some(c) = conn_opt {
             c.write_disk_read_response(&pending.response_ctx, value_bytes);
             c.pending_disk_read = None;
@@ -466,7 +484,9 @@ impl<C: Cache> ServerHandler<C> {
             return;
         };
 
+        DISK_FLUSHES.increment();
         if !success {
+            DISK_FLUSH_ERRORS.increment();
             tracing::warn!("Disk flush failed for seq={seq}");
         }
 

@@ -435,7 +435,6 @@ impl Connection {
                                 continue;
                             }
                             LookupResult::DiskRead(params) => {
-                                HITS.increment();
                                 buf.consume(consumed);
                                 // Stall pipeline: save params for handler to submit io_uring read
                                 self.pending_disk_read = Some(PendingDiskReadInfo {
@@ -778,7 +777,6 @@ impl Connection {
                                 self.queue_zero_copy_value(value_ref, b"\r\nEND\r\n");
                             }
                             LookupResult::DiskRead(params) => {
-                                HITS.increment();
                                 self.pending_disk_read = Some(PendingDiskReadInfo {
                                     params,
                                     response_ctx:
@@ -1124,7 +1122,6 @@ impl Connection {
                                     self.queue_zero_copy_value(value_ref, b"");
                                 }
                                 cache_core::LookupResult::DiskRead(params) => {
-                                    HITS.increment();
                                     let opcode_byte = match &cmd {
                                         BinaryCommand::Get { .. } => Opcode::Get as u8,
                                         BinaryCommand::GetK { .. } => Opcode::GetK as u8,

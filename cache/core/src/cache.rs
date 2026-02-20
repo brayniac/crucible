@@ -19,6 +19,8 @@ use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentKeyVerify};
 use crate::slice_segment::SliceSegment;
+use crate::cache_trait::CacheInternalStats;
+use crate::sync::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -426,6 +428,38 @@ impl CacheLayer {
     }
 }
 
+/// Atomic counters for cache-internal events (demotions, evictions).
+pub struct CacheStats {
+    /// Items demoted from one layer to another.
+    pub demotions: AtomicU64,
+    /// Segments evicted entirely (items discarded).
+    pub evictions: AtomicU64,
+}
+
+impl CacheStats {
+    /// Create a new zeroed stats instance.
+    pub const fn new() -> Self {
+        Self {
+            demotions: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the current values as a `CacheInternalStats`.
+    pub fn snapshot(&self) -> CacheInternalStats {
+        CacheInternalStats {
+            demotions: self.demotions.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for CacheStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A tiered cache with multiple layers and a shared hashtable.
 ///
 /// # Architecture
@@ -481,6 +515,9 @@ pub struct TieredCache<H: Hashtable> {
 
     /// Maximum eviction attempts per write.
     max_eviction_attempts: usize,
+
+    /// Atomic counters for demotion and eviction events.
+    stats: CacheStats,
 }
 
 impl<H: Hashtable> TieredCache<H> {
@@ -492,6 +529,11 @@ impl<H: Hashtable> TieredCache<H> {
     /// Get the hashtable.
     pub fn hashtable(&self) -> &Arc<H> {
         &self.hashtable
+    }
+
+    /// Get the cache stats (demotions, evictions).
+    pub fn stats(&self) -> &CacheStats {
+        &self.stats
     }
 
     /// Get the number of layers.
@@ -1374,6 +1416,7 @@ impl<H: Hashtable> TieredCache<H> {
             let hashtable = self.hashtable.as_ref();
 
             // Create demoter callback that writes to target layer and updates hashtable
+            let stats = &self.stats;
             let demoter = |key: &[u8],
                            value: &[u8],
                            optional: &[u8],
@@ -1384,6 +1427,7 @@ impl<H: Hashtable> TieredCache<H> {
                     // Atomically update hashtable to point to new location
                     // preserve_freq=true to keep the frequency counter
                     hashtable.cas_location(key, old_location, new_location.to_location(), true);
+                    stats.demotions.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // Target write failed, just remove from hashtable
                     hashtable.remove(key, old_location);
@@ -1401,14 +1445,18 @@ impl<H: Hashtable> TieredCache<H> {
         }
 
         // No next layer — just evict (discard items)
-        match layer.evict_nonblocking(self.hashtable.as_ref()) {
+        let result = match layer.evict_nonblocking(self.hashtable.as_ref()) {
             EvictResult::Freed => true,
             EvictResult::Deferred => {
                 // Segment was pinned by readers — try emergency evict
                 layer.emergency_evict(self.hashtable.as_ref())
             }
             EvictResult::NoCandidate => false,
+        };
+        if result {
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     /// Mark an item as deleted at the given location.
@@ -1711,6 +1759,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
             pool_map: self.pool_map,
             eviction_threshold: self.eviction_threshold,
             max_eviction_attempts: self.max_eviction_attempts,
+            stats: CacheStats::new(),
         }
     }
 }

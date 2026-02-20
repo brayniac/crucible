@@ -27,6 +27,12 @@ pub mod request {
 pub mod cache {
     pub const HITS: usize = 0;
     pub const MISSES: usize = 1;
+    pub const DISK_READS: usize = 2;
+    pub const DISK_READ_HITS: usize = 3;
+    pub const DISK_READ_MISSES: usize = 4;
+    pub const DISK_READ_ERRORS: usize = 5;
+    pub const DISK_FLUSHES: usize = 6;
+    pub const DISK_FLUSH_ERRORS: usize = 7;
 }
 
 /// Counter slot indices for error metrics.
@@ -68,6 +74,40 @@ pub static HITS: Counter = Counter::new(&CACHE, cache::HITS);
 
 #[metric(name = "cache_misses", description = "Total cache misses")]
 pub static MISSES: Counter = Counter::new(&CACHE, cache::MISSES);
+
+// Disk tier metrics
+#[metric(name = "disk_reads", description = "Disk read I/O operations submitted")]
+pub static DISK_READS: Counter = Counter::new(&CACHE, cache::DISK_READS);
+
+#[metric(
+    name = "disk_read_hits",
+    description = "Disk reads that returned a valid value"
+)]
+pub static DISK_READ_HITS: Counter = Counter::new(&CACHE, cache::DISK_READ_HITS);
+
+#[metric(
+    name = "disk_read_misses",
+    description = "Disk reads that found deleted/invalid items"
+)]
+pub static DISK_READ_MISSES: Counter = Counter::new(&CACHE, cache::DISK_READ_MISSES);
+
+#[metric(
+    name = "disk_read_errors",
+    description = "Disk reads that failed (I/O error, buffer exhausted)"
+)]
+pub static DISK_READ_ERRORS: Counter = Counter::new(&CACHE, cache::DISK_READ_ERRORS);
+
+#[metric(
+    name = "disk_flushes",
+    description = "Segment flush completions (writes to disk)"
+)]
+pub static DISK_FLUSHES: Counter = Counter::new(&CACHE, cache::DISK_FLUSHES);
+
+#[metric(
+    name = "disk_flush_errors",
+    description = "Segment flushes that failed"
+)]
+pub static DISK_FLUSH_ERRORS: Counter = Counter::new(&CACHE, cache::DISK_FLUSH_ERRORS);
 
 // Errors
 #[metric(

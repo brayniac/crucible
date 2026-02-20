@@ -433,12 +433,16 @@ impl FifoLayer {
     /// Non-blocking variant of process_evicted_segment_with_demoter.
     ///
     /// Returns `true` if fully processed, `false` if deferred (AwaitingRelease).
-    /// For deferred segments, demotion is skipped (can't read data while readers hold refs).
+    ///
+    /// Demotes items regardless of active readers. Segment data is immutable
+    /// once sealed, so it is safe to read while readers hold refs. After
+    /// demotion, if readers remain the segment transitions to AwaitingRelease
+    /// for the last reader to free.
     fn process_evicted_segment_with_demoter_nonblocking<H, F>(
         &self,
         segment_id: u32,
         hashtable: &H,
-        demoter: F,
+        mut demoter: F,
     ) -> bool
     where
         H: Hashtable,
@@ -449,20 +453,83 @@ impl FifoLayer {
             None => return true,
         };
 
-        if segment.ref_count() > 0 {
-            // Can't demote while readers hold refs - just drain hashtable and defer
-            self.drain_segment_from_hashtable(segment_id, hashtable);
-            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
-            // Race fix: reclaim if last reader dropped during the window above.
-            if segment.ref_count() == 0 && segment.release_condemned() {
-                return true;
+        // Iterate items and run demoter while still in Draining state.
+        // Segment data is immutable (sealed) — safe to read with active readers.
+        // No new readers will be admitted (is_readable() returns false for Draining).
+        let now = Self::now_secs();
+        let mut offset = 0u32;
+        let write_offset = segment.write_offset();
+
+        while offset < write_offset {
+            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
+                if let Some(header) = TtlHeader::try_from_bytes(data) {
+                    let item_size = header.padded_size() as u32;
+
+                    if !header.is_deleted() && !header.is_expired(now) {
+                        let optional_start = offset as usize + TtlHeader::SIZE;
+                        let optional_len = header.optional_len() as usize;
+                        let key_start = optional_start + optional_len;
+                        let key_len = header.key_len() as usize;
+                        let value_start = key_start + key_len;
+                        let value_len = header.value_len() as usize;
+
+                        if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                            let location =
+                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+
+                            let verifier = SinglePoolVerifier { pool: &self.pool };
+                            let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+                            let fate = determine_item_fate(freq, &self.config);
+
+                            match fate {
+                                ItemFate::Ghost => {
+                                    hashtable.convert_to_ghost(key, location.to_location());
+                                }
+                                ItemFate::Demote => {
+                                    let optional = segment
+                                        .data_slice(optional_start as u32, optional_len)
+                                        .unwrap_or(&[]);
+                                    let value = segment
+                                        .data_slice(value_start as u32, value_len)
+                                        .unwrap_or(&[]);
+
+                                    let expire_at = header.expire_at();
+                                    let remaining_secs = expire_at.saturating_sub(now);
+                                    let ttl = Duration::from_secs(remaining_secs as u64);
+
+                                    demoter(key, value, optional, ttl, location.to_location());
+                                }
+                                ItemFate::Discard => {
+                                    hashtable.remove(key, location.to_location());
+                                }
+                            }
+                        }
+                    }
+
+                    offset += item_size;
+                } else {
+                    break;
+                }
+            } else {
+                break;
             }
-            return false;
         }
 
-        // Normal path: use full demoter logic
-        self.process_evicted_segment_with_demoter(segment_id, hashtable, demoter);
-        true
+        // All items processed. Try to release the segment.
+        if segment.ref_count() == 0 {
+            segment.cas_metadata(State::Draining, State::Locked, None, None);
+            segment.cas_metadata(State::Locked, State::Reserved, None, None);
+            self.pool.release(segment_id);
+            return true;
+        }
+
+        // Readers still active — let last reader free it.
+        segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+        // Race fix: reclaim if last reader dropped during the window above.
+        if segment.ref_count() == 0 && segment.release_condemned() {
+            return true;
+        }
+        false
     }
 }
 

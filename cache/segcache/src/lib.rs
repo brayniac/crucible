@@ -55,9 +55,10 @@ use std::time::Duration;
 
 // Re-export common types from cache-core
 pub use cache_core::{
-    AtomicCounters, BasicItemGuard, Cache, CacheError, CacheMetrics, CacheResult, CounterSnapshot,
-    DEFAULT_TTL, EvictionStrategy, FrequencyDecay, HugepageSize, ItemLocation, LayerMetrics,
-    LookupResult, MergeConfig, OwnedGuard, PoolMetrics, SyncMode, ValueRef,
+    AtomicCounters, BasicItemGuard, Cache, CacheError, CacheInternalStats, CacheMetrics,
+    CacheResult, CounterSnapshot, DEFAULT_TTL, EvictionStrategy, FrequencyDecay, HugepageSize,
+    ItemLocation, LayerMetrics, LookupResult, MergeConfig, OwnedGuard, PoolMetrics, SyncMode,
+    ValueRef,
 };
 
 /// Eviction policy for the segmented cache.
@@ -730,6 +731,10 @@ impl Cache for SegCache {
 
     fn lookup(&self, key: &[u8]) -> LookupResult {
         self.inner.lookup(key)
+    }
+
+    fn internal_stats(&self) -> Option<CacheInternalStats> {
+        Some(self.inner.stats().snapshot())
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {

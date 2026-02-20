@@ -91,43 +91,52 @@ fn run(
         numa_node,
     });
 
-    // Start admin server for health checks and metrics
-    let admin_handle = admin::start(AdminConfig {
-        address: config.metrics.address,
-        shutdown: shutdown.clone(),
-    })?;
-
-    // Create cache based on backend + policy selection
+    // Create cache based on backend + policy selection, then start admin
+    // server so we can pass the cache stats closure to /metrics.
     let drain_timeout = Duration::from_secs(config.shutdown.drain_timeout_secs);
 
-    let result = match config.cache.backend {
+    match config.cache.backend {
         CacheBackend::Segment => {
             let cache = create_segment(&config, policy)?;
-            run_with_cache(config, cache, shutdown, drain_timeout)
+            run_with_admin(config, cache, shutdown, drain_timeout)
         }
         CacheBackend::Slab => {
             let cache = create_slab(&config, policy)?;
-            run_with_cache(config, cache, shutdown, drain_timeout)
+            run_with_admin(config, cache, shutdown, drain_timeout)
         }
         CacheBackend::Heap => {
             let cache = create_heap(&config, policy)?;
-            run_with_cache(config, cache, shutdown, drain_timeout)
+            run_with_admin(config, cache, shutdown, drain_timeout)
         }
-    };
-
-    // Shutdown admin server
-    admin_handle.shutdown();
-
-    result
+    }
 }
 
-fn run_with_cache<C: cache_core::Cache + 'static>(
+fn run_with_admin<C: cache_core::Cache + 'static>(
     config: Config,
     cache: C,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    server::native::run(&config, cache, shutdown, drain_timeout)
+    use std::sync::Arc;
+
+    // Wrap cache in Arc so we can share it with the admin stats closure.
+    let cache = Arc::new(cache);
+    let cache_for_stats = Arc::clone(&cache);
+
+    let admin_handle = admin::start(AdminConfig {
+        address: config.metrics.address,
+        shutdown: shutdown.clone(),
+        cache_stats_fn: Some(Arc::new(move || cache_for_stats.internal_stats())),
+    })?;
+
+    // Unwrap the Arc: run() wraps in Arc internally, so pass the inner value.
+    // Since we hold a second Arc via cache_stats_fn, use Arc::try_unwrap or
+    // just pass the Arc directly via run_shared.
+    let result = server::native::run_shared(&config, cache, shutdown, drain_timeout);
+
+    admin_handle.shutdown();
+
+    result
 }
 
 fn create_segment(

@@ -6,7 +6,7 @@
 
 mod handler;
 
-pub use server::run;
+pub use server::{run, run_shared};
 
 mod server {
     use crate::config::{Config, DiskIoBackendConfig};
@@ -30,7 +30,16 @@ mod server {
         shutdown: Arc<AtomicBool>,
         drain_timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let cache = Arc::new(cache);
+        run_shared(config, Arc::new(cache), shutdown, drain_timeout)
+    }
+
+    /// Run the async native runtime server with a pre-shared cache Arc.
+    pub fn run_shared<C: Cache + 'static>(
+        config: &Config,
+        cache: Arc<C>,
+        shutdown: Arc<AtomicBool>,
+        drain_timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let num_workers = config.threads();
         let cpu_affinity = config.cpu_affinity();
 
