@@ -76,35 +76,3 @@ pub trait RamPool: Send + Sync {
         Box::new(0..self.segment_count() as u32)
     }
 }
-
-impl<T: RamPool> RamPool for std::sync::Arc<T> {
-    type Segment = T::Segment;
-
-    fn pool_id(&self) -> u8 {
-        (**self).pool_id()
-    }
-
-    fn get(&self, id: u32) -> Option<&Self::Segment> {
-        (**self).get(id)
-    }
-
-    fn segment_count(&self) -> usize {
-        (**self).segment_count()
-    }
-
-    fn segment_size(&self) -> usize {
-        (**self).segment_size()
-    }
-
-    fn reserve(&self) -> Option<u32> {
-        (**self).reserve()
-    }
-
-    fn release(&self, id: u32) {
-        (**self).release(id)
-    }
-
-    fn free_count(&self) -> usize {
-        (**self).free_count()
-    }
-}

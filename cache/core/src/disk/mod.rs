@@ -67,7 +67,7 @@ mod recovery;
 pub use aligned_buffer::{AlignedBuffer, AlignedBufferPool, ReadBufferPool};
 pub use config::{DiskConfig, DiskIoBackend, SyncMode};
 pub use disk_layer::{DiskLayer, DiskLayerBuilder};
-pub use disk_segment_meta::{DiskSegmentMeta, StagingBuffer};
+pub use disk_segment_meta::DiskSegmentMeta;
 pub use file_pool::{FilePool, FilePoolBuilder, FilePoolHeader};
 pub use file_segment::FileSegment;
 pub use io_uring_layer::{DiskReadParams, FlushRequest, IoUringDiskLayer, IoUringDiskLayerBuilder};

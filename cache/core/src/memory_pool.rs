@@ -129,33 +129,6 @@ impl MemoryPool {
         }
     }
 
-    /// Reserve a segment from the spare queue only (no free queue fallback).
-    ///
-    /// Unlike [`reserve_spare`], this does not fall back to the main free
-    /// queue when the spare queue is empty. Use this for disk staging where
-    /// graceful degradation (discard) is preferred over starving RAM allocation.
-    ///
-    /// # Returns
-    /// `Some(segment_id)` if a spare was available, `None` otherwise.
-    pub fn try_reserve_spare(&self) -> Option<u32> {
-        match self.spare_queue.steal() {
-            crossbeam_deque::Steal::Success(segment_id) => {
-                let segment = &self.segments[segment_id as usize];
-
-                // Transition Free -> Reserved
-                if !segment.try_reserve() {
-                    self.spare_queue.push(segment_id);
-                    return self.try_reserve_spare(); // Retry
-                }
-
-                self.spare_count.fetch_sub(1, Ordering::Relaxed);
-                Some(segment_id)
-            }
-            crossbeam_deque::Steal::Retry => self.try_reserve_spare(), // Retry
-            crossbeam_deque::Steal::Empty => None,
-        }
-    }
-
     /// Release a segment back to the appropriate queue with automatic balancing.
     ///
     /// This method is called by guard Drop when a segment in AwaitingRelease

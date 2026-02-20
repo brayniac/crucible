@@ -568,23 +568,11 @@ impl SegCacheBuilder {
             .heap_size(self.heap_size)
             .hugepage_size(self.hugepage_size);
 
-        // Increase spare capacity when io_uring disk tier is enabled so
-        // the staging pool has enough spare segments for concurrent demotions.
-        // Scale proportionally to avoid starving small pools.
-        if self.io_uring_disk_tier.is_some() {
-            let total_segments = self.heap_size / self.segment_size;
-            let spare = ((total_segments / 8) as u32).clamp(2, 16);
-            layer_builder = layer_builder.spare_capacity(spare);
-        }
-
         if let Some(node) = self.numa_node {
             layer_builder = layer_builder.numa_node(node);
         }
 
         let layer = layer_builder.build()?;
-
-        // Get shared pool before consuming the layer (for io_uring staging)
-        let shared_pool = layer.shared_pool();
 
         let mut builder = TieredCacheBuilder::new(hashtable).with_layer(CacheLayer::Ttl(layer));
 
@@ -617,7 +605,7 @@ impl SegCacheBuilder {
                 .segment_size(self.segment_size)
                 .segment_count(io_uring_config.segment_count)
                 .block_size(io_uring_config.block_size)
-                .staging_pool(shared_pool)
+                .write_buffer_count(io_uring_config.write_buffer_count)
                 .build();
 
             builder = builder.with_io_uring_disk_layer(io_uring_layer);
@@ -689,22 +677,11 @@ impl SegCacheBuilder {
             .heap_size(main_cache_size)
             .hugepage_size(self.hugepage_size);
 
-        // Increase spare capacity when io_uring disk tier is enabled so
-        // the staging pool has enough spare segments for concurrent demotions.
-        // Scale proportionally to avoid starving small pools.
-        if self.io_uring_disk_tier.is_some() {
-            let spare = ((main_cache_segments / 8) as u32).clamp(2, 16);
-            layer1_builder = layer1_builder.spare_capacity(spare);
-        }
-
         if let Some(node) = self.numa_node {
             layer1_builder = layer1_builder.numa_node(node);
         }
 
         let layer1 = layer1_builder.build()?;
-
-        // Get shared pool before consuming the layer (for io_uring staging)
-        let shared_pool = layer1.shared_pool();
 
         let mut builder = TieredCacheBuilder::new(hashtable)
             .with_fifo_layer(layer0)
@@ -739,7 +716,7 @@ impl SegCacheBuilder {
                 .segment_size(self.segment_size)
                 .segment_count(io_uring_config.segment_count)
                 .block_size(io_uring_config.block_size)
-                .staging_pool(shared_pool)
+                .write_buffer_count(io_uring_config.write_buffer_count)
                 .build();
 
             builder = builder.with_io_uring_disk_layer(io_uring_layer);

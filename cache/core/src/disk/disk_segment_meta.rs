@@ -6,6 +6,7 @@
 //! lifecycle (state transitions, chain pointers, TTL) without keeping
 //! full segment data in RAM.
 
+use crate::disk::AlignedBuffer;
 use crate::error::CacheError;
 use crate::item::BasicHeader;
 use crate::segment::{Segment, SegmentKeyVerify};
@@ -13,55 +14,6 @@ use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
 use crate::sync::*;
 use std::cell::UnsafeCell;
 use std::time::Duration;
-
-/// A staging buffer backed by a spare segment from the RAM pool.
-///
-/// Used as a write buffer for disk segments. The spare segment's
-/// memory serves as the I/O staging area. On flush completion,
-/// the spare segment is released back to the memory pool.
-pub struct StagingBuffer {
-    /// Pointer to the spare segment's data region.
-    ptr: *mut u8,
-    /// Capacity of the staging buffer in bytes.
-    capacity: usize,
-    /// ID of the spare segment in the staging pool, used to release it.
-    pub spare_segment_id: u32,
-}
-
-// SAFETY: StagingBuffer wraps a raw pointer to a stable MemoryPool allocation.
-// Only one StagingBuffer exists per spare segment at a time (enforced by
-// reserve_spare / release lifecycle). The disk layer serializes access.
-unsafe impl Send for StagingBuffer {}
-unsafe impl Sync for StagingBuffer {}
-
-impl StagingBuffer {
-    /// Create a new staging buffer from a spare segment.
-    pub fn new(ptr: *mut u8, capacity: usize, spare_segment_id: u32) -> Self {
-        Self {
-            ptr,
-            capacity,
-            spare_segment_id,
-        }
-    }
-
-    /// Get a pointer to the buffer data.
-    #[inline]
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr
-    }
-
-    /// Get a mutable pointer to the buffer data.
-    #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr
-    }
-
-    /// Get the buffer capacity in bytes.
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-}
 
 /// In-RAM metadata for a segment whose data lives on disk.
 ///
@@ -124,7 +76,7 @@ pub struct DiskSegmentMeta {
     /// RAM write buffer: present while the segment is being written to
     /// or while a flush is in-flight. Once the flush completes, this is
     /// detached (set to None) and reads go to disk via io_uring.
-    write_buffer: UnsafeCell<Option<StagingBuffer>>,
+    write_buffer: UnsafeCell<Option<AlignedBuffer>>,
 }
 
 // SAFETY: All mutable state is managed through atomics.
@@ -193,7 +145,7 @@ impl DiskSegmentMeta {
     /// # Safety
     ///
     /// Must be called from the owning worker thread only.
-    pub fn attach_write_buffer(&self, buf: StagingBuffer) {
+    pub fn attach_write_buffer(&self, buf: AlignedBuffer) {
         unsafe {
             debug_assert!(
                 (*self.write_buffer.get()).is_none(),
@@ -209,7 +161,7 @@ impl DiskSegmentMeta {
     /// # Safety
     ///
     /// Must be called from the owning worker thread only.
-    pub fn detach_write_buffer(&self) -> Option<StagingBuffer> {
+    pub fn detach_write_buffer(&self) -> Option<AlignedBuffer> {
         unsafe { (*self.write_buffer.get()).take() }
     }
 

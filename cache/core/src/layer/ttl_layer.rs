@@ -25,7 +25,6 @@ use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentGuard, SegmentKeyVerify, SegmentPrune};
 use crate::slice_segment::SliceSegment;
 use crate::state::State;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// A TTL bucket-organized layer for main cache storage.
@@ -48,8 +47,8 @@ pub struct TtlLayer {
     /// Layer configuration.
     config: LayerConfig,
 
-    /// Segment pool (shared via Arc so the disk tier can borrow spare segments).
-    pool: Arc<MemoryPool>,
+    /// Segment pool.
+    pool: MemoryPool,
 
     /// TTL bucket organization.
     buckets: TtlBuckets,
@@ -84,11 +83,6 @@ impl TtlLayer {
     /// Get a reference to the segment pool.
     pub fn pool(&self) -> &MemoryPool {
         &self.pool
-    }
-
-    /// Get the shared pool handle (for passing to the disk tier as staging pool).
-    pub fn shared_pool(&self) -> Arc<MemoryPool> {
-        Arc::clone(&self.pool)
     }
 
     /// Get the TTL buckets.
@@ -1446,7 +1440,7 @@ impl TtlLayerBuilder {
             builder = builder.spare_capacity(spare);
         }
 
-        let pool = Arc::new(builder.build()?);
+        let pool = builder.build()?;
 
         // Initialize cached write segments (one per bucket)
         let bucket_count = crate::organization::MAX_TTL_BUCKETS;

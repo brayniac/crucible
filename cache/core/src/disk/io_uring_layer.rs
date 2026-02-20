@@ -27,17 +27,16 @@ use crate::item::BasicHeader;
 use crate::item_location::ItemLocation;
 use crate::layer::Layer;
 use crate::location::Location;
-use crate::memory_pool::MemoryPool;
 use crate::organization::TtlBuckets;
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentKeyVerify};
 use crate::slice_segment::ValueRefRaw;
 use crate::state::State;
 use crate::sync::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use super::disk_segment_meta::StagingBuffer;
+use super::aligned_buffer::AlignedBufferPool;
 use super::io_uring_pool::IoUringPool;
 
 /// Parameters for submitting an io_uring read of a disk segment item.
@@ -122,12 +121,8 @@ pub struct IoUringDiskLayer {
     /// Queue of sealed segments pending flush to disk.
     flush_queue: Mutex<Vec<FlushRequest>>,
 
-    /// Shared RAM pool that provides spare segments as staging buffers.
-    ///
-    /// Spare segments are borrowed via `reserve_spare()` and returned via
-    /// `release()` on flush completion or eviction. This replaces the
-    /// private `AlignedBufferPool` and leverages auto-replenishment.
-    staging_pool: Option<Arc<MemoryPool>>,
+    /// Pool of page-aligned write buffers for staging segment data.
+    buffer_pool: Mutex<AlignedBufferPool>,
 }
 
 impl IoUringDiskLayer {
@@ -151,45 +146,6 @@ impl IoUringDiskLayer {
         clocksource::coarse::UnixInstant::now()
             .duration_since(clocksource::coarse::UnixInstant::EPOCH)
             .as_secs()
-    }
-
-    /// Set the staging pool (shared MemoryPool) for write buffer allocation.
-    ///
-    /// Must be called before any write operations. The staging pool provides
-    /// spare segments that serve as write buffers for disk segments.
-    pub fn set_staging_pool(&mut self, pool: Arc<MemoryPool>) {
-        self.staging_pool = Some(pool);
-    }
-
-    /// Allocate a staging buffer from the shared memory pool.
-    ///
-    /// Borrows a spare segment from the staging pool and wraps its memory
-    /// as a `StagingBuffer` for use as a disk segment write buffer.
-    /// Uses `try_reserve_spare()` (no free queue fallback) to avoid
-    /// starving RAM allocation when spares are exhausted.
-    fn allocate_staging_buffer(&self) -> CacheResult<StagingBuffer> {
-        let pool = self.staging_pool.as_ref().ok_or(CacheError::OutOfMemory)?;
-        let spare_id = pool.try_reserve_spare().ok_or(CacheError::OutOfMemory)?;
-        let spare_segment = pool.get(spare_id).ok_or_else(|| {
-            // Should never happen, but release the spare if it does
-            pool.release(spare_id);
-            CacheError::OutOfMemory
-        })?;
-        Ok(StagingBuffer::new(
-            spare_segment.data_ptr(),
-            pool.segment_size(),
-            spare_id,
-        ))
-    }
-
-    /// Release a staging buffer back to the shared memory pool.
-    ///
-    /// Returns the spare segment to the pool where it will be automatically
-    /// replenished into the spare queue if below target capacity.
-    fn release_staging_buffer(&self, buf: StagingBuffer) {
-        if let Some(pool) = self.staging_pool.as_ref() {
-            pool.release(buf.spare_segment_id);
-        }
     }
 
     /// Write an item to the disk layer.
@@ -398,12 +354,12 @@ impl IoUringDiskLayer {
     /// Complete a flush operation.
     ///
     /// Called when an io_uring write completes. Detaches the write buffer
-    /// from the segment and returns the spare segment to the staging pool.
+    /// from the segment and returns it to the buffer pool.
     pub fn complete_flush(&self, segment_id: u32) {
         if let Some(segment) = self.pool.get(segment_id)
             && let Some(buf) = segment.detach_write_buffer()
         {
-            self.release_staging_buffer(buf);
+            self.buffer_pool.lock().unwrap().release(buf);
         }
     }
 
@@ -418,9 +374,9 @@ impl IoUringDiskLayer {
             // Check if this was the last reader and segment is condemned
             if prev == 1 {
                 fence(Ordering::Acquire);
-                // Return staging buffer before releasing condemned segment
+                // Return write buffer before releasing condemned segment
                 if let Some(buf) = segment.detach_write_buffer() {
-                    self.release_staging_buffer(buf);
+                    self.buffer_pool.lock().unwrap().release(buf);
                 }
                 segment.release_condemned();
             }
@@ -472,15 +428,15 @@ impl IoUringDiskLayer {
             }
         };
 
-        // Attach a staging buffer from the shared memory pool
-        let staging = match self.allocate_staging_buffer() {
-            Ok(buf) => buf,
-            Err(e) => {
+        // Allocate a write buffer from the dedicated buffer pool
+        let buf = match self.buffer_pool.lock().unwrap().allocate() {
+            Some(buf) => buf,
+            None => {
                 self.pool.release(segment_id);
-                return Err(e);
+                return Err(CacheError::OutOfMemory);
             }
         };
-        segment.attach_write_buffer(staging);
+        segment.attach_write_buffer(buf);
 
         // Set segment expiration time
         let expire_at = Self::now_secs() + ttl.as_secs() as u32;
@@ -496,9 +452,9 @@ impl IoUringDiskLayer {
                 Ok(segment_id)
             }
             Err(_) => {
-                // Return staging buffer and release segment
+                // Return write buffer and release segment
                 if let Some(buf) = segment.detach_write_buffer() {
-                    self.release_staging_buffer(buf);
+                    self.buffer_pool.lock().unwrap().release(buf);
                 }
                 self.pool.release(segment_id);
                 Err(CacheError::OutOfMemory)
@@ -602,7 +558,7 @@ impl IoUringDiskLayer {
             // Re-check ref_count after CAS to handle race
             if segment.ref_count() == 0 {
                 if let Some(buf) = segment.detach_write_buffer() {
-                    self.release_staging_buffer(buf);
+                    self.buffer_pool.lock().unwrap().release(buf);
                 }
                 segment.release_condemned();
             }
@@ -655,9 +611,9 @@ impl IoUringDiskLayer {
             }
         }
 
-        // Return staging buffer before releasing segment
+        // Return write buffer before releasing segment
         if let Some(buf) = segment.detach_write_buffer() {
-            self.release_staging_buffer(buf);
+            self.buffer_pool.lock().unwrap().release(buf);
         }
 
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
@@ -874,7 +830,7 @@ pub struct IoUringDiskLayerBuilder {
     segment_size: usize,
     segment_count: usize,
     block_size: u32,
-    staging_pool: Option<Arc<MemoryPool>>,
+    write_buffer_count: usize,
 }
 
 impl IoUringDiskLayerBuilder {
@@ -889,7 +845,7 @@ impl IoUringDiskLayerBuilder {
             segment_size: 8 * 1024 * 1024, // 8MB
             segment_count: 128,
             block_size: 4096,
-            staging_pool: None,
+            write_buffer_count: 16,
         }
     }
 
@@ -929,18 +885,11 @@ impl IoUringDiskLayerBuilder {
         self
     }
 
-    /// Set the staging pool (shared MemoryPool) for write buffer allocation.
+    /// Set the number of write buffers for staging segment data before flush.
     ///
-    /// Spare segments from this pool are borrowed as staging buffers for
-    /// disk segment writes. The pool auto-replenishes spares on release.
-    pub fn staging_pool(mut self, pool: Arc<MemoryPool>) -> Self {
-        self.staging_pool = Some(pool);
-        self
-    }
-
-    /// Deprecated: write buffers are now provided by the shared staging pool.
-    /// This method is a no-op for backwards compatibility.
-    pub fn write_buffer_count(self, _count: usize) -> Self {
+    /// Under pressure, demotion degrades to discard. Default: 16.
+    pub fn write_buffer_count(mut self, count: usize) -> Self {
+        self.write_buffer_count = count;
         self
     }
 
@@ -958,6 +907,8 @@ impl IoUringDiskLayerBuilder {
 
         let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 
+        let buffer_pool = AlignedBufferPool::new(self.write_buffer_count, self.segment_size, 4096);
+
         IoUringDiskLayer {
             layer_id: self.layer_id,
             config: self.config,
@@ -965,7 +916,7 @@ impl IoUringDiskLayerBuilder {
             buckets,
             current_write_segments,
             flush_queue: Mutex::new(Vec::new()),
-            staging_pool: self.staging_pool,
+            buffer_pool: Mutex::new(buffer_pool),
         }
     }
 }
