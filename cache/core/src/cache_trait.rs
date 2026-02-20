@@ -582,6 +582,41 @@ pub trait Cache: Send + Sync + 'static {
         None
     }
 
+    /// Drain the io_uring disk tier's flush queue.
+    ///
+    /// Returns all pending [`FlushRequest`]s that need to be submitted as
+    /// io_uring writes. The server should call this periodically (e.g., in
+    /// `on_tick`) and submit each request as a disk write, then call
+    /// [`complete_flush`](Self::complete_flush) when the write completes.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns an empty Vec — only caches with an io_uring disk tier produce flush requests.
+    fn take_flush_queue(&self) -> Vec<crate::FlushRequest> {
+        Vec::new()
+    }
+
+    /// Signal that a disk flush has completed for the given segment.
+    ///
+    /// Detaches the write buffer from the segment and returns it to the pool.
+    /// After this call, lookups for items in this segment will return
+    /// [`LookupResult::DiskRead`] instead of [`LookupResult::Hit`].
+    ///
+    /// # Default Implementation
+    ///
+    /// No-op — only caches with an io_uring disk tier need this.
+    fn complete_flush(&self, _segment_id: u32) {}
+
+    /// Release a disk segment's ref_count after an async disk read completes.
+    ///
+    /// Must be called after the server finishes processing a `DiskRead` response,
+    /// to allow the segment to be evicted if needed.
+    ///
+    /// # Default Implementation
+    ///
+    /// No-op — only caches with an io_uring disk tier need this.
+    fn release_disk_read(&self, _segment_id: u32, _pool_id: u8) {}
+
     /// Look up a key, returning either an immediate hit or disk read params.
     ///
     /// For items in RAM (or in a disk segment's write buffer), returns

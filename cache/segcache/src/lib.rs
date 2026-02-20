@@ -46,8 +46,8 @@
 #![warn(clippy::all)]
 
 use cache_core::{
-    CacheLayer, CasToken, DiskLayerBuilder, FifoLayerBuilder, IoUringDiskLayerBuilder, ItemGuard,
-    LayerConfig, MultiChoiceHashtable, TieredCache, TieredCacheBuilder, TtlLayerBuilder,
+    CasToken, DiskLayerBuilder, FifoLayerBuilder, IoUringDiskLayerBuilder, ItemGuard, LayerConfig,
+    MultiChoiceHashtable, TieredCache, TieredCacheBuilder, TtlLayerBuilder,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,10 +55,10 @@ use std::time::Duration;
 
 // Re-export common types from cache-core
 pub use cache_core::{
-    AtomicCounters, BasicItemGuard, Cache, CacheError, CacheInternalStats, CacheMetrics,
-    CacheResult, CounterSnapshot, DEFAULT_TTL, EvictionStrategy, FrequencyDecay, HugepageSize,
-    ItemLocation, LayerMetrics, LookupResult, MergeConfig, OwnedGuard, PoolMetrics, SyncMode,
-    ValueRef,
+    AtomicCounters, BasicHeader, BasicItemGuard, Cache, CacheError, CacheInternalStats,
+    CacheLayer, CacheMetrics, CacheResult, CounterSnapshot, DEFAULT_TTL, EvictionStrategy,
+    FrequencyDecay, HugepageSize, ItemLocation, LayerMetrics, LookupResult, MergeConfig,
+    OwnedGuard, PoolMetrics, SyncMode, ValueRef,
 };
 
 /// Eviction policy for the segmented cache.
@@ -218,6 +218,19 @@ impl SegCache {
     /// Uses the configured eviction policy.
     pub fn evict(&self) -> bool {
         self.inner.evict_from(0)
+    }
+
+    /// Get a cache layer by index.
+    ///
+    /// Layer 0 is the admission queue (FIFO), layer 1 is the main cache (TTL),
+    /// and layer 2 (if present) is the disk tier.
+    pub fn layer(&self, index: usize) -> Option<&CacheLayer> {
+        self.inner.layer(index)
+    }
+
+    /// Get the number of cache layers.
+    pub fn layer_count(&self) -> usize {
+        self.inner.layer_count()
     }
 
     /// Get metrics for the cache.
@@ -752,6 +765,18 @@ impl Cache for SegCache {
 
     fn flush(&self) {
         self.inner.flush();
+    }
+
+    fn take_flush_queue(&self) -> Vec<cache_core::FlushRequest> {
+        self.inner.take_flush_queue()
+    }
+
+    fn complete_flush(&self, segment_id: u32) {
+        self.inner.complete_flush(segment_id);
+    }
+
+    fn release_disk_read(&self, segment_id: u32, pool_id: u8) {
+        self.inner.release_disk_read(segment_id, pool_id);
     }
 
     fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {

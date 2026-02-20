@@ -248,6 +248,11 @@ impl<C: Cache + 'static> EventHandler for ServerHandler<C> {
     fn on_tick(&mut self, ctx: &mut DriverCtx) {
         self.stats[self.worker_id].inc_poll();
 
+        // Submit pending disk tier flushes (write buffers → disk).
+        if self.disk_io.is_some() {
+            self.submit_pending_flushes(ctx);
+        }
+
         if self.shutdown.load(Ordering::Relaxed) {
             let active = self.connections.iter().filter(|c| c.is_some()).count();
             if active == 0 {
@@ -398,7 +403,8 @@ impl<C: Cache> ServerHandler<C> {
             }
             // Release read buffer and segment ref_count
             disk_io.release_read_buffer(pending.buffer);
-            // TODO: release_read on the IoUringDiskLayer
+            self.cache
+                .release_disk_read(pending.params.segment_id, pending.params.pool_id);
             return;
         }
 
@@ -469,9 +475,10 @@ impl<C: Cache> ServerHandler<C> {
             let _ = send_pending(ctx, c, pending.conn, self.send_copy_slot_size);
         }
 
-        // Release read buffer
+        // Release read buffer and disk segment ref_count
         disk_io.release_read_buffer(pending.buffer);
-        // TODO: release_read on the IoUringDiskLayer to decrement ref_count
+        self.cache
+            .release_disk_read(pending.params.segment_id, pending.params.pool_id);
     }
 
     /// Handle a disk flush (write) completion.
@@ -480,7 +487,7 @@ impl<C: Cache> ServerHandler<C> {
             return;
         };
 
-        let Some(_pending) = disk_io.take_pending_flush(seq) else {
+        let Some(pending) = disk_io.take_pending_flush(seq) else {
             return;
         };
 
@@ -488,10 +495,66 @@ impl<C: Cache> ServerHandler<C> {
         if !success {
             DISK_FLUSH_ERRORS.increment();
             tracing::warn!("Disk flush failed for seq={seq}");
+            // On failure, still detach the write buffer to avoid leaking it.
+            // The data is lost for this segment, but items will be evicted
+            // from the hashtable on the next lookup (read returns garbage).
         }
 
-        // TODO: call IoUringDiskLayer::complete_flush(segment_id)
-        // to detach the write buffer and return it to the pool.
+        // Detach write buffer and return it to the pool so it can be reused.
+        self.cache.complete_flush(pending.segment_id);
+    }
+
+    /// Drain the cache's disk flush queue and submit io_uring writes.
+    fn submit_pending_flushes(&mut self, ctx: &mut DriverCtx) {
+        let flush_requests = self.cache.take_flush_queue();
+        if flush_requests.is_empty() {
+            return;
+        }
+
+        let Some(disk_io) = &mut self.disk_io else {
+            return;
+        };
+
+        for req in flush_requests {
+            let result = match &disk_io.backend {
+                DiskBackend::Nvme { device, block_size } => {
+                    let lba = req.disk_offset / *block_size as u64;
+                    let num_blocks = (req.buffer_len / *block_size) as u16;
+                    ctx.nvme_write(
+                        *device,
+                        lba,
+                        num_blocks,
+                        req.buffer_ptr as u64, // addr
+                        req.buffer_len,
+                    )
+                }
+                DiskBackend::DirectIo { file, .. } => unsafe {
+                    ctx.direct_io_write(
+                        *file,
+                        req.disk_offset,
+                        req.buffer_ptr,
+                        req.buffer_len,
+                    )
+                },
+            };
+
+            match result {
+                Ok(seq) => {
+                    disk_io.store_pending_flush(
+                        seq,
+                        crate::disk_io::PendingFlush {
+                            segment_id: req.segment_id,
+                        },
+                    );
+                }
+                Err(e) => {
+                    DISK_FLUSH_ERRORS.increment();
+                    tracing::warn!("Disk flush submit failed: {e}");
+                    // Detach write buffer anyway to avoid permanent leak
+                    self.cache.complete_flush(req.segment_id);
+                }
+            }
+        }
     }
 }
 

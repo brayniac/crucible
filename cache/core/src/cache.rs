@@ -1529,6 +1529,42 @@ impl<H: Hashtable> TieredCache<H> {
         CacheKeyVerifier { pools }
     }
 
+    /// Drain the io_uring disk tier's flush queue.
+    ///
+    /// Returns all pending flush requests. The server submits each as an
+    /// io_uring write and calls `complete_flush` when the write completes.
+    pub fn take_flush_queue(&self) -> Vec<crate::FlushRequest> {
+        for layer in &self.layers {
+            if let CacheLayer::IoUringDisk(disk_layer) = layer {
+                return disk_layer.take_flush_queue();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Signal that a disk flush completed for the given segment.
+    ///
+    /// Detaches the write buffer and returns it to the buffer pool.
+    pub fn complete_flush(&self, segment_id: u32) {
+        for layer in &self.layers {
+            if let CacheLayer::IoUringDisk(disk_layer) = layer {
+                disk_layer.complete_flush(segment_id);
+                return;
+            }
+        }
+    }
+
+    /// Release a disk segment's ref_count after an async read completes.
+    pub fn release_disk_read(&self, segment_id: u32, pool_id: u8) {
+        let Some(layer_idx) = self.layer_for_pool(pool_id) else {
+            return;
+        };
+        let Some(CacheLayer::IoUringDisk(disk_layer)) = self.layers.get(layer_idx) else {
+            return;
+        };
+        disk_layer.release_read(segment_id);
+    }
+
     /// Flush all items from the cache.
     ///
     /// This clears the hashtable and resets all segments to their initial state.

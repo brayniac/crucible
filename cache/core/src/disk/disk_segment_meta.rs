@@ -205,9 +205,11 @@ impl DiskSegmentMeta {
 
 impl SegmentKeyVerify for DiskSegmentMeta {
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
-        // Key verification only works when write buffer is present
+        // When write buffer has been flushed to disk, we can't verify the key
+        // in RAM. Trust the hashtable tag match — the server will verify the
+        // actual key after completing the async disk read.
         let Some(data_ptr) = self.write_buffer_ptr() else {
-            return false;
+            return self.state().is_readable();
         };
 
         if offset as usize + BasicHeader::SIZE > self.capacity as usize {
