@@ -464,10 +464,22 @@ impl IoUringDiskLayer {
     fn allocate_segment_for_bucket(&self, bucket_index: usize, ttl: Duration) -> CacheResult<u32> {
         let segment_id = self.pool.reserve().ok_or(CacheError::OutOfMemory)?;
 
-        let segment = self.pool.get(segment_id).ok_or(CacheError::OutOfMemory)?;
+        let segment = match self.pool.get(segment_id) {
+            Some(s) => s,
+            None => {
+                self.pool.release(segment_id);
+                return Err(CacheError::OutOfMemory);
+            }
+        };
 
         // Attach a staging buffer from the shared memory pool
-        let staging = self.allocate_staging_buffer()?;
+        let staging = match self.allocate_staging_buffer() {
+            Ok(buf) => buf,
+            Err(e) => {
+                self.pool.release(segment_id);
+                return Err(e);
+            }
+        };
         segment.attach_write_buffer(staging);
 
         // Set segment expiration time
