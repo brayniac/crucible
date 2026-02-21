@@ -9,7 +9,7 @@ description = "High-performance cache protocol benchmark tool"
 
 [dependencies]
 # I/O event loop
-ringline = { workspace = true, features = ["tls"] }
+ringline = { workspace = true, features = ["tls", "timestamps"] }
 http2-proto = { workspace = true, features = ["tls"] }
 
 # TLS
@@ -30,6 +30,7 @@ protocol-momento = { workspace = true }
 # Client crates
 ringline-redis = { workspace = true }
 ringline-memcache = { workspace = true }
+ringline-ping = { workspace = true }
 
 # Metrics
 metrics = { workspace = true }

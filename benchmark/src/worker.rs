@@ -6,7 +6,7 @@
 //! phase transitions, diagnostics, and shutdown.
 
 use crate::client::{MomentoConn, MomentoSetup, RequestResult, RequestType};
-use crate::config::{Config, Protocol as CacheProtocol};
+use crate::config::{Config, Protocol as CacheProtocol, TimestampMode};
 use crate::metrics;
 use crate::ratelimit::DynamicRateLimiter;
 
@@ -587,6 +587,83 @@ async fn establish_connection(
     }
 }
 
+// ── on_result callback factories ─────────────────────────────────────────
+
+/// Create a RESP on_result callback that records metrics for each completed command.
+fn make_resp_callback() -> impl Fn(&ringline_redis::CommandResult) {
+    move |r| {
+        metrics::RESPONSES_RECEIVED.increment();
+        match r.command {
+            ringline_redis::CommandType::Get => {
+                metrics::GET_COUNT.increment();
+                match r.hit {
+                    Some(true) => metrics::CACHE_HITS.increment(),
+                    Some(false) => metrics::CACHE_MISSES.increment(),
+                    _ => {}
+                }
+                let _ = metrics::GET_LATENCY.increment(r.latency_ns);
+            }
+            ringline_redis::CommandType::Set => {
+                metrics::SET_COUNT.increment();
+                let _ = metrics::SET_LATENCY.increment(r.latency_ns);
+            }
+            ringline_redis::CommandType::Del => {
+                metrics::DELETE_COUNT.increment();
+                let _ = metrics::DELETE_LATENCY.increment(r.latency_ns);
+            }
+            _ => {}
+        }
+        if !r.success {
+            metrics::REQUEST_ERRORS.increment();
+        }
+        let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
+    }
+}
+
+/// Create a Memcache on_result callback that records metrics for each completed command.
+fn make_memcache_callback() -> impl Fn(&ringline_memcache::CommandResult) {
+    move |r| {
+        metrics::RESPONSES_RECEIVED.increment();
+        match r.command {
+            ringline_memcache::CommandType::Get => {
+                metrics::GET_COUNT.increment();
+                match r.hit {
+                    Some(true) => metrics::CACHE_HITS.increment(),
+                    Some(false) => metrics::CACHE_MISSES.increment(),
+                    _ => {}
+                }
+                let _ = metrics::GET_LATENCY.increment(r.latency_ns);
+            }
+            ringline_memcache::CommandType::Set => {
+                metrics::SET_COUNT.increment();
+                let _ = metrics::SET_LATENCY.increment(r.latency_ns);
+            }
+            ringline_memcache::CommandType::Delete => {
+                metrics::DELETE_COUNT.increment();
+                let _ = metrics::DELETE_LATENCY.increment(r.latency_ns);
+            }
+            _ => {}
+        }
+        if !r.success {
+            metrics::REQUEST_ERRORS.increment();
+        }
+        let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
+    }
+}
+
+/// Create a Ping on_result callback that records metrics for each completed ping.
+fn make_ping_callback() -> impl Fn(&ringline_ping::CommandResult) {
+    move |r| {
+        metrics::RESPONSES_RECEIVED.increment();
+        metrics::GET_COUNT.increment(); // Ping counts as GET for metrics
+        if !r.success {
+            metrics::REQUEST_ERRORS.increment();
+        }
+        let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
+        let _ = metrics::GET_LATENCY.increment(r.latency_ns);
+    }
+}
+
 // ── RESP connection task ─────────────────────────────────────────────────
 
 /// A single RESP (Redis) connection task that connects, drives workload, and reconnects.
@@ -616,7 +693,11 @@ async fn resp_connection_task(
         };
 
         metrics::CONNECTIONS_ACTIVE.increment();
-        let client = ringline_redis::Client::new(conn);
+        let use_kernel_ts = matches!(config.timestamps.mode, TimestampMode::Software);
+        let mut client = ringline_redis::Client::builder(conn)
+            .on_result(make_resp_callback())
+            .kernel_timestamps(use_kernel_ts)
+            .build();
 
         tracing::debug!(
             worker = state.task_state.worker_id,
@@ -626,7 +707,7 @@ async fn resp_connection_task(
         );
 
         let result = drive_resp_workload(
-            &client,
+            &mut client,
             &state,
             endpoint_idx,
             &mut rng,
@@ -651,7 +732,7 @@ async fn resp_connection_task(
 
 /// Drive the RESP workload on a connected client.
 async fn drive_resp_workload(
-    client: &ringline_redis::Client,
+    client: &mut ringline_redis::Client,
     state: &Arc<SharedWorkerState>,
     endpoint_idx: usize,
     rng: &mut Xoshiro256PlusPlus,
@@ -673,8 +754,6 @@ async fn drive_resp_workload(
             return Ok(());
         }
 
-        let recording = phase.is_recording();
-
         // Prefill phase
         if phase == Phase::Prefill && !state.is_prefill_done() {
             let key_id = {
@@ -692,19 +771,14 @@ async fn drive_resp_workload(
 
                 match result {
                     Ok(()) => {
-                        metrics::RESPONSES_RECEIVED.increment();
-                        metrics::SET_COUNT.increment();
                         confirm_prefill_key(state);
                     }
                     Err(ringline_redis::Error::ConnectionClosed) => {
                         requeue_prefill_key(state, key_id);
                         return Err(DisconnectReason::Eof);
                     }
-                    Err(e) => {
+                    Err(_) => {
                         requeue_prefill_key(state, key_id);
-                        tracing::debug!("prefill SET error: {}", e);
-                        metrics::RESPONSES_RECEIVED.increment();
-                        metrics::REQUEST_ERRORS.increment();
                     }
                 }
             }
@@ -731,26 +805,18 @@ async fn drive_resp_workload(
             let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.set_with_guard(key_buf, guard).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
 
             match result {
                 Ok(()) => {
-                    metrics::RESPONSES_RECEIVED.increment();
-                    metrics::SET_COUNT.increment();
-                    if recording {
-                        let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                        let _ = metrics::SET_LATENCY.increment(latency_ns);
-                        metrics::BACKFILL_SET_COUNT.increment();
-                        let _ = metrics::BACKFILL_SET_LATENCY.increment(latency_ns);
-                    }
+                    metrics::BACKFILL_SET_COUNT.increment();
+                    let _ = metrics::BACKFILL_SET_LATENCY
+                        .increment(start.elapsed().as_nanos() as u64);
                 }
                 Err(ringline_redis::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
                 }
-                Err(e) => {
-                    metrics::RESPONSES_RECEIVED.increment();
-                    metrics::REQUEST_ERRORS.increment();
-                    check_resp_redirect(&e, state, key_buf);
+                Err(ref e) => {
+                    check_resp_redirect(e, state, key_buf);
                 }
             }
             continue;
@@ -779,88 +845,50 @@ async fn drive_resp_workload(
         let roll = rng.random_range(0..100);
         if roll < get_ratio {
             // GET
-            let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.get(key_buf as &[u8]).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
-
-            metrics::RESPONSES_RECEIVED.increment();
-            metrics::GET_COUNT.increment();
 
             match &result {
-                Ok(Some(_)) => {
-                    metrics::CACHE_HITS.increment();
-                }
-                Ok(None) => {
-                    metrics::CACHE_MISSES.increment();
-                    if backfill_on_miss {
-                        backfill_queue.push(key_id);
-                    }
+                Ok(None) if backfill_on_miss => {
+                    backfill_queue.push(key_id);
                 }
                 Err(ringline_redis::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
                 }
                 Err(e) => {
-                    metrics::REQUEST_ERRORS.increment();
                     check_resp_redirect(e, state, key_buf);
                 }
-            }
-
-            if recording {
-                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                let _ = metrics::GET_LATENCY.increment(latency_ns);
+                _ => {}
             }
         } else if roll < get_ratio + delete_ratio {
             // DELETE
-            let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.del(key_buf as &[u8]).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
-
-            metrics::RESPONSES_RECEIVED.increment();
-            metrics::DELETE_COUNT.increment();
 
             match &result {
                 Err(ringline_redis::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
                 }
                 Err(e) => {
-                    metrics::REQUEST_ERRORS.increment();
                     check_resp_redirect(e, state, key_buf);
                 }
-                Ok(_) => {}
-            }
-
-            if recording {
-                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                let _ = metrics::DELETE_LATENCY.increment(latency_ns);
+                _ => {}
             }
         } else {
             // SET with zero-copy value
             let guard = make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
 
-            let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.set_with_guard(key_buf, guard).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
-
-            metrics::RESPONSES_RECEIVED.increment();
-            metrics::SET_COUNT.increment();
 
             match &result {
                 Err(ringline_redis::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
                 }
                 Err(e) => {
-                    metrics::REQUEST_ERRORS.increment();
                     check_resp_redirect(e, state, key_buf);
                 }
-                Ok(()) => {}
-            }
-
-            if recording {
-                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                let _ = metrics::SET_LATENCY.increment(latency_ns);
+                _ => {}
             }
         }
     }
@@ -950,7 +978,11 @@ async fn memcache_connection_task(
         };
 
         metrics::CONNECTIONS_ACTIVE.increment();
-        let client = ringline_memcache::Client::new(conn);
+        let use_kernel_ts = matches!(config.timestamps.mode, TimestampMode::Software);
+        let mut client = ringline_memcache::Client::builder(conn)
+            .on_result(make_memcache_callback())
+            .kernel_timestamps(use_kernel_ts)
+            .build();
 
         tracing::debug!(
             worker = state.task_state.worker_id,
@@ -960,7 +992,7 @@ async fn memcache_connection_task(
         );
 
         let result = drive_memcache_workload(
-            &client,
+            &mut client,
             &state,
             endpoint_idx,
             &mut rng,
@@ -985,7 +1017,7 @@ async fn memcache_connection_task(
 
 /// Drive the Memcache workload on a connected client.
 async fn drive_memcache_workload(
-    client: &ringline_memcache::Client,
+    client: &mut ringline_memcache::Client,
     state: &Arc<SharedWorkerState>,
     endpoint_idx: usize,
     rng: &mut Xoshiro256PlusPlus,
@@ -1007,8 +1039,6 @@ async fn drive_memcache_workload(
             return Ok(());
         }
 
-        let recording = phase.is_recording();
-
         // Prefill phase
         if phase == Phase::Prefill && !state.is_prefill_done() {
             let key_id = {
@@ -1026,19 +1056,14 @@ async fn drive_memcache_workload(
 
                 match result {
                     Ok(()) => {
-                        metrics::RESPONSES_RECEIVED.increment();
-                        metrics::SET_COUNT.increment();
                         confirm_prefill_key(state);
                     }
                     Err(ringline_memcache::Error::ConnectionClosed) => {
                         requeue_prefill_key(state, key_id);
                         return Err(DisconnectReason::Eof);
                     }
-                    Err(e) => {
+                    Err(_) => {
                         requeue_prefill_key(state, key_id);
-                        tracing::debug!("prefill SET error: {}", e);
-                        metrics::RESPONSES_RECEIVED.increment();
-                        metrics::REQUEST_ERRORS.increment();
                     }
                 }
             }
@@ -1065,26 +1090,17 @@ async fn drive_memcache_workload(
             let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.set_with_guard(key_buf, guard, 0, 0).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
 
             match result {
                 Ok(()) => {
-                    metrics::RESPONSES_RECEIVED.increment();
-                    metrics::SET_COUNT.increment();
-                    if recording {
-                        let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                        let _ = metrics::SET_LATENCY.increment(latency_ns);
-                        metrics::BACKFILL_SET_COUNT.increment();
-                        let _ = metrics::BACKFILL_SET_LATENCY.increment(latency_ns);
-                    }
+                    metrics::BACKFILL_SET_COUNT.increment();
+                    let _ = metrics::BACKFILL_SET_LATENCY
+                        .increment(start.elapsed().as_nanos() as u64);
                 }
                 Err(ringline_memcache::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
                 }
-                Err(_) => {
-                    metrics::RESPONSES_RECEIVED.increment();
-                    metrics::REQUEST_ERRORS.increment();
-                }
+                Err(_) => {}
             }
             continue;
         }
@@ -1112,85 +1128,35 @@ async fn drive_memcache_workload(
         let roll = rng.random_range(0..100);
         if roll < get_ratio {
             // GET
-            let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.get(key_buf as &[u8]).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
-
-            metrics::RESPONSES_RECEIVED.increment();
-            metrics::GET_COUNT.increment();
 
             match &result {
-                Ok(Some(_)) => {
-                    metrics::CACHE_HITS.increment();
-                }
-                Ok(None) => {
-                    metrics::CACHE_MISSES.increment();
-                    if backfill_on_miss {
-                        backfill_queue.push(key_id);
-                    }
+                Ok(None) if backfill_on_miss => {
+                    backfill_queue.push(key_id);
                 }
                 Err(ringline_memcache::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
                 }
-                Err(_) => {
-                    metrics::REQUEST_ERRORS.increment();
-                }
-            }
-
-            if recording {
-                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                let _ = metrics::GET_LATENCY.increment(latency_ns);
+                _ => {}
             }
         } else if roll < get_ratio + delete_ratio {
             // DELETE
-            let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.delete(key_buf as &[u8]).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
 
-            metrics::RESPONSES_RECEIVED.increment();
-            metrics::DELETE_COUNT.increment();
-
-            match &result {
-                Err(ringline_memcache::Error::ConnectionClosed) => {
-                    return Err(DisconnectReason::Eof);
-                }
-                Err(_) => {
-                    metrics::REQUEST_ERRORS.increment();
-                }
-                Ok(_) => {}
-            }
-
-            if recording {
-                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                let _ = metrics::DELETE_LATENCY.increment(latency_ns);
+            if let Err(ringline_memcache::Error::ConnectionClosed) = &result {
+                return Err(DisconnectReason::Eof);
             }
         } else {
             // SET with zero-copy value (flags=0, exptime=0)
             let guard = make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
 
-            let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
             let result = client.set_with_guard(key_buf, guard, 0, 0).await;
-            let latency_ns = start.elapsed().as_nanos() as u64;
 
-            metrics::RESPONSES_RECEIVED.increment();
-            metrics::SET_COUNT.increment();
-
-            match &result {
-                Err(ringline_memcache::Error::ConnectionClosed) => {
-                    return Err(DisconnectReason::Eof);
-                }
-                Err(_) => {
-                    metrics::REQUEST_ERRORS.increment();
-                }
-                Ok(()) => {}
-            }
-
-            if recording {
-                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-                let _ = metrics::SET_LATENCY.increment(latency_ns);
+            if let Err(ringline_memcache::Error::ConnectionClosed) = &result {
+                return Err(DisconnectReason::Eof);
             }
         }
     }
@@ -1205,6 +1171,7 @@ async fn ping_connection_task(
     _seed: u64,
 ) {
     let endpoint = state.task_state.endpoints[endpoint_idx];
+    let config = &state.task_state.config;
 
     loop {
         let phase = state.task_state.shared.phase();
@@ -1221,6 +1188,11 @@ async fn ping_connection_task(
         };
 
         metrics::CONNECTIONS_ACTIVE.increment();
+        let use_kernel_ts = matches!(config.timestamps.mode, TimestampMode::Software);
+        let mut client = ringline_ping::Client::builder(conn)
+            .on_result(make_ping_callback())
+            .kernel_timestamps(use_kernel_ts)
+            .build();
 
         tracing::debug!(
             worker = state.task_state.worker_id,
@@ -1229,7 +1201,7 @@ async fn ping_connection_task(
             "connected (Ping)"
         );
 
-        let result = drive_ping_workload(&conn, &state).await;
+        let result = drive_ping_workload(&mut client, &state).await;
 
         metrics::CONNECTIONS_ACTIVE.decrement();
 
@@ -1247,7 +1219,7 @@ async fn ping_connection_task(
 
 /// Drive the Ping workload: send PING, parse PONG, repeat.
 async fn drive_ping_workload(
-    conn: &ConnCtx,
+    client: &mut ringline_ping::Client,
     state: &Arc<SharedWorkerState>,
 ) -> Result<(), DisconnectReason> {
     loop {
@@ -1271,8 +1243,6 @@ async fn drive_ping_workload(
             continue;
         }
 
-        let recording = phase.is_recording();
-
         // Rate limiting
         if let Some(ref rl) = state.task_state.ratelimiter
             && !rl.try_acquire()
@@ -1280,39 +1250,13 @@ async fn drive_ping_workload(
             continue;
         }
 
-        // Send PING
-        let start = Instant::now();
-        if let Err(_) = conn.send(b"PING\r\n") {
-            return Err(DisconnectReason::SendError);
-        }
         metrics::REQUESTS_SENT.increment();
-
-        // Wait for PONG response
-        let consumed = conn
-            .with_data(|data| {
-                if data.is_empty() {
-                    return ParseResult::Consumed(0);
-                }
-                match protocol_ping::Response::parse(data) {
-                    Ok((_response, consumed)) => ParseResult::Consumed(consumed),
-                    Err(protocol_ping::ParseError::Incomplete) => ParseResult::Consumed(0),
-                    Err(_) => ParseResult::Consumed(data.len()),
-                }
-            })
-            .await;
-
-        let latency_ns = start.elapsed().as_nanos() as u64;
-
-        if consumed == 0 {
-            return Err(DisconnectReason::Eof);
-        }
-
-        metrics::RESPONSES_RECEIVED.increment();
-        metrics::GET_COUNT.increment(); // Ping counts as GET for metrics
-
-        if recording {
-            let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
-            let _ = metrics::GET_LATENCY.increment(latency_ns);
+        match client.ping().await {
+            Ok(()) => {}
+            Err(ringline_ping::Error::ConnectionClosed) => {
+                return Err(DisconnectReason::Eof);
+            }
+            Err(_) => {}
         }
     }
 }

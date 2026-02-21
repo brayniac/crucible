@@ -69,9 +69,10 @@ tracing = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-ringline = { path = "../ringline/ringline" }
-ringline-redis = { path = "../ringline/ringline-redis" }
-ringline-memcache = { path = "../ringline/ringline-memcache" }
+ringline = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
+ringline-redis = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
+ringline-memcache = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
+ringline-ping = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
 http2-proto = "0.0.1"
 grpc-proto = "0.0.1"
 protocol-momento = { path = "protocol/momento" }

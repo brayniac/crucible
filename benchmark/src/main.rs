@@ -1,5 +1,5 @@
 use benchmark::client::build_momento_tls_config;
-use benchmark::config::{Config, MomentoWireFormat, Protocol as CacheProtocol};
+use benchmark::config::{Config, MomentoWireFormat, Protocol as CacheProtocol, TimestampMode};
 use benchmark::metrics;
 use benchmark::output::{PrefillDiagnostics, PrefillStallCause};
 use benchmark::ratelimit::DynamicRateLimiter;
@@ -294,6 +294,7 @@ fn run_benchmark(
         },
         tcp_nodelay: true,
         tls_client,
+        timestamps: matches!(config.timestamps.mode, TimestampMode::Software),
         ..Default::default()
     };
 
