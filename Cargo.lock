@@ -434,7 +434,6 @@ dependencies = [
  "itoa",
  "ketama",
  "libc",
- "memcache-proto",
  "metrics",
  "metriken",
  "metriken-exposition",
@@ -447,6 +446,8 @@ dependencies = [
  "rand_xoshiro",
  "resp-proto",
  "ringline",
+ "ringline-memcache",
+ "ringline-redis",
  "ringlog",
  "rustls",
  "serde",
@@ -2340,7 +2341,6 @@ dependencies = [
 [[package]]
 name = "ringline"
 version = "0.0.2-alpha.0"
-source = "git+https://github.com/ringline-rs/ringline?rev=7780265#7780265e406fc870059df9c7c6118e85f882e5a4"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -2349,6 +2349,30 @@ dependencies = [
  "metriken",
  "pin-project-lite",
  "rustls",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ringline-memcache"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "histogram",
+ "ketama",
+ "memcache-proto",
+ "ringline",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ringline-redis"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "histogram",
+ "ketama",
+ "resp-proto",
+ "ringline",
  "thiserror 2.0.18",
 ]
 

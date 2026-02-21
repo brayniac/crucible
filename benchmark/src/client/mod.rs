@@ -1,8 +1,6 @@
 mod momento;
-mod session;
 
 pub use momento::{MomentoConn, MomentoSetup, build_momento_tls_config};
-pub use session::{RecvBuf, Session, SessionConfig, SessionError, Timestamp};
 
 /// Result of a completed request.
 #[derive(Debug, Clone)]
@@ -37,12 +35,4 @@ pub enum RequestType {
     Ping,
     Delete,
     Other,
-}
-
-/// Connection state for reconnection handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    Connected,
-    Disconnected,
-    Connecting,
 }

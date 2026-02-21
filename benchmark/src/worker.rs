@@ -5,12 +5,12 @@
 //! requests, parses responses, and reconnects on failure. `on_tick()` handles
 //! phase transitions, diagnostics, and shutdown.
 
-use crate::client::{MomentoConn, MomentoSetup, RecvBuf, RequestResult, RequestType, Session};
+use crate::client::{MomentoConn, MomentoSetup, RequestResult, RequestType};
 use crate::config::{Config, Protocol as CacheProtocol};
 use crate::metrics;
 use crate::ratelimit::DynamicRateLimiter;
 
-use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, ParseResult, RegionId, SendGuard};
+use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, ParseResult, RegionId, SendGuard};
 
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -200,38 +200,6 @@ fn recv_config() -> BenchWorkerConfig {
     rx.recv().expect("config channel closed")
 }
 
-// ── DataSlice adapter for zero-copy parsing ──────────────────────────────
-
-/// Wraps a `&[u8]` slice as a RecvBuf for zero-copy response parsing.
-struct DataSlice<'a> {
-    data: &'a [u8],
-    consumed: usize,
-}
-
-impl<'a> DataSlice<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, consumed: 0 }
-    }
-}
-
-impl RecvBuf for DataSlice<'_> {
-    fn as_slice(&self) -> &[u8] {
-        &self.data[self.consumed..]
-    }
-    fn len(&self) -> usize {
-        self.data.len() - self.consumed
-    }
-    fn consume(&mut self, n: usize) {
-        self.consumed += n;
-    }
-    fn capacity(&self) -> usize {
-        self.data.len()
-    }
-    fn shrink_if_oversized(&mut self) {
-        // no-op for borrowed slice
-    }
-}
-
 // ── ValuePoolGuard ────────────────────────────────────────────────────────
 
 /// Zero-copy send guard referencing a slice of the shared value pool.
@@ -256,6 +224,22 @@ impl SendGuard for ValuePoolGuard {
 
     fn region(&self) -> RegionId {
         RegionId::UNREGISTERED
+    }
+}
+
+/// Create a ValuePoolGuard referencing a random slice of the value pool.
+fn make_value_guard(
+    rng: &mut Xoshiro256PlusPlus,
+    value_pool: &Arc<Vec<u8>>,
+    value_len: usize,
+    pool_len: usize,
+) -> ValuePoolGuard {
+    let max_offset = pool_len - value_len;
+    let offset = rng.random_range(0..=max_offset);
+    ValuePoolGuard {
+        pool: Arc::clone(value_pool),
+        offset: offset as u32,
+        len: value_len as u32,
     }
 }
 
@@ -328,14 +312,27 @@ impl AsyncEventHandler for BenchHandler {
         let worker_state = Arc::clone(&self.worker_state);
         let my_connections = self.my_connections;
         let worker_id = self.id;
-        let is_momento =
-            worker_state.task_state.config.target.protocol == CacheProtocol::Momento;
+        let protocol = worker_state.task_state.config.target.protocol;
 
         Some(Box::pin(async move {
-            if is_momento {
-                spawn_momento_tasks(&worker_state, my_connections, worker_id);
-            } else {
-                spawn_session_tasks(&worker_state, my_connections, worker_id);
+            match protocol {
+                CacheProtocol::Momento => {
+                    spawn_momento_tasks(&worker_state, my_connections, worker_id);
+                }
+                CacheProtocol::Ping => {
+                    spawn_protocol_tasks(&worker_state, my_connections, worker_id);
+                }
+                CacheProtocol::Resp | CacheProtocol::Resp3 => {
+                    spawn_protocol_tasks(&worker_state, my_connections, worker_id);
+                }
+                CacheProtocol::Memcache => {
+                    spawn_protocol_tasks(&worker_state, my_connections, worker_id);
+                }
+                CacheProtocol::MemcacheBinary => {
+                    tracing::error!(
+                        "MemcacheBinary protocol is not supported; use Memcache (ASCII) instead"
+                    );
+                }
             }
         }))
     }
@@ -480,8 +477,8 @@ impl AsyncEventHandler for BenchHandler {
 
 // ── Spawn helpers ────────────────────────────────────────────────────────
 
-/// Spawn one async task per regular (RESP/Memcache) connection.
-fn spawn_session_tasks(
+/// Spawn one async task per protocol connection (RESP, Memcache, or Ping).
+fn spawn_protocol_tasks(
     worker_state: &Arc<SharedWorkerState>,
     my_connections: usize,
     worker_id: usize,
@@ -498,6 +495,8 @@ fn spawn_session_tasks(
         remainder * (base_per_thread + 1) + (worker_id - remainder) * base_per_thread
     };
 
+    let protocol = worker_state.task_state.config.target.protocol;
+
     for i in 0..my_connections {
         let global_conn_idx = my_start + i;
         let endpoint_idx = global_conn_idx % num_endpoints;
@@ -505,7 +504,18 @@ fn spawn_session_tasks(
         let session_seed = 42 + worker_id as u64 * 10000 + i as u64;
 
         let _ = ringline::spawn(async move {
-            session_connection_task(state, endpoint_idx, session_seed).await;
+            match protocol {
+                CacheProtocol::Resp | CacheProtocol::Resp3 => {
+                    resp_connection_task(state, endpoint_idx, session_seed).await;
+                }
+                CacheProtocol::Memcache => {
+                    memcache_connection_task(state, endpoint_idx, session_seed).await;
+                }
+                CacheProtocol::Ping => {
+                    ping_connection_task(state, endpoint_idx, session_seed).await;
+                }
+                _ => unreachable!(),
+            }
         });
     }
 }
@@ -542,37 +552,54 @@ fn spawn_momento_tasks(
     }
 }
 
-// ── Session connection task (RESP/Memcache) ──────────────────────────────
+// ── Connection establishment helper ──────────────────────────────────────
 
-/// A single connection task that connects, drives workload, and reconnects.
-async fn session_connection_task(
+/// Try to connect to an endpoint, returning Ok(conn) or Err with retry sleep.
+async fn establish_connection(
+    endpoint: SocketAddr,
+    worker_id: usize,
+) -> Result<ConnCtx, DisconnectReason> {
+    match ringline::connect(endpoint) {
+        Ok(future) => match future.await {
+            Ok(conn) => Ok(conn),
+            Err(e) => {
+                tracing::debug!(
+                    worker = worker_id,
+                    endpoint = %endpoint,
+                    "connect failed: {}",
+                    e
+                );
+                metrics::CONNECTIONS_FAILED.increment();
+                metrics::DISCONNECTS_CONNECT_FAILED.increment();
+                Err(DisconnectReason::ConnectFailed)
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                worker = worker_id,
+                endpoint = %endpoint,
+                "connect initiation failed: {}",
+                e
+            );
+            metrics::CONNECTIONS_FAILED.increment();
+            Err(DisconnectReason::ConnectFailed)
+        }
+    }
+}
+
+// ── RESP connection task ─────────────────────────────────────────────────
+
+/// A single RESP (Redis) connection task that connects, drives workload, and reconnects.
+async fn resp_connection_task(
     state: Arc<SharedWorkerState>,
     endpoint_idx: usize,
     seed: u64,
 ) {
     let endpoint = state.task_state.endpoints[endpoint_idx];
     let config = &state.task_state.config;
-
-    let mut session = match Session::from_config(endpoint, config) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                worker = state.task_state.worker_id,
-                endpoint = %endpoint,
-                "failed to create session: {}",
-                e
-            );
-            return;
-        }
-    };
-
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut key_buf = vec![0u8; config.workload.keyspace.length];
-    let mut set_prefix_buf = Vec::with_capacity(256);
-    let mut results = Vec::with_capacity(config.connection.pipeline_depth);
     let mut backfill_queue: Vec<usize> = Vec::new();
-    let mut prefill_in_flight: VecDeque<usize> = VecDeque::new();
-    let mut prefill_confirmed: usize = 0;
 
     loop {
         let phase = state.task_state.shared.phase();
@@ -580,111 +607,56 @@ async fn session_connection_task(
             return;
         }
 
-        // Connect
-        let conn = match ringline::connect(endpoint) {
-            Ok(future) => match future.await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::debug!(
-                        worker = state.task_state.worker_id,
-                        endpoint = %endpoint,
-                        "connect failed: {}",
-                        e
-                    );
-                    metrics::CONNECTIONS_FAILED.increment();
-                    metrics::DISCONNECTS_CONNECT_FAILED.increment();
-                    ringline::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    worker = state.task_state.worker_id,
-                    endpoint = %endpoint,
-                    "connect initiation failed: {}",
-                    e
-                );
-                metrics::CONNECTIONS_FAILED.increment();
+        let conn = match establish_connection(endpoint, state.task_state.worker_id).await {
+            Ok(conn) => conn,
+            Err(_) => {
                 ringline::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
 
-        session.set_conn_id(conn.index());
-        session.reconnect_attempted(true);
         metrics::CONNECTIONS_ACTIVE.increment();
+        let client = ringline_redis::Client::new(conn);
 
         tracing::debug!(
             worker = state.task_state.worker_id,
             endpoint = %endpoint,
             conn_index = conn.index(),
-            "connected"
+            "connected (RESP)"
         );
 
-        // Drive workload on this connection
-        let result = drive_session(
-            &conn,
-            &mut session,
+        let result = drive_resp_workload(
+            &client,
             &state,
             endpoint_idx,
             &mut rng,
             &mut key_buf,
-            &mut set_prefix_buf,
-            &mut results,
             &mut backfill_queue,
-            &mut prefill_in_flight,
-            &mut prefill_confirmed,
         )
         .await;
 
-        // Disconnected
-        session.disconnect();
         metrics::CONNECTIONS_ACTIVE.decrement();
 
-        // Move in-flight prefill keys back to the shared queue
-        if !state.is_prefill_done() && !prefill_in_flight.is_empty() {
-            let mut queue = state.task_state.prefill_queue.lock().unwrap();
-            while let Some(key_id) = prefill_in_flight.pop_front() {
-                queue.push_back(key_id);
-            }
-        }
-
         match result {
-            Ok(()) => return, // Clean shutdown (phase == Stop)
+            Ok(()) => return,
             Err(reason) => {
                 metrics::CONNECTIONS_FAILED.increment();
-                match reason {
-                    DisconnectReason::Eof => metrics::DISCONNECTS_EOF.increment(),
-                    DisconnectReason::RecvError => metrics::DISCONNECTS_RECV_ERROR.increment(),
-                    DisconnectReason::SendError => metrics::DISCONNECTS_SEND_ERROR.increment(),
-                    DisconnectReason::ClosedEvent => metrics::DISCONNECTS_CLOSED_EVENT.increment(),
-                    DisconnectReason::ErrorEvent => metrics::DISCONNECTS_ERROR_EVENT.increment(),
-                    DisconnectReason::ConnectFailed => {
-                        metrics::DISCONNECTS_CONNECT_FAILED.increment()
-                    }
-                }
+                record_disconnect_reason(reason);
             }
         }
 
-        session.reset();
         ringline::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// Drive the workload on a connected session. Returns Ok(()) for clean shutdown,
-/// Err(reason) for disconnect.
-async fn drive_session(
-    conn: &ConnCtx,
-    session: &mut Session,
+/// Drive the RESP workload on a connected client.
+async fn drive_resp_workload(
+    client: &ringline_redis::Client,
     state: &Arc<SharedWorkerState>,
     endpoint_idx: usize,
     rng: &mut Xoshiro256PlusPlus,
     key_buf: &mut Vec<u8>,
-    set_prefix_buf: &mut Vec<u8>,
-    results: &mut Vec<RequestResult>,
     backfill_queue: &mut Vec<usize>,
-    prefill_in_flight: &mut VecDeque<usize>,
-    prefill_confirmed: &mut usize,
 ) -> Result<(), DisconnectReason> {
     let config = &state.task_state.config;
     let key_count = config.workload.keyspace.count;
@@ -693,6 +665,7 @@ async fn drive_session(
     let value_len = config.workload.values.length;
     let pool_len = state.task_state.value_pool.len();
     let backfill_on_miss = state.task_state.backfill_on_miss;
+    let multi_endpoint = state.task_state.endpoints.len() > 1;
 
     loop {
         let phase = state.task_state.shared.phase();
@@ -702,495 +675,646 @@ async fn drive_session(
 
         let recording = phase.is_recording();
 
-        // Phase-specific request driving
+        // Prefill phase
         if phase == Phase::Prefill && !state.is_prefill_done() {
-            drive_prefill_requests(
-                conn,
-                session,
-                state,
-                rng,
-                key_buf,
-                set_prefix_buf,
-                prefill_in_flight,
-                value_len,
-                pool_len,
-            )?;
-        } else if phase == Phase::Warmup || phase == Phase::Running {
-            drive_normal_requests(
-                conn,
-                session,
-                state,
-                endpoint_idx,
-                rng,
-                key_buf,
-                set_prefix_buf,
-                backfill_queue,
-                key_count,
-                get_ratio,
-                delete_ratio,
-                value_len,
-                pool_len,
-            )?;
-        }
+            let key_id = {
+                let mut queue = state.task_state.prefill_queue.lock().unwrap();
+                queue.pop_front()
+            };
 
-        // Flush any pending send data
-        flush_session(conn, session)?;
+            if let Some(key_id) = key_id {
+                write_key(key_buf, key_id);
+                let guard =
+                    make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
 
-        // Wait for response data
-        let consumed = conn.with_data(|data| {
-            if data.is_empty() {
-                return ParseResult::Consumed(0);
-            }
+                metrics::REQUESTS_SENT.increment();
+                let result = client.set_with_guard(key_buf, guard).await;
 
-            let now = Instant::now();
-
-            // Stamp TTFB on the first unstamped in-flight request
-            session.stamp_first_byte(now);
-
-            // Zero-copy path: parse responses directly from ringline's buffer
-            results.clear();
-            let mut buf = DataSlice::new(data);
-            if let Err(e) = session.poll_responses_from(&mut buf, results, now) {
-                tracing::debug!(
-                    consumed = buf.consumed,
-                    remaining_len = data.len() - buf.consumed,
-                    in_flight = session.in_flight_count(),
-                    "protocol error: {}",
-                    e,
-                );
-            }
-
-            ParseResult::Consumed(buf.consumed)
-        }).await;
-
-        if consumed == 0 {
-            // Connection closed (EOF)
-            return Err(DisconnectReason::Eof);
-        }
-
-        metrics::BYTES_RX.add(consumed as u64);
-
-        // Handle prefill tracking
-        if phase == Phase::Prefill && !state.is_prefill_done() {
-            handle_prefill_results(results, state, prefill_in_flight, prefill_confirmed);
-        }
-
-        // Record metrics (counters always, latencies only when recording)
-        for result in results.iter() {
-            record_counters(result);
-        }
-        if recording {
-            for result in results.iter() {
-                record_latencies(result);
-            }
-        }
-
-        // Queue backfill SETs for GET misses (backfill_on_miss)
-        if backfill_on_miss {
-            for result in results.iter() {
-                if result.request_type == RequestType::Get
-                    && result.hit == Some(false)
-                    && result.success
-                    && let Some(key_id) = result.key_id
-                {
-                    backfill_queue.push(key_id);
+                match result {
+                    Ok(()) => {
+                        metrics::RESPONSES_RECEIVED.increment();
+                        metrics::SET_COUNT.increment();
+                        confirm_prefill_key(state);
+                    }
+                    Err(ringline_redis::Error::ConnectionClosed) => {
+                        requeue_prefill_key(state, key_id);
+                        return Err(DisconnectReason::Eof);
+                    }
+                    Err(e) => {
+                        requeue_prefill_key(state, key_id);
+                        tracing::debug!("prefill SET error: {}", e);
+                        metrics::RESPONSES_RECEIVED.increment();
+                        metrics::REQUEST_ERRORS.increment();
+                    }
                 }
             }
+            continue;
         }
 
-        // Handle cluster redirects (MOVED/ASK)
-        handle_cluster_redirects(results, state);
+        // Normal workload (Warmup or Running)
+        if phase != Phase::Warmup && phase != Phase::Running {
+            continue;
+        }
+
+        // Drain backfill queue first
+        if let Some(key_id) = backfill_queue.pop() {
+            write_key(key_buf, key_id);
+            let guard = make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+
+            if let Some(ref rl) = state.task_state.ratelimiter
+                && !rl.try_acquire()
+            {
+                backfill_queue.push(key_id);
+                continue;
+            }
+
+            let start = Instant::now();
+            metrics::REQUESTS_SENT.increment();
+            let result = client.set_with_guard(key_buf, guard).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            match result {
+                Ok(()) => {
+                    metrics::RESPONSES_RECEIVED.increment();
+                    metrics::SET_COUNT.increment();
+                    if recording {
+                        let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                        let _ = metrics::SET_LATENCY.increment(latency_ns);
+                        metrics::BACKFILL_SET_COUNT.increment();
+                        let _ = metrics::BACKFILL_SET_LATENCY.increment(latency_ns);
+                    }
+                }
+                Err(ringline_redis::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(e) => {
+                    metrics::RESPONSES_RECEIVED.increment();
+                    metrics::REQUEST_ERRORS.increment();
+                    check_resp_redirect(&e, state, key_buf);
+                }
+            }
+            continue;
+        }
+
+        // Rate limiting
+        if let Some(ref rl) = state.task_state.ratelimiter
+            && !rl.try_acquire()
+        {
+            continue;
+        }
+
+        // Generate random key
+        let key_id = rng.random_range(0..key_count);
+        write_key(key_buf, key_id);
+
+        // Multi-endpoint routing: skip keys that don't route to our endpoint
+        if multi_endpoint {
+            let routed = route_key(&state.task_state, key_buf);
+            if routed != endpoint_idx {
+                continue;
+            }
+        }
+
+        // Choose command
+        let roll = rng.random_range(0..100);
+        if roll < get_ratio {
+            // GET
+            let start = Instant::now();
+            metrics::REQUESTS_SENT.increment();
+            let result = client.get(key_buf as &[u8]).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            metrics::RESPONSES_RECEIVED.increment();
+            metrics::GET_COUNT.increment();
+
+            match &result {
+                Ok(Some(_)) => {
+                    metrics::CACHE_HITS.increment();
+                }
+                Ok(None) => {
+                    metrics::CACHE_MISSES.increment();
+                    if backfill_on_miss {
+                        backfill_queue.push(key_id);
+                    }
+                }
+                Err(ringline_redis::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(e) => {
+                    metrics::REQUEST_ERRORS.increment();
+                    check_resp_redirect(e, state, key_buf);
+                }
+            }
+
+            if recording {
+                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                let _ = metrics::GET_LATENCY.increment(latency_ns);
+            }
+        } else if roll < get_ratio + delete_ratio {
+            // DELETE
+            let start = Instant::now();
+            metrics::REQUESTS_SENT.increment();
+            let result = client.del(key_buf as &[u8]).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            metrics::RESPONSES_RECEIVED.increment();
+            metrics::DELETE_COUNT.increment();
+
+            match &result {
+                Err(ringline_redis::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(e) => {
+                    metrics::REQUEST_ERRORS.increment();
+                    check_resp_redirect(e, state, key_buf);
+                }
+                Ok(_) => {}
+            }
+
+            if recording {
+                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                let _ = metrics::DELETE_LATENCY.increment(latency_ns);
+            }
+        } else {
+            // SET with zero-copy value
+            let guard = make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+
+            let start = Instant::now();
+            metrics::REQUESTS_SENT.increment();
+            let result = client.set_with_guard(key_buf, guard).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            metrics::RESPONSES_RECEIVED.increment();
+            metrics::SET_COUNT.increment();
+
+            match &result {
+                Err(ringline_redis::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(e) => {
+                    metrics::REQUEST_ERRORS.increment();
+                    check_resp_redirect(e, state, key_buf);
+                }
+                Ok(()) => {}
+            }
+
+            if recording {
+                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                let _ = metrics::SET_LATENCY.increment(latency_ns);
+            }
+        }
     }
 }
 
-/// Drive normal workload requests (GET/SET/DELETE).
-///
-/// In multi-endpoint mode, generates random keys and only sends those that
-/// route to this task's endpoint (via ketama or slot table). For single
-/// endpoints, all keys are sent.
-fn drive_normal_requests(
-    conn: &ConnCtx,
-    session: &mut Session,
+/// Check a RESP error for cluster redirects (MOVED/ASK) and update slot table.
+fn check_resp_redirect(
+    error: &ringline_redis::Error,
+    state: &Arc<SharedWorkerState>,
+    _key: &[u8],
+) {
+    let msg = match error {
+        ringline_redis::Error::Redis(msg) => msg.as_str(),
+        _ => return,
+    };
+
+    // Parse "MOVED <slot> <host>:<port>" or "ASK <slot> <host>:<port>"
+    let (kind, rest) = if let Some(rest) = msg.strip_prefix("MOVED ") {
+        (resp_proto::RedirectKind::Moved, rest)
+    } else if let Some(rest) = msg.strip_prefix("ASK ") {
+        (resp_proto::RedirectKind::Ask, rest)
+    } else {
+        return;
+    };
+
+    metrics::CLUSTER_REDIRECTS.increment();
+
+    if kind != resp_proto::RedirectKind::Moved {
+        return;
+    }
+
+    // Parse slot and address
+    let mut parts = rest.splitn(2, ' ');
+    let slot: u16 = match parts.next().and_then(|s| s.parse().ok()) {
+        Some(s) => s,
+        None => return,
+    };
+    let address = match parts.next() {
+        Some(a) => a,
+        None => return,
+    };
+
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        let mut slot_table = state.task_state.slot_table.lock().unwrap();
+        if let Some(ref mut table) = *slot_table {
+            let endpoint_idx = state.task_state.endpoints.iter().position(|a| *a == addr);
+            if let Some(idx) = endpoint_idx {
+                table[slot as usize] = idx as u16;
+            } else {
+                tracing::warn!(
+                    worker = state.task_state.worker_id,
+                    addr = %addr,
+                    slot = slot,
+                    "MOVED redirect to unknown endpoint (cannot add dynamically)"
+                );
+            }
+        }
+    }
+}
+
+// ── Memcache connection task ─────────────────────────────────────────────
+
+/// A single Memcache (ASCII) connection task.
+async fn memcache_connection_task(
+    state: Arc<SharedWorkerState>,
+    endpoint_idx: usize,
+    seed: u64,
+) {
+    let endpoint = state.task_state.endpoints[endpoint_idx];
+    let config = &state.task_state.config;
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let mut key_buf = vec![0u8; config.workload.keyspace.length];
+    let mut backfill_queue: Vec<usize> = Vec::new();
+
+    loop {
+        let phase = state.task_state.shared.phase();
+        if phase.should_stop() {
+            return;
+        }
+
+        let conn = match establish_connection(endpoint, state.task_state.worker_id).await {
+            Ok(conn) => conn,
+            Err(_) => {
+                ringline::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        metrics::CONNECTIONS_ACTIVE.increment();
+        let client = ringline_memcache::Client::new(conn);
+
+        tracing::debug!(
+            worker = state.task_state.worker_id,
+            endpoint = %endpoint,
+            conn_index = conn.index(),
+            "connected (Memcache)"
+        );
+
+        let result = drive_memcache_workload(
+            &client,
+            &state,
+            endpoint_idx,
+            &mut rng,
+            &mut key_buf,
+            &mut backfill_queue,
+        )
+        .await;
+
+        metrics::CONNECTIONS_ACTIVE.decrement();
+
+        match result {
+            Ok(()) => return,
+            Err(reason) => {
+                metrics::CONNECTIONS_FAILED.increment();
+                record_disconnect_reason(reason);
+            }
+        }
+
+        ringline::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Drive the Memcache workload on a connected client.
+async fn drive_memcache_workload(
+    client: &ringline_memcache::Client,
     state: &Arc<SharedWorkerState>,
     endpoint_idx: usize,
     rng: &mut Xoshiro256PlusPlus,
     key_buf: &mut Vec<u8>,
-    set_prefix_buf: &mut Vec<u8>,
     backfill_queue: &mut Vec<usize>,
-    key_count: usize,
-    get_ratio: usize,
-    delete_ratio: usize,
-    value_len: usize,
-    pool_len: usize,
 ) -> Result<(), DisconnectReason> {
+    let config = &state.task_state.config;
+    let key_count = config.workload.keyspace.count;
+    let get_ratio = config.workload.commands.get as usize;
+    let delete_ratio = config.workload.commands.delete as usize;
+    let value_len = config.workload.values.length;
+    let pool_len = state.task_state.value_pool.len();
+    let backfill_on_miss = state.task_state.backfill_on_miss;
     let multi_endpoint = state.task_state.endpoints.len() > 1;
 
-    // Drain backfill queue before normal requests
-    if !backfill_queue.is_empty() {
-        drain_backfill_queue(
-            conn,
-            session,
-            state,
-            rng,
-            key_buf,
-            set_prefix_buf,
-            backfill_queue,
-            value_len,
-            pool_len,
-        )?;
-    }
-
-    let now = Instant::now();
-    let mut consecutive_skips = 0u32;
-
     loop {
-        if !session.can_send() {
-            break;
-        }
-
-        let key_id = rng.random_range(0..key_count);
-        write_key(key_buf, key_id);
-
-        // In multi-endpoint mode, skip keys that don't route to our endpoint
-        if multi_endpoint {
-            let routed = route_key(&state.task_state, key_buf);
-            if routed != endpoint_idx {
-                consecutive_skips += 1;
-                // Avoid infinite loop if all keys route elsewhere
-                if consecutive_skips > 100 {
-                    break;
-                }
-                continue;
-            }
-            consecutive_skips = 0;
-        }
-
-        if let Some(ref rl) = state.task_state.ratelimiter
-            && !rl.try_acquire()
-        {
-            break;
-        }
-
-        let roll = rng.random_range(0..100);
-        if roll < get_ratio {
-            let kid = if state.task_state.backfill_on_miss {
-                Some(key_id)
-            } else {
-                None
-            };
-            if session.get(key_buf, now, kid).is_none() {
-                break;
-            }
-        } else if roll < get_ratio + delete_ratio {
-            if session.delete(key_buf, now).is_none() {
-                break;
-            }
-        } else {
-            // SET: flush pending GET/DELETE data first, then send via guard
-            flush_session(conn, session)?;
-
-            if let Some(suffix) = session.encode_set_prefix(set_prefix_buf, key_buf, value_len) {
-                let prefix_len = set_prefix_buf.len();
-                let suffix_len = suffix.len();
-                if let Err(e) =
-                    send_set_parts(conn, set_prefix_buf, rng, &state.task_state.value_pool, value_len, pool_len, suffix)
-                {
-                    if e.kind() != io::ErrorKind::Other {
-                        return Err(DisconnectReason::SendError);
-                    }
-                    break;
-                }
-                session.confirm_set_sent(prefix_len, value_len, suffix_len, now);
-            } else {
-                break;
-            }
-        }
-
-        metrics::REQUESTS_SENT.increment();
-    }
-
-    Ok(())
-}
-
-/// Drain the backfill queue by sending SET requests for keys that missed on GET.
-fn drain_backfill_queue(
-    conn: &ConnCtx,
-    session: &mut Session,
-    state: &Arc<SharedWorkerState>,
-    rng: &mut Xoshiro256PlusPlus,
-    key_buf: &mut Vec<u8>,
-    set_prefix_buf: &mut Vec<u8>,
-    backfill_queue: &mut Vec<usize>,
-    value_len: usize,
-    pool_len: usize,
-) -> Result<(), DisconnectReason> {
-    let now = Instant::now();
-    let mut i = 0;
-    while i < backfill_queue.len() {
-        if !session.can_send() {
-            break;
-        }
-
-        let key_id = backfill_queue[i];
-        write_key(key_buf, key_id);
-
-        if let Some(ref rl) = state.task_state.ratelimiter
-            && !rl.try_acquire()
-        {
+        let phase = state.task_state.shared.phase();
+        if phase.should_stop() {
             return Ok(());
         }
 
-        backfill_queue.swap_remove(i);
+        let recording = phase.is_recording();
 
-        // Flush any pending GET/DELETE data first
-        flush_session(conn, session)?;
+        // Prefill phase
+        if phase == Phase::Prefill && !state.is_prefill_done() {
+            let key_id = {
+                let mut queue = state.task_state.prefill_queue.lock().unwrap();
+                queue.pop_front()
+            };
 
-        if let Some(suffix) = session.encode_set_prefix(set_prefix_buf, key_buf, value_len) {
-            let prefix_len = set_prefix_buf.len();
-            let suffix_len = suffix.len();
-            if let Err(e) =
-                send_set_parts(conn, set_prefix_buf, rng, &state.task_state.value_pool, value_len, pool_len, suffix)
+            if let Some(key_id) = key_id {
+                write_key(key_buf, key_id);
+                let guard =
+                    make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+
+                metrics::REQUESTS_SENT.increment();
+                let result = client.set_with_guard(key_buf, guard, 0, 0).await;
+
+                match result {
+                    Ok(()) => {
+                        metrics::RESPONSES_RECEIVED.increment();
+                        metrics::SET_COUNT.increment();
+                        confirm_prefill_key(state);
+                    }
+                    Err(ringline_memcache::Error::ConnectionClosed) => {
+                        requeue_prefill_key(state, key_id);
+                        return Err(DisconnectReason::Eof);
+                    }
+                    Err(e) => {
+                        requeue_prefill_key(state, key_id);
+                        tracing::debug!("prefill SET error: {}", e);
+                        metrics::RESPONSES_RECEIVED.increment();
+                        metrics::REQUEST_ERRORS.increment();
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Normal workload (Warmup or Running)
+        if phase != Phase::Warmup && phase != Phase::Running {
+            continue;
+        }
+
+        // Drain backfill queue first
+        if let Some(key_id) = backfill_queue.pop() {
+            write_key(key_buf, key_id);
+            let guard = make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+
+            if let Some(ref rl) = state.task_state.ratelimiter
+                && !rl.try_acquire()
             {
                 backfill_queue.push(key_id);
-                if e.kind() != io::ErrorKind::Other {
-                    return Err(DisconnectReason::SendError);
-                }
                 continue;
             }
-            session.confirm_set_sent(prefix_len, value_len, suffix_len, now);
-            session.mark_last_request_backfill();
+
+            let start = Instant::now();
             metrics::REQUESTS_SENT.increment();
+            let result = client.set_with_guard(key_buf, guard, 0, 0).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            match result {
+                Ok(()) => {
+                    metrics::RESPONSES_RECEIVED.increment();
+                    metrics::SET_COUNT.increment();
+                    if recording {
+                        let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                        let _ = metrics::SET_LATENCY.increment(latency_ns);
+                        metrics::BACKFILL_SET_COUNT.increment();
+                        let _ = metrics::BACKFILL_SET_LATENCY.increment(latency_ns);
+                    }
+                }
+                Err(ringline_memcache::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(_) => {
+                    metrics::RESPONSES_RECEIVED.increment();
+                    metrics::REQUEST_ERRORS.increment();
+                }
+            }
+            continue;
+        }
+
+        // Rate limiting
+        if let Some(ref rl) = state.task_state.ratelimiter
+            && !rl.try_acquire()
+        {
+            continue;
+        }
+
+        // Generate random key
+        let key_id = rng.random_range(0..key_count);
+        write_key(key_buf, key_id);
+
+        // Multi-endpoint routing
+        if multi_endpoint {
+            let routed = route_key(&state.task_state, key_buf);
+            if routed != endpoint_idx {
+                continue;
+            }
+        }
+
+        // Choose command
+        let roll = rng.random_range(0..100);
+        if roll < get_ratio {
+            // GET
+            let start = Instant::now();
+            metrics::REQUESTS_SENT.increment();
+            let result = client.get(key_buf as &[u8]).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            metrics::RESPONSES_RECEIVED.increment();
+            metrics::GET_COUNT.increment();
+
+            match &result {
+                Ok(Some(_)) => {
+                    metrics::CACHE_HITS.increment();
+                }
+                Ok(None) => {
+                    metrics::CACHE_MISSES.increment();
+                    if backfill_on_miss {
+                        backfill_queue.push(key_id);
+                    }
+                }
+                Err(ringline_memcache::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(_) => {
+                    metrics::REQUEST_ERRORS.increment();
+                }
+            }
+
+            if recording {
+                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                let _ = metrics::GET_LATENCY.increment(latency_ns);
+            }
+        } else if roll < get_ratio + delete_ratio {
+            // DELETE
+            let start = Instant::now();
+            metrics::REQUESTS_SENT.increment();
+            let result = client.delete(key_buf as &[u8]).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            metrics::RESPONSES_RECEIVED.increment();
+            metrics::DELETE_COUNT.increment();
+
+            match &result {
+                Err(ringline_memcache::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(_) => {
+                    metrics::REQUEST_ERRORS.increment();
+                }
+                Ok(_) => {}
+            }
+
+            if recording {
+                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                let _ = metrics::DELETE_LATENCY.increment(latency_ns);
+            }
         } else {
-            backfill_queue.push(key_id);
-            i += 1;
+            // SET with zero-copy value (flags=0, exptime=0)
+            let guard = make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+
+            let start = Instant::now();
+            metrics::REQUESTS_SENT.increment();
+            let result = client.set_with_guard(key_buf, guard, 0, 0).await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+
+            metrics::RESPONSES_RECEIVED.increment();
+            metrics::SET_COUNT.increment();
+
+            match &result {
+                Err(ringline_memcache::Error::ConnectionClosed) => {
+                    return Err(DisconnectReason::Eof);
+                }
+                Err(_) => {
+                    metrics::REQUEST_ERRORS.increment();
+                }
+                Ok(()) => {}
+            }
+
+            if recording {
+                let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+                let _ = metrics::SET_LATENCY.increment(latency_ns);
+            }
         }
     }
-    Ok(())
 }
 
-/// Maximum in-flight prefill requests per task.
-const PREFILL_MAX_PIPELINE: usize = 16;
+// ── Ping connection task ─────────────────────────────────────────────────
 
-/// Drive prefill requests (sequential SET commands).
-fn drive_prefill_requests(
-    conn: &ConnCtx,
-    session: &mut Session,
-    state: &Arc<SharedWorkerState>,
-    rng: &mut Xoshiro256PlusPlus,
-    key_buf: &mut Vec<u8>,
-    set_prefix_buf: &mut Vec<u8>,
-    prefill_in_flight: &mut VecDeque<usize>,
-    value_len: usize,
-    pool_len: usize,
-) -> Result<(), DisconnectReason> {
-    let now = Instant::now();
+/// A single Ping protocol connection task.
+async fn ping_connection_task(
+    state: Arc<SharedWorkerState>,
+    endpoint_idx: usize,
+    _seed: u64,
+) {
+    let endpoint = state.task_state.endpoints[endpoint_idx];
 
-    while prefill_in_flight.len() < PREFILL_MAX_PIPELINE && session.can_send() {
-        // Pop a key from the shared prefill queue
-        let key_id = {
-            let mut queue = state.task_state.prefill_queue.lock().unwrap();
-            match queue.pop_front() {
-                Some(id) => id,
-                None => break,
+    loop {
+        let phase = state.task_state.shared.phase();
+        if phase.should_stop() {
+            return;
+        }
+
+        let conn = match establish_connection(endpoint, state.task_state.worker_id).await {
+            Ok(conn) => conn,
+            Err(_) => {
+                ringline::sleep(Duration::from_millis(100)).await;
+                continue;
             }
         };
 
-        write_key(key_buf, key_id);
+        metrics::CONNECTIONS_ACTIVE.increment();
 
-        // Flush pending data first
-        flush_session(conn, session)?;
+        tracing::debug!(
+            worker = state.task_state.worker_id,
+            endpoint = %endpoint,
+            conn_index = conn.index(),
+            "connected (Ping)"
+        );
 
-        if let Some(suffix) = session.encode_set_prefix(set_prefix_buf, key_buf, value_len) {
-            let prefix_len = set_prefix_buf.len();
-            let suffix_len = suffix.len();
-            if let Err(e) =
-                send_set_parts(conn, set_prefix_buf, rng, &state.task_state.value_pool, value_len, pool_len, suffix)
-            {
-                // Put key back on failure
-                let mut queue = state.task_state.prefill_queue.lock().unwrap();
-                queue.push_front(key_id);
-                if e.kind() != io::ErrorKind::Other {
-                    return Err(DisconnectReason::SendError);
-                }
-                break;
-            }
-            session.confirm_set_sent(prefix_len, value_len, suffix_len, now);
-            prefill_in_flight.push_back(key_id);
-            metrics::REQUESTS_SENT.increment();
-        } else {
-            // Put key back if we can't encode
-            let mut queue = state.task_state.prefill_queue.lock().unwrap();
-            queue.push_front(key_id);
-            break;
-        }
-    }
+        let result = drive_ping_workload(&conn, &state).await;
 
-    Ok(())
-}
+        metrics::CONNECTIONS_ACTIVE.decrement();
 
-/// Handle prefill response tracking.
-fn handle_prefill_results(
-    results: &[RequestResult],
-    state: &Arc<SharedWorkerState>,
-    prefill_in_flight: &mut VecDeque<usize>,
-    prefill_confirmed: &mut usize,
-) {
-    if state.is_prefill_done() {
-        return;
-    }
-
-    let mut confirmed_batch = 0usize;
-    for result in results {
-        if result.request_type == RequestType::Set
-            && let Some(key_id) = prefill_in_flight.pop_front()
-        {
-            if result.success {
-                *prefill_confirmed += 1;
-                confirmed_batch += 1;
-            } else {
-                // Put failed key back
-                let mut queue = state.task_state.prefill_queue.lock().unwrap();
-                queue.push_back(key_id);
+        match result {
+            Ok(()) => return,
+            Err(reason) => {
+                metrics::CONNECTIONS_FAILED.increment();
+                record_disconnect_reason(reason);
             }
         }
-    }
 
-    if confirmed_batch > 0 {
-        let new_total = state
-            .task_state
-            .shared
-            .prefill_keys_confirmed
-            .fetch_add(confirmed_batch, Ordering::AcqRel)
-            + confirmed_batch;
-
-        if new_total >= state.prefill_total && state.prefill_total > 0 {
-            // Use CAS to ensure only one task marks completion
-            if state
-                .prefill_done
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                tracing::debug!(
-                    worker_id = state.task_state.worker_id,
-                    confirmed = new_total,
-                    total = state.prefill_total,
-                    "prefill complete"
-                );
-                state.task_state.shared.mark_prefill_complete();
-            }
-        }
+        ringline::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// Handle cluster redirects (MOVED/ASK) from response results.
-fn handle_cluster_redirects(results: &[RequestResult], state: &Arc<SharedWorkerState>) {
-    let mut slot_table = state.task_state.slot_table.lock().unwrap();
-    if slot_table.is_none() {
-        return;
-    }
-
-    for result in results {
-        if let Some(ref redirect) = result.redirect {
-            metrics::CLUSTER_REDIRECTS.increment();
-            if redirect.kind == resp_proto::RedirectKind::Moved {
-                if let Ok(addr) = redirect.address.parse::<SocketAddr>() {
-                    // Find existing endpoint or note that we need to add it
-                    let endpoint_idx = state.task_state.endpoints.iter().position(|a| *a == addr);
-                    if let Some(idx) = endpoint_idx {
-                        slot_table.as_mut().unwrap()[redirect.slot as usize] = idx as u16;
-                    }
-                    // Note: we cannot dynamically add endpoints to the shared
-                    // Vec from a task. In the async model, new endpoints require
-                    // a slot table update from the orchestrator. For now, log
-                    // if we see a redirect to an unknown endpoint.
-                    if endpoint_idx.is_none() {
-                        tracing::warn!(
-                            worker = state.task_state.worker_id,
-                            addr = %addr,
-                            slot = redirect.slot,
-                            "MOVED redirect to unknown endpoint (cannot add dynamically)"
-                        );
-                    }
-                }
-            }
-            // ASK: count but don't update slot table (migration in progress)
-        }
-    }
-}
-
-/// Route a key to an endpoint index.
-fn route_key(state: &TaskSharedState, key: &[u8]) -> usize {
-    let slot_table = state.slot_table.lock().unwrap();
-    if let Some(ref table) = *slot_table {
-        let slot = resp_proto::hash_slot(key);
-        table[slot as usize] as usize
-    } else if state.endpoints.len() == 1 {
-        0
-    } else {
-        state.ring.route(key)
-    }
-}
-
-/// Flush a session's send buffer via the connection.
-fn flush_session(conn: &ConnCtx, session: &mut Session) -> Result<(), DisconnectReason> {
-    let send_buf = session.send_buffer();
-    if send_buf.is_empty() {
-        return Ok(());
-    }
-
-    let n = send_buf.len();
-    match conn.send_nowait(&send_buf[..n]) {
-        Ok(()) => {
-            session.bytes_sent(n);
-            Ok(())
-        }
-        Err(e) => {
-            if e.kind() != io::ErrorKind::Other {
-                tracing::debug!(error = %e, "send error (closing)");
-                Err(DisconnectReason::SendError)
-            } else {
-                tracing::debug!(error = %e, "send pool exhausted");
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Submit a guard-based SET send via send_parts().
-fn send_set_parts(
+/// Drive the Ping workload: send PING, parse PONG, repeat.
+async fn drive_ping_workload(
     conn: &ConnCtx,
-    set_prefix_buf: &[u8],
-    rng: &mut Xoshiro256PlusPlus,
-    value_pool: &Arc<Vec<u8>>,
-    value_len: usize,
-    pool_len: usize,
-    suffix: &'static [u8],
-) -> io::Result<()> {
-    // Pick a random offset into the value pool
-    let max_offset = pool_len - value_len;
-    let offset = rng.random_range(0..=max_offset);
-
-    let guard = ValuePoolGuard {
-        pool: Arc::clone(value_pool),
-        offset: offset as u32,
-        len: value_len as u32,
-    };
-
-    let prefix_copy = set_prefix_buf.to_vec();
-    let suffix_copy = if !suffix.is_empty() {
-        Some(suffix.to_vec())
-    } else {
-        None
-    };
-
-    conn.send_parts().build(move |b| {
-        let mut builder = b.copy(&prefix_copy);
-        builder = builder.guard(GuardBox::new(guard));
-        if let Some(ref s) = suffix_copy {
-            builder = builder.copy(s);
+    state: &Arc<SharedWorkerState>,
+) -> Result<(), DisconnectReason> {
+    loop {
+        let phase = state.task_state.shared.phase();
+        if phase.should_stop() {
+            return Ok(());
         }
-        builder.submit()
-    })
+
+        // Skip Connect/Prefill phases (no prefill for ping)
+        if phase != Phase::Warmup && phase != Phase::Running {
+            // Mark prefill as done if in Prefill phase
+            if phase == Phase::Prefill && !state.is_prefill_done() {
+                if state
+                    .prefill_done
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    state.task_state.shared.mark_prefill_complete();
+                }
+            }
+            continue;
+        }
+
+        let recording = phase.is_recording();
+
+        // Rate limiting
+        if let Some(ref rl) = state.task_state.ratelimiter
+            && !rl.try_acquire()
+        {
+            continue;
+        }
+
+        // Send PING
+        let start = Instant::now();
+        if let Err(_) = conn.send(b"PING\r\n") {
+            return Err(DisconnectReason::SendError);
+        }
+        metrics::REQUESTS_SENT.increment();
+
+        // Wait for PONG response
+        let consumed = conn
+            .with_data(|data| {
+                if data.is_empty() {
+                    return ParseResult::Consumed(0);
+                }
+                match protocol_ping::Response::parse(data) {
+                    Ok((_response, consumed)) => ParseResult::Consumed(consumed),
+                    Err(protocol_ping::ParseError::Incomplete) => ParseResult::Consumed(0),
+                    Err(_) => ParseResult::Consumed(data.len()),
+                }
+            })
+            .await;
+
+        let latency_ns = start.elapsed().as_nanos() as u64;
+
+        if consumed == 0 {
+            return Err(DisconnectReason::Eof);
+        }
+
+        metrics::RESPONSES_RECEIVED.increment();
+        metrics::GET_COUNT.increment(); // Ping counts as GET for metrics
+
+        if recording {
+            let _ = metrics::RESPONSE_LATENCY.increment(latency_ns);
+            let _ = metrics::GET_LATENCY.increment(latency_ns);
+        }
+    }
 }
 
 // ── Momento connection task ──────────────────────────────────────────────
@@ -1526,13 +1650,59 @@ fn handle_momento_prefill_results(results: &[RequestResult], state: &Arc<SharedW
     }
 }
 
+// ── Prefill helpers ──────────────────────────────────────────────────────
+
+/// Confirm a single prefill key was successfully stored.
+fn confirm_prefill_key(state: &Arc<SharedWorkerState>) {
+    let new_total = state
+        .task_state
+        .shared
+        .prefill_keys_confirmed
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+
+    if new_total >= state.prefill_total && state.prefill_total > 0 {
+        if state
+            .prefill_done
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tracing::debug!(
+                worker_id = state.task_state.worker_id,
+                confirmed = new_total,
+                total = state.prefill_total,
+                "prefill complete"
+            );
+            state.task_state.shared.mark_prefill_complete();
+        }
+    }
+}
+
+/// Put a prefill key back in the queue on failure.
+fn requeue_prefill_key(state: &Arc<SharedWorkerState>, key_id: usize) {
+    let mut queue = state.task_state.prefill_queue.lock().unwrap();
+    queue.push_front(key_id);
+}
+
 // ── Utility functions ────────────────────────────────────────────────────
+
+/// Record disconnect reason metrics.
+fn record_disconnect_reason(reason: DisconnectReason) {
+    match reason {
+        DisconnectReason::Eof => metrics::DISCONNECTS_EOF.increment(),
+        DisconnectReason::RecvError => metrics::DISCONNECTS_RECV_ERROR.increment(),
+        DisconnectReason::SendError => metrics::DISCONNECTS_SEND_ERROR.increment(),
+        DisconnectReason::ClosedEvent => metrics::DISCONNECTS_CLOSED_EVENT.increment(),
+        DisconnectReason::ErrorEvent => metrics::DISCONNECTS_ERROR_EVENT.increment(),
+        DisconnectReason::ConnectFailed => metrics::DISCONNECTS_CONNECT_FAILED.increment(),
+    }
+}
 
 /// Record counter metrics for a completed request result (always called).
 fn record_counters(result: &RequestResult) {
     metrics::RESPONSES_RECEIVED.increment();
     if result.redirect.is_some() {
-        // Redirects are counted via CLUSTER_REDIRECTS in handle_cluster_redirects, not as errors
+        // Redirects are counted via CLUSTER_REDIRECTS, not as errors
     } else if result.is_error_response {
         metrics::REQUEST_ERRORS.increment();
     }
@@ -1572,6 +1742,19 @@ fn record_latencies(result: &RequestResult) {
             let _ = metrics::DELETE_LATENCY.increment(result.latency_ns);
         }
         RequestType::Ping | RequestType::Other => {}
+    }
+}
+
+/// Route a key to an endpoint index.
+fn route_key(state: &TaskSharedState, key: &[u8]) -> usize {
+    let slot_table = state.slot_table.lock().unwrap();
+    if let Some(ref table) = *slot_table {
+        let slot = resp_proto::hash_slot(key);
+        table[slot as usize] as usize
+    } else if state.endpoints.len() == 1 {
+        0
+    } else {
+        state.ring.route(key)
     }
 }
 

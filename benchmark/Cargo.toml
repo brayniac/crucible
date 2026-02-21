@@ -25,8 +25,11 @@ crossbeam-channel = { workspace = true }
 # Protocol implementations
 protocol-ping = { workspace = true }
 resp-proto = { workspace = true, features = ["resp3"] }
-memcache-proto = { workspace = true, features = ["full"] }
 protocol-momento = { workspace = true }
+
+# Client crates
+ringline-redis = { workspace = true }
+ringline-memcache = { workspace = true }
 
 # Metrics
 metrics = { workspace = true }
