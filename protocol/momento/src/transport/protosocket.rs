@@ -11,7 +11,7 @@ use crate::proto::{
 };
 
 use bytes::{Bytes, BytesMut};
-use http2::Transport;
+use http2_proto::Transport;
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
@@ -379,7 +379,7 @@ impl<T: Transport> MomentoTransport for ProtosocketTransport<T> {
 mod tests {
     use super::*;
     use crate::proto::StatusCode;
-    use http2::PlainTransport;
+    use http2_proto::PlainTransport;
 
     #[test]
     fn test_protosocket_transport_new() {

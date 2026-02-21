@@ -10,7 +10,7 @@ description = "High-performance cache protocol benchmark tool"
 [dependencies]
 # I/O event loop
 ringline = { workspace = true, features = ["tls"] }
-http2 = { workspace = true, features = ["tls"] }
+http2-proto = { workspace = true, features = ["tls"] }
 
 # TLS
 rustls = { workspace = true, features = ["std", "ring"] }

@@ -26,7 +26,7 @@
 //! ```
 
 use crate::Credential;
-use http2::{
+use http2_proto::{
     Connection, ConnectionEvent, ConnectionState, HeaderField, TlsConfig, TlsTransport, Transport,
     TransportState,
 };

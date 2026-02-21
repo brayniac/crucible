@@ -12,7 +12,7 @@
 mod grpc;
 mod protosocket;
 
-pub use grpc::GrpcTransport;
+pub use self::grpc::GrpcTransport;
 pub use protosocket::ProtosocketTransport;
 
 use crate::CacheValue;
@@ -46,8 +46,8 @@ impl From<u64> for RequestId {
     }
 }
 
-impl From<::grpc::StreamId> for RequestId {
-    fn from(id: ::grpc::StreamId) -> Self {
+impl From<::grpc_proto::StreamId> for RequestId {
+    fn from(id: ::grpc_proto::StreamId) -> Self {
         Self(id.value() as u64)
     }
 }
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_request_id_from_stream_id() {
-        let stream_id = ::grpc::StreamId::new(7);
+        let stream_id = ::grpc_proto::StreamId::new(7);
         let request_id: RequestId = stream_id.into();
         assert_eq!(request_id.value(), 7);
     }

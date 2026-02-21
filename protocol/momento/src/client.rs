@@ -8,8 +8,8 @@ use crate::transport::{
 };
 
 use bytes::Bytes;
-use grpc::StreamId;
-use http2::{TlsConfig, TlsTransport, Transport};
+use grpc_proto::StreamId;
+use http2_proto::{TlsConfig, TlsTransport, Transport};
 use std::io;
 use std::time::Duration;
 
@@ -436,7 +436,7 @@ impl<T: Transport> CacheClient<T> {
     /// Get the underlying gRPC channel (if using gRPC transport).
     ///
     /// Returns `None` if using protosocket transport.
-    pub fn channel(&self) -> Option<&grpc::Channel<T>> {
+    pub fn channel(&self) -> Option<&grpc_proto::Channel<T>> {
         match &self.inner {
             TransportInner::Grpc(t) => Some(t.channel()),
             TransportInner::Protosocket(_) => None,
@@ -446,7 +446,7 @@ impl<T: Transport> CacheClient<T> {
     /// Get mutable access to the underlying gRPC channel (if using gRPC transport).
     ///
     /// Returns `None` if using protosocket transport.
-    pub fn channel_mut(&mut self) -> Option<&mut grpc::Channel<T>> {
+    pub fn channel_mut(&mut self) -> Option<&mut grpc_proto::Channel<T>> {
         match &mut self.inner {
             TransportInner::Grpc(t) => Some(t.channel_mut()),
             TransportInner::Protosocket(_) => None,
@@ -458,7 +458,7 @@ impl<T: Transport> CacheClient<T> {
 mod tests {
     use super::*;
     use crate::proto::CacheResponse;
-    use http2::PlainTransport;
+    use http2_proto::PlainTransport;
 
     // CacheValue tests
 

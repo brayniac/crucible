@@ -9,8 +9,8 @@ description = "Lightweight Momento cache protocol implementation for ringline-ba
 
 [dependencies]
 bytes = { workspace = true }
-grpc = { workspace = true }
-http2 = { workspace = true }
+grpc-proto = { workspace = true }
+http2-proto = { workspace = true }
 
 [[bin]]
 name = "momento-cli"

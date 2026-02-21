@@ -11,7 +11,7 @@ use crate::proto::{
 };
 use crate::transport::RequestId;
 use bytes::Bytes;
-use grpc::{GrpcServerEvent, Request, Server, Status, StreamId};
+use grpc_proto::{GrpcServerEvent, Request, Server, Status, StreamId};
 use std::io;
 
 /// Method paths for the Momento cache API.
@@ -427,10 +427,10 @@ impl CacheServer {
             }
             ServerTransport::Protosocket { send_buf, .. } => {
                 let code = match status.code() {
-                    grpc::Code::NotFound => StatusCode::NotFound,
-                    grpc::Code::InvalidArgument => StatusCode::InvalidArgument,
-                    grpc::Code::PermissionDenied => StatusCode::PermissionDenied,
-                    grpc::Code::Unauthenticated => StatusCode::Unauthenticated,
+                    grpc_proto::Code::NotFound => StatusCode::NotFound,
+                    grpc_proto::Code::InvalidArgument => StatusCode::InvalidArgument,
+                    grpc_proto::Code::PermissionDenied => StatusCode::PermissionDenied,
+                    grpc_proto::Code::Unauthenticated => StatusCode::Unauthenticated,
                     _ => StatusCode::Unknown,
                 };
                 let response = crate::proto::CacheResponse::error(
@@ -505,7 +505,7 @@ impl Default for CacheServer {
 mod tests {
     use super::*;
     use crate::proto::{CacheCommand, DeleteRequest, GetRequest, SetRequest, UnaryCommand};
-    use grpc::{Metadata, Request};
+    use grpc_proto::{Metadata, Request};
 
     #[test]
     fn test_server_new() {

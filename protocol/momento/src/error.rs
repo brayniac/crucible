@@ -1,6 +1,6 @@
 //! Error types for the Momento client.
 
-use grpc::{Code, Status};
+use grpc_proto::{Code, Status};
 use std::fmt;
 use std::io;
 

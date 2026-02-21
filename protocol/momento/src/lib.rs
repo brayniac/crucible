@@ -24,7 +24,7 @@
 //!
 //! ```ignore
 //! use protocol_momento::{CacheClient, Credential, WireFormat};
-//! use http2::TlsConfig;
+//! use http2_proto::TlsConfig;
 //!
 //! // Create client with gRPC (default)
 //! let credential = Credential::from_token("your-api-token")?;
@@ -54,8 +54,8 @@ pub use error::{Error, Result};
 pub use server::{CacheRequest, CacheResponse, CacheServer, CacheServerBuilder, CacheServerEvent};
 
 // Re-export useful types
-pub use grpc::{Code, Status};
-pub use http2::{TlsConfig, TlsTransport};
+pub use grpc_proto::{Code, Status};
+pub use http2_proto::{TlsConfig, TlsTransport};
 
 /// Wire format for Momento communication.
 ///

@@ -10,9 +10,9 @@ use crate::proto::{
 };
 
 use bytes::Bytes;
-use grpc::{CallBuilder, CallEvent, Channel, Code, Status};
-use http2::Connection;
-use http2::Transport;
+use grpc_proto::{CallBuilder, CallEvent, Channel, Code, Status};
+use http2_proto::Connection;
+use http2_proto::Transport;
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
@@ -298,7 +298,7 @@ impl<T: Transport> MomentoTransport for GrpcTransport<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http2::PlainTransport;
+    use http2_proto::PlainTransport;
 
     #[test]
     fn test_grpc_transport_new() {

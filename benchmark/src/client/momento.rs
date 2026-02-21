@@ -8,7 +8,7 @@
 use super::{RequestResult, RequestType};
 use crate::config::{Config, MomentoWireFormat};
 
-use http2::PlainTransport;
+use http2_proto::PlainTransport;
 use protocol_momento::{
     CacheClient, CacheValue, CompletedOp, Credential, EndpointsFetcher, WireFormat,
 };

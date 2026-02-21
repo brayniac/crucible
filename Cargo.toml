@@ -8,11 +8,7 @@ members = [
 	"cache/slab",
 	"cache/heap",
 
-	# IO Framework and Transport
-	"io/grpc",
-	"io/http2",
-
-	# Protocol Implementations
+# Protocol Implementations
 	"protocol/momento",
 	"protocol/ping",
 
@@ -53,9 +49,6 @@ clap = "4"
 clocksource = "0.8"
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
-http-body-util = "0.1"
-hyper = "1"
-hyper-util = "0.1"
 itoa = "1.0"
 libc = "0.2"
 loom = "0.7"
@@ -80,8 +73,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
 ringline = { git = "https://github.com/ringline-rs/ringline", rev = "7780265" }
-http2 = { path = "io/http2" }
-grpc = { path = "io/grpc" }
+http2-proto = "0.0.1"
+grpc-proto = "0.0.1"
 protocol-momento = { path = "protocol/momento" }
 protocol-ping = { path = "protocol/ping" }
 resp-proto = "0.0.1"

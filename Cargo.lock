@@ -429,7 +429,7 @@ dependencies = [
  "ctrlc",
  "histogram",
  "http",
- "http2",
+ "http2-proto",
  "include_dir",
  "itoa",
  "ketama",
@@ -1080,11 +1080,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "grpc"
-version = "0.3.8"
+name = "grpc-proto"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "251e77f35a022f2ec42a80b004042570e6585506ddd7927d2f66c942edce6557"
 dependencies = [
  "bytes",
- "http2",
+ "http2-proto",
 ]
 
 [[package]]
@@ -1173,8 +1175,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "http2"
-version = "0.3.8"
+name = "http2-proto"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346ea9f18bd84e3c02dc9321afea9cec87576061357027c19ecfc707b2d4cc91"
 dependencies = [
  "bytes",
  "rustls",
@@ -2130,8 +2134,8 @@ name = "protocol-momento"
 version = "0.3.8"
 dependencies = [
  "bytes",
- "grpc",
- "http2",
+ "grpc-proto",
+ "http2-proto",
  "serial_test",
 ]
 
