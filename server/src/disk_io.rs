@@ -9,6 +9,7 @@ use cache_core::disk::{AlignedBuffer, AlignedBufferPool, DiskReadParams};
 use krio::{ConnToken, DirectIoFile, NvmeDevice};
 
 /// Backend for disk I/O operations.
+#[derive(Clone, Copy)]
 pub enum DiskBackend {
     /// NVMe passthrough via `/dev/ng*` character device.
     Nvme {

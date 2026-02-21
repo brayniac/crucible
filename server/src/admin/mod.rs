@@ -250,6 +250,11 @@ fn generate_prometheus_output(cache_stats_fn: &CacheStatsFn) -> String {
     {
         output.push_str("# TYPE cache_demotions counter\n");
         output.push_str(&format!("cache_demotions {}\n\n", stats.demotions));
+        output.push_str("# TYPE cache_demotion_failures counter\n");
+        output.push_str(&format!(
+            "cache_demotion_failures {}\n\n",
+            stats.demotion_failures
+        ));
         output.push_str("# TYPE cache_evictions counter\n");
         output.push_str(&format!("cache_evictions {}\n\n", stats.evictions));
     }

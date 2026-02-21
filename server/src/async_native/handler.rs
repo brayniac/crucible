@@ -8,8 +8,8 @@
 use crate::connection::{Connection, PendingDiskReadInfo, SliceRecvBuf};
 use crate::disk_io::DiskBackend;
 use crate::metrics::{
-    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_READS, DISK_READ_ERRORS, DISK_READ_HITS,
-    DISK_READ_MISSES, HITS, MISSES, WorkerStats,
+    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_FLUSHES, DISK_FLUSH_ERRORS, DISK_READS,
+    DISK_READ_ERRORS, DISK_READ_HITS, DISK_READ_MISSES, HITS, MISSES, WorkerStats,
 };
 use crate::native::handler::DiskIoWorkerConfig;
 use bytes::Bytes;
@@ -118,10 +118,6 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
         CONNECTIONS_ACCEPTED.increment();
         CONNECTIONS_ACTIVE.increment();
 
-        // Take the disk I/O config (if not yet consumed) so the first async
-        // task to run can initialize it inside the executor context.
-        let pending_disk_io_config = self.disk_io_config.lock().unwrap().take();
-
         let cache = Arc::clone(&self.cache);
         let cfg = ConnConfig {
             max_value_size: self.max_value_size,
@@ -131,19 +127,22 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
         };
         let disk_io = Arc::clone(&self.disk_io);
 
-        Box::pin(handle_connection(
-            conn,
-            cache,
-            cfg,
-            disk_io,
-            pending_disk_io_config,
-        ))
+        Box::pin(handle_connection(conn, cache, cfg, disk_io))
     }
 
     fn on_tick(&mut self, ctx: &mut DriverCtx<'_>) {
         if self.shutdown.load(Ordering::Relaxed) {
             ctx.request_shutdown();
         }
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        // Spawn a flush worker task if disk I/O is configured.
+        let disk_io_config = self.disk_io_config.lock().unwrap().take()?;
+        let disk_io = Arc::clone(&self.disk_io);
+        let cache = Arc::clone(&self.cache);
+        let shutdown = Arc::clone(&self.shutdown);
+        Some(Box::pin(flush_worker(disk_io_config, disk_io, cache, shutdown)))
     }
 
     fn create_for_worker(worker_id: usize) -> Self {
@@ -166,10 +165,88 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
     }
 }
 
+/// Background flush worker task.
+///
+/// Eagerly initializes disk I/O and then loops, draining the cache's flush
+/// queue and submitting io_uring writes. Runs as a standalone krio task
+/// alongside per-connection tasks.
+async fn flush_worker<C: Cache>(
+    config: DiskIoWorkerConfig,
+    disk_io: Arc<Mutex<Option<AsyncDiskIo>>>,
+    cache: Arc<C>,
+    shutdown: Arc<AtomicBool>,
+) {
+    // Initialize disk I/O eagerly so connections can read from disk immediately.
+    let flush_backend = match init_async_disk_io(&config) {
+        Ok(state) => {
+            let backend = state.backend.clone();
+            *disk_io.lock().unwrap() = Some(state);
+            backend
+        }
+        Err(e) => {
+            tracing::error!("Failed to initialize async disk I/O: {e}");
+            return;
+        }
+    };
+
+    // Loop: sleep briefly, drain flush queue, submit writes, complete flushes.
+    loop {
+        krio::sleep(std::time::Duration::from_millis(1)).await;
+
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let flush_requests = cache.take_flush_queue();
+        if flush_requests.is_empty() {
+            continue;
+        }
+
+        for req in flush_requests {
+            let result = match &flush_backend {
+                DiskBackend::DirectIo { file, .. } => unsafe {
+                    match krio::direct_io_write(
+                        *file,
+                        req.disk_offset,
+                        req.buffer_ptr,
+                        req.buffer_len,
+                    ) {
+                        Ok(fut) => fut.await,
+                        Err(e) => Err(e),
+                    }
+                },
+                DiskBackend::Nvme { device, block_size } => {
+                    let lba = req.disk_offset / *block_size as u64;
+                    let num_blocks = (req.buffer_len / *block_size) as u16;
+                    match krio::nvme_write(
+                        *device,
+                        lba,
+                        num_blocks,
+                        req.buffer_ptr as u64,
+                        req.buffer_len,
+                    ) {
+                        Ok(fut) => fut.await,
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+
+            DISK_FLUSHES.increment();
+            if let Err(e) = result {
+                DISK_FLUSH_ERRORS.increment();
+                tracing::warn!("Disk flush failed: {e}");
+            }
+
+            // Detach write buffer and return it to the pool.
+            cache.complete_flush(req.segment_id);
+        }
+    }
+}
+
 /// Initialize disk I/O for this worker using krio async free functions.
 ///
-/// Must be called from within the executor context (e.g., during `on_accept`).
-fn init_async_disk_io(config: DiskIoWorkerConfig) -> io::Result<AsyncDiskIo> {
+/// Must be called from within the executor context (e.g., during `on_start`).
+fn init_async_disk_io(config: &DiskIoWorkerConfig) -> io::Result<AsyncDiskIo> {
     let backend = match &config.backend {
         cache_core::DiskIoBackend::Nvme { device_path, nsid } => {
             let device = krio::open_nvme_device(device_path, *nsid)?;
@@ -220,25 +297,7 @@ async fn handle_connection<C: Cache>(
     cache: Arc<C>,
     cfg: ConnConfig,
     disk_io: Arc<Mutex<Option<AsyncDiskIo>>>,
-    pending_disk_io_config: Option<DiskIoWorkerConfig>,
 ) {
-    // Lazy-initialize disk I/O on the first connection task that carries
-    // the config. This runs inside the executor context (poll_ready_tasks)
-    // where krio::open_direct_io_file() is available.
-    if let Some(dio_config) = pending_disk_io_config {
-        let needs_init = disk_io.lock().unwrap().is_none();
-        if needs_init {
-            match init_async_disk_io(dio_config) {
-                Ok(state) => {
-                    *disk_io.lock().unwrap() = Some(state);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to initialize async disk I/O: {e}");
-                }
-            }
-        }
-    }
-
     let mut connection = if cfg.set_retry_timeout_us > 0 {
         Connection::with_retry(cfg.max_value_size, cfg.allow_flush)
     } else {
@@ -301,6 +360,7 @@ async fn handle_connection<C: Cache>(
                 let pending_info = connection.pending_disk_read.take().unwrap();
                 match submit_and_await_disk_read(
                     &disk_io,
+                    &*cache,
                     &conn,
                     &mut connection,
                     pending_info,
@@ -373,14 +433,19 @@ async fn handle_connection<C: Cache>(
 /// Submit a disk read via io_uring and await its completion inline.
 ///
 /// On success, parses the item from the read buffer and writes the protocol
-/// response. On failure, writes a miss response.
-async fn submit_and_await_disk_read(
+/// response. On failure, writes a miss response. Always releases the disk
+/// segment ref_count on completion.
+async fn submit_and_await_disk_read<C: Cache>(
     disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
+    cache: &C,
     conn: &ConnCtx,
     connection: &mut Connection,
     pending_info: PendingDiskReadInfo,
     slot_size: usize,
 ) -> Result<(), ()> {
+    let segment_id = pending_info.params.segment_id;
+    let pool_id = pending_info.params.pool_id;
+
     // 1. Allocate aligned read buffer.
     let mut buffer: cache_core::disk::AlignedBuffer = {
         let mut dio = disk_io.lock().unwrap();
@@ -391,6 +456,7 @@ async fn submit_and_await_disk_read(
                 DISK_READ_ERRORS.increment();
                 MISSES.increment();
                 connection.write_miss_response();
+                cache.release_disk_read(segment_id, pool_id);
                 return Ok(());
             }
         }
@@ -432,18 +498,20 @@ async fn submit_and_await_disk_read(
         Err(e) => Err(e),
     };
 
+    // Macro to release read buffer + segment ref_count on every exit path.
+    macro_rules! release_read {
+        ($buf:expr) => {
+            disk_io.lock().unwrap().as_mut().unwrap().read_buffer_pool.release($buf);
+            cache.release_disk_read(segment_id, pool_id);
+        };
+    }
+
     // 3. Parse result and write response (same logic as native/handler.rs).
     if result.is_err() {
         DISK_READ_ERRORS.increment();
         MISSES.increment();
         connection.write_miss_response();
-        disk_io
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .read_buffer_pool
-            .release(buffer);
+        release_read!(buffer);
         return Ok(());
     }
 
@@ -455,13 +523,7 @@ async fn submit_and_await_disk_read(
         DISK_READ_MISSES.increment();
         MISSES.increment();
         connection.write_miss_response();
-        disk_io
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .read_buffer_pool
-            .release(buffer);
+        release_read!(buffer);
         return Ok(());
     }
 
@@ -472,13 +534,7 @@ async fn submit_and_await_disk_read(
         DISK_READ_MISSES.increment();
         MISSES.increment();
         connection.write_miss_response();
-        disk_io
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .read_buffer_pool
-            .release(buffer);
+        release_read!(buffer);
         return Ok(());
     }
 
@@ -491,13 +547,7 @@ async fn submit_and_await_disk_read(
         DISK_READ_MISSES.increment();
         MISSES.increment();
         connection.write_miss_response();
-        disk_io
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .read_buffer_pool
-            .release(buffer);
+        release_read!(buffer);
         return Ok(());
     }
 
@@ -508,18 +558,14 @@ async fn submit_and_await_disk_read(
 
     // 4. Drain the response.
     if connection.has_pending_write() {
-        drain_pending(conn, connection, slot_size, false)
-            .await
-            .map_err(|_| ())?;
+        if drain_pending(conn, connection, slot_size, false).await.is_err() {
+            release_read!(buffer);
+            return Err(());
+        }
     }
 
-    disk_io
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .read_buffer_pool
-        .release(buffer);
+    // 5. Release read buffer and segment ref_count.
+    release_read!(buffer);
     Ok(())
 }
 

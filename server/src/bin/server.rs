@@ -147,6 +147,7 @@ fn create_segment(
         DiskTierConfig, EvictionPolicy as SegEvictionPolicy, HugepageSize, IoUringDiskTierConfig,
         MergeConfig, SegCache, SyncMode,
     };
+    use server::config::format_size;
 
     let hugepage_size = match config.cache.hugepage {
         HugepageConfig::None => HugepageSize::None,
@@ -196,6 +197,23 @@ fn create_segment(
                     promotion_threshold: disk_config.promotion_threshold,
                     ..Default::default()
                 };
+                let backend_name = match disk_config.io_backend {
+                    DiskIoBackendConfig::DirectIo => "directio",
+                    DiskIoBackendConfig::Nvme => "nvme",
+                    _ => unreachable!(),
+                };
+                eprintln!(
+                    "Disk tier: {} ({} segments x {}, write_buffers={})",
+                    format_size(disk_config.size),
+                    segment_count,
+                    format_size(config.cache.segment_size),
+                    io_uring_tier.write_buffer_count,
+                );
+                eprintln!(
+                    "Disk I/O:  {} (promotion_threshold={})",
+                    backend_name,
+                    disk_config.promotion_threshold,
+                );
                 builder = builder.io_uring_disk_tier(io_uring_tier);
             }
             DiskIoBackendConfig::Mmap => {
@@ -210,6 +228,13 @@ fn create_segment(
                     .sync_mode(sync_mode)
                     .recover_on_startup(disk_config.recover_on_startup);
 
+                eprintln!(
+                    "Disk tier: {} (mmap, sync={:?}, promotion_threshold={})",
+                    format_size(disk_config.size),
+                    disk_config.sync_mode,
+                    disk_config.promotion_threshold,
+                );
+                eprintln!("Disk path: {}", disk_config.path.display());
                 builder = builder.disk_tier(disk_tier);
             }
         }
