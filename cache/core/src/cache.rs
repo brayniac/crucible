@@ -440,7 +440,7 @@ pub struct CacheStats {
 
 impl CacheStats {
     /// Create a new zeroed stats instance.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             demotions: AtomicU64::new(0),
             evictions: AtomicU64::new(0),

@@ -584,7 +584,7 @@ pub trait Cache: Send + Sync + 'static {
 
     /// Drain the io_uring disk tier's flush queue.
     ///
-    /// Returns all pending [`FlushRequest`]s that need to be submitted as
+    /// Returns all pending [`crate::FlushRequest`]s that need to be submitted as
     /// io_uring writes. The server should call this periodically (e.g., in
     /// `on_tick`) and submit each request as a disk write, then call
     /// [`complete_flush`](Self::complete_flush) when the write completes.
