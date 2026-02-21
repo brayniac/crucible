@@ -9,33 +9,31 @@ Crucible is a high-performance cache server and benchmarking toolkit written in 
 - **Cache Server** (`crucible-server`) - Multi-protocol cache server supporting Redis (RESP) and Memcache protocols
 - **Benchmark Tool** (`crucible-benchmark`) - Load generator with detailed latency metrics
 - **Cache Libraries** - Multiple cache implementations (Segcache, Slab, Heap)
-- **I/O Framework** (`krio`) - Push-based io_uring event loop with callback-driven `EventHandler` trait
+- **Proxy** (`crucible-proxy`) - Redis proxy with optional local caching
 
 ## Design Philosophy
 
 Crucible is built for **performance-critical deployments where microseconds matter**. The architecture reflects deliberate trade-offs that prioritize latency predictability and throughput over developer convenience.
 
-### Why We Built Our Own I/O Framework (Not Tokio)
+### Why We Use ringline (Not Tokio)
 
 Tokio is an excellent general-purpose async runtime, but it abstracts away platform-specific capabilities that are essential for cache server performance:
 
-1. **Push-based callback model vs async/await**: Our `krio` framework uses an `EventHandler` trait with callbacks (`on_data`, `on_accept`, `on_connect`, `on_send_complete`, `on_close`, `on_tick`) instead of async/await. This eliminates task scheduler overhead, context switching, and the latency variance introduced by work-stealing. Each worker thread runs a tight event loop with predictable behavior.
+1. **Async task-per-connection model**: The [ringline](https://github.com/ringline-rs/ringline) framework provides an `AsyncEventHandler` trait where each accepted connection becomes an independent async task. The runtime uses io_uring directly with a thread-per-core model, eliminating the latency variance of work-stealing schedulers.
 
 2. **Direct access to io_uring features**: Tokio's abstractions hide advanced io_uring capabilities that we need:
    - **Multishot recv**: Single submission, multiple completions without re-submission overhead
    - **Ring-provided buffers**: Kernel-managed buffer pool for recv — the kernel selects buffers at completion time, eliminating pre-submission buffer assignment
    - **SendMsgZc**: Zero-copy send with scatter-gather — the kernel DMAs directly from application buffers. Cache values are sent without any copies via `SendGuard` references that pin memory until the kernel signals completion
    - **Fixed file table**: Connections use direct descriptors, eliminating per-syscall fd table lookups
-   - **Dedicated acceptor thread**: A separate thread runs blocking `accept4()` and distributes connections round-robin to workers via channels (multishot accept is on the roadmap)
+   - **Dedicated acceptor thread**: A separate thread runs blocking `accept4()` and distributes connections round-robin to workers via channels
 
 3. **End-to-end zero-copy data paths**: The server minimizes copies across the full request/response lifecycle:
    - **Writes (SET)**: Large values are streamed directly into cache segment memory via `SegmentReservation` — data goes from the kernel recv buffer straight into the cache with a single copy, no intermediate application buffers
    - **Reads (GET)**: Values are read from cache segments via `ValueRef` (reference-counted, no copy), converted to `Bytes`, and sent via `SendMsgZc` with `SendGuard` — zero copies from cache to kernel
-   - **Buffer lifecycle**: Our callback model provides precise control over when buffers can be released. `SendGuard` references pin cache memory until the kernel signals send completion via the ZC notification CQE
+   - **Buffer lifecycle**: `SendGuard` references pin cache memory until the kernel signals send completion via the ZC notification CQE
 
 4. **Thread-per-core with CPU pinning**: Workers are pinned to specific cores, keeping hot data in CPU cache. Tokio's work-stealing scheduler moves tasks between threads, invalidating caches and adding unpredictable latency.
-
-5. **Bundled infrastructure**: krio manages acceptor threads, worker threads, connection lifecycle, and the io_uring submission/completion loop internally—consumers only implement the `EventHandler` trait.
 
 ### Why The Benchmark Tool Doesn't Use Tokio
 
@@ -43,17 +41,17 @@ The benchmark needs to measure latency accurately without introducing measuremen
 
 - **Precise timing**: Direct `Instant::now()` calls at exact points in the event loop, not filtered through async task scheduling
 - **CPU pinning**: Threads pinned to cores for reproducible results across runs
-- **Same I/O advantages**: Uses `krio` to leverage io_uring on Linux, matching the server's I/O characteristics
+- **Same I/O advantages**: Uses ringline to leverage io_uring on Linux, matching the server's I/O characteristics
 - **Dual timestamp modes**: Supports both userspace timing and kernel SO_TIMESTAMPING for sub-microsecond accuracy
 
 The admin/metrics server within the benchmark *does* use Tokio—it's isolated on a separate thread where convenience matters more than latency.
 
 ### Runtime Architecture
 
-The server uses krio's native io_uring runtime for all cache I/O. Tokio is only used for the admin/metrics HTTP server, which runs on a separate thread where convenience matters more than latency.
+The server uses ringline's io_uring runtime for all cache I/O. Tokio is only used for the admin/metrics HTTP server, which runs on a separate thread where convenience matters more than latency.
 
-| Aspect | Cache I/O (krio) | Admin server (Tokio) |
-|--------|-------------------|---------------------|
+| Aspect | Cache I/O (ringline) | Admin server (Tokio) |
+|--------|----------------------|---------------------|
 | Threading | Thread-per-core with CPU pinning | Single-threaded Tokio runtime |
 | I/O | io_uring (Linux 6.0+) | Tokio reactor (epoll) |
 | Purpose | Performance-critical cache operations | Metrics, health checks |
@@ -122,46 +120,57 @@ crucible/
     segcache/   # Segment-based cache with TTL buckets
     slab/       # Memcached-style slab allocator with slab-level eviction
     heap/       # Heap-allocated cache using system allocator
-  io/
-    krio/     # Push-based io_uring event loop (EventHandler trait)
-    http2/      # HTTP/2 framing and Transport abstraction
-    grpc/       # gRPC client implementation
   protocol/
-    resp/       # Redis RESP2/RESP3 protocol
-    memcache/   # Memcache ASCII and binary protocols
-    momento/    # Momento cache protocol
+    momento/    # Momento cache protocol (gRPC + protosocket)
     ping/       # Simple ping protocol for testing
-  server/       # Cache server binary (krio/io_uring runtime)
+  server/       # Cache server binary (ringline/io_uring runtime)
+  proxy/        # Redis proxy with optional local caching
   benchmark/    # Benchmark tool binary
-  xtask/        # Development tasks (fuzz-all, flamegraph)
+  cache-bench/  # In-process cache benchmark
   metrics/      # Metrics infrastructure
+  xtask/        # Development tasks (fuzz-all, flamegraph)
 ```
 
-### Krio I/O Framework
+### External Dependencies (published crates)
 
-The `krio` crate provides a push-based io_uring event loop. Applications implement the `EventHandler` trait:
+| Crate | Description |
+|-------|-------------|
+| [ringline](https://github.com/ringline-rs/ringline) | io_uring event loop with AsyncEventHandler trait |
+| [resp-proto](https://crates.io/crates/resp-proto) | Redis RESP2/RESP3 protocol parser and encoder |
+| [memcache-proto](https://crates.io/crates/memcache-proto) | Memcache ASCII and binary protocol parser and encoder |
+| [http2-proto](https://crates.io/crates/http2-proto) | HTTP/2 framing and transport |
+| [grpc-proto](https://crates.io/crates/grpc-proto) | gRPC protocol framing layer |
+| [ketama](https://crates.io/crates/ketama) | Consistent hash ring (libmemcached/twemproxy compatible) |
+
+### Ringline I/O Framework
+
+The [ringline](https://github.com/ringline-rs/ringline) crate provides an io_uring event loop with an async task-per-connection model. Applications implement the `AsyncEventHandler` trait:
 
 ```rust
-// Applications implement EventHandler callbacks
-impl EventHandler for MyHandler {
+impl AsyncEventHandler for MyHandler {
     fn create_for_worker(worker_id: usize) -> Self { /* per-worker init */ }
-    fn on_accept(&mut self, ctx: &mut DriverCtx, conn: ConnToken) { /* new connection */ }
-    fn on_connect(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<()>) { /* outbound connect done */ }
-    fn on_data(&mut self, ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize { /* returns bytes consumed */ }
-    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) { /* send done */ }
-    fn on_close(&mut self, ctx: &mut DriverCtx, conn: ConnToken) { /* connection closed */ }
-    fn on_tick(&mut self, ctx: &mut DriverCtx) { /* periodic callback */ }
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn.with_data(|data| {
+                    // process data, send responses via conn.send() / conn.send_nowait()
+                    ringline::ParseResult::Consumed(data.len())
+                }).await;
+                if n == 0 { break; } // connection closed
+            }
+        }
+    }
 }
 
 // Launch with builder pattern
-KrioBuilder::new(config).bind("0.0.0.0:6379").launch::<MyHandler>()?;
+RinglineBuilder::new(config).bind(addr).launch::<MyHandler>()?;
 ```
 
 **Key features:**
 - **io_uring**: Multishot recv, SendMsgZc, ring-provided buffers, fixed file table
 - **Thread-per-core**: Dedicated acceptor thread + N pinned worker threads
-- **ConnToken**: Opaque connection handle with `index()` for per-connection state arrays
-- **DriverCtx**: `send()`, `send_parts()` (scatter-gather), `close()`, `shutdown_write()`, `connect()`, `connect_with_timeout()`, `request_shutdown()`, `peer_addr()`
+- **ConnCtx**: Connection context with `with_data()`, `send()`, `send_nowait()`, `send_parts()`
+- **Cross-connection I/O**: `spawn()` for outbound connections, `connect()` / `connect_tls()`
 
 **Platform**: Linux 6.0+ only (io_uring required).
 
@@ -232,6 +241,4 @@ policy = "s3fifo"    # Eviction policy (depends on backend)
 ## Testing
 
 - `/smoketest` - Quick end-to-end validation (starts server, runs benchmark, checks results)
-- Fuzz tests require nightly: `rustup run nightly cargo fuzz`
 - Loom tests (`--features loom`) verify lock-free concurrency but run slowly
-- Protocol fuzz targets in `protocol/*/fuzz/`

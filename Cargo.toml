@@ -18,10 +18,7 @@ members = [
 	# Proxy
 	"proxy",
 
-	# Consistent Hashing
-	"ketama",
-
-	# Benchmark Tool
+# Benchmark Tool
 	"benchmark",
 
 	# In-Process Cache Benchmark
@@ -84,7 +81,7 @@ segcache = { path = "cache/segcache" }
 slab-cache = { path = "cache/slab" }
 heap-cache = { path = "cache/heap" }
 metrics = { path = "metrics" }
-ketama = { path = "ketama" }
+ketama = "0.0.1"
 
 
 # Jemalloc allocator
