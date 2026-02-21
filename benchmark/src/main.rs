@@ -13,11 +13,11 @@ use benchmark::{
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use ringline::RinglineBuilder;
 use metriken::{AtomicHistogram, histogram::Histogram};
 use rand::RngCore;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
+use ringline::RinglineBuilder;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

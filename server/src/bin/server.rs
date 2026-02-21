@@ -200,8 +200,7 @@ fn create_segment(
                 );
                 eprintln!(
                     "Disk I/O:  {} (promotion_threshold={})",
-                    backend_name,
-                    disk_config.promotion_threshold,
+                    backend_name, disk_config.promotion_threshold,
                 );
                 builder = builder.io_uring_disk_tier(io_uring_tier);
             }

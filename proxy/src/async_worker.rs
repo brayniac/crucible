@@ -11,8 +11,8 @@ use crate::cache::SharedCache;
 use crate::config::Config;
 
 use bytes::BytesMut;
-use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, RinglineBuilder};
 use resp_proto::{Command, ParseError, Value};
+use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, RinglineBuilder};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;

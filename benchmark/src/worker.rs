@@ -343,10 +343,7 @@ impl AsyncEventHandler for BenchHandler {
         // Update recording state on phase transition
         if phase != self.last_phase {
             if phase == Phase::Running {
-                tracing::debug!(
-                    worker = self.id,
-                    "entering Running phase"
-                );
+                tracing::debug!(worker = self.id, "entering Running phase");
             }
             self.recording = phase.is_recording();
             self.last_phase = phase;
@@ -484,7 +481,11 @@ fn spawn_protocol_tasks(
     worker_id: usize,
 ) {
     let num_endpoints = worker_state.task_state.endpoints.len();
-    let total_connections = worker_state.task_state.config.connection.total_connections();
+    let total_connections = worker_state
+        .task_state
+        .config
+        .connection
+        .total_connections();
     let num_threads = worker_state.task_state.config.general.threads;
 
     let base_per_thread = total_connections / num_threads;
@@ -667,11 +668,7 @@ fn make_ping_callback() -> impl Fn(&ringline_ping::CommandResult) {
 // ── RESP connection task ─────────────────────────────────────────────────
 
 /// A single RESP (Redis) connection task that connects, drives workload, and reconnects.
-async fn resp_connection_task(
-    state: Arc<SharedWorkerState>,
-    endpoint_idx: usize,
-    seed: u64,
-) {
+async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, seed: u64) {
     let endpoint = state.task_state.endpoints[endpoint_idx];
     let config = &state.task_state.config;
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
@@ -809,8 +806,8 @@ async fn drive_resp_workload(
             match result {
                 Ok(()) => {
                     metrics::BACKFILL_SET_COUNT.increment();
-                    let _ = metrics::BACKFILL_SET_LATENCY
-                        .increment(start.elapsed().as_nanos() as u64);
+                    let _ =
+                        metrics::BACKFILL_SET_LATENCY.increment(start.elapsed().as_nanos() as u64);
                 }
                 Err(ringline_redis::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
@@ -895,11 +892,7 @@ async fn drive_resp_workload(
 }
 
 /// Check a RESP error for cluster redirects (MOVED/ASK) and update slot table.
-fn check_resp_redirect(
-    error: &ringline_redis::Error,
-    state: &Arc<SharedWorkerState>,
-    _key: &[u8],
-) {
+fn check_resp_redirect(error: &ringline_redis::Error, state: &Arc<SharedWorkerState>, _key: &[u8]) {
     let msg = match error {
         ringline_redis::Error::Redis(msg) => msg.as_str(),
         _ => return,
@@ -952,11 +945,7 @@ fn check_resp_redirect(
 // ── Memcache connection task ─────────────────────────────────────────────
 
 /// A single Memcache (ASCII) connection task.
-async fn memcache_connection_task(
-    state: Arc<SharedWorkerState>,
-    endpoint_idx: usize,
-    seed: u64,
-) {
+async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, seed: u64) {
     let endpoint = state.task_state.endpoints[endpoint_idx];
     let config = &state.task_state.config;
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
@@ -1094,8 +1083,8 @@ async fn drive_memcache_workload(
             match result {
                 Ok(()) => {
                     metrics::BACKFILL_SET_COUNT.increment();
-                    let _ = metrics::BACKFILL_SET_LATENCY
-                        .increment(start.elapsed().as_nanos() as u64);
+                    let _ =
+                        metrics::BACKFILL_SET_LATENCY.increment(start.elapsed().as_nanos() as u64);
                 }
                 Err(ringline_memcache::Error::ConnectionClosed) => {
                     return Err(DisconnectReason::Eof);
@@ -1165,11 +1154,7 @@ async fn drive_memcache_workload(
 // ── Ping connection task ─────────────────────────────────────────────────
 
 /// A single Ping protocol connection task.
-async fn ping_connection_task(
-    state: Arc<SharedWorkerState>,
-    endpoint_idx: usize,
-    _seed: u64,
-) {
+async fn ping_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, _seed: u64) {
     let endpoint = state.task_state.endpoints[endpoint_idx];
     let config = &state.task_state.config;
 
@@ -1264,11 +1249,7 @@ async fn drive_ping_workload(
 // ── Momento connection task ──────────────────────────────────────────────
 
 /// A single Momento TLS connection task.
-async fn momento_connection_task(
-    state: Arc<SharedWorkerState>,
-    conn_idx: usize,
-    seed: u64,
-) {
+async fn momento_connection_task(state: Arc<SharedWorkerState>, conn_idx: usize, seed: u64) {
     let config = &state.task_state.config;
     let (addr, tls_host) = {
         let setup_guard = state.task_state.momento_setup.lock().unwrap();
@@ -1410,25 +1391,34 @@ async fn drive_momento_session(
             drive_momento_prefill(conn, momento_conn, state, rng, key_buf, value_buf);
         } else if phase == Phase::Warmup || phase == Phase::Running {
             drive_momento_requests(
-                conn, momento_conn, state, rng, key_buf, value_buf, key_count, get_ratio,
+                conn,
+                momento_conn,
+                state,
+                rng,
+                key_buf,
+                value_buf,
+                key_count,
+                get_ratio,
                 delete_ratio,
             );
         }
 
         // Wait for response data
-        let consumed = conn.with_data(|data| {
-            if data.is_empty() {
-                return ParseResult::Consumed(0);
-            }
+        let consumed = conn
+            .with_data(|data| {
+                if data.is_empty() {
+                    return ParseResult::Consumed(0);
+                }
 
-            // Feed data into HTTP/2 framing layer
-            if let Err(e) = momento_conn.feed_data(data) {
-                tracing::debug!(error = %e, "Momento feed_data error");
-                return ParseResult::Consumed(data.len());
-            }
+                // Feed data into HTTP/2 framing layer
+                if let Err(e) = momento_conn.feed_data(data) {
+                    tracing::debug!(error = %e, "Momento feed_data error");
+                    return ParseResult::Consumed(data.len());
+                }
 
-            ParseResult::Consumed(data.len())
-        }).await;
+                ParseResult::Consumed(data.len())
+            })
+            .await;
 
         if consumed == 0 {
             return Err(DisconnectReason::Eof);
@@ -1526,7 +1516,10 @@ fn drive_momento_prefill(
         write_key(key_buf, key_id);
         rng.fill_bytes(value_buf);
 
-        if momento_conn.set(key_buf, value_buf, Instant::now()).is_none() {
+        if momento_conn
+            .set(key_buf, value_buf, Instant::now())
+            .is_none()
+        {
             let mut queue = state.task_state.prefill_queue.lock().unwrap();
             queue.push_front(key_id);
             break;

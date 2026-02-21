@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
 use proxy::async_worker::run_async;
+use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
 
 /// Serialize all async proxy tests to prevent global config channel races.
 static TEST_MUTEX: Mutex<()> = Mutex::new(());

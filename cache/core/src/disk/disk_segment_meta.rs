@@ -185,7 +185,11 @@ impl DiskSegmentMeta {
 
     /// Get the capacity of the attached write buffer (if present).
     pub fn write_buffer_capacity(&self) -> Option<usize> {
-        unsafe { (*self.write_buffer.get()).as_ref().map(|buf| buf.capacity()) }
+        unsafe {
+            (*self.write_buffer.get())
+                .as_ref()
+                .map(|buf| buf.capacity())
+        }
     }
 
     /// Get the pointer to the metadata atomic for ValueRef construction.

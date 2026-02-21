@@ -4,8 +4,8 @@
 //! No cache, no complex protocol handling - just pure I/O.
 
 use clap::Parser;
-use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, ParseResult, RinglineBuilder};
 use protocol_ping::Response;
+use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, ParseResult, RinglineBuilder};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;

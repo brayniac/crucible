@@ -6,6 +6,7 @@
 //! - Synchronous eviction when space is needed
 //! - Layer-based read with proper frequency tracking
 
+use crate::cache_trait::CacheInternalStats;
 use crate::cas::CasToken;
 use crate::config::LayerConfig;
 use crate::disk::{DiskLayer, FilePool, IoUringDiskLayer, IoUringPool};
@@ -19,7 +20,6 @@ use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentKeyVerify};
 use crate::slice_segment::SliceSegment;
-use crate::cache_trait::CacheInternalStats;
 use crate::sync::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

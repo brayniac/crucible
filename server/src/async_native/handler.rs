@@ -7,11 +7,11 @@
 
 use crate::connection::{Connection, PendingDiskReadInfo, SliceRecvBuf};
 use crate::disk_io::DiskBackend;
-use crate::metrics::{
-    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_FLUSHES, DISK_FLUSH_ERRORS, DISK_READS,
-    DISK_READ_ERRORS, DISK_READ_HITS, DISK_READ_MISSES, HITS, MISSES, WorkerStats,
-};
 use crate::disk_io::DiskIoWorkerConfig;
+use crate::metrics::{
+    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_FLUSH_ERRORS, DISK_FLUSHES, DISK_READ_ERRORS,
+    DISK_READ_HITS, DISK_READ_MISSES, DISK_READS, HITS, MISSES, WorkerStats,
+};
 use bytes::Bytes;
 use cache_core::Cache;
 use cache_core::disk::AlignedBufferPool;
@@ -142,7 +142,12 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
         let disk_io = Arc::clone(&self.disk_io);
         let cache = Arc::clone(&self.cache);
         let shutdown = Arc::clone(&self.shutdown);
-        Some(Box::pin(flush_worker(disk_io_config, disk_io, cache, shutdown)))
+        Some(Box::pin(flush_worker(
+            disk_io_config,
+            disk_io,
+            cache,
+            shutdown,
+        )))
     }
 
     fn create_for_worker(worker_id: usize) -> Self {
@@ -348,7 +353,9 @@ async fn handle_connection<C: Cache>(
                 connection.process_from(&mut buf, &*cache);
                 ringline::ParseResult::Consumed(buf.consumed())
             });
-            if sink_bytes == 0 && !matches!(processed, Some(ringline::ParseResult::Consumed(n)) if n > 0) {
+            if sink_bytes == 0
+                && !matches!(processed, Some(ringline::ParseResult::Consumed(n)) if n > 0)
+            {
                 break; // no progress — connection closed
             }
         }
@@ -501,7 +508,13 @@ async fn submit_and_await_disk_read<C: Cache>(
     // Macro to release read buffer + segment ref_count on every exit path.
     macro_rules! release_read {
         ($buf:expr) => {
-            disk_io.lock().unwrap().as_mut().unwrap().read_buffer_pool.release($buf);
+            disk_io
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .read_buffer_pool
+                .release($buf);
             cache.release_disk_read(segment_id, pool_id);
         };
     }
@@ -558,7 +571,10 @@ async fn submit_and_await_disk_read<C: Cache>(
 
     // 4. Drain the response.
     if connection.has_pending_write() {
-        if drain_pending(conn, connection, slot_size, false).await.is_err() {
+        if drain_pending(conn, connection, slot_size, false)
+            .await
+            .is_err()
+        {
             release_read!(buffer);
             return Err(());
         }

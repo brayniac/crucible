@@ -332,8 +332,7 @@ impl TtlLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location =
-                            ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
 
                         let verifier = SinglePoolVerifier { pool: &self.pool };
                         let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -351,13 +350,7 @@ impl TtlLayer {
                                     .data_slice(value_start as u32, value_len)
                                     .unwrap_or(&[]);
 
-                                demoter(
-                                    key,
-                                    value,
-                                    optional,
-                                    segment_ttl,
-                                    location.to_location(),
-                                );
+                                demoter(key, value, optional, segment_ttl, location.to_location());
                             }
                             ItemFate::Discard => {
                                 hashtable.remove(key, location.to_location());

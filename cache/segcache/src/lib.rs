@@ -55,10 +55,10 @@ use std::time::Duration;
 
 // Re-export common types from cache-core
 pub use cache_core::{
-    AtomicCounters, BasicHeader, BasicItemGuard, Cache, CacheError, CacheInternalStats,
-    CacheLayer, CacheMetrics, CacheResult, CounterSnapshot, DEFAULT_TTL, EvictionStrategy,
-    FrequencyDecay, HugepageSize, ItemLocation, LayerMetrics, LookupResult, MergeConfig,
-    OwnedGuard, PoolMetrics, SyncMode, ValueRef,
+    AtomicCounters, BasicHeader, BasicItemGuard, Cache, CacheError, CacheInternalStats, CacheLayer,
+    CacheMetrics, CacheResult, CounterSnapshot, DEFAULT_TTL, EvictionStrategy, FrequencyDecay,
+    HugepageSize, ItemLocation, LayerMetrics, LookupResult, MergeConfig, OwnedGuard, PoolMetrics,
+    SyncMode, ValueRef,
 };
 
 /// Eviction policy for the segmented cache.

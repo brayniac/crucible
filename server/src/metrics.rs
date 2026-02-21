@@ -76,7 +76,10 @@ pub static HITS: Counter = Counter::new(&CACHE, cache::HITS);
 pub static MISSES: Counter = Counter::new(&CACHE, cache::MISSES);
 
 // Disk tier metrics
-#[metric(name = "disk_reads", description = "Disk read I/O operations submitted")]
+#[metric(
+    name = "disk_reads",
+    description = "Disk read I/O operations submitted"
+)]
 pub static DISK_READS: Counter = Counter::new(&CACHE, cache::DISK_READS);
 
 #[metric(

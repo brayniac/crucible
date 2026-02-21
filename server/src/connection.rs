@@ -287,9 +287,9 @@ impl Connection {
                 self.pending_retry = None;
                 true
             }
-            Err(
-                cache_core::CacheError::OutOfMemory | cache_core::CacheError::HashTableFull,
-            ) => false,
+            Err(cache_core::CacheError::OutOfMemory | cache_core::CacheError::HashTableFull) => {
+                false
+            }
             Err(_) => {
                 // Non-retryable error, give up
                 self.abandon_retry();

@@ -158,7 +158,8 @@ fn test_demoted_items_have_correct_values() {
         if let Some(got) = cache.get(key.as_bytes()) {
             found += 1;
             assert_eq!(
-                got, expected,
+                got,
+                expected,
                 "Data corruption for key {} (len got={}, expected={})",
                 i,
                 got.len(),
@@ -174,10 +175,7 @@ fn test_demoted_items_have_correct_values() {
         found, verified, stats.demotions, stats.evictions
     );
 
-    assert!(
-        found > 0,
-        "Expected some items readable via get(), got 0"
-    );
+    assert!(found > 0, "Expected some items readable via get(), got 0");
     assert_eq!(found, verified, "All found items should have correct data");
 }
 
@@ -322,8 +320,7 @@ fn test_disk_read_params_point_to_correct_data() {
     // the server would write to the disk file).
     let mut disk_data: Vec<u8> = vec![0u8; 8 * segment_size]; // 8 disk segments
     for req in &flush_requests {
-        let src =
-            unsafe { std::slice::from_raw_parts(req.buffer_ptr, req.data_len as usize) };
+        let src = unsafe { std::slice::from_raw_parts(req.buffer_ptr, req.data_len as usize) };
         let offset = req.disk_offset as usize;
         disk_data[offset..offset + src.len()].copy_from_slice(src);
     }
@@ -366,8 +363,7 @@ fn test_disk_read_params_point_to_correct_data() {
             };
 
             // Extract value from the block
-            let key_start =
-                item_offset + BasicHeader::SIZE + header.optional_len() as usize;
+            let key_start = item_offset + BasicHeader::SIZE + header.optional_len() as usize;
             let value_start = key_start + header.key_len() as usize;
             let value_end = value_start + header.value_len() as usize;
 
@@ -377,9 +373,12 @@ fn test_disk_read_params_point_to_correct_data() {
 
             let actual_value = &block[value_start..value_end];
             assert_eq!(
-                actual_value, &expected_value[..],
+                actual_value,
+                &expected_value[..],
                 "Data mismatch for key k:{} (disk_offset={}, item_offset={})",
-                i, params.disk_offset, params.item_offset
+                i,
+                params.disk_offset,
+                params.item_offset
             );
             verified += 1;
         }
@@ -387,9 +386,7 @@ fn test_disk_read_params_point_to_correct_data() {
 
     eprintln!(
         "disk_reads={}, verified={}, demotions={}",
-        disk_reads,
-        verified,
-        stats.demotions
+        disk_reads, verified, stats.demotions
     );
 
     assert!(
