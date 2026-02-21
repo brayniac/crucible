@@ -3,10 +3,24 @@
 //! This module provides the server-side orchestration for disk-backed cache
 //! operations. The cache layer ([`cache_core::disk::IoUringDiskLayer`]) manages segment metadata
 //! and decides what to read; this module handles the actual I/O submission
-//! and completion via krio's NVMe or Direct I/O APIs.
+//! and completion via ringline's NVMe or Direct I/O APIs.
 
 use cache_core::disk::{AlignedBuffer, AlignedBufferPool, DiskReadParams};
-use krio::{ConnToken, DirectIoFile, NvmeDevice};
+use ringline::{ConnToken, DirectIoFile, NvmeDevice};
+
+/// Configuration for per-worker disk I/O initialization.
+pub(crate) struct DiskIoWorkerConfig {
+    /// Backend type.
+    pub backend: cache_core::DiskIoBackend,
+    /// Path to the disk file (used by DirectIo backend).
+    pub path: String,
+    /// Number of read buffers per worker.
+    pub read_buffer_count: usize,
+    /// Size of each read buffer (typically one block = 4096).
+    pub read_buffer_size: usize,
+    /// Block size for alignment.
+    pub block_size: u32,
+}
 
 /// Backend for disk I/O operations.
 #[derive(Clone, Copy)]

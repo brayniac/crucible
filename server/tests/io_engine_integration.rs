@@ -1,6 +1,6 @@
-//! Integration tests for the io_uring (krio) backend.
+//! Integration tests for the io_uring (ringline) backend.
 //!
-//! These tests verify that the server works correctly with the native krio
+//! These tests verify that the server works correctly with the native ringline
 //! backend, including the zero-copy recv path.
 //!
 //! Test dimensions:
@@ -95,7 +95,7 @@ fn start_test_server(port: u16, worker_threads: usize) -> thread::JoinHandle<()>
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_timeout = Duration::from_secs(5);
 
-        let _ = server::native::run(&config, cache, shutdown, drain_timeout);
+        let _ = server::async_native::run(&config, cache, shutdown, drain_timeout);
     })
 }
 
@@ -524,7 +524,7 @@ fn run_basic_test() {
 }
 
 // =============================================================================
-// io_uring (krio) backend tests
+// io_uring (ringline) backend tests
 // =============================================================================
 
 #[test]

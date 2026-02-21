@@ -30,7 +30,7 @@ protocol-resp = { workspace = true, features = ["resp3"] }
 protocol-memcache = { workspace = true, features = ["full"] }
 
 # I/O driver (native runtime)
-krio = { workspace = true, features = ["tls"] }
+ringline = { workspace = true, features = ["tls"] }
 
 # Core utilities
 bytes = { workspace = true }
@@ -72,7 +72,7 @@ rustls = { workspace = true, features = ["std", "ring"] }
 
 [[bin]]
 name = "crucible-server"
-path = "src/bin/server_async.rs"
+path = "src/bin/server.rs"
 
 [[bin]]
 name = "ping-server"

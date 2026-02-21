@@ -433,7 +433,6 @@ dependencies = [
  "include_dir",
  "itoa",
  "ketama",
- "krio",
  "libc",
  "metrics",
  "metriken",
@@ -447,6 +446,7 @@ dependencies = [
  "protocol-resp",
  "rand 0.9.2",
  "rand_xoshiro",
+ "ringline",
  "ringlog",
  "rustls",
  "serde",
@@ -1063,10 +1063,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "wasi",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -1076,11 +1074,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -1182,20 +1178,6 @@ version = "0.3.8"
 dependencies = [
  "bytes",
  "rustls",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "http3"
-version = "0.1.4"
-dependencies = [
- "bytes",
- "krio",
- "krio-quic",
- "quinn-proto",
- "rcgen",
- "rustls",
- "rustls-pki-types",
  "webpki-roots 0.26.11",
 ]
 
@@ -1399,61 +1381,6 @@ name = "ketama"
 version = "0.3.8"
 
 [[package]]
-name = "krio"
-version = "0.1.3"
-dependencies = [
- "bytes",
- "crossbeam-channel",
- "io-uring",
- "libc",
- "metriken",
- "pin-project-lite",
- "rustls",
-]
-
-[[package]]
-name = "krio-memcache"
-version = "0.1.4"
-dependencies = [
- "bytes",
- "ketama",
- "krio",
- "protocol-memcache",
- "segcache",
- "server",
- "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
-name = "krio-quic"
-version = "0.1.4"
-dependencies = [
- "bytes",
- "krio",
- "quinn-proto",
- "rcgen",
- "rustls",
- "rustls-pki-types",
- "slab",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "krio-redis"
-version = "0.1.4"
-dependencies = [
- "bytes",
- "ketama",
- "krio",
- "protocol-resp",
- "segcache",
- "server",
- "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1648,12 +1575,6 @@ dependencies = [
  "sparsevec",
  "vob",
 ]
-
-[[package]]
-name = "lru-slab"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
@@ -2053,16 +1974,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
-name = "pem"
-version = "3.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
-dependencies = [
- "base64",
- "serde_core",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2251,12 +2162,12 @@ dependencies = [
  "crossbeam-channel",
  "ctrlc",
  "ketama",
- "krio",
  "libc",
  "metrics",
  "metriken",
  "num_cpus",
  "protocol-resp",
+ "ringline",
  "segcache",
  "serde",
  "slab",
@@ -2265,27 +2176,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "quinn-proto"
-version = "0.11.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
-dependencies = [
- "bytes",
- "getrandom 0.3.4",
- "lru-slab",
- "rand 0.9.2",
- "ring",
- "rustc-hash",
- "rustls",
- "rustls-pki-types",
- "slab",
- "thiserror 2.0.18",
- "tinyvec",
- "tracing",
- "web-time",
 ]
 
 [[package]]
@@ -2377,19 +2267,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rcgen"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
-dependencies = [
- "pem",
- "ring",
- "rustls-pki-types",
- "time",
- "yasna",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2451,6 +2328,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ringline"
+version = "0.0.2-alpha.0"
+source = "git+https://github.com/ringline-rs/ringline?rev=7780265#7780265e406fc870059df9c7c6118e85f882e5a4"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "io-uring",
+ "libc",
+ "metriken",
+ "pin-project-lite",
+ "rustls",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ringlog"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2481,12 +2373,6 @@ dependencies = [
  "rmp",
  "serde",
 ]
-
-[[package]]
-name = "rustc-hash"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
 
 [[package]]
 name = "rustc_version"
@@ -2530,7 +2416,6 @@ version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
 dependencies = [
- "web-time",
  "zeroize",
 ]
 
@@ -2736,7 +2621,6 @@ dependencies = [
  "ctrlc",
  "heap-cache",
  "itoa",
- "krio",
  "libc",
  "metrics",
  "metriken",
@@ -2744,6 +2628,7 @@ dependencies = [
  "protocol-memcache",
  "protocol-ping",
  "protocol-resp",
+ "ringline",
  "rustls",
  "segcache",
  "serde",
@@ -3041,21 +2926,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "tinyvec"
-version = "1.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfa5fdc3bce6191a1dbc8c02d5c8bffcf557bafa17c124c5264a458f1b0613fa"
-dependencies = [
- "tinyvec_macros",
-]
-
-[[package]]
-name = "tinyvec_macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
@@ -3448,16 +3318,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "web-time"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "webpki-roots"
 version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3751,15 +3611,6 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
-]
-
-[[package]]
-name = "yasna"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
-dependencies = [
- "time",
 ]
 
 [[package]]

@@ -73,7 +73,7 @@ fn start_test_server(cache_port: u16) -> (thread::JoinHandle<()>, Arc<AtomicBool
 
         // Use a short drain timeout for tests
         let drain_timeout = Duration::from_millis(500);
-        let _ = server::native::run(&config, cache, shutdown_clone, drain_timeout);
+        let _ = server::async_native::run(&config, cache, shutdown_clone, drain_timeout);
     });
 
     (handle, shutdown)

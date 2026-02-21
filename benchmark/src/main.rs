@@ -13,7 +13,7 @@ use benchmark::{
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use krio::KrioBuilder;
+use ringline::RinglineBuilder;
 use metriken::{AtomicHistogram, histogram::Histogram};
 use rand::RngCore;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -244,7 +244,7 @@ fn run_benchmark(
         Arc::new(pool)
     };
 
-    // Set up config channel for krio workers
+    // Set up config channel for ringline workers
     let (config_tx, config_rx) = crossbeam_channel::bounded::<BenchWorkerConfig>(num_threads);
     #[allow(clippy::needless_range_loop)]
     for id in 0..num_threads {
@@ -264,7 +264,7 @@ fn run_benchmark(
     }
     init_config_channel(config_rx);
 
-    // Build krio config (client-only, no bind).
+    // Build ringline config (client-only, no bind).
     // With guard-based sends for SET values, the copy pool only holds small
     // protocol framing data, so the default 16KB slot size is sufficient.
     let tls_client = if config.target.protocol == CacheProtocol::Momento {
@@ -273,21 +273,21 @@ fn run_benchmark(
             MomentoWireFormat::Protosocket => protocol_momento::WireFormat::Protosocket,
         };
         let tls_config = build_momento_tls_config(wire_format)?;
-        Some(krio::TlsClientConfig {
+        Some(ringline::TlsClientConfig {
             client_config: Arc::new(tls_config),
         })
     } else {
         None
     };
 
-    let krio_config = krio::Config {
-        recv_buffer: krio::RecvBufferConfig {
+    let krio_config = ringline::Config {
+        recv_buffer: ringline::RecvBufferConfig {
             // Use 256KB buffers for io_uring to reduce CQE overhead with large values.
             ring_size: 1024u16.next_power_of_two(),
             buffer_size: 256 * 1024,
             ..Default::default()
         },
-        worker: krio::WorkerConfig {
+        worker: ringline::WorkerConfig {
             threads: num_threads,
             pin_to_core: false, // We pin in create_for_worker instead
             core_offset: 0,
@@ -297,11 +297,11 @@ fn run_benchmark(
         ..Default::default()
     };
 
-    // Launch krio workers (client-only, no bind)
-    tracing::debug!(num_threads, "launching krio workers");
+    // Launch ringline workers (client-only, no bind)
+    tracing::debug!(num_threads, "launching ringline workers");
     let (shutdown_handle, handles) =
-        KrioBuilder::new(krio_config).launch::<benchmark::worker::BenchHandler>()?;
-    tracing::debug!(workers = handles.len(), "krio workers launched");
+        RinglineBuilder::new(krio_config).launch::<benchmark::worker::BenchHandler>()?;
+    tracing::debug!(workers = handles.len(), "ringline workers launched");
 
     // Start in prefill or warmup phase
     if prefill_enabled {
@@ -644,7 +644,7 @@ fn run_benchmark(
         return Err("prefill failed: timed out or stalled".into());
     }
 
-    // Shutdown krio workers
+    // Shutdown ringline workers
     shutdown_handle.shutdown();
 
     // Wait for workers to finish with timeout

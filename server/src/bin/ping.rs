@@ -4,10 +4,9 @@
 //! No cache, no complex protocol handling - just pure I/O.
 
 use clap::Parser;
-use krio::{ConnToken, DriverCtx, EventHandler, KrioBuilder};
+use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, ParseResult, RinglineBuilder};
 use protocol_ping::Response;
 use serde::Deserialize;
-use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -112,130 +111,59 @@ impl Config {
     }
 }
 
-/// Per-connection state.
-struct Conn {
-    write_buf: Vec<u8>,
-    write_pos: usize,
-}
+/// Ping server async event handler.
+struct PingHandler;
 
-impl Conn {
-    fn new() -> Self {
-        Self {
-            write_buf: Vec::with_capacity(4096),
-            write_pos: 0,
-        }
-    }
+impl AsyncEventHandler for PingHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+        async move {
+            let mut write_buf = Vec::with_capacity(4096);
 
-    /// Process received data, returning number of bytes consumed.
-    fn process(&mut self, data: &[u8]) -> usize {
-        let mut consumed = 0;
-        let mut remaining = data;
+            loop {
+                let consumed = conn
+                    .with_data(|data| {
+                        if data.is_empty() {
+                            return ParseResult::Consumed(0);
+                        }
 
-        loop {
-            if remaining.len() >= 6 && &remaining[..6] == b"PING\r\n" {
-                remaining = &remaining[6..];
-                consumed += 6;
-                let start = self.write_buf.len();
-                self.write_buf.resize(start + 6, 0);
-                Response::Pong.encode(&mut self.write_buf[start..]);
-            } else {
-                break;
+                        let mut consumed = 0;
+                        let mut remaining = data;
+
+                        loop {
+                            if remaining.len() >= 6 && &remaining[..6] == b"PING\r\n" {
+                                remaining = &remaining[6..];
+                                consumed += 6;
+                                let start = write_buf.len();
+                                write_buf.resize(start + 6, 0);
+                                Response::Pong.encode(&mut write_buf[start..]);
+                            } else {
+                                break;
+                            }
+                        }
+
+                        ParseResult::Consumed(consumed)
+                    })
+                    .await;
+
+                if consumed == 0 {
+                    break;
+                }
+
+                // Send pending responses
+                if !write_buf.is_empty() {
+                    if conn.send_nowait(&write_buf).is_err() {
+                        break;
+                    }
+                    write_buf.clear();
+                }
             }
         }
-
-        consumed
     }
 
-    fn pending_write(&self) -> &[u8] {
-        &self.write_buf[self.write_pos..]
-    }
+    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {}
 
-    fn advance_write(&mut self, n: usize) {
-        self.write_pos += n;
-        if self.write_pos >= self.write_buf.len() {
-            self.write_buf.clear();
-            self.write_pos = 0;
-        }
-    }
-
-    fn has_pending_write(&self) -> bool {
-        self.write_pos < self.write_buf.len()
-    }
-}
-
-/// Ping server event handler.
-struct PingHandler {
-    connections: Vec<Option<Conn>>,
-}
-
-impl EventHandler for PingHandler {
     fn create_for_worker(_worker_id: usize) -> Self {
-        PingHandler {
-            connections: Vec::with_capacity(1024),
-        }
-    }
-
-    fn on_accept(&mut self, _ctx: &mut DriverCtx, conn: ConnToken) {
-        let idx = conn.index();
-        if idx >= self.connections.len() {
-            self.connections.resize_with(idx + 1, || None);
-        }
-        self.connections[idx] = Some(Conn::new());
-    }
-
-    fn on_data(&mut self, ctx: &mut DriverCtx, conn: ConnToken, data: &[u8]) -> usize {
-        let idx = conn.index();
-
-        if let Some(c) = self.connections.get_mut(idx).and_then(|c| c.as_mut()) {
-            let n = c.process(data);
-
-            // Send pending responses
-            while c.has_pending_write() {
-                match ctx.send(conn, c.pending_write()) {
-                    Ok(()) => {
-                        let len = c.pending_write().len();
-                        c.advance_write(len);
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            n
-        } else {
-            0
-        }
-    }
-
-    fn on_send_complete(&mut self, ctx: &mut DriverCtx, conn: ConnToken, result: io::Result<u32>) {
-        if result.is_err() {
-            ctx.close(conn);
-            let idx = conn.index();
-            if let Some(slot) = self.connections.get_mut(idx) {
-                *slot = None;
-            }
-            return;
-        }
-
-        // Try to send more pending data
-        let idx = conn.index();
-        if let Some(c) = self.connections.get_mut(idx).and_then(|c| c.as_mut()) {
-            while c.has_pending_write() {
-                match ctx.send(conn, c.pending_write()) {
-                    Ok(()) => {
-                        let len = c.pending_write().len();
-                        c.advance_write(len);
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-
-    fn on_close(&mut self, _ctx: &mut DriverCtx, conn: ConnToken) {
-        let idx = conn.index();
-        if let Some(slot) = self.connections.get_mut(idx) {
-            *slot = None;
-        }
+        PingHandler
     }
 }
 
@@ -255,15 +183,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Starting ping server on {}", listen);
 
-    let krio_config = krio::Config {
+    let krio_config = ringline::Config {
         sq_entries: config.uring.sq_depth,
         sqpoll: config.uring.sqpoll,
-        recv_buffer: krio::RecvBufferConfig {
+        recv_buffer: ringline::RecvBufferConfig {
             ring_size: config.uring.buffer_count.next_power_of_two(),
             buffer_size: config.uring.buffer_size,
             ..Default::default()
         },
-        worker: krio::WorkerConfig {
+        worker: ringline::WorkerConfig {
             threads: if threads == 0 { 0 } else { threads },
             pin_to_core: false,
             core_offset: 0,
@@ -279,8 +207,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("Listening on {} ({} workers)", listen, workers);
 
-    let (shutdown_handle, handles) = KrioBuilder::new(krio_config)
-        .bind(&listen.to_string())
+    let (shutdown_handle, handles) = RinglineBuilder::new(krio_config)
+        .bind(listen)
         .launch::<PingHandler>()?;
 
     // Wait for Ctrl+C

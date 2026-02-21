@@ -1,6 +1,6 @@
 //! Krio AsyncEventHandler implementation for the cache server.
 //!
-//! Mirrors `native/handler.rs` but uses krio's async API (one task per connection).
+//! Mirrors `native/handler.rs` but uses ringline's async API (one task per connection).
 //! The per-connection async task reuses `Connection::process_from()` for parsing
 //! and command execution, then drains pending writes via copy sends (small
 //! protocol framing) and zero-copy guard sends (large values).
@@ -11,11 +11,11 @@ use crate::metrics::{
     CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_FLUSHES, DISK_FLUSH_ERRORS, DISK_READS,
     DISK_READ_ERRORS, DISK_READ_HITS, DISK_READ_MISSES, HITS, MISSES, WorkerStats,
 };
-use crate::native::handler::DiskIoWorkerConfig;
+use crate::disk_io::DiskIoWorkerConfig;
 use bytes::Bytes;
 use cache_core::Cache;
 use cache_core::disk::AlignedBufferPool;
-use krio::{
+use ringline::{
     AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
     SendPart,
 };
@@ -87,7 +87,7 @@ pub(crate) fn wait_for_workers() {
 /// Per-worker disk I/O state for the async handler.
 ///
 /// Shared via `Rc<RefCell<...>>` so the per-connection async tasks can
-/// borrow it. This is safe because krio is single-threaded per worker.
+/// borrow it. This is safe because ringline is single-threaded per worker.
 struct AsyncDiskIo {
     backend: DiskBackend,
     read_buffer_pool: AlignedBufferPool,
@@ -107,14 +107,14 @@ pub(crate) struct AsyncServerHandler<C: Cache> {
     set_retry_timeout_us: u64,
     /// Shared disk I/O state, lazily initialized on first accept.
     /// Uses `Arc<Mutex<...>>` because `AsyncEventHandler` requires `Send`.
-    /// The Mutex is never contended (krio is single-threaded per worker).
+    /// The Mutex is never contended (ringline is single-threaded per worker).
     disk_io: Arc<Mutex<Option<AsyncDiskIo>>>,
     /// Saved config for deferred disk I/O initialization (needs executor context).
     disk_io_config: Mutex<Option<DiskIoWorkerConfig>>,
 }
 
 impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
-    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         CONNECTIONS_ACCEPTED.increment();
         CONNECTIONS_ACTIVE.increment();
 
@@ -168,7 +168,7 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
 /// Background flush worker task.
 ///
 /// Eagerly initializes disk I/O and then loops, draining the cache's flush
-/// queue and submitting io_uring writes. Runs as a standalone krio task
+/// queue and submitting io_uring writes. Runs as a standalone ringline task
 /// alongside per-connection tasks.
 async fn flush_worker<C: Cache>(
     config: DiskIoWorkerConfig,
@@ -191,7 +191,7 @@ async fn flush_worker<C: Cache>(
 
     // Loop: sleep briefly, drain flush queue, submit writes, complete flushes.
     loop {
-        krio::sleep(std::time::Duration::from_millis(1)).await;
+        ringline::sleep(std::time::Duration::from_millis(1)).await;
 
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -205,7 +205,7 @@ async fn flush_worker<C: Cache>(
         for req in flush_requests {
             let result = match &flush_backend {
                 DiskBackend::DirectIo { file, .. } => unsafe {
-                    match krio::direct_io_write(
+                    match ringline::direct_io_write(
                         *file,
                         req.disk_offset,
                         req.buffer_ptr,
@@ -218,7 +218,7 @@ async fn flush_worker<C: Cache>(
                 DiskBackend::Nvme { device, block_size } => {
                     let lba = req.disk_offset / *block_size as u64;
                     let num_blocks = (req.buffer_len / *block_size) as u16;
-                    match krio::nvme_write(
+                    match ringline::nvme_write(
                         *device,
                         lba,
                         num_blocks,
@@ -243,13 +243,13 @@ async fn flush_worker<C: Cache>(
     }
 }
 
-/// Initialize disk I/O for this worker using krio async free functions.
+/// Initialize disk I/O for this worker using ringline async free functions.
 ///
 /// Must be called from within the executor context (e.g., during `on_start`).
 fn init_async_disk_io(config: &DiskIoWorkerConfig) -> io::Result<AsyncDiskIo> {
     let backend = match &config.backend {
         cache_core::DiskIoBackend::Nvme { device_path, nsid } => {
-            let device = krio::open_nvme_device(device_path, *nsid)?;
+            let device = ringline::open_nvme_device(device_path, *nsid)?;
             DiskBackend::Nvme {
                 device,
                 block_size: config.block_size,
@@ -257,7 +257,7 @@ fn init_async_disk_io(config: &DiskIoWorkerConfig) -> io::Result<AsyncDiskIo> {
         }
 
         cache_core::DiskIoBackend::DirectIo => {
-            let file = krio::open_direct_io_file(&config.path)?;
+            let file = ringline::open_direct_io_file(&config.path)?;
             DiskBackend::DirectIo {
                 file,
                 block_size: config.block_size,
@@ -319,12 +319,12 @@ async fn handle_connection<C: Cache>(
         let consumed = conn
             .with_data(|data| {
                 if data.is_empty() {
-                    return 0; // EOF
+                    return ringline::ParseResult::Consumed(0); // EOF
                 }
 
                 let mut buf = SliceRecvBuf::new(data);
                 connection.process_from(&mut buf, &*cache);
-                buf.consumed()
+                ringline::ParseResult::Consumed(buf.consumed())
             })
             .await;
 
@@ -346,9 +346,9 @@ async fn handle_connection<C: Cache>(
             let processed = conn.try_with_data(|data| {
                 let mut buf = SliceRecvBuf::new(data);
                 connection.process_from(&mut buf, &*cache);
-                buf.consumed()
+                ringline::ParseResult::Consumed(buf.consumed())
             });
-            if sink_bytes == 0 && processed.unwrap_or(0) == 0 {
+            if sink_bytes == 0 && !matches!(processed, Some(ringline::ParseResult::Consumed(n)) if n > 0) {
                 break; // no progress — connection closed
             }
         }
@@ -396,9 +396,9 @@ async fn handle_connection<C: Cache>(
 
             SET_RETRIES.increment();
             let deadline =
-                krio::Deadline::after(Duration::from_micros(cfg.set_retry_timeout_us));
+                ringline::Deadline::after(Duration::from_micros(cfg.set_retry_timeout_us));
             loop {
-                krio::sleep(Duration::from_micros(50)).await;
+                ringline::sleep(Duration::from_micros(50)).await;
                 if connection.retry_set(&*cache) {
                     break; // succeeded or gave up on non-retryable error
                 }
@@ -470,7 +470,7 @@ async fn submit_and_await_disk_read<C: Cache>(
         let dio = dio.as_ref().unwrap();
         match &dio.backend {
             DiskBackend::DirectIo { file, .. } => unsafe {
-                krio::direct_io_read(
+                ringline::direct_io_read(
                     *file,
                     pending_info.params.disk_offset,
                     buffer.as_mut_ptr(),
@@ -480,7 +480,7 @@ async fn submit_and_await_disk_read<C: Cache>(
             DiskBackend::Nvme { device, block_size } => {
                 let lba = pending_info.params.disk_offset / *block_size as u64;
                 let num_blocks = (pending_info.params.read_len / *block_size) as u16;
-                krio::nvme_read(
+                ringline::nvme_read(
                     *device,
                     lba,
                     num_blocks,
@@ -621,7 +621,7 @@ async fn drain_pending(
             if parts.len() - part_idx == 1 && parts[part_idx].len() <= slot_size {
                 let data = &parts[part_idx];
                 if need_yield {
-                    match conn.send_await(data) {
+                    match conn.send(data) {
                         Ok(fut) => {
                             need_yield = false;
                             if fut.await.is_err() {
@@ -636,7 +636,7 @@ async fn drain_pending(
                         Err(_) => return Err(()),
                     }
                 } else {
-                    match conn.send(data) {
+                    match conn.send_nowait(data) {
                         Ok(()) => {}
                         Err(e) if e.kind() == io::ErrorKind::Other => {
                             connection.advance_write(advanced);
@@ -680,7 +680,7 @@ async fn drain_pending(
                 while offset < part.len() {
                     let end = (offset + slot_size).min(part.len());
                     if need_yield {
-                        match conn.send_await(&part[offset..end]) {
+                        match conn.send(&part[offset..end]) {
                             Ok(fut) => {
                                 need_yield = false;
                                 if fut.await.is_err() {
@@ -696,7 +696,7 @@ async fn drain_pending(
                             Err(_) => return Err(()),
                         }
                     } else {
-                        match conn.send(&part[offset..end]) {
+                        match conn.send_nowait(&part[offset..end]) {
                             Ok(()) => offset = end,
                             Err(e) if e.kind() == io::ErrorKind::Other => {
                                 connection.advance_write(advanced + offset);

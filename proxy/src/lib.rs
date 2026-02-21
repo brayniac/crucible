@@ -9,11 +9,9 @@ pub mod cache;
 pub mod client;
 pub mod config;
 pub mod metrics;
-pub mod worker;
 
 pub mod logging;
 pub mod signal;
 
 pub use async_worker::run_async;
 pub use config::Config;
-pub use worker::run;

@@ -18,10 +18,6 @@ struct Args {
     /// Print default configuration and exit
     #[arg(long)]
     print_config: bool,
-
-    /// Use async event handler (one task per connection)
-    #[arg(long = "async")]
-    use_async: bool,
 }
 
 fn main() {
@@ -53,11 +49,7 @@ fn main() {
     let shutdown = proxy::signal::install_signal_handler();
 
     // Run the proxy
-    let result = if args.use_async {
-        proxy::run_async(&config, shutdown)
-    } else {
-        proxy::run(&config, shutdown)
-    };
+    let result = proxy::run_async(&config, shutdown);
     if let Err(e) = result {
         tracing::error!(error = %e, "Proxy error");
         std::process::exit(1);

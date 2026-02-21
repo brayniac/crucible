@@ -1,4 +1,4 @@
-//! Async proxy worker using krio's AsyncEventHandler.
+//! Async proxy worker using ringline's AsyncEventHandler.
 //!
 //! Each client connection gets a dedicated async task that:
 //! 1. Connects to a backend on accept
@@ -11,12 +11,11 @@ use crate::cache::SharedCache;
 use crate::config::Config;
 
 use bytes::BytesMut;
-use krio::{AsyncEventHandler, ConnCtx, DriverCtx, KrioBuilder};
+use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, RinglineBuilder};
 use protocol_resp::{Command, ParseError, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,7 +48,7 @@ fn recv_config() -> AsyncProxyWorkerConfig {
 
 // ── AsyncProxyHandler ───────────────────────────────────────────────────
 
-/// Async proxy handler implementing krio's AsyncEventHandler.
+/// Async proxy handler implementing ringline's AsyncEventHandler.
 pub struct AsyncProxyHandler {
     #[allow(dead_code)]
     worker_id: usize,
@@ -60,7 +59,7 @@ pub struct AsyncProxyHandler {
 }
 
 impl AsyncEventHandler for AsyncProxyHandler {
-    fn on_accept(&self, client: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let cache = Arc::clone(&self.cache);
         let backends = self.backends.clone();
         let ring = self.ring.clone();
@@ -124,10 +123,10 @@ async fn handle_client(
         let got = client
             .with_data(|data| {
                 if data.is_empty() {
-                    return 0;
+                    return ringline::ParseResult::Consumed(0);
                 }
                 buf.extend_from_slice(data);
-                data.len()
+                ringline::ParseResult::Consumed(data.len())
             })
             .await;
 
@@ -288,10 +287,10 @@ async fn process_command(
         let got = backend
             .with_data(|data| {
                 if data.is_empty() {
-                    return 0;
+                    return ringline::ParseResult::Consumed(0);
                 }
                 resp_buf.extend_from_slice(data);
-                data.len()
+                ringline::ParseResult::Consumed(data.len())
             })
             .await;
 
@@ -432,14 +431,14 @@ pub fn run_async(
     }
     init_config_channel(config_rx);
 
-    // Build krio config.
-    let krio_config = krio::Config {
-        recv_buffer: krio::RecvBufferConfig {
+    // Build ringline config.
+    let krio_config = ringline::Config {
+        recv_buffer: ringline::RecvBufferConfig {
             ring_size: config.uring.buffer_count.next_power_of_two(),
             buffer_size: config.uring.buffer_size as u32,
             ..Default::default()
         },
-        worker: krio::WorkerConfig {
+        worker: ringline::WorkerConfig {
             threads: num_workers,
             pin_to_core: false, // We pin in create_for_worker.
             core_offset: 0,
@@ -449,10 +448,10 @@ pub fn run_async(
         ..Default::default()
     };
 
-    // Launch krio with async event handler.
-    let (shutdown_handle, handles) = KrioBuilder::new(krio_config)
-        .bind(&listen_addr.to_string())
-        .launch_async::<AsyncProxyHandler>()?;
+    // Launch ringline with async event handler.
+    let (shutdown_handle, handles) = RinglineBuilder::new(krio_config)
+        .bind(listen_addr)
+        .launch::<AsyncProxyHandler>()?;
 
     // Wait for shutdown signal.
     while !shutdown.load(Ordering::Relaxed) {

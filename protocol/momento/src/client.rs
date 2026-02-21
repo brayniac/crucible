@@ -302,7 +302,7 @@ impl<T: Transport> CacheClient<T> {
     /// Feed plaintext data directly, bypassing the Transport recv buffer.
     ///
     /// More efficient than `on_recv()` when TLS is handled externally
-    /// (e.g., by krio's native TLS). Skips the Transport recv buffer entirely.
+    /// (e.g., by ringline's native TLS). Skips the Transport recv buffer entirely.
     pub fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
         match &mut self.inner {
             TransportInner::Grpc(t) => t.feed_data(data),

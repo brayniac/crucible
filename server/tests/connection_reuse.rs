@@ -53,7 +53,7 @@ fn start_test_server(port: u16) -> thread::JoinHandle<()> {
         let drain_timeout = Duration::from_secs(5);
 
         // Run server (this blocks, but we'll kill the thread)
-        let _ = server::native::run(&config, cache, shutdown, drain_timeout);
+        let _ = server::async_native::run(&config, cache, shutdown, drain_timeout);
     })
 }
 

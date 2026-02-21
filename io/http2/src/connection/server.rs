@@ -121,7 +121,7 @@ impl ServerConnection {
     /// Feed plaintext data directly into the connection's frame buffer.
     ///
     /// Equivalent to `on_recv()` followed by `process()`, but named
-    /// consistently with `Connection::feed_data()` for krio integration.
+    /// consistently with `Connection::feed_data()` for ringline integration.
     pub fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {
         self.read_buf.extend_from_slice(data);
         self.process()

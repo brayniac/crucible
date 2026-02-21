@@ -59,7 +59,7 @@ fn start_test_server(
         let drain_timeout = Duration::from_secs(config.shutdown.drain_timeout_secs);
 
         // Run server
-        let _ = server::native::run(&config, cache, shutdown_clone, drain_timeout);
+        let _ = server::async_native::run(&config, cache, shutdown_clone, drain_timeout);
     });
 
     (handle, shutdown)

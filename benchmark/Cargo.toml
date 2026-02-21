@@ -9,7 +9,7 @@ description = "High-performance cache protocol benchmark tool"
 
 [dependencies]
 # I/O event loop
-krio = { workspace = true, features = ["tls"] }
+ringline = { workspace = true, features = ["tls"] }
 http2 = { workspace = true, features = ["tls"] }
 
 # TLS

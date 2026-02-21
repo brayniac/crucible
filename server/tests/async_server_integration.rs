@@ -1,7 +1,7 @@
-//! Integration tests for the async server (krio AsyncEventHandler).
+//! Integration tests for the async server (ringline AsyncEventHandler).
 //!
 //! Mirrors a subset of `io_engine_integration.rs` but uses
-//! `server::async_native::run()` instead of `server::native::run()`.
+//! `server::async_native::run()` instead of the removed callback-based server.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

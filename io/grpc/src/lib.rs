@@ -1,7 +1,7 @@
-//! grpc - gRPC implementation for krio-based applications.
+//! grpc - gRPC implementation for ringline-based applications.
 //!
 //! This crate provides gRPC framing on top of HTTP/2, designed to work
-//! with the krio I/O framework. It does not use async/await or tokio.
+//! with the ringline I/O framework. It does not use async/await or tokio.
 //!
 //! # Features
 //!

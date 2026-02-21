@@ -1,8 +1,7 @@
-//! Async native runtime server implementation using krio (io_uring).
+//! Native runtime server implementation using ringline (io_uring).
 //!
-//! Mirrors `native/` but uses `AsyncEventHandler` instead of `EventHandler`.
-//! One async task per connection, reusing `Connection::process_from()` for
-//! protocol parsing and command execution.
+//! Uses `AsyncEventHandler` with one async task per connection, reusing
+//! `Connection::process_from()` for protocol parsing and command execution.
 
 mod handler;
 
@@ -10,10 +9,10 @@ pub use server::{run, run_shared};
 
 mod server {
     use crate::config::{Config, DiskIoBackendConfig};
+    use crate::disk_io::DiskIoWorkerConfig;
     use crate::metrics::{WorkerStats, WorkerStatsSnapshot};
-    use crate::native::handler::DiskIoWorkerConfig;
     use cache_core::Cache;
-    use krio::KrioBuilder;
+    use ringline::RinglineBuilder;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -78,7 +77,7 @@ mod server {
             .filter(|d| d.enabled)
             .map(|d| d.io_backend);
 
-        // Pre-create disk file before krio launch (workers need it for O_DIRECT open)
+        // Pre-create disk file before ringline launch (workers need it for O_DIRECT open)
         if disk_io_backend == Some(DiskIoBackendConfig::DirectIo) {
             let disk_config = config.cache.disk.as_ref().unwrap();
             if let Err(e) = ensure_disk_file(&disk_config.path, disk_config.size) {
@@ -91,16 +90,16 @@ mod server {
             );
         }
 
-        let krio_config = krio::Config {
+        let krio_config = ringline::Config {
             sq_entries: config.uring.sq_depth,
             sqpoll: config.uring.sqpoll,
             sqpoll_idle_ms: config.uring.sqpoll_idle_ms,
-            recv_buffer: krio::RecvBufferConfig {
+            recv_buffer: ringline::RecvBufferConfig {
                 ring_size: config.uring.buffer_count.next_power_of_two(),
                 buffer_size: config.uring.buffer_size as u32,
                 ..Default::default()
             },
-            worker: krio::WorkerConfig {
+            worker: ringline::WorkerConfig {
                 threads: num_workers,
                 pin_to_core: cpu_affinity.is_some(),
                 core_offset: cpu_affinity.as_ref().map(|c| c[0]).unwrap_or(0),
@@ -112,14 +111,14 @@ mod server {
             ..Default::default()
         };
 
-        // Enable krio's disk I/O subsystem based on backend
+        // Enable ringline's disk I/O subsystem based on backend
         let mut krio_config = krio_config;
         match disk_io_backend {
             Some(DiskIoBackendConfig::DirectIo) => {
-                krio_config.direct_io = Some(krio::direct_io::DirectIoConfig::default());
+                krio_config.direct_io = Some(ringline::direct_io::DirectIoConfig::default());
             }
             Some(DiskIoBackendConfig::Nvme) => {
-                krio_config.nvme = Some(krio::nvme::NvmeConfig::default());
+                krio_config.nvme = Some(ringline::nvme::NvmeConfig::default());
             }
             _ => {}
         }
@@ -193,9 +192,9 @@ mod server {
         }
         init_config_channel(config_rx, num_workers);
 
-        let (shutdown_handle, handles) = KrioBuilder::new(krio_config)
-            .bind(&bind_addr.to_string())
-            .launch_async::<AsyncServerHandler<C>>()?;
+        let (shutdown_handle, handles) = RinglineBuilder::new(krio_config)
+            .bind(bind_addr)
+            .launch::<AsyncServerHandler<C>>()?;
 
         wait_for_workers();
         drop(_launch_guard);

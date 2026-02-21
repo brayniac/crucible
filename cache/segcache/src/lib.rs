@@ -506,7 +506,7 @@ impl SegCacheBuilder {
     /// Unlike [`disk_tier`](Self::disk_tier) which uses mmap, this tier
     /// performs all I/O through io_uring with O_DIRECT. Segment metadata
     /// is managed in-memory; the server handler submits reads/writes via
-    /// krio's Direct I/O API.
+    /// ringline's Direct I/O API.
     pub fn io_uring_disk_tier(mut self, config: IoUringDiskTierConfig) -> Self {
         self.io_uring_disk_tier = Some(config);
         self

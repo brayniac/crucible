@@ -1,9 +1,9 @@
-//! Momento connection for benchmarking Momento cache via krio.
+//! Momento connection for benchmarking Momento cache via ringline.
 //!
-//! Uses krio's native TLS (`connect_tls`) so that Momento connections
+//! Uses ringline's native TLS (`connect_tls`) so that Momento connections
 //! benefit from io_uring (multishot recv, SendMsgZc, CPU pinning). The
 //! `CacheClient<PlainTransport>` handles HTTP/2 framing and gRPC while
-//! krio handles TCP + TLS transparently.
+//! ringline handles TCP + TLS transparently.
 
 use super::{RequestResult, RequestType};
 use crate::config::{Config, MomentoWireFormat};
@@ -30,9 +30,9 @@ struct InFlightRequest {
 ///
 /// Unlike the old `MomentoSession` which managed its own TcpStream and TLS,
 /// this struct only tracks the protocol-level state. TCP + TLS is handled
-/// by krio (`connect_tls` / `on_data` / `ctx.send`).
+/// by ringline (`connect_tls` / `on_data` / `ctx.send`).
 pub struct MomentoConn {
-    /// The Momento cache client using PlainTransport (krio handles TLS).
+    /// The Momento cache client using PlainTransport (ringline handles TLS).
     client: CacheClient<PlainTransport>,
     /// Cache name for operations.
     cache_name: String,
@@ -51,7 +51,7 @@ pub struct MomentoConn {
 impl MomentoConn {
     /// Create a new Momento connection with PlainTransport.
     ///
-    /// Call `on_transport_ready()` after krio's TLS handshake completes
+    /// Call `on_transport_ready()` after ringline's TLS handshake completes
     /// (`on_connect` callback), then flush pending bytes.
     pub fn new(credential: &Credential, config: &Config) -> Self {
         let client = match credential.wire_format() {
@@ -82,7 +82,7 @@ impl MomentoConn {
         self.client.on_transport_ready()
     }
 
-    /// Feed plaintext data received from krio's `on_data` callback.
+    /// Feed plaintext data received from ringline's `on_data` callback.
     ///
     /// Uses `feed_data()` to skip the PlainTransport recv buffer entirely.
     pub fn feed_data(&mut self, data: &[u8]) -> io::Result<()> {

@@ -2,7 +2,7 @@
 
 use super::connection::BackendConnection;
 use ahash::AHashMap;
-use krio::ConnToken;
+use ringline::ConnToken;
 use std::net::SocketAddr;
 
 /// A pool of connections to backend nodes.

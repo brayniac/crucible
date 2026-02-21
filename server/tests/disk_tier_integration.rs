@@ -161,7 +161,7 @@ fn start_disk_test_server_callback(
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_timeout = Duration::from_secs(5);
 
-        let _ = server::native::run(&config, cache, shutdown, drain_timeout);
+        let _ = server::async_native::run(&config, cache, shutdown, drain_timeout);
     })
 }
 

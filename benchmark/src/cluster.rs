@@ -1,6 +1,6 @@
 //! Redis Cluster topology discovery.
 //!
-//! Sends `CLUSTER SLOTS` to seed nodes via blocking TCP before krio launches,
+//! Sends `CLUSTER SLOTS` to seed nodes via blocking TCP before ringline launches,
 //! builds a slot table mapping each of 16384 slots to an endpoint index.
 
 use protocol_resp::{SLOT_COUNT, SlotMap, Value};

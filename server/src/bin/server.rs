@@ -1,4 +1,7 @@
 //! Crucible cache server binary.
+//!
+//! Uses ringline's AsyncEventHandler (one async task per connection)
+//! with io_uring for high-performance cache I/O.
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -28,8 +31,9 @@ fn main() {
     let args = Args::parse();
 
     if args.print_config {
-        print_default_config();
-        return;
+        // Reuse the same config format — runtime choice is binary-level, not config-level.
+        eprintln!("Use crucible-server --print-config (same config format)");
+        std::process::exit(0);
     }
 
     let config = match &args.config {
@@ -41,15 +45,13 @@ fn main() {
             }
         },
         None => {
-            eprintln!("No config file specified. Use --config <path> or --print-config");
+            eprintln!("No config file specified. Use --config <path>");
             std::process::exit(1);
         }
     };
 
-    // Initialize logging first
     logging::init(&config.logging);
 
-    // Install signal handler for graceful shutdown
     let shutdown = signal::install_signal_handler();
 
     if let Err(e) = run(config, shutdown) {
@@ -62,7 +64,6 @@ fn run(
     config: Config,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Print banner
     let listeners: Vec<_> = config
         .listener
         .iter()
@@ -71,7 +72,7 @@ fn run(
     let cpu_affinity = config.cpu_affinity();
     let cpu_affinity_slice = cpu_affinity.as_deref();
 
-    let backend_detail = server::native::backend_detail();
+    let backend_detail = server::async_native::backend_detail();
 
     let numa_node = config.numa_node();
     let policy = config.cache.effective_policy();
@@ -91,8 +92,6 @@ fn run(
         numa_node,
     });
 
-    // Create cache based on backend + policy selection, then start admin
-    // server so we can pass the cache stats closure to /metrics.
     let drain_timeout = Duration::from_secs(config.shutdown.drain_timeout_secs);
 
     match config.cache.backend {
@@ -119,7 +118,6 @@ fn run_with_admin<C: cache_core::Cache + 'static>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
-    // Wrap cache in Arc so we can share it with the admin stats closure.
     let cache = Arc::new(cache);
     let cache_for_stats = Arc::clone(&cache);
 
@@ -129,10 +127,7 @@ fn run_with_admin<C: cache_core::Cache + 'static>(
         cache_stats_fn: Some(Arc::new(move || cache_for_stats.internal_stats())),
     })?;
 
-    // Unwrap the Arc: run() wraps in Arc internally, so pass the inner value.
-    // Since we hold a second Arc via cache_stats_fn, use Arc::try_unwrap or
-    // just pass the Arc directly via run_shared.
-    let result = server::native::run_shared(&config, cache, shutdown, drain_timeout);
+    let result = server::async_native::run_shared(&config, cache, shutdown, drain_timeout);
 
     admin_handle.shutdown();
 
@@ -161,7 +156,6 @@ fn create_segment(
         .hashtable_power(config.cache.hashtable_power)
         .hugepage_size(hugepage_size);
 
-    // Apply eviction policy
     builder = match policy {
         EvictionPolicy::S3Fifo => builder.eviction_policy(SegEvictionPolicy::S3Fifo {
             small_queue_percent: config.cache.small_queue_percent,
@@ -176,20 +170,15 @@ fn create_segment(
         _ => unreachable!("invalid policy for segment backend"),
     };
 
-    // Use auto-detected or explicit NUMA node
     if let Some(node) = config.numa_node() {
         builder = builder.numa_node(node);
     }
 
-    // Configure disk tier if enabled
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
         match disk_config.io_backend {
             DiskIoBackendConfig::DirectIo | DiskIoBackendConfig::Nvme => {
-                // Both DirectIo and NVMe use the io_uring disk layer with
-                // in-memory segment metadata. The actual I/O backend (O_DIRECT
-                // file vs NVMe passthrough) is selected at the krio level.
                 let segment_count = disk_config.size / config.cache.segment_size;
                 let io_uring_tier = IoUringDiskTierConfig {
                     segment_count,
@@ -272,12 +261,10 @@ fn create_slab(
         .hugepage_size(hugepage_size)
         .eviction_strategy(eviction_strategy);
 
-    // Use auto-detected or explicit NUMA node
     if let Some(node) = config.numa_node() {
         builder = builder.numa_node(node);
     }
 
-    // Configure disk tier if enabled
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
@@ -319,7 +306,6 @@ fn create_heap(
         .eviction_policy(heap_policy)
         .small_queue_percent(config.cache.small_queue_percent);
 
-    // Configure disk tier if enabled
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
@@ -340,116 +326,4 @@ fn create_heap(
     let cache = builder.build()?;
 
     Ok(cache)
-}
-
-fn print_default_config() {
-    let config = r#"# Crucible Server Configuration
-
-[shutdown]
-# Timeout in seconds for draining connections during graceful shutdown
-drain_timeout_secs = 30
-
-[logging]
-# Log level: "error", "warn", "info", "debug", "trace"
-# Can be overridden with RUST_LOG environment variable
-level = "info"
-# Log format: "pretty" (human-readable), "json", or "compact"
-format = "pretty"
-# Include timestamps
-timestamps = true
-# Include thread names
-thread_names = false
-# Include module target
-target = true
-
-[workers]
-# Number of worker threads (default: number of CPUs)
-# threads = 8
-
-# CPU cores to pin workers to (Linux-style, e.g., "0-3,6-8")
-# cpu_affinity = "0-7"
-
-[cache]
-# Cache backend (storage type): "segment", "slab", or "heap"
-backend = "segment"
-
-# Eviction policy (depends on backend):
-#   segment: "s3fifo" (default), "fifo", "random", "cte", "merge"
-#   heap:    "s3fifo" (default), "lfu"
-#   slab:    "lra" (default), "lrc", "random", "none"
-policy = "s3fifo"
-
-# S3-FIFO small queue percentage (1-50, default: 10)
-# small_queue_percent = 10
-
-# Total heap size (e.g., "4GB", "512MB")
-heap_size = "4GB"
-
-# Segment size (e.g., "1MB", "512KB")
-segment_size = "1MB"
-
-# Hashtable power (2^power buckets)
-hashtable_power = 26
-
-# Hugepage size: "none", "2mb", or "1gb" (Linux only)
-# Falls back to regular pages if hugepages are unavailable
-hugepage = "none"
-
-# NUMA node to bind cache memory to (Linux only)
-# If not set, auto-detected from cpu_affinity when all CPUs are on the same node
-# numa_node = 0
-
-# Disk tier configuration (optional)
-# When enabled, items evicted from RAM are demoted to disk instead of being discarded.
-# See server/config/disk-tier.toml for a full example.
-# [cache.disk]
-# enabled = true
-# io_backend = "directio"           # "directio" (default), "nvme", or "mmap"
-# path = "/var/cache/crucible/disk.dat"  # File path (directio/mmap backends)
-# size = "100GB"
-# promotion_threshold = 2           # Promote items with freq > threshold to RAM
-# # For mmap backend only:
-# # sync_mode = "async"             # "sync", "async", or "none"
-# # recover_on_startup = true
-# # For NVMe passthrough (io_backend = "nvme"):
-# # nvme_device = "/dev/ng0n1"      # NVMe generic character device
-# # nvme_nsid = 1                   # NVMe namespace ID
-
-# Protocol listeners - configure one or more
-[[listener]]
-protocol = "resp"
-address = "0.0.0.0:6379"
-
-[[listener]]
-protocol = "memcache"
-address = "0.0.0.0:11211"
-
-# Optional: Momento gRPC listener
-# [[listener]]
-# protocol = "momento"
-# address = "0.0.0.0:8443"
-# [listener.tls]
-# cert = "/path/to/cert.pem"
-# key = "/path/to/key.pem"
-
-[metrics]
-# Admin server with health checks (/health, /ready) and Prometheus metrics (/metrics)
-address = "0.0.0.0:9090"
-
-# io_uring specific settings (native runtime on Linux only)
-[uring]
-# Enable SQPOLL mode (requires CAP_SYS_NICE or root)
-sqpoll = false
-
-# SQPOLL idle timeout in milliseconds
-sqpoll_idle_ms = 1000
-
-# Buffer pool settings
-buffer_count = 1024
-buffer_size = 4096
-
-# Submission queue depth
-sq_depth = 1024
-"#;
-    print!("{}", config);
 }

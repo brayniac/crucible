@@ -1,7 +1,7 @@
 //! Integration tests for the async proxy handler.
 //!
 //! Each test starts:
-//! 1. A krio backend that speaks RESP (simple echo of raw bytes)
+//! 1. A ringline backend that speaks RESP (simple echo of raw bytes)
 //! 2. An async proxy connected to that backend
 //! 3. A TCP client that sends RESP commands to the proxy
 //!
@@ -12,13 +12,12 @@
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use krio::{AsyncEventHandler, Config, ConnCtx, KrioBuilder};
+use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
 use proxy::async_worker::run_async;
 
 /// Serialize all async proxy tests to prevent global config channel races.
@@ -32,20 +31,20 @@ static TEST_MUTEX: Mutex<()> = Mutex::new(());
 struct RespEchoBackend;
 
 impl AsyncEventHandler for RespEchoBackend {
-    fn on_accept(&self, conn: ConnCtx) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
-        Box::pin(async move {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
             loop {
                 let n = conn
                     .with_data(|data| {
-                        let _ = conn.send(data);
-                        data.len()
+                        let _ = conn.send_nowait(data);
+                        ringline::ParseResult::Consumed(data.len())
                     })
                     .await;
                 if n == 0 {
                     break;
                 }
             }
-        })
+        }
     }
     fn create_for_worker(_id: usize) -> Self {
         RespEchoBackend
@@ -128,18 +127,19 @@ fn is_complete_resp(s: &str) -> bool {
     s.ends_with("\r\n")
 }
 
-/// Start a backend krio echo server.
+/// Start a backend ringline echo server.
 fn start_backend() -> (
     String,
-    krio::ShutdownHandle,
-    Vec<std::thread::JoinHandle<Result<(), krio::Error>>>,
+    ringline::ShutdownHandle,
+    Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
 ) {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let (shutdown, handles) = KrioBuilder::new(test_krio_config())
-        .bind(&addr)
-        .launch_async::<RespEchoBackend>()
+    let bind_addr: std::net::SocketAddr = addr.parse().unwrap();
+    let (shutdown, handles) = RinglineBuilder::new(test_krio_config())
+        .bind(bind_addr)
+        .launch::<RespEchoBackend>()
         .expect("backend launch failed");
 
     wait_for_server(&addr);

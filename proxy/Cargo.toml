@@ -19,7 +19,7 @@ segcache = { workspace = true }
 protocol-resp = { workspace = true, features = ["resp3"] }
 
 # I/O event loop
-krio = { workspace = true }
+ringline = { workspace = true }
 
 # Core utilities
 bytes = { workspace = true }

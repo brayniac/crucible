@@ -1,4 +1,4 @@
-//! Comprehensive large value tests for the krio (io_uring) backend.
+//! Comprehensive large value tests for the ringline (io_uring) backend.
 //!
 //! These tests verify correct handling of large values (256KB to 64MB+):
 //! - Send modes: buffered, zerocopy, threshold
@@ -124,7 +124,7 @@ fn start_test_server_full_with_max_value(
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_timeout = Duration::from_secs(5);
 
-        let _ = server::native::run(&config, cache, shutdown, drain_timeout);
+        let _ = server::async_native::run(&config, cache, shutdown, drain_timeout);
     })
 }
 

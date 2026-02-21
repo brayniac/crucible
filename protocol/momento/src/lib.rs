@@ -1,4 +1,4 @@
-//! protocol-momento - Lightweight Momento cache implementation for krio-based applications.
+//! protocol-momento - Lightweight Momento cache implementation for ringline-based applications.
 //!
 //! This crate provides a minimal Momento cache client and server that supports both
 //! the gRPC API and the higher-performance protosocket wire format, without pulling
@@ -17,7 +17,7 @@
 //! - Get, Set, Delete cache operations
 //! - Client and server implementations
 //! - Minimal protobuf encoding (no code generation)
-//! - Completion-based I/O via krio
+//! - Completion-based I/O via ringline
 //! - Support for both gRPC and protosocket wire formats
 //!
 //! # Client Example
