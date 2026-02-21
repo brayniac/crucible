@@ -2,9 +2,9 @@
 
 use bytes::BytesMut;
 use cache_core::{Cache, HashCache, ListCache, SetCache};
-use protocol_memcache::Command as MemcacheCommand;
-use protocol_memcache::binary::{BinaryCommand, BinaryResponse, Opcode};
-use protocol_resp::Command as RespCommand;
+use memcache_proto::Command as MemcacheCommand;
+use memcache_proto::binary::{BinaryCommand, BinaryResponse, Opcode};
+use resp_proto::Command as RespCommand;
 use std::time::Duration;
 
 use crate::metrics::{DELETES, FLUSHES, GETS, HITS, MISSES, SET_ERRORS, SETS};

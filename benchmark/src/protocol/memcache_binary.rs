@@ -4,8 +4,8 @@
 //! that integrates with brrr's Buffer type for zero-copy encoding and decoding.
 
 use crate::buffer::Buffer;
-use protocol_memcache::ParseError;
-use protocol_memcache::binary::{BinaryRequest, HEADER_SIZE, ParsedBinaryResponse, Status};
+use memcache_proto::ParseError;
+use memcache_proto::binary::{BinaryRequest, HEADER_SIZE, ParsedBinaryResponse, Status};
 
 /// Memcache binary protocol codec.
 ///

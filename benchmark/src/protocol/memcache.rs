@@ -4,7 +4,7 @@
 //! with brrr's Buffer type for zero-copy encoding and decoding.
 
 use crate::buffer::Buffer;
-use protocol_memcache::{ParseError, Request, Response, Value};
+use memcache_proto::{ParseError, Request, Response, Value};
 
 /// Memcache text protocol codec.
 ///
@@ -175,7 +175,7 @@ impl Default for MemcacheCodec {
     }
 }
 
-/// A parsed memcache response (wrapper around protocol_memcache::Response).
+/// A parsed memcache response (wrapper around memcache_proto::Response).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemcacheResponse(Response);
 
@@ -205,9 +205,9 @@ impl MemcacheResponse {
 }
 
 /// A single value from a GET response.
-pub use protocol_memcache::Value as MemcacheValue;
+pub use memcache_proto::Value as MemcacheValue;
 
-/// Memcache protocol errors (wrapper around protocol_memcache::ParseError).
+/// Memcache protocol errors (wrapper around memcache_proto::ParseError).
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
 pub struct MemcacheError(ParseError);

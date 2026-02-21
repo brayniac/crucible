@@ -24,8 +24,8 @@ crossbeam-channel = { workspace = true }
 
 # Protocol implementations
 protocol-ping = { workspace = true }
-protocol-resp = { workspace = true, features = ["resp3"] }
-protocol-memcache = { workspace = true, features = ["full"] }
+resp-proto = { workspace = true, features = ["resp3"] }
+memcache-proto = { workspace = true, features = ["full"] }
 protocol-momento = { workspace = true }
 
 # Metrics

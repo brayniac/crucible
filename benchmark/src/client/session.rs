@@ -54,10 +54,10 @@ use crate::protocol::{
 };
 
 // Import underlying protocol parsers for zero-copy path
-use protocol_memcache::Response as MemcacheResponseParser;
-use protocol_memcache::binary::ParsedBinaryResponse as MemcacheBinaryResponseParser;
+use memcache_proto::Response as MemcacheResponseParser;
+use memcache_proto::binary::ParsedBinaryResponse as MemcacheBinaryResponseParser;
 use protocol_ping::Response as PingResponseParser;
-use protocol_resp::{ParseOptions as RespParseOptions, Value as RespValueParser};
+use resp_proto::{ParseOptions as RespParseOptions, Value as RespValueParser};
 
 /// Maximum bulk string size for benchmark: 512MB (matches official RESP protocol spec).
 const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
@@ -719,7 +719,7 @@ impl Session {
                 ProtocolCodec::Resp(codec) => match codec.decode_response(&mut self.buffers.recv) {
                     Ok(Some(v)) => {
                         let redirect = if v.is_error() {
-                            protocol_resp::parse_redirect(v.inner())
+                            resp_proto::parse_redirect(v.inner())
                         } else {
                             None
                         };
@@ -870,7 +870,7 @@ impl Session {
                     match RespValueParser::parse_with_options(data, &resp_parse_options()) {
                         Ok((value, consumed)) => {
                             let redirect = if value.is_error() {
-                                protocol_resp::parse_redirect(&value)
+                                resp_proto::parse_redirect(&value)
                             } else {
                                 None
                             };
@@ -882,7 +882,7 @@ impl Session {
                                 redirect,
                             })
                         }
-                        Err(protocol_resp::ParseError::Incomplete) => None,
+                        Err(resp_proto::ParseError::Incomplete) => None,
                         Err(e) => return Err(SessionError::Resp(RespError::from_parse_error(e))),
                     }
                 }
@@ -895,7 +895,7 @@ impl Session {
                             redirect: None,
                         })
                     }
-                    Err(protocol_memcache::ParseError::Incomplete) => None,
+                    Err(memcache_proto::ParseError::Incomplete) => None,
                     Err(e) => {
                         return Err(SessionError::Memcache(MemcacheError::from_parse_error(e)));
                     }
@@ -908,7 +908,7 @@ impl Session {
                             let (is_error, is_miss) = match &value {
                                 MemcacheBinaryResponseParser::Error { status, .. } => (
                                     true,
-                                    *status == protocol_memcache::binary::Status::KeyNotFound,
+                                    *status == memcache_proto::binary::Status::KeyNotFound,
                                 ),
                                 _ => (false, false),
                             };
@@ -920,7 +920,7 @@ impl Session {
                                 redirect: None,
                             })
                         }
-                        Err(protocol_memcache::ParseError::Incomplete) => None,
+                        Err(memcache_proto::ParseError::Incomplete) => None,
                         Err(e) => {
                             return Err(SessionError::MemcacheBinary(
                                 MemcacheBinaryError::from_parse_error(e),
@@ -1082,7 +1082,7 @@ struct ResponseInfo {
     is_error: bool,
     is_null: bool,
     /// Cluster redirect parsed from RESP error (MOVED/ASK).
-    redirect: Option<protocol_resp::Redirect>,
+    redirect: Option<resp_proto::Redirect>,
 }
 
 /// Session error type.

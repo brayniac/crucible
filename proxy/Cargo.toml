@@ -16,7 +16,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 segcache = { workspace = true }
 
 # Protocol parsing
-protocol-resp = { workspace = true, features = ["resp3"] }
+resp-proto = { workspace = true, features = ["resp3"] }
 
 # I/O event loop
 ringline = { workspace = true }

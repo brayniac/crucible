@@ -3,7 +3,7 @@
 //! Sends `CLUSTER SLOTS` to seed nodes via blocking TCP before ringline launches,
 //! builds a slot table mapping each of 16384 slots to an endpoint index.
 
-use protocol_resp::{SLOT_COUNT, SlotMap, Value};
+use resp_proto::{SLOT_COUNT, SlotMap, Value};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -66,7 +66,7 @@ fn try_discover(
             Ok((value, _consumed)) => {
                 return build_topology(&value);
             }
-            Err(protocol_resp::ParseError::Incomplete) => {
+            Err(resp_proto::ParseError::Incomplete) => {
                 // Need more data
                 continue;
             }

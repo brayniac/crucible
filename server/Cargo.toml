@@ -26,8 +26,8 @@ heap-cache = { workspace = true }
 
 # Protocol implementations
 protocol-ping = { workspace = true }
-protocol-resp = { workspace = true, features = ["resp3"] }
-protocol-memcache = { workspace = true, features = ["full"] }
+resp-proto = { workspace = true, features = ["resp3"] }
+memcache-proto = { workspace = true, features = ["full"] }
 
 # I/O driver (native runtime)
 ringline = { workspace = true, features = ["tls"] }

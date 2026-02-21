@@ -67,15 +67,15 @@ impl RecvBuf for SliceRecvBuf<'_> {
         // No-op: the underlying slice is borrowed from ringline's accumulator
     }
 }
-use protocol_memcache::binary::{
+use memcache_proto::binary::{
     BINARY_STREAMING_THRESHOLD, BinaryParseProgress, REQUEST_MAGIC, parse_binary_streaming,
 };
-use protocol_memcache::{
+use memcache_proto::{
     ParseOptions as MemcacheParseOptions, ParseProgress as MemcacheParseProgress,
     STREAMING_THRESHOLD as MEMCACHE_STREAMING_THRESHOLD,
     parse_streaming as parse_memcache_streaming,
 };
-use protocol_resp::{
+use resp_proto::{
     Command as RespCommand, ParseOptions, ParseProgress, STREAMING_THRESHOLD, parse_streaming,
 };
 use std::collections::VecDeque;
@@ -152,7 +152,7 @@ enum StreamingState {
         /// Bytes received so far
         received: usize,
         /// Original opcode for response
-        opcode: protocol_memcache::binary::Opcode,
+        opcode: memcache_proto::binary::Opcode,
         /// Opaque value for response
         opaque: u32,
     },
@@ -163,7 +163,7 @@ enum StreamingState {
         /// Bytes received so far
         received: usize,
         /// Original opcode for response
-        opcode: protocol_memcache::binary::Opcode,
+        opcode: memcache_proto::binary::Opcode,
         /// Opaque value for response
         opaque: u32,
     },
@@ -320,7 +320,7 @@ impl Connection {
                 if let Some(retry) = &self.pending_retry
                     && !retry.quiet
                 {
-                    use protocol_memcache::binary::{BinaryResponse, Opcode};
+                    use memcache_proto::binary::{BinaryResponse, Opcode};
                     let start = self.write_buf.len();
                     self.write_buf.reserve(32);
                     unsafe {
@@ -758,7 +758,7 @@ impl Connection {
             ) {
                 Ok(MemcacheParseProgress::Complete(cmd, consumed)) => {
                     // Intercept GET for zero-copy path
-                    if let protocol_memcache::Command::Get { key } = cmd {
+                    if let memcache_proto::Command::Get { key } = cmd {
                         use crate::metrics::{GETS, HITS, MISSES};
                         use cache_core::LookupResult;
                         GETS.increment();
@@ -1059,7 +1059,7 @@ impl Connection {
             match parse_binary_streaming(data, BINARY_STREAMING_THRESHOLD) {
                 Ok(BinaryParseProgress::Complete(cmd, consumed)) => {
                     // Intercept GET variants for zero-copy path
-                    use protocol_memcache::binary::{
+                    use memcache_proto::binary::{
                         BinaryCommand, BinaryResponse, HEADER_SIZE, Opcode, ResponseHeader, Status,
                     };
                     match &cmd {
@@ -1250,7 +1250,7 @@ impl Connection {
                         }
                         Err(_e) => {
                             // Binary protocol error response
-                            use protocol_memcache::binary::{BinaryResponse, Status};
+                            use memcache_proto::binary::{BinaryResponse, Status};
                             let start = self.write_buf.len();
                             self.write_buf.reserve(32);
                             unsafe {
@@ -1327,7 +1327,7 @@ impl Connection {
                 let opaque_val = *opaque;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheBinarySegment { reservation, .. } = state {
-                    use protocol_memcache::binary::BinaryResponse;
+                    use memcache_proto::binary::BinaryResponse;
                     if cache.commit_segment_set(reservation).is_ok() {
                         if !opcode_val.is_quiet() {
                             let response_len = BinaryResponse::encode_stored(
@@ -1349,7 +1349,7 @@ impl Connection {
                             );
                         }
                     } else if !opcode_val.is_quiet() {
-                        use protocol_memcache::binary::Status;
+                        use memcache_proto::binary::Status;
                         let response_len = BinaryResponse::encode_error(
                             &mut [0u8; 32],
                             opcode_val,
@@ -1398,7 +1398,7 @@ impl Connection {
                 let opaque_val = *opaque;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheBinaryVec { reservation, .. } = state {
-                    use protocol_memcache::binary::BinaryResponse;
+                    use memcache_proto::binary::BinaryResponse;
                     if cache.commit_set(reservation).is_ok() {
                         if !opcode_val.is_quiet() {
                             let response_len = BinaryResponse::encode_stored(
@@ -1420,7 +1420,7 @@ impl Connection {
                             );
                         }
                     } else if !opcode_val.is_quiet() {
-                        use protocol_memcache::binary::Status;
+                        use memcache_proto::binary::Status;
                         let response_len = BinaryResponse::encode_error(
                             &mut [0u8; 32],
                             opcode_val,
@@ -1776,7 +1776,7 @@ impl Connection {
                 opaque,
                 quiet: _,
             } => {
-                use protocol_memcache::binary::{HEADER_SIZE, Opcode, ResponseHeader, Status};
+                use memcache_proto::binary::{HEADER_SIZE, Opcode, ResponseHeader, Status};
                 // Map the saved opcode byte back to the Opcode enum
                 let opcode = match *opcode {
                     x if x == Opcode::Get as u8 => Opcode::Get,
@@ -2536,7 +2536,7 @@ mod tests {
 
     #[test]
     fn test_memcache_binary_get_hit_large_value() {
-        use protocol_memcache::binary::{BinaryRequest, HEADER_SIZE, ParsedBinaryResponse};
+        use memcache_proto::binary::{BinaryRequest, HEADER_SIZE, ParsedBinaryResponse};
 
         let value = vec![b'B'; 2048];
         let cache = MockCacheWithValue::new(value.clone());
@@ -2580,7 +2580,7 @@ mod tests {
 
     #[test]
     fn test_memcache_binary_get_hit_small_value() {
-        use protocol_memcache::binary::{BinaryRequest, ParsedBinaryResponse};
+        use memcache_proto::binary::{BinaryRequest, ParsedBinaryResponse};
 
         let value = vec![b'S'; 512];
         let cache = MockCacheWithValue::new(value.clone());
@@ -2615,7 +2615,7 @@ mod tests {
 
     #[test]
     fn test_memcache_binary_get_miss() {
-        use protocol_memcache::binary::{BinaryRequest, ParsedBinaryResponse, Status};
+        use memcache_proto::binary::{BinaryRequest, ParsedBinaryResponse, Status};
 
         let cache = MockCache;
         let mut conn = Connection::default();
@@ -2644,7 +2644,7 @@ mod tests {
 
     #[test]
     fn test_memcache_binary_getq_miss_silent() {
-        use protocol_memcache::binary::BinaryRequest;
+        use memcache_proto::binary::BinaryRequest;
 
         let cache = MockCache;
         let mut conn = Connection::default();
@@ -2662,7 +2662,7 @@ mod tests {
 
     #[test]
     fn test_memcache_binary_getk_hit_large_value() {
-        use protocol_memcache::binary::{BinaryRequest, ParsedBinaryResponse};
+        use memcache_proto::binary::{BinaryRequest, ParsedBinaryResponse};
 
         let value = vec![b'K'; 2048];
         let cache = MockCacheWithValue::new(value.clone());

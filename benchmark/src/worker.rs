@@ -1092,7 +1092,7 @@ fn handle_cluster_redirects(results: &[RequestResult], state: &Arc<SharedWorkerS
     for result in results {
         if let Some(ref redirect) = result.redirect {
             metrics::CLUSTER_REDIRECTS.increment();
-            if redirect.kind == protocol_resp::RedirectKind::Moved {
+            if redirect.kind == resp_proto::RedirectKind::Moved {
                 if let Ok(addr) = redirect.address.parse::<SocketAddr>() {
                     // Find existing endpoint or note that we need to add it
                     let endpoint_idx = state.task_state.endpoints.iter().position(|a| *a == addr);
@@ -1122,7 +1122,7 @@ fn handle_cluster_redirects(results: &[RequestResult], state: &Arc<SharedWorkerS
 fn route_key(state: &TaskSharedState, key: &[u8]) -> usize {
     let slot_table = state.slot_table.lock().unwrap();
     if let Some(ref table) = *slot_table {
-        let slot = protocol_resp::hash_slot(key);
+        let slot = resp_proto::hash_slot(key);
         table[slot as usize] as usize
     } else if state.endpoints.len() == 1 {
         0

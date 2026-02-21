@@ -4,7 +4,7 @@
 //! with brrr's Buffer type for zero-copy encoding and decoding.
 
 use crate::buffer::Buffer;
-use protocol_resp::{ParseError, ParseOptions, Request, Value};
+use resp_proto::{ParseError, ParseOptions, Request, Value};
 
 /// Maximum bulk string size: 512MB (matches official RESP protocol spec).
 const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
@@ -161,12 +161,12 @@ impl Default for RespCodec {
     }
 }
 
-/// A parsed RESP value (wrapper around protocol_resp::Value).
+/// A parsed RESP value (wrapper around resp_proto::Value).
 #[derive(Debug, Clone)]
 pub struct RespValue(Value);
 
 impl RespValue {
-    /// Returns a reference to the inner protocol_resp::Value.
+    /// Returns a reference to the inner resp_proto::Value.
     pub fn inner(&self) -> &Value {
         &self.0
     }
@@ -192,7 +192,7 @@ impl RespValue {
     }
 }
 
-/// RESP parsing/encoding errors (wrapper around protocol_resp::ParseError).
+/// RESP parsing/encoding errors (wrapper around resp_proto::ParseError).
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
 pub struct RespError(ParseError);

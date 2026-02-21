@@ -15,8 +15,6 @@ members = [
 	# Protocol Implementations
 	"protocol/momento",
 	"protocol/ping",
-	"protocol/resp",
-	"protocol/memcache",
 
 	# Server
 	"server",
@@ -61,14 +59,12 @@ hyper-util = "0.1"
 itoa = "1.0"
 libc = "0.2"
 loom = "0.7"
-memchr = "2.7"
 memmap2 = "0.9"
 metriken = "0.7"
 num_cpus = "1.16"
 parking_lot = "0.12"
 rand = "0.9"
 rustls = { version = "0.23", default-features = false }
-rustls-pki-types = "1"
 ryu = "1.0"
 serde = "1"
 slab = "0.4"
@@ -88,8 +84,8 @@ http2 = { path = "io/http2" }
 grpc = { path = "io/grpc" }
 protocol-momento = { path = "protocol/momento" }
 protocol-ping = { path = "protocol/ping" }
-protocol-resp = { path = "protocol/resp" }
-protocol-memcache = { path = "protocol/memcache" }
+resp-proto = "0.0.1"
+memcache-proto = "0.0.1"
 cache-core = { path = "cache/core" }
 segcache = { path = "cache/segcache" }
 slab-cache = { path = "cache/slab" }
