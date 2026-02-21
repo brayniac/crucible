@@ -43,14 +43,12 @@ jobs:
   audit:
     name: Audit
     runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          curl -sSL https://github.com/rustsec/rustsec/releases/latest/download/cargo-audit-x86_64-unknown-linux-musl-v0.21.2.tgz \
+            | tar xz -C /usr/local/bin cargo-audit
+      - run: cargo audit
 
   test:
     name: Test
