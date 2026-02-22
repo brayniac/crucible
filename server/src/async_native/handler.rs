@@ -184,7 +184,7 @@ async fn flush_worker<C: Cache>(
     // Initialize disk I/O eagerly so connections can read from disk immediately.
     let flush_backend = match init_async_disk_io(&config) {
         Ok(state) => {
-            let backend = state.backend.clone();
+            let backend = state.backend;
             *disk_io.lock().unwrap() = Some(state);
             backend
         }
@@ -570,14 +570,13 @@ async fn submit_and_await_disk_read<C: Cache>(
     connection.write_disk_read_response(&pending_info.response_ctx, value_bytes);
 
     // 4. Drain the response.
-    if connection.has_pending_write() {
-        if drain_pending(conn, connection, slot_size, false)
+    if connection.has_pending_write()
+        && drain_pending(conn, connection, slot_size, false)
             .await
             .is_err()
-        {
-            release_read!(buffer);
-            return Err(());
-        }
+    {
+        release_read!(buffer);
+        return Err(());
     }
 
     // 5. Release read buffer and segment ref_count.

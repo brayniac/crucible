@@ -31,6 +31,7 @@ static TEST_MUTEX: Mutex<()> = Mutex::new(());
 struct RespEchoBackend;
 
 impl AsyncEventHandler for RespEchoBackend {
+    #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
             loop {

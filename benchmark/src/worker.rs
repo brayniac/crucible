@@ -303,6 +303,7 @@ pub struct BenchHandler {
 }
 
 impl AsyncEventHandler for BenchHandler {
+    #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         // Benchmark is client-only, no accepts expected
         async {}
@@ -733,7 +734,7 @@ async fn drive_resp_workload(
     state: &Arc<SharedWorkerState>,
     endpoint_idx: usize,
     rng: &mut Xoshiro256PlusPlus,
-    key_buf: &mut Vec<u8>,
+    key_buf: &mut [u8],
     backfill_queue: &mut Vec<usize>,
 ) -> Result<(), DisconnectReason> {
     let config = &state.task_state.config;
@@ -1010,7 +1011,7 @@ async fn drive_memcache_workload(
     state: &Arc<SharedWorkerState>,
     endpoint_idx: usize,
     rng: &mut Xoshiro256PlusPlus,
-    key_buf: &mut Vec<u8>,
+    key_buf: &mut [u8],
     backfill_queue: &mut Vec<usize>,
 ) -> Result<(), DisconnectReason> {
     let config = &state.task_state.config;
@@ -1216,14 +1217,14 @@ async fn drive_ping_workload(
         // Skip Connect/Prefill phases (no prefill for ping)
         if phase != Phase::Warmup && phase != Phase::Running {
             // Mark prefill as done if in Prefill phase
-            if phase == Phase::Prefill && !state.is_prefill_done() {
-                if state
+            if phase == Phase::Prefill
+                && !state.is_prefill_done()
+                && state
                     .prefill_done
                     .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
-                {
-                    state.task_state.shared.mark_prefill_complete();
-                }
+            {
+                state.task_state.shared.mark_prefill_complete();
             }
             continue;
         }
@@ -1369,8 +1370,8 @@ async fn drive_momento_session(
     momento_conn: &mut MomentoConn,
     state: &Arc<SharedWorkerState>,
     rng: &mut Xoshiro256PlusPlus,
-    key_buf: &mut Vec<u8>,
-    value_buf: &mut Vec<u8>,
+    key_buf: &mut [u8],
+    value_buf: &mut [u8],
     results: &mut Vec<RequestResult>,
 ) -> Result<(), DisconnectReason> {
     let config = &state.task_state.config;
@@ -1452,13 +1453,14 @@ async fn drive_momento_session(
 }
 
 /// Drive Momento workload requests.
+#[allow(clippy::too_many_arguments)]
 fn drive_momento_requests(
     conn: &ConnCtx,
     momento_conn: &mut MomentoConn,
     state: &Arc<SharedWorkerState>,
     rng: &mut Xoshiro256PlusPlus,
-    key_buf: &mut Vec<u8>,
-    value_buf: &mut Vec<u8>,
+    key_buf: &mut [u8],
+    value_buf: &mut [u8],
     key_count: usize,
     get_ratio: usize,
     delete_ratio: usize,
@@ -1501,8 +1503,8 @@ fn drive_momento_prefill(
     momento_conn: &mut MomentoConn,
     state: &Arc<SharedWorkerState>,
     rng: &mut Xoshiro256PlusPlus,
-    key_buf: &mut Vec<u8>,
-    value_buf: &mut Vec<u8>,
+    key_buf: &mut [u8],
+    value_buf: &mut [u8],
 ) {
     while momento_conn.can_send() {
         let key_id = {
@@ -1569,20 +1571,20 @@ fn handle_momento_prefill_results(results: &[RequestResult], state: &Arc<SharedW
             .fetch_add(confirmed_batch, Ordering::AcqRel)
             + confirmed_batch;
 
-        if new_total >= state.prefill_total && state.prefill_total > 0 {
-            if state
+        if new_total >= state.prefill_total
+            && state.prefill_total > 0
+            && state
                 .prefill_done
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
-            {
-                tracing::debug!(
-                    worker_id = state.task_state.worker_id,
-                    confirmed = new_total,
-                    total = state.prefill_total,
-                    "prefill complete (momento)"
-                );
-                state.task_state.shared.mark_prefill_complete();
-            }
+        {
+            tracing::debug!(
+                worker_id = state.task_state.worker_id,
+                confirmed = new_total,
+                total = state.prefill_total,
+                "prefill complete (momento)"
+            );
+            state.task_state.shared.mark_prefill_complete();
         }
     }
 }
@@ -1598,20 +1600,20 @@ fn confirm_prefill_key(state: &Arc<SharedWorkerState>) {
         .fetch_add(1, Ordering::AcqRel)
         + 1;
 
-    if new_total >= state.prefill_total && state.prefill_total > 0 {
-        if state
+    if new_total >= state.prefill_total
+        && state.prefill_total > 0
+        && state
             .prefill_done
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-        {
-            tracing::debug!(
-                worker_id = state.task_state.worker_id,
-                confirmed = new_total,
-                total = state.prefill_total,
-                "prefill complete"
-            );
-            state.task_state.shared.mark_prefill_complete();
-        }
+    {
+        tracing::debug!(
+            worker_id = state.task_state.worker_id,
+            confirmed = new_total,
+            total = state.prefill_total,
+            "prefill complete"
+        );
+        state.task_state.shared.mark_prefill_complete();
     }
 }
 

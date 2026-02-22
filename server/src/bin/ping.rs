@@ -115,6 +115,7 @@ impl Config {
 struct PingHandler;
 
 impl AsyncEventHandler for PingHandler {
+    #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
         async move {
             let mut write_buf = Vec::with_capacity(4096);
