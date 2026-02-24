@@ -397,9 +397,7 @@ async fn process_command(
                     let _ = client.send(Value::NULL_BULK);
                     CommandResult::ForwardedAndResponded
                 }
-                Err(ringline_redis::Error::ConnectionClosed) => {
-                    CommandResult::BackendDisconnected
-                }
+                Err(ringline_redis::Error::ConnectionClosed) => CommandResult::BackendDisconnected,
                 Err(e) => {
                     send_error(client, &e.to_string());
                     CommandResult::ForwardedAndResponded
@@ -432,24 +430,27 @@ async fn process_command(
                 if *xx {
                     forward_raw_value(backend, cmd).await
                 } else {
-                    backend.set_ex(*key, *value, *secs).await.map(|()| {
-                        Value::SimpleString(Bytes::from_static(b"OK"))
-                    })
+                    backend
+                        .set_ex(*key, *value, *secs)
+                        .await
+                        .map(|()| Value::SimpleString(Bytes::from_static(b"OK")))
                 }
             } else if let Some(ms) = px {
                 if *xx {
                     forward_raw_value(backend, cmd).await
                 } else {
-                    backend.set_px(*key, *value, *ms).await.map(|()| {
-                        Value::SimpleString(Bytes::from_static(b"OK"))
-                    })
+                    backend
+                        .set_px(*key, *value, *ms)
+                        .await
+                        .map(|()| Value::SimpleString(Bytes::from_static(b"OK")))
                 }
             } else if *xx {
                 forward_raw_value(backend, cmd).await
             } else {
-                backend.set(*key, *value).await.map(|()| {
-                    Value::SimpleString(Bytes::from_static(b"OK"))
-                })
+                backend
+                    .set(*key, *value)
+                    .await
+                    .map(|()| Value::SimpleString(Bytes::from_static(b"OK")))
             };
 
             send_result(client, result)
@@ -572,15 +573,17 @@ async fn process_command(
             send_result(client, result)
         }
         Command::HKeys { key } => {
-            let result = backend.hkeys(*key).await.map(|keys| {
-                Value::Array(keys.into_iter().map(Value::BulkString).collect())
-            });
+            let result = backend
+                .hkeys(*key)
+                .await
+                .map(|keys| Value::Array(keys.into_iter().map(Value::BulkString).collect()));
             send_result(client, result)
         }
         Command::HVals { key } => {
-            let result = backend.hvals(*key).await.map(|vals| {
-                Value::Array(vals.into_iter().map(Value::BulkString).collect())
-            });
+            let result = backend
+                .hvals(*key)
+                .await
+                .map(|vals| Value::Array(vals.into_iter().map(Value::BulkString).collect()));
             send_result(client, result)
         }
         Command::HSetNx { key, field, value } => {
@@ -593,7 +596,10 @@ async fn process_command(
         }
         Command::HIncrBy { key, field, delta } => {
             cache.delete(key);
-            let result = backend.hincrby(*key, *field, *delta).await.map(Value::Integer);
+            let result = backend
+                .hincrby(*key, *field, *delta)
+                .await
+                .map(Value::Integer);
             send_result(client, result)
         }
 
@@ -638,23 +644,26 @@ async fn process_command(
             send_result(client, result)
         }
         Command::LRange { key, start, stop } => {
-            let result = backend.lrange(*key, *start, *stop).await.map(|items| {
-                Value::Array(items.into_iter().map(Value::BulkString).collect())
-            });
+            let result = backend
+                .lrange(*key, *start, *stop)
+                .await
+                .map(|items| Value::Array(items.into_iter().map(Value::BulkString).collect()));
             send_result(client, result)
         }
         Command::LTrim { key, start, stop } => {
             cache.delete(key);
-            let result = backend.ltrim(*key, *start, *stop).await.map(|()| {
-                Value::SimpleString(Bytes::from_static(b"OK"))
-            });
+            let result = backend
+                .ltrim(*key, *start, *stop)
+                .await
+                .map(|()| Value::SimpleString(Bytes::from_static(b"OK")));
             send_result(client, result)
         }
         Command::LSet { key, index, value } => {
             cache.delete(key);
-            let result = backend.lset(*key, *index, *value).await.map(|()| {
-                Value::SimpleString(Bytes::from_static(b"OK"))
-            });
+            let result = backend
+                .lset(*key, *index, *value)
+                .await
+                .map(|()| Value::SimpleString(Bytes::from_static(b"OK")));
             send_result(client, result)
         }
         Command::LPushX { key, values } => {
@@ -693,9 +702,10 @@ async fn process_command(
             send_result(client, result)
         }
         Command::SMembers { key } => {
-            let result = backend.smembers(*key).await.map(|members| {
-                Value::Array(members.into_iter().map(Value::BulkString).collect())
-            });
+            let result = backend
+                .smembers(*key)
+                .await
+                .map(|members| Value::Array(members.into_iter().map(Value::BulkString).collect()));
             send_result(client, result)
         }
         Command::SCard { key } => {
@@ -731,31 +741,35 @@ async fn process_command(
         }
         Command::SRandMember { key, count } => {
             let count = count.unwrap_or(1);
-            let result = backend.srandmember(*key, count).await.map(|members| {
-                Value::Array(members.into_iter().map(Value::BulkString).collect())
-            });
+            let result = backend
+                .srandmember(*key, count)
+                .await
+                .map(|members| Value::Array(members.into_iter().map(Value::BulkString).collect()));
             send_result(client, result)
         }
 
         // ── Key commands ────────────────────────────────────────────
         Command::Type { key } => {
-            let result = backend.key_type(*key).await.map(|t| {
-                Value::SimpleString(Bytes::from(t))
-            });
+            let result = backend
+                .key_type(*key)
+                .await
+                .map(|t| Value::SimpleString(Bytes::from(t)));
             send_result(client, result)
         }
 
         // ── Server commands ─────────────────────────────────────────
         Command::FlushDb => {
-            let result = backend.flushdb().await.map(|()| {
-                Value::SimpleString(Bytes::from_static(b"OK"))
-            });
+            let result = backend
+                .flushdb()
+                .await
+                .map(|()| Value::SimpleString(Bytes::from_static(b"OK")));
             send_result(client, result)
         }
         Command::FlushAll => {
-            let result = backend.flushall().await.map(|()| {
-                Value::SimpleString(Bytes::from_static(b"OK"))
-            });
+            let result = backend
+                .flushall()
+                .await
+                .map(|()| Value::SimpleString(Bytes::from_static(b"OK")));
             send_result(client, result)
         }
 
@@ -805,10 +819,7 @@ fn send_error(client: &ConnCtx, msg: &str) {
 }
 
 /// Convert a typed client result to a wire response and send to the client.
-fn send_result(
-    client: &ConnCtx,
-    result: Result<Value, ringline_redis::Error>,
-) -> CommandResult {
+fn send_result(client: &ConnCtx, result: Result<Value, ringline_redis::Error>) -> CommandResult {
     match result {
         Ok(value) => {
             send_value(client, &value);

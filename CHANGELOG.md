@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-02-24
+
+### Added
+- **SET retry on eviction failure**: Async server handler retries SET commands that fail due to
+  eviction pressure, with configurable timeout (`set_retry_timeout_us`). Prevents spurious
+  failures under sustained write load
+- **Async server as default**: `crucible-server` now uses the async ringline handler (io_uring
+  with async task-per-connection) as the sole runtime
+
+### Changed
+- **Migrated to [ringline](https://github.com/ringline-rs/ringline)**: Replaced the local `krio`
+  I/O framework with the published `ringline` crate. All handlers (server, proxy, benchmark) now
+  implement `AsyncEventHandler` with the async task-per-connection model
+- **Migrated to published protocol crates**: `resp-proto`, `memcache-proto`, `http2-proto`,
+  `grpc-proto`, and `ketama` are now published crates on crates.io instead of in-tree
+- **Proxy migrated to ringline-redis**: Proxy backend uses `ringline-redis::Client` instead of
+  custom client module
+- **Benchmark extracted to [cachecannon](https://github.com/cachecannon/cachecannon)**: The
+  in-tree benchmark tool has been moved to a separate repository. CI smoketests and docs updated
+  to reference cachecannon
+
+### Fixed
+- **Memcache binary unknown command hang**: Unsupported binary commands (Append, Prepend, Touch,
+  Gat) now return an error response instead of silently returning nothing, which caused clients
+  to hang indefinitely
+- **Disk tier flush and read lifecycle**: Wired up io_uring disk flush worker and fixed read
+  error paths to properly release segment ref_counts and staging buffers
+- **Disk demotion under reader pressure**: Items can now be demoted to disk even when the source
+  segment has active readers
+- Clippy and rustdoc warnings across workspace
+
+### Removed
+- Local `krio` I/O framework (replaced by `ringline`)
+- In-tree `client-*` Tokio-based client crates (not krio-native)
+- In-tree `benchmark` crate (moved to cachecannon)
+- Unused `ArcCache` wrapper, dead `workers` module, unused `slab` dependency
+- Dead `stats` and `worker_id` fields from `AsyncServerHandler`
+
 ## [0.3.8] - 2026-02-19
 
 ### Fixed

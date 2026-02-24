@@ -72,7 +72,6 @@ enum Commands {
         /// Skip running the benchmark (just profile idle server)
         #[arg(long)]
         no_load: bool,
-
     },
 }
 
