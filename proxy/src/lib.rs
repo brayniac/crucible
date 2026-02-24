@@ -6,7 +6,6 @@
 pub mod async_worker;
 pub mod backend;
 pub mod cache;
-pub mod client;
 pub mod config;
 pub mod metrics;
 
