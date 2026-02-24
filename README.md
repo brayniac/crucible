@@ -17,7 +17,7 @@ The benchmark tool has been moved to a separate repository: [cachecannon](https:
 - **RAM → Disk tiering**: Extend cache capacity beyond RAM (segment and slab backends)
 - **Pluggable eviction policies**: S3-FIFO, FIFO, LRU variants, Random, CTE, Merge
 - **TTL-aware storage**: Segment backend groups items by expiration for efficient proactive expiration
-- **Protocol support**: RESP2/RESP3 (Redis-compatible), Memcache ASCII
+- **Protocol support**: RESP2/RESP3 (Redis-compatible), Memcache ASCII and binary
 - **ringline I/O framework**: io_uring event loop with async task-per-connection model (not Tokio) for predictable latency
 - **Zero-copy I/O**: io_uring multishot recv, SendZc, ring-provided buffers
 - **Zero allocations on hot path**: Pre-allocated buffer pools and segment storage (segment backend)
@@ -29,8 +29,7 @@ The benchmark tool has been moved to a separate repository: [cachecannon](https:
 
 Crucible is built for **latency-sensitive deployments where microseconds matter**. Key design decisions:
 
-- **Completion-based I/O** instead of async/await—eliminates task scheduler overhead
-- **ringline io_uring framework** instead of Tokio—direct access to io_uring features (multishot, SendMsgZc, ring buffers)
+- **io_uring with async task-per-connection** via [ringline](https://github.com/ringline-rs/ringline)—direct access to io_uring features (multishot, SendMsgZc, ring buffers) without Tokio
 - **Thread-per-core** with CPU pinning—no work-stealing, predictable cache locality
 - **Pre-allocated everything**—buffer pools and segment storage avoid malloc on hot path
 
@@ -52,8 +51,8 @@ See [docs/design.md](docs/design.md#development-philosophy) for our full philoso
 
 ## Requirements
 
-- **Linux**: Kernel 6.0+ for full io_uring features (falls back to mio on older kernels)
-- **macOS**: Supported via mio backend
+- **Linux**: Kernel 6.0+ (io_uring required)
+- **Architectures**: x86_64 and ARM64
 - **Rust**: 1.85+ (Edition 2024) - only required for building from source
 
 ## Installation
@@ -140,7 +139,7 @@ All storage backends share a **lock-free hashtable** with optional tiering:
 |---------|-------------|--------------|----------|
 | `segment` | Fixed-size segments, TTL-aware organization | Yes | General purpose, TTL-heavy workloads |
 | `slab` | Memcached-style slab allocator with size classes | Yes | Memcached migration, in-place updates |
-| `heap` | System allocator, per-item allocation | No | Variable-size items, future data structures |
+| `heap` | System allocator, per-item allocation | No | Variable-size items, data structures (hashes, lists, sets) |
 
 ### Eviction Policies
 
@@ -172,22 +171,32 @@ See [docs/design.md](docs/design.md) for design rationale.
 ### Redis (RESP)
 
 Supported commands:
-- **Basic**: `GET`, `SET`, `MGET`, `DEL`
+- **Basic**: `GET`, `SET`, `MGET`, `DEL`, `APPEND`, `TYPE`
 - **SET options**: `EX` (seconds), `PX` (milliseconds), `NX`, `XX`
 - **Counters**: `INCR`, `DECR`, `INCRBY`, `DECRBY`
+- **Hashes** (heap backend): `HSET`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HSETNX`, `HINCRBY`
+- **Lists** (heap backend): `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LPUSHX`, `RPUSHX`
+- **Sets** (heap backend): `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SPOP`, `SRANDMEMBER`
 - **Admin**: `PING`, `HELLO`, `CONFIG GET/SET`
 - **No-op**: `FLUSHDB`, `FLUSHALL` (accepted, does nothing)
 
-Not supported: data structures (lists, sets, hashes), persistence, pub/sub, Lua scripting.
+Not supported: persistence, pub/sub, Lua scripting, streams, sorted sets.
 
 ### Memcache
 
-Supported commands:
+ASCII protocol:
 - **Retrieval**: `get`, `gets` (multi-get)
-- **Storage**: `set`, `add`, `replace`, `cas`
+- **Storage**: `set`, `add`, `replace`, `cas`, `append`, `prepend`
 - **Deletion**: `delete`
 - **Counters**: `incr`, `decr`
 - **Admin**: `version`, `quit`, `flush_all` (no-op)
+
+Binary protocol:
+- **Retrieval**: `Get`, `GetK`, `GetQ`, `GetKQ`
+- **Storage**: `Set`, `SetQ`, `Add`, `Replace`
+- **Deletion**: `Delete`, `DeleteQ`
+- **Counters**: `Increment`, `Decrement`
+- **Admin**: `Noop`, `Version`, `Quit`, `Stat`, `Flush`
 
 ## Usage
 
