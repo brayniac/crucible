@@ -120,7 +120,6 @@ cargo xtask flamegraph --duration 10 --output profile.svg
 # With custom configs
 cargo xtask flamegraph \
     --config server/config/example.toml \
-    --bench-config benchmark/config/redis.toml \
     --duration 30 \
     --output profile.svg
 
@@ -139,8 +138,9 @@ For more detailed profiling on Linux:
 # Record with perf
 sudo perf record -g ./target/release/crucible-server server/config/example.toml
 
-# In another terminal, run load
-./target/release/crucible-benchmark benchmark/config/redis.toml
+# In another terminal, run load with cachecannon
+# See: https://github.com/cachecannon/cachecannon
+cachecannon config.toml
 
 # Analyze
 sudo perf report
@@ -173,7 +173,7 @@ cargo clippy -- -D warnings
 
 ## Smoke Testing
 
-Quick validation that the server and benchmark work together:
+Quick validation that the server works correctly:
 
 ```bash
 # Build release binaries
@@ -186,8 +186,9 @@ SERVER_PID=$!
 # Wait for server to start
 sleep 2
 
-# Run quick benchmark
-./target/release/crucible-benchmark benchmark/config/quick-test.toml
+# Run quick benchmark with cachecannon
+# See: https://github.com/cachecannon/cachecannon
+cachecannon config.toml
 
 # Verify with redis-cli
 redis-cli -p 6379 PING
@@ -224,7 +225,6 @@ crucible/
 │   └── ping/           # Ping protocol
 │       └── fuzz/       # Fuzz tests for Ping
 ├── server/             # Cache server binary
-├── benchmark/          # Benchmark tool binary
 ├── metrics/            # Metrics infrastructure
 └── xtask/              # Development tasks
 ```

@@ -352,21 +352,15 @@ spec:
 
 ## Benchmarking
 
-Before production deployment, validate performance:
+Before production deployment, validate performance using
+[cachecannon](https://github.com/cachecannon/cachecannon):
 
 ```bash
 # Start server
 ./target/release/crucible-server server/config/example.toml &
 
-# Run benchmark (configure threads, connections, rate in config file)
-./target/release/crucible-benchmark benchmark/config/redis.toml
-
-# Save results to parquet for analysis
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --parquet results.parquet
-
-# View results in web dashboard
-./target/release/crucible-benchmark view results.parquet
+# Run benchmark with cachecannon (install from the cachecannon repo)
+cachecannon config.toml
 
 # Check results:
 # - Throughput meets requirements
@@ -375,4 +369,5 @@ Before production deployment, validate performance:
 # - Hit rate as expected
 ```
 
-See [benchmark/README.md](../benchmark/README.md) for detailed benchmarking guide.
+See the [cachecannon repository](https://github.com/cachecannon/cachecannon) for
+detailed benchmarking guide and configuration reference.

@@ -17,12 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        package: [crucible-server, crucible-benchmark]
+        package: [crucible-server]
         include:
           - package: crucible-server
             crate: server
-          - package: crucible-benchmark
-            crate: benchmark
     steps:
       - uses: actions/checkout@v4
 
@@ -30,9 +28,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-amd64
-          save-if: ${{ matrix.package == 'crucible-server' }}
 
       - name: Install cargo-deb
         run: cargo install cargo-deb
@@ -59,12 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        package: [crucible-server, crucible-benchmark]
+        package: [crucible-server]
         include:
           - package: crucible-server
             crate: server
-          - package: crucible-benchmark
-            crate: benchmark
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +69,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-arm64
-          save-if: ${{ matrix.package == 'crucible-server' }}
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -106,12 +98,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        package: [crucible-server, crucible-benchmark]
+        package: [crucible-server]
         include:
           - package: crucible-server
             crate: server
-          - package: crucible-benchmark
-            crate: benchmark
     steps:
       - uses: actions/checkout@v4
 
@@ -121,7 +111,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-rpm-amd64
-          save-if: ${{ matrix.package == 'crucible-server' }}
 
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm
@@ -148,12 +137,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        package: [crucible-server, crucible-benchmark]
+        package: [crucible-server]
         include:
           - package: crucible-server
             crate: server
-          - package: crucible-benchmark
-            crate: benchmark
     steps:
       - uses: actions/checkout@v4
 
@@ -165,7 +152,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-rpm-arm64
-          save-if: ${{ matrix.package == 'crucible-server' }}
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross

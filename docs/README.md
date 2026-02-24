@@ -6,7 +6,7 @@ Welcome to the Crucible documentation. Crucible is a high-performance cache serv
 
 1. **[Installation](INSTALL.md)** - Install from APT/YUM repositories or build from source
 2. **[Quick Start](../README.md)** - Build and run Crucible in 5 minutes
-3. **[Configuration](configuration.md)** - Server and benchmark configuration reference
+3. **[Configuration](configuration.md)** - Server configuration reference
 4. **[Operations](operations.md)** - Running in production, performance tuning
 
 ## Understanding Crucible
@@ -21,7 +21,7 @@ Welcome to the Crucible documentation. Crucible is a high-performance cache serv
 ## Deep Dives
 
 8. **[I/O Driver Architecture](../io/driver/ARCHITECTURE.md)** - Buffer management and copy semantics
-9. **[Benchmark Guide](../benchmark/README.md)** - Load testing and performance measurement
+9. **[Benchmark Tool (cachecannon)](https://github.com/cachecannon/cachecannon)** - Load testing and performance measurement
 
 ## Quick Reference
 
@@ -38,19 +38,9 @@ Welcome to the Crucible documentation. Crucible is a high-performance cache serv
 ./target/release/crucible-server server/config/memcached.toml
 ```
 
-### Benchmark Commands
+### Benchmark
 
-```bash
-# Run benchmark
-./target/release/crucible-benchmark benchmark/config/redis.toml
-
-# Output to parquet
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --parquet results.parquet
-
-# View results in web dashboard
-./target/release/crucible-benchmark view results.parquet
-```
+For load testing, use [cachecannon](https://github.com/cachecannon/cachecannon).
 
 ### Supported Protocols
 

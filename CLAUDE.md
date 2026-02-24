@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Crucible is a high-performance cache server and benchmarking toolkit written in Rust. It provides:
+Crucible is a high-performance cache server written in Rust. It provides:
 
 - **Cache Server** (`crucible-server`) - Multi-protocol cache server supporting Redis (RESP) and Memcache protocols
-- **Benchmark Tool** (`crucible-benchmark`) - Load generator with detailed latency metrics
 - **Cache Libraries** - Multiple cache implementations (Segcache, Slab, Heap)
 - **Proxy** (`crucible-proxy`) - Redis proxy with optional local caching
+
+The benchmark tool has been moved to a separate repository: [cachecannon](https://github.com/cachecannon/cachecannon).
 
 ## Design Philosophy
 
@@ -34,17 +35,6 @@ Tokio is an excellent general-purpose async runtime, but it abstracts away platf
    - **Buffer lifecycle**: `SendGuard` references pin cache memory until the kernel signals send completion via the ZC notification CQE
 
 4. **Thread-per-core with CPU pinning**: Workers are pinned to specific cores, keeping hot data in CPU cache. Tokio's work-stealing scheduler moves tasks between threads, invalidating caches and adding unpredictable latency.
-
-### Why The Benchmark Tool Doesn't Use Tokio
-
-The benchmark needs to measure latency accurately without introducing measurement artifacts:
-
-- **Precise timing**: Direct `Instant::now()` calls at exact points in the event loop, not filtered through async task scheduling
-- **CPU pinning**: Threads pinned to cores for reproducible results across runs
-- **Same I/O advantages**: Uses ringline to leverage io_uring on Linux, matching the server's I/O characteristics
-- **Dual timestamp modes**: Supports both userspace timing and kernel SO_TIMESTAMPING for sub-microsecond accuracy
-
-The admin/metrics server within the benchmark *does* use Tokio—it's isolated on a separate thread where convenience matters more than latency.
 
 ### Runtime Architecture
 
@@ -72,7 +62,6 @@ cargo test
 # Run tests for a specific crate
 cargo test -p cache-core
 cargo test -p server
-cargo test -p benchmark
 
 # Run a specific test
 cargo test test_name
@@ -93,20 +82,11 @@ cargo xtask fuzz-all --duration 60 --jobs 4
 cargo xtask flamegraph --duration 10 --output profile.svg
 ```
 
-## Running the Server and Benchmark
+## Running the Server
 
 ```bash
 # Run cache server (requires Linux 6.0+ for io_uring)
 ./target/release/crucible-server server/config/example.toml
-
-# Run benchmark against a server
-./target/release/crucible-benchmark benchmark/config/redis.toml
-
-# Save benchmark results to parquet
-./target/release/crucible-benchmark benchmark/config/redis.toml --parquet results.parquet
-
-# View results in web dashboard
-./target/release/crucible-benchmark view results.parquet
 ```
 
 ## Architecture
@@ -125,7 +105,6 @@ crucible/
     ping/       # Simple ping protocol for testing
   server/       # Cache server binary (ringline/io_uring runtime)
   proxy/        # Redis proxy with optional local caching
-  benchmark/    # Benchmark tool binary
   cache-bench/  # In-process cache benchmark
   metrics/      # Metrics infrastructure
   xtask/        # Development tasks (fuzz-all, flamegraph)
@@ -240,5 +219,5 @@ policy = "s3fifo"    # Eviction policy (depends on backend)
 
 ## Testing
 
-- `/smoketest` - Quick end-to-end validation (starts server, runs benchmark, checks results)
+- `/smoketest` - Quick end-to-end validation (starts server, runs [cachecannon](https://github.com/cachecannon/cachecannon), checks results)
 - Loom tests (`--features loom`) verify lock-free concurrency but run slowly

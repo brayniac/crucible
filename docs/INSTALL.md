@@ -22,9 +22,6 @@ sudo apt update
 ```bash
 # Install the cache server
 sudo apt install crucible-server
-
-# Install the benchmark tool
-sudo apt install crucible-benchmark
 ```
 
 ## RHEL / CentOS / Fedora / Amazon Linux 2023 (YUM/DNF)
@@ -48,16 +45,12 @@ EOF
 ```bash
 # Install the cache server
 sudo dnf install crucible-server
-
-# Install the benchmark tool
-sudo dnf install crucible-benchmark
 ```
 
 For older systems using yum instead of dnf:
 
 ```bash
 sudo yum install crucible-server
-sudo yum install crucible-benchmark
 ```
 
 ## Building from source
@@ -73,7 +66,7 @@ cd crucible
 cargo build --release
 
 # Binaries are in target/release/
-ls target/release/crucible-server target/release/crucible-benchmark
+ls target/release/crucible-server
 ```
 
 ## Verifying installation
@@ -82,7 +75,6 @@ After installation, verify the binaries are available:
 
 ```bash
 crucible-server --version
-crucible-benchmark --version
 ```
 
 ## Next steps

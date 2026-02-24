@@ -1634,7 +1634,6 @@ dependencies = [
  "rustls",
  "segcache",
  "serde",
- "slab",
  "slab-cache",
  "tikv-jemallocator",
  "tokio",

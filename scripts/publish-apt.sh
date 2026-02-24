@@ -21,7 +21,6 @@ trap "rm -rf $REPO_DIR" EXIT
 
 # Create pool directories for each package
 mkdir -p "$REPO_DIR/pool/$COMPONENT/c/crucible-server"
-mkdir -p "$REPO_DIR/pool/$COMPONENT/c/crucible-benchmark"
 
 # Create binary directories for each architecture
 for arch in $ARCHITECTURES; do
@@ -38,8 +37,6 @@ for deb in debs/*.deb; do
         # Determine which package pool directory based on filename
         if [[ "$basename_deb" == crucible-server* ]]; then
             cp "$deb" "$REPO_DIR/pool/$COMPONENT/c/crucible-server/"
-        elif [[ "$basename_deb" == crucible-benchmark* ]]; then
-            cp "$deb" "$REPO_DIR/pool/$COMPONENT/c/crucible-benchmark/"
         else
             echo "Warning: Unknown package $basename_deb, skipping"
             continue
@@ -77,7 +74,7 @@ Suite: $DIST
 Codename: $DIST
 Architectures: $ARCHITECTURES
 Components: $COMPONENT
-Description: Crucible cache server and benchmark packages
+Description: Crucible cache server packages
 $(cat "dists/$DIST/Release.tmp")
 EOF
 rm "dists/$DIST/Release.tmp"
