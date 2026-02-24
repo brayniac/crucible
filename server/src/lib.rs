@@ -15,6 +15,6 @@ pub mod logging;
 pub mod metrics;
 pub mod signal;
 pub mod tls;
-pub mod workers;
+
 
 pub use config::{CacheBackend, Config, Protocol};

@@ -1814,8 +1814,8 @@ pub fn execute_memcache_binary<C: Cache>(
             }
         }
         _ => {
-            // Unsupported commands
-            0
+            // Unsupported commands — respond with error so clients don't hang.
+            BinaryResponse::encode_unknown_command(buf, Opcode::Noop, cmd.opaque())
         }
     };
 

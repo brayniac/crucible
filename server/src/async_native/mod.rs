@@ -174,7 +174,6 @@ mod server {
             config_tx
                 .send(HandlerConfig {
                     cache: cache.clone(),
-                    stats: worker_stats.clone(),
                     shutdown: shutdown.clone(),
                     max_value_size: config.cache.max_value_size,
                     allow_flush,

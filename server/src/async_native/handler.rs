@@ -10,7 +10,7 @@ use crate::disk_io::DiskBackend;
 use crate::disk_io::DiskIoWorkerConfig;
 use crate::metrics::{
     CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_FLUSH_ERRORS, DISK_FLUSHES, DISK_READ_ERRORS,
-    DISK_READ_HITS, DISK_READ_MISSES, DISK_READS, HITS, MISSES, WorkerStats,
+    DISK_READ_HITS, DISK_READ_MISSES, DISK_READS, HITS, MISSES,
 };
 use bytes::Bytes;
 use cache_core::Cache;
@@ -31,7 +31,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// Per-worker configuration passed to AsyncServerHandler during creation.
 pub(crate) struct HandlerConfig<C: Cache> {
     pub cache: Arc<C>,
-    pub stats: Arc<Vec<WorkerStats>>,
     pub shutdown: Arc<AtomicBool>,
     pub max_value_size: usize,
     pub allow_flush: bool,
@@ -96,10 +95,6 @@ struct AsyncDiskIo {
 /// Krio async event handler for the cache server.
 pub(crate) struct AsyncServerHandler<C: Cache> {
     cache: Arc<C>,
-    #[allow(dead_code)]
-    stats: Arc<Vec<WorkerStats>>,
-    #[allow(dead_code)]
-    worker_id: usize,
     shutdown: Arc<AtomicBool>,
     max_value_size: usize,
     allow_flush: bool,
@@ -157,8 +152,6 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
 
         AsyncServerHandler {
             cache: config.cache,
-            stats: config.stats,
-            worker_id,
             shutdown: config.shutdown,
             max_value_size: config.max_value_size,
             allow_flush: config.allow_flush,
