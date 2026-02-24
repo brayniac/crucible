@@ -1,25 +1,26 @@
 //! Async proxy worker using ringline's AsyncEventHandler.
 //!
 //! Each client connection gets a dedicated async task that:
-//! 1. Connects to a backend on accept
+//! 1. Connects to backend(s) on demand via `ringline_redis::Client`
 //! 2. Reads commands from the client
 //! 3. Checks the local cache for GET hits
-//! 4. Forwards cache misses to the backend
+//! 4. Forwards cache misses to the typed backend client
 //! 5. Caches backend responses and sends them back to the client
 
 use crate::cache::SharedCache;
 use crate::config::Config;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use resp_proto::{Command, ParseError, Value};
 use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, RinglineBuilder};
+use ringline_redis::Client;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // ── Config channel ──────────────────────────────────────────────────────
 
@@ -56,6 +57,10 @@ pub struct AsyncProxyHandler {
     cache: Arc<SharedCache>,
     backends: Vec<SocketAddr>,
     ring: ketama::Ring,
+    password: Option<String>,
+    username: Option<String>,
+    tls_server_name: Option<String>,
+    connect_timeout_ms: u64,
 }
 
 impl AsyncEventHandler for AsyncProxyHandler {
@@ -63,7 +68,20 @@ impl AsyncEventHandler for AsyncProxyHandler {
         let cache = Arc::clone(&self.cache);
         let backends = self.backends.clone();
         let ring = self.ring.clone();
-        Box::pin(handle_client(client, ring, backends, cache))
+        let password = self.password.clone();
+        let username = self.username.clone();
+        let tls_server_name = self.tls_server_name.clone();
+        let connect_timeout_ms = self.connect_timeout_ms;
+        Box::pin(handle_client(
+            client,
+            ring,
+            backends,
+            cache,
+            password,
+            username,
+            tls_server_name,
+            connect_timeout_ms,
+        ))
     }
 
     fn on_tick(&mut self, ctx: &mut DriverCtx<'_>) {
@@ -101,6 +119,10 @@ impl AsyncEventHandler for AsyncProxyHandler {
             cache: cfg.cache,
             backends,
             ring,
+            password: cfg.config.backend.password.clone(),
+            username: cfg.config.backend.username.clone(),
+            tls_server_name: cfg.config.backend.tls_server_name.clone(),
+            connect_timeout_ms: cfg.config.backend.connect_timeout_ms,
         }
     }
 }
@@ -109,13 +131,18 @@ impl AsyncEventHandler for AsyncProxyHandler {
 
 /// Handle a single client connection: route commands to backends via
 /// ketama consistent hashing, establishing backend connections lazily.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     client: ConnCtx,
     ring: ketama::Ring,
     backends: Vec<SocketAddr>,
     cache: Arc<SharedCache>,
+    password: Option<String>,
+    username: Option<String>,
+    tls_server_name: Option<String>,
+    connect_timeout_ms: u64,
 ) {
-    let mut conns: HashMap<usize, ConnCtx> = HashMap::new();
+    let mut conns: HashMap<usize, Client> = HashMap::new();
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
@@ -133,7 +160,7 @@ async fn handle_client(
         if got == 0 {
             // Client disconnected.
             for (_, conn) in conns.drain() {
-                conn.close();
+                conn.conn().close();
             }
             break;
         }
@@ -148,17 +175,27 @@ async fn handle_client(
                 Ok((cmd, consumed)) => {
                     // Route the command to the appropriate backend.
                     let endpoint_idx = route_command(&cmd, &ring, backends.len());
-                    let backend =
-                        match get_or_connect(&client, &mut conns, &backends, endpoint_idx).await {
-                            Some(conn) => conn,
-                            None => {
-                                let _ = client.send(b"-ERR backend unavailable\r\n");
-                                for (_, conn) in conns.drain() {
-                                    conn.close();
-                                }
-                                return;
+                    let backend = match get_or_connect(
+                        &client,
+                        &mut conns,
+                        &backends,
+                        endpoint_idx,
+                        password.as_deref(),
+                        username.as_deref(),
+                        tls_server_name.as_deref(),
+                        connect_timeout_ms,
+                    )
+                    .await
+                    {
+                        Some(conn) => conn,
+                        None => {
+                            let _ = client.send(b"-ERR backend unavailable\r\n");
+                            for (_, conn) in conns.drain() {
+                                conn.conn().close();
                             }
-                        };
+                            return;
+                        }
+                    };
 
                     match process_command(&cmd, &client, backend, &cache).await {
                         CommandResult::Responded => {}
@@ -166,7 +203,7 @@ async fn handle_client(
                         CommandResult::BackendDisconnected => {
                             // Remove the failed backend; next use will reconnect.
                             if let Some(conn) = conns.remove(&endpoint_idx) {
-                                conn.close();
+                                conn.conn().close();
                             }
                             let _ = client.send(b"-ERR backend disconnected\r\n");
                         }
@@ -178,7 +215,7 @@ async fn handle_client(
                     warn!(error = ?e, "Client parse error");
                     let _ = client.send(b"-ERR protocol error\r\n");
                     for (_, conn) in conns.drain() {
-                        conn.close();
+                        conn.conn().close();
                     }
                     return;
                 }
@@ -193,45 +230,128 @@ fn route_command(cmd: &Command<'_>, ring: &ketama::Ring, num_backends: usize) ->
         return 0;
     }
     match cmd {
-        Command::Get { key } | Command::Set { key, .. } | Command::Del { key } => ring.route(key),
+        // String commands with a key
+        Command::Get { key }
+        | Command::Set { key, .. }
+        | Command::Del { key }
+        | Command::Incr { key }
+        | Command::Decr { key }
+        | Command::IncrBy { key, .. }
+        | Command::DecrBy { key, .. }
+        | Command::Append { key, .. } => ring.route(key),
+        // Hash commands
+        Command::HSet { key, .. }
+        | Command::HGet { key, .. }
+        | Command::HMGet { key, .. }
+        | Command::HGetAll { key }
+        | Command::HDel { key, .. }
+        | Command::HExists { key, .. }
+        | Command::HLen { key }
+        | Command::HKeys { key }
+        | Command::HVals { key }
+        | Command::HSetNx { key, .. }
+        | Command::HIncrBy { key, .. } => ring.route(key),
+        // List commands
+        Command::LPush { key, .. }
+        | Command::RPush { key, .. }
+        | Command::LPop { key, .. }
+        | Command::RPop { key, .. }
+        | Command::LRange { key, .. }
+        | Command::LLen { key }
+        | Command::LIndex { key, .. }
+        | Command::LSet { key, .. }
+        | Command::LTrim { key, .. }
+        | Command::LPushX { key, .. }
+        | Command::RPushX { key, .. } => ring.route(key),
+        // Set commands
+        Command::SAdd { key, .. }
+        | Command::SRem { key, .. }
+        | Command::SMembers { key }
+        | Command::SIsMember { key, .. }
+        | Command::SMisMember { key, .. }
+        | Command::SCard { key }
+        | Command::SPop { key, .. }
+        | Command::SRandMember { key, .. } => ring.route(key),
+        // Key commands
+        Command::Type { key } => ring.route(key),
+        // MGet: route by first key (may span shards, but simple approach)
+        Command::MGet { keys } => {
+            if let Some(first) = keys.first() {
+                ring.route(first)
+            } else {
+                0
+            }
+        }
         // Non-keyed commands go to endpoint 0.
         _ => 0,
     }
 }
 
 /// Get an existing backend connection or establish a new one lazily.
+#[allow(clippy::too_many_arguments)]
 async fn get_or_connect<'a>(
     client: &ConnCtx,
-    conns: &'a mut HashMap<usize, ConnCtx>,
+    conns: &'a mut HashMap<usize, Client>,
     backends: &[SocketAddr],
     idx: usize,
-) -> Option<&'a ConnCtx> {
+    password: Option<&str>,
+    username: Option<&str>,
+    tls_server_name: Option<&str>,
+    connect_timeout_ms: u64,
+) -> Option<&'a mut Client> {
     if let std::collections::hash_map::Entry::Vacant(e) = conns.entry(idx) {
         let addr = backends[idx];
-        let conn = match client.connect(addr) {
-            Ok(fut) => match fut.await {
-                Ok(ctx) => {
-                    debug!(
-                        client_index = client.index(),
-                        backend_index = ctx.index(),
-                        backend_addr = %addr,
-                        "Backend connected"
-                    );
-                    ctx
-                }
-                Err(e) => {
-                    warn!(error = %e, backend_addr = %addr, "Backend connect failed");
-                    return None;
-                }
-            },
+
+        // Submit the connect request (with optional TLS and timeout).
+        let connect_fut = match (tls_server_name, connect_timeout_ms > 0) {
+            (Some(sni), true) => client.connect_tls_with_timeout(addr, sni, connect_timeout_ms),
+            (Some(sni), false) => client.connect_tls(addr, sni),
+            (None, true) => client.connect_with_timeout(addr, connect_timeout_ms),
+            (None, false) => client.connect(addr),
+        };
+
+        let connect_fut = match connect_fut {
+            Ok(fut) => fut,
             Err(e) => {
                 warn!(error = %e, backend_addr = %addr, "Backend connect submission failed");
                 return None;
             }
         };
-        e.insert(conn);
+
+        let ctx: ConnCtx = match connect_fut.await {
+            Ok(ctx) => {
+                debug!(
+                    client_index = client.index(),
+                    backend_index = ctx.index(),
+                    backend_addr = %addr,
+                    "Backend connected"
+                );
+                ctx
+            }
+            Err(e) => {
+                warn!(error = %e, backend_addr = %addr, "Backend connect failed");
+                return None;
+            }
+        };
+
+        let mut redis_client = Client::new(ctx);
+
+        // Authenticate if credentials are configured.
+        if let Some(pw) = password {
+            let auth_result = match username {
+                Some(user) => redis_client.auth_username(user, pw).await,
+                None => redis_client.auth(pw).await,
+            };
+            if let Err(e) = auth_result {
+                warn!(error = %e, backend_addr = %addr, "Backend auth failed");
+                redis_client.conn().close();
+                return None;
+            }
+        }
+
+        e.insert(redis_client);
     }
-    conns.get(&idx)
+    conns.get_mut(&idx)
 }
 
 /// Result of processing a single command.
@@ -248,120 +368,527 @@ enum CommandResult {
 async fn process_command(
     cmd: &Command<'_>,
     client: &ConnCtx,
-    backend: &ConnCtx,
+    backend: &mut Client,
     cache: &SharedCache,
 ) -> CommandResult {
-    // PING: respond directly.
-    if matches!(cmd, Command::Ping) {
-        let _ = client.send(b"+PONG\r\n");
-        return CommandResult::Responded;
-    }
-
-    // GET: check cache first.
-    if let Command::Get { key } = cmd
-        && let Some(data) = cache.with_value(key, |v| v.to_vec())
-    {
-        let _ = client.send(&data);
-        return CommandResult::Responded;
-    }
-
-    // Invalidate cache on writes.
     match cmd {
-        Command::Set { key, .. } | Command::Del { key } => {
+        // ── PING: respond directly ──────────────────────────────────
+        Command::Ping => {
+            let _ = client.send(Value::PONG);
+            CommandResult::Responded
+        }
+
+        // ── GET: check cache first, then backend ────────────────────
+        Command::Get { key } => {
+            // Cache hit: encode the raw value as a RESP bulk string.
+            if let Some(data) = cache.with_value(key, Bytes::copy_from_slice) {
+                send_bulk_string(client, &data);
+                return CommandResult::Responded;
+            }
+
+            match backend.get(*key).await {
+                Ok(Some(value)) => {
+                    // Cache the raw value bytes.
+                    cache.set(key, &value);
+                    send_bulk_string(client, &value);
+                    CommandResult::ForwardedAndResponded
+                }
+                Ok(None) => {
+                    let _ = client.send(Value::NULL_BULK);
+                    CommandResult::ForwardedAndResponded
+                }
+                Err(ringline_redis::Error::ConnectionClosed) => {
+                    CommandResult::BackendDisconnected
+                }
+                Err(e) => {
+                    send_error(client, &e.to_string());
+                    CommandResult::ForwardedAndResponded
+                }
+            }
+        }
+
+        // ── SET: forward to backend, invalidate cache ───────────────
+        Command::Set {
+            key,
+            value,
+            ex,
+            px,
+            nx,
+            xx,
+        } => {
             cache.delete(key);
-        }
-        _ => {}
-    }
 
-    // Encode and forward to backend.
-    let mut encoded = BytesMut::with_capacity(64);
-    encode_command(cmd, &mut encoded);
-
-    if backend.send(&encoded).is_err() {
-        return CommandResult::BackendDisconnected;
-    }
-
-    // Read the response from backend.
-    let mut resp_buf = BytesMut::with_capacity(4096);
-    loop {
-        let got = backend
-            .with_data(|data| {
-                if data.is_empty() {
-                    return ringline::ParseResult::Consumed(0);
+            let result = if *nx {
+                backend.set_nx(*key, *value).await.map(|was_set| {
+                    if was_set {
+                        Value::SimpleString(Bytes::from_static(b"OK"))
+                    } else {
+                        Value::Null
+                    }
+                })
+            } else if let Some(secs) = ex {
+                // SET with XX + EX is not directly supported by typed methods;
+                // for simplicity we ignore XX here since it's rare for proxies.
+                if *xx {
+                    forward_raw_value(backend, cmd).await
+                } else {
+                    backend.set_ex(*key, *value, *secs).await.map(|()| {
+                        Value::SimpleString(Bytes::from_static(b"OK"))
+                    })
                 }
-                resp_buf.extend_from_slice(data);
-                ringline::ParseResult::Consumed(data.len())
-            })
-            .await;
+            } else if let Some(ms) = px {
+                if *xx {
+                    forward_raw_value(backend, cmd).await
+                } else {
+                    backend.set_px(*key, *value, *ms).await.map(|()| {
+                        Value::SimpleString(Bytes::from_static(b"OK"))
+                    })
+                }
+            } else if *xx {
+                forward_raw_value(backend, cmd).await
+            } else {
+                backend.set(*key, *value).await.map(|()| {
+                    Value::SimpleString(Bytes::from_static(b"OK"))
+                })
+            };
 
-        if got == 0 {
-            return CommandResult::BackendDisconnected;
+            send_result(client, result)
         }
 
-        // Try to parse a complete RESP value.
-        match Value::parse(&resp_buf) {
-            Ok((_value, consumed)) => {
-                let response_bytes = &resp_buf[..consumed];
+        // ── DEL: forward to backend, invalidate cache ───────────────
+        Command::Del { key } => {
+            cache.delete(key);
+            let result = backend.del(*key).await.map(|n| Value::Integer(n as i64));
+            send_result(client, result)
+        }
 
-                // Cache successful GET responses.
-                if let Command::Get { key } = cmd
-                    && !response_bytes.starts_with(b"$-1\r\n")
-                    && !response_bytes.starts_with(b"_\r\n")
-                    && !response_bytes.starts_with(b"-")
-                {
-                    cache.set(key, response_bytes);
+        // ── MGET: forward to backend ────────────────────────────────
+        Command::MGet { keys } => {
+            let key_slices: Vec<&[u8]> = keys.to_vec();
+            let result = backend.mget(&key_slices).await.map(|values| {
+                let arr: Vec<Value> = values
+                    .into_iter()
+                    .map(|v| match v {
+                        Some(data) => Value::BulkString(data),
+                        None => Value::Null,
+                    })
+                    .collect();
+                Value::Array(arr)
+            });
+            send_result(client, result)
+        }
+
+        // ── INCR/DECR/INCRBY/DECRBY ────────────────────────────────
+        Command::Incr { key } => {
+            cache.delete(key);
+            let result = backend.incr(*key).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::Decr { key } => {
+            cache.delete(key);
+            let result = backend.decr(*key).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::IncrBy { key, delta } => {
+            cache.delete(key);
+            let result = backend.incrby(*key, *delta).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::DecrBy { key, delta } => {
+            cache.delete(key);
+            let result = backend.decrby(*key, *delta).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::Append { key, value } => {
+            cache.delete(key);
+            let result = backend.append(*key, *value).await.map(Value::Integer);
+            send_result(client, result)
+        }
+
+        // ── Hash commands ───────────────────────────────────────────
+        Command::HGet { key, field } => {
+            let result = backend.hget(*key, *field).await.map(|v| match v {
+                Some(data) => Value::BulkString(data),
+                None => Value::Null,
+            });
+            send_result(client, result)
+        }
+        Command::HSet { key, fields } => {
+            cache.delete(key);
+            // The typed client only supports single field hset, so use raw cmd
+            // for multi-field HSET to send it in one round trip.
+            if fields.len() == 1 {
+                let (field, value) = fields[0];
+                let result = backend
+                    .hset(*key, field, value)
+                    .await
+                    .map(|is_new| Value::Integer(if is_new { 1 } else { 0 }));
+                send_result(client, result)
+            } else {
+                let result = forward_raw_value(backend, cmd).await;
+                send_result(client, result)
+            }
+        }
+        Command::HGetAll { key } => {
+            let result = backend.hgetall(*key).await.map(|pairs| {
+                let mut arr = Vec::with_capacity(pairs.len() * 2);
+                for (f, v) in pairs {
+                    arr.push(Value::BulkString(f));
+                    arr.push(Value::BulkString(v));
                 }
+                Value::Array(arr)
+            });
+            send_result(client, result)
+        }
+        Command::HMGet { key, fields } => {
+            let field_slices: Vec<&[u8]> = fields.to_vec();
+            let result = backend.hmget(*key, &field_slices).await.map(|values| {
+                let arr: Vec<Value> = values
+                    .into_iter()
+                    .map(|v| match v {
+                        Some(data) => Value::BulkString(data),
+                        None => Value::Null,
+                    })
+                    .collect();
+                Value::Array(arr)
+            });
+            send_result(client, result)
+        }
+        Command::HDel { key, fields } => {
+            cache.delete(key);
+            let field_slices: Vec<&[u8]> = fields.to_vec();
+            let result = backend.hdel(*key, &field_slices).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::HExists { key, field } => {
+            let result = backend
+                .hexists(*key, *field)
+                .await
+                .map(|exists| Value::Integer(if exists { 1 } else { 0 }));
+            send_result(client, result)
+        }
+        Command::HLen { key } => {
+            let result = backend.hlen(*key).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::HKeys { key } => {
+            let result = backend.hkeys(*key).await.map(|keys| {
+                Value::Array(keys.into_iter().map(Value::BulkString).collect())
+            });
+            send_result(client, result)
+        }
+        Command::HVals { key } => {
+            let result = backend.hvals(*key).await.map(|vals| {
+                Value::Array(vals.into_iter().map(Value::BulkString).collect())
+            });
+            send_result(client, result)
+        }
+        Command::HSetNx { key, field, value } => {
+            cache.delete(key);
+            let result = backend
+                .hsetnx(*key, *field, *value)
+                .await
+                .map(|is_new| Value::Integer(if is_new { 1 } else { 0 }));
+            send_result(client, result)
+        }
+        Command::HIncrBy { key, field, delta } => {
+            cache.delete(key);
+            let result = backend.hincrby(*key, *field, *delta).await.map(Value::Integer);
+            send_result(client, result)
+        }
 
-                let _ = client.send(response_bytes);
-                return CommandResult::ForwardedAndResponded;
+        // ── List commands ───────────────────────────────────────────
+        Command::LPush { key, values } => {
+            cache.delete(key);
+            let val_slices: Vec<&[u8]> = values.to_vec();
+            let result = backend.lpush(*key, &val_slices).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::RPush { key, values } => {
+            cache.delete(key);
+            let val_slices: Vec<&[u8]> = values.to_vec();
+            let result = backend.rpush(*key, &val_slices).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::LPop { key, .. } => {
+            cache.delete(key);
+            let result = backend.lpop(*key).await.map(|v| match v {
+                Some(data) => Value::BulkString(data),
+                None => Value::Null,
+            });
+            send_result(client, result)
+        }
+        Command::RPop { key, .. } => {
+            cache.delete(key);
+            let result = backend.rpop(*key).await.map(|v| match v {
+                Some(data) => Value::BulkString(data),
+                None => Value::Null,
+            });
+            send_result(client, result)
+        }
+        Command::LLen { key } => {
+            let result = backend.llen(*key).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::LIndex { key, index } => {
+            let result = backend.lindex(*key, *index).await.map(|v| match v {
+                Some(data) => Value::BulkString(data),
+                None => Value::Null,
+            });
+            send_result(client, result)
+        }
+        Command::LRange { key, start, stop } => {
+            let result = backend.lrange(*key, *start, *stop).await.map(|items| {
+                Value::Array(items.into_iter().map(Value::BulkString).collect())
+            });
+            send_result(client, result)
+        }
+        Command::LTrim { key, start, stop } => {
+            cache.delete(key);
+            let result = backend.ltrim(*key, *start, *stop).await.map(|()| {
+                Value::SimpleString(Bytes::from_static(b"OK"))
+            });
+            send_result(client, result)
+        }
+        Command::LSet { key, index, value } => {
+            cache.delete(key);
+            let result = backend.lset(*key, *index, *value).await.map(|()| {
+                Value::SimpleString(Bytes::from_static(b"OK"))
+            });
+            send_result(client, result)
+        }
+        Command::LPushX { key, values } => {
+            cache.delete(key);
+            // Client only supports single value lpushx; for multi, use first.
+            if let Some(first) = values.first() {
+                let result = backend.lpushx(*key, *first).await.map(Value::Integer);
+                send_result(client, result)
+            } else {
+                let _ = client.send(b":0\r\n");
+                CommandResult::Responded
             }
-            Err(ParseError::Incomplete) => {
-                // Need more data — continue reading.
-                continue;
+        }
+        Command::RPushX { key, values } => {
+            cache.delete(key);
+            if let Some(first) = values.first() {
+                let result = backend.rpushx(*key, *first).await.map(Value::Integer);
+                send_result(client, result)
+            } else {
+                let _ = client.send(b":0\r\n");
+                CommandResult::Responded
             }
-            Err(e) => {
-                error!(error = ?e, "Backend response parse error");
-                let _ = client.send(b"-ERR backend protocol error\r\n");
-                return CommandResult::BackendDisconnected;
-            }
+        }
+
+        // ── Set commands ────────────────────────────────────────────
+        Command::SAdd { key, members } => {
+            cache.delete(key);
+            let mem_slices: Vec<&[u8]> = members.to_vec();
+            let result = backend.sadd(*key, &mem_slices).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::SRem { key, members } => {
+            cache.delete(key);
+            let mem_slices: Vec<&[u8]> = members.to_vec();
+            let result = backend.srem(*key, &mem_slices).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::SMembers { key } => {
+            let result = backend.smembers(*key).await.map(|members| {
+                Value::Array(members.into_iter().map(Value::BulkString).collect())
+            });
+            send_result(client, result)
+        }
+        Command::SCard { key } => {
+            let result = backend.scard(*key).await.map(Value::Integer);
+            send_result(client, result)
+        }
+        Command::SIsMember { key, member } => {
+            let result = backend
+                .sismember(*key, *member)
+                .await
+                .map(|exists| Value::Integer(if exists { 1 } else { 0 }));
+            send_result(client, result)
+        }
+        Command::SMisMember { key, members } => {
+            let mem_slices: Vec<&[u8]> = members.to_vec();
+            let result = backend.smismember(*key, &mem_slices).await.map(|bools| {
+                Value::Array(
+                    bools
+                        .into_iter()
+                        .map(|b| Value::Integer(if b { 1 } else { 0 }))
+                        .collect(),
+                )
+            });
+            send_result(client, result)
+        }
+        Command::SPop { key, .. } => {
+            cache.delete(key);
+            let result = backend.spop(*key).await.map(|v| match v {
+                Some(data) => Value::BulkString(data),
+                None => Value::Null,
+            });
+            send_result(client, result)
+        }
+        Command::SRandMember { key, count } => {
+            let count = count.unwrap_or(1);
+            let result = backend.srandmember(*key, count).await.map(|members| {
+                Value::Array(members.into_iter().map(Value::BulkString).collect())
+            });
+            send_result(client, result)
+        }
+
+        // ── Key commands ────────────────────────────────────────────
+        Command::Type { key } => {
+            let result = backend.key_type(*key).await.map(|t| {
+                Value::SimpleString(Bytes::from(t))
+            });
+            send_result(client, result)
+        }
+
+        // ── Server commands ─────────────────────────────────────────
+        Command::FlushDb => {
+            let result = backend.flushdb().await.map(|()| {
+                Value::SimpleString(Bytes::from_static(b"OK"))
+            });
+            send_result(client, result)
+        }
+        Command::FlushAll => {
+            let result = backend.flushall().await.map(|()| {
+                Value::SimpleString(Bytes::from_static(b"OK"))
+            });
+            send_result(client, result)
+        }
+
+        // ── Config ──────────────────────────────────────────────────
+        Command::Config { .. } | Command::Cluster { .. } => {
+            // Forward raw for complex admin commands.
+            let result = forward_raw_value(backend, cmd).await;
+            send_result(client, result)
+        }
+
+        // ── Unsupported commands ────────────────────────────────────
+        _ => {
+            send_error(client, "unsupported command");
+            CommandResult::Responded
         }
     }
 }
 
-// ── Command encoding ────────────────────────────────────────────────────
+// ── Response helpers ────────────────────────────────────────────────────
 
-/// Encode a RESP command into a BytesMut buffer.
-fn encode_command(cmd: &Command<'_>, buf: &mut BytesMut) {
+/// Send a RESP bulk string to the client connection.
+fn send_bulk_string(client: &ConnCtx, data: &[u8]) {
+    let mut buf = BytesMut::with_capacity(data.len() + 16);
+    buf.extend_from_slice(b"$");
+    write_usize(&mut buf, data.len());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"\r\n");
+    let _ = client.send(&buf);
+}
+
+/// Encode a `resp_proto::Value` into RESP wire format and send to the client.
+fn send_value(client: &ConnCtx, value: &Value) {
+    let len = value.encoded_len();
+    let mut buf = vec![0u8; len];
+    value.encode(&mut buf);
+    let _ = client.send(&buf);
+}
+
+/// Send an error response to the client.
+fn send_error(client: &ConnCtx, msg: &str) {
+    let mut buf = BytesMut::with_capacity(msg.len() + 8);
+    buf.extend_from_slice(b"-ERR ");
+    buf.extend_from_slice(msg.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    let _ = client.send(&buf);
+}
+
+/// Convert a typed client result to a wire response and send to the client.
+fn send_result(
+    client: &ConnCtx,
+    result: Result<Value, ringline_redis::Error>,
+) -> CommandResult {
+    match result {
+        Ok(value) => {
+            send_value(client, &value);
+            CommandResult::ForwardedAndResponded
+        }
+        Err(ringline_redis::Error::ConnectionClosed) => CommandResult::BackendDisconnected,
+        Err(e) => {
+            send_error(client, &e.to_string());
+            CommandResult::ForwardedAndResponded
+        }
+    }
+}
+
+/// Forward a command to the backend using raw `cmd()` and return the raw Value.
+/// Used for commands with complex flags not covered by typed methods.
+async fn forward_raw_value(
+    backend: &mut Client,
+    cmd: &Command<'_>,
+) -> Result<Value, ringline_redis::Error> {
+    let req = build_request(cmd);
+    backend.cmd(&req).await
+}
+
+/// Build a `resp_proto::Request` from a parsed `Command`.
+fn build_request<'a>(cmd: &Command<'a>) -> resp_proto::Request<'a> {
     match cmd {
-        Command::Get { key } => {
-            buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$");
-            write_usize(buf, key.len());
-            buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(b"\r\n");
+        Command::Get { key } => resp_proto::Request::get(key),
+        Command::Set {
+            key,
+            value,
+            ex,
+            px,
+            nx,
+            xx,
+        } => {
+            let mut req = resp_proto::Request::cmd(b"SET").arg(key).arg(value);
+            if let Some(secs) = ex {
+                let s = secs.to_string();
+                // We need to leak the string since Request borrows &'a [u8].
+                // This is only called for rare SET XX+EX combinations.
+                let leaked: &'static [u8] = Box::leak(s.into_bytes().into_boxed_slice());
+                req = req.arg(b"EX" as &[u8]).arg(leaked);
+            }
+            if let Some(ms) = px {
+                let s = ms.to_string();
+                let leaked: &'static [u8] = Box::leak(s.into_bytes().into_boxed_slice());
+                req = req.arg(b"PX" as &[u8]).arg(leaked);
+            }
+            if *nx {
+                req = req.arg(b"NX" as &[u8]);
+            }
+            if *xx {
+                req = req.arg(b"XX" as &[u8]);
+            }
+            req
         }
-        Command::Set { key, value, .. } => {
-            buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
-            write_usize(buf, key.len());
-            buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(b"\r\n$");
-            write_usize(buf, value.len());
-            buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(value);
-            buf.extend_from_slice(b"\r\n");
+        Command::Del { key } => resp_proto::Request::del(key),
+        Command::Config { subcommand, args } => {
+            let mut req = resp_proto::Request::cmd(b"CONFIG").arg(subcommand);
+            for arg in args {
+                req = req.arg(arg);
+            }
+            req
         }
-        Command::Del { key } => {
-            buf.extend_from_slice(b"*2\r\n$3\r\nDEL\r\n$");
-            write_usize(buf, key.len());
-            buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(b"\r\n");
+        Command::Cluster { subcommand, args } => {
+            let mut req = resp_proto::Request::cmd(b"CLUSTER").arg(subcommand);
+            for arg in args {
+                req = req.arg(arg);
+            }
+            req
         }
-        _ => {
-            // Fallback: encode as PING.
-            buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        // Multi-field HSET
+        Command::HSet { key, fields } => {
+            let mut req = resp_proto::Request::cmd(b"HSET").arg(key);
+            for (field, value) in fields {
+                req = req.arg(field).arg(value);
+            }
+            req
         }
+        _ => resp_proto::Request::cmd(b"PING"),
     }
 }
 

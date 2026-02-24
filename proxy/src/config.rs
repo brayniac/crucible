@@ -109,6 +109,18 @@ pub struct BackendConfig {
     /// Read timeout in milliseconds.
     #[serde(default = "BackendConfig::default_read_timeout_ms")]
     pub read_timeout_ms: u64,
+
+    /// Redis AUTH password (optional).
+    #[serde(default)]
+    pub password: Option<String>,
+
+    /// Redis AUTH username for ACL-based auth (optional, requires password).
+    #[serde(default)]
+    pub username: Option<String>,
+
+    /// TLS server name for backend connections (optional, enables TLS when set).
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
 }
 
 impl BackendConfig {

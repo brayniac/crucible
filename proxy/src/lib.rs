@@ -4,7 +4,6 @@
 //! architecture for maximum performance.
 
 pub mod async_worker;
-pub mod backend;
 pub mod cache;
 pub mod config;
 pub mod metrics;

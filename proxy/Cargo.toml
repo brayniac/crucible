@@ -21,6 +21,9 @@ resp-proto = { workspace = true, features = ["resp3"] }
 # I/O event loop
 ringline = { workspace = true }
 
+# Backend Redis client (typed async client on ringline)
+ringline-redis = { workspace = true }
+
 # Core utilities
 bytes = { workspace = true }
 crossbeam-channel = { workspace = true }

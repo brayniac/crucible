@@ -63,6 +63,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
 ringline = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
+ringline-redis = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214" }
 http2-proto = "0.0.1"
 grpc-proto = "0.0.1"
 protocol-momento = { path = "protocol/momento" }
