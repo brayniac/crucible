@@ -170,9 +170,6 @@ mod set_cache;
 pub use hash_cache::HashCache;
 pub use list_cache::ListCache;
 pub use set_cache::SetCache;
-mod arc_cache;
-pub use arc_cache::{ArcCache, Entry};
-
 // Reservation for zero-copy receive
 mod reservation;
 pub use reservation::{SegmentReservation, SetReservation};
