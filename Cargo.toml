@@ -18,9 +18,6 @@ members = [
 	# Proxy
 	"proxy",
 
-# Benchmark Tool
-	"benchmark",
-
 	# In-Process Cache Benchmark
 	"cache-bench",
 
@@ -55,24 +52,17 @@ num_cpus = "1.16"
 parking_lot = "0.12"
 rand = "0.9"
 rustls = { version = "0.23", default-features = false }
-ryu = "1.0"
 serde = "1"
 slab = "0.4"
 smallvec = "1.13"
-socket2 = "0.5"
 thiserror = "2"
-wide = "1.1"
 tokio = "1"
 toml = "0.8"
-webpki-roots = "0.26"
 tracing = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
 ringline = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
-ringline-redis = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
-ringline-memcache = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
-ringline-ping = { git = "https://github.com/ringline-rs/ringline.git", rev = "b5a4214", features = ["timestamps"] }
 http2-proto = "0.0.1"
 grpc-proto = "0.0.1"
 protocol-momento = { path = "protocol/momento" }

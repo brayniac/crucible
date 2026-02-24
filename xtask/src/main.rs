@@ -9,6 +9,23 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn which_cachecannon() -> Result<PathBuf, String> {
+    Command::new("which")
+        .arg("cachecannon")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| PathBuf::from(s.trim()))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| "cachecannon not found".to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "xtask")]
 #[command(about = "Development tasks for the crucible workspace")]
@@ -56,9 +73,6 @@ enum Commands {
         #[arg(long)]
         no_load: bool,
 
-        /// Server runtime: "native" or "tokio"
-        #[arg(long, default_value = "native")]
-        runtime: String,
     },
 }
 
@@ -77,8 +91,7 @@ fn main() {
             config,
             bench_config,
             no_load,
-            runtime,
-        } => flamegraph(duration, output, config, bench_config, no_load, runtime),
+        } => flamegraph(duration, output, config, bench_config, no_load),
     };
 
     if let Err(e) = result {
@@ -400,7 +413,6 @@ fn flamegraph(
     config: Option<PathBuf>,
     bench_config: Option<PathBuf>,
     no_load: bool,
-    runtime: String,
 ) -> Result<(), String> {
     let workspace_root = find_workspace_root()?;
 
@@ -416,14 +428,13 @@ fn flamegraph(
     println!("=====================");
     println!("Duration: {}s", duration);
     println!("Output: {}", output.display());
-    println!("Runtime: {}", runtime);
     println!("Load: {}", if no_load { "none" } else { "benchmark" });
     println!();
 
     // Build release binaries
     println!("Building release binaries...");
     let status = Command::new("cargo")
-        .args(["build", "--release", "-p", "server", "-p", "benchmark"])
+        .args(["build", "--release", "-p", "server"])
         .current_dir(&workspace_root)
         .status()
         .map_err(|e| format!("failed to run cargo build: {e}"))?;
@@ -436,15 +447,12 @@ fn flamegraph(
     let server_config = match config {
         Some(path) => path,
         None => {
-            let config_content = format!(
-                r#"
-runtime = "{runtime}"
-
+            let config_content = r#"
 [workers]
 threads = 4
 
 [cache]
-backend = "segcache"
+backend = "segment"
 heap_size = "64MB"
 segment_size = "1MB"
 hashtable_power = 16
@@ -461,8 +469,7 @@ sqpoll = false
 buffer_count = 1024
 buffer_size = 4096
 sq_depth = 1024
-"#
-            );
+"#;
             let config_path = workspace_root.join("target/flamegraph-server.toml");
             fs::write(&config_path, config_content)
                 .map_err(|e| format!("failed to write temp config: {e}"))?;
@@ -537,7 +544,7 @@ length = 64
     let mut benchmark: Option<Child> = None;
     if !no_load {
         println!("Starting benchmark...");
-        let bench_bin = workspace_root.join("target/release/crucible-benchmark");
+        let bench_bin = which_cachecannon().map_err(|_| "cachecannon not found in PATH. Install with: cargo install --git https://github.com/cachecannon/cachecannon".to_string())?;
         let child = Command::new(&bench_bin)
             .arg(&benchmark_config)
             .current_dir(&workspace_root)

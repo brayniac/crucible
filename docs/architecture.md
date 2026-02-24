@@ -15,7 +15,7 @@ Crucible is a high-performance cache server with a clear separation between data
 │  Worker 0 │  Worker 1 │    ...    │   Worker N    │      Admin        │
 │  (CPU 0)  │  (CPU 1)  │           │   (CPU N)     │                   │
 │           │           │           │               │   Tokio runtime   │
-│ io-driver │ io-driver │ io-driver │   io-driver   │   /health         │
+│ ringline │ ringline │ ringline │   ringline   │   /health         │
 │ instance  │ instance  │ instance  │   instance    │   /ready          │
 │           │           │           │               │   /metrics        │
 ├───────────┴───────────┴───────────┴───────────────┤                   │
@@ -26,7 +26,7 @@ Crucible is a high-performance cache server with a clear separation between data
 └───────────────────────────────────────────────────┴───────────────────┘
 ```
 
-**Data plane**: Workers handle RESP/Memcache requests. Each has its own io-driver instance (io_uring on Linux 6.0+, mio elsewhere), optionally pinned to a CPU core. All workers share a single lock-free cache.
+**Data plane**: Workers handle RESP/Memcache requests. Each runs as an async task on a ringline io_uring worker (Linux 6.0+), optionally pinned to a CPU core. All workers share a single lock-free cache.
 
 **Control plane**: Admin thread runs a single-threaded Tokio runtime for health checks and Prometheus metrics. Isolated from workers so it doesn't affect request latency.
 
@@ -41,17 +41,11 @@ crucible/
 │   ├── segcache/     # Segment-based cache implementation
 │   ├── slab/         # Memcached-style slab allocator
 │   └── heap/         # Simple heap-allocated cache
-├── io/
-│   ├── driver/       # io_uring + mio abstraction
-│   ├── http2/        # HTTP/2 framing (for Momento)
-│   └── grpc/         # gRPC client (for Momento)
 ├── protocol/
-│   ├── resp/         # Redis RESP2/RESP3
-│   ├── memcache/     # Memcache ASCII + binary
 │   ├── momento/      # Momento cache protocol
 │   └── ping/         # Simple ping (testing)
 ├── server/           # Cache server binary
-├── benchmark/        # Benchmark tool binary
+├── proxy/            # Redis proxy with optional local caching
 ├── metrics/          # Metrics infrastructure
 └── xtask/            # Dev tasks (fuzz, flamegraph)
 ```
@@ -59,19 +53,13 @@ crucible/
 ### Dependency Flow
 
 ```
-server, benchmark
-       │
-       ▼
-┌──────────────┐
-│   io-driver  │ ←── Handles all network I/O
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│   protocol   │ ←── Parses RESP, Memcache, etc.
-└──────┬───────┘
-       │
-       ▼
+server
+  │
+  ├──► ringline        ←── io_uring event loop (async task per connection)
+  ├──► resp-proto      ←── Redis RESP2/RESP3 protocol
+  ├──► memcache-proto  ←── Memcache ASCII protocol
+  │
+  ▼
 ┌──────────────┐
 │  cache-core  │ ←── TieredCache, hashtable, segments
 └──────┬───────┘
@@ -82,68 +70,16 @@ server, benchmark
 └──────────────┘
 ```
 
-## I/O Layer (io-driver)
+## I/O Layer (ringline)
 
-The I/O driver provides a unified completion-based API:
+The server uses [ringline](https://github.com/ringline-rs/ringline), an io_uring event loop with an async task-per-connection model. Each accepted connection becomes an independent async task.
 
-```rust
-pub trait IoDriver {
-    /// Poll for I/O completions
-    fn poll(&mut self, timeout: Option<Duration>) -> io::Result<usize>;
-
-    /// Drain completed operations
-    fn drain_completions(&mut self) -> impl Iterator<Item = Completion>;
-
-    /// Send data to a connection
-    fn send(&mut self, id: ConnId, data: &[u8]) -> io::Result<usize>;
-
-    /// Zero-copy send (takes ownership)
-    fn send_owned(&mut self, id: ConnId, buf: BoxedZeroCopy) -> io::Result<usize>;
-
-    /// Access received data
-    fn with_recv_buf<F>(&mut self, id: ConnId, f: F) -> io::Result<()>
-    where F: FnMut(&mut dyn RecvBuf) -> io::Result<()>;
-}
-```
-
-### Backends
-
-**io_uring (Linux 6.0+)**
+**io_uring features used:**
 - Multishot recv/accept
 - Ring-provided buffers
-- Zero-copy send (SendZc)
-- SQPOLL mode
-- Registered file descriptors
-
-**mio (all platforms)**
-- epoll on Linux
-- kqueue on macOS/BSD
-- Standard read/write syscalls
-
-### Buffer Pools
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   Buffer Hierarchy                   │
-├─────────────────────────────────────────────────────┤
-│                                                      │
-│  BufRing (io_uring multishot only)                  │
-│  ├── 8192 × 16KB buffers                            │
-│  ├── Kernel picks from ring                         │
-│  └── Returned immediately after copy                │
-│                                                      │
-│  RecvBufferPool (io_uring single-shot)              │
-│  ├── 8192 × 16KB buffers                            │
-│  ├── Stable pointers for kernel I/O                 │
-│  └── Held until app consumes data                   │
-│                                                      │
-│  Per-Connection Coalesce Buffer                     │
-│  ├── 16KB initial (TLS record size)                 │
-│  ├── Grows as needed                                │
-│  └── Holds partial messages across recvs            │
-│                                                      │
-└─────────────────────────────────────────────────────┘
-```
+- Zero-copy send (SendMsgZc)
+- Fixed file descriptors
+- Dedicated acceptor thread distributing connections round-robin to workers
 
 ## Protocol Layer
 
@@ -298,65 +234,21 @@ Pre-allocates segments from a contiguous allocation:
 └─────────────────────────────────────────────────────┘
 ```
 
-### Tokio Runtime
+## Benchmark Tool
 
-```
-┌─────────────────────────────────────────────────────┐
-│              Tokio Multi-Thread Runtime              │
-│                                                      │
-│  ┌─────────────┐      ┌─────────────┐              │
-│  │ Accept Task │      │ Accept Task │     ...      │
-│  │ (listener 0)│      │ (listener 1)│              │
-│  └──────┬──────┘      └──────┬──────┘              │
-│         │                    │                      │
-│         │ spawn              │ spawn                │
-│         ▼                    ▼                      │
-│  ┌─────────────┐      ┌─────────────┐              │
-│  │ Conn Task 0 │      │ Conn Task N │     ...      │
-│  │  (async)    │      │  (async)    │              │
-│  └─────────────┘      └─────────────┘              │
-│                                                      │
-│  Work-stealing scheduler moves tasks between threads │
-└─────────────────────────────────────────────────────┘
-```
+The benchmark tool has been moved to a separate repository:
+[cachecannon](https://github.com/cachecannon/cachecannon).
 
-## Benchmark Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  crucible-benchmark                  │
-├─────────────────────────────────────────────────────┤
-│                                                      │
-│  ┌─────────────┐                                    │
-│  │ Main Thread │                                    │
-│  │ - Config    │                                    │
-│  │ - Spawn     │                                    │
-│  │ - Report    │                                    │
-│  └──────┬──────┘                                    │
-│         │                                           │
-│    ┌────┴────┬────────┬────────┐                   │
-│    ▼         ▼        ▼        ▼                   │
-│  ┌────┐   ┌────┐   ┌────┐   ┌────────────────┐    │
-│  │ W0 │   │ W1 │   │ WN │   │ Admin (Tokio)  │    │
-│  │    │   │    │   │    │   │ - Prometheus   │    │
-│  │ io │   │ io │   │ io │   │ - Parquet      │    │
-│  └────┘   └────┘   └────┘   └────────────────┘    │
-│                                                      │
-│  Workers:                                           │
-│  - Generate requests (keyspace, distribution)       │
-│  - Track in-flight requests with timestamps         │
-│  - Record latency histograms                        │
-│  - Report metrics to shared counters                │
-│                                                      │
-└─────────────────────────────────────────────────────┘
-```
+Cachecannon uses the same ringline principles (direct io_uring, CPU pinning,
+precise timing) to ensure benchmark results reflect actual server performance
+rather than measurement overhead.
 
 ## Data Flow: GET Request
 
 ```
 1. Client sends: *2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n
 
-2. io-driver receives data
+2. ringline receives data
    └── Completion { kind: Recv, conn_id, bytes }
 
 3. Protocol parser extracts command
@@ -371,7 +263,7 @@ Pre-allocates segments from a contiguous allocation:
 5. Protocol encoder builds response
    └── $3\r\nbar\r\n (or $-1\r\n for miss)
 
-6. io-driver sends response
+6. ringline sends response
    └── send_owned() for zero-copy, or send() with copy
 
 7. Client receives: $3\r\nbar\r\n
@@ -382,7 +274,7 @@ Pre-allocates segments from a contiguous allocation:
 ```
 1. Client sends: *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
 
-2. io-driver receives data
+2. ringline receives data
    └── Completion { kind: Recv, conn_id, bytes }
 
 3. Protocol parser extracts command
@@ -395,7 +287,7 @@ Pre-allocates segments from a contiguous allocation:
 5. Protocol encoder builds response
    └── +OK\r\n
 
-6. io-driver sends response
+6. ringline sends response
 
 7. Client receives: +OK\r\n
 ```

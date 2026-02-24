@@ -1,13 +1,14 @@
 # Crucible
 
-A high-performance cache server and benchmarking toolkit written in Rust.
+A high-performance cache server written in Rust.
 
 ## Overview
 
 Crucible provides:
 
 - **Cache Server** (`crucible-server`) - A multi-protocol cache server with support for Redis (RESP) and Memcache protocols
-- **Benchmark Tool** (`crucible-benchmark`) - A load generator for benchmarking cache servers with detailed latency metrics
+
+The benchmark tool has been moved to a separate repository: [cachecannon](https://github.com/cachecannon/cachecannon).
 
 ## Features
 
@@ -17,28 +18,19 @@ Crucible provides:
 - **Pluggable eviction policies**: S3-FIFO, FIFO, LRU variants, Random, CTE, Merge
 - **TTL-aware storage**: Segment backend groups items by expiration for efficient proactive expiration
 - **Protocol support**: RESP2/RESP3 (Redis-compatible), Memcache ASCII
-- **Custom I/O driver**: Completion-based io_uring/mio abstraction (not Tokio) for predictable latency
+- **ringline I/O framework**: io_uring event loop with async task-per-connection model (not Tokio) for predictable latency
 - **Zero-copy I/O**: io_uring multishot recv, SendZc, ring-provided buffers
 - **Zero allocations on hot path**: Pre-allocated buffer pools and segment storage (segment backend)
 - **Thread-per-core architecture**: CPU pinning, NUMA-aware allocation, no work-stealing
 - **Hugepage support**: 2MB/1GB pages for reduced TLB pressure
 - **Prometheus metrics**: Separate control plane for metrics exposition
 
-### Benchmark Tool
-- Multi-threaded load generation with the same io-driver as the server
-- Configurable workloads: key distribution (uniform/zipf), command mix, value sizes
-- Request pipelining for maximum throughput
-- High-resolution latency histograms (p50, p90, p99, p99.9, p99.99)
-- Precise timing without async runtime overhead
-- Parquet output for post-hoc analysis
-- **Web dashboard viewer**: Interactive analysis of benchmark results with optional Rezolus telemetry correlation
-
 ## Design
 
 Crucible is built for **latency-sensitive deployments where microseconds matter**. Key design decisions:
 
 - **Completion-based I/O** instead of async/await—eliminates task scheduler overhead
-- **Custom io-driver** instead of Tokio—direct access to io_uring features (multishot, SendZc, ring buffers)
+- **ringline io_uring framework** instead of Tokio—direct access to io_uring features (multishot, SendMsgZc, ring buffers)
 - **Thread-per-core** with CPU pinning—no work-stealing, predictable cache locality
 - **Pre-allocated everything**—buffer pools and segment storage avoid malloc on hot path
 
@@ -72,7 +64,7 @@ Pre-built packages are available for Debian/Ubuntu and RHEL/CentOS/Fedora:
 # Debian/Ubuntu
 curl -fsSL https://apt.thermitesolutions.com/gpg-key.asc | sudo gpg --dearmor -o /usr/share/keyrings/crucible-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/crucible-archive-keyring.gpg] https://apt.thermitesolutions.com stable main" | sudo tee /etc/apt/sources.list.d/crucible.list
-sudo apt update && sudo apt install crucible-server crucible-benchmark
+sudo apt update && sudo apt install crucible-server
 
 # RHEL/CentOS/Fedora/Amazon Linux 2023
 sudo tee /etc/yum.repos.d/crucible.repo << 'EOF'
@@ -83,7 +75,7 @@ enabled=1
 gpgcheck=1
 gpgkey=https://yum.thermitesolutions.com/gpg-key.asc
 EOF
-sudo dnf install crucible-server crucible-benchmark
+sudo dnf install crucible-server
 ```
 
 See [docs/INSTALL.md](docs/INSTALL.md) for detailed installation instructions.
@@ -97,18 +89,15 @@ cargo build --release
 # Start the cache server
 ./target/release/crucible-server server/config/example.toml
 
-# In another terminal, run the benchmark
-./target/release/crucible-benchmark benchmark/config/redis.toml
+# In another terminal, run cachecannon (https://github.com/cachecannon/cachecannon)
+cachecannon config/redis.toml
 ```
 
 ## Building
 
 ```bash
-# Build all binaries (includes Tokio runtime and io_uring by default)
+# Build all binaries
 cargo build --release
-
-# Build without Tokio runtime
-cargo build --release -p server --no-default-features --features io_uring
 
 # Build with validation checks (for debugging)
 cargo build --release -p server --features validation
@@ -169,15 +158,14 @@ All storage backends share a **lock-free hashtable** with optional tiering:
 - **random**: Random eviction
 - **merge**: Frequency-aware pruning—retains high-value items, evicts low-value ones (segment only)
 
-### I/O Driver
+### I/O Layer
 
-We built a custom completion-based I/O driver instead of using Tokio. This gives us:
-- **Direct io_uring access**: Multishot recv/accept, SendZc, ring-provided buffers, SQPOLL
-- **Predictable latency**: No async task scheduler overhead or work-stealing
-- **Zero-copy potential**: 0 copies with single-shot recv + SendZc on Linux 6.0+
-- **Graceful fallback**: mio backend (epoll/kqueue) on older kernels and macOS
+The server uses [ringline](https://github.com/ringline-rs/ringline), an io_uring event loop with an async task-per-connection model. This gives us:
+- **Direct io_uring access**: Multishot recv, SendMsgZc, ring-provided buffers, fixed file descriptors
+- **Predictable latency**: Thread-per-core with CPU pinning, no work-stealing
+- **Zero-copy potential**: 0 copies with single-shot recv + SendMsgZc on Linux 6.0+
 
-See [io/driver/ARCHITECTURE.md](io/driver/ARCHITECTURE.md) for buffer management details and [docs/design.md](docs/design.md) for design rationale.
+See [docs/design.md](docs/design.md) for design rationale.
 
 ## Protocol Support
 
@@ -206,11 +194,8 @@ Supported commands:
 ### Cache Server
 
 ```bash
-# Run with native runtime (io_uring on Linux 6.0+, mio fallback)
+# Run the cache server (requires Linux 6.0+ for io_uring)
 ./target/release/crucible-server server/config/example.toml
-
-# Run with Tokio runtime
-./target/release/crucible-server server/config/tokio.toml
 ```
 
 #### Configuration
@@ -218,8 +203,6 @@ Supported commands:
 The server separates **storage backend** from **eviction policy**:
 
 ```toml
-runtime = "native"
-
 [workers]
 threads = 4
 # cpu_affinity = "0-3"  # Pin to specific CPUs
@@ -275,37 +258,15 @@ sq_depth = 1024
 | `memcached.toml` | Memcached migration (slab backend, port 11211) |
 | `heap.toml` | Heap backend for variable-size items |
 | `slab.toml` | Slab allocator with LRA eviction |
-| `tokio.toml` | Tokio runtime instead of native |
 
 ### Benchmark Tool
 
+For load testing, use [cachecannon](https://github.com/cachecannon/cachecannon):
+
 ```bash
-# Run benchmark against a Redis-compatible server
-./target/release/crucible-benchmark benchmark/config/redis.toml
-
-# Output to Parquet for analysis
-./target/release/crucible-benchmark benchmark/config/redis.toml \
-    --parquet results.parquet
-
-# View results in web dashboard (opens browser automatically)
-./target/release/crucible-benchmark view results.parquet
-
-# Correlate with Rezolus system telemetry
-./target/release/crucible-benchmark view results.parquet \
-    --server server-rezolus.parquet \
-    --client client-rezolus.parquet
+cargo install --git https://github.com/cachecannon/cachecannon
+cachecannon config/redis.toml
 ```
-
-The viewer provides interactive dashboards for throughput, latency percentiles, cache hit rates, and connection statistics. When combined with [Rezolus](https://github.com/brayniac/rezolus) parquet files, you can correlate benchmark performance with CPU, network, and scheduler metrics.
-
-Available benchmark configurations:
-- `redis.toml` - Redis RESP protocol
-- `memcache.toml` - Memcache protocol
-- `momento.toml` - Momento gRPC protocol
-- `ping.toml` - Simple ping test
-- `quick-test.toml` - Quick validation test
-
-See [benchmark/README.md](benchmark/README.md) for complete configuration reference and tuning guide.
 
 ## Workspace Structure
 
@@ -316,17 +277,11 @@ crucible/
 │   ├── segcache/   # Segment-based cache with TTL buckets
 │   ├── slab/       # Memcached-style slab allocator
 │   └── heap/       # Heap-allocated cache using system allocator
-├── io/
-│   ├── driver/     # Unified I/O driver (io_uring + mio backends)
-│   ├── http2/      # HTTP/2 framing
-│   └── grpc/       # gRPC client implementation
 ├── protocol/
-│   ├── resp/       # Redis RESP2/RESP3 protocol
-│   ├── memcache/   # Memcache ASCII protocol
 │   ├── momento/    # Momento cache protocol
 │   └── ping/       # Simple ping protocol for testing
 ├── server/         # Cache server binary
-├── benchmark/      # Benchmark tool binary
+├── proxy/          # Redis proxy with optional local caching
 ├── metrics/        # Metrics infrastructure
 └── xtask/          # Development tasks (fuzz testing, flamegraphs)
 ```
@@ -371,8 +326,7 @@ For best performance on Linux:
 - [Configuration Reference](docs/configuration.md) - Complete config options
 - [Operations Guide](docs/operations.md) - Production deployment and tuning
 - [Development Guide](docs/development.md) - Testing, profiling, and contributing
-- [I/O Driver Architecture](io/driver/ARCHITECTURE.md) - Buffer management and copy semantics
-- [Benchmark Guide](benchmark/README.md) - Load testing and performance measurement
+- [Benchmark Tool (cachecannon)](https://github.com/cachecannon/cachecannon) - Load testing and performance measurement
 
 ## License
 

@@ -36,7 +36,7 @@ This model:
 - **Predictable latency**: No variance from work-stealing or task migration
 - **Cache-friendly**: Data stays on one core, in L1/L2 cache
 
-For a cache server handling millions of simple GET/SET operations, we expect the overhead of task scheduling to be measurable, though we haven't published formal benchmarks comparing the runtimes yet. The server supports both runtimes (`runtime = "native"` or `runtime = "tokio"`) so you can evaluate this for your workload.
+For a cache server handling millions of simple GET/SET operations, the overhead of task scheduling is measurable.
 
 ### 2. Direct Access to io_uring Features
 
@@ -92,7 +92,7 @@ Crucible pins each worker to a specific CPU core:
 │  Worker 0 │  Worker 1 │  Worker 2 │  Worker 3   │      Admin        │
 │  (CPU 0)  │  (CPU 1)  │  (CPU 2)  │  (CPU 3)    │                   │
 │           │           │           │             │   Tokio runtime   │
-│ io-driver │ io-driver │ io-driver │  io-driver  │   /health         │
+│ ringline  │ ringline  │ ringline  │  ringline   │   /health         │
 │ instance  │ instance  │ instance  │  instance   │   /ready          │
 │           │           │           │             │   /metrics        │
 ├───────────┴───────────┴───────────┴─────────────┤                   │
@@ -103,7 +103,7 @@ Crucible pins each worker to a specific CPU core:
 └─────────────────────────────────────────────────┴───────────────────┘
 ```
 
-**Data plane**: Workers handle RESP/Memcache requests. Each has its own io-driver instance (io_uring on Linux 6.0+, mio elsewhere), pinned to a CPU core. All workers share a single lock-free cache.
+**Data plane**: Workers handle RESP/Memcache requests. Each runs as an async task on a ringline io_uring worker (Linux 6.0+), pinned to a CPU core. All workers share a single lock-free cache.
 
 **Control plane**: Admin thread runs a single-threaded Tokio runtime for health checks and Prometheus metrics. Isolated from workers so it doesn't affect request latency.
 
@@ -123,25 +123,6 @@ The admin/metrics server uses Tokio because:
 - It benefits from async ecosystem (hyper, tower)
 - It runs on a separate thread, isolated from workers
 
-## The io-driver Abstraction
-
-We built `io-driver` as a unified abstraction over io_uring and mio:
-
-```
-┌─────────────────────────────────────────┐
-│              Application                 │
-│  (server, benchmark, your code)         │
-├─────────────────────────────────────────┤
-│              io-driver API               │
-│  poll(), drain_completions(), send()    │
-├─────────────┬───────────────────────────┤
-│  io_uring   │          mio              │
-│ (Linux 6.0+)│  (Linux, macOS, BSD)      │
-└─────────────┴───────────────────────────┘
-```
-
-The driver auto-selects the best backend at runtime. Code written against `io-driver` works everywhere but gets io_uring optimizations on modern Linux.
-
 ### Copy Semantics
 
 Understanding where copies happen is critical for performance.
@@ -152,7 +133,6 @@ Understanding where copies happen is critical for performance.
 |------|------|------|-------|
 | io_uring single-shot + SendZc | 0 | 0 | **0 copies** |
 | io_uring multishot + SendZc | 1 (ring → coalesce) | 0 | **1 copy** |
-| mio (epoll/kqueue) | 1 (read syscall) | 1 (write syscall) | **2 copies** |
 
 We default to multishot recv because it reduces syscall overhead, but single-shot is available for latency-sensitive deployments.
 
@@ -369,32 +349,19 @@ Features:
 - **Ghost entries**: Track recently-evicted keys for admission decisions
 - **Inline frequency**: 4-bit counter stored in slot metadata
 
-## Why Two Runtimes?
-
-The server supports both native (io-driver) and Tokio runtimes:
-
-| Use Case | Recommended Runtime |
-|----------|-------------------|
-| Production on Linux 6.0+ | Native |
-| Development/testing | Either |
-| macOS | Native (uses mio) |
-| Integration with async code | Tokio |
-| Maximum performance | Native |
-| Simpler deployment | Either |
-
-Both runtimes are production-ready. We expect the native runtime to have better tail latency due to the completion-based model and lack of task scheduler overhead, but recommend benchmarking with your specific workload to validate. The server makes it easy to switch between runtimes via configuration.
-
 ## Benchmark Design
 
-The benchmark tool uses the same principles as the server:
-- **No Tokio**: Direct io-driver for accurate measurements
+The benchmark tool has been moved to a separate repository:
+[cachecannon](https://github.com/cachecannon/cachecannon).
+
+Cachecannon follows the same design principles as the server:
+- **No Tokio**: Direct io_uring for accurate measurements
 - **CPU pinning**: Reproducible results across runs
 - **Precise timing**: Captures timestamps at exact points in the I/O path
 - **Kernel timestamps**: Optional SO_TIMESTAMPING for sub-microsecond accuracy
 
-This ensures benchmark results reflect actual server performance, not measurement overhead.
-
-**Note:** The benchmark tool only supports the native io-driver, not Tokio. This was a deliberate choice to minimize measurement artifacts, but it does mean you can't directly compare "Tokio benchmark vs native benchmark" scenarios. For comparing server runtimes, use the same benchmark binary against both `runtime = "native"` and `runtime = "tokio"` server configurations.
+This ensures benchmark results reflect actual server performance, not measurement
+overhead.
 
 ## Development Philosophy
 
@@ -446,7 +413,7 @@ We compensate for rapid development with multiple layers of testing:
 - Catches corruption issues during development
 
 **Benchmarking and Profiling**
-- The benchmark tool uses the same io-driver as the server for accurate measurements
+- [Cachecannon](https://github.com/cachecannon/cachecannon) provides accurate load generation for benchmarking
 - Flamegraph generation identifies hot paths and optimization opportunities
 - Performance regressions are caught by comparing benchmark runs
 - Profiling guided decisions like buffer sizes, batch depths, and data structure choices

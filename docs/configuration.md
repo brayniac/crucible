@@ -1,28 +1,11 @@
 # Configuration Reference
 
-Crucible server and benchmark are configured via TOML files.
+Crucible server is configured via TOML files. For benchmark configuration, see
+the [cachecannon](https://github.com/cachecannon/cachecannon) repository.
 
 ## Server Configuration
 
 Example configurations are in `server/config/`. Start with `example.toml` for most use cases.
-
-### Runtime Selection
-
-```toml
-# Runtime: "native" (recommended) or "tokio"
-runtime = "native"
-
-# I/O engine: "auto", "uring", or "mio"
-# "auto" uses io_uring on Linux 6.0+, falls back to mio
-io_engine = "auto"
-```
-
-**When to use each runtime:**
-
-| Runtime | Best For |
-|---------|----------|
-| `native` | Production, maximum performance, Linux |
-| `tokio` | Development, portability, async ecosystem integration |
 
 ### Workers
 
@@ -159,9 +142,6 @@ The driver uses a hybrid recv mode that automatically switches between multishot
 ## Complete Server Example
 
 ```toml
-runtime = "native"
-io_engine = "auto"
-
 [workers]
 threads = 8
 cpu_affinity = "0-7"
@@ -196,163 +176,14 @@ sq_depth = 2048
 
 ## Benchmark Configuration
 
-Example configurations are in `benchmark/config/`.
+The benchmark tool (`cachecannon`) has been moved to a separate repository:
+[cachecannon](https://github.com/cachecannon/cachecannon).
 
-### General Settings
-
-```toml
-[general]
-# Test duration
-duration = "60s"
-
-# Warmup period (metrics not recorded)
-warmup = "10s"
-
-# Number of worker threads
-threads = 4
-
-# CPU pinning (Linux only)
-cpu_list = "0-3"
-
-# I/O engine: "auto", "uring", "mio"
-io_engine = "auto"
-```
-
-### Target
-
-```toml
-[target]
-# Server endpoints (supports multiple for load balancing)
-endpoints = ["127.0.0.1:6379"]
-
-# Protocol: "resp", "resp3", "memcache", "memcache_binary", "momento", "ping"
-protocol = "resp"
-
-# Enable TLS
-tls = false
-```
-
-### Connection
-
-```toml
-[connection]
-# Total connections across all threads
-connections = 16
-
-# Pipeline depth (in-flight requests per connection)
-# Higher = more throughput, slightly higher latency
-pipeline_depth = 32
-
-# Timeouts
-connect_timeout = "5s"
-request_timeout = "1s"
-
-# Distribution: "roundrobin" or "greedy"
-request_distribution = "roundrobin"
-```
-
-### Workload
-
-```toml
-[workload]
-# Global rate limit (requests/second)
-# Omit for unlimited
-rate_limit = 100000
-
-[workload.keyspace]
-# Key length in bytes
-length = 16
-
-# Number of unique keys
-count = 1000000
-
-# Distribution: "uniform" or "zipf"
-distribution = "uniform"
-
-[workload.commands]
-# Command weights (normalized to percentages)
-get = 80
-set = 20
-
-[workload.values]
-# Value size in bytes
-length = 64
-```
-
-### Output
-
-```toml
-[admin]
-# Prometheus endpoint
-listen = "127.0.0.1:9090"
-
-# Parquet output
-parquet = "results.parquet"
-parquet_interval = "1s"
-
-# Output format: "clean", "json", "verbose", "quiet"
-format = "clean"
-
-# Color: "auto", "always", "never"
-color = "auto"
-```
-
-## Complete Benchmark Example
-
-```toml
-[general]
-duration = "60s"
-warmup = "10s"
-threads = 4
-cpu_list = "0-3"
-io_engine = "auto"
-
-[target]
-endpoints = ["127.0.0.1:6379"]
-protocol = "resp"
-tls = false
-
-[connection]
-connections = 32
-pipeline_depth = 32
-connect_timeout = "5s"
-request_timeout = "1s"
-request_distribution = "roundrobin"
-
-[workload]
-rate_limit = 500000
-
-[workload.keyspace]
-length = 16
-count = 1000000
-distribution = "zipf"
-
-[workload.commands]
-get = 80
-set = 20
-
-[workload.values]
-length = 64
-
-[admin]
-listen = "127.0.0.1:9091"
-parquet = "results.parquet"
-format = "clean"
-color = "auto"
-```
+See the cachecannon repository for benchmark configuration reference and examples.
 
 ## CLI Options
 
-The benchmark tool is primarily configured via TOML files. The only CLI override is for the parquet output path:
-
 ```bash
-# Override parquet output path
-./target/release/crucible-benchmark config.toml --parquet results.parquet
-
-# View results in web dashboard
-./target/release/crucible-benchmark view results.parquet
-
-# See all options
-./target/release/crucible-benchmark --help
+# See server options
 ./target/release/crucible-server --help
 ```
