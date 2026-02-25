@@ -661,7 +661,7 @@ impl TtlBucket {
     /// Replace N contiguous head segments with a single spare segment.
     ///
     /// This is used for merge eviction (SSD GC style). The source segments must be
-    /// contiguous from the head of the chain (source_ids[0] == head, each source's
+    /// contiguous from the head of the chain (source_ids\[0\] == head, each source's
     /// next == the following source), and all must be in Relinking state.
     ///
     /// After this operation:
@@ -712,16 +712,12 @@ impl TtlBucket {
             }
 
             // Verify adjacency: src[i].next == src[i+1]
-            if i + 1 < source_ids.len()
-                && src.next() != Some(source_ids[i + 1])
-            {
+            if i + 1 < source_ids.len() && src.next() != Some(source_ids[i + 1]) {
                 return Err(TtlBucketError::InvalidState);
             }
         }
 
-        let spare = pool
-            .get(spare_id)
-            .ok_or(TtlBucketError::InvalidSegmentId)?;
+        let spare = pool.get(spare_id).ok_or(TtlBucketError::InvalidSegmentId)?;
 
         // Spare must be in Reserved or Sealed state
         let spare_state = spare.state();
@@ -737,7 +733,12 @@ impl TtlBucket {
 
         // Set spare's chain pointers: prev=INVALID (new head), next=next_of_last
         // Transition spare to Sealed
-        if !spare.cas_metadata(spare_state, State::Sealed, Some(next_of_last), Some(INVALID_SEGMENT_ID)) {
+        if !spare.cas_metadata(
+            spare_state,
+            State::Sealed,
+            Some(next_of_last),
+            Some(INVALID_SEGMENT_ID),
+        ) {
             return Err(TtlBucketError::StateTransitionFailed);
         }
 

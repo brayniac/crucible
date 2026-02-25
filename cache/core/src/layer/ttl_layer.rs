@@ -937,11 +937,9 @@ impl TtlLayer {
         };
 
         // Get N candidates from the head of the bucket
-        let candidates = self.buckets.select_merge_candidates(
-            bucket_idx,
-            merge_config.min_segments,
-            &self.pool,
-        );
+        let candidates =
+            self.buckets
+                .select_merge_candidates(bucket_idx, merge_config.min_segments, &self.pool);
 
         // Need at least min_segments candidates
         if candidates.len() < merge_config.min_segments {
@@ -1063,10 +1061,8 @@ impl TtlLayer {
                         .unwrap_or(&[]);
 
                     if let Some(new_offset) = spare.append_item(key, value, optional) {
-                        let old_loc =
-                            ItemLocation::new(self.pool.pool_id(), cand_id, offset);
-                        let new_loc =
-                            ItemLocation::new(self.pool.pool_id(), spare_id, new_offset);
+                        let old_loc = ItemLocation::new(self.pool.pool_id(), cand_id, offset);
+                        let new_loc = ItemLocation::new(self.pool.pool_id(), spare_id, new_offset);
 
                         // Update hashtable (preserve frequency)
                         if !hashtable.cas_location(
@@ -1081,8 +1077,7 @@ impl TtlLayer {
                         seg_retained += 1;
                     } else {
                         // Spare is full — discard remaining items
-                        let location =
-                            ItemLocation::new(self.pool.pool_id(), cand_id, offset);
+                        let location = ItemLocation::new(self.pool.pool_id(), cand_id, offset);
                         if self.config.create_ghosts {
                             hashtable.convert_to_ghost(key, location.to_location());
                         } else {
@@ -1092,8 +1087,7 @@ impl TtlLayer {
                     }
                 } else {
                     // Frequency too low — discard (convert to ghost or remove)
-                    let location =
-                        ItemLocation::new(self.pool.pool_id(), cand_id, offset);
+                    let location = ItemLocation::new(self.pool.pool_id(), cand_id, offset);
                     if self.config.create_ghosts {
                         hashtable.convert_to_ghost(key, location.to_location());
                     } else {
