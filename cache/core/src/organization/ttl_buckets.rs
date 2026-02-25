@@ -658,6 +658,131 @@ impl TtlBucket {
         Ok(())
     }
 
+    /// Replace N contiguous head segments with a single spare segment.
+    ///
+    /// This is used for merge eviction (SSD GC style). The source segments must be
+    /// contiguous from the head of the chain (source_ids[0] == head, each source's
+    /// next == the following source), and all must be in Relinking state.
+    ///
+    /// After this operation:
+    /// - All source segments are transitioned to AwaitingRelease
+    /// - The spare is inserted at the head position with state Sealed
+    /// - Chain pointers are updated under the chain mutex
+    ///
+    /// # Arguments
+    /// * `source_ids` - Segment IDs to replace, contiguous from head
+    /// * `spare_id` - The spare segment to insert at head
+    /// * `pool` - The segment pool
+    pub fn replace_head_segments<P: RamPool>(
+        &self,
+        source_ids: &[u32],
+        spare_id: u32,
+        pool: &P,
+    ) -> Result<(), TtlBucketError>
+    where
+        P::Segment: Segment,
+    {
+        let _guard = self.chain_mutex.lock();
+
+        if source_ids.is_empty() {
+            return Err(TtlBucketError::EmptyBucket);
+        }
+
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+
+        // Verify source_ids[0] is the head
+        if source_ids[0] != head {
+            return Err(TtlBucketError::InvalidState);
+        }
+
+        // Verify all sources are contiguous and in Relinking state
+        for i in 0..source_ids.len() {
+            let src = pool
+                .get(source_ids[i])
+                .ok_or(TtlBucketError::InvalidSegmentId)?;
+
+            if src.state() != State::Relinking {
+                return Err(TtlBucketError::InvalidState);
+            }
+
+            // No source can be the tail (tail is Live)
+            if source_ids[i] == tail {
+                return Err(TtlBucketError::InvalidState);
+            }
+
+            // Verify adjacency: src[i].next == src[i+1]
+            if i + 1 < source_ids.len()
+                && src.next() != Some(source_ids[i + 1])
+            {
+                return Err(TtlBucketError::InvalidState);
+            }
+        }
+
+        let spare = pool
+            .get(spare_id)
+            .ok_or(TtlBucketError::InvalidSegmentId)?;
+
+        // Spare must be in Reserved or Sealed state
+        let spare_state = spare.state();
+        if spare_state != State::Reserved && spare_state != State::Sealed {
+            return Err(TtlBucketError::InvalidState);
+        }
+
+        // Get the segment after the last source
+        let last_src = pool
+            .get(*source_ids.last().unwrap())
+            .ok_or(TtlBucketError::InvalidSegmentId)?;
+        let next_of_last = last_src.next().unwrap_or(INVALID_SEGMENT_ID);
+
+        // Set spare's chain pointers: prev=INVALID (new head), next=next_of_last
+        // Transition spare to Sealed
+        if !spare.cas_metadata(spare_state, State::Sealed, Some(next_of_last), Some(INVALID_SEGMENT_ID)) {
+            return Err(TtlBucketError::StateTransitionFailed);
+        }
+
+        // Update the segment after the last source to point back to spare
+        if next_of_last != INVALID_SEGMENT_ID
+            && let Some(next_segment) = pool.get(next_of_last)
+        {
+            next_segment.cas_metadata(
+                next_segment.state(),
+                next_segment.state(),
+                None,
+                Some(spare_id),
+            );
+        }
+
+        // Update bucket head to spare
+        self.head.store(spare_id, Ordering::Release);
+
+        // Transition all sources to AwaitingRelease with cleared chain pointers
+        for &src_id in source_ids {
+            if let Some(src) = pool.get(src_id) {
+                src.cas_metadata(
+                    State::Relinking,
+                    State::AwaitingRelease,
+                    Some(INVALID_SEGMENT_ID),
+                    Some(INVALID_SEGMENT_ID),
+                );
+
+                // Race fix: if last reader dropped during the transition window,
+                // the segment would be stuck in AwaitingRelease with ref_count == 0.
+                if src.ref_count() == 0 {
+                    src.release_condemned();
+                }
+            }
+        }
+
+        // Update segment count: removed N sources, added 1 spare = net -(N-1)
+        let n = source_ids.len() as u32;
+        if n > 1 {
+            self.segment_count.fetch_sub(n - 1, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
     /// Walk the chain and count segments (up to max_count).
     pub fn chain_len<P: RamPool>(&self, max_count: usize, pool: &P) -> usize
     where
