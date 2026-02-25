@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-02-25
+
+### Fixed
+- **Merge eviction rewritten to SSD GC style** (cache-core): The previous implementation used
+  in-place pruning (`segment.prune()`) which marked items as deleted but never freed segments,
+  causing `ensure_space` to loop until OutOfMemory. The new implementation reserves a spare
+  segment, copies high-frequency items into it via `cas_location` (preserving frequency),
+  atomically replaces the source segments in the chain, and frees them — correctly reclaiming
+  memory. Adds `TtlBucket::replace_head_segments()` for atomically swapping N contiguous head
+  segments with a spare
+
 ## [0.4.0] - 2026-02-24
 
 ### Added
