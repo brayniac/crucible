@@ -3,6 +3,7 @@
 //! Mirrors a subset of `io_engine_integration.rs` but uses
 //! `server::async_native::run()` instead of the removed callback-based server.
 
+use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -422,6 +423,7 @@ fn run_async_parameterized_test(config: TestConfig) {
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[test]
+#[serial]
 fn test_async_basic() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -474,21 +476,25 @@ fn test_async_basic() {
 }
 
 #[test]
+#[serial]
 fn test_async_1conn_p1_small() {
     run_async_parameterized_test(TestConfig::new(1, 1, 64));
 }
 
 #[test]
+#[serial]
 fn test_async_8conn_p8_medium() {
     run_async_parameterized_test(TestConfig::new(8, 8, 1024));
 }
 
 #[test]
+#[serial]
 fn test_async_8conn_p8_large() {
     run_async_parameterized_test(TestConfig::new(8, 8, 16384));
 }
 
 #[test]
+#[serial]
 fn test_async_large_objects() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -522,6 +528,7 @@ fn test_async_large_objects() {
 }
 
 #[test]
+#[serial]
 fn test_async_connection_churn() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -551,6 +558,7 @@ fn test_async_connection_churn() {
 }
 
 #[test]
+#[serial]
 fn test_async_deep_pipeline() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();

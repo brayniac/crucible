@@ -8,6 +8,7 @@
 //! - Pipeline depths: 1, 8, 64
 //! - Object sizes: small (64B), medium (1KB), large (16KB)
 
+use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -528,88 +529,105 @@ fn run_basic_test() {
 // =============================================================================
 
 #[test]
+#[serial]
 fn test_uring_basic() {
     run_basic_test();
 }
 
 #[test]
+#[serial]
 fn test_uring_1conn_p1_small() {
     run_parameterized_test(TestConfig::new(1, 1, 64));
 }
 
 #[test]
+#[serial]
 fn test_uring_1conn_p1_medium() {
     run_parameterized_test(TestConfig::new(1, 1, 1024));
 }
 
 #[test]
+#[serial]
 fn test_uring_1conn_p1_large() {
     run_parameterized_test(TestConfig::new(1, 1, 16384));
 }
 
 #[test]
+#[serial]
 fn test_uring_8conn_p1_small() {
     run_parameterized_test(TestConfig::new(8, 1, 64));
 }
 
 #[test]
+#[serial]
 fn test_uring_8conn_p8_small() {
     run_parameterized_test(TestConfig::new(8, 8, 64));
 }
 
 #[test]
+#[serial]
 fn test_uring_8conn_p64_small() {
     run_parameterized_test(TestConfig::new(8, 64, 64));
 }
 
 #[test]
+#[serial]
 fn test_uring_8conn_p8_medium() {
     run_parameterized_test(TestConfig::new(8, 8, 1024));
 }
 
 #[test]
+#[serial]
 fn test_uring_8conn_p8_large() {
     run_parameterized_test(TestConfig::new(8, 8, 16384));
 }
 
 #[test]
+#[serial]
 fn test_uring_64conn_p1_small() {
     run_parameterized_test(TestConfig::new(64, 1, 64));
 }
 
 #[test]
+#[serial]
 fn test_uring_64conn_p8_small() {
     run_parameterized_test(TestConfig::new(64, 8, 64));
 }
 
 #[test]
+#[serial]
 fn test_uring_64conn_p64_small() {
     run_parameterized_test(TestConfig::new(64, 64, 64));
 }
 
 #[test]
+#[serial]
 fn test_uring_64conn_p8_medium() {
     run_parameterized_test(TestConfig::new(64, 8, 1024));
 }
 
 #[test]
+#[serial]
 fn test_uring_64conn_p8_large() {
     run_parameterized_test(TestConfig::new(64, 8, 16384));
 }
 
 #[test]
+#[serial]
 #[ignore] // Expensive test, run with --ignored
 fn test_uring_256conn_p1_small() {
     run_parameterized_test(TestConfig::new(256, 1, 64));
 }
 
 #[test]
+#[serial]
 #[ignore] // Expensive test, run with --ignored
 fn test_uring_256conn_p8_small() {
     run_parameterized_test(TestConfig::new(256, 8, 64));
 }
 
 #[test]
+#[serial]
 #[ignore] // Expensive test, run with --ignored
 fn test_uring_256conn_p64_small() {
     run_parameterized_test(TestConfig::new(256, 64, 64));
@@ -620,6 +638,7 @@ fn test_uring_256conn_p64_small() {
 // =============================================================================
 
 #[test]
+#[serial]
 fn test_uring_large_objects() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -658,6 +677,7 @@ fn test_uring_large_objects() {
 // =============================================================================
 
 #[test]
+#[serial]
 fn test_uring_connection_churn() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -693,6 +713,7 @@ fn test_uring_connection_churn() {
 // =============================================================================
 
 #[test]
+#[serial]
 fn test_uring_deep_pipeline() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -735,6 +756,7 @@ fn test_uring_deep_pipeline() {
 // =============================================================================
 
 #[test]
+#[serial]
 fn test_uring_pipelined_large_sets_diagnostic() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -801,23 +823,27 @@ fn test_uring_pipelined_large_sets_diagnostic() {
 }
 
 #[test]
+#[serial]
 fn test_uring_1conn_p8_60k() {
     run_parameterized_test(TestConfig::new(1, 8, 60_000));
 }
 
 #[test]
+#[serial]
 fn test_uring_1conn_p8_65535() {
     // Just below streaming threshold (65536)
     run_parameterized_test(TestConfig::new(1, 8, 65_535));
 }
 
 #[test]
+#[serial]
 fn test_uring_1conn_p8_65536() {
     // Exactly at streaming threshold
     run_parameterized_test(TestConfig::new(1, 8, 65_536));
 }
 
 #[test]
+#[serial]
 fn test_uring_1conn_p8_100k() {
     // Above streaming threshold
     run_parameterized_test(TestConfig::new(1, 8, 100_000));

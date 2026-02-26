@@ -2,6 +2,7 @@
 //!
 //! Tests that the server shuts down gracefully when signaled.
 
+use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -89,6 +90,7 @@ fn send_ping(stream: &mut TcpStream) -> bool {
 
 /// Test that server responds before shutdown.
 #[test]
+#[serial]
 fn test_server_responds_before_shutdown() {
     let cache_port = get_available_port();
     let admin_port = get_available_port();
@@ -128,6 +130,7 @@ fn test_server_responds_before_shutdown() {
 
 /// Test that shutdown happens within the configured timeout.
 #[test]
+#[serial]
 fn test_shutdown_timeout() {
     let cache_port = get_available_port();
     let admin_port = get_available_port();

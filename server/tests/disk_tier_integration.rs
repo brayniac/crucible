@@ -5,6 +5,7 @@
 //! 2. Write enough data to trigger eviction/demotion to disk.
 //! 3. Read back keys that were demoted to verify disk reads work.
 
+use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -320,6 +321,7 @@ impl Drop for TempDiskFile {
 }
 
 #[test]
+#[serial]
 fn test_disk_tier_callback_basic() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -337,6 +339,7 @@ fn test_disk_tier_callback_basic() {
 }
 
 #[test]
+#[serial]
 fn test_disk_tier_async_basic() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
