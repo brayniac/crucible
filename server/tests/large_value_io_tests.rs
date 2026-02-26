@@ -7,6 +7,7 @@
 //! The goal is to stress-test buffer management, coalesce buffer growth,
 //! and data integrity for values that span multiple ring buffers (16KB default).
 
+use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -494,11 +495,13 @@ fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
 // =============================================================================
 
 #[test]
+#[serial]
 fn test_uring_large_values_256k_to_1m() {
     run_large_value_test(LargeValueTestConfig::default());
 }
 
 #[test]
+#[serial]
 fn test_uring_large_values_4m_to_16m() {
     run_large_value_test(LargeValueTestConfig {
         sizes: VERY_LARGE_SIZES,
@@ -509,6 +512,7 @@ fn test_uring_large_values_4m_to_16m() {
 }
 
 #[test]
+#[serial]
 #[ignore] // Expensive test
 fn test_uring_large_values_64m() {
     run_large_value_test(LargeValueTestConfig {
@@ -520,11 +524,13 @@ fn test_uring_large_values_64m() {
 }
 
 #[test]
+#[serial]
 fn test_uring_concurrent_large_values_1m() {
     run_concurrent_large_value_test(8, 1024 * 1024);
 }
 
 #[test]
+#[serial]
 #[ignore] // Expensive test
 fn test_uring_concurrent_large_values_4m() {
     run_concurrent_large_value_test(4, 4 * 1024 * 1024);
@@ -536,6 +542,7 @@ fn test_uring_concurrent_large_values_4m() {
 
 /// Test rapid large value SET/GET cycles to stress buffer recycling.
 #[test]
+#[serial]
 fn test_uring_rapid_large_value_cycles() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -576,6 +583,7 @@ fn test_uring_rapid_large_value_cycles() {
 /// Test increasing value sizes in sequence.
 /// This stresses coalesce buffer growth.
 #[test]
+#[serial]
 fn test_uring_increasing_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -631,6 +639,7 @@ fn test_uring_increasing_value_sizes() {
 /// Test alternating between small and large values.
 /// This tests buffer shrink/grow behavior.
 #[test]
+#[serial]
 fn test_uring_alternating_value_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -675,6 +684,7 @@ fn test_uring_alternating_value_sizes() {
 /// Test values at exact buffer boundary sizes.
 /// Ring buffers are 16KB, so test around that boundary.
 #[test]
+#[serial]
 fn test_uring_buffer_boundary_sizes() {
     let port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();

@@ -3,6 +3,7 @@
 //! These tests verify that connections are correctly tracked even after
 //! connections are opened and closed, ensuring no ConnId/state mismatch.
 
+use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -80,6 +81,7 @@ fn send_resp_command(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
 /// This tests the bug where using a Slab for connection storage caused
 /// ConnId/index mismatches after connections were closed and new ones opened.
 #[test]
+#[serial]
 fn test_connection_id_tracking() {
     let port = get_available_port();
     let _server = start_test_server(port);
@@ -193,6 +195,7 @@ fn test_connection_id_tracking() {
 
 /// Test rapid connection open/close cycles.
 #[test]
+#[serial]
 fn test_rapid_connection_cycles() {
     let port = get_available_port();
     let _server = start_test_server(port);

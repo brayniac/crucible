@@ -70,6 +70,9 @@ tikv-jemallocator = { workspace = true, optional = true }
 # TLS
 rustls = { workspace = true, features = ["std", "ring"] }
 
+[dev-dependencies]
+serial_test = "3.4"
+
 [[bin]]
 name = "crucible-server"
 path = "src/bin/server.rs"

@@ -2,6 +2,7 @@
 //!
 //! Basic functional tests for Redis RESP protocol operations.
 
+use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -131,6 +132,7 @@ fn del_cmd(key: &str) -> Vec<u8> {
 
 /// Test basic PING command.
 #[test]
+#[serial]
 fn test_ping() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
@@ -154,6 +156,7 @@ fn test_ping() {
 
 /// Test SET and GET cycle.
 #[test]
+#[serial]
 fn test_set_get() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
@@ -181,6 +184,7 @@ fn test_set_get() {
 
 /// Test GET on non-existent key.
 #[test]
+#[serial]
 fn test_get_nonexistent() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
@@ -203,6 +207,7 @@ fn test_get_nonexistent() {
 
 /// Test DEL command.
 #[test]
+#[serial]
 fn test_del() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
@@ -234,6 +239,7 @@ fn test_del() {
 
 /// Test multiple concurrent connections.
 #[test]
+#[serial]
 fn test_concurrent_connections() {
     let cache_port = get_available_port();
     let (handle, shutdown) = start_test_server(cache_port);
