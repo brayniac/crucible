@@ -402,7 +402,7 @@ mod tests {
         }
 
         // Spawn consumer threads
-        let total_items = (num_threads * items_per_thread) as u64;
+        let total_items = num_threads * items_per_thread;
         let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         for _ in 0..num_threads {
             let q = queue.clone();
