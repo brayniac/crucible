@@ -140,20 +140,41 @@ impl SlotStorage {
 
     /// Return a slot to the free list.
     ///
+    /// Returns `true` if the slot was successfully deallocated, `false` if the
+    /// location is stale (generation mismatch) or the slot was already cleared
+    /// by another thread.
+    ///
     /// # Thread Safety
     ///
-    /// Clears the slot (waiting for readers) then pushes to the free list
-    /// with version tag to prevent ABA problems.
-    pub fn deallocate(&self, loc: SlotLocation) {
+    /// Checks the slot generation before clearing to prevent races where a
+    /// stale location (from eviction queues or displaced hashtable entries)
+    /// could corrupt a freshly-allocated slot. The slot's `clear()` method
+    /// uses CAS as a second layer of defense.
+    pub fn deallocate(&self, loc: SlotLocation) -> bool {
         let idx = loc.slot_index();
         if idx as usize >= self.slots.len() {
-            return; // Invalid index, ignore
+            return false; // Invalid index, ignore
         }
 
         let slot = &self.slots[idx as usize];
 
-        // Clear the entry (waits for readers, increments generation)
-        slot.clear();
+        // Generation guard: if the slot has been recycled since this location
+        // was created, the generation will have incremented. Skip the
+        // deallocation to avoid corrupting the new occupant's state.
+        if slot.generation() != loc.generation() {
+            return false;
+        }
+
+        // Clear the entry if present (CAS-based, waits for readers).
+        // Returns false if the slot was empty (allocated but never stored into,
+        // e.g. rollback after a failed hashtable insert). This is safe because
+        // the generation check above ensures the slot hasn't been recycled —
+        // if another thread had deallocated it, the generation would differ.
+        if !slot.clear() {
+            // No entry to free, but we still need to increment generation
+            // to invalidate any remaining references at the old generation.
+            slot.increment_generation();
+        }
 
         // Decrement occupied count
         self.occupied_count.fetch_sub(1, Ordering::Relaxed);
@@ -172,7 +193,7 @@ impl SlotStorage {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return true,
                 Err(_) => spin_loop(),
             }
         }
@@ -267,7 +288,7 @@ mod tests {
         assert_eq!(storage.occupied(), 10);
 
         // Deallocate one
-        storage.deallocate(locations.pop().unwrap());
+        assert!(storage.deallocate(locations.pop().unwrap()));
         assert_eq!(storage.occupied(), 9);
 
         // Should be able to allocate again
@@ -289,7 +310,7 @@ mod tests {
 
         assert!(storage.is_slot_occupied(loc.slot_index()));
 
-        storage.deallocate(loc);
+        assert!(storage.deallocate(loc));
         assert!(!storage.is_slot_occupied(loc.slot_index()));
     }
 
@@ -297,6 +318,73 @@ mod tests {
     fn test_capacity() {
         let storage = SlotStorage::new(100);
         assert_eq!(storage.capacity(), 100);
+        assert_eq!(storage.occupied(), 0);
+    }
+
+    #[test]
+    fn test_stale_deallocate_is_noop() {
+        let storage = SlotStorage::new(5);
+
+        // Allocate and store an entry
+        let loc1 = storage.allocate().expect("allocation failed");
+        let entry1 = HeapEntry::allocate(b"key1", b"val1", Duration::ZERO, 1).unwrap();
+        let slot = storage.get(loc1.slot_index()).unwrap();
+        slot.store(entry1);
+        assert_eq!(storage.occupied(), 1);
+
+        // Save the location (simulating a stale reference from an eviction queue)
+        let stale_loc = loc1;
+
+        // Deallocate the slot
+        assert!(storage.deallocate(loc1));
+        assert_eq!(storage.occupied(), 0);
+
+        // Re-allocate the same slot index — it gets a new generation
+        let loc2 = storage.allocate().expect("should re-allocate");
+        assert_eq!(loc2.slot_index(), stale_loc.slot_index());
+        assert_ne!(loc2.generation(), stale_loc.generation());
+
+        // Store a new entry in the recycled slot
+        let entry2 = HeapEntry::allocate(b"key2", b"val2", Duration::ZERO, 2).unwrap();
+        let slot = storage.get(loc2.slot_index()).unwrap();
+        slot.store(entry2);
+        assert_eq!(storage.occupied(), 1);
+
+        // Attempt to deallocate using the STALE location — should be a no-op
+        assert!(
+            !storage.deallocate(stale_loc),
+            "stale deallocate should return false"
+        );
+
+        // The new entry should still be intact
+        assert_eq!(storage.occupied(), 1);
+        assert!(storage.is_slot_occupied(loc2.slot_index()));
+
+        // Verify we can still read the new entry
+        let entry = slot.get(loc2.generation(), false);
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().key(), b"key2");
+        slot.release_read();
+    }
+
+    #[test]
+    fn test_duplicate_deallocate_is_noop() {
+        let storage = SlotStorage::new(5);
+
+        let loc = storage.allocate().expect("allocation failed");
+        let entry = HeapEntry::allocate(b"key", b"value", Duration::ZERO, 1).unwrap();
+        let slot = storage.get(loc.slot_index()).unwrap();
+        slot.store(entry);
+
+        // First deallocate succeeds
+        assert!(storage.deallocate(loc));
+        assert_eq!(storage.occupied(), 0);
+
+        // Second deallocate with same location is a no-op (generation changed)
+        assert!(
+            !storage.deallocate(loc),
+            "duplicate deallocate should return false"
+        );
         assert_eq!(storage.occupied(), 0);
     }
 }
