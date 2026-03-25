@@ -229,15 +229,33 @@ mod server {
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        // Join workers that stopped within the drain timeout. For workers
+        // that are still stuck, force exit — joining them would block forever.
+        let mut stuck_count = 0;
         for (i, handle) in handles.into_iter().enumerate() {
-            if !workers_stopped[i] {
-                debug!(worker_id = i, "Worker did not stop within drain timeout");
+            if workers_stopped[i] {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(worker_id = i, error = %e, "worker thread returned error")
+                    }
+                    Err(e) => warn!(worker_id = i, "worker thread panicked: {e:?}"),
+                }
+            } else {
+                warn!(
+                    worker_id = i,
+                    "Worker did not stop within drain timeout — will force exit"
+                );
+                stuck_count += 1;
             }
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!(worker_id = i, error = %e, "worker thread returned error"),
-                Err(e) => warn!(worker_id = i, "worker thread panicked: {e:?}"),
-            }
+        }
+
+        if stuck_count > 0 {
+            warn!(
+                stuck_workers = stuck_count,
+                "Forcing exit due to stuck worker threads"
+            );
+            std::process::exit(1);
         }
 
         if let Some(handle) = diagnostics_handle {
