@@ -64,7 +64,7 @@ impl Slot {
 
     /// Increment generation (wraps at 9 bits via mask in `generation()`).
     #[inline]
-    fn increment_generation(&self) {
+    pub(crate) fn increment_generation(&self) {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
@@ -163,42 +163,67 @@ impl Slot {
         self.generation()
     }
 
-    /// Clear the slot, dropping the entry if present.
+    /// Clear the slot if it contains a valid entry, dropping the entry.
+    ///
+    /// Returns `true` if an entry was cleared, `false` if the slot was already
+    /// empty or contained a free-list link.
     ///
     /// # Thread Safety
     ///
-    /// Waits for all readers to finish before dropping the entry.
-    /// This may spin briefly under contention.
-    pub fn clear(&self) {
-        // Swap out the entry pointer
-        let ptr = self.entry_ptr.swap(0, Ordering::SeqCst);
+    /// Uses CAS to atomically claim the entry pointer, preventing races where
+    /// a stale deallocate could corrupt a freshly-stored entry. Waits for all
+    /// readers to finish before dropping the claimed entry.
+    pub fn clear(&self) -> bool {
+        // Load the current entry pointer
+        let ptr = self.entry_ptr.load(Ordering::SeqCst);
 
-        // CRITICAL: Full barrier ensures our swap is visible to other threads
+        if !Self::is_entry_pointer(ptr) {
+            // Slot is empty or contains a free-list link — nothing to clear.
+            // Do NOT increment generation: this is a stale or duplicate clear.
+            return false;
+        }
+
+        // CAS the entry pointer to 0. If another thread clears or stores
+        // concurrently, the CAS fails and we return false (no-op).
+        match self
+            .entry_ptr
+            .compare_exchange(ptr, 0, Ordering::SeqCst, Ordering::Relaxed)
+        {
+            Ok(_) => {}
+            Err(_) => {
+                // Another thread modified entry_ptr first — the entry was
+                // either already cleared or replaced with a new entry.
+                return false;
+            }
+        }
+
+        // CRITICAL: Full barrier ensures our CAS is visible to other threads
         // BEFORE we load readers. This is the Dekker pattern - without this
         // fence, we could see readers=0 while a reader sees our old pointer.
         fence(Ordering::SeqCst);
 
-        if Self::is_entry_pointer(ptr) {
-            // Wait for readers to finish
-            let mut spin_count = 0;
-            while self.readers.load(Ordering::SeqCst) > 0 {
-                spin_count += 1;
-                if spin_count < 100 {
-                    spin_loop();
-                } else {
-                    yield_now();
-                }
-            }
-
-            // SAFETY: All readers have finished, safe to drop
-            unsafe {
-                let entry_ptr = NonNull::new_unchecked(ptr as *mut HeapEntry);
-                HeapEntry::free(entry_ptr);
+        // Wait for readers to finish
+        let mut spin_count = 0;
+        while self.readers.load(Ordering::SeqCst) > 0 {
+            spin_count += 1;
+            if spin_count < 100 {
+                spin_loop();
+            } else {
+                yield_now();
             }
         }
 
-        // Always increment generation to invalidate stale locations (ABA safety)
+        // SAFETY: We won the CAS, so we own this pointer. All readers have
+        // finished, safe to drop.
+        unsafe {
+            let entry_ptr = NonNull::new_unchecked(ptr as *mut HeapEntry);
+            HeapEntry::free(entry_ptr);
+        }
+
+        // Increment generation to invalidate stale locations (ABA safety)
         self.increment_generation();
+
+        true
     }
 
     /// Check if entry_ptr contains an entry pointer (not a free list link).
@@ -336,10 +361,30 @@ mod tests {
         let gen0 = slot.store(entry);
         assert_eq!(gen0, 0);
 
-        slot.clear();
+        assert!(slot.clear(), "clear of occupied slot should return true");
         assert!(!slot.is_occupied());
 
         // Generation should have incremented
+        assert_eq!(slot.generation(), 1);
+    }
+
+    #[test]
+    fn test_clear_empty_slot_returns_false() {
+        let slot = Slot::new();
+        assert!(!slot.clear(), "clear of empty slot should return false");
+        // Generation should NOT increment for an empty clear
+        assert_eq!(slot.generation(), 0);
+    }
+
+    #[test]
+    fn test_clear_already_cleared_returns_false() {
+        let slot = Slot::new();
+        let entry = HeapEntry::allocate(b"key", b"value", Duration::ZERO, 1).unwrap();
+        slot.store(entry);
+
+        assert!(slot.clear(), "first clear should succeed");
+        assert!(!slot.clear(), "second clear should return false");
+        // Generation incremented only once
         assert_eq!(slot.generation(), 1);
     }
 
