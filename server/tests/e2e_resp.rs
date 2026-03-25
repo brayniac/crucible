@@ -80,13 +80,27 @@ fn start_test_server(cache_port: u16) -> (thread::JoinHandle<()>, Arc<AtomicBool
     (handle, shutdown)
 }
 
-/// Stop the test server - closes connections first, then signals shutdown.
+/// Stop the test server and wait for it to fully shut down.
+///
+/// This MUST join the server thread to ensure global statics (CONFIG_CHANNEL,
+/// WORKERS_INITIALIZED, CONNECTIONS_ACTIVE) are in a clean state before the
+/// next `#[serial]` test starts.
 fn stop_test_server(handle: thread::JoinHandle<()>, shutdown: Arc<AtomicBool>) {
     shutdown.store(true, Ordering::SeqCst);
-    // Wait a bit for server to shut down, but don't block forever
+
+    // Wait for the server thread to actually finish. The drain timeout in the
+    // test config is 500ms, so the server should stop within ~1s.
+    let start = std::time::Instant::now();
+    while !handle.is_finished() && start.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if handle.is_finished() {
+        let _ = handle.join();
+    }
+
+    // Brief pause for kernel to release the listening socket (TIME_WAIT).
     thread::sleep(Duration::from_millis(100));
-    // Drop the handle - the server thread will be cleaned up when the test exits
-    drop(handle);
 }
 
 /// Send a RESP command and read the response.

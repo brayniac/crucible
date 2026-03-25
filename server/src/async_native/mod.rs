@@ -229,16 +229,10 @@ mod server {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        let active_conns = crate::metrics::CONNECTIONS_ACTIVE.value();
-        if active_conns > 0 {
-            warn!(
-                active_connections = active_conns,
-                "Drain timeout reached, {} connections still active — forcing exit", active_conns
-            );
-            std::process::exit(1);
-        }
-
         for (i, handle) in handles.into_iter().enumerate() {
+            if !workers_stopped[i] {
+                debug!(worker_id = i, "Worker did not stop within drain timeout");
+            }
             match handle.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!(worker_id = i, error = %e, "worker thread returned error"),
