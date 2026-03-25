@@ -63,13 +63,15 @@ recover_on_startup = true
 # size = "100GB"
 # promotion_threshold = 2
 
+# Protocol listener (only one listener is supported)
 [[listener]]
 protocol = "resp"
 address = "0.0.0.0:6379"
 
-[[listener]]
-protocol = "memcache"
-address = "0.0.0.0:11211"
+# # Memcache protocol listener (swap with above to use memcache instead)
+# [[listener]]
+# protocol = "memcache"
+# address = "0.0.0.0:11211"
 
 [metrics]
 address = "0.0.0.0:9090"

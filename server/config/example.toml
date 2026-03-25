@@ -85,15 +85,15 @@ hashtable_power = 16
 # # nvme_device = "/dev/ng0n1"
 # # nvme_nsid = 1
 
-# RESP protocol listener (Redis-compatible)
+# Protocol listener (only one listener is supported)
 [[listener]]
 protocol = "resp"
 address = "127.0.0.1:6379"
 
-# Memcache protocol listener
-[[listener]]
-protocol = "memcache"
-address = "127.0.0.1:11211"
+# # Memcache protocol listener (swap with above to use memcache instead)
+# [[listener]]
+# protocol = "memcache"
+# address = "127.0.0.1:11211"
 
 [metrics]
 # Prometheus metrics endpoint

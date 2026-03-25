@@ -824,6 +824,25 @@ impl Config {
             return Err("at least one listener must be configured".into());
         }
 
+        if self.listener.len() > 1 {
+            return Err(
+                "multiple listeners are not yet supported; configure exactly one listener".into(),
+            );
+        }
+
+        // Validate NVMe disk config fields
+        if let Some(ref disk) = self.cache.disk
+            && disk.enabled
+            && disk.io_backend == DiskIoBackendConfig::Nvme
+        {
+            if disk.nvme_device.is_none() {
+                return Err("nvme_device is required when disk io_backend is \"nvme\"".into());
+            }
+            if disk.nvme_nsid.is_none() {
+                return Err("nvme_nsid is required when disk io_backend is \"nvme\"".into());
+            }
+        }
+
         Ok(())
     }
 
@@ -966,5 +985,120 @@ mod tests {
         assert_eq!(parse_cpu_list("0-7").unwrap(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(parse_cpu_list("1,3,8").unwrap(), vec![1, 3, 8]);
         assert_eq!(parse_cpu_list("0-7:2").unwrap(), vec![0, 2, 4, 6]);
+    }
+
+    /// Helper to build a minimal valid Config for validation tests.
+    fn minimal_config() -> Config {
+        Config {
+            workers: WorkersConfig::default(),
+            cache: CacheConfig::default(),
+            listener: vec![ListenerConfig {
+                protocol: Protocol::Resp,
+                address: "127.0.0.1:6379".parse().unwrap(),
+                tls: None,
+                allow_flush: false,
+            }],
+            metrics: MetricsConfig::default(),
+            shutdown: ShutdownConfig::default(),
+            logging: LoggingConfig::default(),
+            uring: UringConfig::default(),
+        }
+    }
+
+    #[test]
+    fn test_validate_single_listener_ok() {
+        let config = minimal_config();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_listeners() {
+        let mut config = minimal_config();
+        config.listener.clear();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("at least one listener"));
+    }
+
+    #[test]
+    fn test_validate_multiple_listeners_rejected() {
+        let mut config = minimal_config();
+        config.listener.push(ListenerConfig {
+            protocol: Protocol::Memcache,
+            address: "127.0.0.1:11211".parse().unwrap(),
+            tls: None,
+            allow_flush: false,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("multiple listeners"));
+    }
+
+    #[test]
+    fn test_validate_nvme_missing_device() {
+        let mut config = minimal_config();
+        config.cache.disk = Some(DiskConfig {
+            enabled: true,
+            io_backend: DiskIoBackendConfig::Nvme,
+            nvme_device: None,
+            nvme_nsid: Some(1),
+            path: default_disk_path(),
+            size: default_disk_size(),
+            promotion_threshold: default_promotion_threshold(),
+            sync_mode: DiskSyncMode::default(),
+            recover_on_startup: true,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("nvme_device is required"));
+    }
+
+    #[test]
+    fn test_validate_nvme_missing_nsid() {
+        let mut config = minimal_config();
+        config.cache.disk = Some(DiskConfig {
+            enabled: true,
+            io_backend: DiskIoBackendConfig::Nvme,
+            nvme_device: Some("/dev/ng0n1".to_string()),
+            nvme_nsid: None,
+            path: default_disk_path(),
+            size: default_disk_size(),
+            promotion_threshold: default_promotion_threshold(),
+            sync_mode: DiskSyncMode::default(),
+            recover_on_startup: true,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("nvme_nsid is required"));
+    }
+
+    #[test]
+    fn test_validate_nvme_complete_config_ok() {
+        let mut config = minimal_config();
+        config.cache.disk = Some(DiskConfig {
+            enabled: true,
+            io_backend: DiskIoBackendConfig::Nvme,
+            nvme_device: Some("/dev/ng0n1".to_string()),
+            nvme_nsid: Some(1),
+            path: default_disk_path(),
+            size: default_disk_size(),
+            promotion_threshold: default_promotion_threshold(),
+            sync_mode: DiskSyncMode::default(),
+            recover_on_startup: true,
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_nvme_disabled_skips_check() {
+        let mut config = minimal_config();
+        config.cache.disk = Some(DiskConfig {
+            enabled: false,
+            io_backend: DiskIoBackendConfig::Nvme,
+            nvme_device: None,
+            nvme_nsid: None,
+            path: default_disk_path(),
+            size: default_disk_size(),
+            promotion_threshold: default_promotion_threshold(),
+            sync_mode: DiskSyncMode::default(),
+            recover_on_startup: true,
+        });
+        assert!(config.validate().is_ok());
     }
 }
