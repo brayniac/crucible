@@ -1,8 +1,12 @@
 //! Ring buffer FIFO queue for S3-FIFO eviction policy.
 //!
-//! This module provides a lock-free FIFO queue implemented as a ring buffer,
-//! used for tracking items in the small and main queues of S3-FIFO.
+//! This module provides a multi-producer multi-consumer (MPMC) FIFO queue
+//! implemented as a bounded ring buffer using the Vyukov MPMC algorithm.
+//! Per-slot sequence counters ensure entries are fully written before being
+//! read, and CAS loops on head/tail prevent data races under concurrent
+//! push/pop from multiple worker threads.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Queue entry stored in the ring buffer.
@@ -51,19 +55,36 @@ impl QueueEntry {
     }
 }
 
-/// Ring buffer FIFO queue.
+/// Per-slot state for the Vyukov MPMC queue.
 ///
-/// This is a single-producer-single-consumer queue optimized for eviction.
-/// In practice, only the eviction thread modifies head, and only the insertion
-/// thread modifies tail.
+/// The sequence counter coordinates producers and consumers:
+/// - When `sequence == tail`: the slot is ready for a producer to write
+/// - When `sequence == head + 1`: the slot has been written and is ready to read
+/// - After reading, sequence is advanced to `head + capacity` for the next cycle
+struct Slot {
+    sequence: AtomicU32,
+    entry: UnsafeCell<QueueEntry>,
+}
+
+// SAFETY: The sequence counter ensures entries are only accessed by one thread
+// at a time — producers write after claiming via CAS, consumers read after
+// verifying the sequence, and the Release/Acquire ordering ensures visibility.
+unsafe impl Send for Slot {}
+unsafe impl Sync for Slot {}
+
+/// MPMC ring buffer FIFO queue (Vyukov bounded queue).
+///
+/// Used by S3-FIFO eviction policy to track items in the small and main queues.
+/// Multiple worker threads may push (during insert) and pop (during eviction)
+/// concurrently.
 pub struct FifoQueue {
-    /// Fixed-size entry storage.
-    entries: Box<[QueueEntry]>,
-    /// Head index - points to the next entry to evict (consume).
+    /// Per-slot storage with sequence counters.
+    slots: Box<[Slot]>,
+    /// Head index (monotonically increasing, masked for array access).
     head: AtomicU32,
-    /// Tail index - points to the next slot to insert (produce).
+    /// Tail index (monotonically increasing, masked for array access).
     tail: AtomicU32,
-    /// Queue capacity (power of 2 for efficient masking).
+    /// Queue capacity (power of 2).
     capacity: u32,
     /// Mask for wrapping indices (capacity - 1).
     mask: u32,
@@ -78,10 +99,15 @@ impl FifoQueue {
         let capacity = capacity.next_power_of_two();
         let mask = capacity - 1;
 
-        let entries = vec![QueueEntry::default(); capacity as usize].into_boxed_slice();
+        let slots: Vec<Slot> = (0..capacity)
+            .map(|i| Slot {
+                sequence: AtomicU32::new(i),
+                entry: UnsafeCell::new(QueueEntry::default()),
+            })
+            .collect();
 
         Self {
-            entries,
+            slots: slots.into_boxed_slice(),
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
             capacity,
@@ -92,112 +118,152 @@ impl FifoQueue {
     /// Push an entry to the tail of the queue.
     ///
     /// Returns `true` if successful, `false` if the queue is full.
+    ///
+    /// # Thread Safety
+    ///
+    /// Uses CAS on the tail index and per-slot sequence counters to ensure
+    /// only one thread writes to each slot. The sequence store with Release
+    /// ordering ensures the entry is visible to consumers.
     #[inline]
     pub fn push(&self, entry: QueueEntry) -> bool {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        loop {
+            let slot = &self.slots[(tail & self.mask) as usize];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            let diff = seq.wrapping_sub(tail) as i32;
 
-        // Check if full (tail would wrap to head)
-        let next_tail = (tail + 1) & self.mask;
-        if next_tail == head {
-            return false;
+            if diff == 0 {
+                // Slot is ready for writing — try to claim it
+                match self.tail.compare_exchange_weak(
+                    tail,
+                    tail.wrapping_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // SAFETY: We won the CAS, so we have exclusive write
+                        // access to this slot until we advance its sequence.
+                        unsafe {
+                            slot.entry.get().write(entry);
+                        }
+                        // Signal that the entry is ready for consumers
+                        slot.sequence.store(tail.wrapping_add(1), Ordering::Release);
+                        return true;
+                    }
+                    Err(new_tail) => tail = new_tail,
+                }
+            } else if diff < 0 {
+                // Queue is full
+                return false;
+            } else {
+                // Another producer is writing to this slot, reload tail
+                tail = self.tail.load(Ordering::Relaxed);
+            }
         }
-
-        // Store entry at tail position
-        // SAFETY: We have exclusive write access to the tail position
-        unsafe {
-            let slot = self.entries.as_ptr().add((tail & self.mask) as usize) as *mut QueueEntry;
-            std::ptr::write_volatile(slot, entry);
-        }
-
-        // Advance tail
-        self.tail.store(next_tail, Ordering::Release);
-        true
     }
 
     /// Pop an entry from the head of the queue.
     ///
     /// Returns `None` if the queue is empty.
+    ///
+    /// # Thread Safety
+    ///
+    /// Uses CAS on the head index and per-slot sequence counters to ensure
+    /// only one thread reads from each slot. The sequence load with Acquire
+    /// ordering ensures the entry written by the producer is visible.
     #[inline]
     pub fn pop(&self) -> Option<QueueEntry> {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            let slot = &self.slots[(head & self.mask) as usize];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            let diff = seq.wrapping_sub(head.wrapping_add(1)) as i32;
 
-        // Check if empty
-        if head == tail {
-            return None;
+            if diff == 0 {
+                // Entry is ready — try to claim it
+                match self.head.compare_exchange_weak(
+                    head,
+                    head.wrapping_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // SAFETY: We won the CAS, so we have exclusive read
+                        // access to this slot until we advance its sequence.
+                        let entry = unsafe { slot.entry.get().read() };
+                        // Mark slot as available for the next producer cycle
+                        slot.sequence
+                            .store(head.wrapping_add(self.capacity), Ordering::Release);
+                        return Some(entry);
+                    }
+                    Err(new_head) => head = new_head,
+                }
+            } else if diff < 0 {
+                // Queue is empty
+                return None;
+            } else {
+                // Another consumer is reading from this slot, reload head
+                head = self.head.load(Ordering::Relaxed);
+            }
         }
-
-        // Read entry at head position
-        // SAFETY: We have exclusive read access to the head position
-        let entry = unsafe {
-            let slot = self.entries.as_ptr().add((head & self.mask) as usize);
-            std::ptr::read_volatile(slot)
-        };
-
-        // Advance head
-        let next_head = (head + 1) & self.mask;
-        self.head.store(next_head, Ordering::Release);
-
-        Some(entry)
     }
 
     /// Peek at the head entry without removing it.
+    ///
+    /// Note: under concurrent access, the peeked entry may be popped by
+    /// another thread before the caller acts on it.
     #[allow(dead_code)]
     #[inline]
     pub fn peek(&self) -> Option<QueueEntry> {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let slot = &self.slots[(head & self.mask) as usize];
+        let seq = slot.sequence.load(Ordering::Acquire);
 
-        if head == tail {
-            return None;
-        }
-
-        unsafe {
-            let slot = self.entries.as_ptr().add((head & self.mask) as usize);
-            Some(std::ptr::read_volatile(slot))
+        if seq.wrapping_sub(head.wrapping_add(1)) as i32 == 0 {
+            // SAFETY: The entry has been written (sequence check passed).
+            // We don't advance head, so another thread may also read this.
+            Some(unsafe { slot.entry.get().read() })
+        } else {
+            None
         }
     }
 
-    /// Get the current number of entries in the queue.
+    /// Get the approximate number of entries in the queue.
+    ///
+    /// Under concurrent access, this is a snapshot and may be stale.
     #[inline]
     pub fn len(&self) -> u32 {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-
-        if tail >= head {
-            tail - head
-        } else {
-            self.capacity - (head - tail)
-        }
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        tail.wrapping_sub(head)
     }
 
-    /// Check if the queue is empty.
+    /// Check if the queue is approximately empty.
     #[allow(dead_code)]
     #[inline]
     pub fn is_empty(&self) -> bool {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-        head == tail
+        self.len() == 0
     }
 
-    /// Check if the queue is full.
+    /// Check if the queue is approximately full.
     #[allow(dead_code)]
     #[inline]
     pub fn is_full(&self) -> bool {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        let next_tail = (tail + 1) & self.mask;
-        next_tail == head
+        self.len() >= self.capacity
     }
 
     /// Get the queue capacity.
     #[allow(dead_code)]
     #[inline]
     pub fn capacity(&self) -> u32 {
-        self.capacity - 1 // One slot is reserved to distinguish full from empty
+        self.capacity
     }
 }
+
+// SAFETY: FifoQueue is Send + Sync because all shared access is coordinated
+// through atomic operations and per-slot sequence counters.
+unsafe impl Send for FifoQueue {}
+unsafe impl Sync for FifoQueue {}
 
 #[cfg(test)]
 mod tests {
@@ -206,7 +272,7 @@ mod tests {
     #[test]
     fn test_queue_creation() {
         let queue = FifoQueue::new(16);
-        assert_eq!(queue.capacity(), 15); // One slot reserved
+        assert_eq!(queue.capacity(), 16);
         assert!(queue.is_empty());
         assert!(!queue.is_full());
     }
@@ -225,12 +291,13 @@ mod tests {
 
     #[test]
     fn test_queue_full() {
-        let queue = FifoQueue::new(4); // Capacity is 4, but usable is 3
+        let queue = FifoQueue::new(4);
 
         assert!(queue.push(QueueEntry::new(1, 1)));
         assert!(queue.push(QueueEntry::new(2, 2)));
         assert!(queue.push(QueueEntry::new(3, 3)));
-        assert!(!queue.push(QueueEntry::new(4, 4))); // Should fail - full
+        assert!(queue.push(QueueEntry::new(4, 4)));
+        assert!(!queue.push(QueueEntry::new(5, 5))); // Should fail - full
 
         assert!(queue.is_full());
     }
@@ -241,10 +308,10 @@ mod tests {
 
         // Fill and empty multiple times
         for round in 0u64..3 {
-            for i in 0u64..3 {
+            for i in 0u64..4 {
                 assert!(queue.push(QueueEntry::new(round * 10 + i, i)));
             }
-            for i in 0u64..3 {
+            for i in 0u64..4 {
                 let entry = queue.pop().unwrap();
                 assert_eq!(entry.bucket_index, round * 10 + i);
             }
@@ -306,5 +373,61 @@ mod tests {
 
         queue.pop();
         assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_concurrent_push_pop() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let queue = Arc::new(FifoQueue::new(1024));
+        let items_per_thread = 10_000;
+        let num_threads = 4;
+
+        // Spawn producer threads
+        let mut handles = Vec::new();
+        for t in 0..num_threads {
+            let q = queue.clone();
+            handles.push(thread::spawn(move || {
+                let mut pushed = 0u64;
+                for i in 0..items_per_thread {
+                    let entry = QueueEntry::new(t * items_per_thread + i, i);
+                    while !q.push(entry) {
+                        std::thread::yield_now();
+                    }
+                    pushed += 1;
+                }
+                pushed
+            }));
+        }
+
+        // Spawn consumer threads
+        let total_items = num_threads * items_per_thread;
+        let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        for _ in 0..num_threads {
+            let q = queue.clone();
+            let consumed = consumed.clone();
+            handles.push(thread::spawn(move || {
+                let mut count = 0u64;
+                loop {
+                    if let Some(_entry) = q.pop() {
+                        count += 1;
+                        consumed.fetch_add(1, Ordering::Relaxed);
+                    } else if consumed.load(Ordering::Relaxed) >= total_items {
+                        break;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                count
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.join().unwrap();
+        }
+
+        assert_eq!(consumed.load(Ordering::Relaxed), total_items);
+        assert!(queue.is_empty());
     }
 }
