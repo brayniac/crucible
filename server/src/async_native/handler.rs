@@ -25,6 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 
 // ── Config channel ──────────────────────────────────────────────────────
 
@@ -303,13 +304,20 @@ async fn handle_connection<C: Cache>(
     };
 
     loop {
-        // Backpressure: if write queue is full, await a send completion first.
+        // Backpressure: if write queue is full, drain pending writes first.
         if !connection.should_read() && connection.has_pending_write() {
+            let pending_before = connection.pending_write_len();
             if drain_pending(&conn, &mut connection, cfg.slot_size, true)
                 .await
                 .is_err()
             {
                 break;
+            }
+            // If drain made progress, loop back to check backpressure again.
+            // If no progress (e.g. SQE full), yield to the executor so it can
+            // process CQEs and free resources before we retry.
+            if connection.pending_write_len() >= pending_before && connection.has_pending_write() {
+                yield_once().await;
             }
             continue;
         }
@@ -758,4 +766,22 @@ async fn drain_pending(
 
         connection.advance_write(advanced);
     }
+}
+
+/// Yield once to the executor, allowing it to process pending CQEs.
+///
+/// Returns `Pending` on the first poll, then `Ready(())` on subsequent polls.
+/// This is used when the SQE is full during backpressure draining — yielding
+/// lets the executor process completions and free SQE slots.
+fn yield_once() -> impl Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
 }
