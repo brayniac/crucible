@@ -14,7 +14,7 @@ Run the cache server with the cachecannon benchmark tool to detect issues.
 
 2. **Install cachecannon** (if not already installed):
    ```bash
-   cargo install --git https://github.com/cachecannon/cachecannon
+   curl -fsSL https://cachecannon.cc/install.sh | bash
    ```
 
 3. **Kill any existing server** to avoid port conflicts:
