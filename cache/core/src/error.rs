@@ -101,6 +101,26 @@ impl fmt::Display for CacheError {
     }
 }
 
+impl CacheError {
+    /// Returns true if this error indicates a client-side issue (bad input)
+    /// that should be reported back to the client, as opposed to an internal
+    /// cache-pressure or transient error that can be silently dropped in
+    /// best-effort mode.
+    pub fn is_client_error(&self) -> bool {
+        matches!(
+            self,
+            Self::KeyTooLong
+                | Self::ValueTooLong
+                | Self::OptionalTooLong
+                | Self::InvalidTtl
+                | Self::WrongType
+                | Self::Unsupported
+                | Self::NotNumeric
+                | Self::Overflow
+        )
+    }
+}
+
 impl std::error::Error for CacheError {}
 
 /// Result type for cache operations.
@@ -182,5 +202,28 @@ mod tests {
         let result: CacheResult<i32> = Err(CacheError::KeyNotFound);
         assert!(result.is_err());
         assert!(matches!(result, Err(CacheError::KeyNotFound)));
+    }
+
+    #[test]
+    fn test_is_client_error() {
+        // Client errors: should be reported back to the caller
+        assert!(CacheError::KeyTooLong.is_client_error());
+        assert!(CacheError::ValueTooLong.is_client_error());
+        assert!(CacheError::OptionalTooLong.is_client_error());
+        assert!(CacheError::InvalidTtl.is_client_error());
+        assert!(CacheError::WrongType.is_client_error());
+        assert!(CacheError::Unsupported.is_client_error());
+        assert!(CacheError::NotNumeric.is_client_error());
+        assert!(CacheError::Overflow.is_client_error());
+
+        // Internal/cache-pressure errors: safe to silently drop
+        assert!(!CacheError::OutOfMemory.is_client_error());
+        assert!(!CacheError::HashTableFull.is_client_error());
+        assert!(!CacheError::KeyExists.is_client_error());
+        assert!(!CacheError::KeyNotFound.is_client_error());
+        assert!(!CacheError::Corrupted.is_client_error());
+        assert!(!CacheError::SegmentNotAccessible.is_client_error());
+        assert!(!CacheError::ItemExpired.is_client_error());
+        assert!(!CacheError::ItemDeleted.is_client_error());
     }
 }

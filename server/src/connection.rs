@@ -290,20 +290,35 @@ impl Connection {
             Err(cache_core::CacheError::OutOfMemory | cache_core::CacheError::HashTableFull) => {
                 false
             }
-            Err(_) => {
+            Err(e) => {
                 // Non-retryable error, give up
-                self.abandon_retry();
+                self.abandon_retry_with_error(e);
                 true
             }
         }
     }
 
-    /// Abandon a pending SET retry: write a success response (silent drop)
-    /// and increment SET_ERRORS.
+    /// Abandon a pending SET retry due to timeout (cache pressure).
+    /// Writes a success response (silent drop) since the original error
+    /// was OutOfMemory/HashTableFull.
     pub fn abandon_retry(&mut self) {
         use crate::metrics::SET_ERRORS;
         SET_ERRORS.increment();
         self.write_set_success_response();
+        self.pending_retry = None;
+    }
+
+    /// Abandon a pending SET retry due to a non-retryable error.
+    /// Reports client errors back to the caller; silently drops for
+    /// cache-internal errors.
+    fn abandon_retry_with_error(&mut self, error: cache_core::CacheError) {
+        use crate::metrics::SET_ERRORS;
+        SET_ERRORS.increment();
+        if error.is_client_error() {
+            self.write_set_error_response(&error);
+        } else {
+            self.write_set_success_response();
+        }
         self.pending_retry = None;
     }
 
@@ -331,6 +346,40 @@ impl Connection {
                         Opcode::Set,
                         retry.opaque,
                         0,
+                    );
+                    self.write_buf.truncate(start + len);
+                }
+            }
+        }
+    }
+
+    /// Write the protocol-appropriate error response for a SET operation.
+    fn write_set_error_response(&mut self, error: &cache_core::CacheError) {
+        match self.protocol {
+            DetectedProtocol::Resp | DetectedProtocol::Unknown => {
+                self.write_buf.extend_from_slice(b"-ERR ");
+                self.write_buf
+                    .extend_from_slice(error.to_string().as_bytes());
+                self.write_buf.extend_from_slice(b"\r\n");
+            }
+            DetectedProtocol::MemcacheAscii => {
+                self.write_buf.extend_from_slice(b"CLIENT_ERROR ");
+                self.write_buf
+                    .extend_from_slice(error.to_string().as_bytes());
+                self.write_buf.extend_from_slice(b"\r\n");
+            }
+            DetectedProtocol::MemcacheBinary => {
+                if let Some(retry) = &self.pending_retry {
+                    use memcache_proto::binary::{BinaryResponse, Opcode};
+                    let start = self.write_buf.len();
+                    self.write_buf.reserve(24);
+                    unsafe {
+                        self.write_buf.set_len(start + 24);
+                    }
+                    let len = BinaryResponse::encode_invalid_arguments(
+                        &mut self.write_buf[start..],
+                        Opcode::Set,
+                        retry.opaque,
                     );
                     self.write_buf.truncate(start + len);
                 }
@@ -2452,6 +2501,144 @@ mod tests {
         assert!(conn.send_queue.is_empty());
         assert_eq!(conn.send_queue_bytes, 0);
         assert!(!conn.has_pending_write());
+    }
+
+    // --- SET error response tests ---
+
+    /// A mock cache that returns a configurable error from set().
+    struct FailingSetCache {
+        error: cache_core::CacheError,
+    }
+
+    impl Cache for FailingSetCache {
+        fn get(&self, _key: &[u8]) -> Option<cache_core::OwnedGuard> {
+            None
+        }
+
+        fn with_value<F, R>(&self, _key: &[u8], _f: F) -> Option<R>
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            None
+        }
+
+        fn get_value_ref(&self, _key: &[u8]) -> Option<cache_core::ValueRef> {
+            None
+        }
+
+        fn set(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), cache_core::CacheError> {
+            Err(self.error)
+        }
+
+        fn delete(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn contains(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn test_resp_set_key_too_long_returns_error() {
+        let cache = FailingSetCache {
+            error: cache_core::CacheError::KeyTooLong,
+        };
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(&build_resp_set(b"foo", b"bar"));
+        conn.process_from(&mut buf, &cache);
+
+        let response = conn.pending_write_data();
+        assert_eq!(
+            response,
+            b"-ERR key too long (max 255 bytes)\r\n",
+            "Expected RESP error for KeyTooLong, got: {:?}",
+            String::from_utf8_lossy(response)
+        );
+    }
+
+    #[test]
+    fn test_resp_set_value_too_long_returns_error() {
+        let cache = FailingSetCache {
+            error: cache_core::CacheError::ValueTooLong,
+        };
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(&build_resp_set(b"foo", b"bar"));
+        conn.process_from(&mut buf, &cache);
+
+        let response = conn.pending_write_data();
+        assert_eq!(
+            response,
+            b"-ERR value too long (max 16MB)\r\n",
+            "Expected RESP error for ValueTooLong, got: {:?}",
+            String::from_utf8_lossy(response)
+        );
+    }
+
+    #[test]
+    fn test_resp_set_out_of_memory_returns_ok() {
+        let cache = FailingSetCache {
+            error: cache_core::CacheError::OutOfMemory,
+        };
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(&build_resp_set(b"foo", b"bar"));
+        conn.process_from(&mut buf, &cache);
+
+        let response = conn.pending_write_data();
+        assert_eq!(
+            response,
+            b"+OK\r\n",
+            "Expected silent OK for OutOfMemory, got: {:?}",
+            String::from_utf8_lossy(response)
+        );
+    }
+
+    #[test]
+    fn test_memcache_ascii_set_key_too_long_returns_error() {
+        let cache = FailingSetCache {
+            error: cache_core::CacheError::KeyTooLong,
+        };
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"set foo 0 0 3\r\nbar\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        let response = conn.pending_write_data();
+        assert_eq!(
+            response,
+            b"CLIENT_ERROR key too long (max 255 bytes)\r\n",
+            "Expected CLIENT_ERROR for KeyTooLong, got: {:?}",
+            String::from_utf8_lossy(response)
+        );
+    }
+
+    #[test]
+    fn test_memcache_ascii_set_out_of_memory_returns_stored() {
+        let cache = FailingSetCache {
+            error: cache_core::CacheError::OutOfMemory,
+        };
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"set foo 0 0 3\r\nbar\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        let response = conn.pending_write_data();
+        assert_eq!(
+            response,
+            b"STORED\r\n",
+            "Expected silent STORED for OutOfMemory, got: {:?}",
+            String::from_utf8_lossy(response)
+        );
     }
 
     // --- Memcache ASCII zero-copy tests ---
