@@ -1227,7 +1227,8 @@ impl HeapCache {
                 Ok((idx, generation, true))
             }
             Err(e) => {
-                // Rollback: deallocate the slot we just created
+                // Rollback: deallocate the slot and undo bytes_used tracking
+                self.bytes_used.fetch_sub(base_size, Ordering::Relaxed);
                 match value_type {
                     ValueType::Hash => self.hash_storage.deallocate(idx),
                     ValueType::List => self.list_storage.deallocate(idx),
