@@ -176,12 +176,20 @@ pub fn execute_resp<C: Cache>(
                             quiet: false,
                         });
                     }
-                    // Silent drop: cache is best-effort storage. Return OK even
-                    // when the cache is full — the item would be evicted soon
-                    // anyway. This matches Redis behavior with eviction enabled
-                    // and avoids breaking clients like valkey-benchmark.
                     SET_ERRORS.increment();
-                    write_buf.extend_from_slice(b"+OK\r\n");
+                    if e.is_client_error() {
+                        // Client validation errors should be reported so the
+                        // caller can fix the request.
+                        write_buf.extend_from_slice(b"-ERR ");
+                        write_buf.extend_from_slice(e.to_string().as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                    } else {
+                        // Cache-pressure / transient errors: silent drop.
+                        // Cache is best-effort storage — the item would be
+                        // evicted soon anyway. This matches Redis behavior with
+                        // eviction enabled.
+                        write_buf.extend_from_slice(b"+OK\r\n");
+                    }
                 }
             }
         }
@@ -1294,7 +1302,9 @@ pub fn execute_memcache<C: Cache>(
             };
 
             match cache.set(key, data, ttl) {
-                Ok(()) => {}
+                Ok(()) => {
+                    write_buf.extend_from_slice(b"STORED\r\n");
+                }
                 Err(e) => {
                     if retry_on_eviction
                         && matches!(
@@ -1315,9 +1325,15 @@ pub fn execute_memcache<C: Cache>(
                         );
                     }
                     SET_ERRORS.increment();
+                    if e.is_client_error() {
+                        write_buf.extend_from_slice(b"CLIENT_ERROR ");
+                        write_buf.extend_from_slice(e.to_string().as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                    } else {
+                        write_buf.extend_from_slice(b"STORED\r\n");
+                    }
                 }
             }
-            write_buf.extend_from_slice(b"STORED\r\n");
             false
         }
         MemcacheCommand::Add {
@@ -1609,7 +1625,10 @@ pub fn execute_memcache_binary<C: Cache>(
             };
 
             match cache.set(key, value, ttl) {
-                Ok(()) => {}
+                Ok(()) => {
+                    let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
+                    unsafe { write_buf.set_len(write_buf.len() + len) };
+                }
                 Err(e) => {
                     if retry_on_eviction
                         && matches!(
@@ -1630,10 +1649,14 @@ pub fn execute_memcache_binary<C: Cache>(
                         );
                     }
                     SET_ERRORS.increment();
+                    let len = if e.is_client_error() {
+                        BinaryResponse::encode_invalid_arguments(buf, Opcode::Set, *opaque)
+                    } else {
+                        BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0)
+                    };
+                    unsafe { write_buf.set_len(write_buf.len() + len) };
                 }
             }
-            let len = BinaryResponse::encode_stored(buf, Opcode::Set, *opaque, 0);
-            unsafe { write_buf.set_len(write_buf.len() + len) };
             return (false, None);
         }
         BinaryCommand::SetQ {
@@ -1672,6 +1695,14 @@ pub fn execute_memcache_binary<C: Cache>(
                         );
                     }
                     SET_ERRORS.increment();
+                    if e.is_client_error() {
+                        let len = BinaryResponse::encode_invalid_arguments(
+                            buf,
+                            Opcode::Set,
+                            *opaque,
+                        );
+                        unsafe { write_buf.set_len(write_buf.len() + len) };
+                    }
                 }
             }
             return (false, None);

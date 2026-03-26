@@ -290,20 +290,35 @@ impl Connection {
             Err(cache_core::CacheError::OutOfMemory | cache_core::CacheError::HashTableFull) => {
                 false
             }
-            Err(_) => {
+            Err(e) => {
                 // Non-retryable error, give up
-                self.abandon_retry();
+                self.abandon_retry_with_error(e);
                 true
             }
         }
     }
 
-    /// Abandon a pending SET retry: write a success response (silent drop)
-    /// and increment SET_ERRORS.
+    /// Abandon a pending SET retry due to timeout (cache pressure).
+    /// Writes a success response (silent drop) since the original error
+    /// was OutOfMemory/HashTableFull.
     pub fn abandon_retry(&mut self) {
         use crate::metrics::SET_ERRORS;
         SET_ERRORS.increment();
         self.write_set_success_response();
+        self.pending_retry = None;
+    }
+
+    /// Abandon a pending SET retry due to a non-retryable error.
+    /// Reports client errors back to the caller; silently drops for
+    /// cache-internal errors.
+    fn abandon_retry_with_error(&mut self, error: cache_core::CacheError) {
+        use crate::metrics::SET_ERRORS;
+        SET_ERRORS.increment();
+        if error.is_client_error() {
+            self.write_set_error_response(&error);
+        } else {
+            self.write_set_success_response();
+        }
         self.pending_retry = None;
     }
 
@@ -331,6 +346,40 @@ impl Connection {
                         Opcode::Set,
                         retry.opaque,
                         0,
+                    );
+                    self.write_buf.truncate(start + len);
+                }
+            }
+        }
+    }
+
+    /// Write the protocol-appropriate error response for a SET operation.
+    fn write_set_error_response(&mut self, error: &cache_core::CacheError) {
+        match self.protocol {
+            DetectedProtocol::Resp | DetectedProtocol::Unknown => {
+                self.write_buf.extend_from_slice(b"-ERR ");
+                self.write_buf
+                    .extend_from_slice(error.to_string().as_bytes());
+                self.write_buf.extend_from_slice(b"\r\n");
+            }
+            DetectedProtocol::MemcacheAscii => {
+                self.write_buf.extend_from_slice(b"CLIENT_ERROR ");
+                self.write_buf
+                    .extend_from_slice(error.to_string().as_bytes());
+                self.write_buf.extend_from_slice(b"\r\n");
+            }
+            DetectedProtocol::MemcacheBinary => {
+                if let Some(retry) = &self.pending_retry {
+                    use memcache_proto::binary::{BinaryResponse, Opcode};
+                    let start = self.write_buf.len();
+                    self.write_buf.reserve(24);
+                    unsafe {
+                        self.write_buf.set_len(start + 24);
+                    }
+                    let len = BinaryResponse::encode_invalid_arguments(
+                        &mut self.write_buf[start..],
+                        Opcode::Set,
+                        retry.opaque,
                     );
                     self.write_buf.truncate(start + len);
                 }
