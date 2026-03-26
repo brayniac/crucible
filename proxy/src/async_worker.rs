@@ -839,6 +839,35 @@ async fn forward_raw_value(
     backend: &mut Client,
     cmd: &Command<'_>,
 ) -> Result<Value, ringline_redis::Error> {
+    // SET with EX/PX needs special handling: the numeric values are formatted
+    // into stack buffers here so they live long enough for the request.
+    if let Command::Set {
+        key,
+        value,
+        ex,
+        px,
+        nx,
+        xx,
+    } = cmd
+    {
+        let ex_str = ex.map(|s| s.to_string());
+        let px_str = px.map(|s| s.to_string());
+        let mut req = resp_proto::Request::cmd(b"SET").arg(key).arg(value);
+        if let Some(ref s) = ex_str {
+            req = req.arg(b"EX" as &[u8]).arg(s.as_bytes());
+        }
+        if let Some(ref s) = px_str {
+            req = req.arg(b"PX" as &[u8]).arg(s.as_bytes());
+        }
+        if *nx {
+            req = req.arg(b"NX" as &[u8]);
+        }
+        if *xx {
+            req = req.arg(b"XX" as &[u8]);
+        }
+        return backend.cmd(&req).await;
+    }
+
     let req = build_request(cmd);
     backend.cmd(&req).await
 }
@@ -847,35 +876,7 @@ async fn forward_raw_value(
 fn build_request<'a>(cmd: &Command<'a>) -> resp_proto::Request<'a> {
     match cmd {
         Command::Get { key } => resp_proto::Request::get(key),
-        Command::Set {
-            key,
-            value,
-            ex,
-            px,
-            nx,
-            xx,
-        } => {
-            let mut req = resp_proto::Request::cmd(b"SET").arg(key).arg(value);
-            if let Some(secs) = ex {
-                let s = secs.to_string();
-                // We need to leak the string since Request borrows &'a [u8].
-                // This is only called for rare SET XX+EX combinations.
-                let leaked: &'static [u8] = Box::leak(s.into_bytes().into_boxed_slice());
-                req = req.arg(b"EX" as &[u8]).arg(leaked);
-            }
-            if let Some(ms) = px {
-                let s = ms.to_string();
-                let leaked: &'static [u8] = Box::leak(s.into_bytes().into_boxed_slice());
-                req = req.arg(b"PX" as &[u8]).arg(leaked);
-            }
-            if *nx {
-                req = req.arg(b"NX" as &[u8]);
-            }
-            if *xx {
-                req = req.arg(b"XX" as &[u8]);
-            }
-            req
-        }
+        Command::Set { .. } => unreachable!("SET is handled directly in forward_raw_value"),
         Command::Del { key } => resp_proto::Request::del(key),
         Command::Config { subcommand, args } => {
             let mut req = resp_proto::Request::cmd(b"CONFIG").arg(subcommand);
