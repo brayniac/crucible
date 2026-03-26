@@ -543,7 +543,7 @@ length = 64
     let mut benchmark: Option<Child> = None;
     if !no_load {
         println!("Starting benchmark...");
-        let bench_bin = which_cachecannon().map_err(|_| "cachecannon not found in PATH. Install with: cargo install --git https://github.com/cachecannon/cachecannon".to_string())?;
+        let bench_bin = which_cachecannon().map_err(|_| "cachecannon not found in PATH. Install with: curl -fsSL https://cachecannon.cc/install.sh | bash".to_string())?;
         let child = Command::new(&bench_bin)
             .arg(&benchmark_config)
             .current_dir(&workspace_root)

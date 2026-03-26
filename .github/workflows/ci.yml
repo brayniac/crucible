@@ -102,7 +102,7 @@ jobs:
       - name: Build debug server with validation
         run: cargo build -p server --features server/validation
       - name: Install cachecannon
-        run: cargo install --git https://github.com/cachecannon/cachecannon
+        run: curl -fsSL https://cachecannon.cc/install.sh | bash
       - name: Run smoketest
         env:
           # Enable debug assertions in dependencies

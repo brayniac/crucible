@@ -273,7 +273,7 @@ sq_depth = 1024
 For load testing, use [cachecannon](https://github.com/cachecannon/cachecannon):
 
 ```bash
-cargo install --git https://github.com/cachecannon/cachecannon
+curl -fsSL https://cachecannon.cc/install.sh | bash
 cachecannon config/redis.toml
 ```
 
