@@ -188,6 +188,11 @@ async fn flush_worker<C: Cache>(
         }
     };
 
+    const MAX_FLUSH_RETRIES: u32 = 3;
+
+    // Requests that failed and need retrying, with attempt counts.
+    let mut retry_queue: Vec<(cache_core::disk::FlushRequest, u32)> = Vec::new();
+
     // Loop: sleep briefly, drain flush queue, submit writes, complete flushes.
     loop {
         ringline::sleep(std::time::Duration::from_millis(1)).await;
@@ -197,11 +202,18 @@ async fn flush_worker<C: Cache>(
         }
 
         let flush_requests = cache.take_flush_queue();
-        if flush_requests.is_empty() {
+        if flush_requests.is_empty() && retry_queue.is_empty() {
             continue;
         }
 
-        for req in flush_requests {
+        // Combine new requests (attempt 0) with retries.
+        let pending: Vec<(cache_core::disk::FlushRequest, u32)> = flush_requests
+            .into_iter()
+            .map(|r| (r, 0))
+            .chain(retry_queue.drain(..))
+            .collect();
+
+        for (req, attempt) in pending {
             let result = match &flush_backend {
                 DiskBackend::DirectIo { file, .. } => unsafe {
                     match ringline::direct_io_write(
@@ -231,13 +243,31 @@ async fn flush_worker<C: Cache>(
             };
 
             DISK_FLUSHES.increment();
-            if let Err(e) = result {
-                DISK_FLUSH_ERRORS.increment();
-                tracing::warn!("Disk flush failed: {e}");
+            match result {
+                Ok(_) => {
+                    // Success: detach write buffer and return it to the pool.
+                    cache.complete_flush(req.segment_id);
+                }
+                Err(e) if attempt < MAX_FLUSH_RETRIES => {
+                    DISK_FLUSH_ERRORS.increment();
+                    tracing::warn!(
+                        segment_id = req.segment_id,
+                        attempt = attempt + 1,
+                        max_retries = MAX_FLUSH_RETRIES,
+                        "Disk flush failed, will retry: {e}"
+                    );
+                    retry_queue.push((req, attempt + 1));
+                }
+                Err(e) => {
+                    DISK_FLUSH_ERRORS.increment();
+                    tracing::error!(
+                        segment_id = req.segment_id,
+                        "Disk flush failed after {MAX_FLUSH_RETRIES} retries, \
+                         data in this segment will be lost: {e}"
+                    );
+                    cache.complete_flush(req.segment_id);
+                }
             }
-
-            // Detach write buffer and return it to the pool.
-            cache.complete_flush(req.segment_id);
         }
     }
 }
