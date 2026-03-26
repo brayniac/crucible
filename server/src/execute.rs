@@ -1696,11 +1696,8 @@ pub fn execute_memcache_binary<C: Cache>(
                     }
                     SET_ERRORS.increment();
                     if e.is_client_error() {
-                        let len = BinaryResponse::encode_invalid_arguments(
-                            buf,
-                            Opcode::Set,
-                            *opaque,
-                        );
+                        let len =
+                            BinaryResponse::encode_invalid_arguments(buf, Opcode::Set, *opaque);
                         unsafe { write_buf.set_len(write_buf.len() + len) };
                     }
                 }
