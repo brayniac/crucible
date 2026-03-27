@@ -258,9 +258,7 @@ impl FifoLayer {
         };
 
         // Wait for readers to finish
-        while segment.ref_count() > 0 {
-            std::hint::spin_loop();
-        }
+        super::wait_for_readers(segment);
 
         // Transition to Locked for clearing
         segment.cas_metadata(State::Draining, State::Locked, None, None);
@@ -346,9 +344,7 @@ impl FifoLayer {
         };
 
         // Wait for readers to finish
-        while segment.ref_count() > 0 {
-            std::hint::spin_loop();
-        }
+        super::wait_for_readers(segment);
 
         // Transition to Locked for clearing
         segment.cas_metadata(State::Draining, State::Locked, None, None);
