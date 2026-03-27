@@ -567,11 +567,16 @@ impl Connection {
                             };
                         }
                         Err(e) => {
-                            // Cache error (out of memory, etc.)
-                            // Send error response
-                            self.write_buf.extend_from_slice(b"-ERR ");
-                            self.write_buf.extend_from_slice(e.to_string().as_bytes());
-                            self.write_buf.extend_from_slice(b"\r\n");
+                            use crate::metrics::SET_ERRORS;
+                            SET_ERRORS.increment();
+                            if e.is_client_error() {
+                                self.write_buf.extend_from_slice(b"-ERR ");
+                                self.write_buf.extend_from_slice(e.to_string().as_bytes());
+                                self.write_buf.extend_from_slice(b"\r\n");
+                            } else {
+                                // Cache-pressure: silent drop, best-effort.
+                                self.write_buf.extend_from_slice(b"+OK\r\n");
+                            }
 
                             // Consume the header + prefix we've already seen
                             buf.consume(header_consumed + prefix_len);
@@ -928,10 +933,17 @@ impl Connection {
                                 noreply,
                             };
                         }
-                        Err(_e) => {
-                            // Send error response
-                            self.write_buf
-                                .extend_from_slice(b"SERVER_ERROR out of memory\r\n");
+                        Err(e) => {
+                            use crate::metrics::SET_ERRORS;
+                            SET_ERRORS.increment();
+                            if e.is_client_error() {
+                                self.write_buf.extend_from_slice(b"CLIENT_ERROR ");
+                                self.write_buf.extend_from_slice(e.to_string().as_bytes());
+                                self.write_buf.extend_from_slice(b"\r\n");
+                            } else {
+                                // Cache-pressure: silent drop, best-effort.
+                                self.write_buf.extend_from_slice(b"STORED\r\n");
+                            }
 
                             // Consume the header + prefix we've already seen
                             buf.consume(header_consumed + prefix_len);
@@ -1297,20 +1309,30 @@ impl Connection {
                                 opaque,
                             };
                         }
-                        Err(_e) => {
-                            // Binary protocol error response
-                            use memcache_proto::binary::{BinaryResponse, Status};
+                        Err(e) => {
+                            use crate::metrics::SET_ERRORS;
+                            use memcache_proto::binary::BinaryResponse;
+                            SET_ERRORS.increment();
                             let start = self.write_buf.len();
                             self.write_buf.reserve(32);
                             unsafe {
                                 self.write_buf.set_len(start + 32);
                             }
-                            let len = BinaryResponse::encode_error(
-                                &mut self.write_buf[start..],
-                                opcode,
-                                opaque,
-                                Status::OutOfMemory,
-                            );
+                            let len = if e.is_client_error() {
+                                BinaryResponse::encode_invalid_arguments(
+                                    &mut self.write_buf[start..],
+                                    opcode,
+                                    opaque,
+                                )
+                            } else {
+                                // Cache-pressure: return stored (best-effort).
+                                BinaryResponse::encode_stored(
+                                    &mut self.write_buf[start..],
+                                    opcode,
+                                    opaque,
+                                    0,
+                                )
+                            };
                             self.write_buf.truncate(start + len);
 
                             // Consume the header + prefix we've already seen
