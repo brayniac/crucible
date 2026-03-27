@@ -15,6 +15,7 @@ use crate::metrics::{
 use bytes::Bytes;
 use cache_core::Cache;
 use cache_core::disk::AlignedBufferPool;
+use parking_lot::Mutex;
 use ringline::{
     AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
     SendPart,
@@ -23,7 +24,6 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 
@@ -55,12 +55,12 @@ pub(crate) fn init_config_channel<C: Cache + 'static>(
 ) {
     WORKERS_INITIALIZED.store(0, Ordering::SeqCst);
     WORKERS_EXPECTED.store(num_workers, Ordering::SeqCst);
-    let mut guard = CONFIG_CHANNEL.lock().unwrap();
+    let mut guard = CONFIG_CHANNEL.lock();
     *guard = Some(Box::new(rx));
 }
 
 fn take_config<C: Cache + 'static>() -> HandlerConfig<C> {
-    let guard = CONFIG_CHANNEL.lock().unwrap();
+    let guard = CONFIG_CHANNEL.lock();
     let channel = guard.as_ref().expect("config channel not initialized");
     let rx = channel
         .downcast_ref::<crossbeam_channel::Receiver<HandlerConfig<C>>>()
@@ -71,8 +71,8 @@ fn take_config<C: Cache + 'static>() -> HandlerConfig<C> {
     config
 }
 
-pub(crate) fn launch_lock() -> std::sync::MutexGuard<'static, ()> {
-    LAUNCH_MUTEX.lock().unwrap()
+pub(crate) fn launch_lock() -> parking_lot::MutexGuard<'static, ()> {
+    LAUNCH_MUTEX.lock()
 }
 
 pub(crate) fn wait_for_workers() {
@@ -134,7 +134,7 @@ impl<C: Cache + 'static> AsyncEventHandler for AsyncServerHandler<C> {
 
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         // Spawn a flush worker task if disk I/O is configured.
-        let disk_io_config = self.disk_io_config.lock().unwrap().take()?;
+        let disk_io_config = self.disk_io_config.lock().take()?;
         let disk_io = Arc::clone(&self.disk_io);
         let cache = Arc::clone(&self.cache);
         let shutdown = Arc::clone(&self.shutdown);
@@ -179,7 +179,7 @@ async fn flush_worker<C: Cache>(
     let flush_backend = match init_async_disk_io(&config) {
         Ok(state) => {
             let backend = state.backend;
-            *disk_io.lock().unwrap() = Some(state);
+            *disk_io.lock() = Some(state);
             backend
         }
         Err(e) => {
@@ -393,7 +393,7 @@ async fn handle_connection<C: Cache>(
 
         // Handle pending disk read (disk-tier GET).
         if connection.pending_disk_read.is_some() {
-            let has_disk_io = disk_io.lock().unwrap().is_some();
+            let has_disk_io = disk_io.lock().is_some();
             if has_disk_io {
                 let pending_info = connection.pending_disk_read.take().unwrap();
                 match submit_and_await_disk_read(
@@ -486,7 +486,7 @@ async fn submit_and_await_disk_read<C: Cache>(
 
     // 1. Allocate aligned read buffer.
     let mut buffer: cache_core::disk::AlignedBuffer = {
-        let mut dio = disk_io.lock().unwrap();
+        let mut dio = disk_io.lock();
         let dio = dio.as_mut().unwrap();
         match dio.read_buffer_pool.allocate() {
             Some(buf) => buf,
@@ -504,7 +504,7 @@ async fn submit_and_await_disk_read<C: Cache>(
     // Extract what we need from disk_io under the lock, then drop the lock
     // before awaiting (the future spans a suspend point).
     let future = {
-        let dio = disk_io.lock().unwrap();
+        let dio = disk_io.lock();
         let dio = dio.as_ref().unwrap();
         match &dio.backend {
             DiskBackend::DirectIo { file, .. } => unsafe {
@@ -541,7 +541,6 @@ async fn submit_and_await_disk_read<C: Cache>(
         ($buf:expr) => {
             disk_io
                 .lock()
-                .unwrap()
                 .as_mut()
                 .unwrap()
                 .read_buffer_pool

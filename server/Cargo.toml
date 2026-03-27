@@ -36,6 +36,7 @@ ringline = { workspace = true }
 bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 itoa = { workspace = true }
+parking_lot = { workspace = true }
 
 libc = { workspace = true }
 
