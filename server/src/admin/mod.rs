@@ -49,6 +49,7 @@ pub struct AdminConfig {
 /// An `AdminHandle` that can be used to shut down the server.
 pub fn start(config: AdminConfig) -> std::io::Result<AdminHandle> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (bind_tx, bind_rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
     let address = config.address;
     let shutdown = config.shutdown;
     let cache_stats_fn = config.cache_stats_fn;
@@ -63,14 +64,22 @@ pub fn start(config: AdminConfig) -> std::io::Result<AdminHandle> {
                 .expect("Failed to create admin runtime");
 
             rt.block_on(async move {
-                run_admin_server(address, shutdown, cache_stats_fn, shutdown_rx).await;
+                run_admin_server(address, shutdown, cache_stats_fn, shutdown_rx, bind_tx).await;
             });
         })?;
 
-    Ok(AdminHandle {
-        shutdown_tx,
-        join_handle,
-    })
+    // Wait for the admin server to bind (or fail).
+    match bind_rx.recv() {
+        Ok(Ok(())) => Ok(AdminHandle {
+            shutdown_tx,
+            join_handle,
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "admin server thread exited before binding",
+        )),
+    }
 }
 
 /// Type alias for the cache stats function.
@@ -81,6 +90,7 @@ async fn run_admin_server(
     shutdown: Arc<AtomicBool>,
     cache_stats_fn: CacheStatsFn,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    bind_tx: std::sync::mpsc::SyncSender<std::io::Result<()>>,
 ) {
     let cache_stats_fn: Arc<CacheStatsFn> = Arc::new(cache_stats_fn);
 
@@ -106,11 +116,12 @@ async fn run_admin_server(
     let listener = match tokio::net::TcpListener::bind(address).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(error = %e, address = %address, "Failed to bind admin server");
+            let _ = bind_tx.send(Err(std::io::Error::new(e.kind(), e.to_string())));
             return;
         }
     };
 
+    let _ = bind_tx.send(Ok(()));
     tracing::info!(address = %address, "Admin server listening");
 
     // Serve with graceful shutdown
