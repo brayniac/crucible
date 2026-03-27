@@ -30,8 +30,13 @@ impl Credential {
         // Try to extract endpoint from token
         // Momento tokens are typically: header.payload.signature (JWT-like)
         // The payload contains the endpoint info
-        let endpoint = Self::extract_endpoint(&token)
-            .unwrap_or_else(|| "cache.cell-us-east-1-1.prod.a.momentohq.com".to_string());
+        let endpoint = Self::extract_endpoint(&token).unwrap_or_else(|| {
+            eprintln!(
+                "Warning: could not extract endpoint from Momento token, \
+                 falling back to us-east-1 default"
+            );
+            "cache.cell-us-east-1-1.prod.a.momentohq.com".to_string()
+        });
 
         Ok(Self {
             token,
