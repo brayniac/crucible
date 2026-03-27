@@ -250,16 +250,20 @@ mod server {
             }
         }
 
+        if let Some(handle) = diagnostics_handle {
+            let _ = handle.join();
+        }
+
         if stuck_count > 0 {
             warn!(
                 stuck_workers = stuck_count,
-                "Forcing exit due to stuck worker threads"
+                "Shutdown complete with stuck worker threads — they will be \
+                 cleaned up on process exit"
             );
-            std::process::exit(1);
-        }
-
-        if let Some(handle) = diagnostics_handle {
-            let _ = handle.join();
+            return Err(format!(
+                "{stuck_count} worker thread(s) did not stop within drain timeout"
+            )
+            .into());
         }
 
         info!("Async server shutdown complete");
