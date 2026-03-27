@@ -30,7 +30,7 @@ resp-proto = { workspace = true, features = ["resp3"] }
 memcache-proto = { workspace = true, features = ["full"] }
 
 # I/O driver (native runtime)
-ringline = { workspace = true, features = ["tls"] }
+ringline = { workspace = true }
 
 # Core utilities
 bytes = { workspace = true }
