@@ -38,8 +38,8 @@ impl S3FifoPolicy {
     /// - `small_percent`: Percentage of capacity for small queue (1-50, typically 10)
     /// - `demotion_threshold`: Frequency threshold for promotion (typically 1)
     pub fn new(total_capacity: u32, small_percent: u8, demotion_threshold: u8) -> Self {
-        let small_percent = small_percent.clamp(1, 50) as u32;
-        let small_capacity = (total_capacity * small_percent / 100).max(1);
+        let small_percent = small_percent.clamp(1, 50) as u64;
+        let small_capacity = (total_capacity as u64 * small_percent / 100).max(1) as u32;
         let main_capacity = total_capacity.saturating_sub(small_capacity).max(1);
 
         Self {
