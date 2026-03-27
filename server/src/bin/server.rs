@@ -167,7 +167,7 @@ fn create_segment(
         EvictionPolicy::Merge => {
             builder.eviction_policy(SegEvictionPolicy::Merge(MergeConfig::default()))
         }
-        _ => unreachable!("invalid policy for segment backend"),
+        other => return Err(format!("unsupported policy '{other:?}' for segment backend").into()),
     };
 
     if let Some(node) = config.numa_node() {
@@ -250,7 +250,7 @@ fn create_slab(
         EvictionPolicy::Lrc => EvictionStrategy::SLAB_LRC,
         EvictionPolicy::Random => EvictionStrategy::RANDOM,
         EvictionPolicy::None => EvictionStrategy::NONE,
-        _ => unreachable!("invalid policy for slab backend"),
+        other => return Err(format!("unsupported policy '{other:?}' for slab backend").into()),
     };
 
     let mut builder = SlabCache::builder()
@@ -296,7 +296,7 @@ fn create_heap(
         EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
         EvictionPolicy::Lfu => HeapEvictionPolicy::Lfu,
         EvictionPolicy::Random => HeapEvictionPolicy::Random,
-        _ => unreachable!("invalid policy for heap backend"),
+        other => return Err(format!("unsupported policy '{other:?}' for heap backend").into()),
     };
 
     let mut builder = HeapCache::builder()
