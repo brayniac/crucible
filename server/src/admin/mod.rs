@@ -75,8 +75,7 @@ pub fn start(config: AdminConfig) -> std::io::Result<AdminHandle> {
             join_handle,
         }),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(_) => Err(std::io::Error::other(
             "admin server thread exited before binding",
         )),
     }
