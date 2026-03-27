@@ -30,3 +30,22 @@ mod ttl_layer;
 pub use fifo_layer::{EvictResult, FifoLayer, FifoLayerBuilder};
 pub use traits::Layer;
 pub use ttl_layer::{TtlLayer, TtlLayerBuilder};
+
+use crate::segment::Segment;
+
+/// Wait for all readers to release a segment.
+///
+/// Spins briefly using `spin_loop` hints for low-latency cases, then
+/// falls back to `thread::yield_now()` to avoid starving other work
+/// on the core.
+pub(crate) fn wait_for_readers<S: Segment>(segment: &S) {
+    let mut spins = 0u32;
+    while segment.ref_count() > 0 {
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+        spins = spins.saturating_add(1);
+    }
+}
