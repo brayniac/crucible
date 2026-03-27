@@ -550,9 +550,10 @@ async fn submit_and_await_disk_read<C: Cache>(
     }
 
     // 3. Parse result and write response (same logic as native/handler.rs).
-    if result.is_err() {
+    if let Err(e) = &result {
         DISK_READ_ERRORS.increment();
         MISSES.increment();
+        tracing::warn!(segment_id, pool_id, "Disk read failed: {e}");
         connection.write_miss_response();
         release_read!(buffer);
         return Ok(());
