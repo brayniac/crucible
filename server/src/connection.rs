@@ -1738,13 +1738,44 @@ impl Connection {
     /// Advance the streaming receive position by `n` bytes (written via recv sink).
     pub fn advance_streaming_recv(&mut self, n: usize) {
         match &mut self.streaming_state {
-            StreamingState::ReceivingSegment { received, .. }
-            | StreamingState::ReceivingVec { received, .. }
-            | StreamingState::MemcacheAsciiSegment { received, .. }
-            | StreamingState::MemcacheAsciiVec { received, .. }
-            | StreamingState::MemcacheBinarySegment { received, .. }
-            | StreamingState::MemcacheBinaryVec { received, .. } => {
-                *received += n;
+            StreamingState::ReceivingSegment {
+                reservation,
+                received,
+                ..
+            } => {
+                debug_assert!(*received + n <= reservation.value_len());
+                *received = (*received + n).min(reservation.value_len());
+            }
+            StreamingState::ReceivingVec {
+                reservation,
+                received,
+                ..
+            }
+            | StreamingState::MemcacheAsciiVec {
+                reservation,
+                received,
+                ..
+            }
+            | StreamingState::MemcacheBinaryVec {
+                reservation,
+                received,
+                ..
+            } => {
+                debug_assert!(*received + n <= reservation.value_len());
+                *received = (*received + n).min(reservation.value_len());
+            }
+            StreamingState::MemcacheAsciiSegment {
+                reservation,
+                received,
+                ..
+            }
+            | StreamingState::MemcacheBinarySegment {
+                reservation,
+                received,
+                ..
+            } => {
+                debug_assert!(*received + n <= reservation.value_len());
+                *received = (*received + n).min(reservation.value_len());
             }
             StreamingState::None | StreamingState::Draining { .. } => {}
         }
