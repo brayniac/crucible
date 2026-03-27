@@ -249,7 +249,9 @@ impl FilePool {
 impl Drop for FilePool {
     fn drop(&mut self) {
         // Sync any remaining dirty data before dropping
-        let _ = self.sync();
+        if let Err(e) = self.sync() {
+            eprintln!("FilePool: failed to sync on drop, data may be lost: {e}");
+        }
         // Clear segments before dropping mmap
         self.segments.clear();
     }
