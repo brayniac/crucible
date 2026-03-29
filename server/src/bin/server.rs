@@ -67,7 +67,7 @@ fn run(
     let listeners: Vec<_> = config
         .listener
         .iter()
-        .map(|l| (l.protocol, l.address, l.tls.is_some()))
+        .filter_map(|l| Some((l.protocol, l.bind_target()?, l.tls.is_some())))
         .collect();
     let cpu_affinity = config.cpu_affinity();
     let cpu_affinity_slice = cpu_affinity.as_deref();
