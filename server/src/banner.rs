@@ -1,6 +1,6 @@
 //! Startup banner utilities.
 
-use crate::config::{CacheBackend, EvictionPolicy, Protocol, format_size};
+use crate::config::{BindTarget, CacheBackend, EvictionPolicy, Protocol, format_size};
 use std::fmt::Write;
 use std::net::SocketAddr;
 
@@ -18,8 +18,8 @@ pub struct BannerConfig<'a> {
     pub small_queue_percent: u8,
     /// Number of worker threads
     pub workers: usize,
-    /// Protocol listeners (protocol, address, tls_enabled)
-    pub listeners: &'a [(Protocol, SocketAddr, bool)],
+    /// Protocol listeners (protocol, bind_target, tls_enabled)
+    pub listeners: &'a [(Protocol, BindTarget, bool)],
     /// Metrics address
     pub metrics_address: SocketAddr,
     /// Cache heap size in bytes

@@ -392,16 +392,50 @@ pub struct ListenerConfig {
     /// Protocol to serve
     pub protocol: Protocol,
 
-    /// Address to listen on
-    pub address: SocketAddr,
+    /// TCP address to listen on (e.g. "127.0.0.1:6379").
+    /// Mutually exclusive with `unix_socket`.
+    pub address: Option<SocketAddr>,
 
-    /// TLS configuration (optional)
+    /// Unix domain socket path (e.g. "/var/run/crucible.sock").
+    /// Mutually exclusive with `address`.
+    pub unix_socket: Option<String>,
+
+    /// TLS configuration (optional, TCP only)
     pub tls: Option<TlsConfig>,
 
     /// Allow FLUSH commands (flush_all for memcache, FLUSHDB/FLUSHALL for RESP).
     /// Default: false (flush commands return error)
     #[serde(default)]
     pub allow_flush: bool,
+}
+
+/// The resolved bind target for a listener.
+#[derive(Debug, Clone)]
+pub enum BindTarget {
+    /// TCP socket address.
+    Tcp(SocketAddr),
+    /// Unix domain socket path.
+    Unix(String),
+}
+
+impl std::fmt::Display for BindTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BindTarget::Tcp(addr) => write!(f, "{addr}"),
+            BindTarget::Unix(path) => write!(f, "unix:{path}"),
+        }
+    }
+}
+
+impl ListenerConfig {
+    /// Returns the resolved bind target.
+    pub fn bind_target(&self) -> Option<BindTarget> {
+        match (&self.address, &self.unix_socket) {
+            (Some(addr), None) => Some(BindTarget::Tcp(*addr)),
+            (None, Some(path)) => Some(BindTarget::Unix(path.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// Supported protocols.
@@ -830,6 +864,25 @@ impl Config {
             );
         }
 
+        // Validate listener bind target
+        let listener = &self.listener[0];
+        match (&listener.address, &listener.unix_socket) {
+            (None, None) => {
+                return Err(
+                    "listener must have either 'address' or 'unix_socket' configured".into(),
+                );
+            }
+            (Some(_), Some(_)) => {
+                return Err(
+                    "listener cannot have both 'address' and 'unix_socket' configured".into(),
+                );
+            }
+            (None, Some(_)) if listener.tls.is_some() => {
+                return Err("TLS is not supported with Unix domain sockets".into());
+            }
+            _ => {}
+        }
+
         // Validate NVMe disk config fields
         if let Some(ref disk) = self.cache.disk
             && disk.enabled
@@ -994,7 +1047,8 @@ mod tests {
             cache: CacheConfig::default(),
             listener: vec![ListenerConfig {
                 protocol: Protocol::Resp,
-                address: "127.0.0.1:6379".parse().unwrap(),
+                address: Some("127.0.0.1:6379".parse().unwrap()),
+                unix_socket: None,
                 tls: None,
                 allow_flush: false,
             }],
@@ -1024,12 +1078,51 @@ mod tests {
         let mut config = minimal_config();
         config.listener.push(ListenerConfig {
             protocol: Protocol::Memcache,
-            address: "127.0.0.1:11211".parse().unwrap(),
+            address: Some("127.0.0.1:11211".parse().unwrap()),
+            unix_socket: None,
             tls: None,
             allow_flush: false,
         });
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("multiple listeners"));
+    }
+
+    #[test]
+    fn test_validate_unix_socket_listener() {
+        let mut config = minimal_config();
+        config.listener[0].address = None;
+        config.listener[0].unix_socket = Some("/tmp/crucible.sock".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_listener_missing_both() {
+        let mut config = minimal_config();
+        config.listener[0].address = None;
+        config.listener[0].unix_socket = None;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("address"));
+    }
+
+    #[test]
+    fn test_validate_listener_both_set() {
+        let mut config = minimal_config();
+        config.listener[0].unix_socket = Some("/tmp/crucible.sock".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("both"));
+    }
+
+    #[test]
+    fn test_validate_unix_socket_no_tls() {
+        let mut config = minimal_config();
+        config.listener[0].address = None;
+        config.listener[0].unix_socket = Some("/tmp/crucible.sock".to_string());
+        config.listener[0].tls = Some(TlsConfig {
+            cert: "cert.pem".to_string(),
+            key: "key.pem".to_string(),
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("TLS"));
     }
 
     #[test]

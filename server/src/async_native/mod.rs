@@ -165,7 +165,9 @@ mod server {
             krio_config
         };
 
-        let bind_addr = config.listener[0].address;
+        let bind_target = config.listener[0]
+            .bind_target()
+            .ok_or("listener must have 'address' or 'unix_socket'")?;
 
         let _launch_guard = launch_lock();
 
@@ -191,9 +193,13 @@ mod server {
         }
         init_config_channel(config_rx, num_workers);
 
-        let (shutdown_handle, handles) = RinglineBuilder::new(krio_config)
-            .bind(bind_addr)
-            .launch::<AsyncServerHandler<C>>()?;
+        use crate::config::BindTarget;
+        let mut builder = RinglineBuilder::new(krio_config);
+        builder = match &bind_target {
+            BindTarget::Tcp(addr) => builder.bind(*addr),
+            BindTarget::Unix(path) => builder.bind_unix(path),
+        };
+        let (shutdown_handle, handles) = builder.launch::<AsyncServerHandler<C>>()?;
 
         wait_for_workers();
         drop(_launch_guard);
