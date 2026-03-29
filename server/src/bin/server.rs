@@ -11,7 +11,7 @@ use clap::Parser;
 use server::admin::{self, AdminConfig};
 use server::banner::{BannerConfig, print_banner};
 use server::config::{CacheBackend, Config, DiskIoBackendConfig, EvictionPolicy, HugepageConfig};
-use server::{logging, signal};
+use server::logging;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -52,7 +52,7 @@ fn main() {
 
     logging::init(&config.logging);
 
-    let shutdown = signal::install_signal_handler();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if let Err(e) = run(config, shutdown) {
         tracing::error!(error = %e, "Server error");

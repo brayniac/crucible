@@ -212,11 +212,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind(listen)
         .launch::<PingHandler>()?;
 
-    // Wait for Ctrl+C
-    ctrlc::set_handler(move || {
-        shutdown_handle.shutdown();
-    })
-    .expect("error setting Ctrl-C handler");
+    // Block until SIGINT/SIGTERM, then shut down gracefully.
+    shutdown_handle.wait_on_signal();
 
     for handle in handles {
         let _ = handle.join();

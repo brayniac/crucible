@@ -52,9 +52,6 @@ clap = { workspace = true, features = ["derive"] }
 metrics = { workspace = true }
 metriken = { workspace = true }
 
-# Signal handling
-ctrlc = { version = "3", features = ["termination"] }
-
 # Structured logging
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

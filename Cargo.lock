@@ -499,6 +499,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
+
+[[package]]
 name = "futures-task"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1403,10 +1409,11 @@ dependencies = [
 [[package]]
 name = "ringline"
 version = "0.0.3-alpha.0"
-source = "git+https://github.com/ringline-rs/ringline.git?rev=771d2bb#771d2bb04f0b08ab8e98866a006a4b7e4cb552e1"
+source = "git+https://github.com/ringline-rs/ringline.git?rev=fa5cca9#fa5cca918800de925ac324e1c109686fd2a35c1c"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "futures-io",
  "io-uring",
  "libc",
  "metriken 0.7.0",
@@ -1418,7 +1425,7 @@ dependencies = [
 [[package]]
 name = "ringline-redis"
 version = "0.1.1"
-source = "git+https://github.com/ringline-rs/ringline.git?rev=771d2bb#771d2bb04f0b08ab8e98866a006a4b7e4cb552e1"
+source = "git+https://github.com/ringline-rs/ringline.git?rev=fa5cca9#fa5cca918800de925ac324e1c109686fd2a35c1c"
 dependencies = [
  "bytes",
  "histogram 0.11.4",
@@ -1642,7 +1649,6 @@ dependencies = [
  "cache-core",
  "clap",
  "crossbeam-channel",
- "ctrlc",
  "heap-cache",
  "itoa",
  "libc",

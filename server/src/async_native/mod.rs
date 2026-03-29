@@ -198,7 +198,20 @@ mod server {
         wait_for_workers();
         drop(_launch_guard);
 
-        // Wait for shutdown signal
+        // Wait for shutdown: either an OS signal (SIGINT/SIGTERM) or the
+        // programmatic shutdown flag (used by tests).
+        {
+            let shutdown_for_signal = shutdown.clone();
+            std::thread::Builder::new()
+                .name("signal".to_string())
+                .spawn(move || {
+                    let signal = ringline::signal::wait();
+                    info!(%signal, "Received signal, initiating shutdown...");
+                    shutdown_for_signal.store(true, Ordering::SeqCst);
+                })
+                .expect("failed to spawn signal thread");
+        }
+
         while !shutdown.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
         }
