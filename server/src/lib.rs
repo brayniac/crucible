@@ -13,7 +13,6 @@ pub mod disk_io;
 pub mod execute;
 pub mod logging;
 pub mod metrics;
-pub mod signal;
 pub mod tls;
 
 pub use config::{CacheBackend, Config, Protocol};
