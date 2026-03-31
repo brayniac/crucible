@@ -188,6 +188,9 @@ pub fn execute_resp<C: Cache>(
                         // Cache is best-effort storage — the item would be
                         // evicted soon anyway. This matches Redis behavior with
                         // eviction enabled.
+                        if e.is_corruption() {
+                            tracing::warn!(error = %e, "SET failed with corruption error");
+                        }
                         write_buf.extend_from_slice(b"+OK\r\n");
                     }
                 }
