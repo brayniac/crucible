@@ -1360,7 +1360,8 @@ impl Connection {
                     }
                 }
                 Ok(BinaryParseProgress::Incomplete) => break,
-                Err(_) => {
+                Err(e) => {
+                    tracing::warn!(error = %e, "binary memcache parse error");
                     PROTOCOL_ERRORS.increment();
                     self.should_close = true;
                     let len = buf.len();
