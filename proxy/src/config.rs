@@ -43,7 +43,60 @@ impl Config {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-        toml::from_str(&content).map_err(ConfigError::Parse)
+        let config: Self = toml::from_str(&content).map_err(ConfigError::Parse)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate configuration values.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Backend validation
+        if self.backend.nodes.is_empty() {
+            return Err(ConfigError::Validation(
+                "backend.nodes must contain at least one address".into(),
+            ));
+        }
+        if self.backend.pool_size == 0 {
+            return Err(ConfigError::Validation(
+                "backend.pool_size must be > 0".into(),
+            ));
+        }
+        if self.backend.connect_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "backend.connect_timeout_ms must be > 0".into(),
+            ));
+        }
+
+        // Cache validation (only when enabled)
+        if self.cache.enabled {
+            if self.cache.heap_size == 0 {
+                return Err(ConfigError::Validation(
+                    "cache.heap_size must be > 0 when cache is enabled".into(),
+                ));
+            }
+            if self.cache.segment_size == 0 {
+                return Err(ConfigError::Validation(
+                    "cache.segment_size must be > 0 when cache is enabled".into(),
+                ));
+            }
+            if self.cache.segment_size > self.cache.heap_size {
+                return Err(ConfigError::Validation(
+                    "cache.segment_size must be <= cache.heap_size".into(),
+                ));
+            }
+            if self.cache.hashtable_power == 0 {
+                return Err(ConfigError::Validation(
+                    "cache.hashtable_power must be > 0 when cache is enabled".into(),
+                ));
+            }
+            if self.cache.ttl_ms == 0 {
+                return Err(ConfigError::Validation(
+                    "cache.ttl_ms must be > 0 when cache is enabled".into(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Get the number of worker threads.
@@ -342,6 +395,7 @@ impl ShutdownConfig {
 pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
+    Validation(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -349,6 +403,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "IO error: {}", e),
             ConfigError::Parse(e) => write!(f, "Parse error: {}", e),
+            ConfigError::Validation(msg) => write!(f, "Validation error: {}", msg),
         }
     }
 }
