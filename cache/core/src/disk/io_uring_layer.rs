@@ -439,7 +439,7 @@ impl IoUringDiskLayer {
         segment.attach_write_buffer(buf);
 
         // Set segment expiration time
-        let expire_at = Self::now_secs() + ttl.as_secs() as u32;
+        let expire_at = Self::now_secs().saturating_add(ttl.as_secs() as u32);
         segment.set_expire_at(expire_at);
 
         // Add to bucket
