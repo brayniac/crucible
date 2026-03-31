@@ -715,7 +715,8 @@ impl Connection {
                 // Extract reservation and commit
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::ReceivingSegment { reservation, .. } = state {
-                    if let Err(_e) = cache.commit_segment_set(reservation) {
+                    if let Err(e) = cache.commit_segment_set(reservation) {
+                        tracing::warn!(error = %e, "commit_segment_set failed");
                         self.write_buf
                             .extend_from_slice(b"-ERR Failed to store value\r\n");
                     } else {
@@ -766,7 +767,8 @@ impl Connection {
                 // Extract reservation and commit (Vec-based uses commit_set)
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::ReceivingVec { reservation, .. } = state {
-                    if let Err(_e) = cache.commit_set(reservation) {
+                    if let Err(e) = cache.commit_set(reservation) {
+                        tracing::warn!(error = %e, "commit_set failed");
                         self.write_buf
                             .extend_from_slice(b"-ERR Failed to store value\r\n");
                     } else {
@@ -1034,12 +1036,18 @@ impl Connection {
                 let noreply_val = *noreply;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheAsciiSegment { reservation, .. } = state {
-                    if cache.commit_segment_set(reservation).is_ok() {
-                        if !noreply_val {
-                            self.write_buf.extend_from_slice(b"STORED\r\n");
+                    match cache.commit_segment_set(reservation) {
+                        Ok(()) => {
+                            if !noreply_val {
+                                self.write_buf.extend_from_slice(b"STORED\r\n");
+                            }
                         }
-                    } else if !noreply_val {
-                        self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                        Err(e) => {
+                            tracing::warn!(error = %e, "commit_segment_set failed");
+                            if !noreply_val {
+                                self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                            }
+                        }
                     }
                 }
 
@@ -1084,12 +1092,18 @@ impl Connection {
                 let noreply_val = *noreply;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheAsciiVec { reservation, .. } = state {
-                    if cache.commit_set(reservation).is_ok() {
-                        if !noreply_val {
-                            self.write_buf.extend_from_slice(b"STORED\r\n");
+                    match cache.commit_set(reservation) {
+                        Ok(()) => {
+                            if !noreply_val {
+                                self.write_buf.extend_from_slice(b"STORED\r\n");
+                            }
                         }
-                    } else if !noreply_val {
-                        self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                        Err(e) => {
+                            tracing::warn!(error = %e, "commit_set failed");
+                            if !noreply_val {
+                                self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
+                            }
+                        }
                     }
                 }
 
@@ -1409,45 +1423,51 @@ impl Connection {
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheBinarySegment { reservation, .. } = state {
                     use memcache_proto::binary::BinaryResponse;
-                    if cache.commit_segment_set(reservation).is_ok() {
-                        if !opcode_val.is_quiet() {
-                            let response_len = BinaryResponse::encode_stored(
-                                &mut [0u8; 32],
-                                opcode_val,
-                                opaque_val,
-                                0,
-                            );
-                            let start = self.write_buf.len();
-                            self.write_buf.reserve(response_len);
-                            unsafe {
-                                self.write_buf.set_len(start + response_len);
+                    match cache.commit_segment_set(reservation) {
+                        Ok(()) => {
+                            if !opcode_val.is_quiet() {
+                                let response_len = BinaryResponse::encode_stored(
+                                    &mut [0u8; 32],
+                                    opcode_val,
+                                    opaque_val,
+                                    0,
+                                );
+                                let start = self.write_buf.len();
+                                self.write_buf.reserve(response_len);
+                                unsafe {
+                                    self.write_buf.set_len(start + response_len);
+                                }
+                                BinaryResponse::encode_stored(
+                                    &mut self.write_buf[start..],
+                                    opcode_val,
+                                    opaque_val,
+                                    0,
+                                );
                             }
-                            BinaryResponse::encode_stored(
-                                &mut self.write_buf[start..],
-                                opcode_val,
-                                opaque_val,
-                                0,
-                            );
                         }
-                    } else if !opcode_val.is_quiet() {
-                        use memcache_proto::binary::Status;
-                        let response_len = BinaryResponse::encode_error(
-                            &mut [0u8; 32],
-                            opcode_val,
-                            opaque_val,
-                            Status::ItemNotStored,
-                        );
-                        let start = self.write_buf.len();
-                        self.write_buf.reserve(response_len);
-                        unsafe {
-                            self.write_buf.set_len(start + response_len);
+                        Err(e) => {
+                            tracing::warn!(error = %e, "commit_segment_set failed");
+                            if !opcode_val.is_quiet() {
+                                use memcache_proto::binary::Status;
+                                let response_len = BinaryResponse::encode_error(
+                                    &mut [0u8; 32],
+                                    opcode_val,
+                                    opaque_val,
+                                    Status::ItemNotStored,
+                                );
+                                let start = self.write_buf.len();
+                                self.write_buf.reserve(response_len);
+                                unsafe {
+                                    self.write_buf.set_len(start + response_len);
+                                }
+                                BinaryResponse::encode_error(
+                                    &mut self.write_buf[start..],
+                                    opcode_val,
+                                    opaque_val,
+                                    Status::ItemNotStored,
+                                );
+                            }
                         }
-                        BinaryResponse::encode_error(
-                            &mut self.write_buf[start..],
-                            opcode_val,
-                            opaque_val,
-                            Status::ItemNotStored,
-                        );
                     }
                 }
 
@@ -1480,45 +1500,51 @@ impl Connection {
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheBinaryVec { reservation, .. } = state {
                     use memcache_proto::binary::BinaryResponse;
-                    if cache.commit_set(reservation).is_ok() {
-                        if !opcode_val.is_quiet() {
-                            let response_len = BinaryResponse::encode_stored(
-                                &mut [0u8; 32],
-                                opcode_val,
-                                opaque_val,
-                                0,
-                            );
-                            let start = self.write_buf.len();
-                            self.write_buf.reserve(response_len);
-                            unsafe {
-                                self.write_buf.set_len(start + response_len);
+                    match cache.commit_set(reservation) {
+                        Ok(()) => {
+                            if !opcode_val.is_quiet() {
+                                let response_len = BinaryResponse::encode_stored(
+                                    &mut [0u8; 32],
+                                    opcode_val,
+                                    opaque_val,
+                                    0,
+                                );
+                                let start = self.write_buf.len();
+                                self.write_buf.reserve(response_len);
+                                unsafe {
+                                    self.write_buf.set_len(start + response_len);
+                                }
+                                BinaryResponse::encode_stored(
+                                    &mut self.write_buf[start..],
+                                    opcode_val,
+                                    opaque_val,
+                                    0,
+                                );
                             }
-                            BinaryResponse::encode_stored(
-                                &mut self.write_buf[start..],
-                                opcode_val,
-                                opaque_val,
-                                0,
-                            );
                         }
-                    } else if !opcode_val.is_quiet() {
-                        use memcache_proto::binary::Status;
-                        let response_len = BinaryResponse::encode_error(
-                            &mut [0u8; 32],
-                            opcode_val,
-                            opaque_val,
-                            Status::ItemNotStored,
-                        );
-                        let start = self.write_buf.len();
-                        self.write_buf.reserve(response_len);
-                        unsafe {
-                            self.write_buf.set_len(start + response_len);
+                        Err(e) => {
+                            tracing::warn!(error = %e, "commit_set failed");
+                            if !opcode_val.is_quiet() {
+                                use memcache_proto::binary::Status;
+                                let response_len = BinaryResponse::encode_error(
+                                    &mut [0u8; 32],
+                                    opcode_val,
+                                    opaque_val,
+                                    Status::ItemNotStored,
+                                );
+                                let start = self.write_buf.len();
+                                self.write_buf.reserve(response_len);
+                                unsafe {
+                                    self.write_buf.set_len(start + response_len);
+                                }
+                                BinaryResponse::encode_error(
+                                    &mut self.write_buf[start..],
+                                    opcode_val,
+                                    opaque_val,
+                                    Status::ItemNotStored,
+                                );
+                            }
                         }
-                        BinaryResponse::encode_error(
-                            &mut self.write_buf[start..],
-                            opcode_val,
-                            opaque_val,
-                            Status::ItemNotStored,
-                        );
                     }
                 }
 
