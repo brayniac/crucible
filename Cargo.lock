@@ -207,6 +207,7 @@ dependencies = [
  "parking_lot",
  "rand 0.9.2",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1216,6 +1217,7 @@ dependencies = [
  "grpc-proto",
  "http2-proto",
  "serial_test",
+ "tracing",
 ]
 
 [[package]]
@@ -1234,7 +1236,6 @@ dependencies = [
  "bytes",
  "clap",
  "crossbeam-channel",
- "ctrlc",
  "ketama",
  "libc",
  "metrics",
