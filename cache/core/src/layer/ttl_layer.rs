@@ -105,7 +105,7 @@ impl TtlLayer {
         let segment = self.pool.get(segment_id).ok_or(CacheError::OutOfMemory)?;
 
         // Set segment expiration time
-        let expire_at = Self::now_secs() + ttl.as_secs() as u32;
+        let expire_at = Self::now_secs().saturating_add(ttl.as_secs() as u32);
         segment.set_expire_at(expire_at);
 
         // Track which bucket this segment belongs to
