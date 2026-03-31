@@ -9,7 +9,7 @@ mod metrics;
 mod ratelimit;
 mod worker;
 
-use crate::config::{CacheBackend, Config, DiskSyncMode, EvictionPolicy};
+use crate::config::{CacheBackend, Config, EvictionPolicy};
 use crate::ratelimit::DynamicRateLimiter;
 use crate::worker::{Phase, SharedState};
 
@@ -396,9 +396,7 @@ fn print_latency_summary(label: &str, hist: &AtomicHistogram) {
 // --- Cache constructors ---
 
 fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
-    use segcache::{
-        DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache, SyncMode,
-    };
+    use segcache::{DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache};
 
     let mut builder = SegCache::builder()
         .heap_size(config.cache.heap_size)
@@ -419,14 +417,9 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let sync_mode = match disk_config.sync_mode {
-            DiskSyncMode::Sync => SyncMode::Sync,
-            DiskSyncMode::Async => SyncMode::Async,
-            DiskSyncMode::None => SyncMode::None,
-        };
         let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
             .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(sync_mode)
+            .sync_mode(disk_config.sync_mode.into())
             .recover_on_startup(disk_config.recover_on_startup);
         builder = builder.disk_tier(disk_tier);
     }
@@ -436,7 +429,7 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
 }
 
 fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
-    use slab_cache::{DiskTierConfig, EvictionStrategy, SlabCache, SyncMode};
+    use slab_cache::{DiskTierConfig, EvictionStrategy, SlabCache};
 
     let eviction_strategy = match config.cache.policy {
         EvictionPolicy::Lra => EvictionStrategy::SLAB_LRA,
@@ -455,14 +448,9 @@ fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let sync_mode = match disk_config.sync_mode {
-            DiskSyncMode::Sync => SyncMode::Sync,
-            DiskSyncMode::Async => SyncMode::Async,
-            DiskSyncMode::None => SyncMode::None,
-        };
         let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
             .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(sync_mode)
+            .sync_mode(disk_config.sync_mode.into())
             .recover_on_startup(disk_config.recover_on_startup);
         builder = builder.disk_tier(disk_tier);
     }
@@ -473,7 +461,7 @@ fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
 }
 
 fn create_heap(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
-    use heap_cache::{DiskTierConfig, EvictionPolicy as HeapEvictionPolicy, HeapCache, SyncMode};
+    use heap_cache::{DiskTierConfig, EvictionPolicy as HeapEvictionPolicy, HeapCache};
 
     let heap_policy = match config.cache.policy {
         EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
@@ -490,14 +478,9 @@ fn create_heap(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let sync_mode = match disk_config.sync_mode {
-            DiskSyncMode::Sync => SyncMode::Sync,
-            DiskSyncMode::Async => SyncMode::Async,
-            DiskSyncMode::None => SyncMode::None,
-        };
         let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
             .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(sync_mode)
+            .sync_mode(disk_config.sync_mode.into())
             .recover_on_startup(disk_config.recover_on_startup);
         builder = builder.disk_tier(disk_tier);
     }

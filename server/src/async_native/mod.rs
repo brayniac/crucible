@@ -320,8 +320,15 @@ mod server {
                 let mut report = format!(
                     "\n=== Worker Stats (last {}s) ===\n{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
                     report_interval.as_secs(),
-                    "worker", "polls", "accepts", "closes", "recv",
-                    "send_rdy", "bytes_in", "bytes_out", "conns"
+                    "worker",
+                    "polls",
+                    "accepts",
+                    "closes",
+                    "recv",
+                    "send_rdy",
+                    "bytes_in",
+                    "bytes_out",
+                    "conns"
                 );
 
                 for (i, (curr, prev)) in current.iter().zip(prev_snapshots.iter()).enumerate() {
@@ -338,14 +345,16 @@ mod server {
                         format_bytes(delta.bytes_received),
                         format_bytes(delta.bytes_sent),
                         curr.active_connections,
-                    ).unwrap();
+                    )
+                    .unwrap();
 
                     if delta.backpressure_events > 0 {
                         write!(
                             &mut report,
                             "\n  ^ Worker {} hit backpressure {} times",
                             i, delta.backpressure_events
-                        ).unwrap();
+                        )
+                        .unwrap();
                     }
                 }
                 info!("{report}");

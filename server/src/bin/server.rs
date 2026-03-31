@@ -10,7 +10,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::Parser;
 use server::admin::{self, AdminConfig};
 use server::banner::{BannerConfig, print_banner};
-use server::config::{CacheBackend, Config, DiskIoBackendConfig, EvictionPolicy, HugepageConfig};
+use server::config::{CacheBackend, Config, DiskIoBackendConfig, EvictionPolicy};
 use server::logging;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -140,15 +140,11 @@ fn create_segment(
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
     use segcache::{
         DiskTierConfig, EvictionPolicy as SegEvictionPolicy, HugepageSize, IoUringDiskTierConfig,
-        MergeConfig, SegCache, SyncMode,
+        MergeConfig, SegCache,
     };
     use server::config::format_size;
 
-    let hugepage_size = match config.cache.hugepage {
-        HugepageConfig::None => HugepageSize::None,
-        HugepageConfig::TwoMegabyte => HugepageSize::TwoMegabyte,
-        HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
-    };
+    let hugepage_size: HugepageSize = config.cache.hugepage.into();
 
     let mut builder = SegCache::builder()
         .heap_size(config.cache.heap_size)
@@ -205,15 +201,9 @@ fn create_segment(
                 builder = builder.io_uring_disk_tier(io_uring_tier);
             }
             DiskIoBackendConfig::Mmap => {
-                let sync_mode = match disk_config.sync_mode {
-                    server::config::DiskSyncMode::Sync => SyncMode::Sync,
-                    server::config::DiskSyncMode::Async => SyncMode::Async,
-                    server::config::DiskSyncMode::None => SyncMode::None,
-                };
-
                 let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
                     .promotion_threshold(disk_config.promotion_threshold)
-                    .sync_mode(sync_mode)
+                    .sync_mode(disk_config.sync_mode.into())
                     .recover_on_startup(disk_config.recover_on_startup);
 
                 eprintln!(
@@ -237,13 +227,9 @@ fn create_slab(
     config: &Config,
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use slab_cache::{DiskTierConfig, EvictionStrategy, HugepageSize, SlabCache, SyncMode};
+    use slab_cache::{DiskTierConfig, EvictionStrategy, HugepageSize, SlabCache};
 
-    let hugepage_size = match config.cache.hugepage {
-        HugepageConfig::None => HugepageSize::None,
-        HugepageConfig::TwoMegabyte => HugepageSize::TwoMegabyte,
-        HugepageConfig::OneGigabyte => HugepageSize::OneGigabyte,
-    };
+    let hugepage_size: HugepageSize = config.cache.hugepage.into();
 
     let eviction_strategy = match policy {
         EvictionPolicy::Lra => EvictionStrategy::SLAB_LRA,
@@ -267,15 +253,9 @@ fn create_slab(
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let sync_mode = match disk_config.sync_mode {
-            server::config::DiskSyncMode::Sync => SyncMode::Sync,
-            server::config::DiskSyncMode::Async => SyncMode::Async,
-            server::config::DiskSyncMode::None => SyncMode::None,
-        };
-
         let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
             .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(sync_mode)
+            .sync_mode(disk_config.sync_mode.into())
             .recover_on_startup(disk_config.recover_on_startup);
 
         builder = builder.disk_tier(disk_tier);
@@ -290,7 +270,7 @@ fn create_heap(
     config: &Config,
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use heap_cache::{DiskTierConfig, EvictionPolicy as HeapEvictionPolicy, HeapCache, SyncMode};
+    use heap_cache::{DiskTierConfig, EvictionPolicy as HeapEvictionPolicy, HeapCache};
 
     let heap_policy = match policy {
         EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
@@ -308,15 +288,9 @@ fn create_heap(
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let sync_mode = match disk_config.sync_mode {
-            server::config::DiskSyncMode::Sync => SyncMode::Sync,
-            server::config::DiskSyncMode::Async => SyncMode::Async,
-            server::config::DiskSyncMode::None => SyncMode::None,
-        };
-
         let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
             .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(sync_mode)
+            .sync_mode(disk_config.sync_mode.into())
             .recover_on_startup(disk_config.recover_on_startup);
 
         builder = builder.disk_tier(disk_tier);

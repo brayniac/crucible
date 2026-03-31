@@ -130,6 +130,16 @@ pub enum DiskSyncMode {
     None,
 }
 
+impl From<DiskSyncMode> for cache_core::SyncMode {
+    fn from(mode: DiskSyncMode) -> Self {
+        match mode {
+            DiskSyncMode::Sync => Self::Sync,
+            DiskSyncMode::Async => Self::Async,
+            DiskSyncMode::None => Self::None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct DiskConfig {
     #[serde(default)]
