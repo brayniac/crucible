@@ -79,7 +79,11 @@ mod server {
 
         // Pre-create disk file before ringline launch (workers need it for O_DIRECT open)
         if disk_io_backend == Some(DiskIoBackendConfig::DirectIo) {
-            let disk_config = config.cache.disk.as_ref().unwrap();
+            let disk_config = config
+                .cache
+                .disk
+                .as_ref()
+                .expect("disk config must be present when io_backend is DirectIo");
             if let Err(e) = ensure_disk_file(&disk_config.path, disk_config.size) {
                 return Err(format!("Failed to create disk file: {e}").into());
             }
@@ -126,7 +130,11 @@ mod server {
         // Build disk I/O worker config
         let disk_io_worker_config: Option<DiskIoWorkerConfig> = match disk_io_backend {
             Some(DiskIoBackendConfig::DirectIo) => {
-                let disk_config = config.cache.disk.as_ref().unwrap();
+                let disk_config = config
+                    .cache
+                    .disk
+                    .as_ref()
+                    .expect("disk config must be present when io_backend is DirectIo");
                 Some(DiskIoWorkerConfig {
                     backend: cache_core::DiskIoBackend::DirectIo,
                     path: disk_config.path.to_string_lossy().into_owned(),
@@ -136,7 +144,11 @@ mod server {
                 })
             }
             Some(DiskIoBackendConfig::Nvme) => {
-                let disk_config = config.cache.disk.as_ref().unwrap();
+                let disk_config = config
+                    .cache
+                    .disk
+                    .as_ref()
+                    .expect("disk config must be present when io_backend is Nvme");
                 let device_path = disk_config
                     .nvme_device
                     .clone()

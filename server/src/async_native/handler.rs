@@ -395,7 +395,10 @@ async fn handle_connection<C: Cache>(
         if connection.pending_disk_read.is_some() {
             let has_disk_io = disk_io.lock().is_some();
             if has_disk_io {
-                let pending_info = connection.pending_disk_read.take().unwrap();
+                let pending_info = connection
+                    .pending_disk_read
+                    .take()
+                    .expect("pending_disk_read must be Some (guarded by is_some check)");
                 match submit_and_await_disk_read(
                     &disk_io,
                     &*cache,
@@ -487,7 +490,9 @@ async fn submit_and_await_disk_read<C: Cache>(
     // 1. Allocate aligned read buffer.
     let mut buffer: cache_core::disk::AlignedBuffer = {
         let mut dio = disk_io.lock();
-        let dio = dio.as_mut().unwrap();
+        let dio = dio
+            .as_mut()
+            .expect("disk_io must be Some when submit_and_await_disk_read is called");
         match dio.read_buffer_pool.allocate() {
             Some(buf) => buf,
             None => {
@@ -505,7 +510,9 @@ async fn submit_and_await_disk_read<C: Cache>(
     // before awaiting (the future spans a suspend point).
     let future = {
         let dio = disk_io.lock();
-        let dio = dio.as_ref().unwrap();
+        let dio = dio
+            .as_ref()
+            .expect("disk_io must be Some when submit_and_await_disk_read is called");
         match &dio.backend {
             DiskBackend::DirectIo { file, .. } => unsafe {
                 ringline::direct_io_read(
@@ -542,7 +549,7 @@ async fn submit_and_await_disk_read<C: Cache>(
             disk_io
                 .lock()
                 .as_mut()
-                .unwrap()
+                .expect("disk_io must be Some during read cleanup")
                 .read_buffer_pool
                 .release($buf);
             cache.release_disk_read(segment_id, pool_id);
