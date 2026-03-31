@@ -39,25 +39,27 @@ pub enum CacheLayer {
     IoUringDisk(IoUringDiskLayer),
 }
 
+/// Dispatches a method call to the inner layer for all CacheLayer variants.
+macro_rules! dispatch {
+    ($self:expr, $method:ident ( $($arg:expr),* $(,)? )) => {
+        match $self {
+            CacheLayer::Fifo(layer) => layer.$method($($arg),*),
+            CacheLayer::Ttl(layer) => layer.$method($($arg),*),
+            CacheLayer::Disk(layer) => layer.$method($($arg),*),
+            CacheLayer::IoUringDisk(layer) => layer.$method($($arg),*),
+        }
+    };
+}
+
 impl CacheLayer {
     /// Get the layer's configuration.
     pub fn config(&self) -> &LayerConfig {
-        match self {
-            CacheLayer::Fifo(layer) => layer.config(),
-            CacheLayer::Ttl(layer) => layer.config(),
-            CacheLayer::Disk(layer) => layer.config(),
-            CacheLayer::IoUringDisk(layer) => layer.config(),
-        }
+        dispatch!(self, config())
     }
 
     /// Get the layer ID.
     pub fn layer_id(&self) -> u8 {
-        match self {
-            CacheLayer::Fifo(layer) => layer.layer_id(),
-            CacheLayer::Ttl(layer) => layer.layer_id(),
-            CacheLayer::Disk(layer) => layer.layer_id(),
-            CacheLayer::IoUringDisk(layer) => layer.layer_id(),
-        }
+        dispatch!(self, layer_id())
     }
 
     /// Write an item to this layer.
@@ -68,12 +70,7 @@ impl CacheLayer {
         optional: &[u8],
         ttl: Duration,
     ) -> CacheResult<ItemLocation> {
-        match self {
-            CacheLayer::Fifo(layer) => layer.write_item(key, value, optional, ttl),
-            CacheLayer::Ttl(layer) => layer.write_item(key, value, optional, ttl),
-            CacheLayer::Disk(layer) => layer.write_item(key, value, optional, ttl),
-            CacheLayer::IoUringDisk(layer) => layer.write_item(key, value, optional, ttl),
-        }
+        dispatch!(self, write_item(key, value, optional, ttl))
     }
 
     /// Get an item from this layer and call the provided function with it.
@@ -113,40 +110,25 @@ impl CacheLayer {
         location: ItemLocation,
         key: &[u8],
     ) -> Option<crate::slice_segment::ValueRefRaw> {
+        // Helper: shared logic for layers backed by SliceSegment pools.
+        macro_rules! value_ref_from_pool {
+            ($layer:expr) => {{
+                let pool = $layer.pool();
+                if location.pool_id() != pool.pool_id() {
+                    return None;
+                }
+                let segment = pool.get(location.segment_id())?;
+                if !segment.state().is_readable() {
+                    return None;
+                }
+                segment.get_value_ref_raw(location.offset(), key).ok()
+            }};
+        }
+
         match self {
-            CacheLayer::Fifo(layer) => {
-                let pool = layer.pool();
-                if location.pool_id() != pool.pool_id() {
-                    return None;
-                }
-                let segment = pool.get(location.segment_id())?;
-                if !segment.state().is_readable() {
-                    return None;
-                }
-                segment.get_value_ref_raw(location.offset(), key).ok()
-            }
-            CacheLayer::Ttl(layer) => {
-                let pool = layer.pool();
-                if location.pool_id() != pool.pool_id() {
-                    return None;
-                }
-                let segment = pool.get(location.segment_id())?;
-                if !segment.state().is_readable() {
-                    return None;
-                }
-                segment.get_value_ref_raw(location.offset(), key).ok()
-            }
-            CacheLayer::Disk(layer) => {
-                let pool = layer.pool();
-                if location.pool_id() != pool.pool_id() {
-                    return None;
-                }
-                let segment = pool.get(location.segment_id())?;
-                if !segment.state().is_readable() {
-                    return None;
-                }
-                segment.get_value_ref_raw(location.offset(), key).ok()
-            }
+            CacheLayer::Fifo(layer) => value_ref_from_pool!(layer),
+            CacheLayer::Ttl(layer) => value_ref_from_pool!(layer),
+            CacheLayer::Disk(layer) => value_ref_from_pool!(layer),
             // io_uring disk layer doesn't support direct value ref for committed
             // segments; use read_from_buffer instead.
             CacheLayer::IoUringDisk(_) => None,
@@ -155,12 +137,7 @@ impl CacheLayer {
 
     /// Mark an item as deleted.
     pub fn mark_deleted(&self, location: ItemLocation) {
-        match self {
-            CacheLayer::Fifo(layer) => layer.mark_deleted(location),
-            CacheLayer::Ttl(layer) => layer.mark_deleted(location),
-            CacheLayer::Disk(layer) => layer.mark_deleted(location),
-            CacheLayer::IoUringDisk(layer) => layer.mark_deleted(location),
-        }
+        dispatch!(self, mark_deleted(location))
     }
 
     /// Mark an item as deleted and attempt segment compaction.
@@ -168,32 +145,17 @@ impl CacheLayer {
     /// This is like `mark_deleted` but additionally attempts to compact the
     /// segment with its predecessor when the deletion creates enough free space.
     pub fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H) {
-        match self {
-            CacheLayer::Fifo(layer) => layer.mark_deleted_and_compact(location, hashtable),
-            CacheLayer::Ttl(layer) => layer.mark_deleted_and_compact(location, hashtable),
-            CacheLayer::Disk(layer) => layer.mark_deleted_and_compact(location, hashtable),
-            CacheLayer::IoUringDisk(layer) => layer.mark_deleted_and_compact(location, hashtable),
-        }
+        dispatch!(self, mark_deleted_and_compact(location, hashtable))
     }
 
     /// Get the remaining TTL for an item.
     pub fn item_ttl(&self, location: ItemLocation) -> Option<Duration> {
-        match self {
-            CacheLayer::Fifo(layer) => layer.item_ttl(location),
-            CacheLayer::Ttl(layer) => layer.item_ttl(location),
-            CacheLayer::Disk(layer) => layer.item_ttl(location),
-            CacheLayer::IoUringDisk(layer) => layer.item_ttl(location),
-        }
+        dispatch!(self, item_ttl(location))
     }
 
     /// Try to evict a segment from this layer.
     pub fn evict<H: Hashtable>(&self, hashtable: &H) -> bool {
-        match self {
-            CacheLayer::Fifo(layer) => layer.evict(hashtable),
-            CacheLayer::Ttl(layer) => layer.evict(hashtable),
-            CacheLayer::Disk(layer) => layer.evict(hashtable),
-            CacheLayer::IoUringDisk(layer) => layer.evict(hashtable),
-        }
+        dispatch!(self, evict(hashtable))
     }
 
     /// Try to evict a segment with a demotion callback.
@@ -205,12 +167,7 @@ impl CacheLayer {
         H: Hashtable,
         F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
     {
-        match self {
-            CacheLayer::Fifo(layer) => layer.evict_with_demoter(hashtable, demoter),
-            CacheLayer::Ttl(layer) => layer.evict_with_demoter(hashtable, demoter),
-            CacheLayer::Disk(layer) => layer.evict_with_demoter(hashtable, demoter),
-            CacheLayer::IoUringDisk(layer) => layer.evict_with_demoter(hashtable, demoter),
-        }
+        dispatch!(self, evict_with_demoter(hashtable, demoter))
     }
 
     /// Try to evict without blocking on ref_count.
@@ -218,7 +175,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.evict_nonblocking(hashtable),
             CacheLayer::Ttl(layer) => layer.evict_nonblocking(hashtable),
-            // Disk layer: fall back to regular evict (disk segments rarely have readers)
+            // Disk layers: fall back to regular evict (disk segments rarely have readers)
             CacheLayer::Disk(layer) => {
                 if layer.evict(hashtable) {
                     EvictResult::Freed
@@ -226,7 +183,6 @@ impl CacheLayer {
                     EvictResult::NoCandidate
                 }
             }
-            // IoUringDisk layer: fall back to regular evict (disk segments rarely have readers)
             CacheLayer::IoUringDisk(layer) => {
                 if layer.evict(hashtable) {
                     EvictResult::Freed
@@ -268,50 +224,29 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.try_emergency_evict(hashtable),
             CacheLayer::Ttl(layer) => layer.try_emergency_evict(hashtable),
-            // Disk layer doesn't support emergency eviction
-            CacheLayer::Disk(_) => false,
-            CacheLayer::IoUringDisk(_) => false,
+            // Disk layers don't support emergency eviction
+            CacheLayer::Disk(_) | CacheLayer::IoUringDisk(_) => false,
         }
     }
 
     /// Try to expire segments in this layer.
     pub fn expire<H: Hashtable>(&self, hashtable: &H) -> usize {
-        match self {
-            CacheLayer::Fifo(layer) => layer.expire(hashtable),
-            CacheLayer::Ttl(layer) => layer.expire(hashtable),
-            CacheLayer::Disk(layer) => layer.expire(hashtable),
-            CacheLayer::IoUringDisk(layer) => layer.expire(hashtable),
-        }
+        dispatch!(self, expire(hashtable))
     }
 
     /// Get the number of free segments.
     pub fn free_segment_count(&self) -> usize {
-        match self {
-            CacheLayer::Fifo(layer) => layer.free_segment_count(),
-            CacheLayer::Ttl(layer) => layer.free_segment_count(),
-            CacheLayer::Disk(layer) => layer.free_segment_count(),
-            CacheLayer::IoUringDisk(layer) => layer.free_segment_count(),
-        }
+        dispatch!(self, free_segment_count())
     }
 
     /// Get the total number of segments.
     pub fn total_segment_count(&self) -> usize {
-        match self {
-            CacheLayer::Fifo(layer) => layer.total_segment_count(),
-            CacheLayer::Ttl(layer) => layer.total_segment_count(),
-            CacheLayer::Disk(layer) => layer.total_segment_count(),
-            CacheLayer::IoUringDisk(layer) => layer.total_segment_count(),
-        }
+        dispatch!(self, total_segment_count())
     }
 
     /// Get the number of segments in use.
     pub fn used_segment_count(&self) -> usize {
-        match self {
-            CacheLayer::Fifo(layer) => layer.used_segment_count(),
-            CacheLayer::Ttl(layer) => layer.used_segment_count(),
-            CacheLayer::Disk(layer) => layer.used_segment_count(),
-            CacheLayer::IoUringDisk(layer) => layer.used_segment_count(),
-        }
+        dispatch!(self, used_segment_count())
     }
 
     /// Get a segment from this layer's pool by segment ID (RAM layers only).
@@ -322,8 +257,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.pool().get(segment_id),
             CacheLayer::Ttl(layer) => layer.pool().get(segment_id),
-            CacheLayer::Disk(_) => None, // Disk segments have different type
-            CacheLayer::IoUringDisk(_) => None, // Disk segments have different type
+            CacheLayer::Disk(_) | CacheLayer::IoUringDisk(_) => None,
         }
     }
 
@@ -336,8 +270,7 @@ impl CacheLayer {
         match self {
             CacheLayer::Fifo(layer) => layer.pool(),
             CacheLayer::Ttl(layer) => layer.pool(),
-            CacheLayer::Disk(_) => panic!("Cannot get MemoryPool from disk layer; use disk_pool()"),
-            CacheLayer::IoUringDisk(_) => {
+            CacheLayer::Disk(_) | CacheLayer::IoUringDisk(_) => {
                 panic!("Cannot get MemoryPool from disk layer; use disk_pool()")
             }
         }
@@ -348,9 +281,8 @@ impl CacheLayer {
     /// Returns `None` for RAM layers and IoUringDisk layers.
     pub fn disk_pool(&self) -> Option<&FilePool> {
         match self {
-            CacheLayer::Fifo(_) | CacheLayer::Ttl(_) => None,
+            CacheLayer::Fifo(_) | CacheLayer::Ttl(_) | CacheLayer::IoUringDisk(_) => None,
             CacheLayer::Disk(layer) => Some(layer.pool()),
-            CacheLayer::IoUringDisk(_) => None,
         }
     }
 
@@ -387,32 +319,17 @@ impl CacheLayer {
         optional: &[u8],
         ttl: Duration,
     ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
-        match self {
-            CacheLayer::Fifo(layer) => layer.begin_write_item(key, value_len, optional, ttl),
-            CacheLayer::Ttl(layer) => layer.begin_write_item(key, value_len, optional, ttl),
-            CacheLayer::Disk(layer) => layer.begin_write_item(key, value_len, optional, ttl),
-            CacheLayer::IoUringDisk(layer) => layer.begin_write_item(key, value_len, optional, ttl),
-        }
+        dispatch!(self, begin_write_item(key, value_len, optional, ttl))
     }
 
     /// Finalize a two-phase write operation.
     pub fn finalize_write_item(&self, location: ItemLocation, item_size: u32) {
-        match self {
-            CacheLayer::Fifo(layer) => layer.finalize_write_item(location, item_size),
-            CacheLayer::Ttl(layer) => layer.finalize_write_item(location, item_size),
-            CacheLayer::Disk(layer) => layer.finalize_write_item(location, item_size),
-            CacheLayer::IoUringDisk(layer) => layer.finalize_write_item(location, item_size),
-        }
+        dispatch!(self, finalize_write_item(location, item_size))
     }
 
     /// Cancel a two-phase write operation.
     pub fn cancel_write_item(&self, location: ItemLocation) {
-        match self {
-            CacheLayer::Fifo(layer) => layer.cancel_write_item(location),
-            CacheLayer::Ttl(layer) => layer.cancel_write_item(location),
-            CacheLayer::Disk(layer) => layer.cancel_write_item(location),
-            CacheLayer::IoUringDisk(layer) => layer.cancel_write_item(location),
-        }
+        dispatch!(self, cancel_write_item(location))
     }
 
     /// Reset all segments in this layer to Free state.
