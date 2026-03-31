@@ -72,16 +72,26 @@ impl SharedCache {
     /// Cache a value with the default TTL.
     #[inline]
     pub fn set(&self, key: &[u8], value: &[u8]) {
-        if let Some(cache) = &self.inner {
-            let _ = cache.set(key, value, self.default_ttl);
+        if let Some(cache) = &self.inner
+            && let Err(e) = cache.set(key, value, self.default_ttl)
+        {
+            crate::metrics::CACHE_SET_ERRORS.increment();
+            if e.is_corruption() {
+                tracing::warn!(error = %e, "local cache SET failed with corruption error");
+            }
         }
     }
 
     /// Cache a value with a specific TTL.
     #[inline]
     pub fn set_with_ttl(&self, key: &[u8], value: &[u8], ttl: Duration) {
-        if let Some(cache) = &self.inner {
-            let _ = cache.set(key, value, ttl);
+        if let Some(cache) = &self.inner
+            && let Err(e) = cache.set(key, value, ttl)
+        {
+            crate::metrics::CACHE_SET_ERRORS.increment();
+            if e.is_corruption() {
+                tracing::warn!(error = %e, "local cache SET failed with corruption error");
+            }
         }
     }
 

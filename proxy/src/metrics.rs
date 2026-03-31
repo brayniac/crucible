@@ -24,6 +24,7 @@ mod backend {
 mod cache {
     pub const HITS: usize = 0;
     pub const MISSES: usize = 1;
+    pub const SET_ERRORS: usize = 2;
 }
 
 /// Total client connections (gauge, not high-frequency).
@@ -53,3 +54,7 @@ pub static CACHE_HITS: Counter = Counter::new(&CACHE, cache::HITS);
 /// Cache misses (when caching is enabled).
 #[metric(name = "proxy_cache_misses")]
 pub static CACHE_MISSES: Counter = Counter::new(&CACHE, cache::MISSES);
+
+/// Local cache SET errors.
+#[metric(name = "proxy_cache_set_errors")]
+pub static CACHE_SET_ERRORS: Counter = Counter::new(&CACHE, cache::SET_ERRORS);
