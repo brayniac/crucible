@@ -316,27 +316,19 @@ mod server {
                 let current: Vec<WorkerStatsSnapshot> =
                     stats.iter().map(|s| s.snapshot()).collect();
 
-                eprintln!(
-                    "\n[diagnostics] === Worker Stats (last {}s) ===",
-                    report_interval.as_secs()
-                );
-                eprintln!(
-                    "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
-                    "worker",
-                    "polls",
-                    "accepts",
-                    "closes",
-                    "recv",
-                    "send_rdy",
-                    "bytes_in",
-                    "bytes_out",
-                    "conns"
+                use std::fmt::Write;
+                let mut report = format!(
+                    "\n=== Worker Stats (last {}s) ===\n{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
+                    report_interval.as_secs(),
+                    "worker", "polls", "accepts", "closes", "recv",
+                    "send_rdy", "bytes_in", "bytes_out", "conns"
                 );
 
                 for (i, (curr, prev)) in current.iter().zip(prev_snapshots.iter()).enumerate() {
                     let delta = curr.delta(prev);
-                    eprintln!(
-                        "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
+                    write!(
+                        &mut report,
+                        "\n{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
                         i,
                         delta.poll_count,
                         delta.accepts,
@@ -346,15 +338,17 @@ mod server {
                         format_bytes(delta.bytes_received),
                         format_bytes(delta.bytes_sent),
                         curr.active_connections,
-                    );
+                    ).unwrap();
 
                     if delta.backpressure_events > 0 {
-                        eprintln!(
-                            "  ^ INFO: Worker {} hit backpressure {} times",
+                        write!(
+                            &mut report,
+                            "\n  ^ Worker {} hit backpressure {} times",
                             i, delta.backpressure_events
-                        );
+                        ).unwrap();
                     }
                 }
+                info!("{report}");
 
                 prev_snapshots = current;
                 last_report = Instant::now();

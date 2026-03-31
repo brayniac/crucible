@@ -11,6 +11,7 @@ description = "Lightweight Momento cache protocol implementation for ringline-ba
 bytes = { workspace = true }
 grpc-proto = { workspace = true }
 http2-proto = { workspace = true }
+tracing = { workspace = true }
 
 [[bin]]
 name = "momento-cli"
