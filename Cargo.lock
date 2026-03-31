@@ -1409,7 +1409,7 @@ dependencies = [
 [[package]]
 name = "ringline"
 version = "0.0.3-alpha.0"
-source = "git+https://github.com/ringline-rs/ringline.git?rev=9c5168d#9c5168d06fdc121137379472f8a78bab694830c1"
+source = "git+https://github.com/ringline-rs/ringline.git?rev=6e373ef#6e373ef4da8db5f0d6027921e588455d005ccea0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -1425,7 +1425,7 @@ dependencies = [
 [[package]]
 name = "ringline-redis"
 version = "0.1.1"
-source = "git+https://github.com/ringline-rs/ringline.git?rev=9c5168d#9c5168d06fdc121137379472f8a78bab694830c1"
+source = "git+https://github.com/ringline-rs/ringline.git?rev=6e373ef#6e373ef4da8db5f0d6027921e588455d005ccea0"
 dependencies = [
  "bytes",
  "histogram 0.11.4",
