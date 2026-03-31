@@ -222,10 +222,10 @@ fn allocate_prefer_1gb(size: usize) -> Result<HugepageAllocation, std::io::Error
         // Waste is acceptable, try 1GB pages
         match try_mmap_hugepage(rounded_1gb, GB) {
             Ok(alloc) => {
-                eprintln!(
-                    "Allocated {} using 1GB hugepages ({} pages)",
-                    format_bytes(rounded_1gb),
-                    rounded_1gb / GB
+                tracing::info!(
+                    size = format_bytes(rounded_1gb),
+                    pages = rounded_1gb / GB,
+                    "Allocated using 1GB hugepages",
                 );
                 return Ok(HugepageAllocation {
                     ptr: alloc,
@@ -235,9 +235,9 @@ fn allocate_prefer_1gb(size: usize) -> Result<HugepageAllocation, std::io::Error
                 });
             }
             Err(e) => {
-                eprintln!(
-                    "1GB hugepage allocation failed ({}), falling back to regular pages",
-                    e
+                tracing::info!(
+                    error = %e,
+                    "1GB hugepage allocation failed, falling back to regular pages",
                 );
             }
         }
@@ -254,10 +254,10 @@ fn allocate_prefer_2mb(size: usize) -> Result<HugepageAllocation, std::io::Error
 
     match try_mmap_hugepage(rounded_2mb, 2 * MB) {
         Ok(alloc) => {
-            eprintln!(
-                "Allocated {} using 2MB hugepages ({} pages)",
-                format_bytes(rounded_2mb),
-                rounded_2mb / (2 * MB)
+            tracing::info!(
+                size = format_bytes(rounded_2mb),
+                pages = rounded_2mb / (2 * MB),
+                "Allocated using 2MB hugepages",
             );
             return Ok(HugepageAllocation {
                 ptr: alloc,
@@ -267,9 +267,9 @@ fn allocate_prefer_2mb(size: usize) -> Result<HugepageAllocation, std::io::Error
             });
         }
         Err(e) => {
-            eprintln!(
-                "2MB hugepage allocation failed ({}), falling back to regular pages",
-                e
+            tracing::info!(
+                error = %e,
+                "2MB hugepage allocation failed, falling back to regular pages",
             );
         }
     }
@@ -312,9 +312,9 @@ fn allocate_regular_internal(
         let _ = libc::madvise(ptr, alloc_size, 14);
     }
 
-    eprintln!(
-        "Allocated {} using regular pages (with THP hint)",
-        format_bytes(alloc_size)
+    tracing::info!(
+        size = format_bytes(alloc_size),
+        "Allocated using regular pages (with THP hint)",
     );
 
     // Pre-fault pages
