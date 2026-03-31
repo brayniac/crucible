@@ -385,6 +385,16 @@ impl<'de> Deserialize<'de> for HugepageConfig {
     }
 }
 
+impl From<HugepageConfig> for cache_core::HugepageSize {
+    fn from(config: HugepageConfig) -> Self {
+        match config {
+            HugepageConfig::None => Self::None,
+            HugepageConfig::TwoMegabyte => Self::TwoMegabyte,
+            HugepageConfig::OneGigabyte => Self::OneGigabyte,
+        }
+    }
+}
+
 /// Protocol listener configuration.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
