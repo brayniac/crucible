@@ -19,6 +19,11 @@ use crate::segment::Segment;
 use crate::slice_segment::SliceSegment;
 use crate::sync::{AtomicU32, Ordering};
 
+/// Maximum number of steal retries before giving up. Bounds the retry loop
+/// in `reserve_spare` and `reserve` to prevent unbounded spinning under
+/// pathological contention.
+const MAX_STEAL_RETRIES: usize = 64;
+
 /// A pool of segments backed by in-memory allocation.
 ///
 /// The pool allocates a contiguous memory region at construction time
@@ -92,23 +97,26 @@ impl MemoryPool {
     /// # Returns
     /// `Some(segment_id)` if a segment was available, `None` otherwise.
     pub fn reserve_spare(&self) -> Option<u32> {
-        // Try spare queue first
-        match self.spare_queue.steal() {
-            crossbeam_deque::Steal::Success(segment_id) => {
-                let segment = &self.segments[segment_id as usize];
+        // Try spare queue first, with a bounded retry loop to avoid
+        // stack overflow under pathological contention.
+        for _ in 0..MAX_STEAL_RETRIES {
+            match self.spare_queue.steal() {
+                crossbeam_deque::Steal::Success(segment_id) => {
+                    let segment = &self.segments[segment_id as usize];
 
-                // Transition Free -> Reserved
-                if !segment.try_reserve() {
-                    // Segment not in Free state - push back and retry
-                    self.spare_queue.push(segment_id);
-                    return self.reserve_spare(); // Retry
+                    // Transition Free -> Reserved
+                    if !segment.try_reserve() {
+                        // Segment not in Free state - push back and retry
+                        self.spare_queue.push(segment_id);
+                        continue;
+                    }
+
+                    self.spare_count.fetch_sub(1, Ordering::Relaxed);
+                    return Some(segment_id);
                 }
-
-                self.spare_count.fetch_sub(1, Ordering::Relaxed);
-                return Some(segment_id);
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => break,
             }
-            crossbeam_deque::Steal::Retry => return self.reserve_spare(), // Retry
-            crossbeam_deque::Steal::Empty => {}
         }
 
         // Fallback: try main free queue if spare is empty
