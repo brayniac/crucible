@@ -102,6 +102,16 @@ impl fmt::Display for CacheError {
 }
 
 impl CacheError {
+    /// Returns true if this error indicates data corruption or an internal
+    /// bug that should be investigated, as opposed to expected cache-pressure
+    /// or client errors.
+    pub fn is_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Corrupted | Self::InvalidOffset | Self::KeyMismatch
+        )
+    }
+
     /// Returns true if this error indicates a client-side issue (bad input)
     /// that should be reported back to the client, as opposed to an internal
     /// cache-pressure or transient error that can be silently dropped in
@@ -225,5 +235,20 @@ mod tests {
         assert!(!CacheError::SegmentNotAccessible.is_client_error());
         assert!(!CacheError::ItemExpired.is_client_error());
         assert!(!CacheError::ItemDeleted.is_client_error());
+    }
+
+    #[test]
+    fn test_is_corruption() {
+        // Corruption errors: indicate bugs or data integrity issues
+        assert!(CacheError::Corrupted.is_corruption());
+        assert!(CacheError::InvalidOffset.is_corruption());
+        assert!(CacheError::KeyMismatch.is_corruption());
+
+        // Everything else is not corruption
+        assert!(!CacheError::OutOfMemory.is_corruption());
+        assert!(!CacheError::HashTableFull.is_corruption());
+        assert!(!CacheError::KeyTooLong.is_corruption());
+        assert!(!CacheError::SegmentNotAccessible.is_corruption());
+        assert!(!CacheError::ItemExpired.is_corruption());
     }
 }

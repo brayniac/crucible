@@ -575,6 +575,9 @@ impl Connection {
                                 self.write_buf.extend_from_slice(b"\r\n");
                             } else {
                                 // Cache-pressure: silent drop, best-effort.
+                                if e.is_corruption() {
+                                    tracing::warn!(error = %e, "streaming SET failed with corruption error");
+                                }
                                 self.write_buf.extend_from_slice(b"+OK\r\n");
                             }
 
@@ -942,6 +945,9 @@ impl Connection {
                                 self.write_buf.extend_from_slice(b"\r\n");
                             } else {
                                 // Cache-pressure: silent drop, best-effort.
+                                if e.is_corruption() {
+                                    tracing::warn!(error = %e, "memcache SET failed with corruption error");
+                                }
                                 self.write_buf.extend_from_slice(b"STORED\r\n");
                             }
 
@@ -1326,6 +1332,9 @@ impl Connection {
                                 )
                             } else {
                                 // Cache-pressure: return stored (best-effort).
+                                if e.is_corruption() {
+                                    tracing::warn!(error = %e, "binary SET failed with corruption error");
+                                }
                                 BinaryResponse::encode_stored(
                                     &mut self.write_buf[start..],
                                     opcode,
