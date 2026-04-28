@@ -16,10 +16,7 @@ use bytes::Bytes;
 use cache_core::Cache;
 use cache_core::disk::AlignedBufferPool;
 use parking_lot::Mutex;
-use ringline::{
-    AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
-    SendPart,
-};
+use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, RegionId, SendGuard, SendPart};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -627,6 +624,14 @@ async fn submit_and_await_disk_read<C: Cache>(
 /// Minimum part size to use zero-copy guard path instead of copy.
 const GUARD_MIN_SIZE: usize = 1024;
 
+/// Maximum zero-copy guards per scatter-gather send.
+/// Copied from ringline::MAX_GUARDS which is no longer exported.
+const MAX_GUARDS: usize = 4;
+
+/// Maximum iovecs per scatter-gather send.
+/// Copied from ringline::MAX_IOVECS which is no longer exported.
+const MAX_IOVECS: usize = 8;
+
 /// Zero-copy send guard backed by a `Bytes` handle.
 struct BytesGuard(Bytes);
 
@@ -766,9 +771,20 @@ async fn drain_pending(
 
             let batch_count = batch.len();
 
+            // The new ringline API uses build_await for the yield path
+            // and submit_batch for the non-yield path
             let result = if need_yield {
-                match conn.send_parts().submit_batch_await(batch) {
-                    Ok((_, fut)) => {
+                // The closure receives builder by value, so we need to chain calls
+                // and return the final builder for submit
+                match conn.send_parts().build_await(|builder| {
+                    let builder = batch.into_iter().fold(builder, |b, part| match part {
+                        SendPart::Copy(data) => b.copy(data),
+                        SendPart::Guard(guard) => b.guard(guard),
+                    });
+                    builder.submit()?;
+                    Ok(())
+                }) {
+                    Ok(fut) => {
                         need_yield = false;
                         if fut.await.is_err() {
                             connection.advance_write(advanced);
