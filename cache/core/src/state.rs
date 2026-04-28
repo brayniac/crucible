@@ -85,6 +85,50 @@ pub enum State {
     /// Segment is condemned (removed from chain, hashtable updated).
     /// Data remains valid for in-flight readers. When ref_count hits 0,
     /// the last reader's guard drop will push segment to free queue.
+    ///
+    /// # AwaitingRelease State Transition Pattern
+    ///
+    /// This state implements a sophisticated concurrency pattern for safe
+    /// segment reclamation during eviction. The pattern works as follows:
+    ///
+    /// ## State Transition Flow
+    ///
+    /// ```text
+    /// Eviction Thread:                    Reader Thread:
+    /// --------------------------------    --------------------------------
+    /// 1. Check ref_count == 0
+    /// 2. CAS: Draining -> AwaitingRelease
+    /// 3. Update hashtable (remove key)
+    ///                                    4. Increment ref_count
+    ///                                    5. Read data
+    ///                                    6. Decrement ref_count in Drop
+    ///                                    7. If prev_count == 1:
+    ///                                       - Check state == AwaitingRelease
+    ///                                       - CAS: AwaitingRelease -> Free
+    ///                                       - Push segment to free queue
+    /// ```
+    ///
+    /// ## Why This Pattern?
+    ///
+    /// The race condition this solves:
+    /// - Eviction thread sees ref_count == 0
+    /// - Before eviction CAS, a reader increments ref_count
+    /// - Eviction thread transitions to AwaitingRelease
+    /// - Reader's Drop sees AwaitingRelease and frees the segment
+    ///
+    /// ## Memory Ordering
+    ///
+    /// - Release fence when decrementing ref_count (ensures all reads
+    ///   complete before checking state)
+    /// - Acquire fence when reading state (ensures we see the
+    ///   AwaitingRelease written by eviction thread)
+    /// - AcqRel for the final CAS (combines acquire/release semantics)
+    ///
+    /// ## Safety Guarantees
+    ///
+    /// - Segment memory remains valid as long as ref_count > 0
+    /// - The last reader (seeing AwaitingRelease) is responsible for freeing
+    /// - Double-free is prevented by the CAS (only one thread succeeds)
     AwaitingRelease = 8,
 }
 

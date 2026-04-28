@@ -23,6 +23,30 @@ pub struct OwnedGuard {
 /// This struct holds a reference to the value bytes directly in segment memory,
 /// keeping the segment's ref_count incremented to prevent eviction.
 ///
+/// # Zero-Copy Design
+///
+/// `ValueRef` enables true zero-copy I/O by:
+/// - Holding a reference to segment memory via raw pointers
+/// - Incrementing ref_count on creation to prevent segment eviction
+/// - Using `Bytes::from_owner(self)` for zero-copy send with io_uring
+///
+/// # AwaitingRelease State Handling
+///
+/// The `Drop` implementation handles the sophisticated concurrency pattern
+/// for safe segment reclamation when a segment is condemned during eviction:
+///
+/// ```text
+/// Drop Path (when prev_count == 1):
+/// 1. Acquire fence - see AwaitingRelease written by eviction thread
+/// 2. Load metadata state
+/// 3. If state == AwaitingRelease:
+///    - CAS: AwaitingRelease -> Free
+///    - If CAS succeeds: push segment to free queue
+/// ```
+///
+/// This ensures the last reader is responsible for freeing the segment when
+/// eviction has already removed it from the hashtable.
+///
 /// # Safety
 ///
 /// This type is `Send` because:
@@ -30,10 +54,25 @@ pub struct OwnedGuard {
 /// - The value pointer points to memory in that same pool
 /// - The pool outlives all ValueRefs (pool is dropped after all refs are released)
 ///
+/// This type is `Sync` because:
+/// - All access to the value is read-only (via `&[u8]`)
+/// - The ref_count uses atomic operations (FetchSub with Release ordering)
+///
 /// # Usage
 ///
 /// Use this for zero-copy scatter-gather I/O where you need to send the value
 /// directly from cache memory without copying to an intermediate buffer.
+///
+/// ```ignore
+/// // Get zero-copy reference
+/// let value_ref = cache.get_value_ref(key)?;
+///
+/// // Use as slice (no copy)
+/// let data: &[u8] = value_ref.as_slice();
+///
+/// // Convert to Bytes for zero-copy send (holds segment ref)
+/// let bytes: Bytes = value_ref.into_bytes();
+/// ```
 pub struct ValueRef {
     /// Pointer to the segment's ref_count for proper cleanup.
     ref_count: *const AtomicU32,
@@ -136,6 +175,45 @@ impl std::ops::Deref for ValueRef {
 }
 
 impl Drop for ValueRef {
+    /// Release the segment reference and handle AwaitingRelease state.
+    ///
+    /// # AwaitingRelease Release Pattern
+    ///
+    /// When the segment is in `AwaitingRelease` state (condemned by eviction
+    /// but still readable by in-flight readers), the last reader to drop its
+    /// `ValueRef` is responsible for freeing the segment.
+    ///
+    /// ## Why This Pattern?
+    ///
+    /// The race condition this solves:
+    /// ```text
+    /// Eviction Thread:                  Reader Thread:
+    /// --------------------------------  --------------------------------
+    /// 1. Check ref_count == 0
+    /// 2. CAS: Draining -> AwaitingRelease
+    /// 3. Update hashtable (remove key)
+    ///                                   4. Increment ref_count (too late)
+    ///                                   5. Read data
+    ///                                   6. Drop ValueRef (prev_count == 1)
+    ///                                   7. See AwaitingRelease state
+    ///                                   8. CAS: AwaitingRelease -> Free
+    ///                                   9. Push to free queue
+    /// ```
+    ///
+    /// ## Memory Ordering
+    ///
+    /// - `Ordering::Release` on fetch_sub: ensures all reads complete before
+    ///   checking the state
+    /// - `Ordering::Acquire` fence: ensures we see the AwaitingRelease state
+    ///   written by the eviction thread
+    /// - `Ordering::AcqRel` on CAS: combines acquire (see other threads' writes)
+    ///   and release (make our changes visible)
+    ///
+    /// ## Safety
+    ///
+    /// Only one thread can succeed in the final CAS (AwaitingRelease -> Free),
+    /// preventing double-free. The successful thread pushes the segment to
+    /// the free queue.
     fn drop(&mut self) {
         // SAFETY: ref_count is a valid AtomicU32 pointer from the segment
         let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::Release) };

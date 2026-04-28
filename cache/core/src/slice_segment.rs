@@ -721,11 +721,13 @@ impl<'a> SliceSegment<'a> {
 
 // Implement SegmentKeyVerify
 impl SegmentKeyVerify for SliceSegment<'_> {
+    #[inline(always)]
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
         self.verify_key_with_header(offset, key, allow_deleted)
             .is_some()
     }
 
+    #[inline(always)]
     fn verify_key_with_header(
         &self,
         offset: u32,
