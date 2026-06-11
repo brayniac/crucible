@@ -976,18 +976,32 @@ impl<H: Hashtable> TieredCache<H> {
         let write_layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
         let new_location = write_layer.write_item(key, value, optional, ttl)?;
 
-        // Update in hashtable
-        match self
-            .hashtable
-            .update_if_present(key, new_location.to_location(), &verifier)
-        {
-            Ok(old_location) => {
-                self.mark_deleted_at(old_location);
-                Ok(true)
+        // Publish by swapping the slot only if it still holds the location we
+        // checked the token against — this is the linearization point. A
+        // plain replace (update_if_present) would overwrite whatever entry is
+        // current, silently losing a write that raced in between the token
+        // check and the publish.
+        loop {
+            if self
+                .hashtable
+                .cas_location(key, current_location, new_location.to_location(), true)
+            {
+                self.mark_deleted_at(current_location);
+                return Ok(true);
             }
-            Err(e) => {
+
+            // cas_location can fail spuriously: the slot exchange covers the
+            // full packed word, so a concurrent reader bumping the frequency
+            // bits fails it even though the location is unchanged. Retry
+            // while the key still maps to the checked location; otherwise the
+            // entry really changed and the CAS fails.
+            if self
+                .hashtable
+                .get_item_frequency(key, current_location)
+                .is_none()
+            {
                 write_layer.mark_deleted(new_location);
-                Err(e)
+                return Ok(false);
             }
         }
     }
@@ -2292,5 +2306,36 @@ mod tests {
         let layer = cache.layer(0).unwrap();
         // Segment 0 should exist after writing
         let _segment = layer.get_segment(0);
+    }
+
+    #[test]
+    fn test_cas_token_lifecycle() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        // Missing key fails with KeyNotFound
+        assert_eq!(
+            cache.cas(b"counter", b"v1", b"", ttl, CasToken::from_raw(0)),
+            Err(CacheError::KeyNotFound)
+        );
+
+        cache.set(b"counter", b"v1", b"", ttl).unwrap();
+        let (value, token) = cache.get_with_cas(b"counter").unwrap();
+        assert_eq!(value, b"v1");
+
+        // A fresh token round-trips
+        assert_eq!(cache.cas(b"counter", b"v2", b"", ttl, token), Ok(true));
+        assert_eq!(cache.get(b"counter").unwrap(), b"v2");
+
+        // The consumed token is now stale and must not match
+        assert_eq!(cache.cas(b"counter", b"v3", b"", ttl, token), Ok(false));
+        assert_eq!(cache.get(b"counter").unwrap(), b"v2");
+
+        // A token invalidated by an intervening set fails and leaves the
+        // newer value in place
+        let (_, token) = cache.get_with_cas(b"counter").unwrap();
+        cache.set(b"counter", b"v4", b"", ttl).unwrap();
+        assert_eq!(cache.cas(b"counter", b"v5", b"", ttl, token), Ok(false));
+        assert_eq!(cache.get(b"counter").unwrap(), b"v4");
     }
 }
