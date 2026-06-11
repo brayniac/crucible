@@ -976,18 +976,32 @@ impl<H: Hashtable> TieredCache<H> {
         let write_layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
         let new_location = write_layer.write_item(key, value, optional, ttl)?;
 
-        // Update in hashtable
-        match self
-            .hashtable
-            .update_if_present(key, new_location.to_location(), &verifier)
-        {
-            Ok(old_location) => {
-                self.mark_deleted_at(old_location);
-                Ok(true)
+        // Publish by swapping the slot only if it still holds the location we
+        // checked the token against — this is the linearization point. A
+        // plain replace (update_if_present) would overwrite whatever entry is
+        // current, silently losing a write that raced in between the token
+        // check and the publish.
+        loop {
+            if self
+                .hashtable
+                .cas_location(key, current_location, new_location.to_location(), true)
+            {
+                self.mark_deleted_at(current_location);
+                return Ok(true);
             }
-            Err(e) => {
+
+            // cas_location can fail spuriously: the slot exchange covers the
+            // full packed word, so a concurrent reader bumping the frequency
+            // bits fails it even though the location is unchanged. Retry
+            // while the key still maps to the checked location; otherwise the
+            // entry really changed and the CAS fails.
+            if self
+                .hashtable
+                .get_item_frequency(key, current_location)
+                .is_none()
+            {
                 write_layer.mark_deleted(new_location);
-                Err(e)
+                return Ok(false);
             }
         }
     }
@@ -1064,8 +1078,14 @@ impl<H: Hashtable> TieredCache<H> {
 
     /// Atomically increment a numeric value stored as ASCII decimal.
     ///
+    /// Reads the current value with its CAS token and publishes the new
+    /// value via [`Self::cas`], retrying if a concurrent write lands in
+    /// between — concurrent increments cannot lose updates. Each retry
+    /// re-reads the value (and counts as a hit for frequency purposes).
+    ///
     /// If the key doesn't exist and `initial` is provided, creates the key
-    /// with `initial + delta`. If `initial` is `None` and the key doesn't exist,
+    /// with `initial + delta` (insert-if-absent; a concurrent creation
+    /// triggers a retry). If `initial` is `None` and the key doesn't exist,
     /// returns `Err(CacheError::KeyNotFound)`.
     ///
     /// # Returns
@@ -1080,38 +1100,48 @@ impl<H: Hashtable> TieredCache<H> {
         initial: Option<u64>,
         ttl: Duration,
     ) -> CacheResult<u64> {
-        // Try to get the current value
-        let current_value = self.get(key);
+        loop {
+            // Read the current value and its CAS token in one step,
+            // parsing as ASCII decimal under the item guard.
+            let current = self.with_value_cas(key, |v| {
+                std::str::from_utf8(v)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            });
 
-        match current_value {
-            Some(data) => {
-                // Parse existing value as ASCII decimal
-                let value_str = std::str::from_utf8(&data).map_err(|_| CacheError::NotNumeric)?;
-                let current: u64 = value_str
-                    .trim()
-                    .parse()
-                    .map_err(|_| CacheError::NotNumeric)?;
-
-                // Compute new value with overflow check
-                let new_value = current.checked_add(delta).ok_or(CacheError::Overflow)?;
-
-                // Store the new value
-                let new_str = new_value.to_string();
-                self.set(key, new_str.as_bytes(), &[], ttl)?;
-
-                Ok(new_value)
-            }
-            None => {
-                // Key doesn't exist
-                match initial {
-                    Some(init) => {
-                        // Create with initial + delta
-                        let new_value = init.checked_add(delta).ok_or(CacheError::Overflow)?;
-                        let new_str = new_value.to_string();
-                        self.set(key, new_str.as_bytes(), &[], ttl)?;
-                        Ok(new_value)
+            match current {
+                Some((Some(current), token)) => {
+                    let new_value = current.checked_add(delta).ok_or(CacheError::Overflow)?;
+                    match self.cas(key, new_value.to_string().as_bytes(), &[], ttl, token) {
+                        Ok(true) => return Ok(new_value),
+                        // Raced with another writer, or the key was deleted
+                        // in between; re-read and retry.
+                        Ok(false) | Err(CacheError::KeyNotFound) => continue,
+                        Err(e) => return Err(e),
                     }
-                    None => Err(CacheError::KeyNotFound),
+                }
+                Some((None, _)) => return Err(CacheError::NotNumeric),
+                None => {
+                    // with_value_cas returns None both when the key is absent
+                    // and when the item is transiently unreadable (e.g. its
+                    // segment is mid-migration). Only treat the key as absent
+                    // if the hashtable agrees; otherwise retry.
+                    let verifier = self.create_key_verifier();
+                    if self.hashtable.contains(key, &verifier) {
+                        continue;
+                    }
+                    match initial {
+                        Some(init) => {
+                            let new_value = init.checked_add(delta).ok_or(CacheError::Overflow)?;
+                            match self.add(key, new_value.to_string().as_bytes(), &[], ttl) {
+                                Ok(()) => return Ok(new_value),
+                                // Lost the creation race; re-read and retry.
+                                Err(CacheError::KeyExists) => continue,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        None => return Err(CacheError::KeyNotFound),
+                    }
                 }
             }
         }
@@ -1119,8 +1149,14 @@ impl<H: Hashtable> TieredCache<H> {
 
     /// Atomically decrement a numeric value stored as ASCII decimal.
     ///
+    /// Reads the current value with its CAS token and publishes the new
+    /// value via [`Self::cas`], retrying if a concurrent write lands in
+    /// between — concurrent decrements cannot lose updates. Each retry
+    /// re-reads the value (and counts as a hit for frequency purposes).
+    ///
     /// If the key doesn't exist and `initial` is provided, creates the key
-    /// with `initial.saturating_sub(delta)`. If `initial` is `None` and the key
+    /// with `initial.saturating_sub(delta)` (insert-if-absent; a concurrent
+    /// creation triggers a retry). If `initial` is `None` and the key
     /// doesn't exist, returns `Err(CacheError::KeyNotFound)`.
     ///
     /// Underflow clamps to 0 (saturating subtraction) per memcache semantics.
@@ -1136,38 +1172,49 @@ impl<H: Hashtable> TieredCache<H> {
         initial: Option<u64>,
         ttl: Duration,
     ) -> CacheResult<u64> {
-        // Try to get the current value
-        let current_value = self.get(key);
+        loop {
+            // Read the current value and its CAS token in one step,
+            // parsing as ASCII decimal under the item guard.
+            let current = self.with_value_cas(key, |v| {
+                std::str::from_utf8(v)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            });
 
-        match current_value {
-            Some(data) => {
-                // Parse existing value as ASCII decimal
-                let value_str = std::str::from_utf8(&data).map_err(|_| CacheError::NotNumeric)?;
-                let current: u64 = value_str
-                    .trim()
-                    .parse()
-                    .map_err(|_| CacheError::NotNumeric)?;
-
-                // Compute new value with saturating subtraction (clamp to 0)
-                let new_value = current.saturating_sub(delta);
-
-                // Store the new value
-                let new_str = new_value.to_string();
-                self.set(key, new_str.as_bytes(), &[], ttl)?;
-
-                Ok(new_value)
-            }
-            None => {
-                // Key doesn't exist
-                match initial {
-                    Some(init) => {
-                        // Create with initial - delta (saturating)
-                        let new_value = init.saturating_sub(delta);
-                        let new_str = new_value.to_string();
-                        self.set(key, new_str.as_bytes(), &[], ttl)?;
-                        Ok(new_value)
+            match current {
+                Some((Some(current), token)) => {
+                    // Saturating subtraction (clamp to 0)
+                    let new_value = current.saturating_sub(delta);
+                    match self.cas(key, new_value.to_string().as_bytes(), &[], ttl, token) {
+                        Ok(true) => return Ok(new_value),
+                        // Raced with another writer, or the key was deleted
+                        // in between; re-read and retry.
+                        Ok(false) | Err(CacheError::KeyNotFound) => continue,
+                        Err(e) => return Err(e),
                     }
-                    None => Err(CacheError::KeyNotFound),
+                }
+                Some((None, _)) => return Err(CacheError::NotNumeric),
+                None => {
+                    // with_value_cas returns None both when the key is absent
+                    // and when the item is transiently unreadable (e.g. its
+                    // segment is mid-migration). Only treat the key as absent
+                    // if the hashtable agrees; otherwise retry.
+                    let verifier = self.create_key_verifier();
+                    if self.hashtable.contains(key, &verifier) {
+                        continue;
+                    }
+                    match initial {
+                        Some(init) => {
+                            let new_value = init.saturating_sub(delta);
+                            match self.add(key, new_value.to_string().as_bytes(), &[], ttl) {
+                                Ok(()) => return Ok(new_value),
+                                // Lost the creation race; re-read and retry.
+                                Err(CacheError::KeyExists) => continue,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        None => return Err(CacheError::KeyNotFound),
+                    }
                 }
             }
         }
@@ -2292,5 +2339,120 @@ mod tests {
         let layer = cache.layer(0).unwrap();
         // Segment 0 should exist after writing
         let _segment = layer.get_segment(0);
+    }
+
+    #[test]
+    fn test_cas_token_lifecycle() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        // Missing key fails with KeyNotFound
+        assert_eq!(
+            cache.cas(b"counter", b"v1", b"", ttl, CasToken::from_raw(0)),
+            Err(CacheError::KeyNotFound)
+        );
+
+        cache.set(b"counter", b"v1", b"", ttl).unwrap();
+        let (value, token) = cache.get_with_cas(b"counter").unwrap();
+        assert_eq!(value, b"v1");
+
+        // A fresh token round-trips
+        assert_eq!(cache.cas(b"counter", b"v2", b"", ttl, token), Ok(true));
+        assert_eq!(cache.get(b"counter").unwrap(), b"v2");
+
+        // The consumed token is now stale and must not match
+        assert_eq!(cache.cas(b"counter", b"v3", b"", ttl, token), Ok(false));
+        assert_eq!(cache.get(b"counter").unwrap(), b"v2");
+
+        // A token invalidated by an intervening set fails and leaves the
+        // newer value in place
+        let (_, token) = cache.get_with_cas(b"counter").unwrap();
+        cache.set(b"counter", b"v4", b"", ttl).unwrap();
+        assert_eq!(cache.cas(b"counter", b"v5", b"", ttl, token), Ok(false));
+        assert_eq!(cache.get(b"counter").unwrap(), b"v4");
+    }
+
+    #[test]
+    fn test_increment_decrement_semantics() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        // Missing key, no initial
+        assert_eq!(
+            cache.increment(b"n", 1, None, ttl),
+            Err(CacheError::KeyNotFound)
+        );
+        assert_eq!(
+            cache.decrement(b"n", 1, None, ttl),
+            Err(CacheError::KeyNotFound)
+        );
+
+        // Missing key, initial provided: created with initial + delta
+        assert_eq!(cache.increment(b"n", 2, Some(10), ttl), Ok(12));
+        assert_eq!(cache.get(b"n").unwrap(), b"12");
+
+        // Existing key: initial is ignored
+        assert_eq!(cache.increment(b"n", 3, Some(100), ttl), Ok(15));
+
+        // Decrement, including saturation at zero
+        assert_eq!(cache.decrement(b"n", 5, None, ttl), Ok(10));
+        assert_eq!(cache.decrement(b"n", 100, None, ttl), Ok(0));
+        assert_eq!(cache.get(b"n").unwrap(), b"0");
+
+        // Decrement creation saturates too
+        assert_eq!(cache.decrement(b"m", 5, Some(3), ttl), Ok(0));
+
+        // Non-numeric value
+        cache.set(b"s", b"not a number", b"", ttl).unwrap();
+        assert_eq!(
+            cache.increment(b"s", 1, None, ttl),
+            Err(CacheError::NotNumeric)
+        );
+
+        // Overflow
+        cache
+            .set(b"max", u64::MAX.to_string().as_bytes(), b"", ttl)
+            .unwrap();
+        assert_eq!(
+            cache.increment(b"max", 1, None, ttl),
+            Err(CacheError::Overflow)
+        );
+    }
+
+    // Concurrent increments must not lose updates. This exercises both the
+    // increment retry loop and the cas() publish linearization: with the
+    // old get-then-set increment, or with cas() publishing via a plain
+    // replace, concurrent updates are lost and the final count comes up
+    // short (measured ~30-45% of updates surviving before the fix).
+    #[test]
+    fn test_increment_concurrent_no_lost_updates() {
+        use std::sync::Arc as StdArc;
+
+        const THREADS: usize = 4;
+        const PER_THREAD: u64 = 250;
+
+        let cache = StdArc::new(create_test_cache());
+        let ttl = Duration::from_secs(3600);
+
+        cache.set(b"counter", b"0", b"", ttl).unwrap();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let cache = StdArc::clone(&cache);
+                std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        cache.increment(b"counter", 1, None, ttl).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let value = cache.get(b"counter").unwrap();
+        let value: u64 = std::str::from_utf8(&value).unwrap().parse().unwrap();
+        assert_eq!(value, THREADS as u64 * PER_THREAD);
     }
 }

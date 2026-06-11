@@ -1534,6 +1534,28 @@ mod tests {
         }
     }
 
+    // Every Free -> Reserved transition must bump the generation counter:
+    // CasToken ABA protection depends on a recycled segment never serving
+    // items under a generation that outstanding tokens were issued against.
+    #[test]
+    fn test_segment_generation_bumps_on_recycle() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 0, 1024);
+        assert_eq!(segment.generation(), 0);
+
+        // First allocation
+        assert!(segment.try_reserve());
+        assert_eq!(segment.generation(), 1);
+
+        // Recycle: back to Free, then reserved again
+        assert!(segment.try_release());
+        assert!(segment.try_reserve());
+        assert_eq!(segment.generation(), 2);
+
+        unsafe {
+            free_test_segment(ptr, layout);
+        }
+    }
+
     #[test]
     fn test_segment_append_basic() {
         let (segment, ptr, layout) = create_test_segment(0, false, 0, 4096);
