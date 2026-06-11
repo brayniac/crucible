@@ -98,11 +98,7 @@ impl DiskConfig {
     /// Calculate the number of segments based on size and segment_size.
     pub fn segment_count(&self, default_segment_size: usize) -> usize {
         let segment_size = self.segment_size.unwrap_or(default_segment_size);
-        if segment_size == 0 {
-            0
-        } else {
-            self.size / segment_size
-        }
+        self.size.checked_div(segment_size).unwrap_or(0)
     }
 }
 
