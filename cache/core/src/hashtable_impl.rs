@@ -517,6 +517,12 @@ impl MultiChoiceHashtable {
                 return None;
             }
 
+            // The slot moved, so the budget above was not spent on a stable
+            // slot after all. Reset it: it bounds one publish landing, not a
+            // key's whole relocation history, and letting it accumulate
+            // across generations answers `None` for a live, visibly-moving
+            // key -- the false absent this function exists to prevent.
+            tombstone_polls = 0;
             packed = current;
         }
     }
@@ -2005,6 +2011,104 @@ mod tests {
         assert!(
             verifier.probes.load(std::sync::atomic::Ordering::SeqCst) >= 3,
             "the delayed-publish window was never exercised"
+        );
+    }
+
+    /// Verifier that walks a key through many successive locations, each
+    /// one costing a tombstone poll before its publish is observed.
+    ///
+    /// This is the shape that catches a tombstone budget scoped to the whole
+    /// lookup rather than to one publish: every generation spends a poll, so
+    /// a cumulative counter runs out and answers absent for a key that is
+    /// live and visibly moving.
+    struct WalkingPublishVerifier {
+        key: Vec<u8>,
+        table: std::sync::Mutex<Option<std::sync::Arc<MultiChoiceHashtable>>>,
+        /// Locations the key occupies, in order.
+        stops: Vec<Location>,
+        /// How far along `stops` the published entry currently is.
+        published: std::sync::atomic::AtomicUsize,
+        /// Probes seen against the current stop.
+        probes_here: std::sync::atomic::AtomicU32,
+    }
+
+    impl KeyVerifier for WalkingPublishVerifier {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            use std::sync::atomic::Ordering as O;
+            if key != self.key.as_slice() {
+                return false;
+            }
+            let idx = self.published.load(O::SeqCst);
+            let current = self.stops[idx];
+
+            if location == current {
+                // The live entry, once it has stopped moving.
+                if idx == self.stops.len() - 1 {
+                    return true;
+                }
+                // Still walking: this stop reads as our key, tombstoned.
+                //
+                // Advance on the *fourth* probe, not the second. A scan
+                // iteration spends two probes (the live check, then the
+                // tombstone re-probe) before it re-reads the slot, so
+                // publishing on probe 2 would move the slot before that
+                // re-read and the poll branch would never run. Letting one
+                // whole iteration find the slot unchanged is what spends a
+                // tombstone poll per hop -- which is the accounting this
+                // test exists to pin.
+                if self.probes_here.fetch_add(1, O::SeqCst) + 1 >= 4 {
+                    self.probes_here.store(0, O::SeqCst);
+                    let table = self.table.lock().unwrap().clone().unwrap();
+                    assert!(
+                        table.cas_location(&self.key, current, self.stops[idx + 1], true),
+                        "each hop of the walk must land"
+                    );
+                    self.published.store(idx + 1, O::SeqCst);
+                }
+                return allow_deleted;
+            }
+            false
+        }
+    }
+
+    /// A key relocating through more generations than the tombstone budget
+    /// must still be found. The budget bounds one publish landing, not the
+    /// key's whole relocation history.
+    #[test]
+    fn relocation_walk_longer_than_the_tombstone_budget_is_still_found() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        let table = StdArc::new(MultiChoiceHashtable::new(8));
+        let key = b"walker".to_vec();
+
+        // Comfortably more hops than MAX_TOMBSTONE_POLLS.
+        let stops: Vec<Location> = (1..=20).map(|i| Location::new(0x1000 * i)).collect();
+
+        let seed = StaticVerifier {
+            key: key.clone(),
+            location: stops[0],
+        };
+        table.insert(&key, stops[0], &seed).unwrap();
+
+        let verifier = WalkingPublishVerifier {
+            key: key.clone(),
+            table: std::sync::Mutex::new(Some(StdArc::clone(&table))),
+            stops: stops.clone(),
+            published: AtomicUsize::new(0),
+            probes_here: AtomicU32::new(0),
+        };
+
+        assert!(
+            table.contains(&key, &verifier),
+            "a key that relocated through more hops than the tombstone budget \
+             was reported absent -- the budget is accumulating across \
+             relocations instead of bounding one publish"
+        );
+        assert!(
+            verifier.published.load(std::sync::atomic::Ordering::SeqCst) > 8,
+            "the walk did not exceed the tombstone budget, so this test would \
+             not have caught a cumulative counter"
         );
     }
 
