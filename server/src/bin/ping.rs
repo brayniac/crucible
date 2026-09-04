@@ -184,22 +184,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Starting ping server on {}", listen);
 
-    let krio_config = ringline::Config {
-        sq_entries: config.uring.sq_depth,
-        sqpoll: config.uring.sqpoll,
-        recv_buffer: ringline::RecvBufferConfig {
-            ring_size: config.uring.buffer_count.next_power_of_two(),
-            buffer_size: config.uring.buffer_size,
-            ..Default::default()
-        },
-        worker: ringline::WorkerConfig {
-            threads: if threads == 0 { 0 } else { threads },
-            pin_to_core: false,
-            core_offset: 0,
-        },
-        tcp_nodelay: true,
-        ..Default::default()
-    };
+    let krio_config = ringline::ConfigBuilder::new()
+        .sq_entries(config.uring.sq_depth)
+        .sqpoll(config.uring.sqpoll)
+        .recv_buffer(
+            config.uring.buffer_count.next_power_of_two(),
+            config.uring.buffer_size,
+        )
+        .workers(threads)
+        .pin_to_core(false)
+        .core_offset(0)
+        .tcp_nodelay(true)
+        .build()?;
 
     let workers = if threads == 0 {
         "auto"

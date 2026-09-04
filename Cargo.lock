@@ -182,8 +182,8 @@ dependencies = [
  "humantime",
  "libc",
  "metrics",
- "metriken 0.8.0",
- "rand 0.9.2",
+ "metriken",
+ "rand",
  "rand_xoshiro",
  "segcache",
  "serde",
@@ -205,7 +205,7 @@ dependencies = [
  "loom",
  "memmap2",
  "parking_lot",
- "rand 0.9.2",
+ "rand",
  "tempfile",
  "tracing",
 ]
@@ -564,9 +564,9 @@ dependencies = [
 
 [[package]]
 name = "grpc-proto"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "251e77f35a022f2ec42a80b004042570e6585506ddd7927d2f66c942edce6557"
+checksum = "bce390c89186df80d4795a4c130ccf145dd5cab4b2841abcb1dddfeb7be3274d"
 dependencies = [
  "bytes",
  "http2-proto",
@@ -624,9 +624,9 @@ dependencies = [
 
 [[package]]
 name = "histogram"
-version = "1.2.0"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df2b5fe6dcc3f27467d78bebc976c7ffb20fc693ad53627ceb0bc58dc6871513"
+checksum = "8ebb5d42df947561c11a73414c53d14c4a0e3193e761a4cdca16ca3d941a2302"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -666,9 +666,9 @@ dependencies = [
 
 [[package]]
 name = "http2-proto"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346ea9f18bd84e3c02dc9321afea9cec87576061357027c19ecfc707b2d4cc91"
+checksum = "fa57f5eb3b9b11f30d7ec1a5672b861d374bad6617c52b03954a9ade4570fb29"
 dependencies = [
  "bytes",
  "rustls",
@@ -794,9 +794,9 @@ dependencies = [
 
 [[package]]
 name = "ketama"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bc28a770b7d738684c2b53fff2e68614edfa874c865b6592a7d72fc3c3ac2be"
+checksum = "02477b4e4b5454c404fa7ef505c85cacb89fee3987793f9a3a2bd9ab556c4e3b"
 
 [[package]]
 name = "lazy_static"
@@ -883,10 +883,11 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "memcache-proto"
-version = "0.0.1"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d9ce3407f1cea26c7596fbdc759cd7f5ad6e325f58c08b51f912f5fca2b49d4"
+checksum = "1bc235782fb39adfbf6629e80cd16bb5fe09c88081a6d7b3ffe8487c6ddbde5d"
 dependencies = [
+ "bytes",
  "itoa",
  "memchr",
  "thiserror 2.0.18",
@@ -911,29 +912,16 @@ dependencies = [
 name = "metrics"
 version = "0.4.2-alpha.0"
 dependencies = [
- "metriken 0.8.0",
+ "metriken",
 ]
 
 [[package]]
 name = "metriken"
-version = "0.7.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fc160a09cad0d921ac6d6a6fe45a31f7f709b5c312afa97d58c637c7add0be9"
+checksum = "d34d88b3f3ec8c532945831eeea8170f9410a37f444feb1322b8e124f3a4a3b9"
 dependencies = [
- "histogram 0.11.4",
- "metriken-core",
- "metriken-derive",
- "once_cell",
- "parking_lot",
-]
-
-[[package]]
-name = "metriken"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "625cf66223be6d306db71b8bec24e8ae6b18bce095d41b8b696fe7b87ccdfd1a"
-dependencies = [
- "histogram 1.2.0",
+ "histogram 1.5.0",
  "metriken-core",
  "metriken-derive",
  "once_cell",
@@ -942,10 +930,11 @@ dependencies = [
 
 [[package]]
 name = "metriken-core"
-version = "0.1.3"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a51491c61573eefe01aff38c3ab258f182c596e29362caffb108c10585fdf6cc"
+checksum = "bab27bd3058a12219267acc9a86c68c9a55ab456825582758f5c0376a1267e31"
 dependencies = [
+ "histogram 1.5.0",
  "linkme",
  "parking_lot",
  "phf",
@@ -976,6 +965,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -1096,29 +1086,30 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phf"
-version = "0.11.3"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
 dependencies = [
  "phf_macros",
  "phf_shared",
+ "serde",
 ]
 
 [[package]]
 name = "phf_generator"
-version = "0.11.3"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+checksum = "135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737"
 dependencies = [
+ "fastrand",
  "phf_shared",
- "rand 0.8.6",
 ]
 
 [[package]]
 name = "phf_macros"
-version = "0.11.3"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
+checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
 dependencies = [
  "phf_generator",
  "phf_shared",
@@ -1129,9 +1120,9 @@ dependencies = [
 
 [[package]]
 name = "phf_shared"
-version = "0.11.3"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
 ]
@@ -1239,7 +1230,7 @@ dependencies = [
  "ketama",
  "libc",
  "metrics",
- "metriken 0.8.0",
+ "metriken",
  "num_cpus",
  "resp-proto",
  "ringline",
@@ -1271,21 +1262,12 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "rand"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
 dependencies = [
  "rand_chacha",
- "rand_core 0.9.5",
+ "rand_core",
 ]
 
 [[package]]
@@ -1295,14 +1277,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core 0.9.5",
+ "rand_core",
 ]
-
-[[package]]
-name = "rand_core"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
 name = "rand_core"
@@ -1319,7 +1295,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
 dependencies = [
- "rand_core 0.9.5",
+ "rand_core",
 ]
 
 [[package]]
@@ -1382,9 +1358,9 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "resp-proto"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1169c78518f0fc00e1b679cd2663cd50c6d05918362bf6a03edf5a15fbe3bac3"
+checksum = "d01e2c53b92515b23532298e01e98af3c6e1b22330411a4b661eab456d78aabc"
 dependencies = [
  "bytes",
  "itoa",
@@ -1409,15 +1385,17 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.0.3-alpha.0"
-source = "git+https://github.com/ringline-rs/ringline.git?rev=6e373ef#6e373ef4da8db5f0d6027921e588455d005ccea0"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ceff25c27887a057239c350c4165fbcfdd8c37ba4ebb12439b0154ff2ad3bd05"
 dependencies = [
  "bytes",
  "crossbeam-channel",
  "futures-io",
  "io-uring",
  "libc",
- "metriken 0.7.0",
+ "metriken",
+ "mio",
  "pin-project-lite",
  "rustls",
  "thiserror 2.0.18",
@@ -1425,11 +1403,13 @@ dependencies = [
 
 [[package]]
 name = "ringline-redis"
-version = "0.1.1"
-source = "git+https://github.com/ringline-rs/ringline.git?rev=6e373ef#6e373ef4da8db5f0d6027921e588455d005ccea0"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c556a8440503cbf9c1c06c0395ab61980acde31805549caf8989983c4f1f18e5"
 dependencies = [
  "bytes",
  "histogram 0.11.4",
+ "itoa",
  "ketama",
  "resp-proto",
  "ringline",
@@ -1655,7 +1635,7 @@ dependencies = [
  "libc",
  "memcache-proto",
  "metrics",
- "metriken 0.8.0",
+ "metriken",
  "num_cpus",
  "parking_lot",
  "protocol-ping",

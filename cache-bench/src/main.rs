@@ -501,8 +501,8 @@ fn percentile(hist: &AtomicHistogram, p: f64) -> f64 {
 }
 
 fn percentile_from_histogram(hist: &Histogram, p: f64) -> f64 {
-    if let Ok(Some(results)) = hist.percentiles(&[p])
-        && let Some((_pct, bucket)) = results.first()
+    if let Ok(Some(results)) = hist.quantile(p / 100.0)
+        && let Some(bucket) = results.entries().values().next()
     {
         return bucket.end() as f64;
     }
@@ -518,10 +518,8 @@ fn max_percentile(hist: &AtomicHistogram) -> f64 {
 }
 
 fn max_from_histogram(hist: &Histogram) -> f64 {
-    if let Ok(Some(results)) = hist.percentiles(&[100.0])
-        && let Some((_pct, bucket)) = results.first()
-    {
-        return bucket.end() as f64;
+    if let Ok(Some(results)) = hist.quantile(1.0) {
+        return results.max().end() as f64;
     }
     0.0
 }

@@ -94,35 +94,29 @@ mod server {
             );
         }
 
-        let krio_config = ringline::Config {
-            sq_entries: config.uring.sq_depth,
-            sqpoll: config.uring.sqpoll,
-            sqpoll_idle_ms: config.uring.sqpoll_idle_ms,
-            recv_buffer: ringline::RecvBufferConfig {
-                ring_size: config.uring.buffer_count.next_power_of_two(),
-                buffer_size: config.uring.buffer_size as u32,
-                ..Default::default()
-            },
-            worker: ringline::WorkerConfig {
-                threads: num_workers,
-                pin_to_core: cpu_affinity.is_some(),
-                core_offset: cpu_affinity.as_ref().map(|c| c[0]).unwrap_or(0),
-            },
-            tcp_nodelay: true,
-            send_copy_slot_size,
-            send_copy_count,
-            send_slab_slots: 4096,
-            ..Default::default()
-        };
+        let mut krio_builder = ringline::ConfigBuilder::new()
+            .sq_entries(config.uring.sq_depth)
+            .sqpoll(config.uring.sqpoll)
+            .sqpoll_idle_ms(config.uring.sqpoll_idle_ms)
+            .recv_buffer(
+                config.uring.buffer_count.next_power_of_two(),
+                config.uring.buffer_size as u32,
+            )
+            .workers(num_workers)
+            .pin_to_core(cpu_affinity.is_some())
+            .core_offset(cpu_affinity.as_ref().map(|c| c[0]).unwrap_or(0))
+            .tcp_nodelay(true)
+            .send_pool(send_copy_count, send_copy_slot_size)
+            .send_slab_slots(4096);
 
         // Enable ringline's disk I/O subsystem based on backend
-        let mut krio_config = krio_config;
         match disk_io_backend {
             Some(DiskIoBackendConfig::DirectIo) => {
-                krio_config.direct_io = Some(ringline::direct_io::DirectIoConfig::default());
+                krio_builder =
+                    krio_builder.direct_io(ringline::direct_io::DirectIoConfig::default());
             }
             Some(DiskIoBackendConfig::Nvme) => {
-                krio_config.nvme = Some(ringline::nvme::NvmeConfig::default());
+                krio_builder = krio_builder.nvme(ringline::nvme::NvmeConfig::default());
             }
             _ => {}
         }
@@ -168,14 +162,12 @@ mod server {
         };
 
         // Load TLS config if configured
-        let krio_config = if let Some(ref tls_cfg) = config.listener[0].tls {
-            let mut c = krio_config;
-            c.tls = Some(crate::tls::load_server_config(tls_cfg)?);
+        if let Some(ref tls_cfg) = config.listener[0].tls {
+            krio_builder = krio_builder.tls(crate::tls::load_server_config(tls_cfg)?);
             info!("TLS enabled");
-            c
-        } else {
-            krio_config
-        };
+        }
+
+        let krio_config = krio_builder.build()?;
 
         let bind_target = config.listener[0]
             .bind_target()

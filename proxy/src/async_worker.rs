@@ -971,21 +971,17 @@ pub fn run_async(
     init_config_channel(config_rx);
 
     // Build ringline config.
-    let krio_config = ringline::Config {
-        recv_buffer: ringline::RecvBufferConfig {
-            ring_size: config.uring.buffer_count.next_power_of_two(),
-            buffer_size: config.uring.buffer_size as u32,
-            ..Default::default()
-        },
-        worker: ringline::WorkerConfig {
-            threads: num_workers,
-            pin_to_core: false, // We pin in create_for_worker.
-            core_offset: 0,
-        },
-        sq_entries: config.uring.sq_depth,
-        tcp_nodelay: true,
-        ..Default::default()
-    };
+    let krio_config = ringline::ConfigBuilder::new()
+        .recv_buffer(
+            config.uring.buffer_count.next_power_of_two(),
+            config.uring.buffer_size as u32,
+        )
+        .workers(num_workers)
+        .pin_to_core(false) // We pin in create_for_worker.
+        .core_offset(0)
+        .sq_entries(config.uring.sq_depth)
+        .tcp_nodelay(true)
+        .build()?;
 
     // Launch ringline with async event handler.
     let (shutdown_handle, handles) = RinglineBuilder::new(krio_config)

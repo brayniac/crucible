@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Upgraded to published ringline releases**: `ringline` 0.6 and `ringline-redis` 0.7 from
+  crates.io, replacing the pinned git revision. Picks up the io_uring send/close correctness
+  fixes, segmented zero-copy recv, and the 1 GiB `recv_accumulator_max` default. Adapting to the
+  breaking API changes:
+  - `ringline::Config` is built through `ConfigBuilder` (server, proxy, ping, proxy tests);
+    `WorkerConfig` / `RecvBufferConfig` are no longer exported and `Config::validate()` now
+    always runs at build time
+  - `ringline::TlsConfig` is constructed with `TlsConfig::new()` instead of a struct literal
+  - `nvme_read` / `nvme_write` are `unsafe fn`; the disk-tier read and flush paths wrap them with
+    the buffer-lifetime safety argument
+  - `AsyncSendBuilder::submit_batch_await` was removed upstream; the scatter-gather drain path
+    submits with `submit_batch` and yields explicitly on the backpressure path. `MAX_IOVECS` /
+    `MAX_GUARDS` are no longer exported, so the handler defines its own batch caps
+- **Bumped protocol crates**: `resp-proto` 0.0.2, `memcache-proto` 0.0.5, `http2-proto` 0.0.2,
+  `grpc-proto` 0.0.2, `ketama` 0.0.2 — matching what ringline 0.6 builds against (line-framing,
+  ring-routing, and parser-overflow fixes)
+- **Bumped `metriken` to 0.9**, which is what ringline 0.6 registers its metrics with. Crucible
+  and ringline now share one metriken registry, so ringline's I/O metrics are exposed on
+  `/metrics` again; histogram exposition moved from the deprecated `percentiles()` to
+  `quantiles()`
+
 ## [0.4.1] - 2026-02-25
 
 ### Fixed

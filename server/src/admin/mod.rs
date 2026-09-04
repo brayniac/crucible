@@ -218,15 +218,14 @@ fn generate_prometheus_output(cache_stats_fn: &CacheStatsFn) -> String {
                 {
                     output.push_str(&format!("# TYPE {} histogram\n", prom_name));
 
-                    // Output percentiles as summary-style metrics
-                    let percentiles = [50.0, 90.0, 95.0, 99.0, 99.9, 99.99];
-                    if let Ok(Some(results)) = snapshot.percentiles(&percentiles) {
-                        for (pct, bucket) in results {
-                            let quantile = pct / 100.0;
+                    // Output quantiles as summary-style metrics
+                    let quantiles = [0.5, 0.9, 0.95, 0.99, 0.999, 0.9999];
+                    if let Ok(Some(results)) = snapshot.quantiles(&quantiles) {
+                        for (quantile, bucket) in results.entries() {
                             output.push_str(&format!(
                                 "{}{{quantile=\"{}\"}} {}\n",
                                 prom_name,
-                                quantile,
+                                quantile.as_f64(),
                                 bucket.end()
                             ));
                         }
