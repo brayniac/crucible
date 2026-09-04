@@ -395,6 +395,91 @@ impl MultiChoiceHashtable {
 
     /// Search a bucket for an item, updating frequency on hit.
     #[inline]
+    /// Verify the entry a slot currently publishes, distinguishing a real
+    /// key mismatch from a comparison that raced a publish.
+    ///
+    /// # Why a bare `verify` is not enough
+    ///
+    /// [`KeyVerifier::verify`] answers a `bool` by reading item bytes at the
+    /// location it is handed. That answer conflates two very different
+    /// outcomes: "this slot holds some other key", which is authoritative,
+    /// and "the location I was handed stopped being this entry's while I was
+    /// looking", which says nothing about the key.
+    ///
+    /// The second outcome is reachable on every publish.
+    /// `TieredCache::cas` swaps the slot to the new location *first* and
+    /// delete-marks the superseded item *second*, so a reader that loaded the
+    /// slot word before the swap and verifies after the delete-mark compares
+    /// against a delete-marked item and gets `false` — for a key that is live
+    /// in that very slot the whole time. Treating that as a mismatch ends the
+    /// scan in a false absent: `contains` reports a live key missing, and
+    /// `increment` turns that into `KeyNotFound`.
+    ///
+    /// # The invariant this rests on
+    ///
+    /// Re-read the slot word after a `false`. If the published location is
+    /// unchanged, nothing moved under us and the mismatch is authoritative.
+    /// If it moved, the comparison was against a stale location: retry
+    /// against what the slot publishes now, converging on the entry's current
+    /// location.
+    ///
+    /// Frequency lives in the same word, so the comparison is on the location
+    /// and tag bits only — a concurrent reader bumping frequency must not look
+    /// like a relocation.
+    ///
+    /// Returns the (possibly refreshed) slot word and location on a match.
+    fn verify_slot(
+        &self,
+        bucket: &Hashbucket,
+        slot_index: usize,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+        allow_deleted: bool,
+        mut packed: u64,
+    ) -> Option<(u64, Location)> {
+        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
+        const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
+        // Every caller has already matched the slot's tag against the key's
+        // before calling, so the tag we must stay within is the one the
+        // starting word carries.
+        let tag_shifted = packed & TAG_MASK;
+        // A publish can land between the load and the compare. Bounding the
+        // retries keeps a pathological writer from pinning a reader here; the
+        // bound is far above any real relocation rate for one slot.
+        const MAX_ATTEMPTS: usize = 8;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let location = Hashbucket::location(packed);
+            verifier.prefetch(location);
+
+            if verifier.verify(key, location, allow_deleted) {
+                return Some((packed, location));
+            }
+
+            let current = bucket.items[slot_index].load(Ordering::Acquire);
+            if Hashbucket::location(current) == location
+                && (current & TAG_MASK) == (packed & TAG_MASK)
+            {
+                // The slot still publishes what we compared against, so the
+                // mismatch is this slot's real answer.
+                return None;
+            }
+
+            // The slot moved under us. Anything that is no longer a live
+            // entry for our tag cannot be our key.
+            if current == 0
+                || (current & GHOST_LOCATION) == GHOST_LOCATION
+                || (current & TAG_MASK) != tag_shifted
+            {
+                return None;
+            }
+
+            packed = current;
+        }
+
+        None
+    }
+
     fn search_bucket_for_get(
         &self,
         bucket_index: usize,
@@ -428,13 +513,11 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            let location = Hashbucket::location(packed);
-
-            // Prefetch segment data while we verify - pipeline the memory access
-            verifier.prefetch(location);
-
-            // Verify key matches using the verifier
-            if verifier.verify(key, location, false) {
+            // Verify against what the slot publishes, retrying if a publish
+            // moves it under us (see `verify_slot`).
+            if let Some((packed, location)) =
+                self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+            {
                 // Update frequency (best effort)
                 let freq = Hashbucket::freq(packed);
                 if freq < 127
@@ -488,12 +571,10 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            let location = Hashbucket::location(packed);
-
-            // Prefetch segment data while we verify
-            verifier.prefetch(location);
-
-            if verifier.verify(key, location, false) {
+            if self
+                .verify_slot(bucket, slot_index, key, verifier, false, packed)
+                .is_some()
+            {
                 return true;
             }
         }
@@ -534,12 +615,9 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            let location = Hashbucket::location(packed);
-
-            // Prefetch segment data while we verify
-            verifier.prefetch(location);
-
-            if verifier.verify(key, location, false) {
+            if let Some((packed, _location)) =
+                self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+            {
                 return Some(packed);
             }
         }
@@ -631,9 +709,12 @@ impl MultiChoiceHashtable {
                     continue;
                 }
 
-                let location = Hashbucket::location(packed);
-
-                if verifier.verify(key, location, false) {
+                // A false absent here makes `cas` read the entry as changed
+                // and fail spuriously, so it takes the same stale-location
+                // guard as the other read paths (see `verify_slot`).
+                if let Some((packed, _location)) =
+                    self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+                {
                     return Some(Hashbucket::freq(packed));
                 }
             }
@@ -1743,6 +1824,101 @@ mod tests {
         fn add(&mut self, key: &[u8], location: Location, deleted: bool) {
             self.entries.push((key.to_vec(), location, deleted));
         }
+    }
+
+    /// Verifier that reproduces the stale-location false-absent race
+    /// deterministically, with no scheduler involvement.
+    ///
+    /// `TieredCache::cas` publishes a new value by swapping the slot to the
+    /// new location *first* and marking the superseded item deleted
+    /// *second*. A reader that loaded the slot word before the swap and
+    /// verifies after the delete-mark compares against a location that is
+    /// no longer published, sees a deleted item, and — because `verify`
+    /// answers a bare `bool` — cannot distinguish "this slot holds a
+    /// different key" from "I looked at the wrong place". It concludes the
+    /// key is absent while the key is live in that very slot.
+    ///
+    /// This verifier performs that publish from inside its own `verify`
+    /// call, which is exactly where the racing writer would land.
+    struct RacingPublishVerifier {
+        key: Vec<u8>,
+        old_location: Location,
+        new_location: Location,
+        table: std::sync::Mutex<Option<std::sync::Arc<MultiChoiceHashtable>>>,
+        raced: std::sync::atomic::AtomicBool,
+    }
+
+    impl KeyVerifier for RacingPublishVerifier {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            if key == self.key.as_slice() && location == self.old_location {
+                // First look at the stale location: run the concurrent
+                // publish now, then answer as the segment would once the
+                // superseded item is delete-marked.
+                if !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let table = self.table.lock().unwrap().clone().unwrap();
+                    assert!(
+                        table.cas_location(&self.key, self.old_location, self.new_location, true,),
+                        "precondition: the racing publish must land, or the \
+                         test is not exercising the stale-location window"
+                    );
+                }
+                // The superseded item is now delete-marked.
+                return allow_deleted;
+            }
+            // The live item at the new location.
+            key == self.key.as_slice() && location == self.new_location
+        }
+    }
+
+    /// Verifier that recognizes exactly one (key, location) pair as live.
+    struct StaticVerifier {
+        key: Vec<u8>,
+        location: Location,
+    }
+
+    impl KeyVerifier for StaticVerifier {
+        fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+            key == self.key.as_slice() && location == self.location
+        }
+    }
+
+    /// A lookup that races a publish must not report the key absent: the
+    /// key is live in the slot the whole time, only its location moves.
+    #[test]
+    fn stale_location_verify_does_not_report_false_absent() {
+        use std::sync::Arc as StdArc;
+
+        let table = StdArc::new(MultiChoiceHashtable::new(8));
+        let key = b"counter".to_vec();
+        let old_location = Location::new(0x1000);
+        let new_location = Location::new(0x2000);
+
+        let seed = StaticVerifier {
+            key: key.clone(),
+            location: old_location,
+        };
+        table.insert(&key, old_location, &seed).unwrap();
+
+        let racer = RacingPublishVerifier {
+            key: key.clone(),
+            old_location,
+            new_location,
+            table: std::sync::Mutex::new(Some(StdArc::clone(&table))),
+            raced: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        assert!(
+            table.contains(&key, &racer),
+            "contains() reported a live key absent after a publish moved its \
+             location mid-verify"
+        );
+
+        // Precondition: the race actually happened. Without this the test
+        // could pass vacuously if the scan never visited the stale location.
+        assert!(
+            racer.raced.load(std::sync::atomic::Ordering::SeqCst),
+            "the stale-location window was never exercised"
+        );
     }
 
     impl KeyVerifier for MockVerifier {
