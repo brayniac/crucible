@@ -665,8 +665,11 @@ impl SendGuard for BytesGuard {
 /// parts (< 1KB) are copy iovecs; large parts (≥ 1KB) are zero-copy guards.
 /// Up to MAX_IOVECS parts and MAX_GUARDS guards per SQE.
 ///
-/// When `must_yield` is true (backpressure path), the first SQE is awaited (or
-/// followed by an explicit yield) to guarantee at least one yield.
+/// When `must_yield` is true (backpressure path), the first SQE is awaited to
+/// completion, so the connection paces itself against the wire instead of
+/// queueing responses as fast as it can build them. Awaiting also parks the
+/// task, which is what lets the worker's event loop block on a completion
+/// rather than spin.
 async fn drain_pending(
     conn: &ConnCtx,
     connection: &mut Connection,
@@ -785,22 +788,31 @@ async fn drain_pending(
 
             let batch_count = batch.len();
 
-            let result = match conn.send_parts().submit_batch(batch) {
-                Ok(_) => {
-                    // ringline 0.3.0 removed `submit_batch_await`, so the batch
-                    // is fire-and-forget; yield explicitly to give the executor a
-                    // chance to reap completions before we queue more.
-                    if need_yield {
+            let result = if need_yield {
+                match conn.send_parts().submit_batch_await(batch) {
+                    Ok((_, fut)) => {
                         need_yield = false;
-                        yield_once().await;
+                        if fut.await.is_err() {
+                            connection.advance_write(advanced);
+                            return Err(());
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Err(e) if e.kind() == io::ErrorKind::Other => {
+                        connection.advance_write(advanced);
+                        return Ok(());
+                    }
+                    Err(_) => Err(()),
                 }
-                Err(e) if e.kind() == io::ErrorKind::Other => {
-                    connection.advance_write(advanced);
-                    return Ok(());
+            } else {
+                match conn.send_parts().submit_batch(batch) {
+                    Ok(_) => Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::Other => {
+                        connection.advance_write(advanced);
+                        return Ok(());
+                    }
+                    Err(_) => Err(()),
                 }
-                Err(_) => Err(()),
             };
 
             if result.is_err() {
