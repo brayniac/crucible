@@ -8,6 +8,43 @@
 use crate::sync::{AtomicU32, Ordering};
 use std::time::Duration;
 
+/// Read an item's flags byte.
+///
+/// The flags byte is the one header byte written after an item is published:
+/// `Segment::mark_deleted` sets the tombstone bit on a live, reader-visible
+/// item with an atomic `fetch_or`. Readers decode `optional_len`,
+/// `is_deleted` and `is_numeric` out of that same byte on every lookup, so a
+/// plain load here races that store -- a data race in the memory model
+/// whatever the hardware happens to do, and one ThreadSanitizer reports on
+/// the first concurrent delete.
+///
+/// `Relaxed` is sufficient. The byte carries no ordering dependency of its
+/// own: an item's contents are published before it becomes reachable, and
+/// this read establishes nothing beyond the flag bits themselves.
+///
+/// # Safety
+///
+/// `ptr` must point at the flags byte of a live item header.
+#[inline(always)]
+unsafe fn read_flags(ptr: *const u8) -> u8 {
+    #[cfg(not(feature = "loom"))]
+    {
+        // SAFETY: caller guarantees `ptr` addresses the flags byte. `AtomicU8`
+        // has the same layout and alignment (1) as `u8`, and every writer of
+        // this byte goes through the same atomic view.
+        unsafe {
+            (*(ptr as *const core::sync::atomic::AtomicU8))
+                .load(core::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    #[cfg(feature = "loom")]
+    {
+        // loom's atomics cannot be conjured from a raw pointer, so the loom
+        // build keeps the volatile read the writer side pairs with there.
+        unsafe { std::ptr::read_volatile(ptr) }
+    }
+}
+
 // ============================================================================
 // BasicHeader - Header with segment-level TTL
 // ============================================================================
@@ -128,7 +165,7 @@ impl BasicHeader {
 
         // Read key_len, flags, and value_len from new layout
         let key_len = unsafe { *ptr };
-        let flags = unsafe { *ptr.add(1) };
+        let flags = unsafe { read_flags(ptr.add(1)) };
         let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
 
         let optional_len = flags & 0x3F;
@@ -173,7 +210,7 @@ impl BasicHeader {
 
         // Items are 8-byte aligned
         let key_len = unsafe { *ptr };
-        let flags = unsafe { *ptr.add(1) };
+        let flags = unsafe { read_flags(ptr.add(1)) };
         // value_len at offset 2 is NOT 4-byte aligned, must use unaligned read
         let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
 
@@ -434,7 +471,7 @@ impl TtlHeader {
 
         // Read key_len, flags, value_len, and expire_at from new layout
         let key_len = unsafe { *ptr };
-        let flags = unsafe { *ptr.add(1) };
+        let flags = unsafe { read_flags(ptr.add(1)) };
         let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
         let expire_at = unsafe { ptr.add(6).cast::<u32>().read_unaligned() };
 
@@ -487,7 +524,7 @@ impl TtlHeader {
 
         // Items are 8-byte aligned
         let key_len = unsafe { *ptr };
-        let flags = unsafe { *ptr.add(1) };
+        let flags = unsafe { read_flags(ptr.add(1)) };
         // value_len at offset 2 is NOT 4-byte aligned, must use unaligned read
         let value_len = unsafe { ptr.add(2).cast::<u32>().read_unaligned() };
         // expire_at at offset 6 is NOT 4-byte aligned, must use unaligned read
