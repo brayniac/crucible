@@ -55,15 +55,15 @@ impl AsyncEventHandler for RespEchoBackend {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn test_krio_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
-    config.send_copy_count = 64;
-    config
+    ringline::ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+        .build()
+        .expect("valid test ringline config")
 }
 
 fn free_port() -> u16 {

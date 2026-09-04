@@ -26,7 +26,5 @@ pub fn load_server_config(
         .with_single_cert(certs, key)
         .map_err(|e| format!("invalid TLS certificate/key: {e}"))?;
 
-    Ok(ringline::TlsConfig {
-        server_config: Arc::new(server_config),
-    })
+    Ok(ringline::TlsConfig::new(Arc::new(server_config)))
 }

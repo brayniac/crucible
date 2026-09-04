@@ -16,10 +16,7 @@ use bytes::Bytes;
 use cache_core::Cache;
 use cache_core::disk::AlignedBufferPool;
 use parking_lot::Mutex;
-use ringline::{
-    AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, MAX_GUARDS, MAX_IOVECS, RegionId, SendGuard,
-    SendPart,
-};
+use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, GuardBox, RegionId, SendGuard, SendPart};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -229,13 +226,19 @@ async fn flush_worker<C: Cache>(
                 DiskBackend::Nvme { device, block_size } => {
                     let lba = req.disk_offset / *block_size as u64;
                     let num_blocks = (req.buffer_len / *block_size) as u16;
-                    match ringline::nvme_write(
-                        *device,
-                        lba,
-                        num_blocks,
-                        req.buffer_ptr as u64,
-                        req.buffer_len,
-                    ) {
+                    // SAFETY: the flush buffer is owned by the cache's write
+                    // buffer for this segment and is only released by
+                    // `complete_flush` / the retry path below, both of which
+                    // run after the future resolves.
+                    match unsafe {
+                        ringline::nvme_write(
+                            *device,
+                            lba,
+                            num_blocks,
+                            req.buffer_ptr as u64,
+                            req.buffer_len,
+                        )
+                    } {
                         Ok(fut) => fut.await,
                         Err(e) => Err(e),
                     }
@@ -525,13 +528,18 @@ async fn submit_and_await_disk_read<C: Cache>(
             DiskBackend::Nvme { device, block_size } => {
                 let lba = pending_info.params.disk_offset / *block_size as u64;
                 let num_blocks = (pending_info.params.read_len / *block_size) as u16;
-                ringline::nvme_read(
-                    *device,
-                    lba,
-                    num_blocks,
-                    buffer.addr(),
-                    pending_info.params.read_len,
-                )
+                // SAFETY: `buffer` comes from the read buffer pool, is aligned
+                // for O_DIRECT/NVMe, and is only returned to the pool by
+                // `release_read!` after the future below resolves.
+                unsafe {
+                    ringline::nvme_read(
+                        *device,
+                        lba,
+                        num_blocks,
+                        buffer.addr(),
+                        pending_info.params.read_len,
+                    )
+                }
             }
         }
     };
@@ -627,6 +635,17 @@ async fn submit_and_await_disk_read<C: Cache>(
 /// Minimum part size to use zero-copy guard path instead of copy.
 const GUARD_MIN_SIZE: usize = 1024;
 
+/// Maximum iovecs in a single scatter-gather send SQE.
+///
+/// Mirrors ringline's internal `MAX_IOVECS` (unexported since 0.3.0). A batch
+/// larger than this is rejected whole by `submit_batch`, so we split here.
+const MAX_IOVECS: usize = 32;
+
+/// Maximum zero-copy guards in a single scatter-gather send SQE.
+///
+/// Mirrors ringline's internal `MAX_GUARDS` (unexported since 0.3.0).
+const MAX_GUARDS: usize = 8;
+
 /// Zero-copy send guard backed by a `Bytes` handle.
 struct BytesGuard(Bytes);
 
@@ -646,8 +665,8 @@ impl SendGuard for BytesGuard {
 /// parts (< 1KB) are copy iovecs; large parts (≥ 1KB) are zero-copy guards.
 /// Up to MAX_IOVECS parts and MAX_GUARDS guards per SQE.
 ///
-/// When `must_yield` is true (backpressure path), the first SQE uses
-/// `submit_batch_await` to guarantee at least one yield.
+/// When `must_yield` is true (backpressure path), the first SQE is awaited (or
+/// followed by an explicit yield) to guarantee at least one yield.
 async fn drain_pending(
     conn: &ConnCtx,
     connection: &mut Connection,
@@ -766,31 +785,22 @@ async fn drain_pending(
 
             let batch_count = batch.len();
 
-            let result = if need_yield {
-                match conn.send_parts().submit_batch_await(batch) {
-                    Ok((_, fut)) => {
+            let result = match conn.send_parts().submit_batch(batch) {
+                Ok(_) => {
+                    // ringline 0.3.0 removed `submit_batch_await`, so the batch
+                    // is fire-and-forget; yield explicitly to give the executor a
+                    // chance to reap completions before we queue more.
+                    if need_yield {
                         need_yield = false;
-                        if fut.await.is_err() {
-                            connection.advance_write(advanced);
-                            return Err(());
-                        }
-                        Ok(())
+                        yield_once().await;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::Other => {
-                        connection.advance_write(advanced);
-                        return Ok(());
-                    }
-                    Err(_) => Err(()),
+                    Ok(())
                 }
-            } else {
-                match conn.send_parts().submit_batch(batch) {
-                    Ok(_) => Ok(()),
-                    Err(e) if e.kind() == io::ErrorKind::Other => {
-                        connection.advance_write(advanced);
-                        return Ok(());
-                    }
-                    Err(_) => Err(()),
+                Err(e) if e.kind() == io::ErrorKind::Other => {
+                    connection.advance_write(advanced);
+                    return Ok(());
                 }
+                Err(_) => Err(()),
             };
 
             if result.is_err() {
