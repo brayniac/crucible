@@ -91,11 +91,18 @@ jobs:
     # No suppressions: the tree is clean, and a report should fail the job
     # rather than accumulate exceptions. halt_on_error stops at the first.
     #
-    # Scope is `--lib` on the four cache crates: that is where the shared
-    # mutable state lives, it runs in seconds under the sanitizer, and it
-    # skips both the integration soaks (large_value_tests, tens of seconds
-    # each before TSan's slowdown) and doctests, whose rustdoc invocations
-    # do not get the sanitizer ABI flags under -Zbuild-std.
+    # Scope is `--lib` on the four cache crates plus the disk-tier
+    # integration test: that is where the shared mutable state lives, it runs
+    # in seconds under the sanitizer, and it skips both the integration soaks
+    # (large_value_tests, tens of seconds each before TSan's slowdown) and
+    # doctests, whose rustdoc invocations do not get the sanitizer ABI flags
+    # under -Zbuild-std.
+    #
+    # The disk-tier test is included deliberately. `DiskSegmentMeta` carries
+    # its own `mark_deleted`, and a `--lib`-only scope does not execute it --
+    # which is exactly how its non-atomic tombstone write survived the first
+    # pass of this job. Concurrency coverage is what this job can see, so a
+    # path with no concurrent test is a path TSan is not checking.
     env:
       RUSTFLAGS: "-Zsanitizer=thread"
     steps:
@@ -109,10 +116,13 @@ jobs:
       - name: Test under ThreadSanitizer
         env:
           TSAN_OPTIONS: "halt_on_error=1"
-        run: >
-          cargo +nightly test
-          -p cache-core -p segcache -p slab-cache -p heap-cache
-          -Zbuild-std --target x86_64-unknown-linux-gnu --lib
+        run: |
+          cargo +nightly test \
+            -p cache-core -p segcache -p slab-cache -p heap-cache \
+            -Zbuild-std --target x86_64-unknown-linux-gnu --lib
+          cargo +nightly test \
+            -p segcache -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --test io_uring_disk_tier_tests
 
   smoketest:
     name: Smoketest (${{ matrix.config }})

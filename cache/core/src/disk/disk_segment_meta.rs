@@ -619,11 +619,31 @@ impl Segment for DiskSegmentMeta {
             return;
         }
 
-        // Set deleted flag in the header
-        unsafe {
-            let flags_ptr = data_ptr.add(offset as usize + 1);
-            let flags = *flags_ptr;
-            *flags_ptr = flags | 0x40; // Set is_deleted bit
+        // Set the deleted flag atomically. This byte is read concurrently by
+        // every header decode (`item::read_flags`), so a plain
+        // read-modify-write here is a data race with live readers.
+        let flags_ptr = unsafe { data_ptr.add(offset as usize + 1) };
+
+        #[cfg(not(feature = "loom"))]
+        {
+            // SAFETY: `flags_ptr` addresses the header's flags byte, which is
+            // in bounds (checked above). `AtomicU8` matches `u8` in layout and
+            // alignment, and every other writer of this byte uses the same
+            // atomic view.
+            let flags_atomic = unsafe { &*(flags_ptr as *const AtomicU8) };
+            flags_atomic.fetch_or(0x40, Ordering::Release);
+        }
+
+        #[cfg(feature = "loom")]
+        {
+            // loom does not re-export `AtomicU8` and its atomics cannot be
+            // built from a raw pointer, so the loom build pairs volatile
+            // access with the volatile readers, as `SliceSegment` does.
+            fence(Ordering::Release);
+            unsafe {
+                let old = std::ptr::read_volatile(flags_ptr);
+                std::ptr::write_volatile(flags_ptr, old | 0x40);
+            }
         }
     }
 
@@ -640,9 +660,10 @@ impl Segment for DiskSegmentMeta {
             unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
         let header = BasicHeader::from_bytes(header_bytes);
 
-        if header.is_deleted() {
-            return Ok(false); // Already deleted
-        }
+        // NOTE: the is_deleted check that used to live here has moved below
+        // the flag write. Checking first and acting later let two concurrent
+        // deletes of the same item both observe "live" and both decrement the
+        // live counters, wrapping `live_items` past zero.
 
         // Verify key
         let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -656,11 +677,33 @@ impl Segment for DiskSegmentMeta {
             return Err(CacheError::KeyMismatch);
         }
 
-        // Set deleted flag
-        unsafe {
-            let flags_ptr = data_ptr.add(offset as usize + 1);
-            let flags = *flags_ptr;
-            *flags_ptr = flags | 0x40;
+        // Set the deleted flag atomically and let the returned value decide
+        // who owns the delete. The flag byte is read concurrently by every
+        // header decode, so a plain read-modify-write here both races those
+        // readers and loses the race between two deleters: the winner is
+        // whoever observes the bit still clear, and only that caller may
+        // adjust the live counters.
+        let flags_ptr = unsafe { data_ptr.add(offset as usize + 1) };
+
+        #[cfg(not(feature = "loom"))]
+        let old_flags = {
+            // SAFETY: as in `mark_deleted_at_offset` above.
+            let flags_atomic = unsafe { &*(flags_ptr as *const AtomicU8) };
+            flags_atomic.fetch_or(0x40, Ordering::Release)
+        };
+
+        #[cfg(feature = "loom")]
+        let old_flags = {
+            fence(Ordering::Release);
+            unsafe {
+                let old = std::ptr::read_volatile(flags_ptr);
+                std::ptr::write_volatile(flags_ptr, old | 0x40);
+                old
+            }
+        };
+
+        if (old_flags & 0x40) != 0 {
+            return Ok(false); // Someone else marked it deleted first.
         }
 
         let padded_size = header.padded_size() as u32;
