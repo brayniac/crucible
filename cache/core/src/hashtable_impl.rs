@@ -10,7 +10,7 @@
 use crate::error::{CacheError, CacheResult};
 use crate::hashtable::{Hashtable, KeyVerifier};
 use crate::location::Location;
-use crate::sync::{AtomicU64, Ordering};
+use crate::sync::{AtomicU64, Ordering, fence, spin_loop};
 use ahash::RandomState;
 
 /// Maximum number of bucket choices supported.
@@ -393,6 +393,140 @@ impl MultiChoiceHashtable {
         result
     }
 
+    /// Verify the entry a slot currently publishes, distinguishing a real
+    /// key mismatch from a comparison that raced a publish.
+    ///
+    /// # Why a bare `verify` is not enough
+    ///
+    /// [`KeyVerifier::verify`] answers a `bool` by reading item bytes at the
+    /// location it is handed. That answer conflates two very different
+    /// outcomes: "this slot holds some other key", which is authoritative,
+    /// and "the location I was handed stopped being this entry's while I was
+    /// looking", which says nothing about the key.
+    ///
+    /// The second outcome is reachable on every publish.
+    /// `TieredCache::cas` swaps the slot to the new location *first* and
+    /// delete-marks the superseded item *second*, so a reader that loaded the
+    /// slot word before the swap and verifies after the delete-mark compares
+    /// against a delete-marked item and gets `false` — for a key that is live
+    /// in that very slot the whole time. Treating that as a mismatch ends the
+    /// scan in a false absent: `contains` reports a live key missing, and
+    /// `increment` turns that into `KeyNotFound`.
+    ///
+    /// # The invariant this rests on
+    ///
+    /// Re-read the slot word after a `false`. If the published location is
+    /// unchanged, nothing moved under us and the mismatch is authoritative.
+    /// If it moved, the comparison was against a stale location: retry
+    /// against what the slot publishes now, converging on the entry's current
+    /// location.
+    ///
+    /// Comparing only location and tag bits leaves an A→B→A hole: a slot can
+    /// move away and come back to the same location when a segment is
+    /// recycled and the same key lands at the same offset. So an unchanged
+    /// slot is not trusted on its own. Every writer moves or clears the slot
+    /// *before* it delete-marks what it superseded, so "the slot still
+    /// publishes this location, and the item there is our key with a
+    /// tombstone" is never a settled state — it means a publish is in
+    /// flight. That is the one case an unchanged slot is not authoritative,
+    /// and re-probing with `allow_deleted` is what distinguishes it from the
+    /// genuine "some other key lives here".
+    ///
+    /// # Progress
+    ///
+    /// The retry is unbounded on purpose. It only advances when another
+    /// thread has *completed* a publish to this slot, so the loop is
+    /// lock-free by the usual argument rather than a spin: bounding it and
+    /// answering `None` on exhaustion would reintroduce exactly the false
+    /// absent this exists to prevent, and would be indistinguishable from
+    /// the authoritative answer at every call site. The tombstone case is
+    /// bounded instead, because there a stable slot means the key really is
+    /// deleted and `None` is the right answer.
+    ///
+    /// Convergence is within one slot. An entry that relocates into a
+    /// different slot, or into a bucket this scan already passed, is still
+    /// missed; publishes are in-place slot compare_exchanges, so that does
+    /// not arise from the publish path this guards.
+    ///
+    /// Returns the (possibly refreshed) slot word and location on a match.
+    #[inline]
+    fn verify_slot(
+        &self,
+        bucket: &Hashbucket,
+        slot_index: usize,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+        allow_deleted: bool,
+        mut packed: u64,
+    ) -> Option<(u64, Location)> {
+        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
+        const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
+        // Bound only the in-flight-publish case: a slot that keeps publishing
+        // a tombstone of our key resolves within a publish, and if it never
+        // moves the key is genuinely deleted.
+        const MAX_TOMBSTONE_POLLS: u32 = 8;
+
+        // Every caller has already matched the slot's tag against the key's
+        // before calling, so the tag we must stay within is the one the
+        // starting word carries.
+        let tag_shifted = packed & TAG_MASK;
+        let mut tombstone_polls = 0u32;
+
+        loop {
+            let location = Hashbucket::location(packed);
+            verifier.prefetch(location);
+
+            if verifier.verify(key, location, allow_deleted) {
+                return Some((packed, location));
+            }
+
+            // Is this our key wearing a tombstone, rather than a different
+            // key? Only asked on the mismatch path, which is rare.
+            let tombstoned_self = !allow_deleted && verifier.verify(key, location, true);
+
+            // Order the item reads above *before* the slot re-read below. A
+            // load-acquire orders what follows it, not what precedes it, so
+            // on a weakly-ordered target (aarch64 is supported) the header
+            // and key loads could otherwise be satisfied after this load and
+            // observe a delete-mark the re-read did not account for.
+            fence(Ordering::Acquire);
+            let current = bucket.items[slot_index].load(Ordering::Acquire);
+
+            if Hashbucket::location(current) == location && (current & TAG_MASK) == tag_shifted {
+                if !tombstoned_self {
+                    // The slot still publishes what we compared against, so
+                    // the mismatch is this slot's real answer.
+                    return None;
+                }
+                // A publish is in flight, or the key is deleted. Give the
+                // publisher a bounded window to land its slot swap.
+                tombstone_polls += 1;
+                if tombstone_polls >= MAX_TOMBSTONE_POLLS {
+                    return None;
+                }
+                spin_loop();
+                continue;
+            }
+
+            // The slot moved under us. Anything that is no longer a live
+            // entry for our tag cannot be our key.
+            if current == 0
+                || (current & GHOST_LOCATION) == GHOST_LOCATION
+                || (current & TAG_MASK) != tag_shifted
+            {
+                return None;
+            }
+
+            // The slot moved, so the budget above was not spent on a stable
+            // slot after all. Reset it: it bounds one publish landing, not a
+            // key's whole relocation history, and letting it accumulate
+            // across generations answers `None` for a live, visibly-moving
+            // key -- the false absent this function exists to prevent.
+            tombstone_polls = 0;
+            packed = current;
+        }
+    }
+
     /// Search a bucket for an item, updating frequency on hit.
     #[inline]
     fn search_bucket_for_get(
@@ -428,13 +562,11 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            let location = Hashbucket::location(packed);
-
-            // Prefetch segment data while we verify - pipeline the memory access
-            verifier.prefetch(location);
-
-            // Verify key matches using the verifier
-            if verifier.verify(key, location, false) {
+            // Verify against what the slot publishes, retrying if a publish
+            // moves it under us (see `verify_slot`).
+            if let Some((packed, location)) =
+                self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+            {
                 // Update frequency (best effort)
                 let freq = Hashbucket::freq(packed);
                 if freq < 127
@@ -488,12 +620,10 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            let location = Hashbucket::location(packed);
-
-            // Prefetch segment data while we verify
-            verifier.prefetch(location);
-
-            if verifier.verify(key, location, false) {
+            if self
+                .verify_slot(bucket, slot_index, key, verifier, false, packed)
+                .is_some()
+            {
                 return true;
             }
         }
@@ -534,12 +664,9 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            let location = Hashbucket::location(packed);
-
-            // Prefetch segment data while we verify
-            verifier.prefetch(location);
-
-            if verifier.verify(key, location, false) {
+            if let Some((packed, _location)) =
+                self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+            {
                 return Some(packed);
             }
         }
@@ -631,9 +758,16 @@ impl MultiChoiceHashtable {
                     continue;
                 }
 
-                let location = Hashbucket::location(packed);
-
-                if verifier.verify(key, location, false) {
+                // Same stale-location guard as the other read paths (see
+                // `verify_slot`). This backs `get_frequency`, whose callers
+                // are the eviction and demotion fate decisions in the TTL and
+                // FIFO layers; a false absent there scores a hot item as
+                // freq 0 and discards it. (`cas` asks a different function,
+                // `get_item_frequency`, which is location-scoped and does not
+                // come through here.)
+                if let Some((packed, _location)) =
+                    self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+                {
                     return Some(Hashbucket::freq(packed));
                 }
             }
@@ -1743,6 +1877,316 @@ mod tests {
         fn add(&mut self, key: &[u8], location: Location, deleted: bool) {
             self.entries.push((key.to_vec(), location, deleted));
         }
+    }
+
+    /// Verifier that reproduces the stale-location false-absent race
+    /// deterministically, with no scheduler involvement.
+    ///
+    /// `TieredCache::cas` publishes a new value by swapping the slot to the
+    /// new location *first* and marking the superseded item deleted
+    /// *second*. A reader that loaded the slot word before the swap and
+    /// verifies after the delete-mark compares against a location that is
+    /// no longer published, sees a deleted item, and — because `verify`
+    /// answers a bare `bool` — cannot distinguish "this slot holds a
+    /// different key" from "I looked at the wrong place". It concludes the
+    /// key is absent while the key is live in that very slot.
+    ///
+    /// This verifier performs that publish from inside its own `verify`
+    /// call, which is exactly where the racing writer would land.
+    struct RacingPublishVerifier {
+        key: Vec<u8>,
+        old_location: Location,
+        new_location: Location,
+        table: std::sync::Mutex<Option<std::sync::Arc<MultiChoiceHashtable>>>,
+        raced: std::sync::atomic::AtomicBool,
+    }
+
+    impl KeyVerifier for RacingPublishVerifier {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            if key == self.key.as_slice() && location == self.old_location {
+                // First look at the stale location: run the concurrent
+                // publish now, then answer as the segment would once the
+                // superseded item is delete-marked.
+                if !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let table = self.table.lock().unwrap().clone().unwrap();
+                    assert!(
+                        table.cas_location(&self.key, self.old_location, self.new_location, true,),
+                        "precondition: the racing publish must land, or the \
+                         test is not exercising the stale-location window"
+                    );
+                }
+                // The superseded item is now delete-marked.
+                return allow_deleted;
+            }
+            // The live item at the new location.
+            key == self.key.as_slice() && location == self.new_location
+        }
+    }
+
+    /// Verifier that recognizes exactly one (key, location) pair as live.
+    struct StaticVerifier {
+        key: Vec<u8>,
+        location: Location,
+    }
+
+    impl KeyVerifier for StaticVerifier {
+        fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+            key == self.key.as_slice() && location == self.location
+        }
+    }
+
+    /// Verifier whose location is our key wearing a tombstone, with the
+    /// publish that supersedes it landing only after a few probes.
+    ///
+    /// This is the A→B→A shape: the slot word still reads the old location,
+    /// so a location+tag comparison alone would call the mismatch
+    /// authoritative. Only the `allow_deleted` re-probe distinguishes "our
+    /// key, tombstoned, publish in flight" from "some other key lives here".
+    struct DelayedPublishVerifier {
+        key: Vec<u8>,
+        old_location: Location,
+        new_location: Location,
+        table: std::sync::Mutex<Option<std::sync::Arc<MultiChoiceHashtable>>>,
+        probes: std::sync::atomic::AtomicU32,
+        publish_after: u32,
+    }
+
+    impl KeyVerifier for DelayedPublishVerifier {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            if key == self.key.as_slice() && location == self.old_location {
+                let n = self
+                    .probes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if n == self.publish_after {
+                    let table = self.table.lock().unwrap().clone().unwrap();
+                    assert!(
+                        table.cas_location(&self.key, self.old_location, self.new_location, true),
+                        "the delayed publish must land"
+                    );
+                }
+                // Our key, tombstoned: absent to a live-only lookup, present
+                // to one that accepts tombstones.
+                return allow_deleted;
+            }
+            key == self.key.as_slice() && location == self.new_location
+        }
+    }
+
+    /// An unchanged slot is not on its own proof of a real key mismatch. If
+    /// the item it points at is our key with a tombstone, a publish is in
+    /// flight -- writers move the slot before delete-marking -- so the scan
+    /// must wait for it rather than answer absent.
+    #[test]
+    fn tombstoned_self_is_not_an_authoritative_mismatch() {
+        use std::sync::Arc as StdArc;
+
+        let table = StdArc::new(MultiChoiceHashtable::new(8));
+        let key = b"counter".to_vec();
+        let old_location = Location::new(0x1000);
+        let new_location = Location::new(0x2000);
+
+        let seed = StaticVerifier {
+            key: key.clone(),
+            location: old_location,
+        };
+        table.insert(&key, old_location, &seed).unwrap();
+
+        let verifier = DelayedPublishVerifier {
+            key: key.clone(),
+            old_location,
+            new_location,
+            table: std::sync::Mutex::new(Some(StdArc::clone(&table))),
+            probes: std::sync::atomic::AtomicU32::new(0),
+            // Land the publish after the first poll's pair of probes, so the
+            // scan must actually poll rather than see it immediately.
+            publish_after: 3,
+        };
+
+        assert!(
+            table.contains(&key, &verifier),
+            "a tombstone at a not-yet-moved slot was treated as a different \
+             key, reporting a live key absent"
+        );
+        assert!(
+            verifier.probes.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "the delayed-publish window was never exercised"
+        );
+    }
+
+    /// Verifier that walks a key through many successive locations, each
+    /// one costing a tombstone poll before its publish is observed.
+    ///
+    /// This is the shape that catches a tombstone budget scoped to the whole
+    /// lookup rather than to one publish: every generation spends a poll, so
+    /// a cumulative counter runs out and answers absent for a key that is
+    /// live and visibly moving.
+    struct WalkingPublishVerifier {
+        key: Vec<u8>,
+        table: std::sync::Mutex<Option<std::sync::Arc<MultiChoiceHashtable>>>,
+        /// Locations the key occupies, in order.
+        stops: Vec<Location>,
+        /// How far along `stops` the published entry currently is.
+        published: std::sync::atomic::AtomicUsize,
+        /// Probes seen against the current stop.
+        probes_here: std::sync::atomic::AtomicU32,
+    }
+
+    impl KeyVerifier for WalkingPublishVerifier {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            use std::sync::atomic::Ordering as O;
+            if key != self.key.as_slice() {
+                return false;
+            }
+            let idx = self.published.load(O::SeqCst);
+            let current = self.stops[idx];
+
+            if location == current {
+                // The live entry, once it has stopped moving.
+                if idx == self.stops.len() - 1 {
+                    return true;
+                }
+                // Still walking: this stop reads as our key, tombstoned.
+                //
+                // Advance on the *fourth* probe, not the second. A scan
+                // iteration spends two probes (the live check, then the
+                // tombstone re-probe) before it re-reads the slot, so
+                // publishing on probe 2 would move the slot before that
+                // re-read and the poll branch would never run. Letting one
+                // whole iteration find the slot unchanged is what spends a
+                // tombstone poll per hop -- which is the accounting this
+                // test exists to pin.
+                if self.probes_here.fetch_add(1, O::SeqCst) + 1 >= 4 {
+                    self.probes_here.store(0, O::SeqCst);
+                    let table = self.table.lock().unwrap().clone().unwrap();
+                    assert!(
+                        table.cas_location(&self.key, current, self.stops[idx + 1], true),
+                        "each hop of the walk must land"
+                    );
+                    self.published.store(idx + 1, O::SeqCst);
+                }
+                return allow_deleted;
+            }
+            false
+        }
+    }
+
+    /// A key relocating through more generations than the tombstone budget
+    /// must still be found. The budget bounds one publish landing, not the
+    /// key's whole relocation history.
+    #[test]
+    fn relocation_walk_longer_than_the_tombstone_budget_is_still_found() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        let table = StdArc::new(MultiChoiceHashtable::new(8));
+        let key = b"walker".to_vec();
+
+        // Comfortably more hops than MAX_TOMBSTONE_POLLS.
+        let stops: Vec<Location> = (1..=20).map(|i| Location::new(0x1000 * i)).collect();
+
+        let seed = StaticVerifier {
+            key: key.clone(),
+            location: stops[0],
+        };
+        table.insert(&key, stops[0], &seed).unwrap();
+
+        let verifier = WalkingPublishVerifier {
+            key: key.clone(),
+            table: std::sync::Mutex::new(Some(StdArc::clone(&table))),
+            stops: stops.clone(),
+            published: AtomicUsize::new(0),
+            probes_here: AtomicU32::new(0),
+        };
+
+        assert!(
+            table.contains(&key, &verifier),
+            "a key that relocated through more hops than the tombstone budget \
+             was reported absent -- the budget is accumulating across \
+             relocations instead of bounding one publish"
+        );
+        assert!(
+            verifier.published.load(std::sync::atomic::Ordering::SeqCst) > 8,
+            "the walk did not exceed the tombstone budget, so this test would \
+             not have caught a cumulative counter"
+        );
+    }
+
+    /// The bounded side of the same rule: a slot that keeps publishing a
+    /// tombstone of our key really is a deleted key, and must be reported
+    /// absent rather than polled forever.
+    #[test]
+    fn stable_tombstone_reports_absent() {
+        use std::sync::Arc as StdArc;
+
+        let table = StdArc::new(MultiChoiceHashtable::new(8));
+        let key = b"gone".to_vec();
+        let location = Location::new(0x3000);
+
+        let seed = StaticVerifier {
+            key: key.clone(),
+            location,
+        };
+        table.insert(&key, location, &seed).unwrap();
+
+        // Never publishes: `allow_deleted` matches, live lookups do not.
+        struct TombstoneVerifier {
+            key: Vec<u8>,
+            location: Location,
+        }
+        impl KeyVerifier for TombstoneVerifier {
+            fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+                key == self.key.as_slice() && location == self.location && allow_deleted
+            }
+        }
+
+        let verifier = TombstoneVerifier {
+            key: key.clone(),
+            location,
+        };
+        assert!(
+            !table.contains(&key, &verifier),
+            "a settled tombstone must read as absent"
+        );
+    }
+
+    /// A lookup that races a publish must not report the key absent: the
+    /// key is live in the slot the whole time, only its location moves.
+    #[test]
+    fn stale_location_verify_does_not_report_false_absent() {
+        use std::sync::Arc as StdArc;
+
+        let table = StdArc::new(MultiChoiceHashtable::new(8));
+        let key = b"counter".to_vec();
+        let old_location = Location::new(0x1000);
+        let new_location = Location::new(0x2000);
+
+        let seed = StaticVerifier {
+            key: key.clone(),
+            location: old_location,
+        };
+        table.insert(&key, old_location, &seed).unwrap();
+
+        let racer = RacingPublishVerifier {
+            key: key.clone(),
+            old_location,
+            new_location,
+            table: std::sync::Mutex::new(Some(StdArc::clone(&table))),
+            raced: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        assert!(
+            table.contains(&key, &racer),
+            "contains() reported a live key absent after a publish moved its \
+             location mid-verify"
+        );
+
+        // Precondition: the race actually happened. Without this the test
+        // could pass vacuously if the scan never visited the stale location.
+        assert!(
+            racer.raced.load(std::sync::atomic::Ordering::SeqCst),
+            "the stale-location window was never exercised"
+        );
     }
 
     impl KeyVerifier for MockVerifier {

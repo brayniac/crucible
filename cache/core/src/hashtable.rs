@@ -35,6 +35,21 @@ pub trait KeyVerifier: Send + Sync {
     ///
     /// # Returns
     /// `true` if the key matches at this location.
+    ///
+    /// # What `false` does *not* mean
+    ///
+    /// `false` is not "this entry is some other key". An implementation
+    /// reads item bytes at whatever location it is handed, and that location
+    /// can stop being the entry's while the comparison is in flight — a
+    /// concurrent publish moves the entry and delete-marks what it left
+    /// behind. Such a comparison also answers `false`, about memory that is
+    /// no longer the caller's business.
+    ///
+    /// Callers must therefore not read a single `false` as "this slot does
+    /// not hold the key": doing so reports live keys absent. Bucket scans go
+    /// through `MultiChoiceHashtable::verify_slot`, which re-reads the slot
+    /// word to separate the two cases. Implementations only owe an honest
+    /// answer about the location they were given.
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool;
 
     /// Prefetch memory at the given location.
