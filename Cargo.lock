@@ -1385,9 +1385,8 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceff25c27887a057239c350c4165fbcfdd8c37ba4ebb12439b0154ff2ad3bd05"
+version = "0.6.1"
+source = "git+https://github.com/ringline-rs/ringline.git?rev=be00fde#be00fdee6ea2f5b7cc94ae05aa75d3ba714e40a4"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -1404,8 +1403,7 @@ dependencies = [
 [[package]]
 name = "ringline-redis"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c556a8440503cbf9c1c06c0395ab61980acde31805549caf8989983c4f1f18e5"
+source = "git+https://github.com/ringline-rs/ringline.git?rev=be00fde#be00fdee6ea2f5b7cc94ae05aa75d3ba714e40a4"
 dependencies = [
  "bytes",
  "histogram 0.11.4",

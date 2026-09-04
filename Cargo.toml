@@ -62,8 +62,12 @@ tracing = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-ringline = { version = "0.6", features = ["timestamps"] }
-ringline-redis = "0.7"
+# Pinned to git until a release carries ringline-rs/ringline#337
+# (`submit_batch_await`, which the server's drain path needs) and #340 (the
+# io_uring completion-reaping fix). Switch back to the crates.io versions once
+# both are published.
+ringline = { git = "https://github.com/ringline-rs/ringline.git", rev = "be00fde", features = ["timestamps"] }
+ringline-redis = { git = "https://github.com/ringline-rs/ringline.git", rev = "be00fde" }
 http2-proto = "0.0.2"
 grpc-proto = "0.0.2"
 protocol-momento = { path = "protocol/momento" }
@@ -87,3 +91,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 debug = true
+
