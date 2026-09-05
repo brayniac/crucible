@@ -75,6 +75,8 @@ pub(crate) const SRC: usize = 0;
 pub(crate) const MID: usize = 1;
 /// Where a relocation moves the key to.
 pub(crate) const DST: usize = 2;
+/// Where a racing writer publishes a replacement copy of the key.
+pub(crate) const NEW: usize = 3;
 /// Number of distinct storage locations the oracle models. Kept small on
 /// purpose: every cell is a loom-tracked atomic.
 pub(crate) const NUM_CELLS: usize = 4;
@@ -147,6 +149,27 @@ impl KeyOracle {
         let relinked = ht.cas_location(KEY, Self::location(src), Self::location(dst), true);
         self.place(src, OTHER);
         relinked
+    }
+
+    /// Count the live hashtable entries for [`KEY`] across every modeled
+    /// location — the duplicate detector for insert-path models.
+    ///
+    /// DESTRUCTIVE, and deliberately so: it counts by unlinking. `remove`
+    /// matches on tag AND location, so each call removes at most one slot, and
+    /// the inner loop catches the pathological case of two slots published
+    /// with the same location. Call it once, after every thread has joined.
+    ///
+    /// Counting this way keeps the fixture out of `hashtable_impl`'s private
+    /// internals — the alternative is a hand-rolled bucket scan, which is what
+    /// the `AlwaysVerifier` models copy-paste.
+    pub(crate) fn drain_live_entries(ht: &MultiChoiceHashtable) -> usize {
+        let mut found = 0;
+        for cell in 0..NUM_CELLS {
+            while ht.remove(KEY, Self::location(cell)) {
+                found += 1;
+            }
+        }
+        found
     }
 }
 
