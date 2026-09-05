@@ -1000,21 +1000,35 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            if Hashbucket::tag(speculative) == tag {
-                // Tag matches - do Acquire load to synchronize before CAS
+            if Hashbucket::tag(speculative) != tag {
+                continue;
+            }
+
+            // Re-read and re-evaluate THIS slot until it stops publishing
+            // `expected` or the exchange lands. The exchange covers the whole
+            // packed word, so a concurrent reader bumping the frequency bits
+            // fails it even though the location is unchanged — and treating
+            // that as "the key is not here" makes a DELETE report the key
+            // absent and leave it in the table.
+            loop {
+                // Acquire load to synchronize before the exchange.
                 let packed = slot.load(Ordering::Acquire);
 
-                // Re-check after Acquire load
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+                if packed == 0
+                    || Hashbucket::is_ghost(packed)
+                    || Hashbucket::tag(packed) != tag
+                    || Hashbucket::location(packed) != expected
+                {
+                    break;
                 }
 
-                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
-                    match slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Relaxed) {
-                        Ok(_) => return true,
-                        Err(_) => continue,
-                    }
+                if slot
+                    .compare_exchange(packed, 0, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return true;
                 }
+                spin_loop();
             }
         }
 
@@ -1035,23 +1049,34 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            if Hashbucket::tag(speculative) == tag {
-                // Tag matches - do Acquire load to synchronize before CAS
+            if Hashbucket::tag(speculative) != tag {
+                continue;
+            }
+
+            // Retries for the same reason as `try_unlink_in_bucket`: a lost
+            // exchange means the word changed, not that this is somebody
+            // else's entry, and an eviction that gives up here leaves a live
+            // entry pointing at storage the caller is about to reclaim.
+            loop {
+                // Acquire load to synchronize before the exchange.
                 let packed = slot.load(Ordering::Acquire);
 
-                // Re-check after Acquire load
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+                if packed == 0
+                    || Hashbucket::is_ghost(packed)
+                    || Hashbucket::tag(packed) != tag
+                    || Hashbucket::location(packed) != expected
+                {
+                    break;
                 }
 
-                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
-                    let ghost = Hashbucket::to_ghost(packed);
-                    match slot.compare_exchange(packed, ghost, Ordering::Release, Ordering::Relaxed)
-                    {
-                        Ok(_) => return true,
-                        Err(_) => continue,
-                    }
+                let ghost = Hashbucket::to_ghost(packed);
+                if slot
+                    .compare_exchange(packed, ghost, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return true;
                 }
+                spin_loop();
             }
         }
 
@@ -1079,30 +1104,47 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            if Hashbucket::tag(speculative) == tag {
-                // Tag matches - do Acquire load to synchronize before CAS
+            if Hashbucket::tag(speculative) != tag {
+                continue;
+            }
+
+            // Re-read and re-evaluate THIS slot until it stops publishing
+            // `old_location` or the exchange lands.
+            //
+            // The exchange covers the whole packed word, so a concurrent
+            // reader bumping the frequency bits fails it even though the
+            // location is unchanged. Advancing to the next slot on that
+            // failure reported the entry absent while it was right here, and
+            // callers act on that: `ttl_layer`'s merge and compaction paths
+            // read the resulting `false` as "concurrent overwrite" and discard
+            // the copy they just wrote, leaving the hashtable pointing into a
+            // segment about to be recycled.
+            loop {
+                // Acquire load to synchronize before the exchange.
                 let packed = slot.load(Ordering::Acquire);
 
-                // Re-check after Acquire load
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+                if packed == 0
+                    || Hashbucket::is_ghost(packed)
+                    || Hashbucket::tag(packed) != tag
+                    || Hashbucket::location(packed) != old_location
+                {
+                    break;
                 }
 
-                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == old_location {
-                    let freq = if preserve_freq {
-                        Hashbucket::freq(packed)
-                    } else {
-                        1
-                    };
-                    let new_packed = Hashbucket::pack(tag, freq, new_location);
+                let freq = if preserve_freq {
+                    Hashbucket::freq(packed)
+                } else {
+                    1
+                };
+                let new_packed = Hashbucket::pack(tag, freq, new_location);
 
-                    if slot
-                        .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        return true;
-                    }
+                if slot
+                    .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return true;
                 }
+                spin_loop();
             }
         }
 
@@ -1357,35 +1399,44 @@ impl MultiChoiceHashtable {
                 continue;
             }
 
-            if Hashbucket::tag(speculative) == tag {
-                // Tag matches - do Acquire load to synchronize before CAS
+            if Hashbucket::tag(speculative) != tag {
+                continue;
+            }
+
+            // Re-read and re-evaluate THIS slot until it stops being our
+            // key's or the exchange lands — the same reasoning as
+            // `try_replace_existing_in_bucket`. A lost exchange means the word
+            // changed (a reader bumping the frequency is enough), not that the
+            // key is elsewhere, and giving up here makes a REPLACE report the
+            // key absent while it is live.
+            loop {
+                // Acquire load to synchronize before the exchange.
                 let packed = slot.load(Ordering::Acquire);
 
-                // Re-check after Acquire load
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+                if packed == 0 || Hashbucket::is_ghost(packed) || Hashbucket::tag(packed) != tag {
+                    break;
                 }
 
-                if Hashbucket::tag(packed) != tag {
-                    continue;
+                // `verify_slot` separates "this slot holds another key" from
+                // "the location I read was recycled underneath me"; a bare
+                // `verify` reads a relocation as a mismatch and reports the
+                // live key absent.
+                let Some((packed, old_location)) =
+                    self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+                else {
+                    break;
+                };
+
+                let freq = Hashbucket::freq(packed);
+                let new_packed = Hashbucket::pack(tag, freq, new_location);
+
+                if slot
+                    .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(Ok(old_location));
                 }
-
-                let old_location = Hashbucket::location(packed);
-
-                if verifier.verify(key, old_location, false) {
-                    let freq = Hashbucket::freq(packed);
-                    let new_packed = Hashbucket::pack(tag, freq, new_location);
-
-                    match slot.compare_exchange(
-                        packed,
-                        new_packed,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return Some(Ok(old_location)),
-                        Err(_) => continue,
-                    }
-                }
+                spin_loop();
             }
         }
 
@@ -3403,6 +3454,151 @@ mod loom_tests {
             assert!(found, "live key reported absent across two relocations");
         });
     }
+    /// A relocation's relink must not be defeated by a concurrent reader.
+    ///
+    /// `lookup` bumps the frequency counter with a compare-exchange over the
+    /// WHOLE slot word, so a GET changes the word without changing the
+    /// location it publishes. `try_cas_in_bucket` compares the whole word too,
+    /// and on a failed CAS it advanced to the next slot index — reporting "the
+    /// key is not at this location" when the key was right there.
+    ///
+    /// A relink whose expected location is still the published one must
+    /// succeed. The merge and compaction paths in `ttl_layer` read a `false`
+    /// here as "concurrent overwrite" and discard the copy they just wrote,
+    /// which leaves the hashtable pointing into a segment about to be
+    /// recycled — the key is lost.
+    #[test]
+    fn loom_relink_survives_a_concurrent_frequency_bump() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_r = ht.clone();
+            let oracle_r = oracle.clone();
+            let reader = thread::spawn(move || {
+                ht_lookup(&ht_r, KEY, &*oracle_r);
+            });
+
+            // The drain has already written its copy at DST and now publishes
+            // it. Nothing else mutates the entry, so this must land.
+            oracle.place(DST, KEY);
+            let relinked = <MultiChoiceHashtable as Hashtable>::cas_location(
+                &ht,
+                KEY,
+                KeyOracle::location(SRC),
+                KeyOracle::location(DST),
+                true,
+            );
+
+            reader.join().unwrap();
+
+            assert!(relinked, "a relink lost to a reader's frequency bump");
+        });
+    }
+
+    /// The same hazard for `remove` and `convert_to_ghost`, which share the
+    /// expected-location guard but not `cas_location`'s retry.
+    ///
+    /// A DELETE for a key that a reader is concurrently GETting must still
+    /// unlink it: the reader's frequency bump changes the packed word but not
+    /// the location, and an unlink that reads that lost CAS as "not here"
+    /// tells the caller the key was absent while it is still in the table.
+    fn mutation_survives_a_concurrent_frequency_bump(
+        mutate: fn(&MultiChoiceHashtable, &KeyOracle, Location) -> bool,
+    ) {
+        loom::model(move || {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_r = ht.clone();
+            let oracle_r = oracle.clone();
+            let reader = thread::spawn(move || {
+                ht_lookup(&ht_r, KEY, &*oracle_r);
+            });
+
+            let claimed = mutate(&ht, &oracle, KeyOracle::location(SRC));
+
+            reader.join().unwrap();
+
+            assert!(claimed, "a mutation lost to a reader's frequency bump");
+        });
+    }
+
+    #[test]
+    fn loom_remove_survives_a_concurrent_frequency_bump() {
+        mutation_survives_a_concurrent_frequency_bump(|ht, _oracle, loc| ht_remove(ht, KEY, loc));
+    }
+
+    #[test]
+    fn loom_ghost_conversion_survives_a_concurrent_frequency_bump() {
+        mutation_survives_a_concurrent_frequency_bump(|ht, _oracle, loc| {
+            <MultiChoiceHashtable as Hashtable>::convert_to_ghost(ht, KEY, loc)
+        });
+    }
+
+    /// `update_if_present` shares both of the defects `insert` had: it
+    /// verified with a bare `verify` (so a relocation reads as a different
+    /// key) and advanced on a lost CAS (so a reader's frequency bump reads as
+    /// "not here"). Either one makes a REPLACE report the key absent while it
+    /// is live in the table.
+    #[test]
+    fn loom_update_if_present_survives_a_concurrent_frequency_bump() {
+        mutation_survives_a_concurrent_frequency_bump(|ht, oracle, _loc| {
+            oracle.place(DST, KEY);
+            <MultiChoiceHashtable as Hashtable>::update_if_present(
+                ht,
+                KEY,
+                KeyOracle::location(DST),
+                oracle,
+            )
+            .is_ok()
+        });
+    }
+
+    /// `update_if_present` must also survive a relocation, not just a
+    /// frequency bump.
+    ///
+    /// The entry is continuously present — the relink is an in-place CAS, so
+    /// it names `SRC` before and `DST` after — but the location the scan read
+    /// stops being the entry's mid-comparison. A bare `verify` answers `false`
+    /// there and the replace reports the key absent; `verify_slot` re-reads
+    /// the slot and follows the entry to its new location.
+    #[test]
+    fn loom_update_if_present_survives_a_relocation() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_w = ht.clone();
+            let oracle_w = oracle.clone();
+            let writer = thread::spawn(move || oracle_w.drain_relocate(&ht_w, SRC, DST));
+
+            oracle.place(NEW, KEY);
+            let replaced = <MultiChoiceHashtable as Hashtable>::update_if_present(
+                &ht,
+                KEY,
+                KeyOracle::location(NEW),
+                &*oracle,
+            );
+
+            writer.join().unwrap();
+
+            assert!(
+                replaced.is_ok(),
+                "a live key was reported absent by update_if_present during relocation"
+            );
+        });
+    }
+
     /// `insert` must leave exactly ONE live entry for a key, in every
     /// interleaving and in every bucket.
     ///
