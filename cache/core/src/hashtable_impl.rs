@@ -1184,9 +1184,15 @@ impl MultiChoiceHashtable {
                     continue;
                 }
 
-                let location = Hashbucket::location(packed);
-
-                if verifier.verify(key, location, false) {
+                // `verify_slot`, not a bare `verify`: a relocation that
+                // recycles the location mid-comparison answers `false`,
+                // and reading that as "another key" makes this report a
+                // live key absent — which lets the ADD path publish a
+                // second entry for it.
+                if self
+                    .verify_slot(bucket, slot_index, key, verifier, false, packed)
+                    .is_some()
+                {
                     return true;
                 }
             }
@@ -1278,11 +1284,11 @@ impl MultiChoiceHashtable {
                         if new_current != 0
                             && !Hashbucket::is_ghost(new_current)
                             && Hashbucket::tag(new_current) == tag
+                            && self
+                                .verify_slot(bucket, slot_index, key, verifier, false, new_current)
+                                .is_some()
                         {
-                            let location = Hashbucket::location(new_current);
-                            if verifier.verify(key, location, false) {
-                                return Some(Err(CacheError::KeyExists));
-                            }
+                            return Some(Err(CacheError::KeyExists));
                         }
                         continue;
                     }
@@ -1335,9 +1341,15 @@ impl MultiChoiceHashtable {
                         continue;
                     }
 
-                    let location = Hashbucket::location(packed);
-
-                    if verifier.verify(key, location, false) {
+                    // `verify_slot`, not a bare `verify`: a relocation that
+                    // recycles the location mid-comparison answers `false`,
+                    // and reading that as "another key" makes this report a
+                    // live key absent — which lets the ADD path publish a
+                    // second entry for it.
+                    if self
+                        .verify_slot(bucket, slot_index, key, verifier, false, packed)
+                        .is_some()
+                    {
                         return true;
                     }
                 }
@@ -3595,6 +3607,50 @@ mod loom_tests {
             assert!(
                 replaced.is_ok(),
                 "a live key was reported absent by update_if_present during relocation"
+            );
+        });
+    }
+
+    /// `insert_if_absent` must leave exactly ONE live entry too.
+    ///
+    /// The ADD path has three bare `verify` sites — `check_key_exists` gates
+    /// entry, `try_insert_empty_for_add` re-checks a lost CAS, and
+    /// `check_for_duplicate_after_insert` is the guard meant to catch whatever
+    /// slips past the first. All three read a raced verify as "this is another
+    /// key", so a relocation that recycles the location mid-comparison makes
+    /// the whole path conclude the key is absent, claim a slot, and pass its
+    /// own duplicate check. The key ends up in the table twice.
+    #[test]
+    fn loom_insert_if_absent_leaves_a_single_live_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_w = ht.clone();
+            let oracle_w = oracle.clone();
+            // TWO successive drains. One is not enough: the ADD path's own
+            // `check_for_duplicate_after_insert` re-scans after claiming a
+            // slot, and by then a single relocation has landed, so the guard
+            // sees the entry and rolls the duplicate back. Two drains keep a
+            // location stale across BOTH the entry check and the guard.
+            let writer = thread::spawn(move || {
+                oracle_w.drain_relocate(&ht_w, SRC, MID);
+                oracle_w.drain_relocate(&ht_w, MID, DST);
+            });
+
+            // A racing ADD for the key that is already in the table.
+            oracle.place(NEW, KEY);
+            let _ = ht_insert(&ht, KEY, KeyOracle::location(NEW), &*oracle);
+
+            writer.join().unwrap();
+
+            assert_eq!(
+                KeyOracle::drain_live_entries(&ht),
+                1,
+                "insert_if_absent published a duplicate entry for a key already in the table"
             );
         });
     }
