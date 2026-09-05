@@ -72,6 +72,67 @@ const OTHER_ID: u64 = 2;
 /// Set in a cell word when the occupant is delete-marked in place.
 const DELETED: u64 = 1 << 32;
 
+/// How many times a model's reader was handed a location that no longer held
+/// its key, counted across every loom execution of the current model.
+///
+/// These are `std` atomics, not model atomics, on purpose: they must survive
+/// across loom's repeated executions of the closure, which reset all loom
+/// state. They are the model's HAZARD WITNESS — see
+/// [`KeyOracle::assert_hazard_reached`].
+static OCCUPANT_MISS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TOMBSTONE_MISS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Serializes witness-bearing models against each other; see
+/// [`KeyOracle::arm_hazard_witness`].
+static WITNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Proof that a model reached the hazard it claims to model.
+///
+/// Holds the witness lock for the duration of one model. Consumed by one of
+/// its `assert_*` methods, which is what makes forgetting the check visible:
+/// an unused `HazardWitness` is an unused variable.
+pub(crate) struct HazardWitness(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl HazardWitness {
+    /// Assert that the model actually REACHED the hazard it claims to model.
+    ///
+    /// A model whose reader is never handed a stale location is not testing
+    /// the slot protocol at all — it is asserting that a quiet table stays
+    /// quiet, and it passes against arbitrarily broken code. That is not
+    /// hypothetical: `loom_lookup_survives_tombstoned_relocation` shipped in
+    /// exactly that state until #95, because a non-atomic read-modify-write in
+    /// [`KeyOracle::tombstone`] silently collapsed loom's exploration and the
+    /// reader observed zero misses across every execution.
+    ///
+    /// Reddening under a neutered `verify_slot` is the proof that a model CAN
+    /// fail; this is the standing check that it still can, so the failure mode
+    /// cannot come back unnoticed when something unrelated changes.
+    ///
+    /// Only for models whose hazard is expressed through the verifier. Models
+    /// about CAS contention (`remove` and `convert_to_ghost` take no verifier)
+    /// have a different witness and must not use this.
+    pub(crate) fn assert_reached(self) {
+        let occupant = OCCUPANT_MISS.load(std::sync::atomic::Ordering::Relaxed);
+        let tombstone = TOMBSTONE_MISS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            occupant + tombstone > 0,
+            "model never reached its hazard: the verifier was never handed a \
+             location that had stopped being the key's, so this model would \
+             pass against broken code"
+        );
+    }
+
+    /// As [`HazardWitness::assert_reached`], but for a model whose hazard is
+    /// specifically a DELETE-MARKED occupant rather than a replaced one.
+    pub(crate) fn assert_tombstone_reached(self) {
+        assert!(
+            TOMBSTONE_MISS.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "model never observed a delete-marked occupant, so it is not \
+             exercising verify_slot's tombstone poll"
+        );
+    }
+}
+
 /// Where the subject key starts out.
 pub(crate) const SRC: usize = 0;
 /// An intermediate location, for models that need two successive drains.
@@ -202,6 +263,27 @@ impl KeyOracle {
         }
         found
     }
+
+    /// Arm the hazard witness. Call immediately before `loom::model`, and
+    /// call [`HazardWitness::assert_reached`] on the result afterwards.
+    ///
+    /// The returned guard holds a process-wide lock for as long as it lives.
+    /// The counters are global — the verifier has no idea which model is
+    /// running — and `cargo test` runs tests in PARALLEL, so without the lock
+    /// two witness-bearing models would reset and read each other's counts and
+    /// the witness would report whatever the scheduler happened to produce.
+    /// Only witness-bearing models contend for it; the rest still run
+    /// concurrently.
+    pub(crate) fn arm_hazard_witness() -> HazardWitness {
+        // A panicking model poisons the lock; the next model still wants a
+        // working witness, so take the guard either way.
+        let guard = WITNESS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        OCCUPANT_MISS.store(0, std::sync::atomic::Ordering::Relaxed);
+        TOMBSTONE_MISS.store(0, std::sync::atomic::Ordering::Relaxed);
+        HazardWitness(guard)
+    }
 }
 
 impl KeyVerifier for KeyOracle {
@@ -213,9 +295,25 @@ impl KeyVerifier for KeyOracle {
             return false;
         }
         let word = self.cells[(raw - 1) as usize].load(Ordering::Acquire);
+        use std::sync::atomic::Ordering as O;
         if word & !DELETED != key_id(key) {
+            let n = OCCUPANT_MISS.fetch_add(1, O::Relaxed) + 1;
+            eprintln!(
+                "MISS occupant={} tombstone={}",
+                n,
+                TOMBSTONE_MISS.load(O::Relaxed)
+            );
             return false;
         }
-        allow_deleted || (word & DELETED) == 0
+        if !allow_deleted && (word & DELETED) != 0 {
+            let n = TOMBSTONE_MISS.fetch_add(1, O::Relaxed) + 1;
+            eprintln!(
+                "MISS occupant={} tombstone={}",
+                OCCUPANT_MISS.load(O::Relaxed),
+                n
+            );
+            return false;
+        }
+        true
     }
 }
