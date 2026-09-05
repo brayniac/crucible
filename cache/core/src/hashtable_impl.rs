@@ -3144,4 +3144,105 @@ mod loom_tests {
             let _ = (lookup_result, remove_result);
         });
     }
+
+    // -------------------------------------------------------------------------
+    // Oracle-backed models
+    //
+    // Everything above stubs the verifier with `AlwaysVerifier`, which answers
+    // `true` for every key at every location. Under it the verify-FAILURE half
+    // of the slot protocol is unreachable: `verify_slot`, its relocation walk,
+    // its tombstone poll and every `allow_deleted` decision are dead code.
+    // The models below drive a real `KeyOracle` instead, so a location can
+    // stop being the entry's underneath a reader.
+    // -------------------------------------------------------------------------
+
+    use crate::loom_oracle::{DST, KEY, KeyOracle, MID, SRC};
+
+    /// Driver for the read-path models: one thread drains [`KEY`] from `SRC`
+    /// to `DST` while the main thread performs `read`.
+    ///
+    /// [`KEY`] is never absent from the table — the relink is an in-place CAS,
+    /// so the entry names `SRC` before it and `DST` after it, and no window
+    /// exists where it names neither. A `false` from `read` is therefore a
+    /// false-absent lookup: the reader compared against a location that had
+    /// already been recycled and refilled with another key, and reported a
+    /// live key missing instead of re-reading the slot.
+    ///
+    /// Each read entry point carries its own hand-written copy of the bucket
+    /// scan, so each gets its own model rather than hiding behind a sibling.
+    fn read_survives_relocation(read: fn(&MultiChoiceHashtable, &KeyOracle) -> bool) {
+        loom::model(move || {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_w = ht.clone();
+            let oracle_w = oracle.clone();
+            let writer = thread::spawn(move || oracle_w.drain_relocate(&ht_w, SRC, DST));
+
+            let found = read(&ht, &oracle);
+
+            writer.join().unwrap();
+
+            assert!(found, "live key reported absent during relocation");
+        });
+    }
+
+    #[test]
+    fn loom_lookup_survives_relocation() {
+        read_survives_relocation(|ht, oracle| ht_lookup(ht, KEY, oracle).is_some());
+    }
+
+    #[test]
+    fn loom_contains_survives_relocation() {
+        read_survives_relocation(|ht, oracle| {
+            <MultiChoiceHashtable as Hashtable>::contains(ht, KEY, oracle)
+        });
+    }
+
+    #[test]
+    fn loom_get_frequency_survives_relocation() {
+        read_survives_relocation(|ht, oracle| {
+            <MultiChoiceHashtable as Hashtable>::get_frequency(ht, KEY, oracle).is_some()
+        });
+    }
+
+    #[test]
+    fn loom_lookup_for_tracking_survives_relocation() {
+        read_survives_relocation(|ht, oracle| {
+            <MultiChoiceHashtable as Hashtable>::lookup_for_tracking(ht, KEY, oracle).is_some()
+        });
+    }
+
+    /// Two successive drains (`SRC -> MID -> DST`) racing a reader.
+    ///
+    /// Two relocations is the smallest trace that can strand a reader on a
+    /// location that is stale *twice over*: it re-reads the slot, finds a new
+    /// location, and that one is already gone as well. A walk that gives up
+    /// after a single retry reports the live key absent here.
+    #[test]
+    fn loom_lookup_survives_repeated_relocation() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_w = ht.clone();
+            let oracle_w = oracle.clone();
+            let writer = thread::spawn(move || {
+                oracle_w.drain_relocate(&ht_w, SRC, MID);
+                oracle_w.drain_relocate(&ht_w, MID, DST);
+            });
+
+            let found = ht_lookup(&ht, KEY, &*oracle).is_some();
+
+            writer.join().unwrap();
+
+            assert!(found, "live key reported absent across two relocations");
+        });
+    }
 }

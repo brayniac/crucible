@@ -95,6 +95,10 @@ pub use state::{INVALID_SEGMENT_ID, Metadata, State};
 mod hashtable;
 mod hashtable_impl;
 
+// Model-checking fixture for the hashtable loom models. Test-only.
+#[cfg(all(test, feature = "loom"))]
+mod loom_oracle;
+
 // Phase 3 re-exports
 pub use hashtable::{Hashtable, KeyVerifier};
 pub use hashtable_impl::{Hashbucket, MultiChoiceHashtable};
