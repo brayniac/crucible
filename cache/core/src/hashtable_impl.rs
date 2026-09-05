@@ -3392,6 +3392,7 @@ mod loom_tests {
     /// Each read entry point carries its own hand-written copy of the bucket
     /// scan, so each gets its own model rather than hiding behind a sibling.
     fn read_survives_relocation(read: fn(&MultiChoiceHashtable, &KeyOracle) -> bool) {
+        let witness = KeyOracle::arm_hazard_witness();
         loom::model(move || {
             let ht = Arc::new(MultiChoiceHashtable::new(4));
             let oracle = Arc::new(KeyOracle::new());
@@ -3409,6 +3410,7 @@ mod loom_tests {
 
             assert!(found, "live key reported absent during relocation");
         });
+        witness.assert_reached();
     }
 
     #[test]
@@ -3445,6 +3447,7 @@ mod loom_tests {
     /// after a single retry reports the live key absent here.
     #[test]
     fn loom_lookup_survives_repeated_relocation() {
+        let witness = KeyOracle::arm_hazard_witness();
         loom::model(|| {
             let ht = Arc::new(MultiChoiceHashtable::new(4));
             let oracle = Arc::new(KeyOracle::new());
@@ -3465,6 +3468,7 @@ mod loom_tests {
 
             assert!(found, "live key reported absent across two relocations");
         });
+        witness.assert_reached();
     }
     /// A relocation's relink must not be defeated by a concurrent reader.
     ///
@@ -3583,6 +3587,7 @@ mod loom_tests {
     /// the slot and follows the entry to its new location.
     #[test]
     fn loom_update_if_present_survives_a_relocation() {
+        let witness = KeyOracle::arm_hazard_witness();
         loom::model(|| {
             let ht = Arc::new(MultiChoiceHashtable::new(4));
             let oracle = Arc::new(KeyOracle::new());
@@ -3609,6 +3614,7 @@ mod loom_tests {
                 "a live key was reported absent by update_if_present during relocation"
             );
         });
+        witness.assert_reached();
     }
 
     /// `insert_if_absent` must leave exactly ONE live entry too.
@@ -3622,6 +3628,7 @@ mod loom_tests {
     /// own duplicate check. The key ends up in the table twice.
     #[test]
     fn loom_insert_if_absent_leaves_a_single_live_entry() {
+        let witness = KeyOracle::arm_hazard_witness();
         loom::model(|| {
             let ht = Arc::new(MultiChoiceHashtable::new(4));
             let oracle = Arc::new(KeyOracle::new());
@@ -3653,6 +3660,7 @@ mod loom_tests {
                 "insert_if_absent published a duplicate entry for a key already in the table"
             );
         });
+        witness.assert_reached();
     }
 
     #[test]
@@ -3724,6 +3732,7 @@ mod loom_tests {
 
     #[test]
     fn loom_lookup_survives_tombstoned_relocation() {
+        let witness = KeyOracle::arm_hazard_witness();
         loom::model(|| {
             let ht = Arc::new(MultiChoiceHashtable::new(4));
             let oracle = Arc::new(KeyOracle::new());
@@ -3754,6 +3763,7 @@ mod loom_tests {
                 "live key reported absent across a tombstoned relocation"
             );
         });
+        witness.assert_tombstone_reached();
     }
 
     /// `insert` must leave exactly ONE live entry for a key, in every
@@ -3766,6 +3776,7 @@ mod loom_tests {
     /// deleted key reappears with a stale value.
     #[test]
     fn loom_insert_leaves_a_single_live_entry() {
+        let witness = KeyOracle::arm_hazard_witness();
         loom::model(|| {
             let ht = Arc::new(MultiChoiceHashtable::new(4));
             let oracle = Arc::new(KeyOracle::new());
@@ -3794,5 +3805,6 @@ mod loom_tests {
                 "insert published a duplicate entry for a key already in the table"
             );
         });
+        witness.assert_reached();
     }
 }
