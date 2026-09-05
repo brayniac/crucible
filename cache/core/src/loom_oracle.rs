@@ -69,6 +69,9 @@ pub(crate) const OTHER: &[u8] = b"other";
 const KEY_ID: u64 = 1;
 const OTHER_ID: u64 = 2;
 
+/// Set in a cell word when the occupant is delete-marked in place.
+const DELETED: u64 = 1 << 32;
+
 /// Where the subject key starts out.
 pub(crate) const SRC: usize = 0;
 /// An intermediate location, for models that need two successive drains.
@@ -128,6 +131,34 @@ impl KeyOracle {
         self.cells[cell].store(id, Ordering::Release);
     }
 
+    /// Delete-mark the occupant of `cell` in place.
+    ///
+    /// The bytes still spell the key — this is a flag flip in the item header,
+    /// not a rewrite — so the location keeps matching under
+    /// `allow_deleted = true` and stops matching under `allow_deleted = false`.
+    /// That asymmetry is the whole input to `verify_slot`'s tombstone poll.
+    ///
+    /// # This MUST be one atomic read-modify-write
+    ///
+    /// It is a `fetch_or`, matching production (`mark_deleted` is a
+    /// `fetch_or` on the item flags byte). Writing it the obvious way —
+    /// `load` then `store` — is not merely unfaithful, it silently destroys
+    /// the model: with a non-atomic RMW in the writer, loom stopped exploring
+    /// any interleaving in which the reader observes the writer mid-flight.
+    /// The model then passed against deliberately broken code, because its
+    /// hazard was never reached even once. Instrumenting the verifier showed
+    /// the difference starkly — 0 observed misses with `load`/`store`, 183
+    /// with `fetch_or`.
+    ///
+    /// The general lesson for this fixture: a non-atomic read-modify-write on
+    /// a model atomic can collapse the explored state space to nothing, and a
+    /// model that cannot reach its hazard passes for the wrong reason. Prefer
+    /// a single atomic operation for every oracle mutation, and confirm each
+    /// model reddens against broken code.
+    pub(crate) fn tombstone(&self, cell: usize) {
+        self.cells[cell].fetch_or(DELETED, Ordering::Release);
+    }
+
     /// One merge-drain relocation of [`KEY`], in the order production performs
     /// it:
     ///
@@ -174,20 +205,17 @@ impl KeyOracle {
 }
 
 impl KeyVerifier for KeyOracle {
-    /// `allow_deleted` is ignored: the oracle models a location's OCCUPANT,
-    /// not the delete flag in an item header. Every hazard it can express —
-    /// relocation, recycle, refill — changes who lives at a location, which
-    /// both values of `allow_deleted` answer identically. The delete-marked
-    /// case is covered deterministically by the directed tests above
-    /// (`tombstoned_self_is_not_an_authoritative_mismatch` and friends);
-    /// modelling it here would add a dimension no model asserts on.
-    fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let raw = location.as_raw();
         // Locations the oracle never issued (GHOST, or a backend-shaped word a
         // model handed in by mistake) match nothing.
         if raw == 0 || raw > NUM_CELLS as u64 {
             return false;
         }
-        self.cells[(raw - 1) as usize].load(Ordering::Acquire) == key_id(key)
+        let word = self.cells[(raw - 1) as usize].load(Ordering::Acquire);
+        if word & !DELETED != key_id(key) {
+            return false;
+        }
+        allow_deleted || (word & DELETED) == 0
     }
 }

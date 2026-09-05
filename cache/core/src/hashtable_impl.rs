@@ -3377,7 +3377,7 @@ mod loom_tests {
     // stop being the entry's underneath a reader.
     // -------------------------------------------------------------------------
 
-    use crate::loom_oracle::{DST, KEY, KeyOracle, MID, NEW, SRC};
+    use crate::loom_oracle::{DST, KEY, KeyOracle, MID, NEW, OTHER, SRC};
 
     /// Driver for the read-path models: one thread drains [`KEY`] from `SRC`
     /// to `DST` while the main thread performs `read`.
@@ -3651,6 +3651,107 @@ mod loom_tests {
                 KeyOracle::drain_live_entries(&ht),
                 1,
                 "insert_if_absent published a duplicate entry for a key already in the table"
+            );
+        });
+    }
+
+    #[test]
+    fn loom_remove_does_not_unlink_a_relocated_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_w = ht.clone();
+            let oracle_w = oracle.clone();
+            let writer = thread::spawn(move || oracle_w.drain_relocate(&ht_w, SRC, DST));
+
+            let unlinked = ht_remove(&ht, KEY, KeyOracle::location(SRC));
+            let relinked = writer.join().unwrap();
+
+            assert!(
+                !(unlinked && relinked),
+                "the unlink and the relink both claimed the same entry"
+            );
+
+            let live = KeyOracle::drain_live_entries(&ht);
+            if relinked {
+                assert_eq!(live, 1, "the relink won, so exactly one entry must remain");
+            } else if unlinked {
+                assert_eq!(live, 0, "the unlink won, so no entry may remain");
+            }
+        });
+    }
+
+    #[test]
+    fn loom_ghost_conversion_does_not_capture_a_relocated_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_w = ht.clone();
+            let oracle_w = oracle.clone();
+            let writer = thread::spawn(move || oracle_w.drain_relocate(&ht_w, SRC, DST));
+
+            let ghosted = <MultiChoiceHashtable as Hashtable>::convert_to_ghost(
+                &ht,
+                KEY,
+                KeyOracle::location(SRC),
+            );
+            let relinked = writer.join().unwrap();
+
+            assert!(
+                !(ghosted && relinked),
+                "the ghost conversion and the relink both claimed the same entry"
+            );
+
+            let live = KeyOracle::drain_live_entries(&ht);
+            if relinked {
+                assert_eq!(live, 1, "the relink won, so exactly one entry must remain");
+            } else if ghosted {
+                assert_eq!(
+                    live, 0,
+                    "the ghost conversion won, so no live entry remains"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn loom_lookup_survives_tombstoned_relocation() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            ht_insert(&ht, KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert must find a slot");
+
+            let ht_w = ht.clone();
+            let oracle_w = oracle.clone();
+            let writer = thread::spawn(move || {
+                oracle_w.place(DST, KEY);
+                oracle_w.tombstone(SRC);
+                let relinked = ht_w.cas_location(
+                    KEY,
+                    KeyOracle::location(SRC),
+                    KeyOracle::location(DST),
+                    true,
+                );
+                oracle_w.place(SRC, OTHER);
+                relinked
+            });
+
+            let found = ht_lookup(&ht, KEY, &*oracle).is_some();
+            let _relinked = writer.join().unwrap();
+
+            assert!(
+                found,
+                "live key reported absent across a tombstoned relocation"
             );
         });
     }
