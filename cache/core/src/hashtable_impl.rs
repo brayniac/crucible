@@ -1610,6 +1610,26 @@ impl Hashtable for MultiChoiceHashtable {
             }
         }
 
+        // The table has no room for a NEW entry — but a racing ADD of this
+        // same key may have published one since Phase 1 looked, in which case
+        // there is no new entry to make and capacity is not the problem.
+        //
+        // Without this, the loser of a race for the last free slot reports
+        // `HashTableFull` for a key that is present: it finds the slot already
+        // taken, so it never attempts the exchange that would tell it whose
+        // key is there, and it never claims a slot, so
+        // `check_for_duplicate_after_insert` never runs either. `KeyExists` is
+        // both the accurate answer and the one a single-threaded caller would
+        // get; a spurious `HashTableFull` drives capacity alarms and eviction
+        // pressure on a table that is merely contended.
+        //
+        // Off the hot path: this only runs when the insert has already failed.
+        for &bucket_index in choices {
+            if self.check_key_exists(bucket_index, tag, key, verifier) {
+                return Err(CacheError::KeyExists);
+            }
+        }
+
         Err(CacheError::HashTableFull)
     }
 
@@ -3764,6 +3784,67 @@ mod loom_tests {
             );
         });
         witness.assert_tombstone_reached();
+    }
+
+    /// Two concurrent ADDs racing for the LAST free slot in the table.
+    ///
+    /// Without `try_insert_empty_for_add`'s lost-CAS check, the losing ADD
+    /// walks on looking for another empty slot. When there is not one — the
+    /// table is otherwise full — it runs out of slots, out of buckets and out
+    /// of ghosts, and reports `HashTableFull` for a key that is present. The
+    /// duplicate guard never runs, because the loser never manages to publish
+    /// anything for it to catch.
+    ///
+    /// This is the one thing that check buys that
+    /// `check_for_duplicate_after_insert` cannot: the right ERROR, on a table
+    /// with no room to spare.
+    #[test]
+    fn loom_concurrent_adds_on_a_full_table_report_key_exists() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            oracle.place(DST, KEY);
+
+            // Leave exactly ONE free slot across both of the key's choices.
+            let hash = ht.hash_key(KEY);
+            let tag = MultiChoiceHashtable::tag_from_hash(hash);
+            let choices = ht.bucket_indices(hash);
+            let filler_tag = tag ^ 0xFFF;
+            let mut filled = 0u64;
+            for (n, &b) in choices[..2].iter().enumerate() {
+                for slot in 0..Hashbucket::NUM_ITEM_SLOTS {
+                    if n == 0 && slot == 0 {
+                        continue; // the one free slot
+                    }
+                    filled += 1;
+                    ht.bucket(b).items[slot].store(
+                        Hashbucket::pack(filler_tag, 1, Location::new(0x100 + filled)),
+                        Ordering::Release,
+                    );
+                }
+            }
+
+            let ht1 = ht.clone();
+            let o1 = oracle.clone();
+            let first = thread::spawn(move || ht_insert(&ht1, KEY, KeyOracle::location(SRC), &*o1));
+
+            let second = ht_insert(&ht, KEY, KeyOracle::location(DST), &*oracle);
+            let first = first.join().unwrap();
+
+            // One ADD wins the slot; the other must be told the key exists,
+            // never that the table is full.
+            for r in [&first, &second] {
+                assert!(
+                    !matches!(r, Err(CacheError::HashTableFull)),
+                    "an ADD reported HashTableFull for a key that is present"
+                );
+            }
+            assert!(
+                !(first.is_ok() && second.is_ok()),
+                "both ADDs reported success for the same key"
+            );
+        });
     }
 
     /// Two concurrent ADDs of the SAME key.
