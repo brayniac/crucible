@@ -312,7 +312,34 @@ impl SlabAllocator {
         let slab_ptr = unsafe {
             class.evict_slab(slab_id, |key, cid, sid, slot| {
                 let location = SlabLocation::new(cid, sid, slot).to_location();
-                hashtable.remove(key, location);
+                if !hashtable.remove(key, location) {
+                    // `remove` retries the slot for as long as it keeps
+                    // publishing `location` (cache-core's
+                    // `try_unlink_in_bucket`), so a `false` means the entry
+                    // stopped naming this slot: a racing SET republished the
+                    // key elsewhere, or it was already unlinked. Delete-marking
+                    // the item we are about to free is right in both cases, so
+                    // there is nothing to do here.
+                    //
+                    // That retry is load-bearing and NOT local to this file.
+                    // `SlabClass::evict_slab` delete-marks unconditionally
+                    // immediately after this callback returns, so if `remove`
+                    // could fail while the slot still published `location` — as
+                    // it could before the retry was added — the table would be
+                    // left publishing a tombstone. That is exactly the
+                    // counterexample to the claim `verify_slot` rests on: every
+                    // writer moves or clears the slot before delete-marking what
+                    // it superseded.
+                    //
+                    // Checked rather than assumed, so that if the retry is ever
+                    // removed this fails loudly here instead of silently
+                    // leaking a dangling entry.
+                    debug_assert!(
+                        hashtable.get_item_frequency(key, location).is_none(),
+                        "evict_slab is about to delete-mark an item the \
+                         hashtable still publishes"
+                    );
+                }
             })
         };
 
@@ -790,6 +817,97 @@ mod tests {
             let header = allocator.header(location);
             assert_eq!(header.key(), key);
             assert_eq!(header.value(), value);
+        }
+    }
+
+    /// Evicting a slab must leave NO hashtable entry publishing any location
+    /// in it.
+    ///
+    /// `SlabClass::evict_slab` delete-marks each item unconditionally right
+    /// after the eviction callback runs, so any entry the callback fails to
+    /// unlink is left pointing at a tombstone in memory that is handed back to
+    /// the global pool. Slab ids are not reused within a class, so such an
+    /// entry can never turn into a false positive — it just never goes away.
+    ///
+    /// Single-threaded, so it pins the end-to-end invariant rather than the
+    /// race that used to break it; that race is covered by cache-core's
+    /// `loom_remove_survives_a_concurrent_frequency_bump`.
+    #[test]
+    fn evict_slab_leaves_no_entry_publishing_the_evicted_slab() {
+        use cache_core::{Hashtable, KeyVerifier, Location, MultiChoiceHashtable};
+
+        /// Verifies whatever the test published, by location alone — the slab
+        /// memory is gone by the time we look, so reading it would be a
+        /// use-after-free.
+        struct ByLocation(Vec<(Vec<u8>, Location)>);
+        impl KeyVerifier for ByLocation {
+            fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+                self.0.iter().any(|(k, l)| k == key && *l == location)
+            }
+        }
+
+        let config = test_config();
+        let allocator = SlabAllocator::new(&config).unwrap();
+        let hashtable = MultiChoiceHashtable::new(8);
+
+        let value = b"value";
+        let item_size = HEADER_SIZE + 16 + value.len();
+        let class_id = allocator.select_class(item_size).unwrap();
+
+        // Fill one slab and publish every item.
+        let mut published = Vec::new();
+        let mut slab_id = None;
+        while let Some((sid, slot_index)) = allocator.allocate(class_id) {
+            match slab_id {
+                None => slab_id = Some(sid),
+                Some(first) if first != sid => break, // moved to a second slab
+                Some(_) => {}
+            }
+            let key = format!("key{slot_index:012}").into_bytes();
+            unsafe {
+                allocator.write_item(
+                    class_id,
+                    sid,
+                    slot_index,
+                    &key,
+                    value,
+                    Duration::from_secs(3600),
+                );
+            }
+            // `allocate` hands back a write reference; eviction cannot drain
+            // the slab until every one of them is released.
+            allocator.release_write_ref(class_id, sid);
+            let location = SlabLocation::new(class_id, sid, slot_index).to_location();
+            published.push((key, location));
+            if published.len() == 32 {
+                break; // enough to exercise the walk without filling 64KB
+            }
+        }
+        let slab_id = slab_id.expect("at least one slot must be allocatable");
+        assert!(!published.is_empty(), "precondition: items were published");
+
+        let verifier = ByLocation(published.clone());
+        for (key, location) in &published {
+            hashtable
+                .insert_if_absent(key, *location, &verifier)
+                .expect("seed insert must find a slot");
+        }
+        for (key, location) in &published {
+            assert_eq!(
+                hashtable.get_item_frequency(key, *location),
+                Some(1),
+                "precondition: the entry must be published before eviction"
+            );
+        }
+
+        assert!(allocator.evict_slab(class_id, slab_id, &hashtable));
+
+        for (key, location) in &published {
+            assert_eq!(
+                hashtable.get_item_frequency(key, *location),
+                None,
+                "eviction left an entry publishing a location in the freed slab"
+            );
         }
     }
 
