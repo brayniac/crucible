@@ -154,15 +154,27 @@ impl BasicHeader {
         checksum
     }
 
-    /// Try to parse header from bytes, returning None if validation fails.
+    /// Try to parse a header at `ptr`, returning None if validation fails.
+    ///
+    /// # Why a raw pointer and not `&[u8]`
+    ///
+    /// The flags byte is written by `mark_deleted` after the item is
+    /// published, through an `AtomicU8` view. A `&[u8]` covering the header
+    /// would be `noalias readonly` at the ABI boundary and `SharedReadOnly`
+    /// under Stacked Borrows — both untrue of memory a concurrent writer
+    /// mutates — and reading the flags byte would retag a `SharedReadWrite`
+    /// `&AtomicU8` from that read-only parent, which Miri rejects. Taking the
+    /// pointer keeps the segment allocation's own provenance intact, so no
+    /// read-only reference over live segment memory is ever created.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for reads of [`Self::SIZE`] bytes and carry
+    /// provenance permitting writes to the flags byte (it is read through an
+    /// atomic view). The caller owns the bounds check; there is no length to
+    /// check here.
     #[inline]
-    pub fn try_from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::SIZE {
-            return None;
-        }
-
-        let ptr = data.as_ptr();
-
+    pub unsafe fn try_from_ptr(ptr: *const u8) -> Option<Self> {
         // Read key_len, flags, and value_len from new layout
         let key_len = unsafe { *ptr };
         let flags = unsafe { read_flags(ptr.add(1)) };
@@ -203,11 +215,15 @@ impl BasicHeader {
     /// # Safety assumption
     /// The data pointer must be 8-byte aligned (items are padded to 8-byte boundaries).
     #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::try_from_ptr`]: `ptr` must be valid for reads of
+    /// [`Self::SIZE`] bytes and carry provenance permitting writes to the
+    /// flags byte, which is read through an atomic view. In addition the
+    /// bytes must be a header this cache wrote — nothing is validated.
     #[cfg(not(feature = "validation"))]
-    pub fn from_bytes_unchecked(data: &[u8]) -> Self {
-        debug_assert!(data.len() >= Self::SIZE);
-        let ptr = data.as_ptr();
-
+    pub unsafe fn from_ptr_unchecked(ptr: *const u8) -> Self {
         // Items are 8-byte aligned
         let key_len = unsafe { *ptr };
         let flags = unsafe { read_flags(ptr.add(1)) };
@@ -223,10 +239,13 @@ impl BasicHeader {
         }
     }
 
-    /// Parse header from bytes, panicking if validation fails.
-    pub fn from_bytes(data: &[u8]) -> Self {
-        debug_assert!(data.len() >= Self::SIZE);
-        Self::try_from_bytes(data).expect("Invalid BasicHeader")
+    /// Parse a header at `ptr`, panicking if validation fails.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::try_from_ptr`].
+    pub unsafe fn from_ptr(ptr: *const u8) -> Self {
+        unsafe { Self::try_from_ptr(ptr) }.expect("Invalid BasicHeader")
     }
 
     /// Write header to bytes.
@@ -460,15 +479,15 @@ impl TtlHeader {
         checksum
     }
 
-    /// Try to parse header from bytes, returning None if validation fails.
+    /// Try to parse a header at `ptr`, returning None if validation fails.
+    ///
+    /// # Safety
+    ///
+    /// As [`BasicHeader::try_from_ptr`]: `ptr` must be valid for reads of
+    /// [`Self::SIZE`] bytes and carry provenance permitting writes to the
+    /// flags byte, which is read through an atomic view.
     #[inline]
-    pub fn try_from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::SIZE {
-            return None;
-        }
-
-        let ptr = data.as_ptr();
-
+    pub unsafe fn try_from_ptr(ptr: *const u8) -> Option<Self> {
         // Read key_len, flags, value_len, and expire_at from new layout
         let key_len = unsafe { *ptr };
         let flags = unsafe { read_flags(ptr.add(1)) };
@@ -505,10 +524,13 @@ impl TtlHeader {
         })
     }
 
-    /// Parse header from bytes, panicking if validation fails.
-    pub fn from_bytes(data: &[u8]) -> Self {
-        debug_assert!(data.len() >= Self::SIZE);
-        Self::try_from_bytes(data).expect("Invalid TtlHeader")
+    /// Parse a header at `ptr`, panicking if validation fails.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::try_from_ptr`].
+    pub unsafe fn from_ptr(ptr: *const u8) -> Self {
+        unsafe { Self::try_from_ptr(ptr) }.expect("Invalid TtlHeader")
     }
 
     /// Parse header from bytes without validation checks.
@@ -517,11 +539,15 @@ impl TtlHeader {
     /// # Safety assumption
     /// The data pointer must be 8-byte aligned (items are padded to 8-byte boundaries).
     #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::try_from_ptr`]: `ptr` must be valid for reads of
+    /// [`Self::SIZE`] bytes and carry provenance permitting writes to the
+    /// flags byte, which is read through an atomic view. In addition the
+    /// bytes must be a header this cache wrote — nothing is validated.
     #[cfg(not(feature = "validation"))]
-    pub fn from_bytes_unchecked(data: &[u8]) -> Self {
-        debug_assert!(data.len() >= Self::SIZE);
-        let ptr = data.as_ptr();
-
+    pub unsafe fn from_ptr_unchecked(ptr: *const u8) -> Self {
         // Items are 8-byte aligned
         let key_len = unsafe { *ptr };
         let flags = unsafe { read_flags(ptr.add(1)) };
@@ -824,7 +850,7 @@ mod tests {
         let mut buf = vec![0u8; BasicHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = BasicHeader::try_from_bytes(&buf).expect("parse failed");
+        let parsed = unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) }.expect("parse failed");
         assert_eq!(parsed.key_len(), 10);
         assert_eq!(parsed.optional_len(), 5);
         assert_eq!(parsed.value_len(), 1000);
@@ -847,7 +873,7 @@ mod tests {
         let mut buf = vec![0u8; TtlHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = TtlHeader::try_from_bytes(&buf).expect("parse failed");
+        let parsed = unsafe { TtlHeader::try_from_ptr(buf.as_mut_ptr()) }.expect("parse failed");
         assert_eq!(parsed.key_len(), 10);
         assert_eq!(parsed.optional_len(), 5);
         assert_eq!(parsed.value_len(), 1000);
@@ -902,7 +928,7 @@ mod tests {
         // Corrupt magic byte
         buf[5] = 0xFF;
 
-        assert!(BasicHeader::try_from_bytes(&buf).is_none());
+        assert!(unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) }.is_none());
     }
 
     #[cfg(feature = "validation")]
@@ -915,18 +941,15 @@ mod tests {
         // Corrupt checksum
         buf[7] ^= 0xFF;
 
-        assert!(BasicHeader::try_from_bytes(&buf).is_none());
+        assert!(unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) }.is_none());
     }
 
-    #[test]
-    fn test_basic_header_try_from_bytes_too_short() {
-        // Data shorter than SIZE should return None
-        let short_data = [0u8; 4];
-        assert!(BasicHeader::try_from_bytes(&short_data).is_none());
-
-        let empty_data: [u8; 0] = [];
-        assert!(BasicHeader::try_from_bytes(&empty_data).is_none());
-    }
+    // The old `try_from_bytes` returned `None` for input shorter than `SIZE`.
+    // `try_from_ptr` has no length to check — bounds are the caller's, and
+    // every caller reaches the header through `Segment::header_ptr`, which
+    // returns `None` when the range leaves the segment. That check is covered
+    // by `header_ptr_rejects_a_range_past_the_end_of_the_segment` in
+    // `slice_segment.rs`.
 
     #[test]
     fn test_basic_header_from_bytes() {
@@ -935,7 +958,7 @@ mod tests {
         header.to_bytes(&mut buf);
 
         // from_bytes should work for valid data
-        let parsed = BasicHeader::from_bytes(&buf);
+        let parsed = unsafe { BasicHeader::from_ptr(buf.as_mut_ptr()) };
         assert_eq!(parsed.key_len(), 10);
         assert_eq!(parsed.optional_len(), 5);
         assert_eq!(parsed.value_len(), 1000);
@@ -951,20 +974,12 @@ mod tests {
         let mut buf = vec![0u8; BasicHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = BasicHeader::try_from_bytes(&buf).unwrap();
+        let parsed = unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) }.unwrap();
         assert!(parsed.is_deleted());
         assert!(!parsed.is_numeric());
     }
 
-    #[test]
-    fn test_ttl_header_try_from_bytes_too_short() {
-        // Data shorter than SIZE should return None
-        let short_data = [0u8; 8];
-        assert!(TtlHeader::try_from_bytes(&short_data).is_none());
-
-        let empty_data: [u8; 0] = [];
-        assert!(TtlHeader::try_from_bytes(&empty_data).is_none());
-    }
+    // See the note on the BasicHeader equivalent: bounds moved to callers.
 
     #[test]
     fn test_ttl_header_from_bytes() {
@@ -973,7 +988,7 @@ mod tests {
         header.to_bytes(&mut buf);
 
         // from_bytes should work for valid data
-        let parsed = TtlHeader::from_bytes(&buf);
+        let parsed = unsafe { TtlHeader::from_ptr(buf.as_mut_ptr()) };
         assert_eq!(parsed.key_len(), 10);
         assert_eq!(parsed.optional_len(), 5);
         assert_eq!(parsed.value_len(), 1000);
@@ -989,7 +1004,7 @@ mod tests {
         let mut buf = vec![0u8; TtlHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = TtlHeader::try_from_bytes(&buf).unwrap();
+        let parsed = unsafe { TtlHeader::try_from_ptr(buf.as_mut_ptr()) }.unwrap();
         assert!(parsed.is_deleted());
         assert!(!parsed.is_numeric());
     }
@@ -1003,7 +1018,7 @@ mod tests {
         let mut buf = vec![0u8; BasicHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = BasicHeader::try_from_bytes(&buf).unwrap();
+        let parsed = unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) }.unwrap();
         assert!(parsed.is_deleted());
         assert!(parsed.is_numeric());
     }
@@ -1017,7 +1032,7 @@ mod tests {
         let mut buf = vec![0u8; TtlHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = TtlHeader::try_from_bytes(&buf).unwrap();
+        let parsed = unsafe { TtlHeader::try_from_ptr(buf.as_mut_ptr()) }.unwrap();
         assert!(parsed.is_deleted());
         assert!(parsed.is_numeric());
     }
@@ -1028,7 +1043,7 @@ mod tests {
         let mut buf = vec![0u8; BasicHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = BasicHeader::try_from_bytes(&buf).unwrap();
+        let parsed = unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) }.unwrap();
         assert_eq!(parsed.key_len(), 0);
         assert_eq!(parsed.optional_len(), 0);
         assert_eq!(parsed.value_len(), 0);
@@ -1040,7 +1055,7 @@ mod tests {
         let mut buf = vec![0u8; TtlHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = TtlHeader::try_from_bytes(&buf).unwrap();
+        let parsed = unsafe { TtlHeader::try_from_ptr(buf.as_mut_ptr()) }.unwrap();
         assert_eq!(parsed.expire_at(), 0);
         // With expire_at=0, should be expired at any non-zero time
         assert!(parsed.is_expired(1));
@@ -1052,7 +1067,7 @@ mod tests {
         let mut buf = vec![0u8; TtlHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let parsed = TtlHeader::try_from_bytes(&buf).unwrap();
+        let parsed = unsafe { TtlHeader::try_from_ptr(buf.as_mut_ptr()) }.unwrap();
         assert_eq!(parsed.expire_at(), u32::MAX);
         // Should not be expired yet
         assert!(!parsed.is_expired(1000000));

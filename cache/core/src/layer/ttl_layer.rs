@@ -176,8 +176,8 @@ impl TtlLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     let key_start =
@@ -244,8 +244,8 @@ impl TtlLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     let key_start =
@@ -318,8 +318,8 @@ impl TtlLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     let optional_start = offset as usize + BasicHeader::SIZE;
@@ -434,8 +434,8 @@ impl TtlLayer {
 
         while offset < write_offset {
             // Get header at offset
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     // Get key for this item
@@ -606,8 +606,8 @@ impl TtlLayer {
             let write_offset = src.write_offset();
 
             while offset < write_offset {
-                if let Some(data) = src.data_slice(offset, header_size) {
-                    if let Some(header) = BasicHeader::try_from_bytes(data) {
+                if let Some(data) = src.header_ptr(offset, header_size) {
+                    if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                         let item_size = header.padded_size() as u32;
 
                         // Skip deleted items
@@ -779,8 +779,8 @@ impl TtlLayer {
 
         while offset < write_offset {
             // Get header at offset
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     // Calculate offsets for key, value, optional
@@ -1018,11 +1018,11 @@ impl TtlLayer {
             let write_offset = segment.write_offset();
 
             while offset < write_offset {
-                let data = match segment.data_slice(offset, BasicHeader::SIZE) {
+                let data = match segment.header_ptr(offset, BasicHeader::SIZE) {
                     Some(d) => d,
                     None => break,
                 };
-                let header = match BasicHeader::try_from_bytes(data) {
+                let header = match unsafe { BasicHeader::try_from_ptr(data) } {
                     Some(h) => h,
                     None => break,
                 };
@@ -1219,8 +1219,8 @@ impl Layer for TtlLayer {
             // We need the key to mark deleted.
             // Get it from the segment header.
             let offset = location.offset();
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE)
-                && let Some(header) = BasicHeader::try_from_bytes(data)
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
+                && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
             {
                 let key_start =
                     offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -1358,8 +1358,8 @@ impl Layer for TtlLayer {
         if let Some(segment) = self.pool.get(location.segment_id()) {
             // Mark the item as deleted (same as mark_deleted)
             let offset = location.offset();
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE)
-                && let Some(header) = BasicHeader::try_from_bytes(data)
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
+                && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
             {
                 let key_start =
                     offset as usize + BasicHeader::SIZE + header.optional_len() as usize;

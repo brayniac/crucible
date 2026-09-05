@@ -224,10 +224,7 @@ impl SegmentKeyVerify for DiskSegmentMeta {
             return false;
         }
 
-        let header_bytes =
-            unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
-
-        let header = BasicHeader::from_bytes(header_bytes);
+        let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
 
         if !allow_deleted && header.is_deleted() {
             return false;
@@ -266,10 +263,7 @@ impl SegmentKeyVerify for DiskSegmentMeta {
             return None;
         }
 
-        let header_bytes =
-            unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
-
-        let header = BasicHeader::from_bytes(header_bytes);
+        let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
 
         if !allow_deleted && header.is_deleted() {
             return None;
@@ -519,6 +513,17 @@ impl Segment for DiskSegmentMeta {
         Some(unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), len) })
     }
 
+    fn header_ptr(&self, offset: u32, len: usize) -> Option<*const u8> {
+        // Only available when write buffer is present
+        let data_ptr = self.write_buffer_ptr()?;
+
+        if offset as usize + len > self.capacity as usize {
+            return None;
+        }
+
+        Some(unsafe { data_ptr.add(offset as usize) })
+    }
+
     fn append_item(&self, key: &[u8], value: &[u8], optional: &[u8]) -> Option<u32> {
         let data_ptr = self.write_buffer_mut_ptr()?;
 
@@ -678,9 +683,7 @@ impl Segment for DiskSegmentMeta {
             return Err(CacheError::InvalidOffset);
         }
 
-        let header_bytes =
-            unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
-        let header = BasicHeader::from_bytes(header_bytes);
+        let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
 
         // NOTE: the is_deleted check that used to live here has moved below
         // the flag write. Checking first and acting later let two concurrent

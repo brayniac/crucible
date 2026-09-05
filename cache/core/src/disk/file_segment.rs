@@ -263,6 +263,10 @@ impl Segment for FileSegment<'_> {
         self.inner.data_slice(offset, len)
     }
 
+    fn header_ptr(&self, offset: u32, len: usize) -> Option<*const u8> {
+        self.inner.header_ptr(offset, len)
+    }
+
     fn append_item(&self, key: &[u8], value: &[u8], optional: &[u8]) -> Option<u32> {
         let result = self.inner.append_item(key, value, optional);
         if result.is_some() {

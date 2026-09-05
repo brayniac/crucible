@@ -356,9 +356,12 @@ fn test_disk_read_params_point_to_correct_data() {
             if item_offset + BasicHeader::SIZE > block.len() {
                 continue;
             }
-            let header = match BasicHeader::try_from_bytes(
-                &block[item_offset..item_offset + BasicHeader::SIZE],
-            ) {
+            // Decoded from a private copy: `try_from_ptr` reads the flags
+            // byte through an atomic view, which needs provenance permitting
+            // writes, and a `&[u8]` cannot give that.
+            let mut header_bytes = [0u8; BasicHeader::SIZE];
+            header_bytes.copy_from_slice(&block[item_offset..item_offset + BasicHeader::SIZE]);
+            let header = match unsafe { BasicHeader::try_from_ptr(header_bytes.as_mut_ptr()) } {
                 Some(h) => h,
                 None => continue,
             };

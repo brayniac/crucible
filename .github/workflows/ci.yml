@@ -124,6 +124,47 @@ jobs:
             -p segcache -Zbuild-std --target x86_64-unknown-linux-gnu \
             --test io_uring_disk_tier_tests
 
+  miri:
+    name: Test (miri)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Miri over the item-header decode path, under Stacked Borrows.
+    #
+    # This checks something TSan structurally cannot: the ALIASING claim a
+    # reference makes, as opposed to the accesses it performs. The flags byte
+    # is written by `mark_deleted` after an item is published, so a `&[u8]`
+    # spanning a header is `noalias readonly` at the ABI boundary and
+    # `SharedReadOnly` under Stacked Borrows -- neither true of memory a
+    # concurrent writer mutates. Reading the flags byte from such a slice
+    # retags a `SharedReadWrite` `&AtomicU8` from a read-only parent, which
+    # Miri rejects at the retag, single-threaded, with no race required.
+    #
+    # It earned its place the same way the TSan job did: run against the tree
+    # before the decoders took raw pointers, it failed on an existing test.
+    #
+    # Scope is deliberately narrow. Miri cannot execute the real segment
+    # allocator -- `hugepage.rs` allocates with `mmap`, which Miri does not
+    # support -- nor anything calling `clocksource`, which issues a syscall.
+    # So this runs the header decoders and the segment tests that build their
+    # memory with the global allocator and stay off the clock. That is enough
+    # to cover the decode path itself, which is where the aliasing claim is
+    # made; it is NOT general UB coverage of the cache.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+      - name: Header decode under Miri
+        run: |
+          cargo +nightly miri test -p cache-core --lib item::
+          cargo +nightly miri test -p cache-core --lib \
+            slice_segment::tests::decoding_a_published_header
+          cargo +nightly miri test -p cache-core --lib \
+            slice_segment::tests::header_ptr_rejects
+
   smoketest:
     name: Smoketest (${{ matrix.config }})
     runs-on: ubuntu-latest
