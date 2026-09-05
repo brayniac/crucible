@@ -139,9 +139,14 @@ pub struct FilePool {
     /// Segment metadata.
     segments: Vec<FileSegment<'static>>,
 
-    /// Lock-free free list.
-    /// Boxed for stable address - segments hold raw pointers to this.
-    free_queue: Box<crossbeam_deque::Injector<u32>>,
+    /// Lock-free free list. Segments hold raw pointers to this.    ///
+    /// `Arc`, not `Box`: every segment holds a raw pointer into this queue and
+    /// pushes itself back on release. Dereferencing a `Box` asserts unique
+    /// ownership, which under Stacked Borrows pops every pointer derived from
+    /// it, so the pool's own use of the queue invalidated the pointer the
+    /// segments were holding. An `Arc` is a shared owner and makes no such
+    /// assertion.
+    free_queue: std::sync::Arc<crossbeam_deque::Injector<u32>>,
 
     /// Pool ID (0-3).
     pool_id: u8,
@@ -277,21 +282,31 @@ impl RamPool for FilePool {
     }
 
     fn reserve(&self) -> Option<u32> {
-        match self.free_queue.steal() {
-            crossbeam_deque::Steal::Success(segment_id) => {
-                let segment = &self.segments[segment_id as usize];
+        use crate::memory_pool::MAX_STEAL_RETRIES;
 
-                // Transition Free -> Reserved
-                if !segment.try_reserve() {
-                    // Segment not in Free state - push back and return None
-                    self.free_queue.push(segment_id);
-                    return None;
+        // Bounded retry: `Injector::steal` returns `Retry` transiently, meaning
+        // "another thread was mid-operation, ask again", NOT "the queue is
+        // empty". Only `Empty` answers the question. See `MemoryPool::reserve`.
+        for _ in 0..MAX_STEAL_RETRIES {
+            match self.free_queue.steal() {
+                crossbeam_deque::Steal::Success(segment_id) => {
+                    let segment = &self.segments[segment_id as usize];
+
+                    // Transition Free -> Reserved
+                    if !segment.try_reserve() {
+                        // Segment not in Free state - push back and retry
+                        self.free_queue.push(segment_id);
+                        continue;
+                    }
+
+                    return Some(segment_id);
                 }
-
-                Some(segment_id)
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return None,
             }
-            crossbeam_deque::Steal::Empty | crossbeam_deque::Steal::Retry => None,
         }
+
+        None
     }
 
     fn release(&self, id: u32) {
@@ -470,8 +485,11 @@ impl FilePoolBuilder {
         }
 
         // Initialize free queue first (boxed for stable address)
-        let free_queue = Box::new(crossbeam_deque::Injector::new());
-        let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*free_queue;
+        let free_queue = std::sync::Arc::new(crossbeam_deque::Injector::new());
+        // `Arc::as_ptr`, not `&*free_queue`: a shared reference narrows the
+        // provenance to read-only, and pushing through it needs write access.
+        let free_queue_ptr: *const crossbeam_deque::Injector<u32> =
+            std::sync::Arc::as_ptr(&free_queue);
 
         // Initialize segments with pointer to free queue
         let mut segments = Vec::with_capacity(num_segments);

@@ -127,48 +127,46 @@ jobs:
   miri:
     name: Test (miri)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Miri under Stacked Borrows, over the parts of cache-core it can execute.
+    timeout-minutes: 45
+    # Miri under Stacked Borrows, over nearly all of cache-core.
     #
-    # This checks something TSan structurally cannot: the ALIASING claim a
-    # reference makes, as opposed to the accesses it performs. The flags byte
-    # is written by `mark_deleted` after an item is published, so a `&[u8]`
-    # spanning a header is `noalias readonly` at the ABI boundary and
-    # `SharedReadOnly` under Stacked Borrows -- neither true of memory a
-    # concurrent writer mutates. Reading the flags byte from such a slice
-    # retags a `SharedReadWrite` `&AtomicU8` from a read-only parent, which
-    # Miri rejects at the retag, single-threaded, with no race required.
+    # This checks two things TSan structurally cannot. First, the ALIASING
+    # claim a reference makes rather than the accesses it performs: a `&[u8]`
+    # spanning an item header is `noalias readonly` and `SharedReadOnly`, and
+    # `mark_deleted` writes the flags byte inside it, so merely creating that
+    # reference is wrong -- Miri rejects it single-threaded, no race needed.
+    # Second, PROVENANCE: a raw pointer that stops being valid before it is
+    # used, which no sanitiser sees because the address is still correct.
     #
-    # It earned its place the way the TSan job did: run against the tree
-    # before the decoders took raw pointers, it failed on an existing test.
-    # Widening its scope past that first version immediately found a second,
-    # unrelated provenance defect (see the free-queue issue below).
+    # It has found four defects so far, none of which the other jobs caught:
+    # the header decoders' `&[u8]`, whole-item slices spanning the flags byte
+    # (a genuine data race), a free-queue pointer invalidated by the pool's own
+    # use of its `Box`, and `Steal::Retry` read as "queue empty".
     #
-    # `-Zmiri-disable-isolation` is required and not optional: `clocksource`
-    # calls `clock_gettime`, which isolation blocks. Anonymous `mmap` needs
-    # nothing -- Miri shims it, so the real hugepage allocator runs here.
+    # `-Zmiri-disable-isolation` is required: `clocksource` calls
+    # `clock_gettime`, which isolation blocks. Anonymous `mmap` needs nothing --
+    # Miri shims it.
     #
-    # What is NOT covered, and why:
+    # Excluded, and why:
     #
-    #  - `disk::`  -- `memmap2` maps a FILE, which Miri does not support.
-    #    Anonymous mappings are fine; file-backed ones are not.
-    #  - `hugepage::` -- Miri accepts `mmap` only with
-    #    MAP_PRIVATE|MAP_ANONYMOUS, and the hugepage path adds MAP_HUGETLB.
-    #    It also does not implement MADV_HUGEPAGE, so the THP hint in
-    #    `allocate_on_node` needs skipping before these tests run at all.
-    #    Both are Linux-only paths, so neither shows up when running Miri on
-    #    macOS -- they were found here, on CI, not locally. Excluded rather
-    #    than worked around: unlike a prefetch, the mmap flags decide what is
-    #    actually allocated, so compiling them out would change what is
-    #    tested rather than drop a hint.
-    #  - `layer::`, `organization::`, `cache::` -- these build a real
-    #    `MemoryPool`, which hands every segment a free-queue pointer it then
-    #    invalidates. That is a genuine defect Miri reports, not a limitation:
-    #    it is filed, and fixing it is what widens this job.
-    #  - the SIMD tag scan and the prefetch hints are inline asm Miri cannot
-    #    execute. `cfg(miri)` routes to the scalar fallback, which computes the
-    #    same mask, and drops the prefetches, which have no semantic effect.
-    #    So the vectorised load itself is not what is checked here.
+    #  - the four `disk::` modules that build a pool -- `memmap2` maps a FILE,
+    #    which Miri does not support. Anonymous mappings are fine; file-backed
+    #    ones are not. `disk::disk_segment_meta` DOES run: it allocates through
+    #    the global allocator.
+    #  - `hugepage::` -- Miri accepts `mmap` only with MAP_PRIVATE|MAP_ANONYMOUS
+    #    and the hugepage path adds MAP_HUGETLB. Excluded rather than worked
+    #    around: unlike a prefetch, the mmap flags decide what is actually
+    #    allocated, so compiling them out would change what is tested.
+    #
+    #    The THP `madvise` hint in the same file IS compiled out under
+    #    `cfg(miri)` -- it is advisory and its result is already discarded, and
+    #    every pool-building test reaches it, so without that nothing here
+    #    would run on Linux at all. Both are Linux-only paths, so neither
+    #    reproduces when running Miri on macOS: they were found on CI.
+    #  - the SIMD tag scan and prefetch hints are inline asm Miri cannot run.
+    #    `cfg(miri)` routes to the scalar fallback, which computes the same
+    #    mask, and drops the prefetches, which have no semantic effect. So the
+    #    vectorised load itself is not what is checked here.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -181,9 +179,12 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
-          cargo +nightly miri test -p cache-core --lib item::
-          cargo +nightly miri test -p cache-core --lib slice_segment::
-          cargo +nightly miri test -p cache-core --lib hashtable_impl::
+          cargo +nightly miri test -p cache-core --lib -- \
+            --skip disk::file_pool \
+            --skip disk::disk_layer \
+            --skip disk::io_uring \
+            --skip disk::recovery \
+            --skip hugepage::
 
   smoketest:
     name: Smoketest (${{ matrix.config }})

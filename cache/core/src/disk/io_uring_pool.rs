@@ -31,10 +31,15 @@ pub struct IoUringPool {
     /// In-RAM metadata for each disk segment.
     segments: Vec<DiskSegmentMeta>,
     /// Lock-free free queue for segment allocation.
-    free_queue: Box<crossbeam_deque::Injector<u32>>,
+    ///
+    /// `Arc`, not `Box`: see `MemoryPool::free_queue`. Segments hold raw
+    /// pointers into this queue and push themselves back on release, and a
+    /// `Box` deref asserts unique ownership, which pops those pointers off the
+    /// borrow stack.
+    free_queue: std::sync::Arc<crossbeam_deque::Injector<u32>>,
     /// Spare queue for segments that need special handling.
     #[allow(dead_code)]
-    spare_queue: Box<crossbeam_deque::Injector<u32>>,
+    spare_queue: std::sync::Arc<crossbeam_deque::Injector<u32>>,
     /// Pool ID (0-3).
     pool_id: u8,
     /// Size of each segment in bytes.
@@ -68,10 +73,12 @@ impl IoUringPool {
             "block_size must be a power of two"
         );
 
-        let free_queue = Box::new(crossbeam_deque::Injector::new());
-        let spare_queue = Box::new(crossbeam_deque::Injector::new());
+        // `Arc`, not `Box`: see `MemoryPool::free_queue`. Segments hold raw
+        // pointers into this queue, and a `Box` deref would invalidate them.
+        let free_queue = std::sync::Arc::new(crossbeam_deque::Injector::new());
+        let spare_queue = std::sync::Arc::new(crossbeam_deque::Injector::new());
 
-        let free_queue_ptr = &*free_queue as *const crossbeam_deque::Injector<u32>;
+        let free_queue_ptr = std::sync::Arc::as_ptr(&free_queue);
 
         let mut segments = Vec::with_capacity(segment_count);
         for i in 0..segment_count {

@@ -322,8 +322,12 @@ impl<'a> SliceSegment<'a> {
             return Err(CacheError::InvalidOffset);
         }
 
-        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-
+        // Slice the item's BODY only. A slice spanning the header would
+        // include the flags byte, and `mark_deleted` writes that byte through
+        // an atomic after the item is published -- so merely creating such a
+        // reference is a read that races the write. Key, value and optional
+        // bytes are written before publication and never mutated, so shared
+        // references over them are honest.
         let optional_start = BasicHeader::SIZE;
         let optional_end = optional_start + header.optional_len() as usize;
         let key_start = optional_end;
@@ -331,16 +335,25 @@ impl<'a> SliceSegment<'a> {
         let value_start = key_end;
         let value_end = value_start + header.value_len() as usize;
 
-        if &raw[key_start..key_end] != key {
+        let stored_key =
+            unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
+        let stored_value = unsafe {
+            std::slice::from_raw_parts(data_ptr.add(value_start), value_end - value_start)
+        };
+        let stored_optional = unsafe {
+            std::slice::from_raw_parts(data_ptr.add(optional_start), optional_end - optional_start)
+        };
+
+        if stored_key != key {
             self.ref_count.fetch_sub(1, Ordering::Release);
             return Err(CacheError::KeyMismatch);
         }
 
         Ok(BasicItemGuard::new(
             &self.ref_count,
-            &raw[key_start..key_end],
-            &raw[value_start..value_end],
-            &raw[optional_start..optional_end],
+            stored_key,
+            stored_value,
+            stored_optional,
             &self.metadata,
             self.free_queue,
             self.id,
@@ -396,8 +409,12 @@ impl<'a> SliceSegment<'a> {
             return Err(CacheError::InvalidOffset);
         }
 
-        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-
+        // Slice the item's BODY only. A slice spanning the header would
+        // include the flags byte, and `mark_deleted` writes that byte through
+        // an atomic after the item is published -- so merely creating such a
+        // reference is a read that races the write. Key, value and optional
+        // bytes are written before publication and never mutated, so shared
+        // references over them are honest.
         let optional_start = TtlHeader::SIZE;
         let optional_end = optional_start + header.optional_len() as usize;
         let key_start = optional_end;
@@ -405,16 +422,25 @@ impl<'a> SliceSegment<'a> {
         let value_start = key_end;
         let value_end = value_start + header.value_len() as usize;
 
-        if &raw[key_start..key_end] != key {
+        let stored_key =
+            unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
+        let stored_value = unsafe {
+            std::slice::from_raw_parts(data_ptr.add(value_start), value_end - value_start)
+        };
+        let stored_optional = unsafe {
+            std::slice::from_raw_parts(data_ptr.add(optional_start), optional_end - optional_start)
+        };
+
+        if stored_key != key {
             self.ref_count.fetch_sub(1, Ordering::Release);
             return Err(CacheError::KeyMismatch);
         }
 
         Ok(BasicItemGuard::new(
             &self.ref_count,
-            &raw[key_start..key_end],
-            &raw[value_start..value_end],
-            &raw[optional_start..optional_end],
+            stored_key,
+            stored_value,
+            stored_optional,
             &self.metadata,
             self.free_queue,
             self.id,
@@ -766,8 +792,11 @@ impl SegmentKeyVerify for SliceSegment<'_> {
             let key_start = TtlHeader::SIZE + header.optional_len() as usize;
             let key_end = key_start + header.key_len() as usize;
 
-            let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
-            if key_end <= raw.len() && &raw[key_start..key_end] == key {
+            // Body only -- see the note in `get_item`: a slice spanning the
+            // header would race `mark_deleted`'s write to the flags byte.
+            let stored_key =
+                unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
+            if key_end <= item_size && stored_key == key {
                 Some((header.key_len(), header.optional_len(), header.value_len()))
             } else {
                 None
@@ -1443,7 +1472,6 @@ impl SegmentGuard for SliceSegment<'_> {
         }
 
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-        let raw = unsafe { std::slice::from_raw_parts(data_ptr, item_size) };
 
         // Compute slice boundaries from header info
         let optional_start = header_size;
@@ -1453,11 +1481,23 @@ impl SegmentGuard for SliceSegment<'_> {
         let value_start = key_end;
         let value_end = value_start + value_len as usize;
 
+        // Body only -- see the note in `get_item`: a slice spanning the header
+        // would include the flags byte that `mark_deleted` writes after
+        // publication, and creating it races that write.
+        let stored_key =
+            unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
+        let stored_value = unsafe {
+            std::slice::from_raw_parts(data_ptr.add(value_start), value_end - value_start)
+        };
+        let stored_optional = unsafe {
+            std::slice::from_raw_parts(data_ptr.add(optional_start), optional_end - optional_start)
+        };
+
         Ok(BasicItemGuard::new(
             &self.ref_count,
-            &raw[key_start..key_end],
-            &raw[value_start..value_end],
-            &raw[optional_start..optional_end],
+            stored_key,
+            stored_value,
+            stored_optional,
             &self.metadata,
             self.free_queue,
             self.id,
