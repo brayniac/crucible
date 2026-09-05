@@ -981,29 +981,22 @@ impl<H: Hashtable> TieredCache<H> {
         // plain replace (update_if_present) would overwrite whatever entry is
         // current, silently losing a write that raced in between the token
         // check and the publish.
-        loop {
-            if self
-                .hashtable
-                .cas_location(key, current_location, new_location.to_location(), true)
-            {
-                self.mark_deleted_at(current_location);
-                return Ok(true);
-            }
-
-            // cas_location can fail spuriously: the slot exchange covers the
-            // full packed word, so a concurrent reader bumping the frequency
-            // bits fails it even though the location is unchanged. Retry
-            // while the key still maps to the checked location; otherwise the
-            // entry really changed and the CAS fails.
-            if self
-                .hashtable
-                .get_item_frequency(key, current_location)
-                .is_none()
-            {
-                write_layer.mark_deleted(new_location);
-                return Ok(false);
-            }
+        if self
+            .hashtable
+            .cas_location(key, current_location, new_location.to_location(), true)
+        {
+            self.mark_deleted_at(current_location);
+            return Ok(true);
         }
+
+        // `cas_location` retries the slot itself while it keeps publishing
+        // `current_location`, so a failure here means the entry genuinely
+        // stopped being the one whose token we checked — somebody else
+        // published over it. This used to be a retry loop guarding against
+        // spurious failures from a concurrent reader's frequency bump, which
+        // `try_cas_in_bucket` now absorbs.
+        write_layer.mark_deleted(new_location);
+        Ok(false)
     }
 
     /// Delete an item from the cache.
