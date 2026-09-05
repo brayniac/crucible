@@ -22,7 +22,7 @@ use crate::sync::{AtomicU32, Ordering};
 /// Maximum number of steal retries before giving up. Bounds the retry loop
 /// in `reserve_spare` and `reserve` to prevent unbounded spinning under
 /// pathological contention.
-const MAX_STEAL_RETRIES: usize = 64;
+pub(crate) const MAX_STEAL_RETRIES: usize = 64;
 
 /// A pool of segments backed by in-memory allocation.
 ///
@@ -42,12 +42,19 @@ pub struct MemoryPool {
     segments: Vec<SliceSegment<'static>>,
 
     /// Lock-free free list for normal allocation.
-    /// Boxed for stable address.
-    free_queue: Box<crossbeam_deque::Injector<u32>>,
+    ///
+    /// `Arc`, not `Box`, and that is load-bearing: every segment holds a raw
+    /// pointer into this queue and pushes itself back on release. Dereferencing
+    /// a `Box` asserts unique ownership, which under Stacked Borrows pops every
+    /// pointer derived from it — so each of the pool's own `free_queue.push()`
+    /// calls invalidated the pointer all the segments were holding. An `Arc` is
+    /// a shared owner and makes no such assertion.
+    free_queue: std::sync::Arc<crossbeam_deque::Injector<u32>>,
 
     /// Lock-free free list reserved for compaction operations.
-    /// Boxed for stable address.
-    spare_queue: Box<crossbeam_deque::Injector<u32>>,
+    ///
+    /// `Arc` for the same reason as `free_queue`.
+    spare_queue: std::sync::Arc<crossbeam_deque::Injector<u32>>,
 
     /// Target capacity for spare queue (typically = num_workers).
     spare_capacity: u32,
@@ -119,22 +126,31 @@ impl MemoryPool {
             }
         }
 
-        // Fallback: try main free queue if spare is empty
-        match self.free_queue.steal() {
-            crossbeam_deque::Steal::Success(segment_id) => {
-                let segment = &self.segments[segment_id as usize];
+        // Fallback: try main free queue if spare is empty. Bounded retry for
+        // the same reason as the loop above and as `reserve` -- a `Retry` from
+        // `Injector::steal` means "ask again", not "the queue is empty", and
+        // treating it as the latter reports the pool exhausted while segments
+        // are sitting in it.
+        for _ in 0..MAX_STEAL_RETRIES {
+            match self.free_queue.steal() {
+                crossbeam_deque::Steal::Success(segment_id) => {
+                    let segment = &self.segments[segment_id as usize];
 
-                // Transition Free -> Reserved
-                if !segment.try_reserve() {
-                    // Segment not in Free state - push back and return None
-                    self.free_queue.push(segment_id);
-                    return None;
+                    // Transition Free -> Reserved
+                    if !segment.try_reserve() {
+                        // Segment not in Free state - push back and retry
+                        self.free_queue.push(segment_id);
+                        continue;
+                    }
+
+                    return Some(segment_id);
                 }
-
-                Some(segment_id)
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return None,
             }
-            crossbeam_deque::Steal::Empty | crossbeam_deque::Steal::Retry => None,
         }
+
+        None
     }
 
     /// Release a segment back to the appropriate queue with automatic balancing.
@@ -211,22 +227,34 @@ impl RamPool for MemoryPool {
     }
 
     fn reserve(&self) -> Option<u32> {
-        // Normal allocation only uses free_queue, never spare_queue
-        match self.free_queue.steal() {
-            crossbeam_deque::Steal::Success(segment_id) => {
-                let segment = &self.segments[segment_id as usize];
+        // Normal allocation only uses free_queue, never spare_queue.
+        //
+        // Bounded retry, matching `reserve_spare`. `Injector::steal` returns
+        // `Retry` transiently -- it means "another thread was mid-operation,
+        // ask again", NOT "the queue is empty". Returning `None` on it reports
+        // the pool exhausted while segments are sitting in the queue, which
+        // costs a spurious eviction or allocation failure. Only `Empty` is an
+        // answer about the queue's contents.
+        for _ in 0..MAX_STEAL_RETRIES {
+            match self.free_queue.steal() {
+                crossbeam_deque::Steal::Success(segment_id) => {
+                    let segment = &self.segments[segment_id as usize];
 
-                // Transition Free -> Reserved
-                if !segment.try_reserve() {
-                    // Segment not in Free state - push back and return None
-                    self.free_queue.push(segment_id);
-                    return None;
+                    // Transition Free -> Reserved
+                    if !segment.try_reserve() {
+                        // Segment not in Free state - push back and retry
+                        self.free_queue.push(segment_id);
+                        continue;
+                    }
+
+                    return Some(segment_id);
                 }
-
-                Some(segment_id)
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return None,
             }
-            crossbeam_deque::Steal::Empty | crossbeam_deque::Steal::Retry => None,
         }
+
+        None
     }
 
     fn release(&self, id: u32) {
@@ -421,12 +449,17 @@ impl MemoryPoolBuilder {
         // Allocate backing memory (optionally bound to NUMA node)
         let heap = allocate_on_node(actual_size, self.hugepage_size, self.numa_node)?;
 
-        // Create both queues (boxed for stable address)
-        let free_queue = Box::new(crossbeam_deque::Injector::new());
-        let spare_queue = Box::new(crossbeam_deque::Injector::new());
+        // Create both queues. `Arc` for a stable address AND for provenance
+        // that survives the pool's own use of the queue -- see the field docs.
+        let free_queue = std::sync::Arc::new(crossbeam_deque::Injector::new());
+        let spare_queue = std::sync::Arc::new(crossbeam_deque::Injector::new());
 
-        // Get pointer to free_queue for segments (guards will push here on release)
-        let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*free_queue;
+        // Pointer to free_queue for segments (guards push here on release).
+        // `Arc::as_ptr`, not `&*free_queue`: a shared reference would narrow
+        // the provenance to read-only, and pushing through it later needs
+        // write access to the queue's interior.
+        let free_queue_ptr: *const crossbeam_deque::Injector<u32> =
+            std::sync::Arc::as_ptr(&free_queue);
 
         // Initialize segments with pointer to free_queue
         let mut segments = Vec::with_capacity(num_segments);
