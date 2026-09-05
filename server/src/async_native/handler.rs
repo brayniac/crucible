@@ -586,8 +586,14 @@ async fn submit_and_await_disk_read<C: Cache>(
         return Ok(());
     }
 
-    let header =
-        cache_core::BasicHeader::from_bytes(&buf_slice[item_offset..item_offset + header_size]);
+    // Decoded from a private copy. `BasicHeader::from_ptr` reads the flags byte
+    // through an atomic view, which needs provenance permitting writes, and a
+    // `&[u8]` cannot give that. Unlike segment memory this buffer is a
+    // completed io_uring read that no other thread touches, so copying the
+    // header out is sound and keeps the atomic view off a read-only reference.
+    let mut header_bytes = [0u8; cache_core::BasicHeader::SIZE];
+    header_bytes.copy_from_slice(&buf_slice[item_offset..item_offset + header_size]);
+    let header = unsafe { cache_core::BasicHeader::from_ptr(header_bytes.as_mut_ptr()) };
 
     if header.is_deleted() {
         DISK_READ_MISSES.increment();

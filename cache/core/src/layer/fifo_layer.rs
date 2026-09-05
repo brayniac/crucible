@@ -113,8 +113,8 @@ impl FifoLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
-                if let Some(header) = TtlHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
+                if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     if !header.is_deleted() && !header.is_expired(now) {
@@ -187,8 +187,8 @@ impl FifoLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
-                if let Some(header) = TtlHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
+                if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     if !header.is_deleted() && !header.is_expired(now) {
@@ -270,8 +270,8 @@ impl FifoLayer {
 
         while offset < write_offset {
             // Try to read header at offset
-            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
-                if let Some(header) = TtlHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
+                if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     // Skip if already deleted or expired
@@ -356,8 +356,8 @@ impl FifoLayer {
 
         while offset < write_offset {
             // Try to read header at offset
-            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
-                if let Some(header) = TtlHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
+                if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     // Skip if already deleted or expired
@@ -457,8 +457,8 @@ impl FifoLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE) {
-                if let Some(header) = TtlHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
+                if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     if !header.is_deleted() && !header.is_expired(now) {
@@ -628,8 +628,8 @@ impl Layer for FifoLayer {
             // This is a limitation - mark_deleted needs to be called with key.
             // For now, we skip the key verification by getting it from the segment.
             let offset = location.offset();
-            if let Some(data) = segment.data_slice(offset, TtlHeader::SIZE)
-                && let Some(header) = TtlHeader::try_from_bytes(data)
+            if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE)
+                && let Some(header) = unsafe { TtlHeader::try_from_ptr(data) }
             {
                 let key_start = offset as usize + TtlHeader::SIZE + header.optional_len() as usize;
                 let key_len = header.key_len() as usize;

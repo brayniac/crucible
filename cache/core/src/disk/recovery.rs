@@ -98,8 +98,8 @@ pub fn recover_segment(
 
     while offset < write_offset {
         // Try to parse header at this offset
-        if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-            if let Some(header) = BasicHeader::try_from_bytes(data) {
+        if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+            if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                 let item_size = header.padded_size() as u32;
 
                 // Validate item bounds
@@ -165,8 +165,8 @@ pub fn warm_from_pool<H: Hashtable>(pool: &FilePool, hashtable: &H, now: u32) ->
             let write_offset = segment.write_offset();
 
             while offset < write_offset {
-                if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                    if let Some(header) = BasicHeader::try_from_bytes(data) {
+                if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                    if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                         let item_size = header.padded_size() as u32;
 
                         // Skip deleted items

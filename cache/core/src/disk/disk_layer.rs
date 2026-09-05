@@ -182,8 +182,8 @@ impl DiskLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     let key_start =
@@ -229,8 +229,8 @@ impl DiskLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     let key_start =
@@ -397,8 +397,8 @@ impl Layer for DiskLayer {
 
         if let Some(segment) = self.pool.get(location.segment_id()) {
             let offset = location.offset();
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE)
-                && let Some(header) = BasicHeader::try_from_bytes(data)
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
+                && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
             {
                 let key_start =
                     offset as usize + BasicHeader::SIZE + header.optional_len() as usize;

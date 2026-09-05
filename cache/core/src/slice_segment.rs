@@ -297,12 +297,11 @@ impl<'a> SliceSegment<'a> {
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
 
         // Parse header
-        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
 
         #[cfg(feature = "validation")]
-        let header = BasicHeader::try_from_bytes(header_bytes);
+        let header = unsafe { BasicHeader::try_from_ptr(data_ptr) };
         #[cfg(not(feature = "validation"))]
-        let header = Some(BasicHeader::from_bytes_unchecked(header_bytes));
+        let header = Some(unsafe { BasicHeader::from_ptr_unchecked(data_ptr) });
 
         let header = match header {
             Some(h) => h,
@@ -363,12 +362,11 @@ impl<'a> SliceSegment<'a> {
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
 
         // Parse header
-        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
 
         #[cfg(feature = "validation")]
-        let header = TtlHeader::try_from_bytes(header_bytes);
+        let header = unsafe { TtlHeader::try_from_ptr(data_ptr) };
         #[cfg(not(feature = "validation"))]
-        let header = Some(TtlHeader::from_bytes_unchecked(header_bytes));
+        let header = Some(unsafe { TtlHeader::from_ptr_unchecked(data_ptr) });
 
         let header = match header {
             Some(h) => h,
@@ -484,12 +482,11 @@ impl<'a> SliceSegment<'a> {
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
 
         // Parse header
-        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
 
         #[cfg(feature = "validation")]
-        let header = BasicHeader::try_from_bytes(header_bytes);
+        let header = unsafe { BasicHeader::try_from_ptr(data_ptr) };
         #[cfg(not(feature = "validation"))]
-        let header = Some(BasicHeader::from_bytes_unchecked(header_bytes));
+        let header = Some(unsafe { BasicHeader::from_ptr_unchecked(data_ptr) });
 
         let header = match header {
             Some(h) => h,
@@ -550,12 +547,11 @@ impl<'a> SliceSegment<'a> {
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
 
         // Parse header
-        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
 
         #[cfg(feature = "validation")]
-        let header = TtlHeader::try_from_bytes(header_bytes);
+        let header = unsafe { TtlHeader::try_from_ptr(data_ptr) };
         #[cfg(not(feature = "validation"))]
-        let header = Some(TtlHeader::from_bytes_unchecked(header_bytes));
+        let header = Some(unsafe { TtlHeader::from_ptr_unchecked(data_ptr) });
 
         let header = match header {
             Some(h) => h,
@@ -632,12 +628,11 @@ impl<'a> SliceSegment<'a> {
         }
 
         let data_ptr = unsafe { self.data.as_ptr().add(offset) };
-        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, BasicHeader::SIZE) };
 
         #[cfg(feature = "validation")]
-        let header = BasicHeader::try_from_bytes(header_bytes)?;
+        let header = unsafe { BasicHeader::try_from_ptr(data_ptr) }?;
         #[cfg(not(feature = "validation"))]
-        let header = BasicHeader::from_bytes_unchecked(header_bytes);
+        let header = unsafe { BasicHeader::from_ptr_unchecked(data_ptr) };
 
         if !allow_deleted && header.is_deleted() {
             return None;
@@ -684,12 +679,11 @@ impl<'a> SliceSegment<'a> {
         }
 
         let data_ptr = unsafe { self.data.as_ptr().add(offset) };
-        let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
 
         #[cfg(feature = "validation")]
-        let header = TtlHeader::try_from_bytes(header_bytes)?;
+        let header = unsafe { TtlHeader::try_from_ptr(data_ptr) }?;
         #[cfg(not(feature = "validation"))]
-        let header = TtlHeader::from_bytes_unchecked(header_bytes);
+        let header = unsafe { TtlHeader::from_ptr_unchecked(data_ptr) };
 
         if !allow_deleted && header.is_deleted() {
             return None;
@@ -750,12 +744,10 @@ impl SegmentKeyVerify for SliceSegment<'_> {
                 return None;
             }
 
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
-
             #[cfg(feature = "validation")]
-            let header = TtlHeader::try_from_bytes(header_bytes)?;
+            let header = unsafe { TtlHeader::try_from_ptr(data_ptr) }?;
             #[cfg(not(feature = "validation"))]
-            let header = TtlHeader::from_bytes_unchecked(header_bytes);
+            let header = unsafe { TtlHeader::from_ptr_unchecked(data_ptr) };
 
             if header.is_deleted() {
                 return None;
@@ -971,12 +963,11 @@ impl Segment for SliceSegment<'_> {
             }
 
             let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, TtlHeader::SIZE) };
 
             #[cfg(feature = "validation")]
-            let header = TtlHeader::try_from_bytes(header_bytes)?;
+            let header = unsafe { TtlHeader::try_from_ptr(data_ptr) }?;
             #[cfg(not(feature = "validation"))]
-            let header = TtlHeader::from_bytes_unchecked(header_bytes);
+            let header = unsafe { TtlHeader::from_ptr_unchecked(data_ptr) };
 
             header.remaining_ttl(now)
         } else {
@@ -1009,6 +1000,16 @@ impl Segment for SliceSegment<'_> {
             return None;
         }
         Some(unsafe { std::slice::from_raw_parts(self.data.as_ptr().add(offset as usize), len) })
+    }
+
+    fn header_ptr(&self, offset: u32, len: usize) -> Option<*const u8> {
+        let end = offset as usize + len;
+        if end > self.capacity as usize {
+            return None;
+        }
+        // Derived from the segment allocation's own pointer, so it keeps that
+        // allocation's provenance rather than being narrowed to read-only.
+        Some(unsafe { self.data.as_ptr().add(offset as usize) })
     }
 
     fn append_item(&self, key: &[u8], value: &[u8], optional: &[u8]) -> Option<u32> {
@@ -1495,6 +1496,67 @@ mod tests {
     unsafe fn free_test_segment(ptr: *mut u8, layout: Layout) {
         unsafe {
             dealloc(ptr, layout);
+        }
+    }
+
+    /// The production header-decode path, end to end, over an allocation Miri
+    /// can reason about.
+    ///
+    /// This is the sequence #88 was about: publish an item, decode its header
+    /// (which reads the flags byte through an `AtomicU8`), delete-mark it —
+    /// the one header write that happens after publication — and decode again.
+    /// While the decoders took `&[u8]`, running this under Miri reported a
+    /// `SharedReadWrite` retag of `&AtomicU8` from a `SharedReadOnly` parent.
+    ///
+    /// Deliberately clock-free: `clocksource` issues a syscall Miri does not
+    /// support, so anything touching expiry cannot be checked this way.
+    #[test]
+    fn decoding_a_published_header_does_not_alias_segment_memory() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 0, 4096);
+        segment.try_reserve();
+
+        let offset = segment.append_item(b"mykey", b"myvalue", b"").unwrap();
+
+        // Decode through the production path.
+        assert!(segment.verify_key_at_offset(offset, b"mykey", false));
+        assert!(!segment.verify_key_at_offset(offset, b"otherkey", false));
+
+        // The one header byte written after publication.
+        assert!(segment.mark_deleted(offset, b"mykey").unwrap());
+
+        // Decode again: the flags byte now reads back as deleted.
+        assert!(!segment.verify_key_at_offset(offset, b"mykey", false));
+        assert!(segment.verify_key_at_offset(offset, b"mykey", true));
+
+        unsafe {
+            free_test_segment(ptr, layout);
+        }
+    }
+
+    /// `header_ptr` is where the bounds check for header decoding lives now
+    /// that `try_from_ptr` has no length to check.
+    #[test]
+    fn header_ptr_rejects_a_range_past_the_end_of_the_segment() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 1, 1024);
+        let capacity = segment.capacity() as u32;
+
+        assert!(segment.header_ptr(0, BasicHeader::SIZE).is_some());
+        assert!(
+            segment
+                .header_ptr(capacity - BasicHeader::SIZE as u32, BasicHeader::SIZE)
+                .is_some()
+        );
+
+        assert!(
+            segment
+                .header_ptr(capacity - BasicHeader::SIZE as u32 + 1, BasicHeader::SIZE)
+                .is_none(),
+            "a header running one byte past the end must be rejected"
+        );
+        assert!(segment.header_ptr(capacity, 1).is_none());
+
+        unsafe {
+            free_test_segment(ptr, layout);
         }
     }
 
@@ -2252,16 +2314,15 @@ impl SegmentPrune for SliceSegment<'_> {
             }
 
             let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, header_size) };
 
             // Parse header based on TTL mode
             let (key_len, optional_len, value_len, is_deleted) = if self.is_per_item_ttl() {
-                match TtlHeader::try_from_bytes(header_bytes) {
+                match unsafe { TtlHeader::try_from_ptr(data_ptr) } {
                     Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
                     None => break,
                 }
             } else {
-                match BasicHeader::try_from_bytes(header_bytes) {
+                match unsafe { BasicHeader::try_from_ptr(data_ptr) } {
                     Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
                     None => break,
                 }
@@ -2337,12 +2398,11 @@ impl SegmentPrune for SliceSegment<'_> {
             }
 
             let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, header_size) };
 
             // Parse header based on TTL mode
             let (key_len, optional_len, value_len, is_deleted, expire_at) =
                 if self.is_per_item_ttl() {
-                    match TtlHeader::try_from_bytes(header_bytes) {
+                    match unsafe { TtlHeader::try_from_ptr(data_ptr) } {
                         Some(h) => (
                             h.key_len(),
                             h.optional_len(),
@@ -2353,7 +2413,7 @@ impl SegmentPrune for SliceSegment<'_> {
                         None => break,
                     }
                 } else {
-                    match BasicHeader::try_from_bytes(header_bytes) {
+                    match unsafe { BasicHeader::try_from_ptr(data_ptr) } {
                         Some(h) => (
                             h.key_len(),
                             h.optional_len(),
@@ -2460,16 +2520,15 @@ impl SegmentIter for SliceSegment<'_> {
             }
 
             let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
-            let header_bytes = unsafe { std::slice::from_raw_parts(data_ptr, header_size) };
 
             // Parse header based on TTL mode
             let (key_len, optional_len, value_len, is_deleted) = if self.is_per_item_ttl() {
-                match TtlHeader::try_from_bytes(header_bytes) {
+                match unsafe { TtlHeader::try_from_ptr(data_ptr) } {
                     Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
                     None => break,
                 }
             } else {
-                match BasicHeader::try_from_bytes(header_bytes) {
+                match unsafe { BasicHeader::try_from_ptr(data_ptr) } {
                     Some(h) => (h.key_len(), h.optional_len(), h.value_len(), h.is_deleted()),
                     None => break,
                 }

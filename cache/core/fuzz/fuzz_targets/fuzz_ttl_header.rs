@@ -4,8 +4,15 @@ use cache_core::TtlHeader;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Test TtlHeader parsing
-    if let Some(header) = TtlHeader::try_from_bytes(data) {
+    // `try_from_ptr` reads the flags byte through an atomic view, which needs
+    // provenance permitting writes, so decode from a local copy of the input.
+    if data.len() < TtlHeader::SIZE {
+        return;
+    }
+    let mut input = [0u8; TtlHeader::SIZE];
+    input.copy_from_slice(&data[..TtlHeader::SIZE]);
+
+    if let Some(header) = unsafe { TtlHeader::try_from_ptr(input.as_mut_ptr()) } {
         // Verify all accessors work
         let key_len = header.key_len();
         let optional_len = header.optional_len();
@@ -35,7 +42,7 @@ fuzz_target!(|data: &[u8]| {
         let mut buf = vec![0u8; TtlHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let reparsed = TtlHeader::try_from_bytes(&buf).expect("roundtrip parse failed");
+        let reparsed = unsafe { TtlHeader::try_from_ptr(buf.as_mut_ptr()) }.expect("roundtrip parse failed");
         assert_eq!(key_len, reparsed.key_len(), "key_len mismatch");
         assert_eq!(optional_len, reparsed.optional_len(), "optional_len mismatch");
         assert_eq!(value_len, reparsed.value_len(), "value_len mismatch");
@@ -59,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
         let mut buf = vec![0u8; TtlHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        if let Some(reparsed) = TtlHeader::try_from_bytes(&buf) {
+        if let Some(reparsed) = unsafe { TtlHeader::try_from_ptr(buf.as_mut_ptr()) } {
             assert_eq!(key_len, reparsed.key_len());
             assert_eq!(optional_len, reparsed.optional_len());
             assert_eq!(value_len, reparsed.value_len());

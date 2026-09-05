@@ -1605,7 +1605,9 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
         }
 
-        #[cfg(target_arch = "aarch64")]
+        // `not(miri)`: as in `prefetch_bucket` -- inline asm Miri cannot run,
+        // and a prefetch has no semantic effect.
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
         unsafe {
             // PRFM PLDL1KEEP - prefetch for load, L1 cache, keep in cache
             std::arch::asm!(
@@ -1616,10 +1618,14 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
         }
 
         // On other platforms, this is a no-op
-        #[cfg(not(any(
-            all(target_arch = "x86_64", target_feature = "sse"),
-            target_arch = "aarch64"
-        )))]
+        // `miri` lands here too: both prefetch arms are compiled out under it.
+        #[cfg(any(
+            miri,
+            not(any(
+                all(target_arch = "x86_64", target_feature = "sse"),
+                target_arch = "aarch64"
+            ))
+        ))]
         let _ = ptr;
     }
 

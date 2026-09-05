@@ -241,9 +241,7 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        let header_bytes =
-            unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), BasicHeader::SIZE) };
-        let header = BasicHeader::from_bytes(header_bytes);
+        let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
 
         if header.is_deleted() {
             unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
@@ -511,8 +509,8 @@ impl IoUringDiskLayer {
         let write_offset = segment.write_offset();
 
         while offset < write_offset {
-            if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                if let Some(header) = BasicHeader::try_from_bytes(data) {
+            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                     let item_size = header.padded_size() as u32;
 
                     let key_start =
@@ -573,8 +571,8 @@ impl IoUringDiskLayer {
             let write_offset = segment.write_offset();
 
             while offset < write_offset {
-                if let Some(data) = segment.data_slice(offset, BasicHeader::SIZE) {
-                    if let Some(header) = BasicHeader::try_from_bytes(data) {
+                if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
+                    if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
                         let item_size = header.padded_size() as u32;
 
                         let key_start =

@@ -265,6 +265,25 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     /// `Some(&[u8])` if the range is valid, `None` otherwise.
     fn data_slice(&self, offset: u32, len: usize) -> Option<&[u8]>;
 
+    /// A raw pointer to `len` readable bytes at `offset`, or `None` if that
+    /// range leaves the segment.
+    ///
+    /// This exists for decoding ITEM HEADERS, which [`data_slice`] cannot do
+    /// soundly. A header spans the flags byte, and `mark_deleted` writes that
+    /// byte through an `AtomicU8` after the item is published. A `&[u8]` over
+    /// it would claim `noalias readonly` at the ABI boundary and be
+    /// `SharedReadOnly` under Stacked Borrows, neither of which holds for
+    /// memory a concurrent writer mutates; reading the flags byte from such a
+    /// slice retags a `SharedReadWrite` `&AtomicU8` from a read-only parent,
+    /// which Miri rejects outright.
+    ///
+    /// Key and value bytes stay on [`data_slice`] deliberately: they are
+    /// written before the item is published and never mutated afterwards, so
+    /// a shared reference over them tells the truth.
+    ///
+    /// [`data_slice`]: Segment::data_slice
+    fn header_ptr(&self, offset: u32, len: usize) -> Option<*const u8>;
+
     // ========== Item Operations ==========
 
     /// Append an item to the segment (segment-level TTL).

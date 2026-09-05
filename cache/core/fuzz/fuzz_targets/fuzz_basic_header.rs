@@ -4,8 +4,15 @@ use cache_core::BasicHeader;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Test BasicHeader parsing
-    if let Some(header) = BasicHeader::try_from_bytes(data) {
+    // `try_from_ptr` reads the flags byte through an atomic view, which needs
+    // provenance permitting writes, so decode from a local copy of the input.
+    if data.len() < BasicHeader::SIZE {
+        return;
+    }
+    let mut input = [0u8; BasicHeader::SIZE];
+    input.copy_from_slice(&data[..BasicHeader::SIZE]);
+
+    if let Some(header) = unsafe { BasicHeader::try_from_ptr(input.as_mut_ptr()) } {
         // Verify all accessors work
         let key_len = header.key_len();
         let optional_len = header.optional_len();
@@ -27,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
         let mut buf = vec![0u8; BasicHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        let reparsed = BasicHeader::try_from_bytes(&buf).expect("roundtrip parse failed");
+        let reparsed = unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) }.expect("roundtrip parse failed");
         assert_eq!(key_len, reparsed.key_len(), "key_len mismatch");
         assert_eq!(optional_len, reparsed.optional_len(), "optional_len mismatch");
         assert_eq!(value_len, reparsed.value_len(), "value_len mismatch");
@@ -48,7 +55,7 @@ fuzz_target!(|data: &[u8]| {
         let mut buf = vec![0u8; BasicHeader::SIZE];
         header.to_bytes(&mut buf);
 
-        if let Some(reparsed) = BasicHeader::try_from_bytes(&buf) {
+        if let Some(reparsed) = unsafe { BasicHeader::try_from_ptr(buf.as_mut_ptr()) } {
             assert_eq!(key_len, reparsed.key_len());
             assert_eq!(optional_len, reparsed.optional_len());
             assert_eq!(value_len, reparsed.value_len());
