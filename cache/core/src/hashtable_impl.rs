@@ -3766,6 +3766,41 @@ mod loom_tests {
         witness.assert_tombstone_reached();
     }
 
+    /// Two concurrent ADDs of the SAME key.
+    ///
+    /// This is the race `try_insert_empty_for_add`'s lost-CAS branch exists
+    /// for: both writers find the same empty slot, one CAS wins, and the loser
+    /// must recognise that the word now in the slot is its OWN key rather than
+    /// moving on to claim a second slot. Every other model races an ADD
+    /// against a relocation, which never enters that branch.
+    #[test]
+    fn loom_concurrent_adds_leave_a_single_live_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            // Both writers have already written their copy of the item.
+            oracle.place(SRC, KEY);
+            oracle.place(DST, KEY);
+
+            let ht1 = ht.clone();
+            let o1 = oracle.clone();
+            let first = thread::spawn(move || ht_insert(&ht1, KEY, KeyOracle::location(SRC), &*o1));
+
+            let second = ht_insert(&ht, KEY, KeyOracle::location(DST), &*oracle);
+            let first = first.join().unwrap();
+
+            assert!(
+                !(first.is_ok() && second.is_ok()),
+                "both ADDs reported success for the same key"
+            );
+            assert_eq!(
+                KeyOracle::drain_live_entries(&ht),
+                1,
+                "concurrent ADDs must leave exactly one live entry"
+            );
+        });
+    }
+
     /// `insert` must leave exactly ONE live entry for a key, in every
     /// interleaving and in every bucket.
     ///
