@@ -233,6 +233,17 @@ impl SegmentKeyVerify for DiskSegmentMeta {
             return false;
         }
 
+        // The stored key must be the same LENGTH before its bytes are worth
+        // comparing. The bounds check below is computed from
+        // `header.key_len()` but the slice is built with the caller's
+        // `key.len()`, so without this the two can disagree: a longer caller
+        // key reads past the bound that was checked, and a shorter one
+        // compares against a prefix and reports a match for a key this
+        // segment does not hold. `SliceSegment` has always had this guard.
+        if header.key_len() as usize != key.len() {
+            return false;
+        }
+
         let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
         let key_end = key_start + header.key_len() as usize;
         if key_end > self.capacity as usize {
@@ -261,6 +272,17 @@ impl SegmentKeyVerify for DiskSegmentMeta {
         let header = BasicHeader::from_bytes(header_bytes);
 
         if !allow_deleted && header.is_deleted() {
+            return None;
+        }
+
+        // The stored key must be the same LENGTH before its bytes are worth
+        // comparing. The bounds check below is computed from
+        // `header.key_len()` but the slice is built with the caller's
+        // `key.len()`, so without this the two can disagree: a longer caller
+        // key reads past the bound that was checked, and a shorter one
+        // compares against a prefix and reports a match for a key this
+        // segment does not hold. `SliceSegment` has always had this guard.
+        if header.key_len() as usize != key.len() {
             return None;
         }
 
@@ -665,7 +687,15 @@ impl Segment for DiskSegmentMeta {
         // deletes of the same item both observe "live" and both decrement the
         // live counters, wrapping `live_items` past zero.
 
-        // Verify key
+        // Verify key. Length first: the bounds check below is computed from
+        // `header.key_len()` while the slice is built with the caller's
+        // `key.len()`, so without this a shorter key matches a prefix of a
+        // longer stored one and this tombstones an item the caller never
+        // named.
+        if header.key_len() as usize != key.len() {
+            return Err(CacheError::KeyMismatch);
+        }
+
         let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
         let key_end = key_start + header.key_len() as usize;
         if key_end > self.capacity as usize {
@@ -765,5 +795,113 @@ impl DiskSegmentMeta {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+    use crate::disk::aligned_buffer::AlignedBufferPool;
+
+    /// Build a segment holding one item: `key` then `value`, at offset 0.
+    ///
+    /// Returns the pool and injector alongside it because both must outlive
+    /// the segment — the segment holds a raw pointer to the injector.
+    fn segment_with_item(
+        key: &[u8],
+        value: &[u8],
+    ) -> (
+        DiskSegmentMeta,
+        AlignedBufferPool,
+        Box<crossbeam_deque::Injector<u32>>,
+    ) {
+        let capacity = 4096usize;
+        let mut pool = AlignedBufferPool::new(1, capacity, 512);
+        let buf = pool.allocate().expect("one slot must be available");
+        let injector = Box::new(crossbeam_deque::Injector::new());
+
+        let seg = DiskSegmentMeta::new(0, 0, capacity as u32, 0, &*injector);
+        seg.attach_write_buffer(buf);
+
+        let header = BasicHeader::new(key.len() as u8, 0, value.len() as u32);
+        let ptr = seg.write_buffer_mut_ptr().expect("write buffer attached");
+        // SAFETY: the buffer is `capacity` bytes and the item fits well inside.
+        unsafe {
+            let all = std::slice::from_raw_parts_mut(ptr, capacity);
+            all.fill(0);
+            header.to_bytes(&mut all[..BasicHeader::SIZE]);
+            all[BasicHeader::SIZE..BasicHeader::SIZE + key.len()].copy_from_slice(key);
+            all[BasicHeader::SIZE + key.len()..BasicHeader::SIZE + key.len() + value.len()]
+                .copy_from_slice(value);
+        }
+
+        (seg, pool, injector)
+    }
+
+    /// A key LONGER than the stored one must not match, even when the bytes
+    /// that follow the stored key happen to continue it.
+    ///
+    /// The bounds check is computed from `header.key_len()`, but the slice was
+    /// built with the caller's `key.len()`, with nothing requiring the two to
+    /// agree. So a lookup for `b"abXY"` against a stored `b"ab"` compared the
+    /// stored key PLUS the first two bytes of the value — reading past the
+    /// bound that was actually checked, and reporting a match for a key the
+    /// segment does not hold.
+    ///
+    /// A stale hashtable location pointing at a shorter item is exactly how a
+    /// caller arrives here with a mismatched length.
+    #[test]
+    fn a_longer_key_does_not_match_a_shorter_stored_key() {
+        // The value's first bytes continue the stored key, so a comparison
+        // that overruns `key_len` sees "abXY" and reports a match.
+        let (seg, _pool, _injector) = segment_with_item(b"ab", b"XYZ");
+
+        assert!(
+            !seg.verify_key_at_offset(0, b"abXY", false),
+            "a longer key matched a shorter stored key"
+        );
+        assert!(
+            seg.verify_key_with_header(0, b"abXY", false).is_none(),
+            "a longer key matched a shorter stored key"
+        );
+
+        // The stored key itself must still match, both ways.
+        assert!(seg.verify_key_at_offset(0, b"ab", false));
+        assert!(seg.verify_key_with_header(0, b"ab", false).is_some());
+    }
+
+    /// `mark_deleted` must not tombstone an item whose key merely starts with
+    /// the caller's.
+    ///
+    /// This site had the same mismatch as the two verify paths, and the worst
+    /// consequence of the three: a false-positive match here delete-marks a
+    /// DIFFERENT item than the caller asked for, which is data loss rather
+    /// than a wrong answer to a read.
+    #[test]
+    fn mark_deleted_does_not_tombstone_an_item_with_a_longer_key() {
+        let (seg, _pool, _injector) = segment_with_item(b"abcd", b"V");
+
+        assert!(
+            matches!(seg.mark_deleted(0, b"ab"), Err(CacheError::KeyMismatch)),
+            "mark_deleted matched a prefix and would have tombstoned the wrong item"
+        );
+
+        // And it still deletes the item it was actually asked for.
+        assert_eq!(seg.mark_deleted(0, b"abcd").ok(), Some(true));
+    }
+
+    /// A key SHORTER than the stored one must not match a prefix of it.
+    #[test]
+    fn a_shorter_key_does_not_match_a_prefix_of_a_longer_stored_key() {
+        let (seg, _pool, _injector) = segment_with_item(b"abcd", b"V");
+
+        assert!(
+            !seg.verify_key_at_offset(0, b"ab", false),
+            "a prefix matched a longer stored key"
+        );
+        assert!(
+            seg.verify_key_with_header(0, b"ab", false).is_none(),
+            "a prefix matched a longer stored key"
+        );
     }
 }
