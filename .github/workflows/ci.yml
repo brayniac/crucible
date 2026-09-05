@@ -152,6 +152,15 @@ jobs:
     #
     #  - `disk::`  -- `memmap2` maps a FILE, which Miri does not support.
     #    Anonymous mappings are fine; file-backed ones are not.
+    #  - `hugepage::` -- Miri accepts `mmap` only with
+    #    MAP_PRIVATE|MAP_ANONYMOUS, and the hugepage path adds MAP_HUGETLB.
+    #    It also does not implement MADV_HUGEPAGE, so the THP hint in
+    #    `allocate_on_node` needs skipping before these tests run at all.
+    #    Both are Linux-only paths, so neither shows up when running Miri on
+    #    macOS -- they were found here, on CI, not locally. Excluded rather
+    #    than worked around: unlike a prefetch, the mmap flags decide what is
+    #    actually allocated, so compiling them out would change what is
+    #    tested rather than drop a hint.
     #  - `layer::`, `organization::`, `cache::` -- these build a real
     #    `MemoryPool`, which hands every segment a free-queue pointer it then
     #    invalidates. That is a genuine defect Miri reports, not a limitation:
@@ -175,7 +184,6 @@ jobs:
           cargo +nightly miri test -p cache-core --lib item::
           cargo +nightly miri test -p cache-core --lib slice_segment::
           cargo +nightly miri test -p cache-core --lib hashtable_impl::
-          cargo +nightly miri test -p cache-core --lib hugepage::
 
   smoketest:
     name: Smoketest (${{ matrix.config }})

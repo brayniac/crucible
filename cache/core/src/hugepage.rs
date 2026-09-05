@@ -305,13 +305,8 @@ fn allocate_regular_internal(
         return Err(std::io::Error::last_os_error());
     }
 
-    // Try to enable THP via madvise (Linux only, best-effort).
-    //
-    // `not(miri)`: Miri does not implement MADV_HUGEPAGE. The call is advisory
-    // and its result is already discarded, so skipping it under Miri changes
-    // nothing observable -- and without this, Miri cannot run any test that
-    // allocates a pool on Linux.
-    #[cfg(all(target_os = "linux", not(miri)))]
+    // Try to enable THP via madvise (Linux only, best-effort)
+    #[cfg(target_os = "linux")]
     unsafe {
         // MADV_HUGEPAGE = 14
         let _ = libc::madvise(ptr, alloc_size, 14);
