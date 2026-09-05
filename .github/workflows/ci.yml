@@ -154,11 +154,15 @@ jobs:
     #    ones are not. `disk::disk_segment_meta` DOES run: it allocates through
     #    the global allocator.
     #  - `hugepage::` -- Miri accepts `mmap` only with MAP_PRIVATE|MAP_ANONYMOUS
-    #    and the hugepage path adds MAP_HUGETLB, and MADV_HUGEPAGE is not
-    #    implemented either. Excluded rather than worked around: unlike a
-    #    prefetch, the mmap flags decide what is actually allocated, so
-    #    compiling them out would change what is tested. Both are Linux-only,
-    #    so neither reproduces when running Miri on macOS.
+    #    and the hugepage path adds MAP_HUGETLB. Excluded rather than worked
+    #    around: unlike a prefetch, the mmap flags decide what is actually
+    #    allocated, so compiling them out would change what is tested.
+    #
+    #    The THP `madvise` hint in the same file IS compiled out under
+    #    `cfg(miri)` -- it is advisory and its result is already discarded, and
+    #    every pool-building test reaches it, so without that nothing here
+    #    would run on Linux at all. Both are Linux-only paths, so neither
+    #    reproduces when running Miri on macOS: they were found on CI.
     #  - the SIMD tag scan and prefetch hints are inline asm Miri cannot run.
     #    `cfg(miri)` routes to the scalar fallback, which computes the same
     #    mask, and drops the prefetches, which have no semantic effect. So the
