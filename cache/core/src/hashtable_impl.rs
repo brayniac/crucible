@@ -119,7 +119,9 @@ impl MultiChoiceHashtable {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(bucket_ptr);
         }
 
-        #[cfg(target_arch = "aarch64")]
+        // `not(miri)`: Miri cannot execute inline asm, and a prefetch is a
+        // pure hint, so skipping it changes nothing observable.
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
         unsafe {
             // PRFM PLDL1KEEP - prefetch for load, L1 cache, keep in cache
             std::arch::asm!(
@@ -129,10 +131,14 @@ impl MultiChoiceHashtable {
             );
         }
 
-        #[cfg(not(any(
-            all(target_arch = "x86_64", target_feature = "sse"),
-            target_arch = "aarch64"
-        )))]
+        // `miri` lands here too: both prefetch arms are compiled out under it.
+        #[cfg(any(
+            miri,
+            not(any(
+                all(target_arch = "x86_64", target_feature = "sse"),
+                target_arch = "aarch64"
+            ))
+        ))]
         let _ = bucket_ptr;
     }
 
@@ -194,7 +200,12 @@ impl MultiChoiceHashtable {
     ///
     /// Returns a bitmask where bit N is set if items[N] has a matching tag
     /// and is not empty/ghost. Scans all 8 slots using 2 × 256-bit loads.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(feature = "loom")))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(feature = "loom"),
+        not(miri)
+    ))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::x86_64::*;
@@ -255,7 +266,7 @@ impl MultiChoiceHashtable {
     /// and is not empty/ghost. Scans all 8 slots using 4 × 128-bit loads.
     ///
     /// Compatible with Apple Silicon and AWS Graviton (ARMv8+).
-    #[cfg(all(target_arch = "aarch64", not(feature = "loom")))]
+    #[cfg(all(target_arch = "aarch64", not(feature = "loom"), not(miri)))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::aarch64::*;
@@ -365,8 +376,12 @@ impl MultiChoiceHashtable {
     ///
     /// Returns a bitmask where bit N is set if items[N] has a matching tag
     /// and is not empty/ghost. Scans all 8 slots.
+    // `miri` selects this arm: Miri cannot execute the inline asm the SIMD
+    // arms use. The mask computed here is the same, so what Miri checks is the
+    // surrounding protocol rather than the vectorised load itself.
     #[cfg(any(
         feature = "loom",
+        miri,
         not(any(
             all(target_arch = "x86_64", target_feature = "avx2"),
             target_arch = "aarch64"

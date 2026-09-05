@@ -128,7 +128,7 @@ jobs:
     name: Test (miri)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Miri over the item-header decode path, under Stacked Borrows.
+    # Miri under Stacked Borrows, over the parts of cache-core it can execute.
     #
     # This checks something TSan structurally cannot: the ALIASING claim a
     # reference makes, as opposed to the accesses it performs. The flags byte
@@ -139,16 +139,27 @@ jobs:
     # retags a `SharedReadWrite` `&AtomicU8` from a read-only parent, which
     # Miri rejects at the retag, single-threaded, with no race required.
     #
-    # It earned its place the same way the TSan job did: run against the tree
+    # It earned its place the way the TSan job did: run against the tree
     # before the decoders took raw pointers, it failed on an existing test.
+    # Widening its scope past that first version immediately found a second,
+    # unrelated provenance defect (see the free-queue issue below).
     #
-    # Scope is deliberately narrow. Miri cannot execute the real segment
-    # allocator -- `hugepage.rs` allocates with `mmap`, which Miri does not
-    # support -- nor anything calling `clocksource`, which issues a syscall.
-    # So this runs the header decoders and the segment tests that build their
-    # memory with the global allocator and stay off the clock. That is enough
-    # to cover the decode path itself, which is where the aliasing claim is
-    # made; it is NOT general UB coverage of the cache.
+    # `-Zmiri-disable-isolation` is required and not optional: `clocksource`
+    # calls `clock_gettime`, which isolation blocks. Anonymous `mmap` needs
+    # nothing -- Miri shims it, so the real hugepage allocator runs here.
+    #
+    # What is NOT covered, and why:
+    #
+    #  - `disk::`  -- `memmap2` maps a FILE, which Miri does not support.
+    #    Anonymous mappings are fine; file-backed ones are not.
+    #  - `layer::`, `organization::`, `cache::` -- these build a real
+    #    `MemoryPool`, which hands every segment a free-queue pointer it then
+    #    invalidates. That is a genuine defect Miri reports, not a limitation:
+    #    it is filed, and fixing it is what widens this job.
+    #  - the SIMD tag scan and the prefetch hints are inline asm Miri cannot
+    #    execute. `cfg(miri)` routes to the scalar fallback, which computes the
+    #    same mask, and drops the prefetches, which have no semantic effect.
+    #    So the vectorised load itself is not what is checked here.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -157,13 +168,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri
-      - name: Header decode under Miri
+      - name: Miri (Stacked Borrows)
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
           cargo +nightly miri test -p cache-core --lib item::
-          cargo +nightly miri test -p cache-core --lib \
-            slice_segment::tests::decoding_a_published_header
-          cargo +nightly miri test -p cache-core --lib \
-            slice_segment::tests::header_ptr_rejects
+          cargo +nightly miri test -p cache-core --lib slice_segment::
+          cargo +nightly miri test -p cache-core --lib hashtable_impl::
+          cargo +nightly miri test -p cache-core --lib hugepage::
 
   smoketest:
     name: Smoketest (${{ matrix.config }})
