@@ -153,6 +153,11 @@ impl Segment for FileSegment<'_> {
     }
 
     #[inline]
+    fn incarnation(&self) -> u8 {
+        self.inner.incarnation()
+    }
+
+    #[inline]
     fn increment_generation(&self) {
         self.inner.increment_generation();
     }

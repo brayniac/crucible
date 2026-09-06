@@ -116,6 +116,17 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     /// Increment the generation counter (wraps at u16::MAX).
     fn increment_generation(&self);
 
+    /// Get the incarnation tag (6 bits) currently stamped on this segment.
+    ///
+    /// This is the value carried inside every `Location` issued while the
+    /// segment holds it. A location whose tag differs names a previous
+    /// incarnation and must not be resolved.
+    ///
+    /// Distinct from [`Segment::generation`]: that is a 16-bit counter bumped
+    /// on `Free -> Reserved` and consumed by `CasToken`. This one is 6 bits and
+    /// advances only when a *used* incarnation ends.
+    fn incarnation(&self) -> u8;
+
     // ========== Capacity ==========
 
     /// Get the total data capacity in bytes.

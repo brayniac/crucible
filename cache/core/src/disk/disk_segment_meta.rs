@@ -326,6 +326,11 @@ impl Segment for DiskSegmentMeta {
     }
 
     #[inline]
+    fn incarnation(&self) -> u8 {
+        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
+    }
+
+    #[inline]
     fn capacity(&self) -> usize {
         self.capacity as usize
     }
@@ -389,11 +394,21 @@ impl Segment for DiskSegmentMeta {
         match meta.state {
             State::Free => false, // Already free (idempotent)
             State::Reserved | State::Linking | State::Locked => {
-                // Preserve the incarnation; Task 3 decides which transitions
-                // bump.
+                // Leaving `Locked` ends a used incarnation: the segment has
+                // been drained and cleared. `Reserved` and `Linking` must NOT
+                // bump -- `FilePool::release` returns never-used segments
+                // through here, and bumping there would advance a 6-bit tag at
+                // a rate decoupled from segment lifecycles.
+                let ends_incarnation = meta.state == State::Locked;
+
                 let new_meta = meta
                     .with_state(State::Free)
                     .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
+                let new_meta = if ends_incarnation {
+                    new_meta.bump_incarnation()
+                } else {
+                    new_meta
+                };
                 self.metadata
                     .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
@@ -419,8 +434,18 @@ impl Segment for DiskSegmentMeta {
         let next = new_next.unwrap_or(meta.next);
         let prev = new_prev.unwrap_or(meta.prev);
 
-        // Preserve the incarnation: a chain/state CAS never ends one.
         let new_meta = meta.with_state(new_state).with_chain_ids(next, prev);
+
+        // Leaving `Locked` ends a used incarnation: the layers recycle a
+        // drained segment as `Locked -> Reserved` before releasing it
+        // `Reserved -> Free`. Bumping inside the same CAS that publishes the
+        // new state means no thread can observe the new state paired with the
+        // old tag. Every other transition is mid-life and preserves the tag.
+        let new_meta = if meta.state == State::Locked {
+            new_meta.bump_incarnation()
+        } else {
+            new_meta
+        };
 
         self.metadata
             .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
@@ -439,10 +464,13 @@ impl Segment for DiskSegmentMeta {
             return false;
         }
 
-        // Preserve the incarnation; Task 3 decides which transitions bump.
+        // `AwaitingRelease -> Free` is unconditionally the end of a used
+        // incarnation: the segment was condemned while live and its last reader
+        // has just dropped. Always bump.
         let new_meta = meta
             .with_state(State::Free)
-            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+            .bump_incarnation();
         if self
             .metadata
             .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
@@ -772,11 +800,14 @@ impl Segment for DiskSegmentMeta {
             .store(Self::INVALID_BUCKET_ID, Ordering::Release);
         self.merge_count.store(0, Ordering::Relaxed);
 
-        // Stores unconditionally, so load first to carry the incarnation
-        // forward -- exactly as `SliceSegment::force_free` does.
+        // Stores unconditionally, so load first to advance the incarnation
+        // rather than clobber it -- exactly as `SliceSegment::force_free` does.
+        // A bulk reset recycles the segment, so locations issued before it must
+        // stop resolving.
         let new_meta = Metadata::unpack(self.metadata.load(Ordering::Acquire))
             .with_state(State::Free)
-            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+            .bump_incarnation();
         self.metadata.store(new_meta.pack(), Ordering::Release);
     }
 }
@@ -810,18 +841,6 @@ impl DiskSegmentMeta {
                 }
             }
         }
-    }
-}
-
-/// Test-only accessors.
-///
-/// `Segment::incarnation()` arrives in Task 3 alongside the bump sites; this
-/// must not anticipate it, hence a private helper rather than a trait method.
-#[cfg(all(test, not(feature = "loom")))]
-impl DiskSegmentMeta {
-    /// The incarnation currently stored in the packed metadata word.
-    fn incarnation_for_test(&self) -> u8 {
-        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
     }
 }
 
@@ -865,6 +884,106 @@ mod tests {
         (seg, pool, injector)
     }
 
+    /// The disk twin of the slice-segment bump table: the incarnation advances
+    /// on exactly the transitions that end a *used* incarnation, and no others.
+    ///
+    /// The eviction path recycles a drained segment as `Locked -> Reserved` and
+    /// only then releases it `Reserved -> Free`, so keying the bump on
+    /// `Locked -> Free` -- which the layers never drive -- would leave the tag
+    /// at 0 forever with the whole suite still green. Keying on *leaving
+    /// Locked* is what makes it fire.
+    ///
+    /// The exclusions matter just as much: `FilePool::release` returns
+    /// never-used segments through `try_release`, and a bump there would drain
+    /// the 6-bit tag's collision hardness with no item lifecycle at all.
+    #[test]
+    fn test_disk_incarnation_bumps_on_exactly_the_used_incarnation_transitions() {
+        let (seg, _pool, _injector) = segment_with_item(b"k", b"v");
+        assert_eq!(seg.incarnation(), 0);
+
+        // Free -> Reserved starts an incarnation. Must NOT bump.
+        assert!(seg.try_reserve());
+        assert_eq!(seg.incarnation(), 0, "try_reserve must not bump");
+
+        // Reserved -> Free: reserved but never used. Must NOT bump.
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            0,
+            "Reserved -> Free is a never-used release and must not bump"
+        );
+
+        // Linking -> Free: lost a chain-extension election. Must NOT bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Linking, None, None));
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            0,
+            "Linking -> Free is a lost election and must not bump"
+        );
+
+        // Locked -> Reserved: THE REAL RECYCLE PATH. Must bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Locked, None, None));
+        assert!(seg.cas_metadata(State::Locked, State::Reserved, None, None));
+        assert_eq!(
+            seg.incarnation(),
+            1,
+            "Locked -> Reserved is how a drained segment is recycled and must bump"
+        );
+
+        // The Reserved -> Free that follows must not bump again -- one
+        // incarnation ending is one bump, not two.
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            1,
+            "the release following a recycle must not double-bump"
+        );
+
+        // Locked -> Free: the other way out of Locked. Must bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Locked, None, None));
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            2,
+            "Locked -> Free also ends a used incarnation and must bump"
+        );
+
+        // AwaitingRelease -> Free: condemned. Must bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::AwaitingRelease, None, None));
+        assert!(seg.release_condemned());
+        assert_eq!(
+            seg.incarnation(),
+            3,
+            "AwaitingRelease -> Free ends a used incarnation and must bump"
+        );
+
+        // Bulk reset recycles the segment. Must bump.
+        assert!(seg.try_reserve());
+        seg.reset();
+        assert_eq!(
+            seg.incarnation(),
+            4,
+            "reset recycles the segment and must bump"
+        );
+        assert_eq!(seg.state(), State::Free);
+
+        // Sealed -> Draining and Draining -> Locked are mid-life. Must NOT bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Sealed, None, None));
+        assert!(seg.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(seg.cas_metadata(State::Draining, State::Locked, None, None));
+        assert_eq!(
+            seg.incarnation(),
+            4,
+            "transitions into Locked are mid-life and must not bump"
+        );
+    }
+
     /// Every disk-segment transition must carry the incarnation forward.
     ///
     /// `Metadata::new` zeroes it and compiles clean, so nothing but this test
@@ -872,16 +991,20 @@ mod tests {
     /// stale locations rather than failing loudly. This is the disk twin of
     /// `slice_segment.rs`'s `test_segment_transitions_preserve_incarnation`;
     /// its absence is why these sites went unnoticed.
+    ///
+    /// This pins *preservation* for the transitions that do not end an
+    /// incarnation. `release_condemned` and `reset` do end one and now bump;
+    /// they are still checked here, relative to the seeded tag, because a site
+    /// that rebuilt `Metadata` from scratch and then bumped would land on 1
+    /// rather than `TAG + 1`. Which transitions bump is pinned separately by
+    /// `slice_segment.rs`'s
+    /// `test_incarnation_bumps_on_exactly_the_used_incarnation_transitions`.
     #[test]
     fn test_disk_segment_transitions_preserve_incarnation() {
         const TAG: u8 = 42;
 
         let (seg, _pool, _injector) = segment_with_item(b"k", b"v");
-        assert_eq!(
-            seg.incarnation_for_test(),
-            0,
-            "a brand-new segment starts at 0"
-        );
+        assert_eq!(seg.incarnation(), 0, "a brand-new segment starts at 0");
 
         // Seed a non-zero tag directly, the way a prior incarnation's release
         // would have left it.
@@ -897,31 +1020,31 @@ mod tests {
 
         // Free -> Reserved
         assert!(seg.try_reserve());
-        assert_eq!(seg.incarnation_for_test(), TAG, "try_reserve reset the tag");
+        assert_eq!(seg.incarnation(), TAG, "try_reserve reset the tag");
 
         // Reserved -> Free
         assert!(seg.try_release());
-        assert_eq!(seg.incarnation_for_test(), TAG, "try_release reset the tag");
+        assert_eq!(seg.incarnation(), TAG, "try_release reset the tag");
 
         // Reserved -> AwaitingRelease -> Free
         assert!(seg.try_reserve());
         assert!(seg.cas_metadata(State::Reserved, State::AwaitingRelease, None, None));
-        assert_eq!(
-            seg.incarnation_for_test(),
-            TAG,
-            "cas_metadata reset the tag"
-        );
+        assert_eq!(seg.incarnation(), TAG, "cas_metadata reset the tag");
+        // `release_condemned` ends a used incarnation, so it bumps; what is
+        // pinned here is that it bumps from the seeded tag rather than
+        // rebuilding the word from scratch, which would land on 1.
         assert!(seg.release_condemned());
         assert_eq!(
-            seg.incarnation_for_test(),
-            TAG,
-            "release_condemned reset the tag"
+            seg.incarnation(),
+            TAG + 1,
+            "release_condemned did not carry the tag forward"
         );
 
-        // Unconditional store back to Free
+        // Unconditional store back to Free. Also an incarnation-ending
+        // transition, so it bumps rather than preserves.
         assert!(seg.try_reserve());
         seg.reset();
-        assert_eq!(seg.incarnation_for_test(), TAG, "reset cleared the tag");
+        assert_eq!(seg.incarnation(), TAG + 2, "reset cleared the tag");
     }
 
     /// A key LONGER than the stored one must not match, even when the bytes
