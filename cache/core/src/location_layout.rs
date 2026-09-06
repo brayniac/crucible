@@ -599,6 +599,11 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exceeds this layout's 17-bit offset field")]
+    // `pack` guards with `debug_assert!`, which is compiled out in release, so
+    // there is no panic to expect there. Same gate as `location.rs`'s
+    // `test_overflow_panics`, and the reason `cargo test --release` exists as
+    // a separate CI job.
+    #[cfg(debug_assertions)]
     fn pack_rejects_an_offset_past_the_offset_field() {
         // One byte past a 1 MiB segment, and still 8-aligned, so the alignment
         // assert waves it through. Without the range check this silently
@@ -609,6 +614,8 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "is outside the issuable range")]
+    // Compiled out in release; see the note on the test above.
+    #[cfg(debug_assertions)]
     fn pack_rejects_the_unissuable_top_segment_id() {
         // The id reserved so Location::GHOST cannot be aliased. A pool must
         // never issue it, and pack must say so rather than encode it.
