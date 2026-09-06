@@ -880,20 +880,34 @@ mod tests {
     ///
     /// Returns the pool and injector alongside it because both must outlive
     /// the segment — the segment holds a raw pointer to the injector.
+    ///
+    /// `Arc`, not `Box`, for the reason `MemoryPool::free_queue` documents:
+    /// the segment holds a raw pointer into this queue and pushes itself back
+    /// on release, and moving a `Box` is a `Unique` retag that pops every
+    /// pointer derived from it. Miri caught exactly that here — returning the
+    /// `Box` invalidated the pointer the segment was holding, and
+    /// `release_condemned`'s `(*self.free_queue).push` then dereferenced it.
     fn segment_with_item(
         key: &[u8],
         value: &[u8],
     ) -> (
         DiskSegmentMeta,
         AlignedBufferPool,
-        Box<crossbeam_deque::Injector<u32>>,
+        std::sync::Arc<crossbeam_deque::Injector<u32>>,
     ) {
         let capacity = 4096usize;
         let mut pool = AlignedBufferPool::new(1, capacity, 512);
         let buf = pool.allocate().expect("one slot must be available");
-        let injector = Box::new(crossbeam_deque::Injector::new());
+        let injector = std::sync::Arc::new(crossbeam_deque::Injector::new());
 
-        let seg = DiskSegmentMeta::new(0, 0, capacity as u32, 0, &*injector, 512);
+        let seg = DiskSegmentMeta::new(
+            0,
+            0,
+            capacity as u32,
+            0,
+            std::sync::Arc::as_ptr(&injector),
+            512,
+        );
         seg.attach_write_buffer(buf);
 
         let header = BasicHeader::new(key.len() as u8, 0, value.len() as u32);
@@ -915,19 +929,28 @@ mod tests {
     ///
     /// Separate from `segment_with_item` because these tests append through the
     /// real path rather than writing a header by hand.
+    ///
+    /// `Arc` for the same reason as `segment_with_item`.
     fn segment_with_alignment(
         capacity: usize,
         align: usize,
     ) -> (
         DiskSegmentMeta,
         AlignedBufferPool,
-        Box<crossbeam_deque::Injector<u32>>,
+        std::sync::Arc<crossbeam_deque::Injector<u32>>,
     ) {
         let mut pool = AlignedBufferPool::new(1, capacity, 512);
         let buf = pool.allocate().expect("one slot must be available");
-        let injector = Box::new(crossbeam_deque::Injector::new());
+        let injector = std::sync::Arc::new(crossbeam_deque::Injector::new());
 
-        let seg = DiskSegmentMeta::new(0, 0, capacity as u32, 0, &*injector, align);
+        let seg = DiskSegmentMeta::new(
+            0,
+            0,
+            capacity as u32,
+            0,
+            std::sync::Arc::as_ptr(&injector),
+            align,
+        );
         seg.attach_write_buffer(buf);
         (seg, pool, injector)
     }
