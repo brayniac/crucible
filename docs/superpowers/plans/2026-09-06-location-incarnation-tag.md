@@ -2683,11 +2683,20 @@ useless.
 
 Quote both failures.
 
-- [ ] **Step 6: Confirm every site is reachable**
+- [ ] **Step 6: Mutate every site individually -- do not merely point at a test**
 
-Nine near-identical checks invite one being wrong or dead. For each, either
-point at a test that exercises it, or say plainly that it is unexercised.
-An unexercised check is a hole the feature leaks through silently.
+Nine near-identical checks invite one being wrong or dead, and pointing at a
+test that "covers" a site is not evidence. Task 6b learned this the hard way:
+its new test passed, looked like proof, and touched **none** of the 18
+production scan sites -- 17 of 18 turned out to be entirely unprotected, found
+only by reverting each one and watching for red.
+
+So for each of the ten rows in Step 3's table: remove that check, run the suite,
+record RED or GREEN, restore. Report the table.
+
+Any site that stays GREEN is unprotected. Either add a test that reddens it, or
+state plainly that it is unexercised and why. Do not close this step with a
+site whose status you have not observed.
 
 - [ ] **Step 7: Commit**
 
