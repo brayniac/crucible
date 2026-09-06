@@ -180,10 +180,24 @@ impl State {
 
 /// Packed representation of segment metadata in a single AtomicU64.
 ///
-/// Layout: `[8 bits unused][8 bits state][24 bits prev][24 bits next]`
+/// Layout: `[2 unused][6 bits incarnation][8 bits state][24 prev][24 next]`
 ///
 /// This packing allows atomic updates to state and chain pointers together,
 /// which is essential for lock-free chain operations.
+///
+/// # Why the incarnation lives here
+///
+/// The incarnation tag is the low 6 bits of a per-segment counter that rides
+/// inside every `Location` issued during that incarnation. It must be bumped
+/// *atomically with the state transition that ends the incarnation*. Keeping it
+/// in a separate atomic would leave a window where the segment is already
+/// `Free` but still carries the old counter, and a thread reserving inside that
+/// window would refill under the old tag -- exactly the aliasing the tag exists
+/// to prevent.
+///
+/// This is distinct from `Segment::generation()`, a 16-bit counter bumped on
+/// `Free -> Reserved` that feeds `CasToken`. The two answer different questions
+/// and have different bump sites on purpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Metadata {
     /// Next segment ID in the chain (24 bits, INVALID_SEGMENT_ID if none).
@@ -192,24 +206,95 @@ pub struct Metadata {
     pub prev: u32,
     /// Current state of the segment.
     pub state: State,
+    /// Incarnation tag (6 bits). See the struct docs.
+    pub incarnation: u8,
 }
 
 impl Metadata {
-    /// Create new metadata with the given state and no chain links.
+    /// Bits of incarnation stored in the packed word.
+    ///
+    /// Shared with `Location`'s tag field so the two cannot drift apart.
+    const INCARNATION_BITS: u32 = crate::location_layout::TAG_BITS;
+    /// Mask covering [`Self::INCARNATION_BITS`].
+    const INCARNATION_MASK: u8 = crate::location_layout::TAG_MASK;
+    /// Bit position of the incarnation within the packed word.
+    const INCARNATION_SHIFT: u32 = 56;
+
+    /// Create metadata for a brand-new segment: no chain links, incarnation 0.
+    ///
+    /// # This is not a transition
+    ///
+    /// Zeroing the incarnation is correct **only** when constructing a segment
+    /// that has never been used, or when seeding a test's metadata word.
+    /// Calling this on a live segment silently resets its tag, which
+    /// resurrects every stale location naming it -- and unlike a struct
+    /// literal, it compiles clean. For a state change use `with_state`.
     pub fn new(state: State) -> Self {
         Self {
             next: INVALID_SEGMENT_ID,
             prev: INVALID_SEGMENT_ID,
             state,
+            incarnation: 0,
         }
     }
 
-    /// Create metadata with state and chain pointers.
+    /// Create metadata with state and chain pointers, incarnation 0.
+    ///
+    /// Zeroes the incarnation and carries the same hazard as [`Self::new`];
+    /// see the warning there. For a state or chain change on a live segment
+    /// use `with_state` / `with_chain_ids`.
     pub fn with_chain(state: State, next: Option<u32>, prev: Option<u32>) -> Self {
         Self {
             next: next.unwrap_or(INVALID_SEGMENT_ID),
             prev: prev.unwrap_or(INVALID_SEGMENT_ID),
             state,
+            incarnation: 0,
+        }
+    }
+
+    /// This metadata with a different state, preserving the incarnation.
+    ///
+    /// The correct helper for a transition that does not end an incarnation.
+    #[inline]
+    pub fn with_state(self, state: State) -> Self {
+        Self { state, ..self }
+    }
+
+    /// This metadata with different chain pointers, preserving everything else.
+    #[inline]
+    pub fn with_chain_ids(self, next: u32, prev: u32) -> Self {
+        Self { next, prev, ..self }
+    }
+
+    /// This metadata with the incarnation advanced by one, wrapping at 6 bits.
+    ///
+    /// Call this on exactly the transitions that end a *used* incarnation:
+    ///
+    /// - **Leaving `Locked`** for a *different* state. The layers recycle a
+    ///   drained segment as `Locked -> Reserved` and only then release it
+    ///   `Reserved -> Free`, so keying on `Locked -> Free` alone would never
+    ///   fire on the live eviction path. `Locked -> Free` is reachable through
+    ///   `try_release` directly and bumps too; keying on the *source* state is
+    ///   what covers both. A `Locked -> Locked` chain-pointer rewrite is not a
+    ///   departure and must NOT bump -- see `cas_metadata`.
+    /// - **`AwaitingRelease -> Free`**, in all four places it occurs:
+    ///   `release_condemned` on each segment type, and the last-reader drop in
+    ///   `BasicItemGuard::drop` / `ValueRef::drop`. The drop paths are the
+    ///   dominant ones — the layers condemn a segment with readers outstanding
+    ///   and leave the last guard to free it.
+    /// - **Bulk recycles**: `SliceSegment::force_free` and
+    ///   `DiskSegmentMeta::reset`, which flush every segment at once.
+    ///
+    /// Do NOT call it on `Reserved | Linking -> Free`. Those return never-used
+    /// segments — `MemoryPool::release`, `FilePool::release`,
+    /// `IoUringPool::release` and lost chain-extension elections — and bumping
+    /// there would advance a 6-bit tag at a rate decoupled from segment
+    /// lifecycles, draining its collision hardness for nothing.
+    #[inline]
+    pub fn bump_incarnation(self) -> Self {
+        Self {
+            incarnation: self.incarnation.wrapping_add(1) & Self::INCARNATION_MASK,
+            ..self
         }
     }
 
@@ -220,9 +305,10 @@ impl Metadata {
         let next_24 = (self.next & 0xFF_FFFF) as u64;
         let prev_24 = (self.prev & 0xFF_FFFF) as u64;
         let state_8 = self.state as u64;
+        let inc = ((self.incarnation & Self::INCARNATION_MASK) as u64) << Self::INCARNATION_SHIFT;
 
-        // Pack: [8 unused][8 state][24 prev][24 next]
-        (state_8 << 48) | (prev_24 << 24) | next_24
+        // Pack: [2 unused][6 incarnation][8 state][24 prev][24 next]
+        inc | (state_8 << 48) | (prev_24 << 24) | next_24
     }
 
     /// Unpack metadata from a u64.
@@ -235,6 +321,7 @@ impl Metadata {
             next: (packed & 0xFF_FFFF) as u32,
             prev: ((packed >> 24) & 0xFF_FFFF) as u32,
             state,
+            incarnation: ((packed >> Self::INCARNATION_SHIFT) as u8) & Self::INCARNATION_MASK,
         }
     }
 
@@ -258,6 +345,15 @@ impl Metadata {
         }
     }
 }
+
+/// The incarnation must sit strictly above the state byte (bits 48..56) and
+/// still fit inside the 64-bit packed word. Widening `TAG_BITS` past 8 would
+/// break this, so fail the build rather than corrupt `state`.
+const _: () = assert!(
+    Metadata::INCARNATION_SHIFT >= 56
+        && Metadata::INCARNATION_SHIFT + Metadata::INCARNATION_BITS <= 64,
+    "incarnation tag does not fit above the state byte in the packed metadata word"
+);
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
@@ -324,6 +420,7 @@ mod tests {
             next: 123,
             prev: 456,
             state: State::Live,
+            incarnation: 0,
         };
 
         let packed = meta.pack();
@@ -340,6 +437,7 @@ mod tests {
             next: INVALID_SEGMENT_ID,
             prev: INVALID_SEGMENT_ID,
             state: State::Free,
+            incarnation: 0,
         };
 
         let packed = meta.pack();
@@ -358,6 +456,7 @@ mod tests {
             next: 0xFFFF_FFFF, // 32 bits set
             prev: 0xFFFF_FFFF,
             state: State::Sealed,
+            incarnation: 0,
         };
 
         let packed = meta.pack();
@@ -377,5 +476,101 @@ mod tests {
             let unpacked = Metadata::unpack(packed);
             assert_eq!(unpacked.state, state);
         }
+    }
+
+    #[test]
+    fn test_metadata_incarnation_roundtrip() {
+        for incarnation in 0u8..64 {
+            let meta = Metadata {
+                next: 123,
+                prev: 456,
+                state: State::Live,
+                incarnation,
+            };
+            let unpacked = Metadata::unpack(meta.pack());
+            assert_eq!(unpacked.incarnation, incarnation);
+            assert_eq!(unpacked.next, 123);
+            assert_eq!(unpacked.prev, 456);
+            assert_eq!(unpacked.state, State::Live);
+        }
+    }
+
+    #[test]
+    fn test_metadata_incarnation_masks_to_six_bits() {
+        let meta = Metadata {
+            next: 0,
+            prev: 0,
+            state: State::Free,
+            incarnation: 0xFF,
+        };
+        assert_eq!(Metadata::unpack(meta.pack()).incarnation, 0x3F);
+    }
+
+    #[test]
+    fn test_metadata_incarnation_does_not_disturb_other_fields() {
+        // The tag lives in the byte above `state`; a full-width tag must not
+        // bleed into the state or chain pointers.
+        let meta = Metadata {
+            next: INVALID_SEGMENT_ID,
+            prev: INVALID_SEGMENT_ID,
+            state: State::AwaitingRelease,
+            incarnation: 0x3F,
+        };
+        let unpacked = Metadata::unpack(meta.pack());
+        assert_eq!(unpacked.state, State::AwaitingRelease);
+        assert_eq!(unpacked.next, INVALID_SEGMENT_ID);
+        assert_eq!(unpacked.prev, INVALID_SEGMENT_ID);
+    }
+
+    #[test]
+    fn test_metadata_with_state_and_chain_ids_preserve_incarnation() {
+        // These are the helpers every transition site uses. If either dropped
+        // the tag, stale locations naming the segment would resolve again.
+        let meta = Metadata {
+            next: 1,
+            prev: 2,
+            state: State::Live,
+            incarnation: 0x2A,
+        };
+
+        let restated = meta.with_state(State::Sealed);
+        assert_eq!(restated.incarnation, 0x2A);
+        assert_eq!(restated.state, State::Sealed);
+        assert_eq!(restated.next, 1);
+        assert_eq!(restated.prev, 2);
+
+        let rechained = meta.with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
+        assert_eq!(rechained.incarnation, 0x2A);
+        assert_eq!(rechained.state, State::Live);
+        assert_eq!(rechained.next, INVALID_SEGMENT_ID);
+        assert_eq!(rechained.prev, INVALID_SEGMENT_ID);
+    }
+
+    #[test]
+    fn test_metadata_bump_incarnation_advances_and_preserves_fields() {
+        let meta = Metadata {
+            next: 7,
+            prev: 8,
+            state: State::AwaitingRelease,
+            incarnation: 0,
+        };
+        let bumped = meta.bump_incarnation();
+        assert_eq!(bumped.incarnation, 1);
+        assert_eq!(bumped.state, State::AwaitingRelease);
+        assert_eq!(bumped.next, 7);
+        assert_eq!(bumped.prev, 8);
+        // And it survives a pack/unpack round trip.
+        assert_eq!(Metadata::unpack(bumped.pack()).incarnation, 1);
+    }
+
+    #[test]
+    fn test_metadata_bump_incarnation_wraps_at_six_bits() {
+        let meta = Metadata {
+            next: 0,
+            prev: 0,
+            state: State::Locked,
+            incarnation: 0x3F,
+        };
+        assert_eq!(meta.bump_incarnation().incarnation, 0);
     }
 }

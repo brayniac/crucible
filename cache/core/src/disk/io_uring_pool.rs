@@ -5,10 +5,20 @@
 //! segment allocation via a lock-free free queue, and provides disk
 //! offset calculations for reading/writing segment data.
 
+use crate::location_layout::LocationLayout;
 use crate::pool::RamPool;
 use crate::segment::Segment;
 
 use super::disk_segment_meta::DiskSegmentMeta;
+
+/// Offset alignment factor for io_uring disk pools.
+///
+/// 512, a disk sector, matching [`crate::disk::FilePool`]. Locations store
+/// `offset / align_bytes`, so this is what gives a disk pool 32 TiB of
+/// addressable capacity against 512 GiB at 8; it also stops items straddling an
+/// I/O block, which `item_disk_range` would otherwise pay for with a second
+/// block read. Segments append at this stride -- see `Segment::item_stride`.
+const DEFAULT_ALIGN_BYTES: usize = 512;
 
 /// Pool of disk segment metadata entries.
 ///
@@ -48,6 +58,8 @@ pub struct IoUringPool {
     block_size: u32,
     /// Total number of segments.
     segment_count: usize,
+    /// Bit split for locations naming this pool.
+    layout: LocationLayout,
 }
 
 // SAFETY: All internal state is either immutable after construction
@@ -64,6 +76,13 @@ impl IoUringPool {
     /// - `segment_count`: Number of segments
     /// - `segment_size`: Size of each segment in bytes
     /// - `block_size`: I/O block size (typically 4096)
+    ///
+    /// # Panics
+    ///
+    /// Panics if any argument is out of range, or if `segment_size` and the
+    /// pool's alignment factor (512 bytes) do not yield a usable
+    /// [`LocationLayout`] -- for instance a segment so small that more segment
+    /// id bits remain than a `u32` id can hold.
     pub fn new(pool_id: u8, segment_count: usize, segment_size: usize, block_size: u32) -> Self {
         assert!(pool_id <= 3, "pool_id must be 0-3");
         assert!(segment_count > 0, "segment_count must be > 0");
@@ -71,6 +90,24 @@ impl IoUringPool {
         assert!(
             block_size > 0 && block_size.is_power_of_two(),
             "block_size must be a power of two"
+        );
+
+        // Consistent with the surrounding constructor, which asserts rather
+        // than returning a Result: `IoUringPool` has no builder, and
+        // `IoUringDiskLayerBuilder::build` is infallible.
+        let layout = LocationLayout::new(segment_size, DEFAULT_ALIGN_BYTES)
+            .unwrap_or_else(|e| panic!("invalid location layout for this pool: {e}"));
+        assert!(
+            layout.validate_segment_count(segment_count).is_ok(),
+            "segment_count {segment_count} exceeds the {} the layout addresses",
+            layout.max_segment_count()
+        );
+        // Aligning coarser than the I/O block buys nothing on the read path:
+        // `item_disk_range` already rounds reads down to a block boundary.
+        assert!(
+            layout.align_bytes() <= block_size,
+            "align_bytes ({}) must not exceed block_size ({block_size})",
+            layout.align_bytes()
         );
 
         // `Arc`, not `Box`: see `MemoryPool::free_queue`. Segments hold raw
@@ -89,6 +126,9 @@ impl IoUringPool {
                 segment_size as u32,
                 disk_offset,
                 free_queue_ptr,
+                // From the layout, so the stride a segment appends by and the
+                // alignment a location is packed with cannot drift apart.
+                layout.align_bytes() as usize,
             );
             segments.push(meta);
 
@@ -104,6 +144,7 @@ impl IoUringPool {
             segment_size,
             block_size,
             segment_count,
+            layout,
         }
     }
 
@@ -201,6 +242,11 @@ impl RamPool for IoUringPool {
         self.segment_size
     }
 
+    #[inline]
+    fn layout(&self) -> &LocationLayout {
+        &self.layout
+    }
+
     fn reserve(&self) -> Option<u32> {
         loop {
             match self.free_queue.steal() {
@@ -278,7 +324,10 @@ mod tests {
 
     #[test]
     fn test_reserve_release() {
-        let pool = IoUringPool::new(0, 3, 4096, 4096);
+        // 64 KiB segments, not 4 KiB: at the 512-byte disk alignment a 4 KiB
+        // segment leaves more segment-id bits than a u32 id can hold, and the
+        // layout rejects it. The size was never what this test is about.
+        let pool = IoUringPool::new(0, 3, 64 * 1024, 4096);
         assert_eq!(pool.free_count(), 3);
 
         let id1 = pool.reserve().unwrap();

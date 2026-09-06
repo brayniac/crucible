@@ -14,6 +14,7 @@
 //! even under high memory pressure from normal allocation.
 
 use crate::hugepage::{HugepageAllocation, HugepageSize, allocate_on_node};
+use crate::location_layout::LocationLayout;
 use crate::pool::RamPool;
 use crate::segment::Segment;
 use crate::slice_segment::SliceSegment;
@@ -70,6 +71,9 @@ pub struct MemoryPool {
 
     /// Size of each segment in bytes.
     segment_size: usize,
+
+    /// Bit split for locations naming this pool.
+    layout: LocationLayout,
 }
 
 // SAFETY: MemoryPool is safe to send/share between threads because:
@@ -155,13 +159,15 @@ impl MemoryPool {
 
     /// Release a segment back to the appropriate queue with automatic balancing.
     ///
-    /// This method is called by guard Drop when a segment in AwaitingRelease
-    /// state has its last reader drop. It automatically replenishes the spare
-    /// queue if below target capacity.
+    /// Like [`RamPool::release`], but replenishes the spare queue first when it
+    /// is below target capacity. It has no production callers today: the
+    /// guard-drop path a previous version of this doc described goes through
+    /// `SliceSegment::release_condemned`, not here.
     ///
-    /// # Safety
-    /// The segment must be in a releasable state (Free or AwaitingRelease with
-    /// ref_count == 0).
+    /// # Panics
+    ///
+    /// Calls `try_release`, which panics on any state but `Free`, `Reserved`,
+    /// `Linking` or `Locked` -- `AwaitingRelease` included, despite the name.
     pub fn release_segment(&self, id: u32) {
         let id_usize = id as usize;
 
@@ -224,6 +230,10 @@ impl RamPool for MemoryPool {
 
     fn segment_size(&self) -> usize {
         self.segment_size
+    }
+
+    fn layout(&self) -> &LocationLayout {
+        &self.layout
     }
 
     fn reserve(&self) -> Option<u32> {
@@ -342,6 +352,7 @@ pub struct MemoryPoolBuilder {
     hugepage_size: HugepageSize,
     numa_node: Option<u32>,
     spare_capacity: u32,
+    align_bytes: usize,
 }
 
 impl MemoryPoolBuilder {
@@ -358,6 +369,7 @@ impl MemoryPoolBuilder {
             hugepage_size: HugepageSize::None,
             numa_node: None,
             spare_capacity: 4, // Default: 4 spare segments for compaction
+            align_bytes: 8,    // Default: the item alignment
         }
     }
 
@@ -385,6 +397,23 @@ impl MemoryPoolBuilder {
     /// Set the segment size in bytes (default: 1MB).
     pub fn segment_size(mut self, size: usize) -> Self {
         self.segment_size = size;
+        self
+    }
+
+    /// Set the offset alignment factor in bytes.
+    ///
+    /// Locations store `offset / align_bytes`, so this is the only lever on a
+    /// pool's addressable capacity: `2^36 * align_bytes`. Memory pools default
+    /// to 8, matching the item alignment, because a minimal item is 8 bytes and
+    /// coarser alignment would round small items up. Must be a power of two, at
+    /// least 8, and no larger than `segment_size`.
+    ///
+    /// Segments append at this stride and every scan advances by it -- see
+    /// `Segment::item_stride` -- so raising it costs up to `align_bytes - 1`
+    /// bytes of padding per item. Disk pools take that trade for the block
+    /// alignment it buys; RAM pools have nothing to gain from it.
+    pub fn align_bytes(mut self, align: usize) -> Self {
+        self.align_bytes = align;
         self
     }
 
@@ -435,6 +464,9 @@ impl MemoryPoolBuilder {
             ));
         }
 
+        let layout = LocationLayout::new(self.segment_size, self.align_bytes)?;
+        layout.validate_segment_count(num_segments)?;
+
         // Ensure spare_capacity doesn't consume all segments.
         // We need at least 3 segments in free_queue for the cache to function:
         // - 1 segment for writing (Live state)
@@ -476,6 +508,10 @@ impl MemoryPoolBuilder {
                     segment_ptr,
                     self.segment_size,
                     free_queue_ptr,
+                    // From the layout, not the builder field, so the stride a
+                    // segment appends by and the alignment a location is
+                    // packed with cannot drift apart.
+                    layout.align_bytes() as usize,
                 )
             };
 
@@ -499,6 +535,7 @@ impl MemoryPoolBuilder {
             pool_id: self.pool_id,
             is_per_item_ttl: self.is_per_item_ttl,
             segment_size: self.segment_size,
+            layout,
         })
     }
 }
@@ -515,6 +552,45 @@ mod tests {
             .spare_capacity(0) // No spare capacity for tests
             .build()
             .expect("Failed to create test pool")
+    }
+
+    #[test]
+    fn test_pool_exposes_a_layout_matching_its_segment_size() {
+        let pool = MemoryPoolBuilder::new(0)
+            .heap_size(4 * 1024 * 1024)
+            .segment_size(1024 * 1024)
+            .build()
+            .unwrap();
+        assert_eq!(pool.layout().offset_bits(), 17);
+        assert_eq!(pool.layout().align_bytes(), 8);
+    }
+
+    #[test]
+    fn test_pool_rejects_more_segments_than_the_layout_addresses() {
+        // 128 MB segments leave 12 segment bits (4095 issuable ids). Ask for
+        // more and construction must fail by name rather than alias silently.
+        let err = MemoryPoolBuilder::new(0)
+            .heap_size(5000 * 128 * 1024 * 1024)
+            .segment_size(128 * 1024 * 1024)
+            .build()
+            .err()
+            .expect("layout must reject a pool with more segments than it addresses");
+        assert!(
+            err.to_string().contains("addresses at most"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pool_rejects_alignment_below_item_alignment() {
+        let err = MemoryPoolBuilder::new(0)
+            .heap_size(4 * 1024 * 1024)
+            .segment_size(1024 * 1024)
+            .align_bytes(4)
+            .build()
+            .err()
+            .expect("layout must reject alignment below the item alignment");
+        assert!(err.to_string().contains("at least 8"), "unexpected: {err}");
     }
 
     #[test]

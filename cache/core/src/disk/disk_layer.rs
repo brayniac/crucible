@@ -70,8 +70,15 @@ struct SinglePoolVerifier<'a> {
 impl KeyVerifier for SinglePoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        let (_, segment_id, incarnation, offset) = item_loc.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            // A location naming a previous incarnation of this segment is not ours
+            // to resolve: the segment was drained and refilled, and this offset now
+            // holds a different item. Checked before touching any item bytes.
+            if segment.incarnation() != incarnation {
+                return false;
+            }
+            segment.verify_key_at_offset(offset, key, allow_deleted)
         } else {
             false
         }
@@ -184,7 +191,10 @@ impl DiskLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let key_start =
                         offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -193,7 +203,13 @@ impl DiskLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
                         hashtable.remove(key, location.to_location());
                     }
 
@@ -231,7 +247,10 @@ impl DiskLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let key_start =
                         offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -240,7 +259,13 @@ impl DiskLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
 
                         let verifier = SinglePoolVerifier { pool: &self.pool };
                         let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -345,7 +370,13 @@ impl Layer for DiskLayer {
 
             if let Some(segment) = self.pool.get(segment_id) {
                 if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(self.pool.pool_id(), segment_id, offset));
+                    return Ok(ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    ));
                 }
 
                 // Segment is full
@@ -368,7 +399,8 @@ impl Layer for DiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         let state = segment.state();
         if !state.is_readable() {
@@ -383,11 +415,9 @@ impl Layer for DiskLayer {
         }
 
         // Verify key matches
-        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
+        let header_info = segment.verify_key_unexpired(offset, key, now)?;
 
-        segment
-            .get_item_verified(location.offset(), header_info)
-            .ok()
+        segment.get_item_verified(offset, header_info).ok()
     }
 
     fn mark_deleted(&self, location: ItemLocation) {
@@ -395,17 +425,15 @@ impl Layer for DiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
-            let offset = location.offset();
-            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
-                && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
-            {
-                let key_start =
-                    offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
-                let key_len = header.key_len() as usize;
-                if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                    let _ = segment.mark_deleted(offset, key);
-                }
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id)
+            && let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
+            && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
+        {
+            let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
+            let key_len = header.key_len() as usize;
+            if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                let _ = segment.mark_deleted(offset, key);
             }
         }
     }
@@ -415,7 +443,7 @@ impl Layer for DiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let segment = self.pool.get(location.segment_id(self.pool.layout()))?;
         let now = Self::now_secs();
         segment.segment_ttl(now)
     }
@@ -478,7 +506,13 @@ impl Layer for DiskLayer {
                 if let Some((offset, item_size, value_ptr)) =
                     segment.begin_append(key, value_len, optional)
                 {
-                    let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                    let location = ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    );
                     return Ok((location, value_ptr, item_size));
                 }
 
@@ -500,7 +534,7 @@ impl Layer for DiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        if let Some(segment) = self.pool.get(location.segment_id(self.pool.layout())) {
             segment.finalize_append(item_size);
         }
     }
@@ -510,8 +544,9 @@ impl Layer for DiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
-            segment.mark_deleted_at_offset(location.offset());
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            segment.mark_deleted_at_offset(offset);
         }
     }
 
@@ -651,6 +686,7 @@ impl Default for DiskLayerBuilder {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::item::ItemGuard;
     use tempfile::tempdir;
 
@@ -669,6 +705,129 @@ mod tests {
             .expect("Failed to create test layer");
 
         (dir, layer)
+    }
+
+    /// Fill one segment with `ITEMS` items and index them, returning the keys
+    /// and the segment they share.
+    fn fill_one_segment(layer: &DiskLayer, hashtable: &MultiChoiceHashtable) -> (Vec<String>, u32) {
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+
+        const ITEMS: usize = 5;
+        let mut keys = Vec::new();
+        let mut segment_id = None;
+        for i in 0..ITEMS {
+            let key = format!("key_{i:02}");
+            let location = layer
+                .write_item(key.as_bytes(), b"value", b"", ttl)
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), location.to_location(), &verifier)
+                .expect("insert");
+            let id = location.segment_id(layer.pool.layout());
+            assert_eq!(
+                *segment_id.get_or_insert(id),
+                id,
+                "all items must share one segment for this to test the walk"
+            );
+            keys.push(key);
+        }
+        (keys, segment_id.expect("at least one item"))
+    }
+
+    fn assert_all_removed(layer: &DiskLayer, hashtable: &MultiChoiceHashtable, keys: &[String]) {
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        for key in keys {
+            assert!(
+                hashtable.lookup(key.as_bytes(), &verifier).is_none(),
+                "{key} survived the walk -- it stopped short of that item"
+            );
+        }
+    }
+
+    /// Draining a pinned segment must visit every item, at the pool's stride.
+    ///
+    /// Disk pools align items to 512 bytes while `BasicHeader::padded_size()`
+    /// rounds to 8. A walk that advances by the latter lands mid-item on its
+    /// second iteration, reads a garbage header and stops -- silently, since
+    /// both quantities are `u32`. Hashtable entries left behind after the
+    /// segment is recycled is what that failure looks like from the outside.
+    #[test]
+    fn test_draining_a_segment_walks_every_item_at_the_disk_stride() {
+        let (_dir, layer) = create_test_layer();
+        assert_eq!(
+            layer.pool.layout().align_bytes(),
+            512,
+            "disk pools align to a sector"
+        );
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+
+        layer.drain_segment_from_hashtable(segment_id, &hashtable);
+        assert_all_removed(&layer, &hashtable, &keys);
+    }
+
+    /// The same for the unpinned path, which walks the segment itself rather
+    /// than deferring to `drain_segment_from_hashtable`.
+    #[test]
+    fn test_evicting_a_segment_walks_every_item_at_the_disk_stride() {
+        let (_dir, layer) = create_test_layer();
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+
+        // The eviction path leaves its victim in `Draining`, which is the
+        // state `process_evicted_segment` expects.
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Draining, None, None));
+
+        layer.process_evicted_segment(segment_id, &hashtable);
+        assert_all_removed(&layer, &hashtable, &keys);
+    }
+
+    /// A location from a previous incarnation must not resolve, even though
+    /// the key really is at that offset.
+    ///
+    /// That is the whole hazard: segments are append-only from a fixed start,
+    /// so the n-th item of the new incarnation lands where the n-th item of the
+    /// old one was. The key compare alone says yes; only the tag says no.
+    #[test]
+    fn test_verifier_rejects_a_stale_incarnation() {
+        let (_dir, layer) = create_test_layer();
+        let pool = &layer.pool;
+
+        // Age every segment through a used incarnation, so the tag the write
+        // stamps is non-zero and a predecessor tag exists to test against.
+        let ids: Vec<u32> = (0..pool.segment_count())
+            .map(|_| pool.reserve().expect("pool must have a free segment"))
+            .collect();
+        for &id in &ids {
+            let segment = pool.get(id).expect("segment id came from the pool");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            pool.release(id);
+        }
+
+        let live = layer
+            .write_item(b"key", b"value", b"", Duration::from_secs(3600))
+            .expect("write");
+        let layout = pool.layout();
+        let (pool_id, segment_id, tag, offset) = live.unpack(layout);
+        assert_ne!(tag, 0, "the segment must be past its first incarnation");
+
+        // Same segment, same offset, previous tag.
+        let stale = ItemLocation::new(layout, pool_id, segment_id, tag - 1, offset);
+        let verifier = SinglePoolVerifier { pool };
+
+        assert!(
+            verifier.verify(b"key", live.to_location(), false),
+            "the current incarnation must resolve"
+        );
+        assert!(
+            !verifier.verify(b"key", stale.to_location(), false),
+            "a location from a previous incarnation must not resolve"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! protocol servers like iou-cache and tokio-cache.
 
 use crate::error::CacheError;
-use crate::state::{Metadata, State};
+use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
 use crate::sync::{AtomicU32, AtomicU64, Ordering};
 use bytes::Bytes;
 use std::time::Duration;
@@ -227,8 +227,22 @@ impl Drop for ValueRef {
             let packed = unsafe { (*self.metadata).load(Ordering::Acquire) };
             let meta = Metadata::unpack(packed);
             if meta.state == State::AwaitingRelease {
-                // Try to transition AwaitingRelease -> Free
-                let new_meta = Metadata::new(State::Free);
+                // AwaitingRelease -> Free ends a used incarnation, so the tag
+                // advances in the same CAS that publishes Free.
+                //
+                // This is the *main* condemned-free path, not an edge case: the
+                // layers condemn a segment with readers outstanding and leave
+                // the last guard drop to free it, calling `release_condemned`
+                // only as a fallback when the last reader vanished during the
+                // condemn window. A reader holding a location across this
+                // recycle is exactly what the tag defends against.
+                //
+                // `with_chain_ids` must stay: returning a freed segment to the
+                // free queue still linked to its neighbours is its own defect.
+                let new_meta = meta
+                    .with_state(State::Free)
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+                    .bump_incarnation();
                 if unsafe {
                     (*self.metadata).compare_exchange(
                         packed,
@@ -756,6 +770,60 @@ pub enum LookupResult {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+
+    /// `ValueRef::drop` frees a condemned segment, ending a used incarnation,
+    /// so the tag must advance.
+    ///
+    /// The fourth copy of the `AwaitingRelease -> Free` transition, reachable
+    /// only through `Drop`, so no segment-level test touches it -- and the
+    /// dominant one on the zero-copy read path: the layers condemn a segment
+    /// with readers outstanding and leave the last `ValueRef` drop to free it.
+    /// A reader holding a location across that recycle is exactly what the tag
+    /// defends against.
+    ///
+    /// Seeding a nonzero tag rather than starting from 0 is what distinguishes
+    /// a bump from a site that rebuilds `Metadata` from scratch: the latter
+    /// would land on 1, not 43.
+    #[test]
+    fn test_value_ref_drop_bumps_the_incarnation() {
+        const TAG: u8 = 42;
+
+        let ref_count = AtomicU32::new(1);
+        let free_queue = crossbeam_deque::Injector::new();
+        let metadata = AtomicU64::new(
+            Metadata {
+                next: INVALID_SEGMENT_ID,
+                prev: INVALID_SEGMENT_ID,
+                state: State::AwaitingRelease,
+                incarnation: TAG,
+            }
+            .pack(),
+        );
+        let value = [1u8, 2, 3];
+
+        // SAFETY: every pointer outlives the ValueRef, and ref_count starts at
+        // 1 to stand for this reader.
+        let value_ref = unsafe {
+            ValueRef::new(
+                &ref_count,
+                value.as_ptr(),
+                value.len(),
+                &metadata,
+                &free_queue,
+                7,
+            )
+        };
+        drop(value_ref);
+
+        let meta = Metadata::unpack(metadata.load(Ordering::Acquire));
+        assert_eq!(meta.state, State::Free, "the last reader must free it");
+        assert_eq!(
+            meta.incarnation,
+            TAG + 1,
+            "ValueRef drop must end the incarnation, carrying the tag forward"
+        );
+        assert_eq!(free_queue.len(), 1, "the segment must reach the free queue");
+    }
 
     #[test]
     fn test_owned_guard_new() {

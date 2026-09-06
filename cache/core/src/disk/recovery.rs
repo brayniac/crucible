@@ -9,7 +9,7 @@ use crate::hashtable::Hashtable;
 use crate::item::BasicHeader;
 use crate::item_location::ItemLocation;
 use crate::pool::RamPool;
-use crate::segment::Segment;
+use crate::segment::{Segment, SegmentKeyVerify};
 use crate::state::State;
 
 /// Statistics from segment recovery.
@@ -100,7 +100,10 @@ pub fn recover_segment(
         // Try to parse header at this offset
         if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
             if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                let item_size = header.padded_size() as u32;
+                // The segment's stride, not the 8-byte padded body size: a scan
+                // that advances by anything but what the append advanced by
+                // desyncs after the first item on a coarser-aligned pool.
+                let item_size = segment.item_stride(header.padded_size());
 
                 // Validate item bounds
                 if offset + item_size > write_offset {
@@ -167,7 +170,10 @@ pub fn warm_from_pool<H: Hashtable>(pool: &FilePool, hashtable: &H, now: u32) ->
             while offset < write_offset {
                 if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                     if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                        let item_size = header.padded_size() as u32;
+                        // The segment's stride, not the 8-byte padded body size: a scan
+                        // that advances by anything but what the append advanced by
+                        // desyncs after the first item on a coarser-aligned pool.
+                        let item_size = segment.item_stride(header.padded_size());
 
                         // Skip deleted items
                         if !header.is_deleted() {
@@ -179,8 +185,13 @@ pub fn warm_from_pool<H: Hashtable>(pool: &FilePool, hashtable: &H, now: u32) ->
 
                             if let Some(key) = segment.data_slice(key_start as u32, key_len) {
                                 // Create location for this item
-                                let location =
-                                    ItemLocation::new(pool.pool_id(), segment_id, offset);
+                                let location = ItemLocation::new(
+                                    pool.layout(),
+                                    pool.pool_id(),
+                                    segment_id,
+                                    segment.incarnation(),
+                                    offset,
+                                );
 
                                 // Insert into hashtable
                                 // Note: We use a dummy verifier since we're rebuilding
@@ -236,12 +247,66 @@ impl crate::hashtable::KeyVerifier for DummyVerifier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::disk::file_pool::FilePoolBuilder;
+    use crate::hashtable_impl::MultiChoiceHashtable;
+    use tempfile::tempdir;
 
-    // Note: Tests for recovery require a real FilePool which is tested
-    // in the file_pool and disk_layer modules. Here we test the stats.
+    /// A segment walk must advance by the pool's stride, not `padded_size()`.
+    ///
+    /// Disk pools align items to 512 bytes while `BasicHeader::padded_size()`
+    /// rounds to 8. A scan using the latter lands mid-item on its second
+    /// iteration, reads a garbage header and stops -- silently, since both
+    /// quantities are `u32`. Recovering fewer items than were written is what
+    /// that failure looks like from the outside.
+    #[test]
+    fn test_recovery_walks_every_item_at_the_disk_stride() {
+        let dir = tempdir().expect("temp dir");
+        let pool = FilePoolBuilder::new(2)
+            .path(dir.path().join("recover.dat"))
+            .segment_size(64 * 1024)
+            .size(4 * 64 * 1024)
+            .build()
+            .expect("pool");
+        assert_eq!(
+            pool.layout().align_bytes(),
+            512,
+            "disk pools align to a sector"
+        );
+
+        let id = pool.reserve().expect("a free segment");
+        let segment = pool.get(id).expect("segment");
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+
+        const ITEMS: usize = 5;
+        for i in 0..ITEMS {
+            let key = format!("key_{i:02}");
+            segment
+                .append_item(key.as_bytes(), b"value", &[])
+                .expect("append");
+        }
+        // Every item after the first sits far past where an 8-byte walk looks.
+        assert_eq!(segment.write_offset(), (ITEMS * 512) as u32);
+
+        let stats = recover_segment(segment, 0, 0);
+        assert_eq!(
+            stats.items_recovered, ITEMS,
+            "the scan lost items to a stride mismatch"
+        );
+        assert_eq!(stats.items_corrupted, 0);
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let warm = warm_from_pool(&pool, &hashtable, 0);
+        assert_eq!(
+            warm.items_indexed, ITEMS,
+            "the warm-up walk lost items to a stride mismatch"
+        );
+    }
+
+    // The remaining tests cover the stats types; the scans themselves are
+    // exercised above and in the file_pool and disk_layer modules.
 
     #[test]
     fn test_recovery_stats_default() {

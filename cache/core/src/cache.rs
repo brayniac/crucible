@@ -62,6 +62,19 @@ impl CacheLayer {
         dispatch!(self, layer_id())
     }
 
+    /// Get the location layout of this layer's pool.
+    ///
+    /// A location naming this layer's pool must be decoded with it: pools with
+    /// different segment sizes or alignment factors split the bits differently.
+    pub fn layout(&self) -> &crate::location_layout::LocationLayout {
+        match self {
+            CacheLayer::Fifo(layer) => layer.pool().layout(),
+            CacheLayer::Ttl(layer) => layer.pool().layout(),
+            CacheLayer::Disk(layer) => layer.pool().layout(),
+            CacheLayer::IoUringDisk(layer) => layer.pool().layout(),
+        }
+    }
+
     /// Write an item to this layer.
     pub fn write_item(
         &self,
@@ -117,11 +130,12 @@ impl CacheLayer {
                 if location.pool_id() != pool.pool_id() {
                     return None;
                 }
-                let segment = pool.get(location.segment_id())?;
+                let (_, segment_id, _, offset) = location.unpack(pool.layout());
+                let segment = pool.get(segment_id)?;
                 if !segment.state().is_readable() {
                     return None;
                 }
-                segment.get_value_ref_raw(location.offset(), key).ok()
+                segment.get_value_ref_raw(offset, key).ok()
             }};
         }
 
@@ -874,7 +888,7 @@ impl<H: Hashtable> TieredCache<H> {
         let layer = self.layers.get(layer_idx)?;
 
         // Get the segment to retrieve its generation
-        let segment = layer.get_segment(item_loc.segment_id())?;
+        let segment = layer.get_segment(item_loc.segment_id(layer.layout()))?;
         let generation = segment.generation();
 
         // Get value from layer
@@ -908,7 +922,7 @@ impl<H: Hashtable> TieredCache<H> {
         let layer = self.layers.get(layer_idx)?;
 
         // Get the segment to retrieve its generation
-        let segment = layer.get_segment(item_loc.segment_id())?;
+        let segment = layer.get_segment(item_loc.segment_id(layer.layout()))?;
         let generation = segment.generation();
 
         // Call function with value
@@ -958,7 +972,7 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Get the segment to check generation
         let segment = layer
-            .get_segment(item_loc.segment_id())
+            .get_segment(item_loc.segment_id(layer.layout()))
             .ok_or(CacheError::KeyNotFound)?;
         let current_generation = segment.generation();
 
@@ -1564,8 +1578,11 @@ struct CacheKeyVerifier<'a> {
 impl KeyVerifier for CacheKeyVerifier<'_> {
     #[inline(always)]
     fn prefetch(&self, location: Location) {
-        // Unpack location to get segment and offset
-        let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
+        // pool_id sits at a fixed position and decodes without a layout; the
+        // rest of the split is per-pool, so resolve the pool first and let its
+        // layout decode segment_id and offset.
+        let item_loc = ItemLocation::from_location(location);
+        let pool_id = item_loc.pool_id();
 
         // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
         // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
@@ -1576,21 +1593,35 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
         // Get data pointer based on pool type
         let ptr = match pool_ref {
             PoolRef::Memory(pool) => {
+                let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return;
                 };
+                // Do not prefetch off a stale location either: the address it
+                // names belongs to a later incarnation's item.
+                if segment.incarnation() != incarnation {
+                    return;
+                }
                 unsafe { segment.data_ptr().add(offset as usize) }
             }
             PoolRef::Disk(pool) => {
+                let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return;
                 };
+                if segment.incarnation() != incarnation {
+                    return;
+                }
                 unsafe { segment.data_ptr().add(offset as usize) }
             }
             PoolRef::IoUring(pool) => {
+                let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(meta) = pool.get_meta(segment_id) else {
                     return;
                 };
+                if meta.incarnation() != incarnation {
+                    return;
+                }
                 let Some(data_ptr) = meta.write_buffer_ptr() else {
                     return;
                 };
@@ -1631,8 +1662,11 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
 
     #[inline(always)]
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        // Unpack all location fields in one pass
-        let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
+        // pool_id sits at a fixed position and decodes without a layout; the
+        // rest of the split is per-pool, so resolve the pool first and let its
+        // layout decode segment_id and offset.
+        let item_loc = ItemLocation::from_location(location);
+        let pool_id = item_loc.pool_id();
 
         // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
         // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
@@ -1646,21 +1680,37 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
         // Use verify_key_at_offset from SegmentKeyVerify trait
         match pool_ref {
             PoolRef::Memory(pool) => {
+                let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return false;
                 };
+                // A location naming a previous incarnation of this segment is
+                // not ours to resolve: the segment was drained and refilled,
+                // and this offset now holds a different item. Checked before
+                // touching any item bytes.
+                if segment.incarnation() != incarnation {
+                    return false;
+                }
                 segment.verify_key_at_offset(offset, key, allow_deleted)
             }
             PoolRef::Disk(pool) => {
+                let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return false;
                 };
+                if segment.incarnation() != incarnation {
+                    return false;
+                }
                 segment.verify_key_at_offset(offset, key, allow_deleted)
             }
             PoolRef::IoUring(pool) => {
+                let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(meta) = pool.get_meta(segment_id) else {
                     return false;
                 };
+                if meta.incarnation() != incarnation {
+                    return false;
+                }
                 meta.verify_key_at_offset(offset, key, allow_deleted)
             }
         }
@@ -1773,6 +1823,217 @@ mod tests {
     use super::*;
     use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::layer::{FifoLayerBuilder, TtlLayerBuilder};
+
+    /// The disk arms of the hot-path verifier reject a stale tag too.
+    ///
+    /// `test_stale_location_is_rejected_after_recycle` drives the Memory arm
+    /// through a real recycle; the two disk arms need a disk pool, which the
+    /// cache's own `set` never writes to directly. Here the recycle is staged
+    /// on the pool and the location built from the live one, so the key really
+    /// is at that offset and only the tag distinguishes them.
+    #[test]
+    fn test_stale_location_is_rejected_on_the_disk_arms() {
+        use crate::disk::{DiskLayerBuilder, IoUringDiskLayerBuilder};
+        use crate::pool::RamPool;
+        use crate::segment::Segment;
+        use crate::state::State;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(256 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("fifo layer");
+        let disk_layer = DiskLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .path(dir.path().join("disk.dat"))
+            .size(256 * 1024)
+            .build()
+            .expect("disk layer");
+        let io_uring_layer = IoUringDiskLayerBuilder::new()
+            .layer_id(2)
+            .pool_id(2)
+            .segment_size(64 * 1024)
+            .segment_count(4)
+            .build();
+
+        // Age every disk segment through a used incarnation before anything is
+        // written, so the tag a write stamps is non-zero.
+        for _ in 0..disk_layer.pool().segment_count() {
+            let id = disk_layer.pool().reserve().expect("free segment");
+            let segment = disk_layer.pool().get(id).expect("segment");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            disk_layer.pool().release(id);
+        }
+        for _ in 0..io_uring_layer.pool().segment_count() {
+            let id = io_uring_layer.pool().reserve().expect("free segment");
+            let segment = io_uring_layer.pool().get(id).expect("segment");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            io_uring_layer.pool().release(id);
+        }
+
+        let ttl = Duration::from_secs(3600);
+        let disk_live = disk_layer
+            .write_item(b"key", b"value", b"", ttl)
+            .expect("disk write");
+        let io_uring_live = io_uring_layer
+            .write_item_with_buffers(b"key", b"value", b"", ttl)
+            .expect("io_uring write");
+
+        let disk_layout = *disk_layer.pool().layout();
+        let io_uring_layout = *io_uring_layer.pool().layout();
+
+        let cache: TieredCache<MultiChoiceHashtable> =
+            TieredCacheBuilder::new(Arc::new(MultiChoiceHashtable::new(10)))
+                .with_fifo_layer(fifo_layer)
+                .with_disk_layer(disk_layer)
+                .with_io_uring_disk_layer(io_uring_layer)
+                .build();
+
+        for (label, live, layout) in [
+            ("Disk", disk_live, disk_layout),
+            ("IoUring", io_uring_live, io_uring_layout),
+        ] {
+            let (pool_id, segment_id, tag, offset) = live.unpack(&layout);
+            assert_ne!(
+                tag, 0,
+                "{label}: the segment must be past its first incarnation"
+            );
+            let stale = ItemLocation::new(&layout, pool_id, segment_id, tag - 1, offset);
+
+            assert!(
+                cache
+                    .create_key_verifier()
+                    .verify(b"key", live.to_location(), false),
+                "{label}: the current incarnation must resolve"
+            );
+            assert!(
+                !cache
+                    .create_key_verifier()
+                    .verify(b"key", stale.to_location(), false),
+                "{label}: a location from a previous incarnation must not resolve"
+            );
+        }
+    }
+
+    /// A cache whose FIFO layer holds one big item per segment, so writing the
+    /// same key repeatedly cycles segments and eventually reuses one.
+    fn create_recycling_test_cache() -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
+
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(1024)
+            .heap_size(4 * 1024) // 4 segments
+            .spare_capacity(0)
+            .build()
+            .expect("Failed to create FIFO layer");
+
+        TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo_layer)
+            .eviction_threshold(1)
+            .build()
+    }
+
+    /// A location held across a segment recycle must stop resolving.
+    ///
+    /// This is the crucible#88 hazard, and the shape matters: segments are
+    /// append-only from a fixed start, so with uniform item sizes the n-th item
+    /// of every incarnation lands at the same offset. A stale location does not
+    /// merely point at free space -- it points at a *different live item*, and
+    /// here at one with the very same key. The key compare alone would resolve
+    /// it. Only the incarnation tag can tell the two apart.
+    #[test]
+    fn test_stale_location_is_rejected_after_recycle() {
+        let cache = create_recycling_test_cache();
+        let ttl = Duration::from_secs(60);
+
+        // One item per segment: 600 bytes of value leaves no room for a second.
+        let value = vec![b'v'; 600];
+
+        cache.set(b"key", &value, b"", ttl).unwrap();
+        let (stale_raw, _) = cache
+            .hashtable
+            .lookup(b"key", &cache.create_key_verifier())
+            .expect("key should be present");
+        let stale = ItemLocation::from_location(stale_raw);
+
+        // Sanity: it resolves now, so a later rejection means something.
+        assert!(
+            cache.create_key_verifier().verify(b"key", stale_raw, false),
+            "the location must resolve before any recycle"
+        );
+
+        let pool = match &cache.layers[0] {
+            CacheLayer::Fifo(layer) => layer.pool(),
+            _ => unreachable!("layer 0 is the FIFO layer"),
+        };
+        let (_, stale_segment, stale_tag, stale_offset) = stale.unpack(pool.layout());
+
+        // Rewrite the same key until the pool cycles back to that segment.
+        // Four segments and one item each, so a handful of rounds suffices;
+        // the loop is bounded generously and the guards below prove it ran.
+        let mut recycled = false;
+        for _ in 0..64 {
+            cache.set(b"key", &value, b"", ttl).unwrap();
+
+            let segment = pool
+                .get(stale_segment)
+                .expect("segment id came from a location");
+            if segment.incarnation() != stale_tag
+                && segment.verify_key_at_offset(stale_offset, b"key", false)
+            {
+                recycled = true;
+                break;
+            }
+        }
+
+        // Vacuity guards. Without the first, a loop that never recycled the
+        // segment would pass while proving nothing. Without the second, the
+        // rejection could come from the key compare rather than the tag.
+        assert!(
+            recycled,
+            "no recycle placed a matching key back at that offset; the test is vacuous"
+        );
+        let segment = pool.get(stale_segment).expect("segment");
+        assert_ne!(
+            segment.incarnation(),
+            stale_tag,
+            "the segment was not recycled; the test is vacuous"
+        );
+        assert!(
+            segment.verify_key_at_offset(stale_offset, b"key", false),
+            "the offset must hold a live matching key, or the key compare alone \
+             would reject and this test proves nothing"
+        );
+
+        assert!(
+            !cache.create_key_verifier().verify(b"key", stale_raw, false),
+            "a location from a previous incarnation must not resolve"
+        );
+
+        // ...and the live location still does.
+        let live = ItemLocation::new(
+            pool.layout(),
+            pool.pool_id(),
+            stale_segment,
+            segment.incarnation(),
+            stale_offset,
+        );
+        assert!(
+            cache
+                .create_key_verifier()
+                .verify(b"key", live.to_location(), false),
+            "the current incarnation must still resolve"
+        );
+    }
 
     fn create_test_cache() -> TieredCache<MultiChoiceHashtable> {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10)); // 2^10 = 1024 buckets

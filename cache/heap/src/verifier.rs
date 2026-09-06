@@ -123,12 +123,22 @@ impl<'a> HeapTieredVerifier<'a> {
         };
 
         let item_loc = ItemLocation::from_location(location);
-        let segment = match disk_pool.get(item_loc.segment_id()) {
+        // The disk pool's own layout: pools with different segment sizes split
+        // the location bits differently.
+        let (_, segment_id, incarnation, offset) = item_loc.unpack(disk_pool.layout());
+        let segment = match disk_pool.get(segment_id) {
             Some(s) => s,
             None => return false,
         };
 
-        segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        // A location naming a previous incarnation of this segment is not ours
+        // to resolve: the segment was drained and refilled, and this offset now
+        // holds a different item. Checked before touching any item bytes.
+        if segment.incarnation() != incarnation {
+            return false;
+        }
+
+        segment.verify_key_at_offset(offset, key, allow_deleted)
     }
 }
 
@@ -232,6 +242,64 @@ mod tests {
     use super::*;
     use crate::entry::HeapEntry;
     use std::time::Duration;
+
+    /// A disk location from a previous incarnation must not resolve, even
+    /// though the key really is at that offset.
+    ///
+    /// That is the whole hazard: segments are append-only from a fixed start,
+    /// so the n-th item of the new incarnation lands where the n-th item of the
+    /// old one was. The key compare alone says yes; only the tag says no.
+    #[test]
+    fn test_tiered_verifier_rejects_a_stale_disk_incarnation() {
+        use cache_core::{FilePoolBuilder, ItemLocation, Segment, State};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let disk_pool = FilePoolBuilder::new(2)
+            .path(dir.path().join("disk.dat"))
+            .segment_size(64 * 1024)
+            .size(256 * 1024)
+            .build()
+            .expect("disk pool");
+
+        // Age every segment through a used incarnation, so the tag on the item
+        // written below is non-zero and a predecessor tag exists.
+        for _ in 0..disk_pool.segment_count() {
+            let id = disk_pool.reserve().expect("free segment");
+            let segment = disk_pool.get(id).expect("segment");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            disk_pool.release(id);
+        }
+
+        let id = disk_pool.reserve().expect("free segment");
+        let segment = disk_pool.get(id).expect("segment");
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        let offset = segment.append_item(b"key", b"value", &[]).expect("append");
+        let tag = segment.incarnation();
+        assert_ne!(tag, 0, "the segment must be past its first incarnation");
+
+        let layout = *disk_pool.layout();
+        let live = ItemLocation::new(&layout, 2, id, tag, offset);
+        let stale = ItemLocation::new(&layout, 2, id, tag - 1, offset);
+
+        let storage = SlotStorage::new(10);
+        let verifier = HeapTieredVerifier::with_disk(&storage, 0, &disk_pool, 2);
+
+        // `verify_disk` is called directly rather than through `verify`.
+        // `SlotLocation::pool_id_from_location` is hardcoded to return 0, so
+        // `verify`'s dispatch sends every location to `verify_ram` and the disk
+        // arm is unreachable whenever `ram_pool_id == 0` -- which is how
+        // `HeapCache` builds it. That is a pre-existing defect in the heap
+        // disk tier, not one this check introduces; going through `verify`
+        // here would only test the dead dispatch.
+        assert!(
+            verifier.verify_disk(b"key", live.to_location(), false),
+            "the current incarnation must resolve"
+        );
+        assert!(
+            !verifier.verify_disk(b"key", stale.to_location(), false),
+            "a location from a previous incarnation must not resolve"
+        );
+    }
 
     #[test]
     fn test_verifier_key_match() {

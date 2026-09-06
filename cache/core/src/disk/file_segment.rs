@@ -52,6 +52,8 @@ impl<'a> FileSegment<'a> {
     /// - `data`: Pointer to mmap'd segment memory
     /// - `len`: Size of segment memory in bytes
     /// - `free_queue`: Pointer to the pool's free queue for async segment release
+    /// - `align_bytes`: The owning pool's offset alignment factor. Disk pools
+    ///   use 512 so items start on sector boundaries; see `LocationLayout`.
     pub unsafe fn new(
         pool_id: u8,
         is_per_item_ttl: bool,
@@ -59,12 +61,21 @@ impl<'a> FileSegment<'a> {
         data: *mut u8,
         len: usize,
         free_queue: *const crossbeam_deque::Injector<u32>,
+        align_bytes: usize,
     ) -> Self {
         // SAFETY: Caller ensures data pointer is valid and has proper alignment.
         // The SliceSegment::new call requires the same safety guarantees.
         Self {
             inner: unsafe {
-                SliceSegment::new(pool_id, is_per_item_ttl, id, data, len, free_queue)
+                SliceSegment::new(
+                    pool_id,
+                    is_per_item_ttl,
+                    id,
+                    data,
+                    len,
+                    free_queue,
+                    align_bytes,
+                )
             },
             dirty: AtomicBool::new(false),
         }
@@ -116,6 +127,11 @@ impl<'a> FileSegment<'a> {
 
 // Delegate SegmentKeyVerify to inner
 impl SegmentKeyVerify for FileSegment<'_> {
+    #[inline]
+    fn incarnation(&self) -> u8 {
+        self.inner.incarnation()
+    }
+
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
         self.inner.verify_key_at_offset(offset, key, allow_deleted)
     }
@@ -155,6 +171,11 @@ impl Segment for FileSegment<'_> {
     #[inline]
     fn increment_generation(&self) {
         self.inner.increment_generation();
+    }
+
+    #[inline]
+    fn align_bytes(&self) -> u32 {
+        self.inner.align_bytes()
     }
 
     #[inline]
@@ -431,7 +452,8 @@ mod tests {
         let len = data.len();
 
         let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*TEST_FREE_QUEUE;
-        let segment = unsafe { FileSegment::new(2, false, 0, ptr, len, free_queue_ptr) };
+        // 512, the disk default: a FileSegment always belongs to a FilePool.
+        let segment = unsafe { FileSegment::new(2, false, 0, ptr, len, free_queue_ptr, 512) };
 
         (data, segment)
     }

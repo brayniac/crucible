@@ -32,16 +32,19 @@
 //!   in place ([`KeyOracle::drain_relocate`]);
 //! - **recycle + refill** — the source segment is recycled and rewritten by
 //!   another writer, so the old location now holds an unrelated key ([`OTHER`]);
+//! - **recycle + refill with the SAME key at the SAME address**
+//!   ([`KeyOracle::bump_incarnation`]).
 //!
-//! # What it deliberately cannot model
-//!
-//! **Recycle + refill with the SAME key at the SAME address.** In cache-rs
-//! that hazard is caught by an incarnation tag packed inside the location
-//! word, so a stale location fails validation even when the bytes really do
-//! spell the key again. `cache-core`'s [`Location`] is opaque — the backend
-//! owns all 44 bits and no generation rides in them — so there is nothing for
-//! such a model to assert against. Modelling it here would only prove the
-//! oracle can lie.
+//! That last one used to be out of reach. `cache-core`'s [`Location`] was
+//! opaque — the backend owned all 44 bits and no generation rode in them — so
+//! a model had nothing to assert against, and modelling it would only have
+//! proved the oracle could lie. Segment locations now carry a 6-bit
+//! incarnation tag, bumped when a used incarnation ends and compared by every
+//! verifier before item bytes are touched, so the oracle models it too: a
+//! cell's occupant and its incarnation live in SEPARATE atomics, exactly as
+//! the item bytes and the segment's metadata word do in production. That
+//! separation is what makes the race real — a reader can load one and be
+//! preempted before the other.
 //!
 //! # Faithfulness rules
 //!
@@ -72,6 +75,12 @@ const OTHER_ID: u64 = 2;
 /// Set in a cell word when the occupant is delete-marked in place.
 const DELETED: u64 = 1 << 32;
 
+/// Width of the modeled incarnation tag, matching
+/// [`crate::location_layout::TAG_BITS`].
+const TAG_BITS: u32 = 6;
+/// Mask for a modeled incarnation tag.
+const TAG_MASK: u64 = (1 << TAG_BITS) - 1;
+
 /// How many times a model's reader was handed a location that no longer held
 /// its key, counted across every loom execution of the current model.
 ///
@@ -81,6 +90,19 @@ const DELETED: u64 = 1 << 32;
 /// [`KeyOracle::assert_hazard_reached`].
 static OCCUPANT_MISS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static TOMBSTONE_MISS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the verifier was handed a location whose incarnation had
+/// already advanced — the hazard witness for the recycle models. Same
+/// rationale as the two above for being `std` rather than model atomics.
+static STALE_REJECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the verifier ACCEPTED such a location. Must stay zero: it
+/// can only move if the tag comparison is missing, which is precisely what
+/// `loom_stale_location_never_resolves_to_the_new_occupant` asserts.
+///
+/// Counted separately from the guard rather than inside it, so that neutering
+/// the guard (the model's proof that it can fail) still records the accept.
+static STALE_ACCEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Serializes witness-bearing models against each other; see
 /// [`KeyOracle::arm_hazard_witness`].
@@ -123,6 +145,22 @@ impl HazardWitness {
     }
 
     /// As [`HazardWitness::assert_reached`], but for a model whose hazard is
+    /// specifically a location from a SUPERSEDED INCARNATION of its segment.
+    ///
+    /// The occupant and tombstone witnesses cannot stand in for this one: the
+    /// recycle model refills the cell with the SAME key, precisely so the
+    /// occupant check has nothing to say and only the tag can reject. If this
+    /// counter stays at zero the reader never raced the bump, and the model is
+    /// asserting that a quiet table stays quiet.
+    pub(crate) fn assert_stale_incarnation_reached(self) {
+        assert!(
+            STALE_REJECT.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "model never handed the verifier a location from a superseded \
+             incarnation, so it would pass against a missing tag check"
+        );
+    }
+
+    /// As [`HazardWitness::assert_reached`], but for a model whose hazard is
     /// specifically a DELETE-MARKED occupant rather than a replaced one.
     pub(crate) fn assert_tombstone_reached(self) {
         assert!(
@@ -161,7 +199,15 @@ fn key_id(key: &[u8]) -> u64 {
 /// One cell per modeled storage location: a cell holds the id of the key whose
 /// bytes currently live there, or `0` for "nothing this model knows about".
 pub(crate) struct KeyOracle {
+    /// The occupant of each cell: the id of the key whose bytes live there,
+    /// plus [`DELETED`]. The model's stand-in for ITEM BYTES.
     cells: [AtomicU64; NUM_CELLS],
+
+    /// The incarnation each cell currently carries. The model's stand-in for
+    /// the SEGMENT METADATA WORD, and a separate atomic for the same reason it
+    /// is a separate word in production: a reader loads the tag and the bytes
+    /// at two different instants, and everything interesting lives in the gap.
+    tags: [AtomicU64; NUM_CELLS],
 }
 
 impl KeyOracle {
@@ -169,16 +215,27 @@ impl KeyOracle {
     pub(crate) fn new() -> Self {
         Self {
             cells: std::array::from_fn(|_| AtomicU64::new(0)),
+            tags: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
-    /// The [`Location`] naming `cell`.
+    /// The [`Location`] naming `cell` under its FIRST incarnation.
     ///
-    /// Offset by one so no cell maps to the all-zero location word, which the
-    /// slot encoding reserves for "empty".
+    /// Equivalent to `location_tagged(cell, 0)`. Every model that predates the
+    /// incarnation tag uses this and stays on tag 0 throughout, so their
+    /// behaviour is unchanged.
     pub(crate) fn location(cell: usize) -> Location {
+        Self::location_tagged(cell, 0)
+    }
+
+    /// The [`Location`] naming `cell` under a specific incarnation.
+    ///
+    /// The cell index is offset by one so no cell maps to the all-zero
+    /// location word, which the slot encoding reserves for "empty", and shifted
+    /// above the tag so `location(cell)` keeps a stable value per cell.
+    pub(crate) fn location_tagged(cell: usize, incarnation: u8) -> Location {
         debug_assert!(cell < NUM_CELLS);
-        Location::new(cell as u64 + 1)
+        Location::new(((cell as u64 + 1) << TAG_BITS) | (incarnation as u64 & TAG_MASK))
     }
 
     /// Write `key`'s bytes at `cell` — a segment write (reserve + define, or a
@@ -218,6 +275,25 @@ impl KeyOracle {
     /// model reddens against broken code.
     pub(crate) fn tombstone(&self, cell: usize) {
         self.cells[cell].fetch_or(DELETED, Ordering::Release);
+    }
+
+    /// End the incarnation `cell` is currently on.
+    ///
+    /// The model's stand-in for a segment leaving `Locked` — the point at
+    /// which every [`Location`] issued against the old incarnation must stop
+    /// resolving. The refill that follows is an ordinary [`KeyOracle::place`],
+    /// because in production the tag advances first and items are appended
+    /// under the new one afterwards.
+    ///
+    /// # This MUST be one atomic read-modify-write
+    ///
+    /// Splitting it into a load and a store collapses loom's interleaving
+    /// space: the hazard this models stops being reachable, and the model goes
+    /// green while proving nothing. The same trap cost this fixture 183 hazard
+    /// observations once already — see [`KeyOracle::tombstone`].
+    pub(crate) fn bump_incarnation(&self, cell: usize) {
+        debug_assert!(cell < NUM_CELLS);
+        self.tags[cell].fetch_add(1, Ordering::AcqRel);
     }
 
     /// One merge-drain relocation of [`KEY`], in the order production performs
@@ -282,6 +358,8 @@ impl KeyOracle {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         OCCUPANT_MISS.store(0, std::sync::atomic::Ordering::Relaxed);
         TOMBSTONE_MISS.store(0, std::sync::atomic::Ordering::Relaxed);
+        STALE_REJECT.store(0, std::sync::atomic::Ordering::Relaxed);
+        STALE_ACCEPT.store(0, std::sync::atomic::Ordering::Relaxed);
         HazardWitness(guard)
     }
 }
@@ -289,31 +367,48 @@ impl KeyOracle {
 impl KeyVerifier for KeyOracle {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let raw = location.as_raw();
+        let index = raw >> TAG_BITS;
         // Locations the oracle never issued (GHOST, or a backend-shaped word a
         // model handed in by mistake) match nothing.
-        if raw == 0 || raw > NUM_CELLS as u64 {
+        if index == 0 || index > NUM_CELLS as u64 {
             return false;
         }
-        let word = self.cells[(raw - 1) as usize].load(Ordering::Acquire);
+        let cell = (index - 1) as usize;
         use std::sync::atomic::Ordering as O;
+
+        // The tag first, before any "item bytes" are read: that is the order
+        // every production verifier uses, and the point of the check is to
+        // avoid resolving into a later incarnation's item at all.
+        let stale = (self.tags[cell].load(Ordering::Acquire) & TAG_MASK) != (raw & TAG_MASK);
+        if stale {
+            STALE_REJECT.fetch_add(1, O::Relaxed);
+            // NEUTER THIS `return` to prove the recycle model can fail.
+            return false;
+        }
+
+        let word = self.cells[cell].load(Ordering::Acquire);
         if word & !DELETED != key_id(key) {
-            let n = OCCUPANT_MISS.fetch_add(1, O::Relaxed) + 1;
-            eprintln!(
-                "MISS occupant={} tombstone={}",
-                n,
-                TOMBSTONE_MISS.load(O::Relaxed)
-            );
+            OCCUPANT_MISS.fetch_add(1, O::Relaxed);
             return false;
         }
         if !allow_deleted && (word & DELETED) != 0 {
-            let n = TOMBSTONE_MISS.fetch_add(1, O::Relaxed) + 1;
-            eprintln!(
-                "MISS occupant={} tombstone={}",
-                OCCUPANT_MISS.load(O::Relaxed),
-                n
-            );
+            TOMBSTONE_MISS.fetch_add(1, O::Relaxed);
             return false;
         }
+        if stale {
+            // Only reachable with the guard above neutered. Recorded here
+            // rather than inside the guard so the model still has something to
+            // assert on when the guard is removed.
+            STALE_ACCEPT.fetch_add(1, O::Relaxed);
+        }
         true
+    }
+}
+
+impl KeyOracle {
+    /// How many times the verifier accepted a location from a superseded
+    /// incarnation. Zero unless the tag comparison is missing.
+    pub(crate) fn stale_accepts() -> usize {
+        STALE_ACCEPT.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

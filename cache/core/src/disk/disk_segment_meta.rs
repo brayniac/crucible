@@ -31,7 +31,7 @@ use std::time::Duration;
 /// 5. Subsequent reads go to disk via io_uring
 #[repr(C, align(64))]
 pub struct DiskSegmentMeta {
-    /// Packed metadata: [8 unused][8 state][24 prev][24 next]
+    /// Packed metadata: [2 unused][6 incarnation][8 state][24 prev][24 next]
     metadata: AtomicU64,
 
     /// Next write position in the segment.
@@ -54,6 +54,12 @@ pub struct DiskSegmentMeta {
 
     /// Pool ID (0-3).
     pool_id: u8,
+
+    /// `log2` of the owning pool's offset alignment factor.
+    ///
+    /// Appends stride by `1 << align_shift`, because a `Location` stores
+    /// `offset / align_bytes` and cannot name a finer offset.
+    align_shift: u8,
 
     /// Segment-level expiration time (coarse seconds since epoch).
     expire_at: AtomicU32,
@@ -103,8 +109,13 @@ impl DiskSegmentMeta {
         capacity: u32,
         disk_offset: u64,
         free_queue: *const crossbeam_deque::Injector<u32>,
+        align_bytes: usize,
     ) -> Self {
         debug_assert!(pool_id <= 3, "pool_id {} exceeds 2-bit limit", pool_id);
+        debug_assert!(
+            align_bytes.is_power_of_two() && align_bytes >= 8,
+            "align_bytes {align_bytes} must be a power of two and at least 8"
+        );
 
         let initial_meta = Metadata::new(State::Free);
 
@@ -117,6 +128,7 @@ impl DiskSegmentMeta {
             id,
             capacity,
             pool_id,
+            align_shift: align_bytes.trailing_zeros() as u8,
             expire_at: AtomicU32::new(0),
             bucket_id: AtomicU16::new(Self::INVALID_BUCKET_ID),
             merge_count: AtomicU16::new(0),
@@ -212,6 +224,11 @@ impl DiskSegmentMeta {
 }
 
 impl SegmentKeyVerify for DiskSegmentMeta {
+    #[inline]
+    fn incarnation(&self) -> u8 {
+        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
+    }
+
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
         // When write buffer has been flushed to disk, we can't verify the key
         // in RAM. Trust the hashtable tag match — the server will verify the
@@ -326,6 +343,10 @@ impl Segment for DiskSegmentMeta {
     }
 
     #[inline]
+    fn align_bytes(&self) -> u32 {
+        1 << self.align_shift
+    }
+
     fn capacity(&self) -> usize {
         self.capacity as usize
     }
@@ -362,7 +383,11 @@ impl Segment for DiskSegmentMeta {
             return false;
         }
 
-        let new_meta = Metadata::new(State::Reserved);
+        // Preserve the incarnation: reserving does not end one, and zeroing
+        // here would wipe the tag the release that freed this segment set.
+        let new_meta = meta
+            .with_state(State::Reserved)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
         self.metadata
             .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -385,7 +410,21 @@ impl Segment for DiskSegmentMeta {
         match meta.state {
             State::Free => false, // Already free (idempotent)
             State::Reserved | State::Linking | State::Locked => {
-                let new_meta = Metadata::new(State::Free);
+                // Leaving `Locked` ends a used incarnation: the segment has
+                // been drained and cleared. `Reserved` and `Linking` must NOT
+                // bump -- `FilePool::release` returns never-used segments
+                // through here, and bumping there would advance a 6-bit tag at
+                // a rate decoupled from segment lifecycles.
+                let ends_incarnation = meta.state == State::Locked;
+
+                let new_meta = meta
+                    .with_state(State::Free)
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
+                let new_meta = if ends_incarnation {
+                    new_meta.bump_incarnation()
+                } else {
+                    new_meta
+                };
                 self.metadata
                     .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
@@ -411,10 +450,24 @@ impl Segment for DiskSegmentMeta {
         let next = new_next.unwrap_or(meta.next);
         let prev = new_prev.unwrap_or(meta.prev);
 
-        let new_meta = Metadata {
-            next,
-            prev,
-            state: new_state,
+        let new_meta = meta.with_state(new_state).with_chain_ids(next, prev);
+
+        // *Leaving* `Locked` ends a used incarnation -- not merely being
+        // `Locked`. The layers recycle a drained segment as
+        // `Locked -> Reserved` before releasing it `Reserved -> Free`. Bumping
+        // inside the same CAS that publishes the new state means no thread can
+        // observe the new state paired with the old tag.
+        //
+        // The `new_state != Locked` half is load-bearing: a chain-pointer-only
+        // rewrite that stays in `Locked` is mid-life, and eleven identity CASes
+        // in `organization/` take exactly that shape. Keying on the source
+        // state alone would advance the tag twice in one lifetime, halving the
+        // space the collision argument rests on. Every other transition is
+        // mid-life and preserves the tag.
+        let new_meta = if meta.state == State::Locked && new_state != State::Locked {
+            new_meta.bump_incarnation()
+        } else {
+            new_meta
         };
 
         self.metadata
@@ -434,7 +487,13 @@ impl Segment for DiskSegmentMeta {
             return false;
         }
 
-        let new_meta = Metadata::new(State::Free);
+        // `AwaitingRelease -> Free` is unconditionally the end of a used
+        // incarnation: the segment was condemned while live and its last reader
+        // has just dropped. Always bump.
+        let new_meta = meta
+            .with_state(State::Free)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+            .bump_incarnation();
         if self
             .metadata
             .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
@@ -531,7 +590,9 @@ impl Segment for DiskSegmentMeta {
         let header_size = BasicHeader::SIZE;
 
         let item_size = header_size + optional.len() + key.len() + value.len();
-        let padded_size = (item_size + 7) & !7; // 8-byte alignment
+        // The pool's stride, not a hardcoded 8: every scan advances by the same
+        // quantity, and a `Location` cannot name a finer offset.
+        let padded_size = self.item_stride(item_size) as usize;
 
         // Reserve space atomically
         let offset = self.reserve_space(padded_size as u32)?;
@@ -604,7 +665,7 @@ impl Segment for DiskSegmentMeta {
         let header_size = BasicHeader::SIZE;
 
         let item_size = header_size + optional.len() + key.len() + value_len;
-        let padded_size = (item_size + 7) & !7;
+        let padded_size = self.item_stride(item_size) as usize;
 
         let offset = self.reserve_space(padded_size as u32)?;
 
@@ -739,7 +800,9 @@ impl Segment for DiskSegmentMeta {
             return Ok(false); // Someone else marked it deleted first.
         }
 
-        let padded_size = header.padded_size() as u32;
+        // Must be the stride the append charged to `live_bytes`, not the
+        // 8-padded body size, or the accounting drifts on a coarser pool.
+        let padded_size = self.item_stride(header.padded_size());
         self.live_items.fetch_sub(1, Ordering::Relaxed);
         self.live_bytes.fetch_sub(padded_size, Ordering::Relaxed);
 
@@ -764,7 +827,14 @@ impl Segment for DiskSegmentMeta {
             .store(Self::INVALID_BUCKET_ID, Ordering::Release);
         self.merge_count.store(0, Ordering::Relaxed);
 
-        let new_meta = Metadata::new(State::Free);
+        // Stores unconditionally, so load first to advance the incarnation
+        // rather than clobber it -- exactly as `SliceSegment::force_free` does.
+        // A bulk reset recycles the segment, so locations issued before it must
+        // stop resolving.
+        let new_meta = Metadata::unpack(self.metadata.load(Ordering::Acquire))
+            .with_state(State::Free)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+            .bump_incarnation();
         self.metadata.store(new_meta.pack(), Ordering::Release);
     }
 }
@@ -810,20 +880,34 @@ mod tests {
     ///
     /// Returns the pool and injector alongside it because both must outlive
     /// the segment — the segment holds a raw pointer to the injector.
+    ///
+    /// `Arc`, not `Box`, for the reason `MemoryPool::free_queue` documents:
+    /// the segment holds a raw pointer into this queue and pushes itself back
+    /// on release, and moving a `Box` is a `Unique` retag that pops every
+    /// pointer derived from it. Miri caught exactly that here — returning the
+    /// `Box` invalidated the pointer the segment was holding, and
+    /// `release_condemned`'s `(*self.free_queue).push` then dereferenced it.
     fn segment_with_item(
         key: &[u8],
         value: &[u8],
     ) -> (
         DiskSegmentMeta,
         AlignedBufferPool,
-        Box<crossbeam_deque::Injector<u32>>,
+        std::sync::Arc<crossbeam_deque::Injector<u32>>,
     ) {
         let capacity = 4096usize;
         let mut pool = AlignedBufferPool::new(1, capacity, 512);
         let buf = pool.allocate().expect("one slot must be available");
-        let injector = Box::new(crossbeam_deque::Injector::new());
+        let injector = std::sync::Arc::new(crossbeam_deque::Injector::new());
 
-        let seg = DiskSegmentMeta::new(0, 0, capacity as u32, 0, &*injector);
+        let seg = DiskSegmentMeta::new(
+            0,
+            0,
+            capacity as u32,
+            0,
+            std::sync::Arc::as_ptr(&injector),
+            512,
+        );
         seg.attach_write_buffer(buf);
 
         let header = BasicHeader::new(key.len() as u8, 0, value.len() as u32);
@@ -839,6 +923,288 @@ mod tests {
         }
 
         (seg, pool, injector)
+    }
+
+    /// Build an empty segment with a given capacity and offset alignment.
+    ///
+    /// Separate from `segment_with_item` because these tests append through the
+    /// real path rather than writing a header by hand.
+    ///
+    /// `Arc` for the same reason as `segment_with_item`.
+    fn segment_with_alignment(
+        capacity: usize,
+        align: usize,
+    ) -> (
+        DiskSegmentMeta,
+        AlignedBufferPool,
+        std::sync::Arc<crossbeam_deque::Injector<u32>>,
+    ) {
+        let mut pool = AlignedBufferPool::new(1, capacity, 512);
+        let buf = pool.allocate().expect("one slot must be available");
+        let injector = std::sync::Arc::new(crossbeam_deque::Injector::new());
+
+        let seg = DiskSegmentMeta::new(
+            0,
+            0,
+            capacity as u32,
+            0,
+            std::sync::Arc::as_ptr(&injector),
+            align,
+        );
+        seg.attach_write_buffer(buf);
+        (seg, pool, injector)
+    }
+
+    /// Appends must stride by the pool's alignment, and a scan must agree.
+    ///
+    /// If appends pad to 512 and scans still advance by `header.padded_size()`
+    /// (which rounds to 8), the walk desyncs after the first item and silently
+    /// reads garbage. Offsets must also be representable: an unaligned offset
+    /// is truncated by `LocationLayout::pack` in release.
+    #[test]
+    fn test_disk_appends_stride_by_the_pools_alignment() {
+        let (meta, _pool, _injector) = segment_with_alignment(64 * 1024, 512);
+        assert!(meta.try_reserve());
+
+        // Three small items, each far below the alignment factor.
+        let mut offsets = Vec::new();
+        for i in 0..3u8 {
+            let key = [b'k', i];
+            let offset = meta.append_item(&key, b"v", &[]).expect("append");
+            offsets.push(offset);
+        }
+
+        for (i, &offset) in offsets.iter().enumerate() {
+            assert_eq!(
+                offset % 512,
+                0,
+                "item {i} at offset {offset} is not 512-aligned"
+            );
+        }
+        assert_eq!(offsets, vec![0, 512, 1024], "stride must be the alignment");
+
+        // A scan must land on exactly those offsets, not 8-byte ones.
+        let mut walked = Vec::new();
+        let mut offset = 0u32;
+        while offset < meta.write_offset() {
+            let ptr = meta.header_ptr(offset, BasicHeader::SIZE).expect("header");
+            let header = unsafe { BasicHeader::try_from_ptr(ptr) }.expect("valid header");
+            walked.push(offset);
+            offset += meta.item_stride(header.padded_size());
+        }
+        assert_eq!(
+            walked, offsets,
+            "the scan stride disagrees with the append stride"
+        );
+    }
+
+    /// Memory-style 8-byte alignment must be unaffected.
+    #[test]
+    fn test_disk_alignment_of_eight_is_unchanged() {
+        let (meta, _pool, _injector) = segment_with_alignment(64 * 1024, 8);
+        assert!(meta.try_reserve());
+        let a = meta.append_item(b"k1", b"v", &[]).expect("append");
+        let b = meta.append_item(b"k2", b"v", &[]).expect("append");
+        assert_eq!(a, 0);
+
+        // Derived, not hardcoded: `BasicHeader::SIZE` differs by feature, and
+        // the point is that the stride follows the item, not the disk default.
+        let expected = (BasicHeader::SIZE + b"k2".len() + b"v".len()).next_multiple_of(8) as u32;
+        assert_eq!(
+            b, expected,
+            "an 8-aligned pool must still pack items at 8 bytes"
+        );
+        assert!(
+            b < 512,
+            "an 8-aligned pool must not inherit the 512-byte disk stride"
+        );
+    }
+
+    /// The disk twin of the slice-segment bump table: the incarnation advances
+    /// on exactly the transitions that end a *used* incarnation, and no others.
+    ///
+    /// The eviction path recycles a drained segment as `Locked -> Reserved` and
+    /// only then releases it `Reserved -> Free`, so keying the bump on
+    /// `Locked -> Free` -- which the layers never drive -- would leave the tag
+    /// at 0 forever with the whole suite still green. Keying on *leaving
+    /// Locked* is what makes it fire.
+    ///
+    /// The exclusions matter just as much: `FilePool::release` returns
+    /// never-used segments through `try_release`, and a bump there would drain
+    /// the 6-bit tag's collision hardness with no item lifecycle at all.
+    #[test]
+    fn test_disk_incarnation_bumps_on_exactly_the_used_incarnation_transitions() {
+        let (seg, _pool, _injector) = segment_with_item(b"k", b"v");
+        assert_eq!(seg.incarnation(), 0);
+
+        // Free -> Reserved starts an incarnation. Must NOT bump.
+        assert!(seg.try_reserve());
+        assert_eq!(seg.incarnation(), 0, "try_reserve must not bump");
+
+        // Reserved -> Free: reserved but never used. Must NOT bump.
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            0,
+            "Reserved -> Free is a never-used release and must not bump"
+        );
+
+        // Linking -> Free: lost a chain-extension election. Must NOT bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Linking, None, None));
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            0,
+            "Linking -> Free is a lost election and must not bump"
+        );
+
+        // Locked -> Reserved: THE REAL RECYCLE PATH. Must bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Locked, None, None));
+        assert!(seg.cas_metadata(State::Locked, State::Reserved, None, None));
+        assert_eq!(
+            seg.incarnation(),
+            1,
+            "Locked -> Reserved is how a drained segment is recycled and must bump"
+        );
+
+        // The Reserved -> Free that follows must not bump again -- one
+        // incarnation ending is one bump, not two.
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            1,
+            "the release following a recycle must not double-bump"
+        );
+
+        // Locked -> Free: the other way out of Locked. Must bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Locked, None, None));
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            2,
+            "Locked -> Free also ends a used incarnation and must bump"
+        );
+
+        // AwaitingRelease -> Free: condemned. Must bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::AwaitingRelease, None, None));
+        assert!(seg.release_condemned());
+        assert_eq!(
+            seg.incarnation(),
+            3,
+            "AwaitingRelease -> Free ends a used incarnation and must bump"
+        );
+
+        // Bulk reset recycles the segment. Must bump.
+        assert!(seg.try_reserve());
+        seg.reset();
+        assert_eq!(
+            seg.incarnation(),
+            4,
+            "reset recycles the segment and must bump"
+        );
+        assert_eq!(seg.state(), State::Free);
+
+        // Sealed -> Draining and Draining -> Locked are mid-life. Must NOT bump.
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::Sealed, None, None));
+        assert!(seg.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(seg.cas_metadata(State::Draining, State::Locked, None, None));
+        assert_eq!(
+            seg.incarnation(),
+            4,
+            "transitions into Locked are mid-life and must not bump"
+        );
+
+        // A chain-pointer-only rewrite that stays in Locked is mid-life, not
+        // the end of an incarnation. Eleven identity CASes in organization/
+        // take this shape; if one ever ran against a Locked neighbour, keying
+        // the bump on the source state alone would advance the tag twice in
+        // one lifetime.
+        let before = seg.incarnation();
+        assert!(seg.cas_metadata(State::Locked, State::Locked, Some(7), None));
+        assert_eq!(
+            seg.incarnation(),
+            before,
+            "a Locked -> Locked chain rewrite must not bump"
+        );
+        assert_eq!(
+            seg.next(),
+            Some(7),
+            "the chain pointer must still be written"
+        );
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            before + 1,
+            "leaving Locked must still bump exactly once"
+        );
+    }
+
+    /// Every disk-segment transition must carry the incarnation forward.
+    ///
+    /// `Metadata::new` zeroes it and compiles clean, so nothing but this test
+    /// stands between a refactor and a silently reset tag -- which resurrects
+    /// stale locations rather than failing loudly. This is the disk twin of
+    /// `slice_segment.rs`'s `test_segment_transitions_preserve_incarnation`;
+    /// its absence is why these sites went unnoticed.
+    ///
+    /// This pins *preservation* for the transitions that do not end an
+    /// incarnation. `release_condemned` and `reset` do end one and now bump;
+    /// they are still checked here, relative to the seeded tag, because a site
+    /// that rebuilt `Metadata` from scratch and then bumped would land on 1
+    /// rather than `TAG + 1`. Which transitions bump is pinned separately by
+    /// `slice_segment.rs`'s
+    /// `test_incarnation_bumps_on_exactly_the_used_incarnation_transitions`.
+    #[test]
+    fn test_disk_segment_transitions_preserve_incarnation() {
+        const TAG: u8 = 42;
+
+        let (seg, _pool, _injector) = segment_with_item(b"k", b"v");
+        assert_eq!(seg.incarnation(), 0, "a brand-new segment starts at 0");
+
+        // Seed a non-zero tag directly, the way a prior incarnation's release
+        // would have left it.
+        let seeded = Metadata::unpack(seg.metadata.load(Ordering::Acquire)).with_state(State::Free);
+        seg.metadata.store(
+            Metadata {
+                incarnation: TAG,
+                ..seeded
+            }
+            .pack(),
+            Ordering::Release,
+        );
+
+        // Free -> Reserved
+        assert!(seg.try_reserve());
+        assert_eq!(seg.incarnation(), TAG, "try_reserve reset the tag");
+
+        // Reserved -> Free
+        assert!(seg.try_release());
+        assert_eq!(seg.incarnation(), TAG, "try_release reset the tag");
+
+        // Reserved -> AwaitingRelease -> Free
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::AwaitingRelease, None, None));
+        assert_eq!(seg.incarnation(), TAG, "cas_metadata reset the tag");
+        // `release_condemned` ends a used incarnation, so it bumps; what is
+        // pinned here is that it bumps from the seeded tag rather than
+        // rebuilding the word from scratch, which would land on 1.
+        assert!(seg.release_condemned());
+        assert_eq!(
+            seg.incarnation(),
+            TAG + 1,
+            "release_condemned did not carry the tag forward"
+        );
+
+        // Unconditional store back to Free. Also an incarnation-ending
+        // transition, so it bumps rather than preserves.
+        assert!(seg.try_reserve());
+        seg.reset();
+        assert_eq!(seg.incarnation(), TAG + 2, "reset cleared the tag");
     }
 
     /// A key LONGER than the stored one must not match, even when the bytes

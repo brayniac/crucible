@@ -66,6 +66,7 @@
 mod config;
 mod error;
 mod location;
+mod location_layout;
 pub mod sync;
 
 // Segment-specific location interpretation
@@ -83,6 +84,7 @@ pub use error::{CacheError, CacheResult};
 // Location re-exports
 pub use item_location::{FnVerifier, ItemLocation, MultiPoolVerifier, SinglePoolVerifier};
 pub use location::Location;
+pub use location_layout::{LayoutError, LocationLayout, TAG_BITS, TAG_MASK};
 
 // Phase 2 re-exports
 pub use item::{BasicHeader, BasicItemGuard, ItemGuard, TtlHeader};

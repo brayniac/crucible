@@ -87,8 +87,15 @@ struct IoUringPoolVerifier<'a> {
 impl KeyVerifier for IoUringPoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        let (_, segment_id, incarnation, offset) = item_loc.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            // A location naming a previous incarnation of this segment is not ours
+            // to resolve: the segment was drained and refilled, and this offset now
+            // holds a different item. Checked before touching any item bytes.
+            if segment.incarnation() != incarnation {
+                return false;
+            }
+            segment.verify_key_at_offset(offset, key, allow_deleted)
         } else {
             false
         }
@@ -172,7 +179,13 @@ impl IoUringDiskLayer {
 
             if let Some(segment) = self.pool.get(segment_id) {
                 if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(self.pool.pool_id(), segment_id, offset));
+                    return Ok(ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    ));
                 }
 
                 // Segment is full — seal it and queue for flush
@@ -202,7 +215,8 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         if !segment.state().is_readable() {
             return None;
@@ -233,7 +247,6 @@ impl IoUringDiskLayer {
         fence(Ordering::Acquire);
 
         let data_ptr = segment.write_buffer_ptr()?;
-        let offset = location.offset();
 
         // Parse header
         if offset as usize + BasicHeader::SIZE > segment.capacity() {
@@ -248,6 +261,9 @@ impl IoUringDiskLayer {
             return None;
         }
 
+        // A bounds check on the item's actual bytes, not a stride: the padding
+        // past `padded_size()` is dead space the last item in a segment need
+        // not own, so checking the stride here would reject a valid read.
         let item_size = header.padded_size();
         if offset as usize + item_size > segment.capacity() {
             unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
@@ -299,7 +315,8 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         if !segment.state().is_readable() {
             return None;
@@ -329,14 +346,13 @@ impl IoUringDiskLayer {
 
         // Compute block-aligned read range
         let (disk_offset, read_len, item_offset) =
-            self.pool
-                .item_disk_range(location.segment_id(), location.offset(), read_size);
+            self.pool.item_disk_range(segment_id, offset, read_size);
 
         Some(DiskReadParams {
             disk_offset,
             read_len,
             item_offset,
-            segment_id: location.segment_id(),
+            segment_id,
             pool_id: self.pool.pool_id(),
         })
     }
@@ -511,7 +527,10 @@ impl IoUringDiskLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let key_start =
                         offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -520,7 +539,13 @@ impl IoUringDiskLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
                         hashtable.remove(key, location.to_location());
                     }
 
@@ -573,7 +598,10 @@ impl IoUringDiskLayer {
             while offset < write_offset {
                 if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                     if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                        let item_size = header.padded_size() as u32;
+                        // The segment's stride, not the 8-byte padded body size: a scan
+                        // that advances by anything but what the append advanced by
+                        // desyncs after the first item on a coarser-aligned pool.
+                        let item_size = segment.item_stride(header.padded_size());
 
                         let key_start =
                             offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -582,8 +610,13 @@ impl IoUringDiskLayer {
                         if let Some(key) = segment.data_slice(key_start as u32, key_len)
                             && !header.is_deleted()
                         {
-                            let location =
-                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                            let location = ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            );
 
                             let verifier = IoUringPoolVerifier { pool: &self.pool };
                             let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -690,7 +723,8 @@ impl Layer for IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
         if !segment.state().is_readable() || !segment.has_write_buffer() {
             return None;
         }
@@ -701,7 +735,7 @@ impl Layer for IoUringDiskLayer {
             return None;
         }
 
-        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
+        let header_info = segment.verify_key_unexpired(offset, key, now)?;
 
         // Build a BasicItemGuard from the write buffer data
         let ref_count_ptr = segment.ref_count_ptr();
@@ -714,7 +748,6 @@ impl Layer for IoUringDiskLayer {
         }
 
         let data_ptr = segment.write_buffer_ptr()?;
-        let offset = location.offset();
 
         let (key_len, optional_len, value_len) = header_info;
 
@@ -754,10 +787,11 @@ impl Layer for IoUringDiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
             // Can only mark deleted if write buffer is present
             if segment.has_write_buffer() {
-                segment.mark_deleted_at_offset(location.offset());
+                segment.mark_deleted_at_offset(offset);
             }
         }
     }
@@ -767,7 +801,7 @@ impl Layer for IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let segment = self.pool.get(location.segment_id(self.pool.layout()))?;
         let now = Self::now_secs();
         segment.segment_ttl(now)
     }
@@ -922,5 +956,147 @@ impl IoUringDiskLayerBuilder {
 impl Default for IoUringDiskLayerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+    use crate::hashtable_impl::MultiChoiceHashtable;
+
+    /// Fill one segment with items and index them, returning keys + segment id.
+    fn fill_one_segment(
+        layer: &IoUringDiskLayer,
+        hashtable: &MultiChoiceHashtable,
+    ) -> (Vec<String>, u32) {
+        let verifier = IoUringPoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+
+        const ITEMS: usize = 5;
+        let mut keys = Vec::new();
+        let mut segment_id = None;
+        for i in 0..ITEMS {
+            let key = format!("key_{i:02}");
+            let location = layer
+                .write_item_with_buffers(key.as_bytes(), b"value", b"", ttl)
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), location.to_location(), &verifier)
+                .expect("insert");
+            let id = location.segment_id(layer.pool.layout());
+            assert_eq!(
+                *segment_id.get_or_insert(id),
+                id,
+                "all items must share one segment for this to test the walk"
+            );
+            keys.push(key);
+        }
+        (keys, segment_id.expect("at least one item"))
+    }
+
+    fn assert_all_removed(
+        layer: &IoUringDiskLayer,
+        hashtable: &MultiChoiceHashtable,
+        keys: &[String],
+    ) {
+        let verifier = IoUringPoolVerifier { pool: &layer.pool };
+        for key in keys {
+            assert!(
+                hashtable.lookup(key.as_bytes(), &verifier).is_none(),
+                "{key} survived the walk -- it stopped short of that item"
+            );
+        }
+    }
+
+    fn test_layer() -> IoUringDiskLayer {
+        IoUringDiskLayerBuilder::new()
+            .pool_id(2)
+            .segment_size(64 * 1024)
+            .segment_count(4)
+            .build()
+    }
+
+    /// A location from a previous incarnation must not resolve, even though
+    /// the key really is at that offset.
+    ///
+    /// That is the whole hazard: segments are append-only from a fixed start,
+    /// so the n-th item of the new incarnation lands where the n-th item of the
+    /// old one was. The key compare alone says yes; only the tag says no.
+    #[test]
+    fn test_verifier_rejects_a_stale_incarnation() {
+        let layer = test_layer();
+        let pool = &layer.pool;
+
+        // Age every segment through a used incarnation, so the tag the write
+        // stamps is non-zero and a predecessor tag exists to test against.
+        let ids: Vec<u32> = (0..pool.segment_count())
+            .map(|_| pool.reserve().expect("pool must have a free segment"))
+            .collect();
+        for &id in &ids {
+            let segment = pool.get(id).expect("segment id came from the pool");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            pool.release(id);
+        }
+
+        let live = layer
+            .write_item_with_buffers(b"key", b"value", b"", Duration::from_secs(3600))
+            .expect("write");
+        let layout = pool.layout();
+        let (pool_id, segment_id, tag, offset) = live.unpack(layout);
+        assert_ne!(tag, 0, "the segment must be past its first incarnation");
+
+        // Same segment, same offset, previous tag.
+        let stale = ItemLocation::new(layout, pool_id, segment_id, tag - 1, offset);
+        let verifier = IoUringPoolVerifier { pool };
+
+        assert!(
+            verifier.verify(b"key", live.to_location(), false),
+            "the current incarnation must resolve"
+        );
+        assert!(
+            !verifier.verify(b"key", stale.to_location(), false),
+            "a location from a previous incarnation must not resolve"
+        );
+    }
+
+    /// Draining a pinned segment must visit every item, at the pool's stride.
+    ///
+    /// Disk pools align items to 512 bytes while `BasicHeader::padded_size()`
+    /// rounds to 8. A walk that advances by the latter lands mid-item on its
+    /// second iteration, reads a garbage header and stops -- silently, since
+    /// both quantities are `u32`. Hashtable entries left behind after the
+    /// segment is recycled is what that failure looks like from the outside.
+    #[test]
+    fn test_draining_a_segment_walks_every_item_at_the_disk_stride() {
+        let layer = test_layer();
+        assert_eq!(
+            layer.pool.layout().align_bytes(),
+            512,
+            "disk pools align to a sector"
+        );
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+
+        layer.drain_segment_from_hashtable(segment_id, &hashtable);
+        assert_all_removed(&layer, &hashtable, &keys);
+    }
+
+    /// The same for the unpinned path, which walks the segment itself rather
+    /// than deferring to `drain_segment_from_hashtable`.
+    #[test]
+    fn test_evicting_a_segment_walks_every_item_at_the_disk_stride() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+
+        // The eviction path leaves its victim in `Draining`, which is the
+        // state `process_evicted_segment` expects.
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Draining, None, None));
+
+        layer.process_evicted_segment(segment_id, &hashtable);
+        assert_all_removed(&layer, &hashtable, &keys);
     }
 }

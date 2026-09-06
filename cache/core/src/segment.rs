@@ -21,6 +21,22 @@ use std::time::Duration;
 /// minimal trait, types that don't provide full segment access (like SSD-backed
 /// segments that require async I/O) can still work with the hashtable.
 pub trait SegmentKeyVerify {
+    /// The incarnation tag this segment currently carries.
+    ///
+    /// A location whose tag differs names a previous incarnation of this
+    /// segment and must not be resolved: the segment has been drained and
+    /// refilled, and the offset now holds a different item.
+    ///
+    /// This lives here rather than on [`Segment`] because it is part of
+    /// deciding whether a location verifies, and the hashtable's verifiers are
+    /// generic over this trait alone. Widening them to [`Segment`] would defeat
+    /// the point of this trait being minimal.
+    ///
+    /// Distinct from [`Segment::generation`]: that is a 16-bit counter bumped
+    /// on `Free -> Reserved` and consumed by `CasToken`. This one is 6 bits and
+    /// advances only when a *used* incarnation ends.
+    fn incarnation(&self) -> u8;
+
     /// Verify that the key at the given offset matches.
     ///
     /// Used by hashtables to verify tag matches against actual keys.
@@ -117,6 +133,36 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     fn increment_generation(&self);
 
     // ========== Capacity ==========
+
+    /// Get the offset alignment factor of the pool that owns this segment.
+    ///
+    /// Always a power of two and at least 8. Item offsets are multiples of it,
+    /// because a `Location` stores `offset / align_bytes` and cannot represent
+    /// anything finer -- see `LocationLayout`.
+    fn align_bytes(&self) -> u32;
+
+    /// Round an item size up to this segment's offset alignment.
+    ///
+    /// This is the segment's *stride*: appends advance the write offset by it,
+    /// and **every scan must advance by it too**. A scan that advances by
+    /// `header.padded_size()` -- which rounds to 8 regardless of the pool --
+    /// desyncs after the first item on a coarser-aligned pool and then reads
+    /// garbage headers. Both sides are `u32`, so the compiler cannot catch the
+    /// mismatch; this method exists so there is only one definition to get
+    /// right.
+    ///
+    /// Safe to apply to an already-8-padded size: `align_bytes` is a power of
+    /// two and at least 8, so rounding twice is the same as rounding once.
+    ///
+    /// Note this is *not* the size of the item's bytes. A bounds check against
+    /// `capacity` should use `header.padded_size()`, since the padding beyond
+    /// it is dead space that the last item in a segment need not own.
+    #[inline]
+    fn item_stride(&self, item_size: usize) -> u32 {
+        let align = self.align_bytes() as usize;
+        debug_assert!(align.is_power_of_two() && align >= 8);
+        ((item_size + align - 1) & !(align - 1)) as u32
+    }
 
     /// Get the total data capacity in bytes.
     fn capacity(&self) -> usize;
@@ -418,6 +464,13 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     ///
     /// Clears all data and statistics. Should only be called when
     /// the segment is in `Locked` state with ref_count == 0.
+    ///
+    /// The implementations are asymmetric, and the difference now carries
+    /// meaning: `DiskSegmentMeta::reset` publishes `Free` and advances the
+    /// incarnation, ending the segment's lifecycle, while `SliceSegment::reset`
+    /// touches only statistics and leaves both state and tag alone. A caller
+    /// that needs the RAM equivalent of the disk behaviour wants
+    /// `SliceSegment::force_free`.
     fn reset(&self);
 }
 
