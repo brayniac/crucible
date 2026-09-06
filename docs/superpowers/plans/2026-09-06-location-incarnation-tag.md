@@ -1623,6 +1623,113 @@ chain elections would otherwise drain a 6-bit tag at a rate decoupled from
 segment lifecycles. Pinned as a full transition table, every arm proven red."
 ```
 
+### Task 3b: the guard-drop path that actually frees condemned segments
+
+Task 3 made `release_condemned` bump. It missed the two sites that perform the
+identical `AwaitingRelease -> Free` transition from a guard's `Drop` -- and those
+are the **main** path, not the exception:
+
+```rust
+// fifo_layer.rs:171
+// Draining -> AwaitingRelease (last reader's ValueRef::drop will free it)
+segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+// Race fix: if the last reader dropped between our ref_count check and the
+// CAS above, the segment is now AwaitingRelease with ref_count == 0 and
+// nobody will free it. Reclaim it now.
+if segment.ref_count() == 0 && segment.release_condemned() { return true; }
+```
+
+`release_condemned` here is the **fallback** for a narrow race. Whenever a reader
+is actually outstanding -- `ref_count() > 0`, which is the branch this whole code
+path exists for -- the segment is freed by the last guard drop instead.
+
+That is precisely the case a stale `Location` is most likely to exist for: a
+reader holding a reference across the recycle is the scenario the incarnation tag
+was built to defend against. As Task 3 stands, those segments keep their tag and
+the stale location still resolves.
+
+This is the same error as the `Locked -> Free` one, in the same shape: the
+fallback transition was tagged and the dominant one was not.
+
+**Files:** Modify `cache/core/src/item.rs`, `cache/core/src/cache_trait.rs`
+
+- [ ] **Step 1: Update the two drop tests to expect a bump**
+
+`test_item_guard_drop_preserves_incarnation` and
+`test_value_ref_drop_preserves_incarnation` (added in Task 2b) currently assert
+the tag is preserved at these sites. Invert them: seed 42, drop the guard, assert
+the tag is now **43** and the state is `Free` and the segment reached the free
+queue. Rename both from `_preserves_` to `_bumps_the_incarnation`, and keep the
+free-queue assertion -- it is what proves the transition actually ran rather than
+the CAS silently failing.
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cargo test -p cache-core --lib drop_bumps_the_incarnation`
+Expected: FAIL, tag 42 where 43 was expected, at both sites.
+
+- [ ] **Step 3: Bump at both sites**
+
+`item.rs:813` (`BasicItemGuard::drop`) and `cache_trait.rs:231`
+(`ValueRef::drop`), replacing the "Task 3 decides" comments:
+
+```rust
+                // AwaitingRelease -> Free ends a used incarnation, so the tag
+                // advances in the same CAS that publishes Free.
+                //
+                // This is the *main* condemned-free path, not an edge case: the
+                // layers condemn a segment with readers outstanding and leave
+                // the last guard drop to free it, calling `release_condemned`
+                // only as a fallback when the last reader vanished during the
+                // condemn window. A reader holding a location across this
+                // recycle is exactly what the tag defends against.
+                let new_meta = meta
+                    .with_state(State::Free)
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+                    .bump_incarnation();
+```
+
+Keep the `with_chain_ids` call. Dropping it would return a freed segment to the
+free queue still linked to its neighbours -- the defect caught in the Task 2b
+review.
+
+- [ ] **Step 4: Verify and prove red**
+
+Run: `cargo test -p cache-core --lib`
+Expected: PASS, 452.
+
+Remove each bump in turn and confirm the matching test reddens. Quote both.
+
+- [ ] **Step 5: Check for any remaining unbumped end-of-incarnation**
+
+Both misses so far were a dominant transition overlooked beside a tagged
+fallback. Grep every write that publishes `State::Free` or moves out of
+`State::Locked` and confirm each either bumps or is a documented never-used
+release:
+
+```bash
+grep -rn "State::Free\|State::Locked" --include='*.rs' cache/core/src | grep -v "^.*test"
+```
+
+Report the classified list. A site that ends a used incarnation without bumping
+is the failure this whole task exists to prevent.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add cache/core/src/item.rs cache/core/src/cache_trait.rs
+git commit -m "fix(cache-core): bump the incarnation on the guard-drop free path
+
+Task 3 tagged release_condemned, which is the fallback. The layers condemn
+a segment with readers outstanding and leave the last guard drop to free
+it, so BasicItemGuard::drop and ValueRef::drop are the main path -- and a
+reader holding a location across that recycle is exactly the case the tag
+defends against.
+
+Same shape as the Locked -> Free error: the fallback was tagged and the
+dominant transition was not."
+```
+
 ### Task 4: `ItemLocation` becomes layout-aware
 
 Accessors take the layout rather than `ItemLocation` storing one: the type stays
