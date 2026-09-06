@@ -153,6 +153,10 @@ jobs:
     #    which Miri does not support. Anonymous mappings are fine; file-backed
     #    ones are not. `disk::disk_segment_meta` DOES run: it allocates through
     #    the global allocator.
+    #  - `cache::tests::test_stale_location_is_rejected_on_the_disk_arms` --
+    #    same reason, but it lives outside the `disk::` modules: it builds a
+    #    DiskLayer, and therefore a file-backed FilePool, to reach the verifier's
+    #    disk arms. Module-level skips do not catch it.
     #  - `hugepage::` -- Miri accepts `mmap` only with MAP_PRIVATE|MAP_ANONYMOUS
     #    and the hugepage path adds MAP_HUGETLB. Excluded rather than worked
     #    around: unlike a prefetch, the mmap flags decide what is actually
@@ -184,7 +188,8 @@ jobs:
             --skip disk::disk_layer \
             --skip disk::io_uring \
             --skip disk::recovery \
-            --skip hugepage::
+            --skip hugepage:: \
+            --skip test_stale_location_is_rejected_on_the_disk_arms
 
   smoketest:
     name: Smoketest (${{ matrix.config }})
