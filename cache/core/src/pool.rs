@@ -50,6 +50,12 @@ pub trait RamPool: Send + Sync {
     /// Get the size of each segment in bytes.
     fn segment_size(&self) -> usize;
 
+    /// Get this pool's location layout.
+    ///
+    /// Locations naming this pool must be packed and unpacked with it; pools
+    /// with different segment sizes or alignment factors have different splits.
+    fn layout(&self) -> &crate::location_layout::LocationLayout;
+
     /// Reserve a segment from the pool.
     ///
     /// The segment transitions from `Free` to `Reserved` state.

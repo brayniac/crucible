@@ -5,10 +5,18 @@
 //! segment allocation via a lock-free free queue, and provides disk
 //! offset calculations for reading/writing segment data.
 
+use crate::location_layout::LocationLayout;
 use crate::pool::RamPool;
 use crate::segment::Segment;
 
 use super::disk_segment_meta::DiskSegmentMeta;
+
+/// Offset alignment factor for io_uring disk pools.
+///
+/// 8, matching the alignment the segment append path pads items to. Coarser
+/// alignment would buy addressable capacity (locations store `offset /
+/// align_bytes`) but the appended offsets would no longer be representable.
+const DEFAULT_ALIGN_BYTES: usize = 8;
 
 /// Pool of disk segment metadata entries.
 ///
@@ -48,6 +56,8 @@ pub struct IoUringPool {
     block_size: u32,
     /// Total number of segments.
     segment_count: usize,
+    /// Bit split for locations naming this pool.
+    layout: LocationLayout,
 }
 
 // SAFETY: All internal state is either immutable after construction
@@ -64,6 +74,13 @@ impl IoUringPool {
     /// - `segment_count`: Number of segments
     /// - `segment_size`: Size of each segment in bytes
     /// - `block_size`: I/O block size (typically 4096)
+    ///
+    /// # Panics
+    ///
+    /// Panics if any argument is out of range, or if `segment_size` and the
+    /// pool's alignment factor (8 bytes) do not yield a usable
+    /// [`LocationLayout`] -- for instance a segment so small that more segment
+    /// id bits remain than a `u32` id can hold.
     pub fn new(pool_id: u8, segment_count: usize, segment_size: usize, block_size: u32) -> Self {
         assert!(pool_id <= 3, "pool_id must be 0-3");
         assert!(segment_count > 0, "segment_count must be > 0");
@@ -71,6 +88,24 @@ impl IoUringPool {
         assert!(
             block_size > 0 && block_size.is_power_of_two(),
             "block_size must be a power of two"
+        );
+
+        // Consistent with the surrounding constructor, which asserts rather
+        // than returning a Result: `IoUringPool` has no builder, and
+        // `IoUringDiskLayerBuilder::build` is infallible.
+        let layout = LocationLayout::new(segment_size, DEFAULT_ALIGN_BYTES)
+            .unwrap_or_else(|e| panic!("invalid location layout for this pool: {e}"));
+        assert!(
+            layout.validate_segment_count(segment_count).is_ok(),
+            "segment_count {segment_count} exceeds the {} the layout addresses",
+            layout.max_segment_count()
+        );
+        // Aligning coarser than the I/O block buys nothing on the read path:
+        // `item_disk_range` already rounds reads down to a block boundary.
+        assert!(
+            layout.align_bytes() <= block_size,
+            "align_bytes ({}) must not exceed block_size ({block_size})",
+            layout.align_bytes()
         );
 
         // `Arc`, not `Box`: see `MemoryPool::free_queue`. Segments hold raw
@@ -104,6 +139,7 @@ impl IoUringPool {
             segment_size,
             block_size,
             segment_count,
+            layout,
         }
     }
 
@@ -199,6 +235,11 @@ impl RamPool for IoUringPool {
     #[inline]
     fn segment_size(&self) -> usize {
         self.segment_size
+    }
+
+    #[inline]
+    fn layout(&self) -> &LocationLayout {
+        &self.layout
     }
 
     fn reserve(&self) -> Option<u32> {

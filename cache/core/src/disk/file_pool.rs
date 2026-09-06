@@ -5,6 +5,7 @@
 
 use crate::disk::config::{DiskConfig, SyncMode};
 use crate::disk::file_segment::FileSegment;
+use crate::location_layout::LocationLayout;
 use crate::pool::RamPool;
 use crate::segment::Segment;
 use memmap2::{MmapMut, MmapOptions};
@@ -20,6 +21,13 @@ pub const FILE_VERSION: u32 = 1;
 
 /// Header size (64 bytes, cache line aligned).
 pub const HEADER_SIZE: usize = 64;
+
+/// Default offset alignment factor for file-backed pools.
+///
+/// 8, matching the alignment the segment append path pads items to. Coarser
+/// alignment would buy addressable capacity (locations store `offset /
+/// align_bytes`) but the appended offsets would no longer be representable.
+const DEFAULT_ALIGN_BYTES: usize = 8;
 
 /// Header stored at the beginning of the disk cache file.
 ///
@@ -157,6 +165,9 @@ pub struct FilePool {
     /// Size of each segment in bytes.
     segment_size: usize,
 
+    /// Bit split for locations naming this pool.
+    layout: LocationLayout,
+
     /// Synchronization mode.
     sync_mode: SyncMode,
 }
@@ -281,6 +292,10 @@ impl RamPool for FilePool {
         self.segment_size
     }
 
+    fn layout(&self) -> &LocationLayout {
+        &self.layout
+    }
+
     fn reserve(&self) -> Option<u32> {
         use crate::memory_pool::MAX_STEAL_RETRIES;
 
@@ -338,6 +353,7 @@ pub struct FilePoolBuilder {
     size: usize,
     sync_mode: SyncMode,
     create_new: bool,
+    align_bytes: usize,
 }
 
 impl FilePoolBuilder {
@@ -354,6 +370,7 @@ impl FilePoolBuilder {
             size: 1024 * 1024 * 1024, // 1GB default
             sync_mode: SyncMode::default(),
             create_new: true,
+            align_bytes: DEFAULT_ALIGN_BYTES,
         }
     }
 
@@ -366,6 +383,21 @@ impl FilePoolBuilder {
     /// Set the segment size in bytes.
     pub fn segment_size(mut self, size: usize) -> Self {
         self.segment_size = size;
+        self
+    }
+
+    /// Set the offset alignment factor in bytes.
+    ///
+    /// Locations store `offset / align_bytes`, so this is the only lever on a
+    /// pool's addressable capacity: `2^36 * align_bytes`. Must be a power of
+    /// two, at least 8, and no larger than `segment_size`.
+    ///
+    /// Defaults to 8, the alignment the segment append path actually pads
+    /// items to. Raising it is only sound once that path pads to the same
+    /// factor; until then a coarser value produces item offsets this layout
+    /// cannot represent.
+    pub fn align_bytes(mut self, align: usize) -> Self {
+        self.align_bytes = align;
         self
     }
 
@@ -404,6 +436,7 @@ impl FilePoolBuilder {
             size: config.size,
             sync_mode: config.sync_mode,
             create_new: !config.recover_on_startup,
+            align_bytes: DEFAULT_ALIGN_BYTES,
         }
     }
 
@@ -416,6 +449,9 @@ impl FilePoolBuilder {
                 "size must be >= segment_size",
             ));
         }
+
+        let layout = LocationLayout::new(self.segment_size, self.align_bytes)?;
+        layout.validate_segment_count(num_segments)?;
 
         let total_file_size = HEADER_SIZE + num_segments * self.segment_size;
 
@@ -526,6 +562,7 @@ impl FilePoolBuilder {
             pool_id: self.pool_id,
             is_per_item_ttl: self.is_per_item_ttl,
             segment_size: self.segment_size,
+            layout,
             sync_mode: self.sync_mode,
         })
     }
