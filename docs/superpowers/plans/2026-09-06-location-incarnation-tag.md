@@ -814,6 +814,144 @@ module exists to protect."
 
 ---
 
+### Task 1c: pin the guards Task 1b added
+
+The Task 1b re-review approved the fixes but found the most consequential new
+guard untested, plus four cheap items. N1 and N4 are the substantive ones.
+
+**Files:** Modify `cache/core/src/location_layout.rs`
+
+- [ ] **Step 1: N1 -- pin the `offset` assert**
+
+Deleting `pack`'s offset range check currently leaves all 14 tests green. It is
+the guard against silent incarnation corruption -- the failure this whole
+feature exists to prevent -- so it must be proven red like everything else.
+
+```rust
+    #[test]
+    #[should_panic(expected = "exceeds this layout's 17-bit offset field")]
+    fn pack_rejects_an_offset_past_the_offset_field() {
+        // One byte past a 1 MiB segment, and still 8-aligned, so the alignment
+        // assert waves it through. Without the range check this silently
+        // overflows into the incarnation field and returns a corrupted tag.
+        let layout = LocationLayout::new(1024 * 1024, 8).unwrap();
+        layout.pack(0, 5, 0, 1024 * 1024);
+    }
+```
+
+- [ ] **Step 2: N4 -- tighten the `segment_id` assert to the issuable range**
+
+`ghost_is_unaliasable` now builds its word directly, so `pack` no longer needs
+to admit the top id. As written the assert is value-identical to the old one and
+still passes for `max_segment_count()` -- the GHOST-aliasing value. Tighten it to
+the range a pool can actually issue, which is the off-by-one Tasks 4-6 are most
+likely to make:
+
+```rust
+        debug_assert!(
+            segment_id < self.max_segment_count(),
+            "segment_id {segment_id} is outside the issuable range 0..{}",
+            self.max_segment_count()
+        );
+```
+
+and pin it:
+
+```rust
+    #[test]
+    #[should_panic(expected = "is outside the issuable range")]
+    fn pack_rejects_the_unissuable_top_segment_id() {
+        // The id reserved so Location::GHOST cannot be aliased. A pool must
+        // never issue it, and pack must say so rather than encode it.
+        let layout = LocationLayout::new(1024 * 1024, 8).unwrap();
+        layout.pack(0, layout.max_segment_count(), 0, 0);
+    }
+```
+
+- [ ] **Step 3: N2 -- record the precondition on the new subtraction**
+
+`let seg_bits = PAYLOAD_BITS - TAG_BITS - offset_bits;` cannot underflow only
+because the ceiling above caps `offset_bits` at 29. Swapping the two blocks
+passes every test and then panics on a 1 TiB input. State it:
+
+```rust
+        // Safe from underflow only because the ceiling above already capped
+        // offset_bits at 29 (align_shift >= 3). This ordering is load-bearing.
+        let seg_bits = PAYLOAD_BITS - TAG_BITS - offset_bits;
+```
+
+- [ ] **Step 4: N3 and N5 -- pin `div_ceil`, drop the magic numbers**
+
+`div_ceil` is still unpinned: plain `/` survives every test because
+`next_power_of_two` masks it. It diverges only when `align` does not divide
+`segment_size` and the plain quotient is already a power of two. Add to
+`derives_offset_bits_for_non_power_of_two_segment_sizes`:
+
+```rust
+        // Pins div_ceil specifically: with plain division this is 7 bits, which
+        // cannot address the last 9 bytes of the segment.
+        assert_eq!(LocationLayout::new(1025, 8).unwrap().offset_bits(), 8);
+```
+
+In `ghost_is_unaliasable`, replace the literal `+ 6` and `>> 3` with
+`TAG_BITS` and the layout's own alignment, so the test tracks the constants it
+is meant to pin:
+
+```rust
+        let unissuable = (3u64 << LocationLayout::POOL_SHIFT)
+            | ((layout.max_segment_count() as u64) << (layout.offset_bits() + TAG_BITS))
+            | (0x3Fu64 << layout.offset_bits())
+            | ((max_offset / layout.align_bytes()) as u64);
+```
+
+- [ ] **Step 5: N7 -- pin the downcast contract**
+
+`From<LayoutError> for io::Error` preserving the structured error is a claimed
+capability the pool builders in Task 5 may rely on, and nothing pins it:
+
+```rust
+    #[test]
+    fn io_error_conversion_preserves_the_structured_error() {
+        let err = LocationLayout::new(4096, 512).unwrap_err();
+        let io: std::io::Error = err.into();
+        assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            io.get_ref().and_then(|e| e.downcast_ref::<LayoutError>()),
+            Some(LayoutError::SegmentTooSmall { .. })
+        ));
+    }
+```
+
+- [ ] **Step 6: Verify and prove red**
+
+Run: `cargo test -p cache-core --lib location_layout`
+Expected: PASS, 18 tests.
+
+Prove each new guard red: delete `pack`'s offset assert and confirm
+`pack_rejects_an_offset_past_the_offset_field` fails; loosen the `segment_id`
+assert back to `<= max_segment_count()` and confirm
+`pack_rejects_the_unissuable_top_segment_id` fails; replace `div_ceil` with `/`
+and confirm the non-power-of-two test fails. Restore all three.
+
+Run: `cargo test -p cache-core --lib`, `cargo clippy -p cache-core --all-targets -- -D warnings`, `cargo fmt`
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add cache/core/src/location_layout.rs
+git commit -m "test(cache-core): pin the guards Task 1b added
+
+pack's offset range check -- the guard against silent incarnation
+corruption -- could be deleted with every test still green. Now pinned,
+along with the issuable-id bound, div_ceil, and the io::Error downcast.
+
+Tightens the segment_id assert from the field width to the issuable range,
+so it rejects the unissuable top id that keeps GHOST unaliasable rather
+than encoding it."
+```
+
+---
+
 ### Task 2: `Metadata` carries the incarnation
 
 Adding a field to `Metadata` deliberately breaks every struct-literal site at compile time, so the compiler enumerates the places that must decide whether to preserve or bump. Do not add a `Default`.
