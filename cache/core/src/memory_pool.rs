@@ -159,13 +159,15 @@ impl MemoryPool {
 
     /// Release a segment back to the appropriate queue with automatic balancing.
     ///
-    /// This method is called by guard Drop when a segment in AwaitingRelease
-    /// state has its last reader drop. It automatically replenishes the spare
-    /// queue if below target capacity.
+    /// Like [`RamPool::release`], but replenishes the spare queue first when it
+    /// is below target capacity. It has no production callers today: the
+    /// guard-drop path a previous version of this doc described goes through
+    /// `SliceSegment::release_condemned`, not here.
     ///
-    /// # Safety
-    /// The segment must be in a releasable state (Free or AwaitingRelease with
-    /// ref_count == 0).
+    /// # Panics
+    ///
+    /// Calls `try_release`, which panics on any state but `Free`, `Reserved`,
+    /// `Linking` or `Locked` -- `AwaitingRelease` included, despite the name.
     pub fn release_segment(&self, id: u32) {
         let id_usize = id as usize;
 

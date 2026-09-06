@@ -459,6 +459,13 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     ///
     /// Clears all data and statistics. Should only be called when
     /// the segment is in `Locked` state with ref_count == 0.
+    ///
+    /// The implementations are asymmetric, and the difference now carries
+    /// meaning: `DiskSegmentMeta::reset` publishes `Free` and advances the
+    /// incarnation, ending the segment's lifecycle, while `SliceSegment::reset`
+    /// touches only statistics and leaves both state and tag alone. A caller
+    /// that needs the RAM equivalent of the disk behaviour wants
+    /// `SliceSegment::force_free`.
     fn reset(&self);
 }
 

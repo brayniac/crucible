@@ -926,7 +926,7 @@ impl Segment for SliceSegment<'_> {
             // Leaving `Locked` ends a used incarnation: the segment has been
             // drained and cleared, so every `Location` issued against it must
             // stop resolving. `Reserved` and `Linking` must NOT bump --
-            // `MemoryPool::release_segment`, `MemoryPool::release` and lost
+            // `MemoryPool::release`, `FilePool::release` and lost
             // chain-extension elections all return never-used segments through
             // here, and bumping there would advance a 6-bit tag at a rate
             // decoupled from segment lifecycles.
@@ -980,14 +980,20 @@ impl Segment for SliceSegment<'_> {
             new_prev.unwrap_or(current_meta.prev),
         );
 
-        // Leaving `Locked` ends a used incarnation: the segment has been
-        // drained and cleared, and the layers recycle it as
-        // `Locked -> Reserved` before releasing it `Reserved -> Free`. Bumping
-        // here, inside the same CAS that publishes the new state, is what makes
-        // a stale location stop resolving -- and no thread can observe the new
-        // state paired with the old tag. Every other transition is mid-life and
-        // carries the tag forward unchanged.
-        let new_meta = if current_meta.state == State::Locked {
+        // *Leaving* `Locked` ends a used incarnation -- not merely being
+        // `Locked`. The segment has been drained and cleared, and the layers
+        // recycle it as `Locked -> Reserved` before releasing it
+        // `Reserved -> Free`. Bumping here, inside the same CAS that publishes
+        // the new state, is what makes a stale location stop resolving -- and
+        // no thread can observe the new state paired with the old tag.
+        //
+        // The `new_state != Locked` half is load-bearing: a chain-pointer-only
+        // rewrite that stays in `Locked` is mid-life, and eleven identity CASes
+        // in `organization/` take exactly that shape. Keying on the source
+        // state alone would advance the tag twice in one lifetime, halving the
+        // space the collision argument rests on. Every other transition is
+        // mid-life and carries the tag forward unchanged.
+        let new_meta = if current_meta.state == State::Locked && new_state != State::Locked {
             new_meta.bump_incarnation()
         } else {
             new_meta
@@ -1376,6 +1382,11 @@ impl SliceSegment<'_> {
     /// This should only be called when the cache is being flushed and no
     /// concurrent operations are accessing the segments (e.g., after the
     /// hashtable has been cleared).
+    ///
+    /// The flush-only requirement is stronger than it looks now that this ends
+    /// an incarnation: the bump goes through a plain load-modify-`store`, not a
+    /// CAS. Racing a concurrent `BasicItemGuard::drop`, which bumps through a
+    /// CAS, would drop or duplicate one of the two bumps.
     pub fn force_free(&self) {
         // Reset all data fields
         self.write_offset.store(0, Ordering::Relaxed);
@@ -1717,11 +1728,12 @@ mod tests {
     /// forever with the whole suite still green. Keying on *leaving Locked* is
     /// what makes it fire.
     ///
-    /// The exclusions matter just as much. `MemoryPool::release_segment`,
-    /// `MemoryPool::release` and `FilePool::release` all return never-used
-    /// segments through `try_release`. If the bump fired there too, a burst of
-    /// reserve/release with no item lifecycle at all would drain the 6-bit
-    /// tag's collision hardness for free.
+    /// The exclusions matter just as much. `MemoryPool::release` and
+    /// `FilePool::release` both return never-used segments through
+    /// `try_release`. If the bump fired there too, a burst of reserve/release
+    /// with no item lifecycle at all would drain the 6-bit tag's collision
+    /// hardness for free. The last arm covers the other half of the rule: a
+    /// chain rewrite that stays in `Locked` is not a departure from it.
     #[test]
     fn test_incarnation_bumps_on_exactly_the_used_incarnation_transitions() {
         let (segment, ptr, layout) = create_test_segment(0, false, 0, 4096);
@@ -1797,6 +1809,30 @@ mod tests {
             segment.incarnation(),
             3,
             "transitions into Locked are mid-life and must not bump"
+        );
+
+        // A chain-pointer-only rewrite that stays in Locked is mid-life, not
+        // the end of an incarnation. Eleven identity CASes in organization/
+        // take this shape; if one ever ran against a Locked neighbour, keying
+        // the bump on the source state alone would advance the tag twice in
+        // one lifetime.
+        let before = segment.incarnation();
+        assert!(segment.cas_metadata(State::Locked, State::Locked, Some(7), None));
+        assert_eq!(
+            segment.incarnation(),
+            before,
+            "a Locked -> Locked chain rewrite must not bump"
+        );
+        assert_eq!(
+            segment.next(),
+            Some(7),
+            "the chain pointer must still be written"
+        );
+        assert!(segment.try_release());
+        assert_eq!(
+            segment.incarnation(),
+            before + 1,
+            "leaving Locked must still bump exactly once"
         );
 
         unsafe {

@@ -452,12 +452,19 @@ impl Segment for DiskSegmentMeta {
 
         let new_meta = meta.with_state(new_state).with_chain_ids(next, prev);
 
-        // Leaving `Locked` ends a used incarnation: the layers recycle a
-        // drained segment as `Locked -> Reserved` before releasing it
-        // `Reserved -> Free`. Bumping inside the same CAS that publishes the
-        // new state means no thread can observe the new state paired with the
-        // old tag. Every other transition is mid-life and preserves the tag.
-        let new_meta = if meta.state == State::Locked {
+        // *Leaving* `Locked` ends a used incarnation -- not merely being
+        // `Locked`. The layers recycle a drained segment as
+        // `Locked -> Reserved` before releasing it `Reserved -> Free`. Bumping
+        // inside the same CAS that publishes the new state means no thread can
+        // observe the new state paired with the old tag.
+        //
+        // The `new_state != Locked` half is load-bearing: a chain-pointer-only
+        // rewrite that stays in `Locked` is mid-life, and eleven identity CASes
+        // in `organization/` take exactly that shape. Keying on the source
+        // state alone would advance the tag twice in one lifetime, halving the
+        // space the collision argument rests on. Every other transition is
+        // mid-life and preserves the tag.
+        let new_meta = if meta.state == State::Locked && new_state != State::Locked {
             new_meta.bump_incarnation()
         } else {
             new_meta
@@ -1087,6 +1094,30 @@ mod tests {
             seg.incarnation(),
             4,
             "transitions into Locked are mid-life and must not bump"
+        );
+
+        // A chain-pointer-only rewrite that stays in Locked is mid-life, not
+        // the end of an incarnation. Eleven identity CASes in organization/
+        // take this shape; if one ever ran against a Locked neighbour, keying
+        // the bump on the source state alone would advance the tag twice in
+        // one lifetime.
+        let before = seg.incarnation();
+        assert!(seg.cas_metadata(State::Locked, State::Locked, Some(7), None));
+        assert_eq!(
+            seg.incarnation(),
+            before,
+            "a Locked -> Locked chain rewrite must not bump"
+        );
+        assert_eq!(
+            seg.next(),
+            Some(7),
+            "the chain pointer must still be written"
+        );
+        assert!(seg.try_release());
+        assert_eq!(
+            seg.incarnation(),
+            before + 1,
+            "leaving Locked must still bump exactly once"
         );
     }
 
