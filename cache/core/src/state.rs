@@ -268,8 +268,27 @@ impl Metadata {
 
     /// This metadata with the incarnation advanced by one, wrapping at 6 bits.
     ///
-    /// Call this on exactly the transitions that end a *used* incarnation --
-    /// `Locked -> Free` and `AwaitingRelease -> Free`.
+    /// Call this on exactly the transitions that end a *used* incarnation:
+    ///
+    /// - **Leaving `Locked`**, whatever the destination. The layers recycle a
+    ///   drained segment as `Locked -> Reserved` and only then release it
+    ///   `Reserved -> Free`, so keying on `Locked -> Free` alone would never
+    ///   fire on the live eviction path. `Locked -> Free` is reachable through
+    ///   `try_release` directly and bumps too; keying on the *source* state is
+    ///   what covers both.
+    /// - **`AwaitingRelease -> Free`**, in all four places it occurs:
+    ///   `release_condemned` on each segment type, and the last-reader drop in
+    ///   `BasicItemGuard::drop` / `ValueRef::drop`. The drop paths are the
+    ///   dominant ones — the layers condemn a segment with readers outstanding
+    ///   and leave the last guard to free it.
+    /// - **Bulk recycles**: `SliceSegment::force_free` and
+    ///   `DiskSegmentMeta::reset`, which flush every segment at once.
+    ///
+    /// Do NOT call it on `Reserved | Linking -> Free`. Those return never-used
+    /// segments — `MemoryPool::release_segment`, `MemoryPool::release`,
+    /// `FilePool::release`, and lost chain-extension elections — and bumping
+    /// there would advance a 6-bit tag at a rate decoupled from segment
+    /// lifecycles, draining its collision hardness for nothing.
     #[inline]
     pub fn bump_incarnation(self) -> Self {
         Self {

@@ -227,13 +227,22 @@ impl Drop for ValueRef {
             let packed = unsafe { (*self.metadata).load(Ordering::Acquire) };
             let meta = Metadata::unpack(packed);
             if meta.state == State::AwaitingRelease {
-                // Try to transition AwaitingRelease -> Free.
-                // Preserve the incarnation: freeing a condemned segment is
-                // Task 3's business, and zeroing here would resurrect stale
-                // locations naming this segment.
+                // AwaitingRelease -> Free ends a used incarnation, so the tag
+                // advances in the same CAS that publishes Free.
+                //
+                // This is the *main* condemned-free path, not an edge case: the
+                // layers condemn a segment with readers outstanding and leave
+                // the last guard drop to free it, calling `release_condemned`
+                // only as a fallback when the last reader vanished during the
+                // condemn window. A reader holding a location across this
+                // recycle is exactly what the tag defends against.
+                //
+                // `with_chain_ids` must stay: returning a freed segment to the
+                // free queue still linked to its neighbours is its own defect.
                 let new_meta = meta
                     .with_state(State::Free)
-                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+                    .bump_incarnation();
                 if unsafe {
                     (*self.metadata).compare_exchange(
                         packed,
@@ -762,13 +771,21 @@ pub enum LookupResult {
 mod tests {
     use super::*;
 
-    /// `ValueRef::drop` frees a condemned segment, and must carry the
-    /// incarnation forward while doing so.
+    /// `ValueRef::drop` frees a condemned segment, ending a used incarnation,
+    /// so the tag must advance.
     ///
-    /// The third copy of the `AwaitingRelease -> Free` transition, reachable
-    /// only through `Drop`, so no segment-level test touches it.
+    /// The fourth copy of the `AwaitingRelease -> Free` transition, reachable
+    /// only through `Drop`, so no segment-level test touches it -- and the
+    /// dominant one on the zero-copy read path: the layers condemn a segment
+    /// with readers outstanding and leave the last `ValueRef` drop to free it.
+    /// A reader holding a location across that recycle is exactly what the tag
+    /// defends against.
+    ///
+    /// Seeding a nonzero tag rather than starting from 0 is what distinguishes
+    /// a bump from a site that rebuilds `Metadata` from scratch: the latter
+    /// would land on 1, not 43.
     #[test]
-    fn test_value_ref_drop_preserves_incarnation() {
+    fn test_value_ref_drop_bumps_the_incarnation() {
         const TAG: u8 = 42;
 
         let ref_count = AtomicU32::new(1);
@@ -800,7 +817,11 @@ mod tests {
 
         let meta = Metadata::unpack(metadata.load(Ordering::Acquire));
         assert_eq!(meta.state, State::Free, "the last reader must free it");
-        assert_eq!(meta.incarnation, TAG, "ValueRef drop reset the tag");
+        assert_eq!(
+            meta.incarnation,
+            TAG + 1,
+            "ValueRef drop must end the incarnation, carrying the tag forward"
+        );
         assert_eq!(free_queue.len(), 1, "the segment must reach the free queue");
     }
 

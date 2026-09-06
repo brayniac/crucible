@@ -809,12 +809,22 @@ impl Drop for BasicItemGuard<'_> {
             let meta = Metadata::unpack(packed);
 
             if meta.state == State::AwaitingRelease {
-                // Transition to Free and push to free queue
-                // Preserve the incarnation carried by the metadata we just
-                // loaded; Task 3 decides which transitions bump.
+                // AwaitingRelease -> Free ends a used incarnation, so the tag
+                // advances in the same CAS that publishes Free.
+                //
+                // This is the *main* condemned-free path, not an edge case: the
+                // layers condemn a segment with readers outstanding and leave
+                // the last guard drop to free it, calling `release_condemned`
+                // only as a fallback when the last reader vanished during the
+                // condemn window. A reader holding a location across this
+                // recycle is exactly what the tag defends against.
+                //
+                // `with_chain_ids` must stay: returning a freed segment to the
+                // free queue still linked to its neighbours is its own defect.
                 let new_meta = meta
                     .with_state(State::Free)
-                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+                    .bump_incarnation();
 
                 if self
                     .metadata
@@ -844,14 +854,24 @@ unsafe impl Send for BasicItemGuard<'_> {}
 mod tests {
     use super::*;
 
-    /// The last guard dropped on a condemned segment frees it -- and must
-    /// carry the incarnation forward while doing so.
+    /// The last guard dropped on a condemned segment frees it -- ending a used
+    /// incarnation, so the tag must advance.
     ///
-    /// This drop path is one of three copies of the `AwaitingRelease -> Free`
-    /// transition, and the only one reachable solely through `Drop`, so it is
-    /// invisible to the segment-level transition tests.
+    /// This drop path is one of four copies of the `AwaitingRelease -> Free`
+    /// transition (the other three being `SliceSegment::release_condemned`,
+    /// `DiskSegmentMeta::release_condemned` and `ValueRef::drop`), and is
+    /// reachable solely through `Drop`, so it is
+    /// invisible to the segment-level transition tests. It is also the
+    /// *dominant* one: the layers condemn a segment with readers outstanding
+    /// and leave the last guard drop to free it, calling `release_condemned`
+    /// only as a fallback for the race where the last reader vanished during
+    /// the condemn window.
+    ///
+    /// Seeding a nonzero tag rather than starting from 0 is what distinguishes
+    /// a bump from a site that rebuilds `Metadata` from scratch: the latter
+    /// would land on 1, not 43.
     #[test]
-    fn test_item_guard_drop_preserves_incarnation() {
+    fn test_item_guard_drop_bumps_the_incarnation() {
         use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
 
         const TAG: u8 = 42;
@@ -873,7 +893,11 @@ mod tests {
 
         let meta = Metadata::unpack(metadata.load(Ordering::Acquire));
         assert_eq!(meta.state, State::Free, "the last guard must free it");
-        assert_eq!(meta.incarnation, TAG, "guard drop reset the tag");
+        assert_eq!(
+            meta.incarnation,
+            TAG + 1,
+            "guard drop must end the incarnation, carrying the tag forward"
+        );
         assert_eq!(free_queue.len(), 1, "the segment must reach the free queue");
     }
 
