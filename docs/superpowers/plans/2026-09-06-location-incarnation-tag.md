@@ -2851,20 +2851,36 @@ Proven red by neutering the oracle's tag comparison."
 
 ---
 
-### Task 9: Full verification and the residual issue
+### Task 9: Cleanup, full verification, and the residual
 
-- [ ] **Step 1: Run every gate**
+- [ ] **Step 1: Delete the leftover instrumentation**
+
+`KeyOracle::verify` (`cache/core/src/loom_oracle.rs:392,401`) carries two live
+`eprintln!("MISS occupant=… tombstone=…")` calls -- debugging instrumentation
+left behind by the #95 investigation. They flood every loom run's output and
+have to be filtered out to read a result. Delete both; the `HazardWitness`
+counters they predate now serve the purpose properly.
+
+- [ ] **Step 2: Run every gate**
 
 ```bash
 cargo test --workspace
 cargo test -p cache-core --features loom
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p cache-core --features loom --all-targets -- -D warnings
 cargo fmt --all -- --check
+RUSTDOCFLAGS="-D warnings" cargo doc -p cache-core -p cache-slab -p cache-heap --no-deps
 ```
 
-Expected: all PASS. Record the test counts.
+Record the actual counts. The baselines entering this task are **469**
+(`cache-core --lib`) and **59** under `--features loom`.
 
-- [ ] **Step 2: Run Miri**
+Note `cache::tests::test_increment_concurrent_no_lost_updates` is a known
+pre-existing flake at roughly 1 run in 4 (issue #105, measured on a clean tree
+at `ea96520`). If it fails, re-run and say so; do not attribute it to this
+branch and do not chase it.
+
+- [ ] **Step 3: Run Miri**
 
 ```bash
 MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test -p cache-core --lib -- \
@@ -2872,9 +2888,11 @@ MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test -p cache-core --li
   --skip disk::io_uring --skip disk::recovery --skip hugepage::
 ```
 
-Expected: PASS, 378 tests plus the ones added here.
+This branch changed how segment memory is addressed (`align_bytes` striding) and
+added a new atomic read on the verify path, so Miri is load-bearing here rather
+than a formality. Report the count and any failure in full.
 
-- [ ] **Step 3: File the residual**
+- [ ] **Step 4: File the residual**
 
 ```bash
 gh issue create \
@@ -2903,36 +2921,28 @@ BODY
 )"
 ```
 
-- [ ] **Step 4: Open the PR**
+- [ ] **Step 5: Open the PR**
 
-Body must state, in the author's own words: what the tag does and does not
-close; that capacity per pool is now `2^36 * align_bytes` and therefore
-invariant under `segment_size`; that memory pools are unchanged at 8-byte
-alignment while disk pools coarsen to 512; that the read-path cost is
-**unmeasured** and cache-rs#78's `+0.94 ns` figure does not transfer because
-crucible's shifts became layout-dependent loads; and the residual issue number
-from Step 3.
+The body must state plainly, in the author's own voice:
 
----
+- **What the tag does and does not close.** It closes the false positive; the
+  data race residual is issue number from Step 4.
+- **Capacity.** Per pool it is now `2^36 x align_bytes`, invariant under
+  `segment_size`. Memory stays at 8-byte alignment (512 GiB/pool). Disk moves to
+  512-byte alignment (32 TiB/pool) and **disk appends now stride by 512**, so a
+  100-byte disk item occupies 512 bytes. That fragmentation was a deliberate
+  trade for the capacity and for removing 4096-block straddling.
+- **The read-path cost is unmeasured.** cache-rs#78 measured its tag check at
+  +0.94 +/- 0.26 ns, and that figure **does not transfer**: crucible's shifts
+  became layout-dependent loads rather than constants. Say so rather than
+  implying the cost is known.
+- **Two design errors caught in review**, because they are the interesting part
+  of this branch: the bump table originally named `Locked -> Free`, a transition
+  that never occurs (the layers recycle `Locked -> Reserved` then release
+  `Reserved -> Free`), which would have left every tag at 0 with the suite
+  green; and 512-byte disk alignment was specified without the append-padding
+  change that makes it possible.
+- **Pre-existing bugs found and filed, not fixed here:** #105, #106, #107, #108.
+  Call out #107 specifically -- FLUSHALL leaves a running server unwritable.
 
-## Self-Review
-
-**Spec coverage.** Layout and the fixed 6-bit tag: Task 1. Capacity invariance
-and per-pool alignment: Tasks 1 and 5. `incarnation` in `Metadata` rather than
-`generation`: Task 2. Bump sites and the transition table: Task 3. The check:
-Task 7. GHOST unaliasable: Task 1 (`ghost_is_unaliasable`, `max_segment_count`).
-Construction validates: Tasks 1 and 5. Memory and disk together: Tasks 5, 6, 7.
-Evidence items 1-4: Tasks 7, 8, 3, 1 respectively. Residuals: Task 9 Steps 3-4.
-
-**Known soft spots**, called out rather than hidden:
-
-- Task 7's test uses `build_small_test_cache` / `locate` / `key_verifier`, and
-  Task 3's uses `make_segment`. These are the shapes the tests need, not names
-  verified to exist. Both steps say to adapt to the neighbouring tests' helpers.
-- Task 8's `KeyOracle` extension assumes the cells encode a key and can carry an
-  incarnation in spare bits. If the existing encoding has no room, widen the cell
-  rather than packing the tag into the key field.
-- The read-path cost of turning constant shifts into layout-dependent loads is
-  unmeasured, and no task measures it. That is deliberate: measuring it well
-  needs the counterbalanced A/B discipline cache-rs#78 used, which is its own
-  piece of work and should not be faked inside this one.
+Do not open the PR until every gate in Steps 2 and 3 is green.
