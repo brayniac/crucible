@@ -194,6 +194,8 @@ impl LocationLayout {
             });
         }
 
+        // Safe from underflow only because the ceiling above already capped
+        // offset_bits at 29 (align_shift >= 3). This ordering is load-bearing.
         let seg_bits = PAYLOAD_BITS - TAG_BITS - offset_bits;
         if seg_bits > 31 {
             return Err(LayoutError::SegmentTooSmall {
@@ -260,9 +262,9 @@ impl LocationLayout {
     pub fn pack(&self, pool_id: u8, segment_id: u32, incarnation: u8, offset: u32) -> u64 {
         debug_assert!(pool_id <= 3, "pool_id must be 0-3");
         debug_assert!(
-            segment_id < (1u32 << self.seg_bits()),
-            "segment_id {segment_id} exceeds this layout's {}-bit field",
-            self.seg_bits()
+            segment_id < self.max_segment_count(),
+            "segment_id {segment_id} is outside the issuable range 0..{}",
+            self.max_segment_count()
         );
         debug_assert!(
             offset.is_multiple_of(self.align_bytes()),
@@ -390,10 +392,10 @@ mod tests {
         // And the reason it cannot: only the unissuable top id reaches GHOST.
         // Built directly, not via pack: this id is out of the layout's field
         // range by construction, which is the whole point.
-        let unissuable = ((3u64) << LocationLayout::POOL_SHIFT)
-            | ((layout.max_segment_count() as u64) << (layout.offset_bits() + 6))
+        let unissuable = (3u64 << LocationLayout::POOL_SHIFT)
+            | ((layout.max_segment_count() as u64) << (layout.offset_bits() + TAG_BITS))
             | (0x3Fu64 << layout.offset_bits())
-            | ((max_offset >> 3) as u64);
+            | ((max_offset / layout.align_bytes()) as u64);
         assert_eq!(unissuable, crate::location::Location::MAX_RAW);
     }
 
@@ -561,6 +563,10 @@ mod tests {
 
         let last = 1536 * 1024 - 8;
         assert_eq!(layout.offset(layout.pack(0, 0, 0, last)), last);
+
+        // Pins div_ceil specifically: with plain division this is 7 bits, which
+        // cannot address the last 9 bytes of the segment.
+        assert_eq!(LocationLayout::new(1025, 8).unwrap().offset_bits(), 8);
     }
 
     #[test]
@@ -589,5 +595,35 @@ mod tests {
             .unwrap()
             .pack(2, 5, 0, 0);
         assert_eq!(LocationLayout::pool_id(raw), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds this layout's 17-bit offset field")]
+    fn pack_rejects_an_offset_past_the_offset_field() {
+        // One byte past a 1 MiB segment, and still 8-aligned, so the alignment
+        // assert waves it through. Without the range check this silently
+        // overflows into the incarnation field and returns a corrupted tag.
+        let layout = LocationLayout::new(1024 * 1024, 8).unwrap();
+        layout.pack(0, 5, 0, 1024 * 1024);
+    }
+
+    #[test]
+    #[should_panic(expected = "is outside the issuable range")]
+    fn pack_rejects_the_unissuable_top_segment_id() {
+        // The id reserved so Location::GHOST cannot be aliased. A pool must
+        // never issue it, and pack must say so rather than encode it.
+        let layout = LocationLayout::new(1024 * 1024, 8).unwrap();
+        layout.pack(0, layout.max_segment_count(), 0, 0);
+    }
+
+    #[test]
+    fn io_error_conversion_preserves_the_structured_error() {
+        let err = LocationLayout::new(4096, 512).unwrap_err();
+        let io: std::io::Error = err.into();
+        assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            io.get_ref().and_then(|e| e.downcast_ref::<LayoutError>()),
+            Some(LayoutError::SegmentTooSmall { .. })
+        ));
     }
 }
