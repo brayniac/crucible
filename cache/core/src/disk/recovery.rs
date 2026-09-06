@@ -9,7 +9,7 @@ use crate::hashtable::Hashtable;
 use crate::item::BasicHeader;
 use crate::item_location::ItemLocation;
 use crate::pool::RamPool;
-use crate::segment::Segment;
+use crate::segment::{Segment, SegmentKeyVerify};
 use crate::state::State;
 
 /// Statistics from segment recovery.

@@ -127,6 +127,11 @@ impl<'a> FileSegment<'a> {
 
 // Delegate SegmentKeyVerify to inner
 impl SegmentKeyVerify for FileSegment<'_> {
+    #[inline]
+    fn incarnation(&self) -> u8 {
+        self.inner.incarnation()
+    }
+
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
         self.inner.verify_key_at_offset(offset, key, allow_deleted)
     }
@@ -161,11 +166,6 @@ impl Segment for FileSegment<'_> {
     #[inline]
     fn generation(&self) -> u16 {
         self.inner.generation()
-    }
-
-    #[inline]
-    fn incarnation(&self) -> u8 {
-        self.inner.incarnation()
     }
 
     #[inline]

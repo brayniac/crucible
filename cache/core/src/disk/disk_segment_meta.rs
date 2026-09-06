@@ -224,6 +224,11 @@ impl DiskSegmentMeta {
 }
 
 impl SegmentKeyVerify for DiskSegmentMeta {
+    #[inline]
+    fn incarnation(&self) -> u8 {
+        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
+    }
+
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
         // When write buffer has been flushed to disk, we can't verify the key
         // in RAM. Trust the hashtable tag match — the server will verify the
@@ -335,11 +340,6 @@ impl Segment for DiskSegmentMeta {
 
     fn increment_generation(&self) {
         self.generation.fetch_add(1, Ordering::Release);
-    }
-
-    #[inline]
-    fn incarnation(&self) -> u8 {
-        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
     }
 
     #[inline]

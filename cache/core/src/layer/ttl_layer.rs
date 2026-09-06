@@ -66,9 +66,15 @@ struct SinglePoolVerifier<'a> {
 impl KeyVerifier for SinglePoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        let layout = self.pool.layout();
-        if let Some(segment) = self.pool.get(item_loc.segment_id(layout)) {
-            segment.verify_key_at_offset(item_loc.offset(layout), key, allow_deleted)
+        let (_, segment_id, incarnation, offset) = item_loc.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            // A location naming a previous incarnation of this segment is not ours
+            // to resolve: the segment was drained and refilled, and this offset now
+            // holds a different item. Checked before touching any item bytes.
+            if segment.incarnation() != incarnation {
+                return false;
+            }
+            segment.verify_key_at_offset(offset, key, allow_deleted)
         } else {
             false
         }
@@ -1716,6 +1722,49 @@ mod tests {
             incarnation,
             pool.get(segment_id).unwrap().incarnation(),
             "a location must carry the tag of the segment its item was written into"
+        );
+    }
+
+    /// A location from a previous incarnation must not resolve, even though
+    /// the key really is at that offset.
+    ///
+    /// That is the whole hazard: segments are append-only from a fixed start,
+    /// so the n-th item of the new incarnation lands where the n-th item of the
+    /// old one was. The key compare alone says yes; only the tag says no.
+    #[test]
+    fn test_verifier_rejects_a_stale_incarnation() {
+        let layer = create_test_layer();
+        let pool = layer.pool();
+
+        // Age every segment through a used incarnation, so the tag the write
+        // stamps is non-zero and a predecessor tag exists to test against.
+        let ids: Vec<u32> = (0..pool.segment_count())
+            .map(|_| pool.reserve().expect("pool must have a free segment"))
+            .collect();
+        for &id in &ids {
+            let segment = pool.get(id).expect("segment id came from the pool");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            pool.release(id);
+        }
+
+        let live = layer
+            .write_item(b"key", b"value", b"", Duration::from_secs(3600))
+            .expect("write");
+        let layout = pool.layout();
+        let (pool_id, segment_id, tag, offset) = live.unpack(layout);
+        assert_ne!(tag, 0, "the segment must be past its first incarnation");
+
+        // Same segment, same offset, previous tag.
+        let stale = ItemLocation::new(layout, pool_id, segment_id, tag - 1, offset);
+        let verifier = SinglePoolVerifier { pool };
+
+        assert!(
+            verifier.verify(b"key", live.to_location(), false),
+            "the current incarnation must resolve"
+        );
+        assert!(
+            !verifier.verify(b"key", stale.to_location(), false),
+            "a location from a previous incarnation must not resolve"
         );
     }
 

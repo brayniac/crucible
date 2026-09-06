@@ -756,6 +756,10 @@ impl<'a> SliceSegment<'a> {
 
 // Implement SegmentKeyVerify
 impl SegmentKeyVerify for SliceSegment<'_> {
+    fn incarnation(&self) -> u8 {
+        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
+    }
+
     #[inline(always)]
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
         self.verify_key_with_header(offset, key, allow_deleted)
@@ -839,10 +843,6 @@ impl Segment for SliceSegment<'_> {
 
     fn increment_generation(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn incarnation(&self) -> u8 {
-        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
     }
 
     fn align_bytes(&self) -> u32 {

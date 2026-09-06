@@ -598,6 +598,7 @@ dependencies = [
  "loom",
  "parking_lot",
  "smallvec",
+ "tempfile",
  "tikv-jemalloc-ctl",
 ]
 
@@ -1688,6 +1689,7 @@ dependencies = [
  "crossbeam-deque",
  "loom",
  "parking_lot",
+ "tempfile",
 ]
 
 [[package]]

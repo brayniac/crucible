@@ -187,10 +187,15 @@ impl<'a, S> SinglePoolVerifier<'a, S> {
 impl<S: SegmentKeyVerify + Send + Sync> KeyVerifier for SinglePoolVerifier<'_, S> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        let segment_id = item_loc.segment_id(&self.layout) as usize;
-        let offset = item_loc.offset(&self.layout);
+        let (_, segment_id, incarnation, offset) = item_loc.unpack(&self.layout);
 
-        if let Some(segment) = self.segments.get(segment_id) {
+        if let Some(segment) = self.segments.get(segment_id as usize) {
+            // A location naming a previous incarnation of this segment is not ours
+            // to resolve: the segment was drained and refilled, and this offset now
+            // holds a different item. Checked before touching any item bytes.
+            if segment.incarnation() != incarnation {
+                return false;
+            }
             segment.verify_key_at_offset(offset, key, allow_deleted)
         } else {
             false
@@ -241,10 +246,15 @@ impl<S: SegmentKeyVerify + Send + Sync> KeyVerifier for MultiPoolVerifier<'_, S>
             return false;
         };
 
-        let segment_id = item_loc.segment_id(&layout) as usize;
-        let offset = item_loc.offset(&layout);
+        let (_, segment_id, incarnation, offset) = item_loc.unpack(&layout);
 
-        if let Some(segment) = segments.get(segment_id) {
+        if let Some(segment) = segments.get(segment_id as usize) {
+            // A location naming a previous incarnation of this segment is not ours
+            // to resolve: the segment was drained and refilled, and this offset now
+            // holds a different item. Checked before touching any item bytes.
+            if segment.incarnation() != incarnation {
+                return false;
+            }
             return segment.verify_key_at_offset(offset, key, allow_deleted);
         }
 
@@ -366,10 +376,25 @@ mod tests {
 
     // Mock segment for verifier tests
     struct MockSegment {
+        incarnation: u8,
         keys: Vec<(u32, Vec<u8>, bool)>, // (offset, key, deleted)
     }
 
+    impl MockSegment {
+        /// A segment on its first incarnation, holding one key at one offset.
+        fn new(offset: u32, key: &[u8]) -> Self {
+            Self {
+                incarnation: 0,
+                keys: vec![(offset, key.to_vec(), false)],
+            }
+        }
+    }
+
     impl SegmentKeyVerify for MockSegment {
+        fn incarnation(&self) -> u8 {
+            self.incarnation
+        }
+
         fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
             self.keys
                 .iter()
@@ -404,14 +429,7 @@ mod tests {
     #[test]
     fn test_single_pool_verifier() {
         let l = mem_layout();
-        let segments = vec![
-            MockSegment {
-                keys: vec![(0, b"key0".to_vec(), false)],
-            },
-            MockSegment {
-                keys: vec![(8, b"key1".to_vec(), false)],
-            },
-        ];
+        let segments = vec![MockSegment::new(0, b"key0"), MockSegment::new(8, b"key1")];
         let verifier = SinglePoolVerifier::new(l, &segments);
 
         let loc0 = ItemLocation::new(&l, 0, 0, 0, 0);
@@ -432,16 +450,10 @@ mod tests {
         let l2 = LocationLayout::new(8 * 1024 * 1024, 512).unwrap();
         assert_ne!(l0.offset_bits(), l2.offset_bits());
 
-        let pool0 = vec![MockSegment {
-            keys: vec![(0, b"pool0_key".to_vec(), false)],
-        }];
+        let pool0 = vec![MockSegment::new(0, b"pool0_key")];
         let pool2 = vec![
-            MockSegment {
-                keys: vec![(0, b"pool2_seg0".to_vec(), false)],
-            },
-            MockSegment {
-                keys: vec![(512, b"pool2_seg1".to_vec(), false)],
-            },
+            MockSegment::new(0, b"pool2_seg0"),
+            MockSegment::new(512, b"pool2_seg1"),
         ];
 
         let verifier = MultiPoolVerifier::new()
@@ -450,13 +462,65 @@ mod tests {
 
         let loc0 = ItemLocation::new(&l0, 0, 0, 0, 0);
         let loc2_0 = ItemLocation::new(&l2, 2, 0, 0, 0);
-        let loc2_1 = ItemLocation::new(&l2, 2, 1, 9, 512);
+        let loc2_1 = ItemLocation::new(&l2, 2, 1, 0, 512);
         let loc1 = ItemLocation::new(&l0, 1, 0, 0, 0); // pool 1 not set
 
         assert!(verifier.verify(b"pool0_key", loc0.to_location(), false));
         assert!(verifier.verify(b"pool2_seg0", loc2_0.to_location(), false));
         assert!(verifier.verify(b"pool2_seg1", loc2_1.to_location(), false));
         assert!(!verifier.verify(b"any", loc1.to_location(), false)); // pool 1 not set
+    }
+
+    /// A location from a previous incarnation must not resolve, even though
+    /// the key really is at that offset.
+    ///
+    /// That is the whole hazard: the segment was drained and refilled, and the
+    /// n-th item of the new incarnation landed where the n-th item of the old
+    /// one was. The key compare alone says yes; only the tag says no.
+    #[test]
+    fn test_single_pool_verifier_rejects_a_stale_incarnation() {
+        let l = mem_layout();
+        let segments = vec![MockSegment {
+            incarnation: 1,
+            keys: vec![(0, b"key".to_vec(), false)],
+        }];
+        let verifier = SinglePoolVerifier::new(l, &segments);
+
+        let live = ItemLocation::new(&l, 0, 0, 1, 0);
+        let stale = ItemLocation::new(&l, 0, 0, 0, 0);
+
+        assert!(
+            verifier.verify(b"key", live.to_location(), false),
+            "the current incarnation must resolve"
+        );
+        assert!(
+            !verifier.verify(b"key", stale.to_location(), false),
+            "a location from a previous incarnation must not resolve"
+        );
+    }
+
+    /// The same for the multi-pool verifier, whose per-pool layout decodes the
+    /// tag before it is compared.
+    #[test]
+    fn test_multi_pool_verifier_rejects_a_stale_incarnation() {
+        let l = mem_layout();
+        let pool1 = vec![MockSegment {
+            incarnation: 1,
+            keys: vec![(0, b"key".to_vec(), false)],
+        }];
+        let verifier = MultiPoolVerifier::new().with_pool(1, l, &pool1);
+
+        let live = ItemLocation::new(&l, 1, 0, 1, 0);
+        let stale = ItemLocation::new(&l, 1, 0, 0, 0);
+
+        assert!(
+            verifier.verify(b"key", live.to_location(), false),
+            "the current incarnation must resolve"
+        );
+        assert!(
+            !verifier.verify(b"key", stale.to_location(), false),
+            "a location from a previous incarnation must not resolve"
+        );
     }
 
     #[test]
@@ -479,6 +543,7 @@ mod tests {
     fn test_deleted_handling() {
         let l = mem_layout();
         let segments = vec![MockSegment {
+            incarnation: 0,
             keys: vec![(0, b"deleted_key".to_vec(), true)],
         }];
         let verifier = SinglePoolVerifier::new(l, &segments);

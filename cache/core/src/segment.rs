@@ -21,6 +21,22 @@ use std::time::Duration;
 /// minimal trait, types that don't provide full segment access (like SSD-backed
 /// segments that require async I/O) can still work with the hashtable.
 pub trait SegmentKeyVerify {
+    /// The incarnation tag this segment currently carries.
+    ///
+    /// A location whose tag differs names a previous incarnation of this
+    /// segment and must not be resolved: the segment has been drained and
+    /// refilled, and the offset now holds a different item.
+    ///
+    /// This lives here rather than on [`Segment`] because it is part of
+    /// deciding whether a location verifies, and the hashtable's verifiers are
+    /// generic over this trait alone. Widening them to [`Segment`] would defeat
+    /// the point of this trait being minimal.
+    ///
+    /// Distinct from [`Segment::generation`]: that is a 16-bit counter bumped
+    /// on `Free -> Reserved` and consumed by `CasToken`. This one is 6 bits and
+    /// advances only when a *used* incarnation ends.
+    fn incarnation(&self) -> u8;
+
     /// Verify that the key at the given offset matches.
     ///
     /// Used by hashtables to verify tag matches against actual keys.
@@ -115,17 +131,6 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
 
     /// Increment the generation counter (wraps at u16::MAX).
     fn increment_generation(&self);
-
-    /// Get the incarnation tag (6 bits) currently stamped on this segment.
-    ///
-    /// This is the value carried inside every `Location` issued while the
-    /// segment holds it. A location whose tag differs names a previous
-    /// incarnation and must not be resolved.
-    ///
-    /// Distinct from [`Segment::generation`]: that is a 16-bit counter bumped
-    /// on `Free -> Reserved` and consumed by `CasToken`. This one is 6 bits and
-    /// advances only when a *used* incarnation ends.
-    fn incarnation(&self) -> u8;
 
     // ========== Capacity ==========
 
