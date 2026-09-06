@@ -65,6 +65,16 @@ pub enum LayoutError {
         /// The offset field width this combination would require.
         offset_bits: u32,
     },
+    /// `segment_size / align_bytes` yields so few offset units that more than
+    /// 31 segment-id bits remain, which a `u32` segment id cannot hold.
+    SegmentTooSmall {
+        /// The rejected segment size.
+        segment_size: usize,
+        /// The alignment factor in force.
+        align: usize,
+        /// Segment-id bits the split would have left.
+        seg_bits: u32,
+    },
     /// The pool has more segments than the layout can address.
     TooManySegments {
         /// The number of segments the pool needs.
@@ -97,9 +107,21 @@ impl fmt::Display for LayoutError {
                 offset_bits,
             } => write!(
                 f,
-                "segment_size ({segment_size}) needs {offset_bits} offset bits at \
-                 align_bytes ({align}), leaving none for segment ids; \
-                 reduce segment_size or raise align_bytes"
+                "segment_size ({segment_size}) at align_bytes ({align}) needs \
+                 {offset_bits} offset bits, and offsets past u32 cannot be \
+                 represented; reduce segment_size. Raising align_bytes does not \
+                 help -- it lowers offset_bits by exactly as much as it raises \
+                 the shift"
+            ),
+            Self::SegmentTooSmall {
+                segment_size,
+                align,
+                seg_bits,
+            } => write!(
+                f,
+                "segment_size ({segment_size}) at align_bytes ({align}) addresses \
+                 too few slots, leaving {seg_bits} segment-id bits -- more than the \
+                 31 a u32 segment id can hold; raise segment_size or lower align_bytes"
             ),
             Self::TooManySegments { requested, max } => write!(
                 f,
@@ -114,7 +136,7 @@ impl std::error::Error for LayoutError {}
 
 impl From<LayoutError> for std::io::Error {
     fn from(e: LayoutError) -> Self {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
     }
 }
 
@@ -131,7 +153,7 @@ pub struct LocationLayout {
 
 impl LocationLayout {
     /// Position of the 2-bit `pool_id`, identical for every pool.
-    pub const POOL_SHIFT: u32 = 42;
+    pub const POOL_SHIFT: u32 = PAYLOAD_BITS;
 
     /// Build the layout for a pool.
     pub fn new(segment_size: usize, align_bytes: usize) -> Result<Self, LayoutError> {
@@ -155,19 +177,29 @@ impl LocationLayout {
 
         let align_shift = align_bytes.trailing_zeros();
 
-        // Two independent ceilings, both reported as SegmentTooLarge:
+        // Both fields are u32 in every consumer -- `SliceSegment::capacity`,
+        // `write_offset` and `ItemLocation::new` for the offset, and `segment_id`
+        // for the id -- so a layout that addresses past u32 on either end is
+        // meaningless and must be rejected rather than silently truncated.
         //
-        // 1. The offset field must leave room for segment ids.
-        // 2. The widest offset must fit in u32. Offsets are u32 throughout the
-        //    crate -- `SliceSegment::capacity`, `write_offset`, and
-        //    `ItemLocation::new` all use it -- so a layout that addresses past
-        //    u32 would truncate in `pack`/`offset` rather than error, and the
-        //    round trip would silently lose the high bits.
-        if offset_bits + TAG_BITS >= PAYLOAD_BITS || offset_bits + align_shift > 32 {
+        // Note the id-space bound (`offset_bits + TAG_BITS >= PAYLOAD_BITS`) is
+        // NOT checked: it is unreachable. `align_bytes >= 8` forces
+        // `align_shift >= 3`, so the offset ceiling below caps `offset_bits` at
+        // 29, well under the 36 that bound would need.
+        if offset_bits + align_shift > 32 {
             return Err(LayoutError::SegmentTooLarge {
                 segment_size,
                 align: align_bytes,
                 offset_bits,
+            });
+        }
+
+        let seg_bits = PAYLOAD_BITS - TAG_BITS - offset_bits;
+        if seg_bits > 31 {
+            return Err(LayoutError::SegmentTooSmall {
+                segment_size,
+                align: align_bytes,
+                seg_bits,
             });
         }
 
@@ -178,19 +210,19 @@ impl LocationLayout {
     }
 
     /// Width of the offset field.
-    #[inline(always)]
+    #[inline]
     pub fn offset_bits(&self) -> u32 {
         self.offset_bits as u32
     }
 
     /// Width of the segment id field.
-    #[inline(always)]
+    #[inline]
     pub fn seg_bits(&self) -> u32 {
         PAYLOAD_BITS - TAG_BITS - self.offset_bits as u32
     }
 
     /// Alignment factor in bytes.
-    #[inline(always)]
+    #[inline]
     pub fn align_bytes(&self) -> u32 {
         1 << self.align_shift
     }
@@ -199,7 +231,7 @@ impl LocationLayout {
     ///
     /// One below the field's capacity: leaving the top id unissuable is what
     /// keeps `Location::GHOST` (all 44 bits set) unaliasable by construction.
-    #[inline(always)]
+    #[inline]
     pub fn max_segment_count(&self) -> u32 {
         (1u32 << self.seg_bits()) - 1
     }
@@ -215,26 +247,32 @@ impl LocationLayout {
         Ok(())
     }
 
-    #[inline(always)]
+    #[inline]
     fn seg_shift(&self) -> u32 {
         self.offset_bits as u32 + TAG_BITS
     }
 
     /// Pack the four fields into raw location bits.
-    #[inline(always)]
+    ///
+    /// `incarnation` is masked to 6 bits; the other three are `debug_assert`ed
+    /// in range.
+    #[inline]
     pub fn pack(&self, pool_id: u8, segment_id: u32, incarnation: u8, offset: u32) -> u64 {
         debug_assert!(pool_id <= 3, "pool_id must be 0-3");
-        // `<=` not `<`: pack is a pure bit function, and the top id is a
-        // representable value -- it is `validate_segment_count` that keeps a
-        // pool from ever issuing it, which is what protects GHOST.
         debug_assert!(
-            segment_id <= self.max_segment_count(),
-            "segment_id exceeds this layout"
+            segment_id < (1u32 << self.seg_bits()),
+            "segment_id {segment_id} exceeds this layout's {}-bit field",
+            self.seg_bits()
         );
         debug_assert!(
             offset.is_multiple_of(self.align_bytes()),
             "offset must be {}-byte aligned",
             self.align_bytes()
+        );
+        debug_assert!(
+            (offset >> self.align_shift) < (1u32 << self.offset_bits as u32),
+            "offset {offset} exceeds this layout's {}-bit offset field",
+            self.offset_bits
         );
 
         ((pool_id as u64) << Self::POOL_SHIFT)
@@ -243,26 +281,27 @@ impl LocationLayout {
             | ((offset >> self.align_shift) as u64)
     }
 
-    /// Extract `pool_id`. Layout-independent by design.
-    #[inline(always)]
-    pub fn pool_id(&self, raw: u64) -> u8 {
+    /// Extract `pool_id`. Layout-independent by design: this is what a decoder
+    /// reads first, to find out which layout decodes the rest.
+    #[inline]
+    pub fn pool_id(raw: u64) -> u8 {
         ((raw >> Self::POOL_SHIFT) & 0b11) as u8
     }
 
     /// Extract `segment_id`.
-    #[inline(always)]
+    #[inline]
     pub fn segment_id(&self, raw: u64) -> u32 {
         ((raw >> self.seg_shift()) & ((1 << self.seg_bits()) - 1)) as u32
     }
 
     /// Extract the incarnation tag.
-    #[inline(always)]
+    #[inline]
     pub fn incarnation(&self, raw: u64) -> u8 {
         ((raw >> self.offset_bits as u32) as u8) & TAG_MASK
     }
 
     /// Extract the byte offset.
-    #[inline(always)]
+    #[inline]
     pub fn offset(&self, raw: u64) -> u32 {
         ((raw & ((1u64 << self.offset_bits as u32) - 1)) as u32) << self.align_shift
     }
@@ -326,7 +365,7 @@ mod tests {
                     for incarnation in 0u8..64 {
                         for &offset in &[0u32, align as u32, segment_size as u32 - align as u32] {
                             let raw = layout.pack(3, seg, incarnation, offset);
-                            assert_eq!(layout.pool_id(raw), 3);
+                            assert_eq!(LocationLayout::pool_id(raw), 3);
                             assert_eq!(layout.segment_id(raw), seg);
                             assert_eq!(layout.incarnation(raw), incarnation);
                             assert_eq!(layout.offset(raw), offset);
@@ -349,7 +388,12 @@ mod tests {
         assert_ne!(highest, crate::location::Location::MAX_RAW);
 
         // And the reason it cannot: only the unissuable top id reaches GHOST.
-        let unissuable = layout.pack(3, layout.max_segment_count(), 0x3F, max_offset);
+        // Built directly, not via pack: this id is out of the layout's field
+        // range by construction, which is the whole point.
+        let unissuable = ((3u64) << LocationLayout::POOL_SHIFT)
+            | ((layout.max_segment_count() as u64) << (layout.offset_bits() + 6))
+            | (0x3Fu64 << layout.offset_bits())
+            | ((max_offset >> 3) as u64);
         assert_eq!(unissuable, crate::location::Location::MAX_RAW);
     }
 
@@ -445,5 +489,105 @@ mod tests {
                 .validate_segment_count(layout.max_segment_count() as usize + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_segments_with_too_few_addressable_slots() {
+        // The floor, mirroring the u32 ceiling. `segment_id` is a u32
+        // throughout the crate, so a layout leaving more than 31 segment-id
+        // bits is meaningless -- and `1u32 << seg_bits` overflows computing
+        // `max_segment_count()`. A 4 KiB disk segment at the 512-byte disk
+        // default lands here, and 4 KiB is exactly the block size the design
+        // names, so this is reachable rather than theoretical.
+        assert!(matches!(
+            LocationLayout::new(4096, 512),
+            Err(LayoutError::SegmentTooSmall { .. })
+        ));
+        assert!(matches!(
+            LocationLayout::new(8192, 512),
+            Err(LayoutError::SegmentTooSmall { .. })
+        ));
+        assert!(LocationLayout::new(16 * 1024, 512).is_ok());
+
+        // The degenerate align == segment_size case is subsumed by the same
+        // floor: it derives offset_bits 0, hence seg_bits 36.
+        assert!(matches!(
+            LocationLayout::new(4 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
+            Err(LayoutError::SegmentTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn every_accepted_layout_has_computable_fields() {
+        // Companion to `every_accepted_layout_can_represent_its_own_widest_offset`
+        // at the other end: if `new` accepts a layout, every derived quantity
+        // must be computable rather than overflowing a shift.
+        for segment_size in [
+            4096usize,
+            8192,
+            16 * 1024,
+            64 * 1024,
+            1024 * 1024,
+            8 * 1024 * 1024,
+            128 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ] {
+            for align in [8usize, 512, 4096] {
+                let Ok(layout) = LocationLayout::new(segment_size, align) else {
+                    continue;
+                };
+                assert!(
+                    layout.seg_bits() <= 31,
+                    "segment_size {segment_size} align {align} was accepted with \
+                     {} segment-id bits, which overflows a u32 shift",
+                    layout.seg_bits()
+                );
+                assert!(layout.max_segment_count() > 0);
+                assert_eq!(layout.align_bytes() as usize, align);
+                assert_eq!(layout.offset(layout.pack(0, 0, 0, 0)), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn derives_offset_bits_for_non_power_of_two_segment_sizes() {
+        // `segment_size` is an arbitrary usize from the pool builder, and the
+        // div_ceil/next_power_of_two derivation exists solely for this case --
+        // nothing else pins it. The naive
+        // `segment_size.trailing_zeros() - align_shift` gives 16 here and would
+        // silently truncate most of the segment.
+        let layout = LocationLayout::new(1536 * 1024, 8).unwrap();
+        assert_eq!(layout.offset_bits(), 18);
+
+        let last = 1536 * 1024 - 8;
+        assert_eq!(layout.offset(layout.pack(0, 0, 0, last)), last);
+    }
+
+    #[test]
+    fn segment_too_large_names_the_ceiling_that_actually_fired() {
+        // The message must not advise raising align_bytes: for a power-of-two
+        // segment_size, offset_bits + align_shift is invariant, so coarser
+        // alignment provably cannot get past this ceiling. Advising it sends an
+        // operator down a dead end.
+        let err = LocationLayout::new(8 * 1024 * 1024 * 1024, 8).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("u32"),
+            "message should name the real limit: {msg}"
+        );
+        assert!(
+            !msg.contains("raise align_bytes"),
+            "message advises a remedy that cannot work: {msg}"
+        );
+    }
+
+    #[test]
+    fn pool_id_decodes_without_a_layout_instance() {
+        // The module's premise: pool_id is read to CHOOSE a layout, so reading
+        // it must not require already having one.
+        let raw = LocationLayout::new(1024 * 1024, 8)
+            .unwrap()
+            .pack(2, 5, 0, 0);
+        assert_eq!(LocationLayout::pool_id(raw), 2);
     }
 }
