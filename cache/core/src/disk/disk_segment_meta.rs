@@ -31,7 +31,7 @@ use std::time::Duration;
 /// 5. Subsequent reads go to disk via io_uring
 #[repr(C, align(64))]
 pub struct DiskSegmentMeta {
-    /// Packed metadata: [8 unused][8 state][24 prev][24 next]
+    /// Packed metadata: [2 unused][6 incarnation][8 state][24 prev][24 next]
     metadata: AtomicU64,
 
     /// Next write position in the segment.
@@ -362,7 +362,11 @@ impl Segment for DiskSegmentMeta {
             return false;
         }
 
-        let new_meta = Metadata::new(State::Reserved);
+        // Preserve the incarnation: reserving does not end one, and zeroing
+        // here would wipe the tag the release that freed this segment set.
+        let new_meta = meta
+            .with_state(State::Reserved)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
         self.metadata
             .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -385,7 +389,11 @@ impl Segment for DiskSegmentMeta {
         match meta.state {
             State::Free => false, // Already free (idempotent)
             State::Reserved | State::Linking | State::Locked => {
-                let new_meta = Metadata::new(State::Free);
+                // Preserve the incarnation; Task 3 decides which transitions
+                // bump.
+                let new_meta = meta
+                    .with_state(State::Free)
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
                 self.metadata
                     .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
@@ -431,7 +439,10 @@ impl Segment for DiskSegmentMeta {
             return false;
         }
 
-        let new_meta = Metadata::new(State::Free);
+        // Preserve the incarnation; Task 3 decides which transitions bump.
+        let new_meta = meta
+            .with_state(State::Free)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
         if self
             .metadata
             .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
@@ -761,7 +772,11 @@ impl Segment for DiskSegmentMeta {
             .store(Self::INVALID_BUCKET_ID, Ordering::Release);
         self.merge_count.store(0, Ordering::Relaxed);
 
-        let new_meta = Metadata::new(State::Free);
+        // Stores unconditionally, so load first to carry the incarnation
+        // forward -- exactly as `SliceSegment::force_free` does.
+        let new_meta = Metadata::unpack(self.metadata.load(Ordering::Acquire))
+            .with_state(State::Free)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
         self.metadata.store(new_meta.pack(), Ordering::Release);
     }
 }
@@ -795,6 +810,18 @@ impl DiskSegmentMeta {
                 }
             }
         }
+    }
+}
+
+/// Test-only accessors.
+///
+/// `Segment::incarnation()` arrives in Task 3 alongside the bump sites; this
+/// must not anticipate it, hence a private helper rather than a trait method.
+#[cfg(all(test, not(feature = "loom")))]
+impl DiskSegmentMeta {
+    /// The incarnation currently stored in the packed metadata word.
+    fn incarnation_for_test(&self) -> u8 {
+        Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
     }
 }
 
@@ -836,6 +863,65 @@ mod tests {
         }
 
         (seg, pool, injector)
+    }
+
+    /// Every disk-segment transition must carry the incarnation forward.
+    ///
+    /// `Metadata::new` zeroes it and compiles clean, so nothing but this test
+    /// stands between a refactor and a silently reset tag -- which resurrects
+    /// stale locations rather than failing loudly. This is the disk twin of
+    /// `slice_segment.rs`'s `test_segment_transitions_preserve_incarnation`;
+    /// its absence is why these sites went unnoticed.
+    #[test]
+    fn test_disk_segment_transitions_preserve_incarnation() {
+        const TAG: u8 = 42;
+
+        let (seg, _pool, _injector) = segment_with_item(b"k", b"v");
+        assert_eq!(
+            seg.incarnation_for_test(),
+            0,
+            "a brand-new segment starts at 0"
+        );
+
+        // Seed a non-zero tag directly, the way a prior incarnation's release
+        // would have left it.
+        let seeded = Metadata::unpack(seg.metadata.load(Ordering::Acquire)).with_state(State::Free);
+        seg.metadata.store(
+            Metadata {
+                incarnation: TAG,
+                ..seeded
+            }
+            .pack(),
+            Ordering::Release,
+        );
+
+        // Free -> Reserved
+        assert!(seg.try_reserve());
+        assert_eq!(seg.incarnation_for_test(), TAG, "try_reserve reset the tag");
+
+        // Reserved -> Free
+        assert!(seg.try_release());
+        assert_eq!(seg.incarnation_for_test(), TAG, "try_release reset the tag");
+
+        // Reserved -> AwaitingRelease -> Free
+        assert!(seg.try_reserve());
+        assert!(seg.cas_metadata(State::Reserved, State::AwaitingRelease, None, None));
+        assert_eq!(
+            seg.incarnation_for_test(),
+            TAG,
+            "cas_metadata reset the tag"
+        );
+        assert!(seg.release_condemned());
+        assert_eq!(
+            seg.incarnation_for_test(),
+            TAG,
+            "release_condemned reset the tag"
+        );
+
+        // Unconditional store back to Free
+        assert!(seg.try_reserve());
+        seg.reset();
+        assert_eq!(seg.incarnation_for_test(), TAG, "reset cleared the tag");
     }
 
     /// A key LONGER than the stored one must not match, even when the bytes

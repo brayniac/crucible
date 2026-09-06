@@ -844,6 +844,39 @@ unsafe impl Send for BasicItemGuard<'_> {}
 mod tests {
     use super::*;
 
+    /// The last guard dropped on a condemned segment frees it -- and must
+    /// carry the incarnation forward while doing so.
+    ///
+    /// This drop path is one of three copies of the `AwaitingRelease -> Free`
+    /// transition, and the only one reachable solely through `Drop`, so it is
+    /// invisible to the segment-level transition tests.
+    #[test]
+    fn test_item_guard_drop_preserves_incarnation() {
+        use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
+
+        const TAG: u8 = 42;
+
+        let ref_count = AtomicU32::new(1);
+        let free_queue = crossbeam_deque::Injector::new();
+        let metadata = crate::sync::AtomicU64::new(
+            Metadata {
+                next: INVALID_SEGMENT_ID,
+                prev: INVALID_SEGMENT_ID,
+                state: State::AwaitingRelease,
+                incarnation: TAG,
+            }
+            .pack(),
+        );
+
+        let guard = BasicItemGuard::new(&ref_count, b"k", b"v", b"", &metadata, &free_queue, 7);
+        drop(guard);
+
+        let meta = Metadata::unpack(metadata.load(Ordering::Acquire));
+        assert_eq!(meta.state, State::Free, "the last guard must free it");
+        assert_eq!(meta.incarnation, TAG, "guard drop reset the tag");
+        assert_eq!(free_queue.len(), 1, "the segment must reach the free queue");
+    }
+
     #[test]
     fn test_basic_header_round_trip() {
         let header = BasicHeader::with_flags(10, 5, 1000, false, true);

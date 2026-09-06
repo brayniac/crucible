@@ -220,10 +220,15 @@ impl Metadata {
     /// Bit position of the incarnation within the packed word.
     const INCARNATION_SHIFT: u32 = 56;
 
-    /// Create new metadata with the given state, no chain links, incarnation 0.
+    /// Create metadata for a brand-new segment: no chain links, incarnation 0.
     ///
-    /// Only correct at segment construction. Every *transition* must carry the
-    /// incarnation forward -- use `with_state` or `bump_incarnation`.
+    /// # This is not a transition
+    ///
+    /// Zeroing the incarnation is correct **only** when constructing a segment
+    /// that has never been used, or when seeding a test's metadata word.
+    /// Calling this on a live segment silently resets its tag, which
+    /// resurrects every stale location naming it -- and unlike a struct
+    /// literal, it compiles clean. For a state change use `with_state`.
     pub fn new(state: State) -> Self {
         Self {
             next: INVALID_SEGMENT_ID,
@@ -235,7 +240,9 @@ impl Metadata {
 
     /// Create metadata with state and chain pointers, incarnation 0.
     ///
-    /// Only correct at segment construction; see `new`.
+    /// Zeroes the incarnation and carries the same hazard as [`Self::new`];
+    /// see the warning there. For a state or chain change on a live segment
+    /// use `with_state` / `with_chain_ids`.
     pub fn with_chain(state: State, next: Option<u32>, prev: Option<u32>) -> Self {
         Self {
             next: next.unwrap_or(INVALID_SEGMENT_ID),

@@ -66,7 +66,7 @@ impl Default for CasRetryConfig {
 /// - `true`: Per-item TTL using [`TtlHeader`] (each item has individual expire_at)
 #[repr(C, align(64))]
 pub struct SliceSegment<'a> {
-    /// Packed metadata: [8 unused][8 state][24 prev][24 next]
+    /// Packed metadata: [2 unused][6 incarnation][8 state][24 prev][24 next]
     metadata: AtomicU64,
 
     /// Next write position in the segment.
