@@ -1730,6 +1730,141 @@ Same shape as the Locked -> Free error: the fallback was tagged and the
 dominant transition was not."
 ```
 
+### Task 3c: key the bump on *leaving* Locked, not on being Locked
+
+The Task 3/3b review approved the table but found `cas_metadata` implementing a
+broader rule than the spec states.
+
+The design says the bump fires on **leaving** `Locked`. The code says
+`if current_meta.state == State::Locked` -- source state alone. Those differ for
+a transition that stays in `Locked`, i.e. a chain-pointer-only rewrite.
+
+Eleven call sites use the identity form
+`seg.cas_metadata(seg.state(), seg.state(), Some(x), None)` --
+`organization/fifo.rs:265,333,348,358` and
+`organization/ttl_buckets.rs:438,503,514,611,623,749,763`. If any ever ran
+against a `Locked` neighbour, the tag would advance **mid-life**. The reviewer
+demonstrated it in a scratch copy:
+
+```text
+PROBE-IDCAS Locked identity CAS: 0 -> 1 (state Locked)
+PROBE-IDCAS after recycle: 2          # two bumps, one lifetime
+```
+
+**It is currently unreachable**, and the reviewer traced why: every unlink
+(`fifo::pop_head`/`try_remove`, `TtlBucket::evict_head_segment`/`remove_segment`)
+fixes its neighbours' pointers *under `chain_mutex`* before the layer drives
+`Draining -> Locked` *outside* it, so a chain member never names a `Locked`
+segment.
+
+That invariant is stated nowhere and tested nowhere. It is also exactly the
+"tag advancing at a rate decoupled from segment lifecycles" failure the
+exclusions exist to prevent -- and it stops being merely latent once Task 7's
+read-side check lands, because `process_evicted_segment`'s drain loop builds
+`ItemLocation`s *while* the segment is `Locked`.
+
+Fix the rule rather than rely on an unstated invariant.
+
+**Files:** Modify `cache/core/src/slice_segment.rs`, `cache/core/src/disk/disk_segment_meta.rs`
+
+- [ ] **Step 1: Add the failing arm to the transition table test**
+
+In `test_incarnation_bumps_on_exactly_the_used_incarnation_transitions` (and its
+disk twin), after the `Locked -> Reserved` arm:
+
+```rust
+        // A chain-pointer-only rewrite that stays in Locked is mid-life, not
+        // the end of an incarnation. Eleven identity CASes in organization/
+        // take this shape; if one ever ran against a Locked neighbour, keying
+        // the bump on the source state alone would advance the tag twice in
+        // one lifetime.
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+        let before = segment.incarnation();
+        assert!(segment.cas_metadata(State::Locked, State::Locked, Some(7), None));
+        assert_eq!(
+            segment.incarnation(),
+            before,
+            "a Locked -> Locked chain rewrite must not bump"
+        );
+        assert_eq!(segment.next(), Some(7), "the chain pointer must still be written");
+        assert!(segment.try_release());
+        assert_eq!(
+            segment.incarnation(),
+            before + 1,
+            "leaving Locked must still bump exactly once"
+        );
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `cargo test -p cache-core --lib test_incarnation_bumps_on_exactly`
+Expected: FAIL, `a Locked -> Locked chain rewrite must not bump`.
+
+- [ ] **Step 3: Tighten the condition in both files**
+
+```rust
+        // *Leaving* Locked ends a used incarnation -- not merely being Locked.
+        // A chain-pointer rewrite that stays in Locked is mid-life; bumping
+        // there would advance the tag twice in one lifetime.
+        let new_meta = if current_meta.state == State::Locked && new_state != State::Locked {
+            new_meta.bump_incarnation()
+        } else {
+            new_meta
+        };
+```
+
+- [ ] **Step 4: Correct the two docs that rest on a dead function**
+
+`MemoryPool::release_segment`'s doc claims it is "called by guard Drop when a
+segment in AwaitingRelease state has its last reader drop". It calls
+`try_release`, which **panics** on `AwaitingRelease`, and it has no production
+callers. Both the `try_release` comment and `state.rs`'s `bump_incarnation` doc
+cite it as the justification for the `Reserved|Linking -> Free` exclusion.
+
+The classification is right but the citation is wrong. Point both at the live
+callers -- `MemoryPool::release` (`memory_pool.rs:270`), `FilePool::release`
+(`file_pool.rs:322`), `IoUringPool::release` (`io_uring_pool.rs:222`) -- and fix
+`release_segment`'s own doc to say what it actually does.
+
+- [ ] **Step 5: Note the two asymmetries the review flagged**
+
+Neither is a defect; both now carry semantics they did not before, so record
+them where a reader will find them:
+
+- `force_free` bumps through a plain load-modify-`store`, not a CAS. Racing a
+  concurrent `BasicItemGuard::drop` CAS could drop or duplicate a bump. Add this
+  to its existing `# Safety` note, which already requires flush-only use.
+- `Segment::reset()` is asymmetric: `DiskSegmentMeta::reset` publishes `Free`
+  and bumps, `SliceSegment::reset` touches only statistics. Say so on the trait
+  method, since a bump now hangs off one side of it.
+
+- [ ] **Step 6: Verify and prove red**
+
+Run: `cargo test -p cache-core --lib`, expect 452.
+
+Prove the new arm red by reverting the condition to `state == State::Locked`,
+and confirm the rest of the table still passes (the tightening must not disturb
+`Locked -> Reserved` or `Locked -> Free`). Quote the failure.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add cache/core/src/slice_segment.rs cache/core/src/disk/disk_segment_meta.rs cache/core/src/memory_pool.rs cache/core/src/state.rs cache/core/src/segment.rs
+git commit -m "fix(cache-core): bump on leaving Locked, not on being Locked
+
+cas_metadata keyed on the source state alone, so a chain-pointer-only
+rewrite that stays in Locked would bump mid-life -- two bumps in one
+lifetime, halving the tag space the collision argument depends on.
+
+Unreachable today: unlinks fix neighbour pointers under chain_mutex before
+the layer drives Draining -> Locked outside it, so a chain member never
+names a Locked segment. That invariant was unstated and untested, and it
+stops being latent once the read-side check lands, since the drain loop
+builds locations while the segment is Locked. Fix the rule rather than
+depend on it."
+```
+
 ### Task 4: `ItemLocation` becomes layout-aware
 
 Accessors take the layout rather than `ItemLocation` storing one: the type stays
