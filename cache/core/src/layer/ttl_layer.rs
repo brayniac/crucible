@@ -179,7 +179,10 @@ impl TtlLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let key_start =
                         offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -253,7 +256,10 @@ impl TtlLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let key_start =
                         offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -333,7 +339,10 @@ impl TtlLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let optional_start = offset as usize + BasicHeader::SIZE;
                     let optional_len = header.optional_len() as usize;
@@ -455,7 +464,10 @@ impl TtlLayer {
             // Get header at offset
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     // Get key for this item
                     let key_start =
@@ -633,7 +645,10 @@ impl TtlLayer {
             while offset < write_offset {
                 if let Some(data) = src.header_ptr(offset, header_size) {
                     if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                        let item_size = header.padded_size() as u32;
+                        // The segment's stride, not the 8-byte padded body size: a scan
+                        // that advances by anything but what the append advanced by
+                        // desyncs after the first item on a coarser-aligned pool.
+                        let item_size = src.item_stride(header.padded_size());
 
                         // Skip deleted items
                         if !header.is_deleted() {
@@ -816,7 +831,10 @@ impl TtlLayer {
             // Get header at offset
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     // Calculate offsets for key, value, optional
                     let optional_start = offset as usize + BasicHeader::SIZE;
@@ -1067,7 +1085,10 @@ impl TtlLayer {
                     Some(h) => h,
                     None => break,
                 };
-                let item_size = header.padded_size() as u32;
+                // The segment's stride, not the 8-byte padded body size: a scan
+                // that advances by anything but what the append advanced by
+                // desyncs after the first item on a coarser-aligned pool.
+                let item_size = segment.item_stride(header.padded_size());
 
                 if header.is_deleted() {
                     offset += item_size;

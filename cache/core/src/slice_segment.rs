@@ -100,6 +100,12 @@ pub struct SliceSegment<'a> {
     /// Packed: [2 bits pool_id][1 bit is_per_item_ttl][5 bits reserved]
     pool_flags: u8,
 
+    /// `log2` of the owning pool's offset alignment factor.
+    ///
+    /// Appends stride by `1 << align_shift`, because a `Location` stores
+    /// `offset / align_bytes` and cannot name a finer offset.
+    align_shift: u8,
+
     /// Number of times this segment was a merge destination.
     merge_count: AtomicU16,
 
@@ -138,6 +144,9 @@ impl<'a> SliceSegment<'a> {
     /// - `data`: Pointer to segment memory
     /// - `len`: Size of segment memory in bytes
     /// - `free_queue`: Pointer to pool's main free queue for async release
+    /// - `align_bytes`: The owning pool's offset alignment factor. Items are
+    ///   appended at multiples of it, so it must match the `LocationLayout`
+    ///   the pool packs locations with. A power of two, at least 8.
     pub unsafe fn new(
         pool_id: u8,
         is_per_item_ttl: bool,
@@ -145,9 +154,14 @@ impl<'a> SliceSegment<'a> {
         data: *mut u8,
         len: usize,
         free_queue: *const crossbeam_deque::Injector<u32>,
+        align_bytes: usize,
     ) -> Self {
         debug_assert!(pool_id <= 3, "pool_id {} exceeds 2-bit limit", pool_id);
         debug_assert!(len <= u32::MAX as usize, "segment too large");
+        debug_assert!(
+            align_bytes.is_power_of_two() && align_bytes >= 8,
+            "align_bytes {align_bytes} must be a power of two and at least 8"
+        );
 
         let pool_flags = (pool_id & Self::POOL_ID_MASK)
             | if is_per_item_ttl {
@@ -172,6 +186,7 @@ impl<'a> SliceSegment<'a> {
             expire_at: AtomicU32::new(0),
             bucket_id: AtomicU16::new(Self::INVALID_BUCKET_ID),
             pool_flags,
+            align_shift: align_bytes.trailing_zeros() as u8,
             merge_count: AtomicU16::new(0),
             generation: AtomicU16::new(0),
             free_queue,
@@ -232,7 +247,9 @@ impl<'a> SliceSegment<'a> {
         header_size: usize,
     ) -> Option<u32> {
         let item_size = header_size + optional.len() + key.len() + value.len();
-        let padded_size = (item_size + 7) & !7; // 8-byte alignment
+        // The pool's stride, not a hardcoded 8: every scan advances by the same
+        // quantity, and a `Location` cannot name a finer offset.
+        let padded_size = self.item_stride(item_size) as usize;
 
         let offset = self.reserve_space(padded_size as u32)?;
 
@@ -828,6 +845,10 @@ impl Segment for SliceSegment<'_> {
         Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
     }
 
+    fn align_bytes(&self) -> u32 {
+        1 << self.align_shift
+    }
+
     fn capacity(&self) -> usize {
         self.capacity as usize
     }
@@ -1137,7 +1158,7 @@ impl Segment for SliceSegment<'_> {
         header.to_bytes(&mut header_bytes);
 
         let item_size = TtlHeader::SIZE + optional.len() + key.len() + value_len;
-        let padded_size = (item_size + 7) & !7; // 8-byte alignment
+        let padded_size = self.item_stride(item_size) as usize;
 
         let offset = self.reserve_space(padded_size as u32)?;
 
@@ -1184,7 +1205,7 @@ impl Segment for SliceSegment<'_> {
         header.to_bytes(&mut header_bytes);
 
         let item_size = BasicHeader::SIZE + optional.len() + key.len() + value_len;
-        let padded_size = (item_size + 7) & !7; // 8-byte alignment
+        let padded_size = self.item_stride(item_size) as usize;
 
         let offset = self.reserve_space(padded_size as u32)?;
 
@@ -1284,13 +1305,11 @@ impl Segment for SliceSegment<'_> {
                 None => return Err(CacheError::KeyMismatch),
             };
 
-        // Compute padded item size from header info
-        let item_size = ((header_size
-            + optional_len as usize
-            + key_len as usize
-            + value_len as usize
-            + 7)
-            & !7) as u32;
+        // Must be the stride the append charged to `live_bytes`, not the
+        // 8-padded body size, or the accounting drifts on a coarser pool.
+        let item_size = self.item_stride(
+            header_size + optional_len as usize + key_len as usize + value_len as usize,
+        );
 
         // Set deleted flag (byte 1, bit 6)
         let data_ptr = unsafe { self.data.as_ptr().add(offset as usize) };
@@ -1557,8 +1576,9 @@ mod tests {
             std::ptr::write_bytes(ptr, 0, size);
         }
         let free_queue_ptr: *const crossbeam_deque::Injector<u32> = &*TEST_FREE_QUEUE;
-        let segment =
-            unsafe { SliceSegment::new(pool_id, is_per_item_ttl, id, ptr, size, free_queue_ptr) };
+        let segment = unsafe {
+            SliceSegment::new(pool_id, is_per_item_ttl, id, ptr, size, free_queue_ptr, 8)
+        };
         (segment, ptr, layout)
     }
 
@@ -2599,10 +2619,11 @@ impl SegmentPrune for SliceSegment<'_> {
                 }
             };
 
-            // Calculate padded item size
+            // Calculate the item's stride -- what the append advanced the
+            // write offset by. Advancing by anything else desyncs this walk.
             let item_size =
                 header_size + optional_len as usize + key_len as usize + value_len as usize;
-            let padded_size = ((item_size + 7) & !7) as u32;
+            let padded_size = self.item_stride(item_size);
 
             // Skip if already deleted
             if is_deleted {
@@ -2696,10 +2717,11 @@ impl SegmentPrune for SliceSegment<'_> {
                     }
                 };
 
-            // Calculate padded item size
+            // Calculate the item's stride -- what the append advanced the
+            // write offset by. Advancing by anything else desyncs this walk.
             let item_size =
                 header_size + optional_len as usize + key_len as usize + value_len as usize;
-            let padded_size = ((item_size + 7) & !7) as u32;
+            let padded_size = self.item_stride(item_size);
 
             // Skip if already deleted
             if is_deleted {
@@ -2805,10 +2827,11 @@ impl SegmentIter for SliceSegment<'_> {
                 }
             };
 
-            // Calculate padded item size
+            // Calculate the item's stride -- what the append advanced the
+            // write offset by. Advancing by anything else desyncs this walk.
             let item_size =
                 header_size + optional_len as usize + key_len as usize + value_len as usize;
-            let padded_size = ((item_size + 7) & !7) as u32;
+            let padded_size = self.item_stride(item_size);
 
             // Extract key, value, optional
             let optional_start = offset as usize + header_size;

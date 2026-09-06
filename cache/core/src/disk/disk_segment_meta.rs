@@ -55,6 +55,12 @@ pub struct DiskSegmentMeta {
     /// Pool ID (0-3).
     pool_id: u8,
 
+    /// `log2` of the owning pool's offset alignment factor.
+    ///
+    /// Appends stride by `1 << align_shift`, because a `Location` stores
+    /// `offset / align_bytes` and cannot name a finer offset.
+    align_shift: u8,
+
     /// Segment-level expiration time (coarse seconds since epoch).
     expire_at: AtomicU32,
 
@@ -103,8 +109,13 @@ impl DiskSegmentMeta {
         capacity: u32,
         disk_offset: u64,
         free_queue: *const crossbeam_deque::Injector<u32>,
+        align_bytes: usize,
     ) -> Self {
         debug_assert!(pool_id <= 3, "pool_id {} exceeds 2-bit limit", pool_id);
+        debug_assert!(
+            align_bytes.is_power_of_two() && align_bytes >= 8,
+            "align_bytes {align_bytes} must be a power of two and at least 8"
+        );
 
         let initial_meta = Metadata::new(State::Free);
 
@@ -117,6 +128,7 @@ impl DiskSegmentMeta {
             id,
             capacity,
             pool_id,
+            align_shift: align_bytes.trailing_zeros() as u8,
             expire_at: AtomicU32::new(0),
             bucket_id: AtomicU16::new(Self::INVALID_BUCKET_ID),
             merge_count: AtomicU16::new(0),
@@ -331,6 +343,10 @@ impl Segment for DiskSegmentMeta {
     }
 
     #[inline]
+    fn align_bytes(&self) -> u32 {
+        1 << self.align_shift
+    }
+
     fn capacity(&self) -> usize {
         self.capacity as usize
     }
@@ -567,7 +583,9 @@ impl Segment for DiskSegmentMeta {
         let header_size = BasicHeader::SIZE;
 
         let item_size = header_size + optional.len() + key.len() + value.len();
-        let padded_size = (item_size + 7) & !7; // 8-byte alignment
+        // The pool's stride, not a hardcoded 8: every scan advances by the same
+        // quantity, and a `Location` cannot name a finer offset.
+        let padded_size = self.item_stride(item_size) as usize;
 
         // Reserve space atomically
         let offset = self.reserve_space(padded_size as u32)?;
@@ -640,7 +658,7 @@ impl Segment for DiskSegmentMeta {
         let header_size = BasicHeader::SIZE;
 
         let item_size = header_size + optional.len() + key.len() + value_len;
-        let padded_size = (item_size + 7) & !7;
+        let padded_size = self.item_stride(item_size) as usize;
 
         let offset = self.reserve_space(padded_size as u32)?;
 
@@ -775,7 +793,9 @@ impl Segment for DiskSegmentMeta {
             return Ok(false); // Someone else marked it deleted first.
         }
 
-        let padded_size = header.padded_size() as u32;
+        // Must be the stride the append charged to `live_bytes`, not the
+        // 8-padded body size, or the accounting drifts on a coarser pool.
+        let padded_size = self.item_stride(header.padded_size());
         self.live_items.fetch_sub(1, Ordering::Relaxed);
         self.live_bytes.fetch_sub(padded_size, Ordering::Relaxed);
 
@@ -866,7 +886,7 @@ mod tests {
         let buf = pool.allocate().expect("one slot must be available");
         let injector = Box::new(crossbeam_deque::Injector::new());
 
-        let seg = DiskSegmentMeta::new(0, 0, capacity as u32, 0, &*injector);
+        let seg = DiskSegmentMeta::new(0, 0, capacity as u32, 0, &*injector, 512);
         seg.attach_write_buffer(buf);
 
         let header = BasicHeader::new(key.len() as u8, 0, value.len() as u32);
@@ -882,6 +902,92 @@ mod tests {
         }
 
         (seg, pool, injector)
+    }
+
+    /// Build an empty segment with a given capacity and offset alignment.
+    ///
+    /// Separate from `segment_with_item` because these tests append through the
+    /// real path rather than writing a header by hand.
+    fn segment_with_alignment(
+        capacity: usize,
+        align: usize,
+    ) -> (
+        DiskSegmentMeta,
+        AlignedBufferPool,
+        Box<crossbeam_deque::Injector<u32>>,
+    ) {
+        let mut pool = AlignedBufferPool::new(1, capacity, 512);
+        let buf = pool.allocate().expect("one slot must be available");
+        let injector = Box::new(crossbeam_deque::Injector::new());
+
+        let seg = DiskSegmentMeta::new(0, 0, capacity as u32, 0, &*injector, align);
+        seg.attach_write_buffer(buf);
+        (seg, pool, injector)
+    }
+
+    /// Appends must stride by the pool's alignment, and a scan must agree.
+    ///
+    /// If appends pad to 512 and scans still advance by `header.padded_size()`
+    /// (which rounds to 8), the walk desyncs after the first item and silently
+    /// reads garbage. Offsets must also be representable: an unaligned offset
+    /// is truncated by `LocationLayout::pack` in release.
+    #[test]
+    fn test_disk_appends_stride_by_the_pools_alignment() {
+        let (meta, _pool, _injector) = segment_with_alignment(64 * 1024, 512);
+        assert!(meta.try_reserve());
+
+        // Three small items, each far below the alignment factor.
+        let mut offsets = Vec::new();
+        for i in 0..3u8 {
+            let key = [b'k', i];
+            let offset = meta.append_item(&key, b"v", &[]).expect("append");
+            offsets.push(offset);
+        }
+
+        for (i, &offset) in offsets.iter().enumerate() {
+            assert_eq!(
+                offset % 512,
+                0,
+                "item {i} at offset {offset} is not 512-aligned"
+            );
+        }
+        assert_eq!(offsets, vec![0, 512, 1024], "stride must be the alignment");
+
+        // A scan must land on exactly those offsets, not 8-byte ones.
+        let mut walked = Vec::new();
+        let mut offset = 0u32;
+        while offset < meta.write_offset() {
+            let ptr = meta.header_ptr(offset, BasicHeader::SIZE).expect("header");
+            let header = unsafe { BasicHeader::try_from_ptr(ptr) }.expect("valid header");
+            walked.push(offset);
+            offset += meta.item_stride(header.padded_size());
+        }
+        assert_eq!(
+            walked, offsets,
+            "the scan stride disagrees with the append stride"
+        );
+    }
+
+    /// Memory-style 8-byte alignment must be unaffected.
+    #[test]
+    fn test_disk_alignment_of_eight_is_unchanged() {
+        let (meta, _pool, _injector) = segment_with_alignment(64 * 1024, 8);
+        assert!(meta.try_reserve());
+        let a = meta.append_item(b"k1", b"v", &[]).expect("append");
+        let b = meta.append_item(b"k2", b"v", &[]).expect("append");
+        assert_eq!(a, 0);
+
+        // Derived, not hardcoded: `BasicHeader::SIZE` differs by feature, and
+        // the point is that the stride follows the item, not the disk default.
+        let expected = (BasicHeader::SIZE + b"k2".len() + b"v".len()).next_multiple_of(8) as u32;
+        assert_eq!(
+            b, expected,
+            "an 8-aligned pool must still pack items at 8 bytes"
+        );
+        assert!(
+            b < 512,
+            "an 8-aligned pool must not inherit the 512-byte disk stride"
+        );
     }
 
     /// The disk twin of the slice-segment bump table: the incarnation advances

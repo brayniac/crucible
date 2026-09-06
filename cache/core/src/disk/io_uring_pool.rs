@@ -13,10 +13,12 @@ use super::disk_segment_meta::DiskSegmentMeta;
 
 /// Offset alignment factor for io_uring disk pools.
 ///
-/// 8, matching the alignment the segment append path pads items to. Coarser
-/// alignment would buy addressable capacity (locations store `offset /
-/// align_bytes`) but the appended offsets would no longer be representable.
-const DEFAULT_ALIGN_BYTES: usize = 8;
+/// 512, a disk sector, matching [`crate::disk::FilePool`]. Locations store
+/// `offset / align_bytes`, so this is what gives a disk pool 32 TiB of
+/// addressable capacity against 512 GiB at 8; it also stops items straddling an
+/// I/O block, which `item_disk_range` would otherwise pay for with a second
+/// block read. Segments append at this stride -- see `Segment::item_stride`.
+const DEFAULT_ALIGN_BYTES: usize = 512;
 
 /// Pool of disk segment metadata entries.
 ///
@@ -78,7 +80,7 @@ impl IoUringPool {
     /// # Panics
     ///
     /// Panics if any argument is out of range, or if `segment_size` and the
-    /// pool's alignment factor (8 bytes) do not yield a usable
+    /// pool's alignment factor (512 bytes) do not yield a usable
     /// [`LocationLayout`] -- for instance a segment so small that more segment
     /// id bits remain than a `u32` id can hold.
     pub fn new(pool_id: u8, segment_count: usize, segment_size: usize, block_size: u32) -> Self {
@@ -124,6 +126,9 @@ impl IoUringPool {
                 segment_size as u32,
                 disk_offset,
                 free_queue_ptr,
+                // From the layout, so the stride a segment appends by and the
+                // alignment a location is packed with cannot drift apart.
+                layout.align_bytes() as usize,
             );
             segments.push(meta);
 
@@ -319,7 +324,10 @@ mod tests {
 
     #[test]
     fn test_reserve_release() {
-        let pool = IoUringPool::new(0, 3, 4096, 4096);
+        // 64 KiB segments, not 4 KiB: at the 512-byte disk alignment a 4 KiB
+        // segment leaves more segment-id bits than a u32 id can hold, and the
+        // layout rejects it. The size was never what this test is about.
+        let pool = IoUringPool::new(0, 3, 64 * 1024, 4096);
         assert_eq!(pool.free_count(), 3);
 
         let id1 = pool.reserve().unwrap();

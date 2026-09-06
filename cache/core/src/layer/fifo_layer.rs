@@ -115,7 +115,10 @@ impl FifoLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
                 if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     if !header.is_deleted() && !header.is_expired(now) {
                         let key_start =
@@ -194,7 +197,10 @@ impl FifoLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
                 if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     if !header.is_deleted() && !header.is_expired(now) {
                         let key_start =
@@ -282,7 +288,10 @@ impl FifoLayer {
             // Try to read header at offset
             if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
                 if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     // Skip if already deleted or expired
                     if !header.is_deleted() && !header.is_expired(now) {
@@ -373,7 +382,10 @@ impl FifoLayer {
             // Try to read header at offset
             if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
                 if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     // Skip if already deleted or expired
                     if !header.is_deleted() && !header.is_expired(now) {
@@ -479,7 +491,10 @@ impl FifoLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
                 if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     if !header.is_deleted() && !header.is_expired(now) {
                         let optional_start = offset as usize + TtlHeader::SIZE;

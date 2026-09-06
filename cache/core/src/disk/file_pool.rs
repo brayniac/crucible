@@ -24,10 +24,12 @@ pub const HEADER_SIZE: usize = 64;
 
 /// Default offset alignment factor for file-backed pools.
 ///
-/// 8, matching the alignment the segment append path pads items to. Coarser
-/// alignment would buy addressable capacity (locations store `offset /
-/// align_bytes`) but the appended offsets would no longer be representable.
-const DEFAULT_ALIGN_BYTES: usize = 8;
+/// 512, a disk sector. Locations store `offset / align_bytes`, so this is what
+/// gives a disk pool 32 TiB of addressable capacity against 512 GiB at 8; it
+/// also stops items straddling an I/O block, which costs an extra block read.
+/// The price is up to 511 bytes of padding per item, which is why memory pools
+/// stay at 8.
+const DEFAULT_ALIGN_BYTES: usize = 512;
 
 /// Header stored at the beginning of the disk cache file.
 ///
@@ -392,10 +394,12 @@ impl FilePoolBuilder {
     /// pool's addressable capacity: `2^36 * align_bytes`. Must be a power of
     /// two, at least 8, and no larger than `segment_size`.
     ///
-    /// Defaults to 8, the alignment the segment append path actually pads
-    /// items to. Raising it is only sound once that path pads to the same
-    /// factor; until then a coarser value produces item offsets this layout
-    /// cannot represent.
+    /// Disk pools default to 512 (a sector) rather than 8. The justification is
+    /// the read path, not capacity: `item_disk_range` rounds reads down to a
+    /// `block_size` boundary, so an item straddling a block costs an extra
+    /// block read. Sector alignment removes that, wastes 256 bytes per item on
+    /// average, and yields 32 TiB per pool as a side effect. Segments append at
+    /// this stride -- see `Segment::item_stride`.
     pub fn align_bytes(mut self, align: usize) -> Self {
         self.align_bytes = align;
         self
@@ -542,6 +546,10 @@ impl FilePoolBuilder {
                     segment_ptr,
                     self.segment_size,
                     free_queue_ptr,
+                    // From the layout, not the builder field, so the stride a
+                    // segment appends by and the alignment a location is
+                    // packed with cannot drift apart.
+                    layout.align_bytes() as usize,
                 )
             };
 

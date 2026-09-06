@@ -185,7 +185,10 @@ impl DiskLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let key_start =
                         offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -238,7 +241,10 @@ impl DiskLayer {
         while offset < write_offset {
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
                 if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    let item_size = header.padded_size() as u32;
+                    // The segment's stride, not the 8-byte padded body size: a scan
+                    // that advances by anything but what the append advanced by
+                    // desyncs after the first item on a coarser-aligned pool.
+                    let item_size = segment.item_stride(header.padded_size());
 
                     let key_start =
                         offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
@@ -674,6 +680,7 @@ impl Default for DiskLayerBuilder {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::item::ItemGuard;
     use tempfile::tempdir;
 
@@ -692,6 +699,86 @@ mod tests {
             .expect("Failed to create test layer");
 
         (dir, layer)
+    }
+
+    /// Fill one segment with `ITEMS` items and index them, returning the keys
+    /// and the segment they share.
+    fn fill_one_segment(layer: &DiskLayer, hashtable: &MultiChoiceHashtable) -> (Vec<String>, u32) {
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+
+        const ITEMS: usize = 5;
+        let mut keys = Vec::new();
+        let mut segment_id = None;
+        for i in 0..ITEMS {
+            let key = format!("key_{i:02}");
+            let location = layer
+                .write_item(key.as_bytes(), b"value", b"", ttl)
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), location.to_location(), &verifier)
+                .expect("insert");
+            let id = location.segment_id(layer.pool.layout());
+            assert_eq!(
+                *segment_id.get_or_insert(id),
+                id,
+                "all items must share one segment for this to test the walk"
+            );
+            keys.push(key);
+        }
+        (keys, segment_id.expect("at least one item"))
+    }
+
+    fn assert_all_removed(layer: &DiskLayer, hashtable: &MultiChoiceHashtable, keys: &[String]) {
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        for key in keys {
+            assert!(
+                hashtable.lookup(key.as_bytes(), &verifier).is_none(),
+                "{key} survived the walk -- it stopped short of that item"
+            );
+        }
+    }
+
+    /// Draining a pinned segment must visit every item, at the pool's stride.
+    ///
+    /// Disk pools align items to 512 bytes while `BasicHeader::padded_size()`
+    /// rounds to 8. A walk that advances by the latter lands mid-item on its
+    /// second iteration, reads a garbage header and stops -- silently, since
+    /// both quantities are `u32`. Hashtable entries left behind after the
+    /// segment is recycled is what that failure looks like from the outside.
+    #[test]
+    fn test_draining_a_segment_walks_every_item_at_the_disk_stride() {
+        let (_dir, layer) = create_test_layer();
+        assert_eq!(
+            layer.pool.layout().align_bytes(),
+            512,
+            "disk pools align to a sector"
+        );
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+
+        layer.drain_segment_from_hashtable(segment_id, &hashtable);
+        assert_all_removed(&layer, &hashtable, &keys);
+    }
+
+    /// The same for the unpinned path, which walks the segment itself rather
+    /// than deferring to `drain_segment_from_hashtable`.
+    #[test]
+    fn test_evicting_a_segment_walks_every_item_at_the_disk_stride() {
+        let (_dir, layer) = create_test_layer();
+
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+
+        // The eviction path leaves its victim in `Draining`, which is the
+        // state `process_evicted_segment` expects.
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Draining, None, None));
+
+        layer.process_evicted_segment(segment_id, &hashtable);
+        assert_all_removed(&layer, &hashtable, &keys);
     }
 
     #[test]

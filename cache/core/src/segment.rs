@@ -129,6 +129,36 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
 
     // ========== Capacity ==========
 
+    /// Get the offset alignment factor of the pool that owns this segment.
+    ///
+    /// Always a power of two and at least 8. Item offsets are multiples of it,
+    /// because a `Location` stores `offset / align_bytes` and cannot represent
+    /// anything finer -- see `LocationLayout`.
+    fn align_bytes(&self) -> u32;
+
+    /// Round an item size up to this segment's offset alignment.
+    ///
+    /// This is the segment's *stride*: appends advance the write offset by it,
+    /// and **every scan must advance by it too**. A scan that advances by
+    /// `header.padded_size()` -- which rounds to 8 regardless of the pool --
+    /// desyncs after the first item on a coarser-aligned pool and then reads
+    /// garbage headers. Both sides are `u32`, so the compiler cannot catch the
+    /// mismatch; this method exists so there is only one definition to get
+    /// right.
+    ///
+    /// Safe to apply to an already-8-padded size: `align_bytes` is a power of
+    /// two and at least 8, so rounding twice is the same as rounding once.
+    ///
+    /// Note this is *not* the size of the item's bytes. A bounds check against
+    /// `capacity` should use `header.padded_size()`, since the padding beyond
+    /// it is dead space that the last item in a segment need not own.
+    #[inline]
+    fn item_stride(&self, item_size: usize) -> u32 {
+        let align = self.align_bytes() as usize;
+        debug_assert!(align.is_power_of_two() && align >= 8);
+        ((item_size + align - 1) & !(align - 1)) as u32
+    }
+
     /// Get the total data capacity in bytes.
     fn capacity(&self) -> usize;
 

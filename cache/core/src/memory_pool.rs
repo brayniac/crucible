@@ -406,9 +406,10 @@ impl MemoryPoolBuilder {
     /// coarser alignment would round small items up. Must be a power of two, at
     /// least 8, and no larger than `segment_size`.
     ///
-    /// Raising it above 8 is only sound once the segment append path pads items
-    /// to the same factor -- it pads to 8 today, so a coarser value would
-    /// produce item offsets this layout cannot represent.
+    /// Segments append at this stride and every scan advances by it -- see
+    /// `Segment::item_stride` -- so raising it costs up to `align_bytes - 1`
+    /// bytes of padding per item. Disk pools take that trade for the block
+    /// alignment it buys; RAM pools have nothing to gain from it.
     pub fn align_bytes(mut self, align: usize) -> Self {
         self.align_bytes = align;
         self
@@ -505,6 +506,10 @@ impl MemoryPoolBuilder {
                     segment_ptr,
                     self.segment_size,
                     free_queue_ptr,
+                    // From the layout, not the builder field, so the stride a
+                    // segment appends by and the alignment a location is
+                    // packed with cannot drift apart.
+                    layout.align_bytes() as usize,
                 )
             };
 
