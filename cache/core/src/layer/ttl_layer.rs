@@ -66,8 +66,9 @@ struct SinglePoolVerifier<'a> {
 impl KeyVerifier for SinglePoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        let layout = self.pool.layout();
+        if let Some(segment) = self.pool.get(item_loc.segment_id(layout)) {
+            segment.verify_key_at_offset(item_loc.offset(layout), key, allow_deleted)
         } else {
             false
         }
@@ -187,7 +188,13 @@ impl TtlLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
 
                         let verifier = SinglePoolVerifier { pool: &self.pool };
                         let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -255,7 +262,13 @@ impl TtlLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
 
                         let verifier = SinglePoolVerifier { pool: &self.pool };
                         let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -332,7 +345,13 @@ impl TtlLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
 
                         let verifier = SinglePoolVerifier { pool: &self.pool };
                         let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -446,7 +465,13 @@ impl TtlLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
 
                         // Get frequency from hashtable
                         let verifier = SinglePoolVerifier { pool: &self.pool };
@@ -625,10 +650,20 @@ impl TtlLayer {
                                 src.data_slice(optional_start as u32, optional_len),
                             ) && let Some(new_offset) = spare.append_item(key, value, optional)
                             {
-                                let old_loc =
-                                    ItemLocation::new(self.pool.pool_id(), src_id, offset);
-                                let new_loc =
-                                    ItemLocation::new(self.pool.pool_id(), spare_id, new_offset);
+                                let old_loc = ItemLocation::new(
+                                    self.pool.layout(),
+                                    self.pool.pool_id(),
+                                    src_id,
+                                    src.incarnation(),
+                                    offset,
+                                );
+                                let new_loc = ItemLocation::new(
+                                    self.pool.layout(),
+                                    self.pool.pool_id(),
+                                    spare_id,
+                                    spare.incarnation(),
+                                    new_offset,
+                                );
 
                                 // Update hashtable (preserve frequency)
                                 if !hashtable.cas_location(
@@ -794,7 +829,13 @@ impl TtlLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
 
                         // Get frequency from hashtable
                         let verifier = SinglePoolVerifier { pool: &self.pool };
@@ -1057,8 +1098,20 @@ impl TtlLayer {
                         .unwrap_or(&[]);
 
                     if let Some(new_offset) = spare.append_item(key, value, optional) {
-                        let old_loc = ItemLocation::new(self.pool.pool_id(), cand_id, offset);
-                        let new_loc = ItemLocation::new(self.pool.pool_id(), spare_id, new_offset);
+                        let old_loc = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            cand_id,
+                            segment.incarnation(),
+                            offset,
+                        );
+                        let new_loc = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            spare_id,
+                            spare.incarnation(),
+                            new_offset,
+                        );
 
                         // Update hashtable (preserve frequency)
                         if !hashtable.cas_location(
@@ -1073,7 +1126,13 @@ impl TtlLayer {
                         seg_retained += 1;
                     } else {
                         // Spare is full — discard remaining items
-                        let location = ItemLocation::new(self.pool.pool_id(), cand_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            cand_id,
+                            segment.incarnation(),
+                            offset,
+                        );
                         if self.config.create_ghosts {
                             hashtable.convert_to_ghost(key, location.to_location());
                         } else {
@@ -1083,7 +1142,13 @@ impl TtlLayer {
                     }
                 } else {
                     // Frequency too low — discard (convert to ghost or remove)
-                    let location = ItemLocation::new(self.pool.pool_id(), cand_id, offset);
+                    let location = ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        cand_id,
+                        segment.incarnation(),
+                        offset,
+                    );
                     if self.config.create_ghosts {
                         hashtable.convert_to_ghost(key, location.to_location());
                     } else {
@@ -1161,7 +1226,13 @@ impl Layer for TtlLayer {
             if let Some(segment) = self.pool.get(segment_id) {
                 // Try to append
                 if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(self.pool.pool_id(), segment_id, offset));
+                    return Ok(ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    ));
                 }
 
                 // Segment is full, need to allocate a new one
@@ -1186,7 +1257,8 @@ impl Layer for TtlLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         // Check segment state
         let state = segment.state();
@@ -1202,12 +1274,10 @@ impl Layer for TtlLayer {
         }
 
         // Verify key matches (before acquiring ref count)
-        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
+        let header_info = segment.verify_key_unexpired(offset, key, now)?;
 
         // Get item using pre-verified header info (single parse path)
-        segment
-            .get_item_verified(location.offset(), header_info)
-            .ok()
+        segment.get_item_verified(offset, header_info).ok()
     }
 
     fn mark_deleted(&self, location: ItemLocation) {
@@ -1215,10 +1285,10 @@ impl Layer for TtlLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
             // We need the key to mark deleted.
             // Get it from the segment header.
-            let offset = location.offset();
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
                 && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
             {
@@ -1229,7 +1299,7 @@ impl Layer for TtlLayer {
                     let _ = segment.mark_deleted(offset, key);
 
                     // Try to free segment if now empty
-                    self.try_free_empty_segment(location.segment_id());
+                    self.try_free_empty_segment(segment_id);
                 }
             }
         }
@@ -1240,7 +1310,7 @@ impl Layer for TtlLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let segment = self.pool.get(location.segment_id(self.pool.layout()))?;
         let now = Self::now_secs();
         segment.segment_ttl(now)
     }
@@ -1311,7 +1381,13 @@ impl Layer for TtlLayer {
                 if let Some((offset, item_size, value_ptr)) =
                     segment.begin_append(key, value_len, optional)
                 {
-                    let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                    let location = ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    );
                     return Ok((location, value_ptr, item_size));
                 }
 
@@ -1335,7 +1411,7 @@ impl Layer for TtlLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        if let Some(segment) = self.pool.get(location.segment_id(self.pool.layout())) {
             segment.finalize_append(item_size);
         }
     }
@@ -1345,8 +1421,9 @@ impl Layer for TtlLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
-            segment.mark_deleted_at_offset(location.offset());
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            segment.mark_deleted_at_offset(offset);
         }
     }
 
@@ -1355,9 +1432,9 @@ impl Layer for TtlLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
             // Mark the item as deleted (same as mark_deleted)
-            let offset = location.offset();
             if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
                 && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
             {
@@ -1368,12 +1445,12 @@ impl Layer for TtlLayer {
                     let _ = segment.mark_deleted(offset, key);
 
                     // Try to free segment if now empty
-                    if self.try_free_empty_segment(location.segment_id()) {
+                    if self.try_free_empty_segment(segment_id) {
                         return;
                     }
 
                     // Try compaction with predecessor
-                    self.try_compact_segment(location.segment_id(), hashtable);
+                    self.try_compact_segment(segment_id, hashtable);
                 }
             }
         }
@@ -1587,6 +1664,41 @@ mod tests {
     }
 
     #[test]
+    fn test_written_location_carries_the_segments_incarnation() {
+        let layer = create_test_layer();
+        let pool = layer.pool();
+
+        // A fresh pool hands out incarnation 0, and a location stamped with a
+        // hardcoded 0 would match that by accident. Cycle every segment through
+        // a used incarnation first, so whichever one the layer picks for the
+        // write carries a non-zero tag.
+        let ids: Vec<u32> = (0..pool.segment_count())
+            .map(|_| pool.reserve().expect("pool must have a free segment"))
+            .collect();
+        for &id in &ids {
+            let segment = pool.get(id).expect("segment id came from the pool");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            pool.release(id);
+            assert_ne!(segment.incarnation(), 0, "leaving Locked must bump the tag");
+        }
+
+        let location = layer
+            .write_item(b"key", b"value", b"", Duration::from_secs(3600))
+            .expect("write must succeed");
+
+        let (_, segment_id, incarnation, _) = location.unpack(pool.layout());
+        assert_ne!(
+            incarnation, 0,
+            "the published tag must come from the segment, not a constant"
+        );
+        assert_eq!(
+            incarnation,
+            pool.get(segment_id).unwrap().incarnation(),
+            "a location must carry the tag of the segment its item was written into"
+        );
+    }
+
+    #[test]
     fn test_layer_creation() {
         let layer = create_test_layer();
         assert_eq!(layer.layer_id(), 1);
@@ -1727,7 +1839,11 @@ mod tests {
             .unwrap();
 
         // Create a location with wrong pool_id (must be 0-3)
-        let wrong_location = ItemLocation::new(0, location.segment_id(), location.offset());
+        // Same segment, same incarnation -- only the pool is wrong, which is
+        // what this test is about.
+        let layout = layer.pool().layout();
+        let (_, segment_id, incarnation, offset) = location.unpack(layout);
+        let wrong_location = ItemLocation::new(layout, 0, segment_id, incarnation, offset);
 
         let guard = layer.get_item(wrong_location, key);
         assert!(guard.is_none());
@@ -1758,7 +1874,11 @@ mod tests {
             .unwrap();
 
         // Pool_id must be 0-3, use 0 which is different from layer's pool_id of 1
-        let wrong_location = ItemLocation::new(0, location.segment_id(), location.offset());
+        // Same segment, same incarnation -- only the pool is wrong, which is
+        // what this test is about.
+        let layout = layer.pool().layout();
+        let (_, segment_id, incarnation, offset) = location.unpack(layout);
+        let wrong_location = ItemLocation::new(layout, 0, segment_id, incarnation, offset);
         let ttl = layer.item_ttl(wrong_location);
         assert!(ttl.is_none());
     }
@@ -1773,7 +1893,11 @@ mod tests {
             .unwrap();
 
         // Pool_id must be 0-3, use 0 which is different from layer's pool_id of 1
-        let wrong_location = ItemLocation::new(0, location.segment_id(), location.offset());
+        // Same segment, same incarnation -- only the pool is wrong, which is
+        // what this test is about.
+        let layout = layer.pool().layout();
+        let (_, segment_id, incarnation, offset) = location.unpack(layout);
+        let wrong_location = ItemLocation::new(layout, 0, segment_id, incarnation, offset);
         // Should not panic, just be a no-op
         layer.mark_deleted(wrong_location);
     }
@@ -1815,8 +1939,9 @@ mod tests {
         let loc3 = layer.write_item(b"key3", b"value3", b"", ttl).unwrap();
 
         // All items should be in the same segment (same TTL bucket)
-        assert_eq!(loc1.segment_id(), loc2.segment_id());
-        assert_eq!(loc2.segment_id(), loc3.segment_id());
+        let layout = layer.pool().layout();
+        assert_eq!(loc1.segment_id(layout), loc2.segment_id(layout));
+        assert_eq!(loc2.segment_id(layout), loc3.segment_id(layout));
 
         // All items should be retrievable
         assert!(layer.get_item(loc1, b"key1").is_some());
@@ -2019,7 +2144,7 @@ mod tests {
         let layer = create_test_layer();
 
         // Try to get from an invalid segment ID
-        let invalid_location = ItemLocation::new(1, 9999, 0);
+        let invalid_location = ItemLocation::new(layer.pool().layout(), 1, 9999, 0, 0);
         let guard = layer.get_item(invalid_location, b"key");
         assert!(guard.is_none());
     }
@@ -2029,7 +2154,7 @@ mod tests {
         let layer = create_test_layer();
 
         // Try to get TTL from an invalid segment ID
-        let invalid_location = ItemLocation::new(1, 9999, 0);
+        let invalid_location = ItemLocation::new(layer.pool().layout(), 1, 9999, 0, 0);
         let ttl = layer.item_ttl(invalid_location);
         assert!(ttl.is_none());
     }
@@ -2039,7 +2164,7 @@ mod tests {
         let layer = create_test_layer();
 
         // Try to mark deleted on an invalid segment
-        let invalid_location = ItemLocation::new(1, 9999, 0);
+        let invalid_location = ItemLocation::new(layer.pool().layout(), 1, 9999, 0, 0);
         // Should not panic
         layer.mark_deleted(invalid_location);
     }
@@ -2081,10 +2206,11 @@ mod tests {
 
         // Delete all items in the first segment
         // Find items from the first segment (should all have segment_id of the first allocated)
-        let first_segment_id = locations[0].1.segment_id();
+        let layout = layer.pool().layout();
+        let first_segment_id = locations[0].1.segment_id(layout);
         let items_in_first: Vec<_> = locations
             .iter()
-            .filter(|(_, loc)| loc.segment_id() == first_segment_id)
+            .filter(|(_, loc)| loc.segment_id(layout) == first_segment_id)
             .collect();
 
         // Delete all items in first segment

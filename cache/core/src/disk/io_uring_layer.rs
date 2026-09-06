@@ -87,8 +87,9 @@ struct IoUringPoolVerifier<'a> {
 impl KeyVerifier for IoUringPoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        let layout = self.pool.layout();
+        if let Some(segment) = self.pool.get(item_loc.segment_id(layout)) {
+            segment.verify_key_at_offset(item_loc.offset(layout), key, allow_deleted)
         } else {
             false
         }
@@ -172,7 +173,13 @@ impl IoUringDiskLayer {
 
             if let Some(segment) = self.pool.get(segment_id) {
                 if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(self.pool.pool_id(), segment_id, offset));
+                    return Ok(ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    ));
                 }
 
                 // Segment is full — seal it and queue for flush
@@ -202,7 +209,8 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         if !segment.state().is_readable() {
             return None;
@@ -233,7 +241,6 @@ impl IoUringDiskLayer {
         fence(Ordering::Acquire);
 
         let data_ptr = segment.write_buffer_ptr()?;
-        let offset = location.offset();
 
         // Parse header
         if offset as usize + BasicHeader::SIZE > segment.capacity() {
@@ -299,7 +306,8 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         if !segment.state().is_readable() {
             return None;
@@ -329,14 +337,13 @@ impl IoUringDiskLayer {
 
         // Compute block-aligned read range
         let (disk_offset, read_len, item_offset) =
-            self.pool
-                .item_disk_range(location.segment_id(), location.offset(), read_size);
+            self.pool.item_disk_range(segment_id, offset, read_size);
 
         Some(DiskReadParams {
             disk_offset,
             read_len,
             item_offset,
-            segment_id: location.segment_id(),
+            segment_id,
             pool_id: self.pool.pool_id(),
         })
     }
@@ -520,7 +527,13 @@ impl IoUringDiskLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
                         hashtable.remove(key, location.to_location());
                     }
 
@@ -582,8 +595,13 @@ impl IoUringDiskLayer {
                         if let Some(key) = segment.data_slice(key_start as u32, key_len)
                             && !header.is_deleted()
                         {
-                            let location =
-                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                            let location = ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            );
 
                             let verifier = IoUringPoolVerifier { pool: &self.pool };
                             let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -690,7 +708,8 @@ impl Layer for IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
         if !segment.state().is_readable() || !segment.has_write_buffer() {
             return None;
         }
@@ -701,7 +720,7 @@ impl Layer for IoUringDiskLayer {
             return None;
         }
 
-        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
+        let header_info = segment.verify_key_unexpired(offset, key, now)?;
 
         // Build a BasicItemGuard from the write buffer data
         let ref_count_ptr = segment.ref_count_ptr();
@@ -714,7 +733,6 @@ impl Layer for IoUringDiskLayer {
         }
 
         let data_ptr = segment.write_buffer_ptr()?;
-        let offset = location.offset();
 
         let (key_len, optional_len, value_len) = header_info;
 
@@ -754,10 +772,11 @@ impl Layer for IoUringDiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
             // Can only mark deleted if write buffer is present
             if segment.has_write_buffer() {
-                segment.mark_deleted_at_offset(location.offset());
+                segment.mark_deleted_at_offset(offset);
             }
         }
     }
@@ -767,7 +786,7 @@ impl Layer for IoUringDiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let segment = self.pool.get(location.segment_id(self.pool.layout()))?;
         let now = Self::now_secs();
         segment.segment_ttl(now)
     }

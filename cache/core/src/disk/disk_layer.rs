@@ -70,8 +70,9 @@ struct SinglePoolVerifier<'a> {
 impl KeyVerifier for SinglePoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        let layout = self.pool.layout();
+        if let Some(segment) = self.pool.get(item_loc.segment_id(layout)) {
+            segment.verify_key_at_offset(item_loc.offset(layout), key, allow_deleted)
         } else {
             false
         }
@@ -193,7 +194,13 @@ impl DiskLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
                         hashtable.remove(key, location.to_location());
                     }
 
@@ -240,7 +247,13 @@ impl DiskLayer {
                     if let Some(key) = segment.data_slice(key_start as u32, key_len)
                         && !header.is_deleted()
                     {
-                        let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                        let location = ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        );
 
                         let verifier = SinglePoolVerifier { pool: &self.pool };
                         let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -345,7 +358,13 @@ impl Layer for DiskLayer {
 
             if let Some(segment) = self.pool.get(segment_id) {
                 if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(self.pool.pool_id(), segment_id, offset));
+                    return Ok(ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    ));
                 }
 
                 // Segment is full
@@ -368,7 +387,8 @@ impl Layer for DiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         let state = segment.state();
         if !state.is_readable() {
@@ -383,11 +403,9 @@ impl Layer for DiskLayer {
         }
 
         // Verify key matches
-        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
+        let header_info = segment.verify_key_unexpired(offset, key, now)?;
 
-        segment
-            .get_item_verified(location.offset(), header_info)
-            .ok()
+        segment.get_item_verified(offset, header_info).ok()
     }
 
     fn mark_deleted(&self, location: ItemLocation) {
@@ -395,17 +413,15 @@ impl Layer for DiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
-            let offset = location.offset();
-            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
-                && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
-            {
-                let key_start =
-                    offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
-                let key_len = header.key_len() as usize;
-                if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                    let _ = segment.mark_deleted(offset, key);
-                }
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id)
+            && let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
+            && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
+        {
+            let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
+            let key_len = header.key_len() as usize;
+            if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                let _ = segment.mark_deleted(offset, key);
             }
         }
     }
@@ -415,7 +431,7 @@ impl Layer for DiskLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let segment = self.pool.get(location.segment_id(self.pool.layout()))?;
         let now = Self::now_secs();
         segment.segment_ttl(now)
     }
@@ -478,7 +494,13 @@ impl Layer for DiskLayer {
                 if let Some((offset, item_size, value_ptr)) =
                     segment.begin_append(key, value_len, optional)
                 {
-                    let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                    let location = ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    );
                     return Ok((location, value_ptr, item_size));
                 }
 
@@ -500,7 +522,7 @@ impl Layer for DiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        if let Some(segment) = self.pool.get(location.segment_id(self.pool.layout())) {
             segment.finalize_append(item_size);
         }
     }
@@ -510,8 +532,9 @@ impl Layer for DiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
-            segment.mark_deleted_at_offset(location.offset());
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            segment.mark_deleted_at_offset(offset);
         }
     }
 

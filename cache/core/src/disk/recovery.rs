@@ -179,8 +179,13 @@ pub fn warm_from_pool<H: Hashtable>(pool: &FilePool, hashtable: &H, now: u32) ->
 
                             if let Some(key) = segment.data_slice(key_start as u32, key_len) {
                                 // Create location for this item
-                                let location =
-                                    ItemLocation::new(pool.pool_id(), segment_id, offset);
+                                let location = ItemLocation::new(
+                                    pool.layout(),
+                                    pool.pool_id(),
+                                    segment_id,
+                                    segment.incarnation(),
+                                    offset,
+                                );
 
                                 // Insert into hashtable
                                 // Note: We use a dummy verifier since we're rebuilding

@@ -62,6 +62,19 @@ impl CacheLayer {
         dispatch!(self, layer_id())
     }
 
+    /// Get the location layout of this layer's pool.
+    ///
+    /// A location naming this layer's pool must be decoded with it: pools with
+    /// different segment sizes or alignment factors split the bits differently.
+    pub fn layout(&self) -> &crate::location_layout::LocationLayout {
+        match self {
+            CacheLayer::Fifo(layer) => layer.pool().layout(),
+            CacheLayer::Ttl(layer) => layer.pool().layout(),
+            CacheLayer::Disk(layer) => layer.pool().layout(),
+            CacheLayer::IoUringDisk(layer) => layer.pool().layout(),
+        }
+    }
+
     /// Write an item to this layer.
     pub fn write_item(
         &self,
@@ -117,11 +130,12 @@ impl CacheLayer {
                 if location.pool_id() != pool.pool_id() {
                     return None;
                 }
-                let segment = pool.get(location.segment_id())?;
+                let (_, segment_id, _, offset) = location.unpack(pool.layout());
+                let segment = pool.get(segment_id)?;
                 if !segment.state().is_readable() {
                     return None;
                 }
-                segment.get_value_ref_raw(location.offset(), key).ok()
+                segment.get_value_ref_raw(offset, key).ok()
             }};
         }
 
@@ -874,7 +888,7 @@ impl<H: Hashtable> TieredCache<H> {
         let layer = self.layers.get(layer_idx)?;
 
         // Get the segment to retrieve its generation
-        let segment = layer.get_segment(item_loc.segment_id())?;
+        let segment = layer.get_segment(item_loc.segment_id(layer.layout()))?;
         let generation = segment.generation();
 
         // Get value from layer
@@ -908,7 +922,7 @@ impl<H: Hashtable> TieredCache<H> {
         let layer = self.layers.get(layer_idx)?;
 
         // Get the segment to retrieve its generation
-        let segment = layer.get_segment(item_loc.segment_id())?;
+        let segment = layer.get_segment(item_loc.segment_id(layer.layout()))?;
         let generation = segment.generation();
 
         // Call function with value
@@ -958,7 +972,7 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Get the segment to check generation
         let segment = layer
-            .get_segment(item_loc.segment_id())
+            .get_segment(item_loc.segment_id(layer.layout()))
             .ok_or(CacheError::KeyNotFound)?;
         let current_generation = segment.generation();
 
@@ -1564,8 +1578,11 @@ struct CacheKeyVerifier<'a> {
 impl KeyVerifier for CacheKeyVerifier<'_> {
     #[inline(always)]
     fn prefetch(&self, location: Location) {
-        // Unpack location to get segment and offset
-        let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
+        // pool_id sits at a fixed position and decodes without a layout; the
+        // rest of the split is per-pool, so resolve the pool first and let its
+        // layout decode segment_id and offset.
+        let item_loc = ItemLocation::from_location(location);
+        let pool_id = item_loc.pool_id();
 
         // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
         // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
@@ -1576,18 +1593,21 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
         // Get data pointer based on pool type
         let ptr = match pool_ref {
             PoolRef::Memory(pool) => {
+                let (_, segment_id, _, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return;
                 };
                 unsafe { segment.data_ptr().add(offset as usize) }
             }
             PoolRef::Disk(pool) => {
+                let (_, segment_id, _, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return;
                 };
                 unsafe { segment.data_ptr().add(offset as usize) }
             }
             PoolRef::IoUring(pool) => {
+                let (_, segment_id, _, offset) = item_loc.unpack(pool.layout());
                 let Some(meta) = pool.get_meta(segment_id) else {
                     return;
                 };
@@ -1631,8 +1651,11 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
 
     #[inline(always)]
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        // Unpack all location fields in one pass
-        let (pool_id, segment_id, offset) = ItemLocation::from_location(location).unpack();
+        // pool_id sits at a fixed position and decodes without a layout; the
+        // rest of the split is per-pool, so resolve the pool first and let its
+        // layout decode segment_id and offset.
+        let item_loc = ItemLocation::from_location(location);
+        let pool_id = item_loc.pool_id();
 
         // Direct pool lookup - pool_id is 2 bits (0-3), pools is [_; 4]
         // SAFETY: pool_id is extracted from ItemLocation which stores it in 2 bits
@@ -1646,18 +1669,21 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
         // Use verify_key_at_offset from SegmentKeyVerify trait
         match pool_ref {
             PoolRef::Memory(pool) => {
+                let (_, segment_id, _, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return false;
                 };
                 segment.verify_key_at_offset(offset, key, allow_deleted)
             }
             PoolRef::Disk(pool) => {
+                let (_, segment_id, _, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return false;
                 };
                 segment.verify_key_at_offset(offset, key, allow_deleted)
             }
             PoolRef::IoUring(pool) => {
+                let (_, segment_id, _, offset) = item_loc.unpack(pool.layout());
                 let Some(meta) = pool.get_meta(segment_id) else {
                     return false;
                 };

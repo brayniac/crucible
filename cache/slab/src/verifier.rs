@@ -217,12 +217,15 @@ impl<'a> SlabTieredVerifier<'a> {
         };
 
         let item_loc = ItemLocation::from_location(location);
-        let segment = match disk_pool.get(item_loc.segment_id()) {
+        // The disk pool's own layout: pools with different segment sizes split
+        // the location bits differently.
+        let layout = disk_pool.layout();
+        let segment = match disk_pool.get(item_loc.segment_id(layout)) {
             Some(s) => s,
             None => return false,
         };
 
-        segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        segment.verify_key_at_offset(item_loc.offset(layout), key, allow_deleted)
     }
 }
 

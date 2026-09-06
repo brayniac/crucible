@@ -123,8 +123,13 @@ impl FifoLayer {
                         let key_len = header.key_len() as usize;
 
                         if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                            let location =
-                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                            let location = ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            );
 
                             let verifier = SinglePoolVerifier { pool: &self.pool };
                             let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -197,8 +202,13 @@ impl FifoLayer {
                         let key_len = header.key_len() as usize;
 
                         if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                            let location =
-                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                            let location = ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            );
 
                             let verifier = SinglePoolVerifier { pool: &self.pool };
                             let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -282,8 +292,13 @@ impl FifoLayer {
                         let key_len = header.key_len() as usize;
 
                         if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                            let location =
-                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                            let location = ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            );
 
                             // Get frequency from hashtable
                             let verifier = SinglePoolVerifier { pool: &self.pool };
@@ -371,8 +386,13 @@ impl FifoLayer {
                         let value_len = header.value_len() as usize;
 
                         if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                            let location =
-                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                            let location = ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            );
 
                             // Get frequency from hashtable
                             let verifier = SinglePoolVerifier { pool: &self.pool };
@@ -470,8 +490,13 @@ impl FifoLayer {
                         let value_len = header.value_len() as usize;
 
                         if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                            let location =
-                                ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                            let location = ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            );
 
                             let verifier = SinglePoolVerifier { pool: &self.pool };
                             let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
@@ -537,8 +562,9 @@ struct SinglePoolVerifier<'a> {
 impl KeyVerifier for SinglePoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
-        if let Some(segment) = self.pool.get(item_loc.segment_id()) {
-            segment.verify_key_at_offset(item_loc.offset(), key, allow_deleted)
+        let layout = self.pool.layout();
+        if let Some(segment) = self.pool.get(item_loc.segment_id(layout)) {
+            segment.verify_key_at_offset(item_loc.offset(layout), key, allow_deleted)
         } else {
             false
         }
@@ -582,7 +608,13 @@ impl Layer for FifoLayer {
                 // Try to append with per-item TTL
                 if let Some(offset) = segment.append_item_with_ttl(key, value, optional, expire_at)
                 {
-                    return Ok(ItemLocation::new(self.pool.pool_id(), segment_id, offset));
+                    return Ok(ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    ));
                 }
 
                 // Segment is full, need to allocate a new one
@@ -600,7 +632,8 @@ impl Layer for FifoLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
 
         // Check segment state
         let state = segment.state();
@@ -610,12 +643,10 @@ impl Layer for FifoLayer {
 
         // Verify key matches and check expiration in one parse (before acquiring ref count)
         let now = Self::now_secs();
-        let header_info = segment.verify_key_unexpired(location.offset(), key, now)?;
+        let header_info = segment.verify_key_unexpired(offset, key, now)?;
 
         // Get item using pre-verified header info (single parse path)
-        segment
-            .get_item_verified(location.offset(), header_info)
-            .ok()
+        segment.get_item_verified(offset, header_info).ok()
     }
 
     fn mark_deleted(&self, location: ItemLocation) {
@@ -623,11 +654,11 @@ impl Layer for FifoLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
             // We need the key to mark deleted, but we don't have it here.
             // This is a limitation - mark_deleted needs to be called with key.
             // For now, we skip the key verification by getting it from the segment.
-            let offset = location.offset();
             if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE)
                 && let Some(header) = unsafe { TtlHeader::try_from_ptr(data) }
             {
@@ -645,9 +676,10 @@ impl Layer for FifoLayer {
             return None;
         }
 
-        let segment = self.pool.get(location.segment_id())?;
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let segment = self.pool.get(segment_id)?;
         let now = Self::now_secs();
-        segment.item_ttl(location.offset(), now)
+        segment.item_ttl(offset, now)
     }
 
     fn evict<H: Hashtable>(&self, hashtable: &H) -> bool {
@@ -720,7 +752,13 @@ impl Layer for FifoLayer {
                 if let Some((offset, item_size, value_ptr)) =
                     segment.begin_append_with_ttl(key, value_len, optional, expire_at)
                 {
-                    let location = ItemLocation::new(self.pool.pool_id(), segment_id, offset);
+                    let location = ItemLocation::new(
+                        self.pool.layout(),
+                        self.pool.pool_id(),
+                        segment_id,
+                        segment.incarnation(),
+                        offset,
+                    );
                     return Ok((location, value_ptr, item_size));
                 }
 
@@ -737,7 +775,7 @@ impl Layer for FifoLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
+        if let Some(segment) = self.pool.get(location.segment_id(self.pool.layout())) {
             segment.finalize_append(item_size);
         }
     }
@@ -747,8 +785,9 @@ impl Layer for FifoLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id()) {
-            segment.mark_deleted_at_offset(location.offset());
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            segment.mark_deleted_at_offset(offset);
         }
     }
 
@@ -941,6 +980,41 @@ mod tests {
     }
 
     #[test]
+    fn test_written_location_carries_the_segments_incarnation() {
+        let layer = create_test_layer();
+        let pool = layer.pool();
+
+        // A fresh pool hands out incarnation 0, and a location stamped with a
+        // hardcoded 0 would match that by accident. Cycle every segment through
+        // a used incarnation first, so whichever one the layer picks for the
+        // write carries a non-zero tag.
+        let ids: Vec<u32> = (0..pool.segment_count())
+            .map(|_| pool.reserve().expect("pool must have a free segment"))
+            .collect();
+        for &id in &ids {
+            let segment = pool.get(id).expect("segment id came from the pool");
+            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
+            pool.release(id);
+            assert_ne!(segment.incarnation(), 0, "leaving Locked must bump the tag");
+        }
+
+        let location = layer
+            .write_item(b"key", b"value", b"", Duration::from_secs(3600))
+            .expect("write must succeed");
+
+        let (_, segment_id, incarnation, _) = location.unpack(pool.layout());
+        assert_ne!(
+            incarnation, 0,
+            "the published tag must come from the segment, not a constant"
+        );
+        assert_eq!(
+            incarnation,
+            pool.get(segment_id).unwrap().incarnation(),
+            "a location must carry the tag of the segment its item was written into"
+        );
+    }
+
+    #[test]
     fn test_layer_creation() {
         let layer = create_test_layer();
         assert_eq!(layer.layer_id(), 0);
@@ -1048,7 +1122,11 @@ mod tests {
             .unwrap();
 
         // Create a location with wrong pool_id (must be 0-3)
-        let wrong_location = ItemLocation::new(1, location.segment_id(), location.offset());
+        // Same segment, same incarnation -- only the pool is wrong, which is
+        // what this test is about.
+        let layout = layer.pool().layout();
+        let (_, segment_id, incarnation, offset) = location.unpack(layout);
+        let wrong_location = ItemLocation::new(layout, 1, segment_id, incarnation, offset);
 
         let guard = layer.get_item(wrong_location, key);
         assert!(guard.is_none());
@@ -1095,7 +1173,11 @@ mod tests {
             .unwrap();
 
         // Pool_id must be 0-3, use 1 which is different from layer's pool_id of 0
-        let wrong_location = ItemLocation::new(1, location.segment_id(), location.offset());
+        // Same segment, same incarnation -- only the pool is wrong, which is
+        // what this test is about.
+        let layout = layer.pool().layout();
+        let (_, segment_id, incarnation, offset) = location.unpack(layout);
+        let wrong_location = ItemLocation::new(layout, 1, segment_id, incarnation, offset);
         let ttl = layer.item_ttl(wrong_location);
         assert!(ttl.is_none());
     }
@@ -1110,7 +1192,11 @@ mod tests {
             .unwrap();
 
         // Pool_id must be 0-3, use 1 which is different from layer's pool_id of 0
-        let wrong_location = ItemLocation::new(1, location.segment_id(), location.offset());
+        // Same segment, same incarnation -- only the pool is wrong, which is
+        // what this test is about.
+        let layout = layer.pool().layout();
+        let (_, segment_id, incarnation, offset) = location.unpack(layout);
+        let wrong_location = ItemLocation::new(layout, 1, segment_id, incarnation, offset);
         // Should not panic, just be a no-op
         layer.mark_deleted(wrong_location);
     }
@@ -1152,8 +1238,9 @@ mod tests {
         let loc3 = layer.write_item(b"key3", b"value3", b"", ttl).unwrap();
 
         // All items should be in the same segment (FIFO chain)
-        assert_eq!(loc1.segment_id(), loc2.segment_id());
-        assert_eq!(loc2.segment_id(), loc3.segment_id());
+        let layout = layer.pool().layout();
+        assert_eq!(loc1.segment_id(layout), loc2.segment_id(layout));
+        assert_eq!(loc2.segment_id(layout), loc3.segment_id(layout));
 
         // All items should be retrievable
         assert!(layer.get_item(loc1, b"key1").is_some());
@@ -1323,7 +1410,7 @@ mod tests {
         let layer = create_test_layer();
 
         // Create a location with an invalid segment ID
-        let invalid_location = ItemLocation::new(0, 999, 0);
+        let invalid_location = ItemLocation::new(layer.pool().layout(), 0, 999, 0, 0);
         let guard = layer.get_item(invalid_location, b"key");
         assert!(guard.is_none());
     }
@@ -1333,7 +1420,7 @@ mod tests {
         let layer = create_test_layer();
 
         // Create a location with an invalid segment ID
-        let invalid_location = ItemLocation::new(0, 999, 0);
+        let invalid_location = ItemLocation::new(layer.pool().layout(), 0, 999, 0, 0);
         let ttl = layer.item_ttl(invalid_location);
         assert!(ttl.is_none());
     }
@@ -1343,7 +1430,7 @@ mod tests {
         let layer = create_test_layer();
 
         // Create a location with an invalid segment ID
-        let invalid_location = ItemLocation::new(0, 999, 0);
+        let invalid_location = ItemLocation::new(layer.pool().layout(), 0, 999, 0, 0);
         // Should not panic, just be a no-op
         layer.mark_deleted(invalid_location);
     }
