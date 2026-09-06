@@ -810,11 +810,11 @@ impl Drop for BasicItemGuard<'_> {
 
             if meta.state == State::AwaitingRelease {
                 // Transition to Free and push to free queue
-                let new_meta = Metadata {
-                    next: INVALID_SEGMENT_ID,
-                    prev: INVALID_SEGMENT_ID,
-                    state: State::Free,
-                };
+                // Preserve the incarnation carried by the metadata we just
+                // loaded; Task 3 decides which transitions bump.
+                let new_meta = meta
+                    .with_state(State::Free)
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
 
                 if self
                     .metadata

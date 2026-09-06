@@ -411,11 +411,8 @@ impl Segment for DiskSegmentMeta {
         let next = new_next.unwrap_or(meta.next);
         let prev = new_prev.unwrap_or(meta.prev);
 
-        let new_meta = Metadata {
-            next,
-            prev,
-            state: new_state,
-        };
+        // Preserve the incarnation: a chain/state CAS never ends one.
+        let new_meta = meta.with_state(new_state).with_chain_ids(next, prev);
 
         self.metadata
             .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)

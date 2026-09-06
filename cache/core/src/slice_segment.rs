@@ -156,11 +156,9 @@ impl<'a> SliceSegment<'a> {
                 0
             };
 
-        let initial_meta = Metadata {
-            next: INVALID_SEGMENT_ID,
-            prev: INVALID_SEGMENT_ID,
-            state: State::Free,
-        };
+        // A brand-new segment: this is the one site that legitimately starts
+        // the incarnation counter at zero.
+        let initial_meta = Metadata::new(State::Free);
 
         Self {
             metadata: AtomicU64::new(initial_meta.pack()),
@@ -859,11 +857,10 @@ impl Segment for SliceSegment<'_> {
             return false;
         }
 
-        let new_meta = Metadata {
-            next: INVALID_SEGMENT_ID,
-            prev: INVALID_SEGMENT_ID,
-            state: State::Reserved,
-        };
+        // Preserve the incarnation: reserving does not end one.
+        let new_meta = current_meta
+            .with_state(State::Reserved)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
 
         match self.metadata.compare_exchange(
             current_packed,
@@ -901,11 +898,10 @@ impl Segment for SliceSegment<'_> {
                 }
             }
 
-            let new_meta = Metadata {
-                next: INVALID_SEGMENT_ID,
-                prev: INVALID_SEGMENT_ID,
-                state: State::Free,
-            };
+            // Preserve the incarnation; Task 3 decides which transitions bump.
+            let new_meta = current_meta
+                .with_state(State::Free)
+                .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
 
             match self.metadata.compare_exchange(
                 current_packed,
@@ -941,11 +937,11 @@ impl Segment for SliceSegment<'_> {
             return false;
         }
 
-        let new_meta = Metadata {
-            state: new_state,
-            next: new_next.unwrap_or(current_meta.next),
-            prev: new_prev.unwrap_or(current_meta.prev),
-        };
+        // Preserve the incarnation: a chain/state CAS never ends one.
+        let new_meta = current_meta.with_state(new_state).with_chain_ids(
+            new_next.unwrap_or(current_meta.next),
+            new_prev.unwrap_or(current_meta.prev),
+        );
 
         self.metadata
             .compare_exchange(
@@ -1343,12 +1339,11 @@ impl SliceSegment<'_> {
             .store(Self::INVALID_BUCKET_ID, Ordering::Relaxed);
         self.merge_count.store(0, Ordering::Relaxed);
 
-        // Set state to Free with invalid chain pointers
-        let free_meta = Metadata {
-            next: INVALID_SEGMENT_ID,
-            prev: INVALID_SEGMENT_ID,
-            state: State::Free,
-        };
+        // Set state to Free with invalid chain pointers, preserving the
+        // incarnation carried by the current metadata.
+        let free_meta = Metadata::unpack(self.metadata.load(Ordering::Acquire))
+            .with_state(State::Free)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
         self.metadata.store(free_meta.pack(), Ordering::Release);
     }
 
@@ -1368,11 +1363,10 @@ impl SliceSegment<'_> {
             return false;
         }
 
-        let new_meta = Metadata {
-            next: INVALID_SEGMENT_ID,
-            prev: INVALID_SEGMENT_ID,
-            state: State::Free,
-        };
+        // Preserve the incarnation; Task 3 decides which transitions bump.
+        let new_meta = current_meta
+            .with_state(State::Free)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID);
 
         if self
             .metadata
@@ -1652,6 +1646,68 @@ mod tests {
         assert!(segment.try_release());
         assert!(segment.try_reserve());
         assert_eq!(segment.generation(), 2);
+
+        unsafe {
+            free_test_segment(ptr, layout);
+        }
+    }
+
+    /// Every metadata transition must carry the incarnation forward.
+    ///
+    /// Seeds a nonzero tag and drives each transition site. A site that rebuilt
+    /// `Metadata` from scratch would silently reset the tag to 0, and stale
+    /// `Location`s naming this segment would start resolving again -- exactly
+    /// the aliasing the tag exists to prevent. Nothing bumps the tag yet, so a
+    /// reset is invisible without seeding one first.
+    #[test]
+    fn test_segment_transitions_preserve_incarnation() {
+        const TAG: u8 = 0x2A;
+
+        fn incarnation_of(seg: &SliceSegment<'_>) -> u8 {
+            Metadata::unpack(seg.metadata.load(Ordering::Acquire)).incarnation
+        }
+
+        fn seed(seg: &SliceSegment<'_>, tag: u8) {
+            let cur = Metadata::unpack(seg.metadata.load(Ordering::Acquire));
+            seg.metadata.store(
+                Metadata {
+                    incarnation: tag,
+                    ..cur
+                }
+                .pack(),
+                Ordering::Release,
+            );
+        }
+
+        let (segment, ptr, layout) = create_test_segment(0, false, 0, 1024);
+        assert_eq!(incarnation_of(&segment), 0, "a fresh segment starts at 0");
+
+        seed(&segment, TAG);
+
+        // Free -> Reserved
+        assert!(segment.try_reserve());
+        assert_eq!(incarnation_of(&segment), TAG, "try_reserve reset the tag");
+
+        // Reserved -> Linking, with chain pointers rewritten
+        assert!(segment.cas_metadata(State::Reserved, State::Linking, Some(7), Some(9)));
+        assert_eq!(incarnation_of(&segment), TAG, "cas_metadata reset the tag");
+
+        // Linking -> Free
+        assert!(segment.try_release());
+        assert_eq!(incarnation_of(&segment), TAG, "try_release reset the tag");
+
+        // AwaitingRelease -> Free
+        assert!(segment.cas_metadata(State::Free, State::AwaitingRelease, None, None));
+        assert!(SliceSegment::release_condemned(&segment));
+        assert_eq!(
+            incarnation_of(&segment),
+            TAG,
+            "release_condemned reset the tag"
+        );
+
+        // Bulk pool reset
+        segment.force_free();
+        assert_eq!(incarnation_of(&segment), TAG, "force_free reset the tag");
 
         unsafe {
             free_test_segment(ptr, layout);
