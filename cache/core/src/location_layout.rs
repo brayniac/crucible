@@ -395,17 +395,34 @@ mod tests {
     fn every_accepted_layout_can_represent_its_own_widest_offset() {
         // Guards the truncation the u32 bound exists to prevent: if `new`
         // accepts a layout, packing its widest offset must round-trip.
+        //
+        // The list MUST contain a size past the 4 GiB boundary. 4 GiB is where
+        // offset_bits + align_shift == 32 exactly -- still representable -- so a
+        // list stopping there never constructs a truncating layout and the test
+        // cannot go red when the bound is removed. 8 GiB is the first size that
+        // `new` would wrongly accept without it.
         for segment_size in [
             1024 * 1024usize,
             8 * 1024 * 1024,
             128 * 1024 * 1024,
             4 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
         ] {
             for align in [8usize, 512] {
                 let Ok(layout) = LocationLayout::new(segment_size, align) else {
                     continue;
                 };
-                let widest = ((1u32 << layout.offset_bits()) - 1) * layout.align_bytes();
+
+                // Computed in u64 on purpose: in u32 this multiply would itself
+                // overflow and panic, reddening the test for the wrong reason.
+                let widest = ((1u64 << layout.offset_bits()) - 1) * layout.align_bytes() as u64;
+                assert!(
+                    widest <= u32::MAX as u64,
+                    "segment_size {segment_size} align {align} was accepted but \
+                     addresses past u32 (widest offset {widest})"
+                );
+
+                let widest = widest as u32;
                 assert_eq!(
                     layout.offset(layout.pack(0, 0, 0, widest)),
                     widest,
