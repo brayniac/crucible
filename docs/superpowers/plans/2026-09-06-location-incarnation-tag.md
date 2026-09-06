@@ -954,7 +954,12 @@ than encoding it."
 
 ### Task 2: `Metadata` carries the incarnation
 
-Adding a field to `Metadata` deliberately breaks every struct-literal site at compile time, so the compiler enumerates the places that must decide whether to preserve or bump. Do not add a `Default`.
+Adding a field to `Metadata` deliberately breaks every struct-literal site at compile time. Do not add a `Default`.
+
+**The compiler does NOT enumerate every site.** It catches struct literals only;
+`Metadata::new(state)` calls compile clean and silently zero the tag. Six live
+transition sites take that form and are handled in Task 2b, which must land
+before Task 3 introduces any bump.
 
 **Files:**
 - Modify: `cache/core/src/state.rs:186-260`
@@ -1195,6 +1200,168 @@ Puts the tag in the packed word's unused byte so bumping it is atomic with
 the state transition. Adding the field deliberately breaks every struct
 literal, forcing each transition site to say whether it preserves or bumps;
 with_state and with_chain_ids are the preserving forms."
+```
+
+---
+
+### Task 2b: the six transition sites the compiler could not catch
+
+Task 2's premise was incomplete. Adding the field breaks struct *literals*, but
+`Metadata::new(state)` compiles clean and returns incarnation 0, so six live
+transitions silently reset the tag.
+
+This is harmless **only** while nothing bumps. It becomes a real aliasing bug the
+moment Task 3 lands, and `disk_segment_meta.rs`'s `try_reserve` is the worst of
+them: a `Free -> Reserved` reset would wipe a tag that was just advanced by the
+release which freed the segment.
+
+Every one of these sites already loads the metadata it needs on the line above,
+so each is a one-line change -- except `reset`, which stores unconditionally and
+needs a load added, exactly as `force_free` did in Task 2.
+
+**Files:** Modify `cache/core/src/cache_trait.rs`, `cache/core/src/disk/disk_segment_meta.rs`
+
+- [ ] **Step 1: Write the failing test**
+
+The `SliceSegment` twin of this test already exists from Task 2
+(`test_segment_transitions_preserve_incarnation`). The disk path has no
+equivalent, which is why these six went unnoticed. Add to the `tests` module in
+`cache/core/src/disk/disk_segment_meta.rs`, following that test's shape and
+whatever segment-construction helper the neighbouring tests there already use:
+
+```rust
+    /// Every disk-segment transition must carry the incarnation forward.
+    ///
+    /// `Metadata::new` zeroes it and compiles clean, so nothing but this test
+    /// stands between a refactor and a silently reset tag -- which resurrects
+    /// stale locations rather than failing loudly.
+    #[test]
+    fn test_disk_segment_transitions_preserve_incarnation() {
+        let (meta, _pool) = make_disk_segment_meta(4096);
+
+        // Seed a non-zero tag directly, the way a prior incarnation's release
+        // would have left it.
+        let seeded = Metadata::unpack(meta.metadata.load(Ordering::Acquire))
+            .with_state(State::Free);
+        meta.metadata
+            .store(Metadata { incarnation: 42, ..seeded }.pack(), Ordering::Release);
+
+        assert!(meta.try_reserve());
+        assert_eq!(meta.incarnation_for_test(), 42, "try_reserve reset the tag");
+
+        assert!(meta.try_release());
+        assert_eq!(meta.incarnation_for_test(), 42, "try_release reset the tag");
+
+        assert!(meta.try_reserve());
+        assert!(meta.cas_metadata(State::Reserved, State::AwaitingRelease, None, None));
+        assert!(meta.release_condemned());
+        assert_eq!(
+            meta.incarnation_for_test(),
+            42,
+            "release_condemned reset the tag"
+        );
+
+        assert!(meta.try_reserve());
+        meta.reset();
+        assert_eq!(meta.incarnation_for_test(), 42, "reset cleared the tag");
+    }
+```
+
+`incarnation_for_test` is a private test helper reading
+`Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation` -- Task 3
+adds the real `Segment::incarnation()` trait method, and this task must not
+anticipate it.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `cargo test -p cache-core --lib disk_segment_meta::tests::test_disk_segment_transitions_preserve_incarnation`
+Expected: FAIL with `try_reserve reset the tag`, left `0`, right `42`.
+
+- [ ] **Step 3: Fix all six sites**
+
+Each replaces `Metadata::new(State::X)` with `.with_state(State::X)` on the
+metadata already in hand:
+
+| File | Line | Site | Transition |
+|---|---|---|---|
+| `cache_trait.rs` | 231 | guard `drop` | `AwaitingRelease -> Free` |
+| `disk/disk_segment_meta.rs` | 365 | `try_reserve` | `Free -> Reserved` |
+| `disk/disk_segment_meta.rs` | 388 | `try_release` | `Reserved\|Linking\|Locked -> Free` |
+| `disk/disk_segment_meta.rs` | 437 | `release_condemned` | `AwaitingRelease -> Free` |
+| `disk/disk_segment_meta.rs` | 767 | `reset` | `* -> Free` |
+
+That is five; the sixth is whichever remaining `Metadata::new` call in a
+non-test transition path the compiler-independent audit in Step 4 turns up.
+
+For example, `cache_trait.rs:231` already has `meta` from the line above:
+
+```rust
+            if meta.state == State::AwaitingRelease {
+                // Preserve the incarnation: freeing a condemned segment is
+                // Task 3's business, and zeroing here would resurrect stale
+                // locations naming this segment.
+                let new_meta = meta.with_state(State::Free);
+```
+
+and `disk_segment_meta.rs:767` `reset` needs the load added:
+
+```rust
+        let current = Metadata::unpack(self.metadata.load(Ordering::Acquire));
+        let new_meta = current.with_state(State::Free);
+        self.metadata.store(new_meta.pack(), Ordering::Release);
+```
+
+- [ ] **Step 4: Audit for any site the table missed**
+
+The compiler cannot find these, so grep and classify every one by hand:
+
+```bash
+grep -rn "Metadata::new\|Metadata::with_chain" --include='*.rs' cache/
+```
+
+For each hit, decide: is it constructing a brand-new segment (correct to zero),
+or seeding a test's metadata word (correct to zero), or a state transition on a
+live segment (**must preserve**)? Report the full classified list. There are 23
+`Metadata::new` and 2 `Metadata::with_chain` call sites; most are test setup.
+
+- [ ] **Step 5: Sharpen the doc comment so the next reader is warned**
+
+`Metadata::new`'s doc currently says transitions must carry the incarnation
+forward, while six call sites did the opposite. Make the hazard explicit:
+
+```rust
+    /// Create metadata for a brand-new segment: no chain links, incarnation 0.
+    ///
+    /// # This is not a transition
+    ///
+    /// Zeroing the incarnation is correct **only** when constructing a segment
+    /// that has never been used, or when seeding a test's metadata word.
+    /// Calling this on a live segment silently resets its tag, which
+    /// resurrects every stale location naming it -- and unlike a struct
+    /// literal, it compiles clean. For a state change use `with_state`.
+```
+
+- [ ] **Step 6: Verify and prove red**
+
+Run: `cargo test -p cache-core --lib`
+Expected: PASS, 446 (445 plus this test).
+
+Re-break one site -- revert `disk_segment_meta.rs:365` `try_reserve` to
+`Metadata::new(State::Reserved)` -- and confirm the new test fails with
+`try_reserve reset the tag`. Restore it and quote the failure text.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add cache/core/src/cache_trait.rs cache/core/src/disk/disk_segment_meta.rs
+git commit -m "fix(cache-core): preserve the incarnation across disk-segment transitions
+
+Task 2 assumed adding the field made the compiler enumerate every site. It
+enumerates struct literals only -- Metadata::new(state) compiles clean and
+returns incarnation 0, and six live transitions took that form.
+
+No effect yet, since nothing bumps until Task 3. Landing it first so the
+bump cannot be introduced on top of a silent reset."
 ```
 
 ---
