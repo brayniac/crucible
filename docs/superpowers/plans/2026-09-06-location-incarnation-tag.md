@@ -508,6 +508,312 @@ justifies coarsening disk alignment."
 
 ---
 
+### Task 1b: fixes from the Task 1 code-quality review
+
+The review found a Critical plus four Important issues. C1 is the third instance
+of one defect class in this module -- **an unvalidated bound on a derived
+shift** -- so it must be closed before Tasks 2-9 wire the type into pools, where
+a wrong-but-`Ok` layout surfaces as an inexplicable pool-construction failure
+rather than a layout error.
+
+**Files:** Modify `cache/core/src/location_layout.rs`, `cache/core/src/lib.rs`
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to the `tests` module:
+
+```rust
+    #[test]
+    fn rejects_segments_with_too_few_addressable_slots() {
+        // The floor, mirroring the u32 ceiling. `segment_id` is a u32
+        // throughout the crate, so a layout leaving more than 31 segment-id
+        // bits is meaningless -- and `1u32 << seg_bits` overflows computing
+        // `max_segment_count()`. A 4 KiB disk segment at the 512-byte disk
+        // default lands here, and 4 KiB is exactly the block size the design
+        // names, so this is reachable rather than theoretical.
+        assert!(matches!(
+            LocationLayout::new(4096, 512),
+            Err(LayoutError::SegmentTooSmall { .. })
+        ));
+        assert!(matches!(
+            LocationLayout::new(8192, 512),
+            Err(LayoutError::SegmentTooSmall { .. })
+        ));
+        assert!(LocationLayout::new(16 * 1024, 512).is_ok());
+
+        // The degenerate align == segment_size case is subsumed by the same
+        // floor: it derives offset_bits 0, hence seg_bits 36.
+        assert!(matches!(
+            LocationLayout::new(4 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
+            Err(LayoutError::SegmentTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn every_accepted_layout_has_computable_fields() {
+        // Companion to `every_accepted_layout_can_represent_its_own_widest_offset`
+        // at the other end: if `new` accepts a layout, every derived quantity
+        // must be computable rather than overflowing a shift.
+        for segment_size in [
+            4096usize,
+            8192,
+            16 * 1024,
+            64 * 1024,
+            1024 * 1024,
+            8 * 1024 * 1024,
+            128 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ] {
+            for align in [8usize, 512, 4096] {
+                let Ok(layout) = LocationLayout::new(segment_size, align) else {
+                    continue;
+                };
+                assert!(
+                    layout.seg_bits() <= 31,
+                    "segment_size {segment_size} align {align} was accepted with \
+                     {} segment-id bits, which overflows a u32 shift",
+                    layout.seg_bits()
+                );
+                assert!(layout.max_segment_count() > 0);
+                assert_eq!(layout.align_bytes() as usize, align);
+                assert_eq!(layout.offset(layout.pack(0, 0, 0, 0)), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn derives_offset_bits_for_non_power_of_two_segment_sizes() {
+        // `segment_size` is an arbitrary usize from the pool builder, and the
+        // div_ceil/next_power_of_two derivation exists solely for this case --
+        // nothing else pins it. The naive
+        // `segment_size.trailing_zeros() - align_shift` gives 16 here and would
+        // silently truncate most of the segment.
+        let layout = LocationLayout::new(1536 * 1024, 8).unwrap();
+        assert_eq!(layout.offset_bits(), 18);
+
+        let last = 1536 * 1024 - 8;
+        assert_eq!(layout.offset(layout.pack(0, 0, 0, last)), last);
+    }
+
+    #[test]
+    fn segment_too_large_names_the_ceiling_that_actually_fired() {
+        // The message must not advise raising align_bytes: for a power-of-two
+        // segment_size, offset_bits + align_shift is invariant, so coarser
+        // alignment provably cannot get past this ceiling. Advising it sends an
+        // operator down a dead end.
+        let err = LocationLayout::new(8 * 1024 * 1024 * 1024, 8).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("u32"), "message should name the real limit: {msg}");
+        assert!(
+            !msg.contains("raise align_bytes"),
+            "message advises a remedy that cannot work: {msg}"
+        );
+    }
+
+    #[test]
+    fn pool_id_decodes_without_a_layout_instance() {
+        // The module's premise: pool_id is read to CHOOSE a layout, so reading
+        // it must not require already having one.
+        let raw = LocationLayout::new(1024 * 1024, 8).unwrap().pack(2, 5, 0, 0);
+        assert_eq!(LocationLayout::pool_id(raw), 2);
+    }
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cargo test -p cache-core --lib location_layout`
+Expected: FAIL. `rejects_segments_with_too_few_addressable_slots` and
+`every_accepted_layout_has_computable_fields` panic on a shift overflow in
+debug (`attempt to shift left with overflow`);
+`derives_offset_bits_for_non_power_of_two_segment_sizes` passes already (it
+documents existing correct behaviour, and is the regression guard I4 asked
+for); `segment_too_large_names_the_ceiling_that_actually_fired` and
+`pool_id_decodes_without_a_layout_instance` fail to compile or assert.
+
+- [ ] **Step 3: Fix C1 -- add the floor**
+
+Add the variant to `LayoutError`:
+
+```rust
+    /// `segment_size / align_bytes` yields so few offset units that more than
+    /// 31 segment-id bits remain, which a `u32` segment id cannot hold.
+    SegmentTooSmall {
+        /// The rejected segment size.
+        segment_size: usize,
+        /// The alignment factor in force.
+        align: usize,
+        /// Segment-id bits the split would have left.
+        seg_bits: u32,
+    },
+```
+
+and its `Display` arm:
+
+```rust
+            Self::SegmentTooSmall {
+                segment_size,
+                align,
+                seg_bits,
+            } => write!(
+                f,
+                "segment_size ({segment_size}) at align_bytes ({align}) addresses \
+                 too few slots, leaving {seg_bits} segment-id bits -- more than the \
+                 31 a u32 segment id can hold; raise segment_size or lower align_bytes"
+            ),
+```
+
+In `new()`, replace the ceiling block with both bounds:
+
+```rust
+        let align_shift = align_bytes.trailing_zeros();
+
+        // Both fields are u32 in every consumer -- `SliceSegment::capacity`,
+        // `write_offset` and `ItemLocation::new` for the offset, and `segment_id`
+        // for the id -- so a layout that addresses past u32 on either end is
+        // meaningless and must be rejected rather than silently truncated.
+        //
+        // Note the id-space bound (`offset_bits + TAG_BITS >= PAYLOAD_BITS`) is
+        // NOT checked: it is unreachable. `align_bytes >= 8` forces
+        // `align_shift >= 3`, so the offset ceiling below caps `offset_bits` at
+        // 29, well under the 36 that bound would need.
+        if offset_bits + align_shift > 32 {
+            return Err(LayoutError::SegmentTooLarge {
+                segment_size,
+                align: align_bytes,
+                offset_bits,
+            });
+        }
+
+        let seg_bits = PAYLOAD_BITS - TAG_BITS - offset_bits;
+        if seg_bits > 31 {
+            return Err(LayoutError::SegmentTooSmall {
+                segment_size,
+                align: align_bytes,
+                seg_bits,
+            });
+        }
+```
+
+- [ ] **Step 4: Fix I2 -- correct the `SegmentTooLarge` message**
+
+It currently describes the unreachable ceiling and advises a remedy that
+provably cannot work. Replace its `Display` arm:
+
+```rust
+            Self::SegmentTooLarge {
+                segment_size,
+                align,
+                offset_bits,
+            } => write!(
+                f,
+                "segment_size ({segment_size}) at align_bytes ({align}) needs \
+                 {offset_bits} offset bits, and offsets past u32 cannot be \
+                 represented; reduce segment_size. Raising align_bytes does not \
+                 help -- it lowers offset_bits by exactly as much as it raises \
+                 the shift"
+            ),
+```
+
+- [ ] **Step 5: Fix I3 -- range-check `offset` in `pack`**
+
+An out-of-range offset currently overflows into the incarnation field, silently
+corrupting the tag this module exists to protect. Also document the
+`incarnation` masking, and express the `segment_id` bound as a field width (M2)
+so the assert can catch a caller's off-by-one:
+
+```rust
+    /// Pack the four fields into raw location bits.
+    ///
+    /// `incarnation` is masked to 6 bits; the other three are `debug_assert`ed
+    /// in range.
+    #[inline]
+    pub fn pack(&self, pool_id: u8, segment_id: u32, incarnation: u8, offset: u32) -> u64 {
+        debug_assert!(pool_id <= 3, "pool_id must be 0-3");
+        debug_assert!(
+            segment_id < (1u32 << self.seg_bits()),
+            "segment_id {segment_id} exceeds this layout's {}-bit field",
+            self.seg_bits()
+        );
+        debug_assert!(
+            offset.is_multiple_of(self.align_bytes()),
+            "offset must be {}-byte aligned",
+            self.align_bytes()
+        );
+        debug_assert!(
+            (offset >> self.align_shift) < (1u32 << self.offset_bits as u32),
+            "offset {offset} exceeds this layout's {}-bit offset field",
+            self.offset_bits
+        );
+```
+
+`ghost_is_unaliasable` packs the unissuable top segment id deliberately, so it
+must construct that value directly rather than through `pack`:
+
+```rust
+        // Built directly, not via pack: this id is out of the layout's field
+        // range by construction, which is the whole point.
+        let unissuable = ((3u64) << LocationLayout::POOL_SHIFT)
+            | ((layout.max_segment_count() as u64) << (layout.offset_bits() + 6))
+            | ((0x3F as u64) << layout.offset_bits())
+            | ((max_offset >> 3) as u64);
+        assert_eq!(unissuable, crate::location::Location::MAX_RAW);
+```
+
+- [ ] **Step 6: Fix I5 and the minors**
+
+`pool_id` becomes an associated function -- the module's premise is that it is
+read *before* a layout is known:
+
+```rust
+    /// Extract `pool_id`. Layout-independent by design: this is what a decoder
+    /// reads first, to find out which layout decodes the rest.
+    #[inline]
+    pub fn pool_id(raw: u64) -> u8 {
+        ((raw >> Self::POOL_SHIFT) & 0b11) as u8
+    }
+```
+
+Then:
+- **M1:** `pub const POOL_SHIFT: u32 = PAYLOAD_BITS;` so the two cannot drift.
+- **M5:** `io::Error::new(ErrorKind::InvalidInput, e)` instead of `e.to_string()`, so pool builders can `downcast_ref::<LayoutError>()`.
+- **M6:** follow the crate convention `lib.rs` already uses for `Location` -- `mod location_layout;` plus `pub use location_layout::{LayoutError, LocationLayout, TAG_BITS, TAG_MASK};`.
+- **M7:** `#[inline]` rather than `#[inline(always)]` on the accessors. The design doc flags the layout-dependent shifts as an open measurement; forcing inlining removes the compiler's judgment from the exact thing that needs measuring.
+
+- [ ] **Step 7: Verify**
+
+Run: `cargo test -p cache-core --lib location_layout`
+Expected: PASS, 14 tests.
+
+Run: `cargo test -p cache-core --lib`, `cargo clippy -p cache-core --all-targets -- -D warnings`, `cargo fmt`
+Expected: all clean.
+
+- [ ] **Step 8: Prove the floor red**
+
+Remove the `seg_bits > 31` rejection and confirm BOTH
+`rejects_segments_with_too_few_addressable_slots` and
+`every_accepted_layout_has_computable_fields` fail. Restore it. Quote the
+observed failure text in the commit message.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add cache/core/src/location_layout.rs cache/core/src/lib.rs
+git commit -m "fix(cache-core): bound LocationLayout on both ends, not just the ceiling
+
+Third instance of one defect class in this module: an unvalidated bound on a
+derived shift. seg_bits is 36 - offset_bits, so a small segment leaves more
+than 31 segment-id bits and 1u32 << seg_bits overflows -- reachable with a
+4 KiB disk segment at the 512-byte disk default.
+
+Also: the id-space ceiling was dead code (align_bytes >= 8 caps offset_bits
+at 29), and its message misdescribed the live ceiling while advising a remedy
+that provably cannot work. pack now range-checks offset, which previously
+overflowed into the incarnation field -- silently corrupting the very tag this
+module exists to protect."
+```
+
+---
+
 ### Task 2: `Metadata` carries the incarnation
 
 Adding a field to `Metadata` deliberately breaks every struct-literal site at compile time, so the compiler enumerates the places that must decide whether to preserve or bump. Do not add a `Default`.
