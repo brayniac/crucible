@@ -3448,6 +3448,63 @@ mod loom_tests {
         witness.assert_reached();
     }
 
+    /// A reader holding a location races the recycle of the segment it names,
+    /// which is then REFILLED WITH THE SAME KEY.
+    ///
+    /// This is the hazard the fixture's module header used to record as
+    /// unmodellable, and the same-key refill is the whole point: the occupant
+    /// check has nothing to say, because the bytes really do spell the key
+    /// again. Only the incarnation tag can tell the reader that the item it
+    /// would resolve to belongs to a later incarnation than its location does.
+    ///
+    /// The property is asserted where the decision is made, not on the value
+    /// the reader got back. A location the reader resolved BEFORE the bump was
+    /// legitimately live at that instant, so re-checking it after the join
+    /// would fail for interleavings that are perfectly correct. What must never
+    /// happen is that `verify` accepts a location whose tag has already
+    /// advanced, and the oracle counts exactly that.
+    #[test]
+    fn loom_stale_location_never_resolves_to_the_new_occupant() {
+        let witness = KeyOracle::arm_hazard_witness();
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+
+            oracle.place(SRC, KEY);
+            let stale = KeyOracle::location(SRC);
+            ht_insert(&ht, KEY, stale, &*oracle).expect("seed insert must find a slot");
+
+            let oracle_w = oracle.clone();
+            let recycler = thread::spawn(move || {
+                // The order production uses: the tag advances as the segment
+                // leaves `Locked`, and the new item is appended afterwards.
+                oracle_w.bump_incarnation(SRC);
+                oracle_w.place(SRC, KEY);
+            });
+
+            let ht_r = ht.clone();
+            let oracle_r = oracle.clone();
+            let reader = thread::spawn(move || ht_lookup(&ht_r, KEY, &*oracle_r));
+
+            let observed = reader.join().unwrap();
+            recycler.join().unwrap();
+
+            assert_eq!(
+                KeyOracle::stale_accepts(),
+                0,
+                "a location from a superseded incarnation resolved to the new \
+                 occupant"
+            );
+            if let Some((loc, _freq)) = observed {
+                assert_eq!(
+                    loc, stale,
+                    "a resolved location must be the one we published"
+                );
+            }
+        });
+        witness.assert_stale_incarnation_reached();
+    }
+
     #[test]
     fn loom_lookup_survives_relocation() {
         read_survives_relocation(|ht, oracle| ht_lookup(ht, KEY, oracle).is_some());
