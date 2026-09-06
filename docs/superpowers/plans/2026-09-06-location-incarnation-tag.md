@@ -925,7 +925,7 @@ capability the pool builders in Task 5 may rely on, and nothing pins it:
 - [ ] **Step 6: Verify and prove red**
 
 Run: `cargo test -p cache-core --lib location_layout`
-Expected: PASS, 18 tests.
+Expected: PASS, 17 tests (three new; N2/N3/N5 modify existing tests).
 
 Prove each new guard red: delete `pack`'s offset assert and confirm
 `pack_rejects_an_offset_past_the_offset_field` fails; loosen the `segment_id`
