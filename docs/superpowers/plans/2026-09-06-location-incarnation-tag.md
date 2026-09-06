@@ -2531,48 +2531,83 @@ bytes per disk item, which is the trade this was chosen for."
 
 ### Task 7: The check, and a test that recycles
 
-**Files:**
-- Modify: `cache/core/src/cache.rs:1559-1670` (`CacheKeyVerifier`)
-- Modify: `cache/core/src/item_location.rs` (`SinglePoolVerifier`, `MultiPoolVerifier`)
-- Test: `cache/core/src/cache.rs` tests module
+> **Rewritten 2026-09-06.** The original named four verifier sites. There are
+> **nine** production `KeyVerifier` impls that resolve a segment location, and a
+> missed one is a hole the whole feature leaks through -- that verifier keeps
+> resolving stale locations with nothing to indicate it. Same undercount shape
+> as Task 2b's `Metadata::new` sites and Task 6's unnamed publish sites.
+
+This is the task the entire plan exists for. Everything so far has been
+plumbing: the tag is carved out of the location, stamped at publish, and bumped
+when an incarnation ends. **Nothing reads it yet.**
+
+#### Prerequisite: the check belongs on `SegmentKeyVerify`
+
+`SinglePoolVerifier` and `MultiPoolVerifier` in `item_location.rs` are generic
+over `S: SegmentKeyVerify`, but `incarnation()` currently lives on `Segment`.
+Rather than widen those bounds to `Segment` -- which would defeat the point of
+`SegmentKeyVerify` being minimal so that types without full segment access can
+still back a hashtable -- **move the method onto `SegmentKeyVerify`**:
+
+```rust
+pub trait SegmentKeyVerify {
+    /// The incarnation tag this segment currently carries.
+    ///
+    /// A location whose tag differs names a previous incarnation of this
+    /// segment and must not be resolved: the segment has been drained and
+    /// refilled, and the offset now holds a different item.
+    ///
+    /// This lives here rather than on `Segment` because it is part of deciding
+    /// whether a location verifies, and the hashtable's verifiers are generic
+    /// over this trait alone.
+    fn incarnation(&self) -> u8;
+
+    fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool;
+    // ... existing methods unchanged
+}
+```
+
+`Segment: SegmentKeyVerify`, so remove the duplicate declaration from `Segment`
+and leave the three impls where they are.
+
+**Files:** `cache/core/src/segment.rs`, `cache.rs`, `item_location.rs`,
+`layer/fifo_layer.rs`, `layer/ttl_layer.rs`, `disk/disk_layer.rs`,
+`disk/io_uring_layer.rs`, `cache/slab/src/verifier.rs`, `cache/heap/src/verifier.rs`
 
 - [ ] **Step 1: Write the failing test**
-
-Add to the `tests` module in `cache/core/src/cache.rs`:
 
 ```rust
     /// A location held across a segment recycle must stop resolving.
     ///
-    /// Without the tag this is the crucible#88 hazard: segments are append-only
-    /// from a fixed start, so with uniform item sizes the n-th item of every
-    /// incarnation lands at the same offset, and a stale location silently
-    /// resolves to a different item at the same address.
+    /// This is the crucible#88 hazard. Segments are append-only from a fixed
+    /// start, so with uniform item sizes the n-th item of every incarnation
+    /// lands at the same offset -- a stale location does not merely point at
+    /// free space, it points at a *different live item*.
     #[test]
     fn test_stale_location_is_rejected_after_recycle() {
         let cache = build_small_test_cache();
-        let verifier = cache.key_verifier();
 
         cache.set(b"key", b"value", None, Duration::from_secs(60)).unwrap();
         let stale = cache.locate(b"key").expect("key should be present");
 
         // Sanity: it resolves now, so a later rejection means something.
         assert!(
-            verifier.verify(b"key", stale.to_location(), false),
-            "location must resolve before the recycle"
+            cache.verifier().verify(b"key", stale.to_location(), false),
+            "the location must resolve before any recycle"
         );
 
         let mut rejections = 0usize;
         for _ in 0..64 {
             cache.flush();
             cache.set(b"key", b"value", None, Duration::from_secs(60)).unwrap();
-            if !verifier.verify(b"key", stale.to_location(), false) {
+            if !cache.verifier().verify(b"key", stale.to_location(), false) {
                 rejections += 1;
             }
         }
 
-        // Non-zero guards against vacuity: if the loop never recycled the
+        // Non-zero guards vacuity: if the loop never actually recycled the
         // segment the stale location names, this test proves nothing.
-        assert!(rejections > 0, "no recycle was observed; test is vacuous");
+        assert!(rejections > 0, "no recycle was observed; the test is vacuous");
         assert_eq!(
             rejections, 64,
             "every post-recycle resolution of a stale location must be rejected"
@@ -2580,151 +2615,97 @@ Add to the `tests` module in `cache/core/src/cache.rs`:
     }
 ```
 
-If `build_small_test_cache`, `locate` or `key_verifier` do not exist under those
-names, use the equivalents the neighbouring `cache.rs` tests already use rather
-than adding new public API; the shape of the test is what matters.
+Adapt `build_small_test_cache` / `locate` / `verifier` to whatever the
+neighbouring `cache.rs` tests already provide; do not add public API for the
+test's convenience.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p cache-core --lib test_stale_location_is_rejected_after_recycle`
-Expected: FAIL at the `rejections == 64` assertion (the stale location still
-resolves), or at compile time if a helper name differs.
+Expected: FAIL at the `rejections == 64` assertion -- the stale location still
+resolves, which is the bug.
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Add the check at all nine sites**
 
-In `cache/core/src/cache.rs`, add layouts to the verifier:
-
-```rust
-struct CacheKeyVerifier<'a> {
-    /// Direct pool references with is_per_item_ttl flag, indexed by pool_id.
-    pools: [Option<(PoolRef<'a>, bool)>; 4],
-    /// Each pool's location layout, indexed by pool_id. Decoding a location
-    /// requires the layout of the pool it names, which is why `pool_id` sits at
-    /// a fixed position.
-    layouts: [Option<LocationLayout>; 4],
-}
-```
-
-Populate `layouts` wherever `pools` is populated, from each pool's `layout()`.
-
-Rewrite the body of `verify`:
+The shape is identical everywhere: after resolving the segment, **before any
+item bytes are touched**, compare the location's tag against the segment's.
 
 ```rust
-    #[inline(always)]
-    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        let item_loc = ItemLocation::from_location(location);
-        let pool_id = item_loc.pool_id();
-
-        // SAFETY: pool_id is 2 bits, and both arrays are [_; 4].
-        let Some((pool_ref, _is_per_item_ttl)) =
-            (unsafe { *self.pools.get_unchecked(pool_id as usize) })
-        else {
-            return false;
-        };
-        let Some(layout) = (unsafe { *self.layouts.get_unchecked(pool_id as usize) }) else {
-            return false;
-        };
-
-        let (_, segment_id, incarnation, offset) = item_loc.unpack(&layout);
-
-        match pool_ref {
-            PoolRef::Memory(pool) => {
-                let Some(segment) = pool.get(segment_id) else {
-                    return false;
-                };
-                // Before any item bytes are touched: a location naming a
-                // previous incarnation of this segment is not ours to resolve.
+                // A location naming a previous incarnation of this segment is
+                // not ours to resolve: the segment was drained and refilled,
+                // and this offset now holds a different item. Checked before
+                // touching item bytes.
                 if segment.incarnation() != incarnation {
                     return false;
                 }
-                segment.verify_key_at_offset(offset, key, allow_deleted)
-            }
-            PoolRef::Disk(pool) => {
-                let Some(segment) = pool.get(segment_id) else {
-                    return false;
-                };
-                if segment.incarnation() != incarnation {
-                    return false;
-                }
-                segment.verify_key_at_offset(offset, key, allow_deleted)
-            }
-            PoolRef::IoUring(pool) => {
-                let Some(meta) = pool.get_meta(segment_id) else {
-                    return false;
-                };
-                if meta.incarnation() != incarnation {
-                    return false;
-                }
-                meta.verify_key_at_offset(offset, key, allow_deleted)
-            }
-        }
-    }
 ```
 
-Apply the same decode-and-check to `prefetch` in the same impl (it currently
-calls `unpack()` with no layout), and to `SinglePoolVerifier::verify` and
-`MultiPoolVerifier::verify` in `cache/core/src/item_location.rs`. Both of those
-need a `LocationLayout` field, supplied at construction:
+| # | File | Verifier | Note |
+|---|---|---|---|
+| 1 | `cache.rs:1578` | `CacheKeyVerifier` | **the hot path**; three arms (Memory/Disk/IoUring), each already unpacks and discards the tag as `_` -- bind it |
+| 2 | `cache.rs` | `CacheKeyVerifier::prefetch` | must not prefetch off a stale location either |
+| 3 | `item_location.rs:187` | `SinglePoolVerifier` (generic, exported) | |
+| 4 | `item_location.rs:233` | `MultiPoolVerifier` (generic, exported) | per-pool layout already carried |
+| 5 | `layer/fifo_layer.rs:577` | `SinglePoolVerifier` | |
+| 6 | `layer/ttl_layer.rs:66` | `SinglePoolVerifier` | |
+| 7 | `disk/disk_layer.rs:70` | `SinglePoolVerifier` | |
+| 8 | `disk/io_uring_layer.rs:87` | `IoUringPoolVerifier` | |
+| 9 | `cache/slab/src/verifier.rs:232` | `SlabTieredVerifier::verify_disk` | other crate |
+| 10 | `cache/heap/src/verifier.rs:138` | `HeapTieredVerifier::verify_disk` | other crate |
 
-```rust
-pub struct SinglePoolVerifier<'a, S> {
-    segments: &'a [S],
-    layout: LocationLayout,
-}
+**Do NOT add the check to:** `SlabVerifier` (`slab/verifier.rs:47`) and
+`HeapCacheVerifier` (`heap/verifier.rs:34`) -- those decode slab slots and heap
+slots, which are not segment locations and have no incarnation. Also not
+`FnVerifier`, `DummyVerifier` (`recovery.rs:238`), or any test verifier.
+Check `MultiTypeVerifier` (`heap/verifier.rs:191`) and classify it explicitly.
 
-impl<'a, S> SinglePoolVerifier<'a, S> {
-    /// Create a new single-pool verifier.
-    pub fn new(segments: &'a [S], layout: LocationLayout) -> Self {
-        Self { segments, layout }
-    }
-}
-```
+- [ ] **Step 4: Verify**
 
-and in its `verify`, after resolving the segment and before
-`verify_key_at_offset`:
-
-```rust
-        if segment.incarnation() != item_loc.incarnation(&self.layout) {
-            return false;
-        }
-```
-
-`MultiPoolVerifier::with_pool` gains a `layout` parameter and stores
-`[Option<(&'a [S], LocationLayout)>; 4]`.
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `cargo test -p cache-core --lib test_stale_location_is_rejected_after_recycle`
+Run: `cargo test -p cache-core --lib`, `cargo test --workspace`
 Expected: PASS.
 
-Run: `cargo test -p cache-core`
-Expected: PASS.
+Existing tests that hold a location across an eviction and expect it to still
+resolve are now **testing the old broken behaviour**. Fix them to expect
+rejection, and report each one -- a test that had to change here is evidence the
+feature does something, so it is worth naming rather than quietly editing.
 
-- [ ] **Step 5: Prove the check red**
+- [ ] **Step 5: Prove red, both ways**
 
-Temporarily change the memory arm's guard to `if false {`, then run:
+The guard: change site 1's comparison to `if false {` and confirm
+`test_stale_location_is_rejected_after_recycle` fails on the `rejections == 64`
+assertion.
 
-Run: `cargo test -p cache-core --lib test_stale_location_is_rejected_after_recycle`
-Expected: FAIL on the `rejections == 64` assertion.
+The vacuity trap: restore the guard, replace the loop body's `cache.flush()`
+with a no-op, and confirm the test fails on `no recycle was observed`. **This
+one matters most.** Without it a test that never recycles passes for the wrong
+reason and certifies nothing -- the exact trap that made a Task 1 guard test
+useless.
 
-Then temporarily replace the loop body's `cache.flush()` with a no-op and
-confirm the test fails on `no recycle was observed; test is vacuous` -- this is
-the vacuity trap, and it must fire. Revert both.
+Quote both failures.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Confirm every site is reachable**
+
+Nine near-identical checks invite one being wrong or dead. For each, either
+point at a test that exercises it, or say plainly that it is unexercised.
+An unexercised check is a hole the feature leaks through silently.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add cache/core/src/cache.rs cache/core/src/item_location.rs
+git add cache/core/src cache/slab/src cache/heap/src
 git commit -m "fix(cache-core): reject stale-incarnation locations before reading bytes
 
-Closes the false positive in the crucible#88 family: a location held across
-a segment recycle no longer resolves to whatever now occupies that offset.
+The point of the whole change: a location held across a segment recycle no
+longer resolves to whatever item now occupies that offset. Closes the false
+positive half of crucible#88.
 
-Proven red two ways -- neutering the guard fails the rejection assertion,
-and removing the recycle fails the vacuity assertion."
+incarnation() moves to SegmentKeyVerify -- it is part of deciding whether a
+location verifies, and the hashtable's verifiers are generic over that trait
+rather than over Segment.
+
+Proven red two ways: neutering the guard fails the rejection assertion, and
+removing the recycle fails the vacuity assertion."
 ```
-
----
 
 ### Task 8: Loom model
 
