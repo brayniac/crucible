@@ -388,21 +388,11 @@ impl KeyVerifier for KeyOracle {
 
         let word = self.cells[cell].load(Ordering::Acquire);
         if word & !DELETED != key_id(key) {
-            let n = OCCUPANT_MISS.fetch_add(1, O::Relaxed) + 1;
-            eprintln!(
-                "MISS occupant={} tombstone={}",
-                n,
-                TOMBSTONE_MISS.load(O::Relaxed)
-            );
+            OCCUPANT_MISS.fetch_add(1, O::Relaxed);
             return false;
         }
         if !allow_deleted && (word & DELETED) != 0 {
-            let n = TOMBSTONE_MISS.fetch_add(1, O::Relaxed) + 1;
-            eprintln!(
-                "MISS occupant={} tombstone={}",
-                OCCUPANT_MISS.load(O::Relaxed),
-                n
-            );
+            TOMBSTONE_MISS.fetch_add(1, O::Relaxed);
             return false;
         }
         if stale {
