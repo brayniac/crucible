@@ -153,7 +153,17 @@ impl LocationLayout {
         let units = segment_size.div_ceil(align_bytes);
         let offset_bits = units.next_power_of_two().trailing_zeros();
 
-        if offset_bits + TAG_BITS >= PAYLOAD_BITS {
+        let align_shift = align_bytes.trailing_zeros();
+
+        // Two independent ceilings, both reported as SegmentTooLarge:
+        //
+        // 1. The offset field must leave room for segment ids.
+        // 2. The widest offset must fit in u32. Offsets are u32 throughout the
+        //    crate -- `SliceSegment::capacity`, `write_offset`, and
+        //    `ItemLocation::new` all use it -- so a layout that addresses past
+        //    u32 would truncate in `pack`/`offset` rather than error, and the
+        //    round trip would silently lose the high bits.
+        if offset_bits + TAG_BITS >= PAYLOAD_BITS || offset_bits + align_shift > 32 {
             return Err(LayoutError::SegmentTooLarge {
                 segment_size,
                 align: align_bytes,
@@ -162,7 +172,7 @@ impl LocationLayout {
         }
 
         Ok(Self {
-            align_shift: align_bytes.trailing_zeros() as u8,
+            align_shift: align_shift as u8,
             offset_bits: offset_bits as u8,
         })
     }
@@ -361,13 +371,48 @@ mod tests {
 
     #[test]
     fn rejects_segment_too_large_to_address() {
-        // offset_bits + 6 must leave room for segment ids, so at 8-byte
-        // alignment the ceiling is a 512 GiB segment (offset_bits == 36).
-        assert!(LocationLayout::new(256 * 1024 * 1024 * 1024, 8).is_ok());
+        // Offsets are u32 throughout the crate (`SliceSegment::capacity`,
+        // `write_offset`, `ItemLocation::new`), so the real ceiling is a layout
+        // whose widest offset still fits in u32: offset_bits + align_shift <= 32.
+        // At 8-byte alignment that is a 4 GiB segment, an order of magnitude
+        // above the 128 MB the tests exercise.
+        assert!(LocationLayout::new(4 * 1024 * 1024 * 1024, 8).is_ok());
         assert!(matches!(
-            LocationLayout::new(512 * 1024 * 1024 * 1024, 8),
+            LocationLayout::new(8 * 1024 * 1024 * 1024, 8),
             Err(LayoutError::SegmentTooLarge { .. })
         ));
+
+        // Coarser alignment does not buy past it: the offset field shifts left
+        // by align_shift, so the two trade off exactly.
+        assert!(LocationLayout::new(4 * 1024 * 1024 * 1024, 512).is_ok());
+        assert!(matches!(
+            LocationLayout::new(512 * 1024 * 1024 * 1024, 512),
+            Err(LayoutError::SegmentTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn every_accepted_layout_can_represent_its_own_widest_offset() {
+        // Guards the truncation the u32 bound exists to prevent: if `new`
+        // accepts a layout, packing its widest offset must round-trip.
+        for segment_size in [
+            1024 * 1024usize,
+            8 * 1024 * 1024,
+            128 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ] {
+            for align in [8usize, 512] {
+                let Ok(layout) = LocationLayout::new(segment_size, align) else {
+                    continue;
+                };
+                let widest = ((1u32 << layout.offset_bits()) - 1) * layout.align_bytes();
+                assert_eq!(
+                    layout.offset(layout.pack(0, 0, 0, widest)),
+                    widest,
+                    "segment_size {segment_size} align {align} truncates its widest offset"
+                );
+            }
+        }
     }
 
     #[test]
