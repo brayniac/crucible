@@ -55,7 +55,9 @@ mod tests {
         let layout = LocationLayout::new(1024 * 1024, 8).unwrap();
         assert_eq!(layout.offset_bits(), 17);
         assert_eq!(layout.seg_bits(), 19); // 42 - 6 - 17
-        assert_eq!(layout.max_segments(), (1 << 19) - 1);
+        // A count, not a max id: ids run 0..max_segment_count(), so the top
+        // field value is never issued.
+        assert_eq!(layout.max_segment_count(), (1 << 19) - 1);
 
         // 8 MB segments: offset needs 20 bits.
         let layout = LocationLayout::new(8 * 1024 * 1024, 8).unwrap();
@@ -83,7 +85,7 @@ mod tests {
             128 * 1024 * 1024,
         ] {
             let layout = LocationLayout::new(segment_size, 8).unwrap();
-            let capacity = (layout.max_segments() as u64 + 1) * segment_size as u64;
+            let capacity = (1u64 << layout.seg_bits()) * segment_size as u64;
             assert_eq!(
                 capacity,
                 512 * 1024 * 1024 * 1024,
@@ -97,7 +99,7 @@ mod tests {
         for segment_size in [1024 * 1024, 8 * 1024 * 1024, 128 * 1024 * 1024] {
             for align in [8, 64, 512] {
                 let layout = LocationLayout::new(segment_size, align).unwrap();
-                for &seg in &[0u32, 1, 7, layout.max_segments()] {
+                for &seg in &[0u32, 1, 7, layout.max_segment_count() - 1] {
                     for incarnation in 0u8..64 {
                         for &offset in &[0u32, align, segment_size as u32 - align] {
                             let raw = layout.pack(3, seg, incarnation, offset);
@@ -114,16 +116,18 @@ mod tests {
 
     #[test]
     fn ghost_is_unaliasable() {
-        // The top segment id is never issued, so no real location can collide
-        // with Location::GHOST (all 44 bits set).
+        // The top segment id is never issued, so no issuable location can
+        // collide with Location::GHOST (all 44 bits set).
         let layout = LocationLayout::new(1024 * 1024, 8).unwrap();
-        let highest = layout.pack(
-            3,
-            layout.max_segments(),
-            0x3F,
-            (1 << layout.offset_bits()) * 8 - 8,
-        );
+        let max_offset = ((1u32 << layout.offset_bits()) - 1) * layout.align_bytes();
+
+        // The highest location any pool can actually issue.
+        let highest = layout.pack(3, layout.max_segment_count() - 1, 0x3F, max_offset);
         assert_ne!(highest, crate::location::Location::MAX_RAW);
+
+        // And the reason it cannot: only the unissuable top id reaches GHOST.
+        let unissuable = layout.pack(3, layout.max_segment_count(), 0x3F, max_offset);
+        assert_eq!(unissuable, crate::location::Location::MAX_RAW);
     }
 
     #[test]
@@ -144,9 +148,11 @@ mod tests {
 
     #[test]
     fn rejects_segment_too_large_to_address() {
-        // A segment so large that no bits are left for segment ids.
+        // offset_bits + 6 must leave room for segment ids, so at 8-byte
+        // alignment the ceiling is a 512 GiB segment (offset_bits == 36).
+        assert!(LocationLayout::new(256 * 1024 * 1024 * 1024, 8).is_ok());
         assert!(matches!(
-            LocationLayout::new(64 * 1024 * 1024 * 1024, 8),
+            LocationLayout::new(512 * 1024 * 1024 * 1024, 8),
             Err(LayoutError::SegmentTooLarge { .. })
         ));
     }
@@ -154,9 +160,11 @@ mod tests {
     #[test]
     fn rejects_more_segments_than_fit() {
         let layout = LocationLayout::new(1024 * 1024, 8).unwrap();
-        assert!(layout.validate_segment_count(layout.max_segments() as usize).is_ok());
         assert!(layout
-            .validate_segment_count(layout.max_segments() as usize + 1)
+            .validate_segment_count(layout.max_segment_count() as usize)
+            .is_ok());
+        assert!(layout
+            .validate_segment_count(layout.max_segment_count() as usize + 1)
             .is_err());
     }
 }
@@ -346,21 +354,21 @@ impl LocationLayout {
         1 << self.align_shift
     }
 
-    /// Highest issuable segment id.
+    /// How many segments a pool may hold, so ids run `0..max_segment_count()`.
     ///
-    /// One below the field maximum: leaving the top id unissued is what keeps
-    /// `Location::GHOST` (all 44 bits set) unaliasable by construction.
+    /// One below the field's capacity: leaving the top id unissuable is what
+    /// keeps `Location::GHOST` (all 44 bits set) unaliasable by construction.
     #[inline(always)]
-    pub fn max_segments(&self) -> u32 {
+    pub fn max_segment_count(&self) -> u32 {
         (1u32 << self.seg_bits()) - 1
     }
 
     /// Reject a pool that has more segments than this layout can address.
     pub fn validate_segment_count(&self, count: usize) -> Result<(), LayoutError> {
-        if count > self.max_segments() as usize {
+        if count > self.max_segment_count() as usize {
             return Err(LayoutError::TooManySegments {
                 requested: count,
-                max: self.max_segments(),
+                max: self.max_segment_count(),
             });
         }
         Ok(())
@@ -375,8 +383,11 @@ impl LocationLayout {
     #[inline(always)]
     pub fn pack(&self, pool_id: u8, segment_id: u32, incarnation: u8, offset: u32) -> u64 {
         debug_assert!(pool_id <= 3, "pool_id must be 0-3");
+        // `<=` not `<`: pack is a pure bit function, and the top id is a
+        // representable value -- it is `validate_segment_count` that keeps a
+        // pool from ever issuing it, which is what protects GHOST.
         debug_assert!(
-            segment_id <= self.max_segments(),
+            segment_id <= self.max_segment_count(),
             "segment_id exceeds this layout"
         );
         debug_assert!(
@@ -1808,7 +1819,7 @@ from Step 3.
 **Spec coverage.** Layout and the fixed 6-bit tag: Task 1. Capacity invariance
 and per-pool alignment: Tasks 1 and 5. `incarnation` in `Metadata` rather than
 `generation`: Task 2. Bump sites and the transition table: Task 3. The check:
-Task 7. GHOST unaliasable: Task 1 (`ghost_is_unaliasable`, `max_segments`).
+Task 7. GHOST unaliasable: Task 1 (`ghost_is_unaliasable`, `max_segment_count`).
 Construction validates: Tasks 1 and 5. Memory and disk together: Tasks 5, 6, 7.
 Evidence items 1-4: Tasks 7, 8, 3, 1 respectively. Residuals: Task 9 Steps 3-4.
 
