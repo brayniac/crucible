@@ -66,6 +66,7 @@
 mod config;
 mod error;
 mod location;
+pub mod location_layout;
 pub mod sync;
 
 // Segment-specific location interpretation
