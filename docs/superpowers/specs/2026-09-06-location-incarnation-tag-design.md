@@ -119,13 +119,39 @@ different questions and this must be documented on both fields.
 
 ### 4. Bump sites
 
-`incarnation` bumps on exactly the transitions that end a **used** incarnation:
+> **Corrected 2026-09-06** after the Task 2 review traced the real recycle path.
+> The original table said `Locked -> Free` bumps. **That transition does not
+> occur on crucible's main eviction path**, so implementing the table literally
+> would have left the tag at 0 forever and made the feature inert while every
+> test passed. The actual path is:
+>
+> ```text
+> Sealed -> Draining -> Locked -> Reserved     (cas_metadata, in the layers)
+>                                    |
+>                                    v
+>                        pool.release() -> try_release  =>  Reserved -> Free
+> ```
+>
+> `fifo_layer.rs:227,324,425,517`, `ttl_layer.rs:283,486,734,841`,
+> `disk_layer.rs:270`. The `Reserved -> Free` that follows is precisely the
+> transition the original table forbade bumping.
 
-| transition                  | bumps | why                                  |
-|-----------------------------|-------|--------------------------------------|
-| `Locked -> Free`            | yes   | drained and cleared                  |
-| `AwaitingRelease -> Free`   | yes   | condemned, last reader released      |
-| `Reserved\|Linking -> Free` | NO    | reserved but never used              |
+`incarnation` bumps when a **used** incarnation ends. Stated as a property of
+the segment rather than as a list of state pairs, because the pair list is what
+went wrong:
+
+| transition                   | bumps | why                                        |
+|------------------------------|-------|--------------------------------------------|
+| **leaving `Locked`**, to any state | yes   | drained and cleared; covers both `Locked -> Reserved` (the real recycle path) and `Locked -> Free` |
+| `AwaitingRelease -> Free`    | yes   | condemned, last reader released            |
+| `force_free` (`* -> Free`)   | yes   | flush recycles every segment at once       |
+| `Free -> Reserved`           | NO    | start of an incarnation, not the end       |
+| `Reserved\|Linking -> Free`  | NO    | reserved but never used                    |
+
+Keying on *leaving `Locked`* rather than on a destination state is deliberate:
+`Locked` is reached only after a drain, so any exit from it ends a used
+incarnation regardless of which path took it. Enumerating destination pairs is
+what produced the original error.
 
 The exclusion is the substance of cache-rs#78's prerequisite. `memory_pool.rs:175`,
 `memory_pool.rs:270`, `file_pool.rs:322` and `io_uring_pool.rs:222` all release
