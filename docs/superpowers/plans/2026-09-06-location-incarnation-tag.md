@@ -2342,6 +2342,193 @@ into."
 
 ---
 
+### Task 6b: make disk appends honour `align_bytes`
+
+Task 5 was specified with disk pools defaulting to 512-byte alignment, and the
+Task 4-6 implementer correctly refused to ship it: **every segment type pads
+appends to a hardcoded 8 bytes** (`disk_segment_meta.rs:570,643` and seven more
+across `slice_segment.rs`). With `align_bytes = 512` the second item in any disk
+segment lands unaligned -- `LocationLayout::pack`'s `debug_assert` fires in
+debug, and in release the offset is silently truncated into a corrupted
+location.
+
+The design's justification ("an item straddling a 4096-byte block costs an extra
+block read today; sector alignment cuts that") only holds if items actually
+*start* on sector boundaries. That requires the append change this task makes,
+which the plan never scoped.
+
+**Decision taken: implement the padding.** Disk pools go back to 512-byte
+alignment, buying 32 TiB/pool (vs 512 GiB at align 8, itself a 4x regression on
+today's 2 TiB) and genuinely removing block straddling. The cost is real and was
+accepted: a 100-byte disk item occupies 512 bytes.
+
+Memory pools stay at 8. Only the disk paths change.
+
+**Files:** Modify `cache/core/src/disk/disk_segment_meta.rs`, `disk/file_segment.rs`,
+`disk/file_pool.rs`, `disk/io_uring_pool.rs`, `disk/disk_layer.rs`,
+`disk/io_uring_layer.rs`, `disk/recovery.rs`
+
+#### The trap: stride, not just offset
+
+Padding the append is half the job. Every scan advances `offset += header.padded_size()`,
+and `padded_size()` rounds to **8**. If appends stride by 512 and scans stride by
+8, every segment walk desyncs after the first item -- silently, since the walk
+just reads garbage headers and stops. There are **13 such sites** in the disk
+paths (`recovery.rs` x2, `disk_layer.rs` x2, `disk_segment_meta.rs` x2,
+`io_uring_layer.rs` x3, plus the append-side uses).
+
+The safe formulation: `align_bytes` is always a power of two and at least 8, so
+rounding an already-8-padded value up to `align_bytes` equals rounding the raw
+size up. **Every stride site can simply wrap what it already computes** -- no
+unpadded size needs threading through.
+
+- [ ] **Step 1: Write the failing test**
+
+In `disk_segment_meta.rs`'s tests:
+
+```rust
+    /// Appends must stride by the pool's alignment, and a scan must agree.
+    ///
+    /// If appends pad to 512 and scans still advance by `header.padded_size()`
+    /// (which rounds to 8), the walk desyncs after the first item and silently
+    /// reads garbage. Offsets must also be representable: an unaligned offset
+    /// is truncated by `LocationLayout::pack` in release.
+    #[test]
+    fn test_disk_appends_stride_by_the_pools_alignment() {
+        let (meta, _pool) = segment_with_alignment(64 * 1024, 512);
+        assert!(meta.try_reserve());
+
+        // Three small items, each far below the alignment factor.
+        let mut offsets = Vec::new();
+        for i in 0..3u8 {
+            let key = [b'k', i];
+            let offset = meta.append_item(&key, b"v", &[]).expect("append");
+            offsets.push(offset);
+        }
+
+        for (i, &offset) in offsets.iter().enumerate() {
+            assert_eq!(
+                offset % 512,
+                0,
+                "item {i} at offset {offset} is not 512-aligned"
+            );
+        }
+        assert_eq!(offsets, vec![0, 512, 1024], "stride must be the alignment");
+
+        // A scan must land on exactly those offsets, not 8-byte ones.
+        let mut walked = Vec::new();
+        let mut offset = 0u32;
+        while offset < meta.write_offset() {
+            let ptr = meta.header_ptr(offset, BasicHeader::SIZE).expect("header");
+            let header = unsafe { BasicHeader::try_from_ptr(ptr) }.expect("valid header");
+            walked.push(offset);
+            offset += meta.item_stride(header.padded_size());
+        }
+        assert_eq!(walked, offsets, "the scan stride disagrees with the append stride");
+    }
+
+    /// Memory-style 8-byte alignment must be unaffected.
+    #[test]
+    fn test_disk_alignment_of_eight_is_unchanged() {
+        let (meta, _pool) = segment_with_alignment(64 * 1024, 8);
+        assert!(meta.try_reserve());
+        let a = meta.append_item(b"k1", b"v", &[]).expect("append");
+        let b = meta.append_item(b"k2", b"v", &[]).expect("append");
+        assert_eq!(a, 0);
+        assert_eq!(b, 8, "an 8-aligned pool must still pack items at 8 bytes");
+    }
+```
+
+Add a `segment_with_alignment(capacity, align)` helper beside the existing test
+helpers rather than reworking them.
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p cache-core --lib test_disk_appends_stride`
+Expected: FAIL -- offsets `[0, 8, 16]`, and `item_stride` does not exist.
+
+- [ ] **Step 3: Give the segment its alignment**
+
+`DiskSegmentMeta` gains `align_shift: u8`, set at construction from the owning
+pool's `layout.align_bytes().trailing_zeros()`. Add:
+
+```rust
+    /// Round an item size up to this segment's alignment.
+    ///
+    /// Appends stride by this, and every scan must advance by it too -- a scan
+    /// that advances by `header.padded_size()` (which rounds to 8) desyncs
+    /// after the first item on a coarser-aligned pool.
+    ///
+    /// Safe to apply to an already-8-padded size: `align_bytes` is a power of
+    /// two and at least 8, so rounding twice is the same as rounding once.
+    #[inline]
+    pub fn item_stride(&self, item_size: usize) -> u32 {
+        let align = 1usize << self.align_shift;
+        ((item_size + align - 1) & !(align - 1)) as u32
+    }
+```
+
+Replace both `(item_size + 7) & !7` sites in `disk_segment_meta.rs` with
+`self.item_stride(item_size) as usize`.
+
+- [ ] **Step 4: Fix all 13 stride sites**
+
+Every disk-path `offset += header.padded_size()` (and the `item_size` bindings
+feeding them) becomes `segment.item_stride(header.padded_size())`. Grep to find
+them all -- the compiler will **not** catch these, since both are `u32`:
+
+```bash
+grep -rn "padded_size" --include='*.rs' cache/core/src/disk/
+```
+
+This is the same class as the `Metadata::new` sites in Task 2b: a silent
+behaviour difference that compiles clean. Report the classified list.
+
+- [ ] **Step 5: Restore the 512-byte disk default**
+
+`FilePoolBuilder::align_bytes` defaults to 512; `IoUringPool::new` uses 512 and
+keeps its `align_bytes <= block_size` assert. Update the doc comments the
+Task 4-6 implementer added saying coarser alignment is unsupported -- it is now
+supported, and this task is what supports it.
+
+- [ ] **Step 6: Check what the fragmentation breaks**
+
+Fewer items now fit per disk segment. Run the full workspace and look
+specifically at disk-tier tests that assume a segment holds N items or that a
+given number of writes triggers eviction. Fix by adjusting the test's
+expectations, **not** by lowering the alignment. Report any test whose meaning
+changed.
+
+- [ ] **Step 7: Verify and prove red**
+
+Run: `cargo test -p cache-core --lib`, `cargo test --workspace`, clippy, fmt,
+loom check.
+
+Prove the stride coupling red: revert one scan site to `header.padded_size()`
+and confirm `test_disk_appends_stride_by_the_pools_alignment` fails on the
+walked-offsets assertion. Quote it. That is the assertion standing between this
+change and a silent segment-walk desync.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add cache/core/src/disk/
+git commit -m "feat(cache-core): stride disk appends by the pool's align_bytes
+
+The 512-byte disk alignment the layout was designed around was never
+implementable: every append padded to a hardcoded 8, so the second item in
+a segment landed unaligned -- debug_assert in debug, a silently truncated
+offset in release.
+
+Padding the append is only half of it. Scans advance by header.padded_size(),
+which rounds to 8, so a coarser-aligned pool desyncs its own segment walk
+after one item. item_stride() is now the single definition both sides use.
+
+Restores disk pools to 512-byte alignment: 32 TiB per pool against 512 GiB
+at align 8, and items no longer straddle 4096-byte blocks. Costs up to 511
+bytes per disk item, which is the trade this was chosen for."
+```
+
 ### Task 7: The check, and a test that recycles
 
 **Files:**
