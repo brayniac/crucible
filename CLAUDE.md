@@ -69,6 +69,12 @@ cargo test test_name
 # Run tests with loom for concurrency testing
 cargo test -p cache-core --features loom
 
+# Run tests in release mode - NOT redundant with `cargo test`
+# `debug_assert!` is compiled out in release, so any `#[should_panic]` test
+# covering one silently stops testing anything. Gate those with
+# `#[cfg(debug_assertions)]` (see `cache/core/src/location.rs`).
+cargo test --release
+
 # Format code
 cargo fmt
 
