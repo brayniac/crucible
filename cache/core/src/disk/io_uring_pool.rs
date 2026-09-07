@@ -208,8 +208,24 @@ impl IoUringPool {
         self.segment_size
     }
 
-    /// Reset all segments to Free state and rebuild free queue.
+    /// Reset all segments to Free state and rebuild the free queue.
+    ///
+    /// Used by [`crate::disk::IoUringDiskLayer::reset`] on flush.
+    ///
+    /// The queue is drained before it is rebuilt, matching `MemoryPool` and
+    /// `FilePool`. Appending without draining leaves the ids that were already
+    /// free listed twice; `reserve` shrugs those off -- `try_reserve` fails on
+    /// the second sighting -- but the queue then grows by a segment's worth of
+    /// entries per flush and never gives them back.
     pub fn reset_all(&self) {
+        loop {
+            match self.free_queue.steal() {
+                crossbeam_deque::Steal::Empty => break,
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Success(_) => continue,
+            }
+        }
+
         for segment in &self.segments {
             segment.reset();
         }
@@ -281,6 +297,31 @@ impl RamPool for IoUringPool {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+
+    /// A reset must rebuild the free queue, not append to it.
+    ///
+    /// Every flush goes through here. Pushing all ids onto a queue that still
+    /// lists the free ones leaves duplicates: harmless to `reserve`, which
+    /// rejects the second sighting, but the queue grows by `segment_count`
+    /// entries per flush and nothing ever removes them.
+    #[test]
+    fn test_reset_all_rebuilds_the_free_queue_rather_than_appending() {
+        let pool = IoUringPool::new(0, 4, 64 * 1024, 4096);
+        assert_eq!(
+            pool.free_queue.len(),
+            4,
+            "a fresh pool lists each segment once"
+        );
+
+        for _ in 0..3 {
+            pool.reset_all();
+            assert_eq!(
+                pool.free_queue.len(),
+                4,
+                "reset must leave one entry per segment, however many times it runs"
+            );
+        }
+    }
 
     #[test]
     fn test_pool_creation() {

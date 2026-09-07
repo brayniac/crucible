@@ -1250,6 +1250,39 @@ mod tests {
         let _cache = create_test_cache();
     }
 
+    /// A flushed cache must still accept writes.
+    ///
+    /// The segment backends had this wrong (crucible#107): flush reset the
+    /// pool but left the layer's chain naming the segments it had just freed,
+    /// so every later write failed as `OutOfMemory`. `SlabAllocator::reset_all`
+    /// resets the per-class free lists and the global slab list together, so
+    /// there is no equivalent state left behind here -- this pins that.
+    #[test]
+    fn test_cache_accepts_writes_after_flush() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'x'; 4096];
+
+        // Fill past the point where eviction has to run.
+        for i in 0..300 {
+            let key = format!("pre{i}");
+            cache
+                .set_item(key.as_bytes(), &value, ttl)
+                .expect("pre-flush set");
+        }
+
+        Cache::flush(&cache);
+
+        for i in 0..300 {
+            let key = format!("post{i}");
+            cache
+                .set_item(key.as_bytes(), &value, ttl)
+                .unwrap_or_else(|e| panic!("set {i} after flush failed: {e:?}"));
+        }
+
+        assert!(cache.contains_key(b"post299"));
+    }
+
     #[test]
     fn test_set_and_get() {
         let cache = create_test_cache();
