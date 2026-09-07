@@ -346,15 +346,29 @@ impl CacheLayer {
         dispatch!(self, cancel_write_item(location))
     }
 
-    /// Reset all segments in this layer to Free state.
+    /// Reset this layer to its freshly built state.
     ///
-    /// This is used during flush operations to reset the entire layer.
-    pub fn reset_all_segments(&self) {
+    /// Backs [`TieredCache::flush`]. This is the whole layer, not just its
+    /// pool: chains and bucket lists are cleared, cached write segments are
+    /// dropped, any pending disk flush is discarded, and only then is every
+    /// segment returned to the free queue.
+    ///
+    /// This was once `reset_all_segments`, which reset the pool alone. That
+    /// left each layer's organization state naming segments the pool had just
+    /// recycled, so the next write's chain link failed -- surfacing as
+    /// `OutOfMemory` with every segment free. Anything added here must reset
+    /// the layer completely; a partial reset reproduces that bug.
+    ///
+    /// # Preconditions
+    ///
+    /// Only valid when no concurrent operation is touching the layer, and only
+    /// after the hashtable has been cleared.
+    pub fn reset(&self) {
         match self {
-            CacheLayer::Fifo(layer) => layer.pool().reset_all(),
-            CacheLayer::Ttl(layer) => layer.pool().reset_all(),
-            CacheLayer::Disk(layer) => layer.pool().reset_all(),
-            CacheLayer::IoUringDisk(layer) => layer.pool().reset_all(),
+            CacheLayer::Fifo(layer) => layer.reset(),
+            CacheLayer::Ttl(layer) => layer.reset(),
+            CacheLayer::Disk(layer) => layer.reset(),
+            CacheLayer::IoUringDisk(layer) => layer.reset(),
         }
     }
 }
@@ -1549,9 +1563,10 @@ impl<H: Hashtable> TieredCache<H> {
         // Clear the hashtable first - this makes all items "invisible"
         self.hashtable.clear();
 
-        // Reset all segments in all layers
+        // Reset each layer completely -- organization state and pool both, or
+        // the chains keep naming segments the pool has just recycled.
         for layer in &self.layers {
-            layer.reset_all_segments();
+            layer.reset();
         }
     }
 }
@@ -1823,6 +1838,127 @@ mod tests {
     use super::*;
     use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::layer::{FifoLayerBuilder, TtlLayerBuilder};
+
+    /// Every layer type must still accept writes after `flush()`.
+    ///
+    /// `flush()` backs FLUSHALL. It used to reset the pools alone, leaving
+    /// each layer's organization state -- the FIFO chain, the TTL bucket
+    /// chains, the cached write segments -- naming segments the pool had just
+    /// recycled. The next write could not link onto that stale tail, and
+    /// `allocate_segment` reports the chain failure as `OutOfMemory`, so a
+    /// flushed server served misses forever with every segment free.
+    ///
+    /// Written against the layers directly rather than through `set`, which
+    /// only ever reaches layer 0: each `CacheLayer::reset` arm needs its own
+    /// proof, and three of the four are otherwise unexercised.
+    #[test]
+    fn test_flush_leaves_every_layer_type_writable() {
+        use crate::disk::{DiskLayerBuilder, IoUringDiskLayerBuilder};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(640 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("fifo layer");
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(640 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+        let disk_layer = DiskLayerBuilder::new()
+            .layer_id(2)
+            .pool_id(2)
+            .segment_size(64 * 1024)
+            .path(dir.path().join("disk.dat"))
+            .size(640 * 1024)
+            .build()
+            .expect("disk layer");
+        let io_uring_layer = IoUringDiskLayerBuilder::new()
+            .layer_id(3)
+            .pool_id(3)
+            .segment_size(64 * 1024)
+            .segment_count(10)
+            .build();
+
+        let cache: TieredCache<MultiChoiceHashtable> =
+            TieredCacheBuilder::new(Arc::new(MultiChoiceHashtable::new(10)))
+                .with_fifo_layer(fifo_layer)
+                .with_ttl_layer(ttl_layer)
+                .with_disk_layer(disk_layer)
+                .with_io_uring_disk_layer(io_uring_layer)
+                .build();
+
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+
+        // Deep enough that each layer chains more than one segment, so the
+        // tail a reset must clear is not also the head.
+        let fill = |phase: &str| {
+            for layer in &cache.layers {
+                for i in 0..24 {
+                    let key = format!("{phase}{i:03}");
+                    let written = match layer {
+                        CacheLayer::Fifo(l) => l.write_item(key.as_bytes(), &value, b"", ttl),
+                        CacheLayer::Ttl(l) => l.write_item(key.as_bytes(), &value, b"", ttl),
+                        CacheLayer::Disk(l) => l.write_item(key.as_bytes(), &value, b"", ttl),
+                        CacheLayer::IoUringDisk(l) => {
+                            l.write_item_with_buffers(key.as_bytes(), &value, b"", ttl)
+                        }
+                    };
+                    written.unwrap_or_else(|e| {
+                        panic!(
+                            "layer {} ({phase}) write {i} failed: {e:?}",
+                            layer.layer_id()
+                        )
+                    });
+                }
+            }
+        };
+
+        fill("pre");
+
+        for layer in &cache.layers {
+            let chained = match layer {
+                CacheLayer::Fifo(l) => l.chain().segment_count(),
+                CacheLayer::Ttl(l) => l.buckets().total_segment_count(),
+                CacheLayer::Disk(l) => l.buckets().total_segment_count(),
+                CacheLayer::IoUringDisk(l) => l.buckets().total_segment_count(),
+            };
+            assert!(
+                chained > 1,
+                "layer {} must chain more than one segment for this to test the link",
+                layer.layer_id()
+            );
+        }
+
+        cache.flush();
+
+        for layer in &cache.layers {
+            let chained = match layer {
+                CacheLayer::Fifo(l) => l.chain().segment_count(),
+                CacheLayer::Ttl(l) => l.buckets().total_segment_count(),
+                CacheLayer::Disk(l) => l.buckets().total_segment_count(),
+                CacheLayer::IoUringDisk(l) => l.buckets().total_segment_count(),
+            };
+            assert_eq!(
+                chained,
+                0,
+                "layer {} kept organization state naming segments flush freed",
+                layer.layer_id()
+            );
+        }
+
+        // The same workload again. A failure here is the flushed-server bug.
+        fill("post");
+    }
 
     /// The disk arms of the hot-path verifier reject a stale tag too.
     ///

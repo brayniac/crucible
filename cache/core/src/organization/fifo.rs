@@ -114,6 +114,18 @@ impl FifoChain {
         self.segment_count.load(Ordering::Relaxed) as usize
     }
 
+    /// Return the chain to its freshly constructed state.
+    ///
+    /// For flush only. The caller must have already made the segments
+    /// unreachable -- this drops the chain's references to them without
+    /// touching their state, so calling it while the chain is live would
+    /// strand every segment it names.
+    pub fn reset(&self) {
+        let _guard = self.chain_mutex.lock();
+        self.head_tail.store(Self::EMPTY, Ordering::Release);
+        self.segment_count.store(0, Ordering::Relaxed);
+    }
+
     /// Push a segment onto the tail of the chain.
     ///
     /// The segment must be in Reserved state. It will be transitioned

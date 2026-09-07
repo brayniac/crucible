@@ -201,6 +201,18 @@ impl TtlBuckets {
         None
     }
 
+    /// Return every bucket to its freshly constructed state.
+    ///
+    /// For flush only. The caller must have already made the segments
+    /// unreachable -- this drops the buckets' references to them without
+    /// touching their state, so calling it while the chains are live would
+    /// strand every segment they name.
+    pub fn reset(&self) {
+        for bucket in self.buckets.iter() {
+            bucket.reset();
+        }
+    }
+
     /// Select merge candidates from a bucket.
     ///
     /// Returns the N oldest segment IDs from the given bucket.
@@ -311,6 +323,19 @@ impl TtlBucket {
     /// Check if the bucket is empty.
     pub fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire) == INVALID_SEGMENT_ID
+    }
+
+    /// Return this bucket to its freshly constructed state.
+    ///
+    /// For flush only. The caller must have already made the segments
+    /// unreachable -- this drops the chain's references to them without
+    /// touching their state, so calling it while the chain is live would
+    /// strand every segment it names.
+    pub fn reset(&self) {
+        let _guard = self.chain_mutex.lock();
+        self.head.store(INVALID_SEGMENT_ID, Ordering::Release);
+        self.tail.store(INVALID_SEGMENT_ID, Ordering::Release);
+        self.segment_count.store(0, Ordering::Relaxed);
     }
 
     /// Append a segment to the tail of this bucket's chain.
