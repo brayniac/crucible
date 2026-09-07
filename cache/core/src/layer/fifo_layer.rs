@@ -62,6 +62,34 @@ impl FifoLayer {
         &self.pool
     }
 
+    /// Get a reference to the FIFO segment chain.
+    pub fn chain(&self) -> &FifoChain {
+        &self.chain
+    }
+
+    /// Reset the layer to its freshly built state: an empty chain and every
+    /// segment free.
+    ///
+    /// Backs [`crate::cache::TieredCache::flush`]. Resetting the pool alone is
+    /// not enough: the chain would keep naming segments the pool had just
+    /// recycled, and the next `push` onto that stale tail fails -- reported as
+    /// `OutOfMemory` even with every segment free.
+    ///
+    /// The chain is cleared before the pool so that a reader following the
+    /// chain during the window reaches segments that are still live rather than
+    /// ones already back on the free queue.
+    ///
+    /// # Preconditions
+    ///
+    /// Only valid when no concurrent operation is touching this layer, and only
+    /// after the hashtable has been cleared. Same precondition as
+    /// [`crate::slice_segment::SliceSegment::force_free`], which this reaches
+    /// through `reset_all`.
+    pub fn reset(&self) {
+        self.chain.reset();
+        self.pool.reset_all();
+    }
+
     /// Try to allocate a new segment and add it to the chain.
     fn allocate_segment(&self) -> CacheResult<u32> {
         // Try to reserve a segment from the pool
@@ -998,6 +1026,47 @@ mod tests {
             .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer")
+    }
+
+    /// A layer must accept writes again after `reset()`.
+    ///
+    /// `reset()` backs FLUSHALL. Resetting the pool alone leaves the FIFO
+    /// chain naming segments that are now `Free`, so `FifoChain::push` cannot
+    /// link onto that stale tail -- and `allocate_segment` reports the failure
+    /// as `OutOfMemory` even though every segment is free.
+    #[test]
+    fn test_layer_accepts_writes_after_reset() {
+        let layer = create_test_layer();
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+
+        // Deep enough that the chain spans several segments, so the tail the
+        // reset must clear is not also the head.
+        for i in 0..48 {
+            let key = format!("pre{i:03}");
+            layer
+                .write_item(key.as_bytes(), &value, b"", ttl)
+                .expect("pre-reset write");
+        }
+        assert!(
+            layer.chain.segment_count() > 1,
+            "the fill must chain more than one segment for this to test the link"
+        );
+
+        layer.reset();
+
+        assert_eq!(layer.chain.segment_count(), 0, "chain must be emptied");
+        assert!(
+            layer.chain.tail().is_none(),
+            "tail must not name a free segment"
+        );
+
+        for i in 0..48 {
+            let key = format!("post{i:03}");
+            layer
+                .write_item(key.as_bytes(), &value, b"", ttl)
+                .unwrap_or_else(|e| panic!("write {i} after reset failed: {e:?}"));
+        }
     }
 
     #[test]
