@@ -208,6 +208,15 @@ impl FifoQueue {
         }
     }
 
+    /// Drop every entry, returning the queue to empty.
+    ///
+    /// For flush only. The entries name hashtable buckets and storage slots, so
+    /// this is correct exactly when those have already been cleared -- calling
+    /// it on a live queue silently stops tracking everything it held.
+    pub fn clear(&self) {
+        while self.pop().is_some() {}
+    }
+
     /// Peek at the head entry without removing it.
     ///
     /// Note: under concurrent access, the peeked entry may be popped by

@@ -1247,6 +1247,40 @@ mod tests {
         assert!(!cache.contains(b"key"));
     }
 
+    /// A flushed cache must still accept writes.
+    ///
+    /// `flush()` resets the pools but historically left each layer's chain
+    /// naming the segments it had just freed, so the next chain link failed and
+    /// was reported as `OutOfMemory` with every segment free. `flush()` backs
+    /// FLUSHALL, so this left a running server serving misses forever.
+    #[test]
+    fn test_cache_accepts_writes_after_flush() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'x'; 4096];
+
+        // Fill past the point where eviction has to run, so the chain is deep.
+        for i in 0..300 {
+            let key = format!("pre{i}");
+            cache
+                .set(key.as_bytes(), &value, ttl)
+                .expect("pre-flush set");
+        }
+
+        Cache::flush(&cache);
+
+        // The same workload must succeed again. Failing here means the layer
+        // kept organization state pointing at freed segments.
+        for i in 0..300 {
+            let key = format!("post{i}");
+            cache
+                .set(key.as_bytes(), &value, ttl)
+                .unwrap_or_else(|e| panic!("set {i} after flush failed: {e:?}"));
+        }
+
+        assert!(cache.contains(b"post299"));
+    }
+
     #[test]
     fn test_metrics_structure() {
         let cache = create_test_cache();

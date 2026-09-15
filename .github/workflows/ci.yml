@@ -188,8 +188,7 @@ jobs:
             --skip disk::disk_layer \
             --skip disk::io_uring \
             --skip disk::recovery \
-            --skip hugepage:: \
-            --skip test_stale_location_is_rejected_on_the_disk_arms
+            --skip hugepage::
 
   smoketest:
     name: Smoketest (${{ matrix.config }})

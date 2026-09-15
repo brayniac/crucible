@@ -357,6 +357,57 @@ impl IoUringDiskLayer {
         })
     }
 
+    /// Reset the layer to its freshly built state: empty TTL buckets, no
+    /// cached write segments, no pending flushes, and every segment free.
+    ///
+    /// Backs [`crate::cache::TieredCache::flush`]. Resetting the pool alone is
+    /// not enough, for two reasons:
+    ///
+    /// - The buckets and the per-bucket write-segment cache would keep naming
+    ///   segments the pool had just recycled, and the next append onto that
+    ///   stale tail fails -- reported as `OutOfMemory` even with every segment
+    ///   free.
+    /// - A queued [`FlushRequest`] names a segment id and the disk offset that
+    ///   segment owned when it was sealed. Submitting it after the flush would
+    ///   write a recycled segment's bytes at the old segment's offset, so the
+    ///   queue is dropped rather than carried across.
+    ///
+    /// Every write buffer is detached and returned to the buffer pool; the
+    /// buffers behind the dropped flush requests are exactly those, and
+    /// `DiskSegmentMeta::reset` does not release them.
+    ///
+    /// Organization state is cleared before the pool so that a reader following
+    /// a bucket chain during the window reaches segments that are still live
+    /// rather than ones already back on the free queue.
+    ///
+    /// # Preconditions
+    ///
+    /// Only valid when no concurrent operation is touching this layer, no
+    /// in-flight io_uring write still references a write buffer, and only after
+    /// the hashtable has been cleared.
+    pub fn reset(&self) {
+        // Drop pending flushes before anything can renumber the segments they
+        // name. Their buffers are released with the rest below.
+        self.flush_queue.lock().unwrap().clear();
+
+        self.buckets.reset();
+        for slot in &self.current_write_segments {
+            slot.store(u32::MAX, Ordering::Release);
+        }
+
+        // `DiskSegmentMeta::reset` leaves the write buffer attached, so
+        // reclaim them here or the buffer pool drains one flush at a time.
+        for id in 0..self.pool.segment_count() as u32 {
+            if let Some(segment) = self.pool.get(id)
+                && let Some(buf) = segment.detach_write_buffer()
+            {
+                self.buffer_pool.lock().unwrap().release(buf);
+            }
+        }
+
+        self.pool.reset_all();
+    }
+
     /// Drain the flush queue, returning all pending flush requests.
     ///
     /// Called by the server handler on each tick to submit io_uring writes.
@@ -1014,6 +1065,76 @@ mod tests {
             .segment_size(64 * 1024)
             .segment_count(4)
             .build()
+    }
+
+    /// A layer must accept writes again after `reset()`, with nothing left
+    /// pointing at the segments it just recycled.
+    ///
+    /// `reset()` backs FLUSHALL. Three things go stale at once here:
+    ///
+    /// - the TTL buckets and the per-bucket write-segment cache, which would
+    ///   name `Free` segments and make the next append fail as `OutOfMemory`;
+    /// - the flush queue, whose requests pair a segment id with the disk offset
+    ///   that segment held when it was sealed -- submitting one after a flush
+    ///   writes a recycled segment's bytes over the old segment's extent;
+    /// - the write buffers, which `DiskSegmentMeta::reset` leaves attached, so
+    ///   the buffer pool drains a segment's worth per flush.
+    #[test]
+    fn test_layer_accepts_writes_after_reset() {
+        let layer = test_layer();
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+        let buffers_total = layer.buffer_pool.lock().unwrap().total();
+
+        // Deep enough to fill and seal at least one segment, so the chain has
+        // more than one link and the flush queue is not empty.
+        for i in 0..30 {
+            let key = format!("pre{i:03}");
+            layer
+                .write_item_with_buffers(key.as_bytes(), &value, b"", ttl)
+                .expect("pre-reset write");
+        }
+        assert!(
+            layer.buckets.total_segment_count() > 1,
+            "the fill must chain more than one segment for this to test the link"
+        );
+        assert!(
+            !layer.flush_queue.lock().unwrap().is_empty(),
+            "the fill must seal a segment for this to test the flush queue"
+        );
+
+        layer.reset();
+
+        assert_eq!(
+            layer.buckets.total_segment_count(),
+            0,
+            "every bucket chain must be emptied"
+        );
+        assert!(
+            layer
+                .current_write_segments
+                .iter()
+                .all(|s| s.load(Ordering::Acquire) == u32::MAX),
+            "no bucket may keep a cached write segment across a reset"
+        );
+        assert!(
+            layer.take_flush_queue().is_empty(),
+            "a queued flush names a recycled segment and the offset the old one \
+             owned -- submitting it would corrupt that extent"
+        );
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            buffers_total,
+            "every write buffer must return to the pool, or repeated flushes \
+             starve it"
+        );
+
+        for i in 0..30 {
+            let key = format!("post{i:03}");
+            layer
+                .write_item_with_buffers(key.as_bytes(), &value, b"", ttl)
+                .unwrap_or_else(|e| panic!("write {i} after reset failed: {e:?}"));
+        }
     }
 
     /// A location from a previous incarnation must not resolve, even though

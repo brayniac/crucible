@@ -104,6 +104,32 @@ impl TtlLayer {
             .as_secs()
     }
 
+    /// Reset the layer to its freshly built state: empty TTL buckets, no
+    /// cached write segments, and every segment free.
+    ///
+    /// Backs [`crate::cache::TieredCache::flush`]. Resetting the pool alone is
+    /// not enough: the buckets and the per-bucket write-segment cache would
+    /// keep naming segments the pool had just recycled, and the next append
+    /// onto that stale tail fails -- reported as `OutOfMemory` even with every
+    /// segment free.
+    ///
+    /// Organization state is cleared before the pool so that a reader following
+    /// a bucket chain during the window reaches segments that are still live
+    /// rather than ones already back on the free queue.
+    ///
+    /// # Preconditions
+    ///
+    /// Only valid when no concurrent operation is touching this layer, and only
+    /// after the hashtable has been cleared. Same precondition as
+    /// [`crate::slice_segment::SliceSegment::force_free`], which this reaches through `reset_all`.
+    pub fn reset(&self) {
+        self.buckets.reset();
+        for slot in &self.current_write_segments {
+            slot.store(u32::MAX, std::sync::atomic::Ordering::Release);
+        }
+        self.pool.reset_all();
+    }
+
     /// Allocate a new segment and add it to the specified bucket.
     fn allocate_segment_for_bucket(&self, bucket_index: usize, ttl: Duration) -> CacheResult<u32> {
         // Reserve a segment from the pool
@@ -1688,6 +1714,55 @@ mod tests {
             .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer")
+    }
+
+    /// A layer must accept writes again after `reset()`.
+    ///
+    /// `reset()` backs FLUSHALL. Resetting the pool alone leaves the TTL
+    /// buckets -- and the per-bucket write-segment cache -- naming segments
+    /// that are now `Free`, so `append_segment` cannot link onto that stale
+    /// tail and the failure is reported as `OutOfMemory` even though every
+    /// segment is free.
+    #[test]
+    fn test_layer_accepts_writes_after_reset() {
+        let layer = create_test_layer();
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+
+        // Deep enough that the bucket chain spans several segments, so the
+        // tail the reset must clear is not also the head.
+        for i in 0..48 {
+            let key = format!("pre{i:03}");
+            layer
+                .write_item(key.as_bytes(), &value, b"", ttl)
+                .expect("pre-reset write");
+        }
+        assert!(
+            layer.buckets.total_segment_count() > 1,
+            "the fill must chain more than one segment for this to test the link"
+        );
+
+        layer.reset();
+
+        assert_eq!(
+            layer.buckets.total_segment_count(),
+            0,
+            "every bucket chain must be emptied"
+        );
+        assert!(
+            layer
+                .current_write_segments
+                .iter()
+                .all(|s| s.load(std::sync::atomic::Ordering::Acquire) == u32::MAX),
+            "no bucket may keep a cached write segment across a reset"
+        );
+
+        for i in 0..48 {
+            let key = format!("post{i:03}");
+            layer
+                .write_item(key.as_bytes(), &value, b"", ttl)
+                .unwrap_or_else(|e| panic!("write {i} after reset failed: {e:?}"));
+        }
     }
 
     #[test]
