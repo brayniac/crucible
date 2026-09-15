@@ -1283,6 +1283,23 @@ mod tests {
         assert!(cache.contains_key(b"post299"));
     }
 
+    /// Diagnostic for the intermittent `get` -> None failures tracked in #115.
+    ///
+    /// A bare `assert!(result.is_some())` tells us nothing about which of
+    /// `get_item`'s two None paths was taken, and the failure is rare enough
+    /// (~1 in 400 full-suite runs) that reproducing it to add instrumentation
+    /// is impractical. Capturing the state at the moment of failure is what
+    /// turns the next occurrence into evidence.
+    fn miss_diagnostics(cache: &SlabCache, key: &[u8]) -> String {
+        let in_hashtable = cache.contains_key(key);
+        let second_get = cache.get_item(key).is_some();
+        format!(
+            "get returned None. contains_key={in_hashtable} second_get={second_get} \
+             (in_hashtable=true means the entry survived, so the miss came from \
+             the slab acquire path, not the lookup)"
+        )
+    }
+
     #[test]
     fn test_set_and_get() {
         let cache = create_test_cache();
@@ -1294,7 +1311,7 @@ mod tests {
         cache.set_item(key, value, ttl).expect("Failed to set");
 
         let result = cache.get_item(key);
-        assert!(result.is_some());
+        assert!(result.is_some(), "{}", miss_diagnostics(&cache, key));
         assert_eq!(result.unwrap(), value);
     }
 
@@ -1354,7 +1371,7 @@ mod tests {
         Cache::set(&cache, b"key", b"value", Some(Duration::from_secs(3600))).unwrap();
 
         let result = Cache::get(&cache, b"key");
-        assert!(result.is_some());
+        assert!(result.is_some(), "{}", miss_diagnostics(&cache, b"key"));
         assert_eq!(result.unwrap().value(), b"value");
 
         assert!(Cache::contains(&cache, b"key"));
@@ -1444,16 +1461,26 @@ mod tests {
     fn test_expiration_lazy_cleanup() {
         let cache = create_test_cache();
 
-        // Set an item with a short TTL (1 second minimum since we use second precision)
+        // TTL must be > 1 second. `now_secs()` has one-second granularity and
+        // `is_expired` is `now_secs() >= expire_at`, so a 1-second TTL expires
+        // at the very next tick -- anywhere from 0 to 1000ms after the set. If
+        // that tick lands between `set_item` and the assertion below, the item
+        // is legitimately gone and the "should exist initially" check fails.
+        //
+        // Demonstrated: setting ~985ms into a coarse second gives
+        // present_immediately=true, present_after_20ms=false. That was roughly
+        // a 1-in-400 failure across the parallel suite.
         let key = b"expire_me";
         let value = b"temporary_value";
-        cache.set_item(key, value, Duration::from_secs(1)).unwrap();
+        cache.set_item(key, value, Duration::from_secs(3)).unwrap();
 
-        // Should exist initially
+        // Should exist initially: at least 2 full seconds remain even if the
+        // clock ticks immediately after the set.
         assert!(cache.contains_key(key));
 
-        // Wait for expiration (add buffer for timing)
-        std::thread::sleep(Duration::from_millis(1500));
+        // Wait past the longest possible lifetime: 3s TTL plus the up-to-1s
+        // of granularity slack, plus a margin.
+        std::thread::sleep(Duration::from_millis(4500));
 
         // Should not exist after expiration
         assert!(!cache.contains_key(key));
