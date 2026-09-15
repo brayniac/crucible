@@ -177,9 +177,27 @@ impl MultiChoiceHashtable {
     }
 
     /// Extract tag from hash.
+    ///
+    /// # Tag 0 is reserved
+    ///
+    /// A slot holds `pack(tag, freq, location)` and **every scan in this file
+    /// treats `packed == 0` as an empty slot**. An entry with tag 0, freq 0 and
+    /// location 0 packs to exactly zero, so it is stored and then read back as
+    /// empty -- the key becomes permanently unfindable while `insert` reports
+    /// success.
+    ///
+    /// Location 0 is not exotic: it is the first item in a fresh pool for every
+    /// backend -- `ItemLocation::new(layout, 0, 0, 0, 0)` and slab's
+    /// (class 0, slab 0, slot 0) are both raw 0 -- and freq starts at 0. So the
+    /// whole condition reduces to `tag == 0`, which is 1 in 4096 keys.
+    ///
+    /// Folding tag 0 onto 1 makes `packed` non-zero for any real entry, since
+    /// the tag occupies the top bits. The cost is that tag 1 is twice as likely
+    /// as any other, and a tag collision only costs one `verify` call.
     #[inline]
     fn tag_from_hash(hash: u64) -> u16 {
-        ((hash >> 32) & 0xFFF) as u16
+        let tag = ((hash >> 32) & 0xFFF) as u16;
+        if tag == 0 { 1 } else { tag }
     }
 
     /// Count occupied (non-empty, non-ghost) slots in a bucket.
@@ -2359,6 +2377,68 @@ mod tests {
         assert!(
             racer.raced.load(std::sync::atomic::Ordering::SeqCst),
             "the stale-location window was never exercised"
+        );
+    }
+
+    /// An entry must never pack to the all-zero word, which every slot scan
+    /// reads as "empty".
+    ///
+    /// `pack(tag, freq, location)` is `(tag << 52) | (freq << 44) | location`.
+    /// With tag 0, freq 0 and location 0 that is exactly zero, so the entry is
+    /// stored and then read back as an empty slot: `insert` reports success and
+    /// `lookup` can never find the key again.
+    ///
+    /// Location 0 is the first item in a fresh pool for every backend --
+    /// `ItemLocation::new(layout, 0, 0, 0, 0)` and slab's (class 0, slab 0,
+    /// slot 0) are both raw 0 -- and freq starts at 0, so the condition reduces
+    /// to `tag == 0`: 1 key in 4096. This surfaced as slab's `get` returning
+    /// None right after a successful `set`, measured at 8 misses per 32000
+    /// operations (0.025%, against 1/4096 = 0.0244%).
+    #[test]
+    fn tag_zero_is_reserved_so_no_live_entry_packs_to_zero() {
+        // The tag occupies the top bits, so a non-zero tag alone guarantees a
+        // non-zero word whatever freq and location hold.
+        for h in 0..200_000u64 {
+            // Sweep the bits tag_from_hash actually reads.
+            let hash = h << 32;
+            let tag = MultiChoiceHashtable::tag_from_hash(hash);
+            assert_ne!(tag, 0, "tag_from_hash({hash:#x}) returned the reserved 0");
+            assert_ne!(
+                Hashbucket::pack(tag, 0, Location::new(0)),
+                0,
+                "an entry packed to the empty-slot sentinel"
+            );
+        }
+    }
+
+    /// End-to-end companion: a key whose raw tag is 0, stored at location 0,
+    /// must still be findable.
+    ///
+    /// "probe2491" is such a key under the fixed test seed -- it was the first
+    /// one found when this bug was isolated. Proven red by reverting
+    /// `tag_from_hash` to `((hash >> 32) & 0xFFF)`.
+    #[test]
+    fn a_raw_tag_zero_key_at_location_zero_is_findable() {
+        struct Yes;
+        impl KeyVerifier for Yes {
+            fn verify(&self, _k: &[u8], _l: Location, _d: bool) -> bool {
+                true
+            }
+        }
+
+        let ht = MultiChoiceHashtable::new(10);
+        // Precondition: this key really does have raw tag 0, so the test cannot
+        // decay into asserting something trivial if the seed ever changes.
+        let raw_tag = ((ht.hash_key(b"probe2491") >> 32) & 0xFFF) as u16;
+        assert_eq!(
+            raw_tag, 0,
+            "probe2491 no longer has raw tag 0; pick a new key"
+        );
+
+        ht.insert(b"probe2491", Location::new(0), &Yes).unwrap();
+        assert!(
+            ht.lookup(b"probe2491", &Yes).is_some(),
+            "a raw-tag-0 key at location 0 is invisible"
         );
     }
 
