@@ -200,6 +200,17 @@ impl S3FifoPolicy {
         None
     }
 
+    /// Drop all queued entries, returning the policy to its initial state.
+    ///
+    /// For flush only, and only after the hashtable has been cleared. A queue
+    /// entry names a bucket; once flush clears those buckets, every entry is
+    /// stale, and `evict_from_small` abandons an eviction on the first stale
+    /// entry rather than skipping it.
+    pub fn reset(&self) {
+        self.small.clear();
+        self.main.clear();
+    }
+
     /// Get the number of items in the small queue.
     pub fn small_queue_len(&self) -> u32 {
         self.small.len()

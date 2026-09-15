@@ -1851,7 +1851,12 @@ mod tests {
     /// Written against the layers directly rather than through `set`, which
     /// only ever reaches layer 0: each `CacheLayer::reset` arm needs its own
     /// proof, and three of the four are otherwise unexercised.
+    /// Not run under Miri: building a `DiskLayer` maps a file, and Miri does
+    /// not support file-backed memory mappings. The `--skip disk::` filters in
+    /// CI do not cover this test because it lives in `cache::tests`, so the
+    /// exclusion has to be stated here.
     #[test]
+    #[cfg_attr(miri, ignore = "file-backed mmap is unsupported under Miri")]
     fn test_flush_leaves_every_layer_type_writable() {
         use crate::disk::{DiskLayerBuilder, IoUringDiskLayerBuilder};
 
@@ -1967,7 +1972,12 @@ mod tests {
     /// cache's own `set` never writes to directly. Here the recycle is staged
     /// on the pool and the location built from the live one, so the key really
     /// is at that offset and only the tag distinguishes them.
+    /// Not run under Miri: building a `DiskLayer` maps a file, and Miri does
+    /// not support file-backed memory mappings. The `--skip disk::` filters in
+    /// CI do not cover this test because it lives in `cache::tests`, so the
+    /// exclusion has to be stated here.
     #[test]
+    #[cfg_attr(miri, ignore = "file-backed mmap is unsupported under Miri")]
     fn test_stale_location_is_rejected_on_the_disk_arms() {
         use crate::disk::{DiskLayerBuilder, IoUringDiskLayerBuilder};
         use crate::pool::RamPool;

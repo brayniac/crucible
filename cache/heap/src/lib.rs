@@ -1379,6 +1379,15 @@ impl Cache for HeapCache {
         // Reset all storage slots (frees entries and rebuilds free list)
         self.storage.reset_all();
 
+        // Drop the eviction policy's queues. Their entries name buckets the
+        // hashtable clear above just emptied, and a stale entry aborts an
+        // eviction rather than being skipped, so leaving them costs a burst of
+        // spurious OutOfMemory until the backlog drains. Lfu and Random hold no
+        // state.
+        if let EvictionState::S3Fifo(policy) = &self.eviction_state {
+            policy.reset();
+        }
+
         // Reset memory tracking
         self.bytes_used.store(0, Ordering::Release);
     }
@@ -2493,6 +2502,39 @@ mod tests {
             .data_structures(true) // Enable hash/list/set support
             .build()
             .expect("Failed to create test cache")
+    }
+
+    /// A flushed heap cache must still accept writes.
+    ///
+    /// `flush()` clears the hashtable and resets slot storage but historically
+    /// left `eviction_state` alone, so the S3-FIFO queues kept entries naming
+    /// buckets that had just been cleared. `evict_from_small` uses `?` on the
+    /// stale lookup, which abandons the whole eviction instead of skipping the
+    /// entry, so each attempt burned one stale entry and reported "nothing to
+    /// evict" until the backlog drained. `flush()` backs FLUSHALL.
+    #[test]
+    fn test_cache_accepts_writes_after_flush() {
+        let cache = create_test_cache();
+        let ttl = Some(Duration::from_secs(3600));
+        let value = vec![b'x'; 4096];
+
+        for i in 0..300 {
+            let key = format!("pre{i}");
+            cache
+                .set(key.as_bytes(), &value, ttl)
+                .expect("pre-flush set");
+        }
+
+        Cache::flush(&cache);
+
+        for i in 0..300 {
+            let key = format!("post{i}");
+            cache
+                .set(key.as_bytes(), &value, ttl)
+                .unwrap_or_else(|e| panic!("set {i} after flush failed: {e:?}"));
+        }
+
+        assert!(cache.contains(b"post299"));
     }
 
     #[test]
