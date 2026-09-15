@@ -281,8 +281,16 @@ impl RamPool for IoUringPool {
 
     fn release(&self, id: u32) {
         let segment = &self.segments[id as usize];
-        segment.try_release();
-        self.free_queue.push(id);
+
+        // Only enqueue if this call actually moved the segment to Free.
+        // `try_release` returns false when it was already Free, and pushing
+        // regardless leaves a duplicate id: `reserve` re-checks with
+        // `try_reserve` and skips it, so nothing is double-allocated, but the
+        // queue grows on every such release and nothing removes the entries.
+        // `MemoryPool::release` and `FilePool::release` both guard on this.
+        if segment.try_release() {
+            self.free_queue.push(id);
+        }
     }
 
     fn free_count(&self) -> usize {
@@ -297,6 +305,44 @@ impl RamPool for IoUringPool {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+
+    /// Releasing a segment that is already Free must not enqueue it twice.
+    ///
+    /// `try_release` returns false when the segment is already Free -- that is
+    /// how it says "I did not move this segment". Pushing regardless leaves a
+    /// duplicate id in the queue. `MemoryPool::release` and `FilePool::release`
+    /// both guard on the result; this pool was the odd one out.
+    ///
+    /// Not a double-allocation: `reserve` re-checks with `try_reserve` and
+    /// skips the second sighting. The cost is a queue that grows every time an
+    /// already-free segment is released, plus a wasted `reserve` iteration per
+    /// stale entry. Same shape as #89 -- a lock-free operation's "did not
+    /// happen" read as success.
+    #[test]
+    fn test_releasing_an_already_free_segment_does_not_enqueue_a_duplicate() {
+        let pool = IoUringPool::new(0, 4, 64 * 1024, 4096);
+        let id = pool.reserve().expect("a fresh pool has a free segment");
+        assert_eq!(pool.free_queue.len(), 3, "reserve removes one entry");
+
+        pool.release(id);
+        assert_eq!(pool.free_queue.len(), 4, "release returns it once");
+
+        // The segment is already Free, so this release moves nothing.
+        pool.release(id);
+        assert_eq!(
+            pool.free_queue.len(),
+            4,
+            "releasing an already-free segment enqueued a duplicate"
+        );
+
+        // And the pool still hands out exactly its four segments.
+        let mut ids = Vec::new();
+        while let Some(got) = pool.reserve() {
+            ids.push(got);
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2, 3], "every segment exactly once");
+    }
 
     /// A reset must rebuild the free queue, not append to it.
     ///
