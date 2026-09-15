@@ -2184,12 +2184,23 @@ mod tests {
     fn create_test_cache() -> TieredCache<MultiChoiceHashtable> {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10)); // 2^10 = 1024 buckets
 
+        // Layer 0 must name layer 1 as its demotion target, matching how
+        // `SegCacheBuilder` wires the s3fifo topology. Without it,
+        // `determine_item_fate` can never demote -- it requires
+        // `next_layer.is_some()` -- so eviction discards every item instead
+        // of promoting hot ones, making this a FIFO-with-discard cache that
+        // only looks like S3-FIFO.
+        let fifo_config = LayerConfig::new()
+            .with_next_layer(1)
+            .with_demotion_threshold(1);
+
         let fifo_layer = FifoLayerBuilder::new()
             .layer_id(0)
             .pool_id(0)
             .segment_size(64 * 1024)
             .heap_size(256 * 1024)
             .spare_capacity(0) // No spare for tests
+            .config(fifo_config)
             .build()
             .expect("Failed to create FIFO layer");
 
@@ -2856,6 +2867,21 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+
+        // Eviction would invalidate the premise: `increment` with no initial
+        // value correctly reports KeyNotFound for a key the cache discarded,
+        // so an evicted counter surfaces as a confusing KeyNotFound panic in a
+        // worker rather than as a wrong total here. Assert the precondition so
+        // that failure names itself.
+        //
+        // This is what made the test flaky: the fixture built two layers but
+        // left layer 0's `next_layer` unset, so `determine_item_fate` could
+        // never demote and eviction discarded the counter outright.
+        assert_eq!(
+            cache.stats().evictions.load(Ordering::Relaxed),
+            0,
+            "the counter was evicted, so this run cannot say anything about lost updates"
+        );
 
         let value = cache.get(b"counter").unwrap();
         let value: u64 = std::str::from_utf8(&value).unwrap().parse().unwrap();
