@@ -57,6 +57,16 @@ impl FifoLayer {
         FifoLayerBuilder::new()
     }
 
+    /// Set this layer's demotion target.
+    ///
+    /// Called by `TieredCacheBuilder::build` to wire each layer to the next one
+    /// added, so a tiered cache has a demotion path by default. Without one,
+    /// `determine_item_fate` can never demote and eviction discards items
+    /// instead of promoting hot ones.
+    pub fn set_next_layer(&mut self, layer_id: crate::config::LayerId) {
+        self.config.next_layer = Some(layer_id);
+    }
+
     /// Get a reference to the segment pool.
     pub fn pool(&self) -> &MemoryPool {
         &self.pool
