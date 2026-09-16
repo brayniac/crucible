@@ -756,6 +756,25 @@ impl<'a> SliceSegment<'a> {
 
 // Implement SegmentKeyVerify
 impl SegmentKeyVerify for SliceSegment<'_> {
+    fn try_acquire_read(&self) -> bool {
+        // Increment first, then re-check: an evictor that already observed
+        // ref_count == 0 may be mid-condemn, and only the post-increment check
+        // can see the state it published.
+        if !self.state().holds_valid_data() {
+            return false;
+        }
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+        if !self.state().holds_valid_data() {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    fn release_read(&self) {
+        self.ref_count.fetch_sub(1, Ordering::Release);
+    }
+
     fn incarnation(&self) -> u8 {
         Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation
     }
@@ -1573,6 +1592,73 @@ mod tests {
     /// Dummy free queue for tests - segments won't actually be released back.
     static TEST_FREE_QUEUE: std::sync::LazyLock<crossbeam_deque::Injector<u32>> =
         std::sync::LazyLock::new(crossbeam_deque::Injector::new);
+
+    /// A verify must hold a reference for the duration of its byte reads.
+    ///
+    /// Without it, a reader can pass the incarnation check and then be
+    /// preempted while the segment is drained and refilled, so its reads race
+    /// `append_with_header`'s `copy_nonoverlapping` (crucible#109). The
+    /// reference is what stops the recycle: eviction checks `ref_count() == 0`
+    /// before condemning.
+    #[test]
+    fn test_read_guard_is_taken_and_released_around_a_verify() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 0, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.append_item(b"key", b"value", &[]).expect("append");
+
+        assert_eq!(segment.ref_count(), 0, "starts unreferenced");
+        assert!(segment.verify_key_guarded(0, b"key", false, segment.incarnation()));
+        assert_eq!(
+            segment.ref_count(),
+            0,
+            "the guard must be released, whatever the verify answered"
+        );
+
+        // A mismatching key still releases.
+        assert!(!segment.verify_key_guarded(0, b"other", false, segment.incarnation()));
+        assert_eq!(segment.ref_count(), 0, "released on the reject path too");
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// The guard must refuse a segment whose bytes are not valid to read.
+    ///
+    /// `Locked` is mid-clear and `Free`/`Reserved` hold no published item, so a
+    /// verify against one must fail rather than read whatever is there.
+    /// `Draining` must still be accepted: the drain reads items through the
+    /// verifier while the segment sits in that state, and excluding it stopped
+    /// demotion outright.
+    #[test]
+    fn test_read_guard_accepts_exactly_the_states_holding_valid_data() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 0, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.append_item(b"key", b"value", &[]).expect("append");
+        let inc = segment.incarnation();
+
+        // Live: readable.
+        assert!(segment.verify_key_guarded(0, b"key", false, inc));
+
+        // Sealed and Draining both still hold the item's bytes.
+        assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+        assert!(segment.verify_key_guarded(0, b"key", false, inc));
+        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(
+            segment.verify_key_guarded(0, b"key", false, inc),
+            "Draining must be verifiable -- the drain itself reads through here"
+        );
+
+        // Locked is mid-clear: refuse.
+        assert!(segment.cas_metadata(State::Draining, State::Locked, None, None));
+        assert!(
+            !segment.verify_key_guarded(0, b"key", false, inc),
+            "a segment being cleared must not be read"
+        );
+        assert_eq!(segment.ref_count(), 0, "a refused guard leaks no reference");
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
 
     fn create_test_segment(
         pool_id: u8,

@@ -190,13 +190,10 @@ impl<S: SegmentKeyVerify + Send + Sync> KeyVerifier for SinglePoolVerifier<'_, S
         let (_, segment_id, incarnation, offset) = item_loc.unpack(&self.layout);
 
         if let Some(segment) = self.segments.get(segment_id as usize) {
-            // A location naming a previous incarnation of this segment is not ours
-            // to resolve: the segment was drained and refilled, and this offset now
-            // holds a different item. Checked before touching any item bytes.
-            if segment.incarnation() != incarnation {
-                return false;
-            }
-            segment.verify_key_at_offset(offset, key, allow_deleted)
+            // Guard, then check the incarnation, then read -- see
+            // `SegmentKeyVerify::verify_key_guarded`. The guard stops the
+            // segment being recycled underneath the byte reads (#109).
+            segment.verify_key_guarded(offset, key, allow_deleted, incarnation)
         } else {
             false
         }
@@ -249,13 +246,10 @@ impl<S: SegmentKeyVerify + Send + Sync> KeyVerifier for MultiPoolVerifier<'_, S>
         let (_, segment_id, incarnation, offset) = item_loc.unpack(&layout);
 
         if let Some(segment) = segments.get(segment_id as usize) {
-            // A location naming a previous incarnation of this segment is not ours
-            // to resolve: the segment was drained and refilled, and this offset now
-            // holds a different item. Checked before touching any item bytes.
-            if segment.incarnation() != incarnation {
-                return false;
-            }
-            return segment.verify_key_at_offset(offset, key, allow_deleted);
+            // Guard, then check the incarnation, then read -- see
+            // `SegmentKeyVerify::verify_key_guarded`. The guard stops the
+            // segment being recycled underneath the byte reads (#109).
+            return segment.verify_key_guarded(offset, key, allow_deleted, incarnation);
         }
 
         false
@@ -391,6 +385,12 @@ mod tests {
     }
 
     impl SegmentKeyVerify for MockSegment {
+        fn try_acquire_read(&self) -> bool {
+            true
+        }
+
+        fn release_read(&self) {}
+
         fn incarnation(&self) -> u8 {
             self.incarnation
         }

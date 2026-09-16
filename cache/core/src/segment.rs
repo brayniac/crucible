@@ -21,6 +21,54 @@ use std::time::Duration;
 /// minimal trait, types that don't provide full segment access (like SSD-backed
 /// segments that require async I/O) can still work with the hashtable.
 pub trait SegmentKeyVerify {
+    /// Take a read reference on this segment, or fail if it is not readable.
+    ///
+    /// On success the caller MUST call [`SegmentKeyVerify::release_read`].
+    /// Prefer [`SegmentKeyVerify::verify_key_guarded`], which pairs them.
+    ///
+    /// Holding a reference is what stops a drained segment being recycled and
+    /// rewritten underneath a reader: eviction checks `ref_count() == 0` before
+    /// condemning. Acquiring must therefore increment first and re-check the
+    /// state after, or it races the evictor that already saw zero.
+    ///
+    /// No default body on purpose: a segment type that silently answered `true`
+    /// would read bytes with nothing holding the segment still.
+    fn try_acquire_read(&self) -> bool;
+
+    /// Release a reference taken by [`SegmentKeyVerify::try_acquire_read`].
+    fn release_read(&self);
+
+    /// Verify a key under a read guard, checking the incarnation first.
+    ///
+    /// This is the ONLY correct order, and it is centralised here so no call
+    /// site can get it wrong:
+    ///
+    /// 1. **guard** -- so the incarnation cannot advance underneath us;
+    /// 2. **check the tag** -- so this is the incarnation the location names;
+    /// 3. **read the bytes**;
+    /// 4. **release**.
+    ///
+    /// The guard alone is not enough: it stops the segment being reclaimed but
+    /// says nothing about which incarnation it holds. The tag alone is not
+    /// enough either -- that was crucible#109: a reader could pass the check
+    /// and then be preempted while the segment was drained and refilled, so its
+    /// byte reads raced `append_with_header`'s `copy_nonoverlapping`.
+    fn verify_key_guarded(
+        &self,
+        offset: u32,
+        key: &[u8],
+        allow_deleted: bool,
+        incarnation: u8,
+    ) -> bool {
+        if !self.try_acquire_read() {
+            return false;
+        }
+        let matched = self.incarnation() == incarnation
+            && self.verify_key_at_offset(offset, key, allow_deleted);
+        self.release_read();
+        matched
+    }
+
     /// The incarnation tag this segment currently carries.
     ///
     /// A location whose tag differs names a previous incarnation of this

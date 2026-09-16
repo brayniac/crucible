@@ -127,6 +127,14 @@ impl<'a> FileSegment<'a> {
 
 // Delegate SegmentKeyVerify to inner
 impl SegmentKeyVerify for FileSegment<'_> {
+    fn try_acquire_read(&self) -> bool {
+        self.inner.try_acquire_read()
+    }
+
+    fn release_read(&self) {
+        self.inner.release_read()
+    }
+
     #[inline]
     fn incarnation(&self) -> u8 {
         self.inner.incarnation()

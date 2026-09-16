@@ -1624,6 +1624,13 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
                 };
                 // Do not prefetch off a stale location either: the address it
                 // names belongs to a later incarnation's item.
+                //
+                // Deliberately NOT under a read guard, unlike `verify`. A
+                // prefetch reads no bytes -- it computes an address and issues
+                // a hardware hint -- and pool memory stays mapped for the
+                // pool's lifetime, so a recycled segment's address is still
+                // valid to hint on. Taking a guard here would add three atomics
+                // to an operation whose whole point is being nearly free.
                 if segment.incarnation() != incarnation {
                     return;
                 }
@@ -1709,34 +1716,30 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
                 let Some(segment) = pool.get(segment_id) else {
                     return false;
                 };
-                // A location naming a previous incarnation of this segment is
-                // not ours to resolve: the segment was drained and refilled,
-                // and this offset now holds a different item. Checked before
-                // touching any item bytes.
-                if segment.incarnation() != incarnation {
-                    return false;
-                }
-                segment.verify_key_at_offset(offset, key, allow_deleted)
+                // Guard, then check the incarnation, then read -- see
+                // `SegmentKeyVerify::verify_key_guarded`. The guard stops the
+                // segment being recycled underneath the byte reads (#109).
+                segment.verify_key_guarded(offset, key, allow_deleted, incarnation)
             }
             PoolRef::Disk(pool) => {
                 let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(segment) = pool.get(segment_id) else {
                     return false;
                 };
-                if segment.incarnation() != incarnation {
-                    return false;
-                }
-                segment.verify_key_at_offset(offset, key, allow_deleted)
+                // Guard, then check the incarnation, then read -- see
+                // `SegmentKeyVerify::verify_key_guarded`. The guard stops the
+                // segment being recycled underneath the byte reads (#109).
+                segment.verify_key_guarded(offset, key, allow_deleted, incarnation)
             }
             PoolRef::IoUring(pool) => {
                 let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
                 let Some(meta) = pool.get_meta(segment_id) else {
                     return false;
                 };
-                if meta.incarnation() != incarnation {
-                    return false;
-                }
-                meta.verify_key_at_offset(offset, key, allow_deleted)
+                // Guard, then check the incarnation, then read -- see
+                // `SegmentKeyVerify::verify_key_guarded`. The guard stops the
+                // segment being recycled underneath the byte reads (#109).
+                meta.verify_key_guarded(offset, key, allow_deleted, incarnation)
             }
         }
     }

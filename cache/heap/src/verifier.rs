@@ -131,14 +131,10 @@ impl<'a> HeapTieredVerifier<'a> {
             None => return false,
         };
 
-        // A location naming a previous incarnation of this segment is not ours
-        // to resolve: the segment was drained and refilled, and this offset now
-        // holds a different item. Checked before touching any item bytes.
-        if segment.incarnation() != incarnation {
-            return false;
-        }
-
-        segment.verify_key_at_offset(offset, key, allow_deleted)
+        // Guard, then check the incarnation, then read -- see
+        // `SegmentKeyVerify::verify_key_guarded`. The guard stops the segment
+        // being recycled underneath the byte reads (#109).
+        segment.verify_key_guarded(offset, key, allow_deleted, incarnation)
     }
 }
 
