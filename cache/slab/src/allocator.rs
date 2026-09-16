@@ -189,11 +189,21 @@ impl SlabAllocator {
     /// - RANDOM (2) - Evict a random slab
     ///
     /// If no eviction strategy is configured (NONE), returns `None` when full.
-    pub fn allocate_with_eviction<H: Hashtable>(
+    /// Allocate a slot, evicting a slab if necessary, offering each evicted
+    /// item to `demote` before it is discarded.
+    ///
+    /// Pass `|_| false` for a cache with no disk tier. See
+    /// [`Self::evict_slab_with_demoter`] for the demoter's contract.
+    pub fn allocate_with_eviction_and_demoter<H, D>(
         &self,
         class_id: u8,
         hashtable: &H,
-    ) -> Option<(u32, u16)> {
+        mut demote: D,
+    ) -> Option<(u32, u16)>
+    where
+        H: Hashtable,
+        D: FnMut(&crate::class::EvictedItem<'_>) -> bool,
+    {
         // First try normal allocation
         if let Some(slot) = self.allocate(class_id) {
             return Some(slot);
@@ -212,7 +222,7 @@ impl SlabAllocator {
         if self.eviction_strategy.has_slab_eviction() {
             for _ in 0..Self::MAX_EVICTION_ATTEMPTS {
                 // Try eviction (may fail if another thread is evicting)
-                let _ = self.try_slab_eviction(hashtable);
+                let _ = self.try_slab_eviction_with_demoter(hashtable, &mut demote);
 
                 // Always try allocation - another thread's eviction may have succeeded
                 if let Some(slot) = self.allocate(class_id) {
@@ -302,7 +312,29 @@ impl SlabAllocator {
     /// and returns the slab memory to the global free pool.
     ///
     /// Returns `true` if successful, `false` if the slab doesn't exist.
-    pub fn evict_slab<H: Hashtable>(&self, class_id: u8, slab_id: u32, hashtable: &H) -> bool {
+    /// As [`Self::evict_slab`], but offering each item to `demote` first.
+    ///
+    /// `demote` returns `true` if it took ownership of the item -- it has
+    /// written the value elsewhere and repointed the hashtable entry, so this
+    /// must NOT then remove that entry. Returning `false` means the item is
+    /// being discarded and the entry has to go.
+    ///
+    /// The RAM copy is delete-marked either way, immediately after the
+    /// callback returns. That is correct for a demoted item too: the hashtable
+    /// now names the disk copy, and the drain has already waited for
+    /// `ref_count` to reach zero, so no reader can be mid-read of the slot
+    /// being marked.
+    pub fn evict_slab_with_demoter<H, D>(
+        &self,
+        class_id: u8,
+        slab_id: u32,
+        hashtable: &H,
+        mut demote: D,
+    ) -> bool
+    where
+        H: Hashtable,
+        D: FnMut(&crate::class::EvictedItem<'_>) -> bool,
+    {
         let class = match self.classes.get(class_id as usize) {
             Some(c) => c,
             None => return false,
@@ -310,8 +342,19 @@ impl SlabAllocator {
 
         // Evict all items from the slab
         let slab_ptr = unsafe {
-            class.evict_slab(slab_id, |key, cid, sid, slot| {
-                let location = SlabLocation::new(cid, sid, slot).to_location();
+            class.evict_slab(slab_id, |item| {
+                let location =
+                    SlabLocation::new(item.class_id, item.slab_id, item.slot_index).to_location();
+
+                // Offer it to the disk tier first. A successful demote has
+                // already repointed the hashtable entry at the disk copy via
+                // `cas_location`, so removing it here would delete the item we
+                // just saved.
+                if demote(&item) {
+                    return;
+                }
+
+                let key = item.key;
                 if !hashtable.remove(key, location) {
                     // `remove` retries the slot for as long as it keeps
                     // publishing `location` (cache-core's
@@ -361,14 +404,21 @@ impl SlabAllocator {
     ///
     /// Tries strategies in order: SLAB_LRC (8), SLAB_LRA (4), RANDOM (2).
     /// Returns `true` if a slab was evicted.
-    pub fn try_slab_eviction<H: Hashtable>(&self, hashtable: &H) -> bool {
+    /// As [`Self::try_slab_eviction`], but offering each evicted item to
+    /// `demote` before it is discarded. See
+    /// [`Self::evict_slab_with_demoter`] for the contract.
+    pub fn try_slab_eviction_with_demoter<H, D>(&self, hashtable: &H, mut demote: D) -> bool
+    where
+        H: Hashtable,
+        D: FnMut(&crate::class::EvictedItem<'_>) -> bool,
+    {
         let strategy = self.eviction_strategy;
 
         // Try strategies in order from highest to lowest bit
         // SLAB_LRC (8)
         if strategy.contains(EvictionStrategy::SLAB_LRC)
             && let Some((class_id, slab_id)) = self.find_lrc_slab()
-            && self.evict_slab(class_id, slab_id, hashtable)
+            && self.evict_slab_with_demoter(class_id, slab_id, hashtable, &mut demote)
         {
             return true;
         }
@@ -376,7 +426,7 @@ impl SlabAllocator {
         // SLAB_LRA (4)
         if strategy.contains(EvictionStrategy::SLAB_LRA)
             && let Some((class_id, slab_id)) = self.find_lra_slab()
-            && self.evict_slab(class_id, slab_id, hashtable)
+            && self.evict_slab_with_demoter(class_id, slab_id, hashtable, &mut demote)
         {
             return true;
         }
@@ -384,7 +434,7 @@ impl SlabAllocator {
         // RANDOM (2)
         if strategy.contains(EvictionStrategy::RANDOM)
             && let Some((class_id, slab_id)) = self.find_random_slab()
-            && self.evict_slab(class_id, slab_id, hashtable)
+            && self.evict_slab_with_demoter(class_id, slab_id, hashtable, &mut demote)
         {
             return true;
         }
@@ -542,13 +592,18 @@ impl SlabAllocator {
     ///
     /// # Returns
     /// `Some((location, value_ptr, item_size))` on success, `None` if allocation fails.
-    pub fn begin_write_item<H: Hashtable>(
+    pub fn begin_write_item<H, D>(
         &self,
         key: &[u8],
         value_len: usize,
         ttl: Duration,
         hashtable: &H,
-    ) -> Option<(SlabLocation, *mut u8, usize)> {
+        mut demote: D,
+    ) -> Option<(SlabLocation, *mut u8, usize)>
+    where
+        H: Hashtable,
+        D: FnMut(&crate::class::EvictedItem<'_>) -> bool,
+    {
         // Calculate item size
         let item_size = HEADER_SIZE + key.len() + value_len;
 
@@ -582,7 +637,9 @@ impl SlabAllocator {
         }
 
         // Try slab-level eviction
-        if self.eviction_strategy.has_slab_eviction() && self.try_slab_eviction(hashtable) {
+        if self.eviction_strategy.has_slab_eviction()
+            && self.try_slab_eviction_with_demoter(hashtable, &mut demote)
+        {
             // Eviction freed some slots, try allocation again
             if let Some((slab_id, slot_index, value_ptr, item_size)) =
                 class.begin_write_item(key, value_len, ttl)
@@ -900,7 +957,7 @@ mod tests {
             );
         }
 
-        assert!(allocator.evict_slab(class_id, slab_id, &hashtable));
+        assert!(allocator.evict_slab_with_demoter(class_id, slab_id, &hashtable, |_| false));
 
         for (key, location) in &published {
             assert_eq!(
