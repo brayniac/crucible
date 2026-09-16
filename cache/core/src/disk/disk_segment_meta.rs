@@ -224,6 +224,23 @@ impl DiskSegmentMeta {
 }
 
 impl SegmentKeyVerify for DiskSegmentMeta {
+    fn try_acquire_read(&self) -> bool {
+        // See SliceSegment's impl: increment, then re-check.
+        if !self.state().holds_valid_data() {
+            return false;
+        }
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+        if !self.state().holds_valid_data() {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    fn release_read(&self) {
+        self.ref_count.fetch_sub(1, Ordering::Release);
+    }
+
     #[inline]
     fn incarnation(&self) -> u8 {
         Metadata::unpack(self.metadata.load(Ordering::Acquire)).incarnation

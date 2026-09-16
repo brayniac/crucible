@@ -165,6 +165,33 @@ impl State {
         )
     }
 
+    /// Whether the segment's bytes are intact, so a reader holding a reference
+    /// may read them.
+    ///
+    /// Wider than [`State::is_readable`], and deliberately so. `Draining` means
+    /// the segment is being processed for eviction: its data is still intact,
+    /// and the evictor must wait for `ref_count` to drop before modifying it.
+    /// That is exactly what a read guard relies on -- so a reference taken here
+    /// holds the evictor off, which is the protection crucible#109 needs.
+    ///
+    /// The drain itself reads items through the verifier while the segment sits
+    /// in `Draining`, so excluding it stops demotion entirely: 35730 guard
+    /// refusals, every one in `Draining`, and `demotions` fell to 0.
+    ///
+    /// Excluded: `Free`, `Reserved` and `Linking` hold no published item, and
+    /// `Locked` is mid-clear.
+    #[inline]
+    pub fn holds_valid_data(self) -> bool {
+        matches!(
+            self,
+            State::Live
+                | State::Sealed
+                | State::Relinking
+                | State::AwaitingRelease
+                | State::Draining
+        )
+    }
+
     /// Check if the segment is writable (allows append operations).
     #[inline]
     pub fn is_writable(self) -> bool {
