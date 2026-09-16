@@ -57,6 +57,16 @@ impl CacheLayer {
         dispatch!(self, config())
     }
 
+    /// Set this layer's demotion target.
+    pub fn set_next_layer(&mut self, layer_id: crate::config::LayerId) {
+        match self {
+            CacheLayer::Fifo(l) => l.set_next_layer(layer_id),
+            CacheLayer::Ttl(l) => l.set_next_layer(layer_id),
+            CacheLayer::Disk(l) => l.set_next_layer(layer_id),
+            CacheLayer::IoUringDisk(l) => l.set_next_layer(layer_id),
+        }
+    }
+
     /// Get the layer ID.
     pub fn layer_id(&self) -> u8 {
         dispatch!(self, layer_id())
@@ -1821,7 +1831,27 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
     }
 
     /// Build the tiered cache.
-    pub fn build(self) -> TieredCache<H> {
+    pub fn build(mut self) -> TieredCache<H> {
+        // Wire each layer to demote into the next one added, unless the caller
+        // already chose a target.
+        //
+        // `LayerConfig::next_layer` defaults to `None`, and
+        // `determine_item_fate` only demotes when it is set. Leaving it unset on
+        // a multi-layer cache produces one where the lower tiers are
+        // unreachable by demotion: every eviction discards its items instead of
+        // promoting hot ones, while `layer_count()` and the metrics still report
+        // every layer and `demotions` stays 0 forever. A tier nothing can reach
+        // is indistinguishable at runtime from one that is merely cold, which is
+        // why this defaults rather than being left to each caller (#116, and the
+        // cause of the flake in #105).
+        //
+        // The last layer keeps `None`: there is nothing below it.
+        for i in 0..self.layers.len().saturating_sub(1) {
+            if self.layers[i].config().next_layer.is_none() {
+                self.layers[i].set_next_layer((i + 1) as crate::config::LayerId);
+            }
+        }
+
         TieredCache {
             hashtable: self.hashtable,
             layers: self.layers,
@@ -1838,6 +1868,94 @@ mod tests {
     use super::*;
     use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::layer::{FifoLayerBuilder, TtlLayerBuilder};
+
+    /// A tiered cache must wire a demotion path by default.
+    ///
+    /// `determine_item_fate` only demotes when `config.next_layer.is_some()`,
+    /// and `LayerConfig::next_layer` defaults to `None`. A caller who adds two
+    /// layers and does not set it by hand gets a cache where layer 1 is
+    /// unreachable by demotion: every eviction from layer 0 discards its items
+    /// instead of promoting hot ones. It is a FIFO-with-discard cache that
+    /// presents as S3-FIFO -- `layer_count()` says 2, the metrics show two
+    /// layers, and `demotions` simply stays 0 forever.
+    ///
+    /// That is not hypothetical: it is what made #105 flaky.
+    #[test]
+    fn test_builder_wires_a_demotion_path_between_adjacent_layers() {
+        let cache = create_test_cache_without_explicit_demotion();
+
+        assert_eq!(
+            cache.layers[0].config().next_layer,
+            Some(1),
+            "layer 0 must demote into layer 1 by default, or layer 1 is dead weight"
+        );
+        assert_eq!(
+            cache.layers[1].config().next_layer,
+            None,
+            "the last layer has nowhere to demote to"
+        );
+    }
+
+    /// An explicit `with_next_layer` must win over the default wiring.
+    #[test]
+    fn test_builder_does_not_override_an_explicit_demotion_target() {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
+        let fifo = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(256 * 1024)
+            .spare_capacity(0)
+            // Deliberately points past the adjacent layer.
+            .config(LayerConfig::new().with_next_layer(0))
+            .build()
+            .expect("fifo layer");
+        let ttl = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(512 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo)
+            .with_ttl_layer(ttl)
+            .build();
+
+        assert_eq!(
+            cache.layers[0].config().next_layer,
+            Some(0),
+            "an explicit demotion target must not be overwritten"
+        );
+    }
+
+    /// A two-layer cache built without touching `LayerConfig`.
+    fn create_test_cache_without_explicit_demotion() -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
+        let fifo = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(256 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("fifo layer");
+        let ttl = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(512 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+
+        TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo)
+            .with_ttl_layer(ttl)
+            .build()
+    }
 
     /// Every layer type must still accept writes after `flush()`.
     ///
