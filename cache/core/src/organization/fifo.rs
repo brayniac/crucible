@@ -403,6 +403,31 @@ impl Default for FifoChain {
     }
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// The chain's head/tail word round-trips both ids, including the
+    /// INVALID_SEGMENT_ID sentinel that marks an empty chain.
+    #[kani::proof]
+    fn head_tail_roundtrip() {
+        let head: u32 = kani::any();
+        let tail: u32 = kani::any();
+        let (h, t) = FifoChain::unpack(FifoChain::pack(head, tail));
+        assert_eq!(h, head);
+        assert_eq!(t, tail);
+    }
+
+    /// The empty sentinel is distinguishable from every real pair.
+    #[kani::proof]
+    fn empty_sentinel_is_unambiguous() {
+        let head: u32 = kani::any();
+        let tail: u32 = kani::any();
+        kani::assume(head != INVALID_SEGMENT_ID || tail != INVALID_SEGMENT_ID);
+        assert!(FifoChain::pack(head, tail) != FifoChain::EMPTY);
+    }
+}
+
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;

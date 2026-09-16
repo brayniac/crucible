@@ -309,6 +309,107 @@ impl LocationLayout {
     }
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// An arbitrary layout drawn from the configurations a pool can build.
+    ///
+    /// Sizes are powers of two because every caller derives them that way, and
+    /// bounding the exponents keeps the search a few hundred cases rather than
+    /// 2^128 while still covering every distinct bit layout.
+    fn any_layout() -> LocationLayout {
+        let align_shift: u32 = kani::any();
+        kani::assume((3..=12).contains(&align_shift));
+        let size_shift: u32 = kani::any();
+        kani::assume((10..=35).contains(&size_shift));
+        kani::assume(size_shift >= align_shift);
+
+        let layout = LocationLayout::new(1usize << size_shift, 1usize << align_shift);
+        kani::assume(layout.is_ok());
+        layout.unwrap()
+    }
+
+    /// Every layout `new` accepts must have computable derived quantities.
+    ///
+    /// This is the Critical found in review: `new` bounded the ceiling but not
+    /// the floor, so a small segment left more than 31 segment-id bits and
+    /// `1u32 << seg_bits` overflowed -- panicking in debug and silently
+    /// yielding `max_segment_count() == 0` in release, from a constructor that
+    /// had just returned `Ok`.
+    #[kani::proof]
+    fn accepted_layouts_have_computable_fields() {
+        let layout = any_layout();
+        assert!(
+            layout.seg_bits() <= 31,
+            "segment-id shift would overflow u32"
+        );
+        assert!(layout.offset_bits() + layout.align_shift as u32 <= 32);
+        assert!(layout.max_segment_count() > 0);
+        assert!(layout.align_bytes() >= 8);
+    }
+
+    /// Packing round-trips for every accepted layout and every field value it
+    /// can represent.
+    #[kani::proof]
+    fn pack_unpack_roundtrip() {
+        let layout = any_layout();
+
+        let pool_id: u8 = kani::any();
+        kani::assume(pool_id <= 3);
+        let segment_id: u32 = kani::any();
+        kani::assume(segment_id < layout.max_segment_count());
+        let incarnation: u8 = kani::any();
+        kani::assume(incarnation <= TAG_MASK);
+        let offset: u32 = kani::any();
+        kani::assume(offset >> layout.align_shift < (1u32 << layout.offset_bits()));
+        kani::assume(offset % layout.align_bytes() == 0);
+
+        let raw = layout.pack(pool_id, segment_id, incarnation, offset);
+        assert_eq!(LocationLayout::pool_id(raw), pool_id);
+        assert_eq!(layout.segment_id(raw), segment_id);
+        assert_eq!(layout.incarnation(raw), incarnation);
+        assert_eq!(layout.offset(raw), offset);
+    }
+
+    /// No issuable location can alias `Location::GHOST`.
+    ///
+    /// The property `max_segment_count`'s doc argues in English: the only
+    /// packing that reaches all-44-bits-set needs the top segment id, and
+    /// `validate_segment_count` never issues it. I got this backwards on the
+    /// first attempt -- the original test asserted the top id did NOT reach
+    /// GHOST, which is exactly the combination that does.
+    #[kani::proof]
+    fn no_issuable_location_is_ghost() {
+        let layout = any_layout();
+
+        let pool_id: u8 = kani::any();
+        kani::assume(pool_id <= 3);
+        let segment_id: u32 = kani::any();
+        kani::assume(segment_id < layout.max_segment_count());
+        let incarnation: u8 = kani::any();
+        kani::assume(incarnation <= TAG_MASK);
+        let offset: u32 = kani::any();
+        kani::assume(offset >> layout.align_shift < (1u32 << layout.offset_bits()));
+        kani::assume(offset % layout.align_bytes() == 0);
+
+        let raw = layout.pack(pool_id, segment_id, incarnation, offset);
+        assert!(raw != crate::location::Location::MAX_RAW);
+    }
+
+    /// Capacity per pool is `2^36 * align_bytes`, independent of segment_size.
+    ///
+    /// This is the claim the disk-alignment decision rests on -- offset bits
+    /// gained are segment bits lost, exactly -- and it was only ever checked at
+    /// four hand-picked sizes.
+    #[kani::proof]
+    fn capacity_depends_only_on_alignment() {
+        let layout = any_layout();
+        let capacity = (1u64 << layout.seg_bits()) * (1u64 << layout.offset_bits()) as u64;
+        assert_eq!(capacity, 1u64 << (PAYLOAD_BITS - TAG_BITS));
+    }
+}
+
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
