@@ -4,6 +4,7 @@
 //! a shared heap and divided into equal-sized slots.
 
 use std::ptr;
+use std::time::Duration;
 
 use crate::sync::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
@@ -382,6 +383,25 @@ pub struct SlabClass {
     bytes_used: AtomicU64,
 }
 
+/// One live item handed to `SlabClass::evict_slab`'s callback.
+///
+/// Borrows directly out of the slab, which is sound only because the drain
+/// has already taken the slab to `Locked` with `ref_count == 0`.
+pub struct EvictedItem<'a> {
+    /// The item's key.
+    pub key: &'a [u8],
+    /// The item's value.
+    pub value: &'a [u8],
+    /// Time left before expiry, or `None` if it has already expired.
+    pub remaining_ttl: Option<Duration>,
+    /// Slab class this item lives in.
+    pub class_id: u8,
+    /// Slab within the class.
+    pub slab_id: u32,
+    /// Slot within the slab.
+    pub slot_index: u16,
+}
+
 impl SlabClass {
     /// Create a new slab class.
     pub fn new(class_id: u8, slot_size: usize, slab_size: usize) -> Self {
@@ -723,9 +743,19 @@ impl SlabClass {
     ///
     /// The returned pointer must only be used to return the slab to the allocator's
     /// free pool. The slab should not be used by this class after eviction.
+    /// Drain a slab, calling `on_evict` for each live item before it is
+    /// delete-marked.
+    ///
+    /// The callback receives the item's value and remaining TTL as well as its
+    /// coordinates, so a caller with a disk tier can demote rather than
+    /// discard. `remaining_ttl` is `None` for an item that has already expired.
+    ///
+    /// The callback runs in `Locked` state, after phase 2 has waited for
+    /// `ref_count` to reach zero, so there are no concurrent readers and the
+    /// borrowed `key`/`value` slices are stable for its duration.
     pub unsafe fn evict_slab<F>(&self, slab_id: u32, mut on_evict: F) -> Option<*mut u8>
     where
-        F: FnMut(&[u8], u8, u32, u16),
+        F: FnMut(EvictedItem<'_>),
     {
         if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
             return None;
@@ -789,11 +819,17 @@ impl SlabClass {
                     continue;
                 }
 
-                // Get the key for hashtable removal
-                let key = header.key();
-
-                // Call the callback to remove from hashtable
-                on_evict(key, self.class_id, slab_id, slot_index);
+                // Borrowed for the callback's duration only. Safe: we hold
+                // the slab in Locked state with ref_count already drained to
+                // zero, so nothing can rewrite these bytes under us.
+                on_evict(EvictedItem {
+                    key: header.key(),
+                    value: header.value(),
+                    remaining_ttl: header.remaining_ttl(),
+                    class_id: self.class_id,
+                    slab_id,
+                    slot_index,
+                });
 
                 // Update stats
                 self.sub_bytes(header.item_size());

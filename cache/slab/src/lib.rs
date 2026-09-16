@@ -175,10 +175,11 @@ impl SlabCache {
         };
 
         // Allocate slot (may evict other items). This acquires a write ref on the slab.
-        let (slab_id, slot_index) = match self
-            .allocator
-            .allocate_with_eviction(class_id, &*self.hashtable)
-        {
+        let (slab_id, slot_index) = match self.allocator.allocate_with_eviction_and_demoter(
+            class_id,
+            &*self.hashtable,
+            self.disk_demoter(),
+        ) {
             Some(ids) => ids,
             None => return false,
         };
@@ -229,6 +230,35 @@ impl SlabCache {
     /// Writes the item to disk storage and updates the hashtable.
     /// Returns true if demotion succeeded.
     #[allow(dead_code)]
+    /// A demoter for the slab-eviction path, or a no-op when there is no disk
+    /// tier.
+    ///
+    /// Returns `true` when the item has been written to disk and the hashtable
+    /// entry repointed at it, which tells `evict_slab_with_demoter` not to
+    /// remove that entry.
+    ///
+    /// An already-expired item (`remaining_ttl == None`) is deliberately NOT
+    /// demoted: writing a dead entry to disk costs an I/O and a slot to store
+    /// something no read can ever return.
+    fn disk_demoter(&self) -> impl FnMut(&crate::class::EvictedItem<'_>) -> bool + '_ {
+        move |item| {
+            if self.disk_layer.is_none() {
+                return false;
+            }
+            let Some(ttl) = item.remaining_ttl else {
+                return false;
+            };
+            let location = SlabLocation::with_pool(
+                self.ram_pool_id,
+                item.class_id,
+                item.slab_id,
+                item.slot_index,
+            )
+            .to_location();
+            self.demote_to_disk(item.key, item.value, ttl, location)
+        }
+    }
+
     fn demote_to_disk(
         &self,
         key: &[u8],
@@ -285,7 +315,7 @@ impl SlabCache {
         // Allocate slot (may evict). This acquires a write ref on the slab.
         let (slab_id, slot_index) = self
             .allocator
-            .allocate_with_eviction(class_id, &*self.hashtable)
+            .allocate_with_eviction_and_demoter(class_id, &*self.hashtable, self.disk_demoter())
             .ok_or(CacheError::OutOfMemory)?;
 
         // Write item
@@ -349,7 +379,7 @@ impl SlabCache {
         // Allocate slot (may evict). This acquires a write ref on the slab.
         let (slab_id, slot_index) = self
             .allocator
-            .allocate_with_eviction(class_id, &*self.hashtable)
+            .allocate_with_eviction_and_demoter(class_id, &*self.hashtable, self.disk_demoter())
             .ok_or(CacheError::OutOfMemory)?;
 
         // Write item
@@ -422,7 +452,7 @@ impl SlabCache {
         // Allocate slot (may evict). This acquires a write ref on the slab.
         let (slab_id, slot_index) = self
             .allocator
-            .allocate_with_eviction(class_id, &*self.hashtable)
+            .allocate_with_eviction_and_demoter(class_id, &*self.hashtable, self.disk_demoter())
             .ok_or(CacheError::OutOfMemory)?;
 
         // Write item
@@ -735,7 +765,7 @@ impl SlabCache {
         // Reserve slot in slab
         let (location, value_ptr, item_size) = self
             .allocator
-            .begin_write_item(key, value_len, ttl, &*self.hashtable)
+            .begin_write_item(key, value_len, ttl, &*self.hashtable, self.disk_demoter())
             .ok_or(CacheError::OutOfMemory)?;
 
         // Create the reservation
@@ -1243,6 +1273,57 @@ mod tests {
             .hashtable_power(10) // 1K buckets
             .build()
             .expect("Failed to create test cache")
+    }
+
+    /// Items evicted from RAM must reach the disk tier, and be readable there.
+    ///
+    /// Before this the plumbing existed but nothing connected it:
+    /// `demote_to_disk` was `#[allow(dead_code)]` with no call sites, so a
+    /// configured disk tier was an mmapped file nothing ever wrote to.
+    #[test]
+    fn test_eviction_demotes_to_disk_and_the_item_is_still_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = SlabCacheBuilder::new()
+            // Small RAM so eviction runs early, generous disk so demotion lands.
+            .heap_size(512 * 1024)
+            .slab_size(64 * 1024)
+            .hashtable_power(10)
+            .disk_tier(DiskTierConfig::new(
+                dir.path().join("slab.disk"),
+                8 * 1024 * 1024,
+            ))
+            .build()
+            .expect("cache with disk tier");
+
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+
+        // Write past RAM capacity so the earliest items must be evicted.
+        let n = 400;
+        for i in 0..n {
+            let key = format!("k{i}");
+            cache
+                .set_item(key.as_bytes(), &value, ttl)
+                .unwrap_or_else(|e| panic!("set {i}: {e:?}"));
+        }
+
+        // Some early key must have left RAM. Find one that is still readable:
+        // if demotion works it came back from disk, and if it does not this
+        // finds nothing.
+        let mut found_after_eviction = 0;
+        for i in 0..(n / 2) {
+            let key = format!("k{i}");
+            if let Some(got) = cache.get_item(key.as_bytes()) {
+                assert_eq!(got, value, "key {i} came back with the wrong value");
+                found_after_eviction += 1;
+            }
+        }
+
+        assert!(
+            found_after_eviction > 0,
+            "no item from the first half survived eviction, so nothing was \
+             demoted to disk -- {n} items written into 512 KiB of RAM"
+        );
     }
 
     #[test]
