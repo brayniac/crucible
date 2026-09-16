@@ -116,7 +116,11 @@ jobs:
           if ! command -v cargo-kani >/dev/null \
              || [ "$(cargo kani --version | awk '{print $2}')" != "$KANI_VERSION" ] \
              || ! "$HOME/.kani/kani-$KANI_VERSION/toolchain/bin/rustc" --version >/dev/null 2>&1; then
-            cargo install --version "$KANI_VERSION" --locked kani-verifier
+            # --force: on a warm run the cache has already restored
+            # ~/.cargo/bin/cargo-kani, so a plain install aborts with
+            # "binary `cargo-kani` already exists in destination" -- the guard
+            # would detect the dangling toolchain and then be unable to heal it.
+            cargo install --force --version "$KANI_VERSION" --locked kani-verifier
             cargo kani setup
           fi
 
