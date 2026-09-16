@@ -216,6 +216,30 @@ impl DiskSegmentMeta {
         &self.ref_count as *const AtomicU32
     }
 
+    /// Drop one reference, freeing the segment if we were the last reader and it
+    /// was condemned while we held it.
+    ///
+    /// The same handoff the item guards perform. A back-out can now land on a
+    /// condemned segment (see #127), and the last one out has to release it or
+    /// nobody will.
+    ///
+    /// Note: unlike [`IoUringDiskLayer::release_read`] this cannot return a
+    /// staging buffer to the layer's buffer pool -- the segment does not know
+    /// about it. Reaching here with a write buffer still attached means the
+    /// segment was condemned before it was flushed, which the layer handles on
+    /// its own paths.
+    pub(crate) fn release_ref(&self) {
+        let prev = self.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            fence(Ordering::Acquire);
+            if Metadata::unpack(self.metadata.load(Ordering::Acquire)).state
+                == State::AwaitingRelease
+            {
+                self.release_condemned();
+            }
+        }
+    }
+
     /// Get the pointer to the free queue for ValueRef construction.
     #[inline]
     pub fn free_queue_ptr(&self) -> *const crossbeam_deque::Injector<u32> {
@@ -225,20 +249,25 @@ impl DiskSegmentMeta {
 
 impl SegmentKeyVerify for DiskSegmentMeta {
     fn try_acquire_read(&self) -> bool {
-        // See SliceSegment's impl: increment, then re-check.
-        if !self.state().holds_valid_data() {
+        // See SliceSegment's impl: increment, then re-check. `Draining` stays
+        // admitted so the demoter can verify keys; `AwaitingRelease` does not
+        // -- its hashtable entries are gone and admitting a fresh reference
+        // would unstick the evictor's `ref_count == 0` gate (#127).
+        let state = self.state();
+        if !state.holds_valid_data() || state.is_condemned() {
             return false;
         }
         self.ref_count.fetch_add(1, Ordering::Acquire);
-        if !self.state().holds_valid_data() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+        let state_after = self.state();
+        if !state_after.holds_valid_data() || state_after.is_condemned() {
+            self.release_ref();
             return false;
         }
         true
     }
 
     fn release_read(&self) {
-        self.ref_count.fetch_sub(1, Ordering::Release);
+        self.release_ref();
     }
 
     #[inline]

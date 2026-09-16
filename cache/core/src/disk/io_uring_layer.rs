@@ -20,6 +20,7 @@
 //! - `release_read()` after a disk read completes
 
 use crate::config::LayerConfig;
+use crate::disk::DiskSegmentMeta;
 use crate::error::{CacheError, CacheResult};
 use crate::eviction::{ItemFate, determine_item_fate};
 use crate::hashtable::{Hashtable, KeyVerifier};
@@ -225,7 +226,10 @@ impl IoUringDiskLayer {
         let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
         let segment = self.pool.get(segment_id)?;
 
-        if !segment.state().is_readable() {
+        let state = segment.state();
+        // Condemned: hashtable entries are gone, so this location is stale and
+        // the answer is a miss (#127).
+        if !state.is_readable() || state.is_condemned() {
             return None;
         }
 
@@ -246,8 +250,9 @@ impl IoUringDiskLayer {
         unsafe { (*ref_count_ptr).fetch_add(1, Ordering::Acquire) };
 
         // Double-check state after increment
-        if !segment.state().is_readable() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+        let state_after = segment.state();
+        if !state_after.is_readable() || state_after.is_condemned() {
+            self.release_segment_ref(segment);
             return None;
         }
 
@@ -257,14 +262,14 @@ impl IoUringDiskLayer {
 
         // Parse header
         if offset as usize + BasicHeader::SIZE > segment.capacity() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+            self.release_segment_ref(segment);
             return None;
         }
 
         let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
 
         if header.is_deleted() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+            self.release_segment_ref(segment);
             return None;
         }
 
@@ -273,7 +278,7 @@ impl IoUringDiskLayer {
         // not own, so checking the stride here would reject a valid read.
         let item_size = header.padded_size();
         if offset as usize + item_size > segment.capacity() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+            self.release_segment_ref(segment);
             return None;
         }
 
@@ -281,7 +286,7 @@ impl IoUringDiskLayer {
         let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
         let key_end = key_start + header.key_len() as usize;
         if key_end > segment.capacity() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+            self.release_segment_ref(segment);
             return None;
         }
 
@@ -289,7 +294,7 @@ impl IoUringDiskLayer {
             std::slice::from_raw_parts(data_ptr.add(key_start), header.key_len() as usize)
         };
         if stored_key != key {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+            self.release_segment_ref(segment);
             return None;
         }
 
@@ -325,7 +330,10 @@ impl IoUringDiskLayer {
         let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
         let segment = self.pool.get(segment_id)?;
 
-        if !segment.state().is_readable() {
+        let state = segment.state();
+        // Condemned: hashtable entries are gone, so this location is stale and
+        // the answer is a miss (#127).
+        if !state.is_readable() || state.is_condemned() {
             return None;
         }
 
@@ -346,8 +354,9 @@ impl IoUringDiskLayer {
         unsafe { (*ref_count_ptr).fetch_add(1, Ordering::Acquire) };
 
         // Double-check state after increment
-        if !segment.state().is_readable() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+        let state_after = segment.state();
+        if !state_after.is_readable() || state_after.is_condemned() {
+            self.release_segment_ref(segment);
             return None;
         }
 
@@ -432,6 +441,29 @@ impl IoUringDiskLayer {
             && let Some(buf) = segment.detach_write_buffer()
         {
             self.buffer_pool.lock().unwrap().release(buf);
+        }
+    }
+
+    /// Drop one reference taken by a synchronous read path, completing the
+    /// condemned handoff if we were the last reader.
+    ///
+    /// A back-out can now land on a condemned segment (see #127); the last one
+    /// out has to release it or nobody will. The staging buffer is returned
+    /// only on that condemned path -- a back-out from a live segment must not
+    /// detach the buffer it is still writing into.
+    fn release_segment_ref(&self, segment: &DiskSegmentMeta) {
+        let prev = unsafe { (*segment.ref_count_ptr()).fetch_sub(1, Ordering::Release) };
+        if prev == 1 {
+            // Fence before reading the state, so we see the `AwaitingRelease`
+            // the evictor published -- same order as `SliceSegment::release_ref`.
+            fence(Ordering::Acquire);
+            if segment.state() != State::AwaitingRelease {
+                return;
+            }
+            if let Some(buf) = segment.detach_write_buffer() {
+                self.buffer_pool.lock().unwrap().release(buf);
+            }
+            segment.release_condemned();
         }
     }
 
@@ -783,7 +815,10 @@ impl Layer for IoUringDiskLayer {
 
         let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
         let segment = self.pool.get(segment_id)?;
-        if !segment.state().is_readable() || !segment.has_write_buffer() {
+        let state = segment.state();
+        // Condemned: hashtable entries are gone, so this location is stale and
+        // the answer is a miss (#127).
+        if !state.is_readable() || state.is_condemned() || !segment.has_write_buffer() {
             return None;
         }
 
@@ -800,8 +835,9 @@ impl Layer for IoUringDiskLayer {
         unsafe { (*ref_count_ptr).fetch_add(1, Ordering::Acquire) };
 
         // Double-check state after increment
-        if !segment.state().is_readable() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+        let state_after = segment.state();
+        if !state_after.is_readable() || state_after.is_condemned() {
+            self.release_segment_ref(segment);
             return None;
         }
 
@@ -817,7 +853,7 @@ impl Layer for IoUringDiskLayer {
         let value_end = value_start + value_len as usize;
 
         if value_end > segment.capacity() {
-            unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+            self.release_segment_ref(segment);
             return None;
         }
 

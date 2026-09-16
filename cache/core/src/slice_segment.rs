@@ -299,13 +299,13 @@ impl<'a> SliceSegment<'a> {
             .as_secs();
         let expire_at = self.expire_at.load(Ordering::Acquire);
         if expire_at > 0 && now >= expire_at {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::Expired);
         }
 
         // Validate offset
         if offset as usize + BasicHeader::SIZE > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -321,19 +321,19 @@ impl<'a> SliceSegment<'a> {
         let header = match header {
             Some(h) => h,
             None => {
-                self.ref_count.fetch_sub(1, Ordering::Release);
+                self.release_ref();
                 return Err(CacheError::Corrupted);
             }
         };
 
         if header.is_deleted() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::ItemDeleted);
         }
 
         let item_size = header.padded_size();
         if offset as usize + item_size > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -360,7 +360,7 @@ impl<'a> SliceSegment<'a> {
         };
 
         if stored_key != key {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::KeyMismatch);
         }
 
@@ -383,7 +383,7 @@ impl<'a> SliceSegment<'a> {
     ) -> Result<BasicItemGuard<'_>, CacheError> {
         // Validate offset
         if offset as usize + TtlHeader::SIZE > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -399,13 +399,13 @@ impl<'a> SliceSegment<'a> {
         let header = match header {
             Some(h) => h,
             None => {
-                self.ref_count.fetch_sub(1, Ordering::Release);
+                self.release_ref();
                 return Err(CacheError::Corrupted);
             }
         };
 
         if header.is_deleted() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::ItemDeleted);
         }
 
@@ -414,13 +414,13 @@ impl<'a> SliceSegment<'a> {
             .duration_since(clocksource::coarse::UnixInstant::EPOCH)
             .as_secs();
         if header.is_expired(now) {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::Expired);
         }
 
         let item_size = header.padded_size();
         if offset as usize + item_size > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -447,7 +447,7 @@ impl<'a> SliceSegment<'a> {
         };
 
         if stored_key != key {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::KeyMismatch);
         }
 
@@ -480,7 +480,9 @@ impl<'a> SliceSegment<'a> {
     pub fn get_value_ref_raw(&self, offset: u32, key: &[u8]) -> Result<ValueRefRaw, CacheError> {
         // Check state and increment ref count
         let state = self.state();
-        if !state.is_readable() {
+        // A condemned segment is readable only for a reference already held; a
+        // fresh acquire here is a stale location and must miss (#127).
+        if !state.is_readable() || state.is_condemned() {
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -488,8 +490,8 @@ impl<'a> SliceSegment<'a> {
 
         // Double-check state after increment
         let state_after = self.state();
-        if !state_after.is_readable() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+        if !state_after.is_readable() || state_after.is_condemned() {
+            self.release_ref();
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -510,13 +512,13 @@ impl<'a> SliceSegment<'a> {
             .as_secs();
         let expire_at = self.expire_at.load(Ordering::Acquire);
         if expire_at > 0 && now >= expire_at {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::Expired);
         }
 
         // Validate offset
         if offset as usize + BasicHeader::SIZE > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -532,19 +534,19 @@ impl<'a> SliceSegment<'a> {
         let header = match header {
             Some(h) => h,
             None => {
-                self.ref_count.fetch_sub(1, Ordering::Release);
+                self.release_ref();
                 return Err(CacheError::Corrupted);
             }
         };
 
         if header.is_deleted() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::ItemDeleted);
         }
 
         let item_size = header.padded_size();
         if offset as usize + item_size > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -558,7 +560,7 @@ impl<'a> SliceSegment<'a> {
         let key_bytes =
             unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
         if key_bytes != key {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::KeyMismatch);
         }
 
@@ -581,7 +583,7 @@ impl<'a> SliceSegment<'a> {
     fn get_value_ref_raw_ttl(&self, offset: u32, key: &[u8]) -> Result<ValueRefRaw, CacheError> {
         // Validate offset
         if offset as usize + TtlHeader::SIZE > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -597,13 +599,13 @@ impl<'a> SliceSegment<'a> {
         let header = match header {
             Some(h) => h,
             None => {
-                self.ref_count.fetch_sub(1, Ordering::Release);
+                self.release_ref();
                 return Err(CacheError::Corrupted);
             }
         };
 
         if header.is_deleted() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::ItemDeleted);
         }
 
@@ -612,13 +614,13 @@ impl<'a> SliceSegment<'a> {
             .duration_since(clocksource::coarse::UnixInstant::EPOCH)
             .as_secs();
         if header.is_expired(now) {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::Expired);
         }
 
         let item_size = header.padded_size();
         if offset as usize + item_size > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -632,7 +634,7 @@ impl<'a> SliceSegment<'a> {
         let key_bytes =
             unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key_end - key_start) };
         if key_bytes != key {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::KeyMismatch);
         }
 
@@ -760,19 +762,26 @@ impl SegmentKeyVerify for SliceSegment<'_> {
         // Increment first, then re-check: an evictor that already observed
         // ref_count == 0 may be mid-condemn, and only the post-increment check
         // can see the state it published.
-        if !self.state().holds_valid_data() {
+        // `Draining` stays admitted on purpose -- that is what lets the demoter
+        // verify keys on a segment it is draining. `AwaitingRelease` does not:
+        // the hashtable entries are already gone, so an arriving thread holds a
+        // stale location, and admitting it would unstick the evictor's
+        // `ref_count == 0` gate (#127).
+        let state = self.state();
+        if !state.holds_valid_data() || state.is_condemned() {
             return false;
         }
         self.ref_count.fetch_add(1, Ordering::Acquire);
-        if !self.state().holds_valid_data() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+        let state_after = self.state();
+        if !state_after.holds_valid_data() || state_after.is_condemned() {
+            self.release_ref();
             return false;
         }
         true
     }
 
     fn release_read(&self) {
-        self.ref_count.fetch_sub(1, Ordering::Release);
+        self.release_ref();
     }
 
     fn incarnation(&self) -> u8 {
@@ -1428,6 +1437,24 @@ impl SliceSegment<'_> {
         self.metadata.store(free_meta.pack(), Ordering::Release);
     }
 
+    /// Drop one reference, freeing the segment if we were the last reader and it
+    /// was condemned while we held it.
+    ///
+    /// This is the same handoff `BasicItemGuard::drop` performs. A back-out can
+    /// now land on a condemned segment (see #127), and the last one out has to
+    /// release it or nobody will.
+    fn release_ref(&self) {
+        let prev = self.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            fence(Ordering::Acquire);
+            if Metadata::unpack(self.metadata.load(Ordering::Acquire)).state
+                == State::AwaitingRelease
+            {
+                self.release_condemned();
+            }
+        }
+    }
+
     /// Release a condemned segment to the free queue.
     ///
     /// Called when the last reader drops its guard on a segment in
@@ -1436,6 +1463,12 @@ impl SliceSegment<'_> {
     ///
     /// Returns true if the segment was released, false if it wasn't
     /// in AwaitingRelease state.
+    ///
+    /// Safe to race: the CAS names the exact metadata word it loaded, so of any
+    /// number of concurrent callers -- `release_ref`'s handoff, a guard drop,
+    /// the evictor's race fix -- at most one can succeed, and only that one
+    /// pushes to the free queue. The losers observe the changed word and return
+    /// false.
     pub fn release_condemned(&self) -> bool {
         let current = self.metadata.load(Ordering::Acquire);
         let current_meta = Metadata::unpack(current);
@@ -1488,7 +1521,9 @@ impl SegmentGuard for SliceSegment<'_> {
     fn get_item(&self, offset: u32, key: &[u8]) -> Result<Self::Guard<'_>, CacheError> {
         // Check state and increment ref count
         let state = self.state();
-        if !state.is_readable() {
+        // A condemned segment is readable only for a reference already held; a
+        // fresh acquire here is a stale location and must miss (#127).
+        if !state.is_readable() || state.is_condemned() {
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -1496,8 +1531,8 @@ impl SegmentGuard for SliceSegment<'_> {
 
         // Double-check state after increment
         let state_after = self.state();
-        if !state_after.is_readable() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+        if !state_after.is_readable() || state_after.is_condemned() {
+            self.release_ref();
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -1517,7 +1552,9 @@ impl SegmentGuard for SliceSegment<'_> {
     ) -> Result<Self::Guard<'_>, CacheError> {
         // Check state and increment ref count
         let state = self.state();
-        if !state.is_readable() {
+        // A condemned segment is readable only for a reference already held; a
+        // fresh acquire here is a stale location and must miss (#127).
+        if !state.is_readable() || state.is_condemned() {
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -1525,8 +1562,8 @@ impl SegmentGuard for SliceSegment<'_> {
 
         // Double-check state after increment
         let state_after = self.state();
-        if !state_after.is_readable() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+        if !state_after.is_readable() || state_after.is_condemned() {
+            self.release_ref();
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -1545,7 +1582,7 @@ impl SegmentGuard for SliceSegment<'_> {
 
         // Validate offset bounds
         if offset as usize + item_size > self.capacity as usize {
-            self.ref_count.fetch_sub(1, Ordering::Release);
+            self.release_ref();
             return Err(CacheError::InvalidOffset);
         }
 
@@ -1656,6 +1693,200 @@ mod tests {
             "a segment being cleared must not be read"
         );
         assert_eq!(segment.ref_count(), 0, "a refused guard leaks no reference");
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// Build a Sealed segment holding one item, then condemn it.
+    ///
+    /// This is the state a segment is in after the evictor has drained its
+    /// hashtable entries and is waiting on its last reader: the item's bytes
+    /// are still intact, but no fresh lookup can reach it any more.
+    fn condemned_segment_with_one_item(id: u32) -> (SliceSegment<'static>, *mut u8, Layout) {
+        let (segment, ptr, layout) = create_test_segment(0, false, id, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.append_item(b"key", b"value", &[]).expect("append");
+        assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+        assert!(segment.cas_metadata(State::Sealed, State::AwaitingRelease, None, None));
+        (segment, ptr, layout)
+    }
+
+    /// `get_value_ref_raw` must miss on a condemned segment (#127).
+    #[test]
+    fn test_condemned_segment_refuses_get_value_ref_raw() {
+        let (segment, ptr, layout) = condemned_segment_with_one_item(10);
+
+        assert!(
+            segment.get_value_ref_raw(0, b"key").is_err(),
+            "a fresh zero-copy read must not resolve against a condemned segment"
+        );
+        assert_eq!(
+            segment.ref_count(),
+            0,
+            "a refused acquire must not raise the reference count -- the evictor's \
+             ref_count == 0 gate depends on it staying put"
+        );
+        assert_eq!(
+            segment.state(),
+            State::AwaitingRelease,
+            "a refused read must leave the state machine alone -- gated only on the \
+             post-increment re-check, the refused acquire would take a reference, find \
+             itself the last one out, and recycle the segment itself"
+        );
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// `get_item` must miss on a condemned segment (#127).
+    #[test]
+    fn test_condemned_segment_refuses_get_item() {
+        let (segment, ptr, layout) = condemned_segment_with_one_item(11);
+
+        assert!(
+            segment.get_item(0, b"key").is_err(),
+            "a fresh guarded read must not resolve against a condemned segment"
+        );
+        assert_eq!(segment.ref_count(), 0);
+        assert_eq!(
+            segment.state(),
+            State::AwaitingRelease,
+            "a refused read must leave the state machine alone -- gated only on the \
+             post-increment re-check, the refused acquire would take a reference, find \
+             itself the last one out, and recycle the segment itself"
+        );
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// `get_item_verified` must miss on a condemned segment (#127).
+    ///
+    /// This is the layers' hot path: they parse the header themselves and then
+    /// ask for the guard, so the gate has to be here too and not only in
+    /// `get_item`.
+    #[test]
+    fn test_condemned_segment_refuses_get_item_verified() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 12, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.append_item(b"key", b"value", &[]).expect("append");
+        let header_info = segment
+            .verify_key_with_header(0, b"key", false)
+            .expect("header parses while the segment is live");
+        assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+        assert!(segment.cas_metadata(State::Sealed, State::AwaitingRelease, None, None));
+
+        assert!(
+            segment.get_item_verified(0, header_info).is_err(),
+            "a pre-verified read must not resolve against a condemned segment"
+        );
+        assert_eq!(segment.ref_count(), 0);
+        assert_eq!(
+            segment.state(),
+            State::AwaitingRelease,
+            "a refused read must leave the state machine alone -- gated only on the \
+             post-increment re-check, the refused acquire would take a reference, find \
+             itself the last one out, and recycle the segment itself"
+        );
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// The verify guard must refuse a condemned segment but keep admitting a
+    /// draining one.
+    ///
+    /// `Draining` staying in is load-bearing: the drain reads items through the
+    /// verifier while the segment sits in that state, and excluding it once
+    /// stopped demotion outright. `AwaitingRelease` is the one to exclude
+    /// (#127) -- its hashtable entries are already gone.
+    #[test]
+    fn test_read_guard_refuses_a_condemned_segment_but_admits_a_draining_one() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 13, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.append_item(b"key", b"value", &[]).expect("append");
+        let inc = segment.incarnation();
+
+        assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(
+            segment.try_acquire_read(),
+            "Draining must still be admitted -- the demoter verifies keys through here"
+        );
+        segment.release_read();
+        assert_eq!(segment.ref_count(), 0);
+
+        assert!(segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None));
+        assert!(
+            !segment.try_acquire_read(),
+            "a condemned segment must not admit a fresh reference"
+        );
+        assert!(
+            !segment.verify_key_guarded(0, b"key", false, inc),
+            "and the verify built on it must answer no"
+        );
+        assert_eq!(segment.ref_count(), 0, "a refused guard leaks no reference");
+        assert_eq!(
+            segment.state(),
+            State::AwaitingRelease,
+            "a refused read must leave the state machine alone -- gated only on the \
+             post-increment re-check, the refused acquire would take a reference, find \
+             itself the last one out, and recycle the segment itself"
+        );
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// The last reference out of a condemned segment must free it (#127 part 2).
+    ///
+    /// Part 1 makes this path reachable: a back-out can now land on
+    /// `AwaitingRelease`, and if it just decrements, the segment is stranded
+    /// there with no reader left to hand it on.
+    #[test]
+    fn test_release_ref_frees_a_condemned_segment_when_last_out() {
+        let (segment, ptr, layout) = condemned_segment_with_one_item(14);
+
+        // Stand in for a reference taken before the condemn.
+        segment.ref_count.fetch_add(1, Ordering::Acquire);
+        segment.release_ref();
+
+        assert_eq!(segment.ref_count(), 0);
+        assert_eq!(
+            segment.state(),
+            State::Free,
+            "the last reference out of a condemned segment must release it, not \
+             strand it in AwaitingRelease"
+        );
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// ...but only the *last* one out, and only when condemned.
+    #[test]
+    fn test_release_ref_does_not_free_early_or_spuriously() {
+        let (segment, ptr, layout) = condemned_segment_with_one_item(15);
+
+        segment.ref_count.fetch_add(2, Ordering::Acquire);
+        segment.release_ref();
+        assert_eq!(segment.ref_count(), 1);
+        assert_eq!(
+            segment.state(),
+            State::AwaitingRelease,
+            "a reference still outstanding means the segment is not free yet"
+        );
+        segment.release_ref();
+        assert_eq!(segment.state(), State::Free);
+
+        unsafe { free_test_segment(ptr, layout) };
+
+        // A live segment is left alone.
+        let (segment, ptr, layout) = create_test_segment(0, false, 16, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.ref_count.fetch_add(1, Ordering::Acquire);
+        segment.release_ref();
+        assert_eq!(segment.ref_count(), 0);
+        assert_eq!(segment.state(), State::Live);
 
         unsafe { free_test_segment(ptr, layout) };
     }
@@ -2998,7 +3229,7 @@ impl SegmentIter for SliceSegment<'_> {
 
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
-    use crate::state::{Metadata, State};
+    use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
     use loom::sync::Arc;
     use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use loom::thread;
@@ -3457,6 +3688,219 @@ mod loom_tests {
             // State should be either Live or Sealed
             let final_meta = Metadata::unpack(metadata.load(Ordering::Acquire));
             assert!(final_meta.state == State::Live || final_meta.state == State::Sealed);
+        });
+    }
+
+    /// Mirror of `SliceSegment::release_ref` -- the #127 back-out handoff.
+    fn model_release_ref(rc: &AtomicU32, m: &AtomicU64) -> u32 {
+        let prev = rc.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            loom::sync::atomic::fence(Ordering::Acquire);
+            if Metadata::unpack(m.load(Ordering::Acquire)).state == State::AwaitingRelease {
+                model_release_condemned(m);
+            }
+        }
+        prev
+    }
+
+    /// Mirror of `SliceSegment::release_condemned` -- state-only check, one CAS.
+    fn model_release_condemned(m: &AtomicU64) -> bool {
+        let current = m.load(Ordering::Acquire);
+        let current_meta = Metadata::unpack(current);
+        if current_meta.state != State::AwaitingRelease {
+            return false;
+        }
+        let new_meta = current_meta
+            .with_state(State::Free)
+            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+            .bump_incarnation();
+        m.compare_exchange(
+            current,
+            new_meta.pack(),
+            Ordering::Release,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    }
+
+    /// Mirror of the fresh-acquire gate every read-entry site now uses.
+    fn model_admits_fresh_reader(state: State) -> bool {
+        state.is_readable() && !state.is_condemned()
+    }
+
+    /// Part 2 of #127: a reader turned away by the condemned gate *after* it
+    /// has taken its reference must hand the segment on, not strand it.
+    ///
+    /// Part 1 makes this path reachable. Before it, `AwaitingRelease` passed
+    /// the post-increment re-check, so a back-out there could not happen and a
+    /// bare `ref_count.fetch_sub` was harmless. Now the back-out is the common
+    /// case, and the last reference out is the only one that can free the
+    /// segment -- `SliceSegment::release_ref` is where that happens.
+    ///
+    /// The evictor here deliberately does **not** run its
+    /// `ref_count() == 0 && release_condemned()` race fix: the point is to pin
+    /// the reader's obligation, so nothing else may discharge it.
+    ///
+    /// Scope, deliberately narrow. This does not also assert "a reader holding
+    /// a reference never sees `Free`/`Locked`", because modelling the evictor's
+    /// `ref_count` read alongside the reader's state re-check reopens the
+    /// store-buffer question from crucible#109: reader stores `ref_count` then
+    /// loads state, evictor stores state then loads `ref_count`, and loom lets
+    /// both loads come back stale (with `SeqCst` throughout, too). That window
+    /// predates #127 and is not what this change is about; pinning it here
+    /// would make the test unadjudicable for the property it exists to check.
+    #[test]
+    fn test_condemned_backout_hands_the_segment_on() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let ref_count = Arc::new(AtomicU32::new(0));
+            let metadata = Arc::new(AtomicU64::new(Metadata::new(State::Sealed).pack()));
+
+            // Reader: the fresh-acquire gate every read-entry site now uses,
+            // backed out through `release_ref`.
+            let rc1 = ref_count.clone();
+            let m1 = metadata.clone();
+            let reader = thread::spawn(move || {
+                let state = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                if !model_admits_fresh_reader(state) {
+                    return false;
+                }
+                rc1.fetch_add(1, Ordering::Acquire);
+                let state_after = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                if !model_admits_fresh_reader(state_after) {
+                    let prev = model_release_ref(&rc1, &m1);
+                    return state_after.is_condemned() && prev == 1;
+                }
+                model_release_ref(&rc1, &m1);
+                false
+            });
+
+            // Evictor: drain the hashtable (a no-op here -- no fresh lookup can
+            // find the segment afterwards) and condemn. No race fix.
+            let m2 = metadata.clone();
+            let evictor = thread::spawn(move || {
+                let current = m2.load(Ordering::Acquire);
+                let current_meta = Metadata::unpack(current);
+                if current_meta.state != State::Sealed {
+                    return;
+                }
+                let _ = m2.compare_exchange(
+                    current,
+                    current_meta.with_state(State::AwaitingRelease).pack(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            });
+
+            let backed_out_as_last = reader.join().unwrap();
+            evictor.join().unwrap();
+
+            assert_eq!(ref_count.load(Ordering::Acquire), 0);
+
+            if backed_out_as_last {
+                let final_state = Metadata::unpack(metadata.load(Ordering::Acquire)).state;
+                assert_ne!(
+                    final_state,
+                    State::AwaitingRelease,
+                    "the last reference out backed off a condemned segment and left it \
+                     stranded in AwaitingRelease with ref_count == 0 -- the back-out did \
+                     not complete the handoff (#127 part 2)"
+                );
+            }
+        });
+    }
+
+    /// The condemned-release gate: does the caller's `ref_count() == 0` check
+    /// still hold by the time `release_condemned` CASes to `Free`?
+    ///
+    /// Mirrors, line for line:
+    ///   - the reader, `SliceSegment::get_value_ref_raw` (check the fresh-acquire
+    ///     gate, `fetch_add`, re-check it) -- the gate is
+    ///     `is_readable() && !is_condemned()`, the fix for #127;
+    ///   - the evictor, the race-fix branch in
+    ///     `FifoLayer::process_evicted_segment_nonblocking`
+    ///     (`if segment.ref_count() == 0 && segment.release_condemned()`),
+    ///     with `release_condemned`'s body inlined — it checks the *state*
+    ///     and never re-reads `ref_count`.
+    ///
+    /// The model starts where that branch starts: state `AwaitingRelease`,
+    /// `ref_count` 0 (the last reader dropped during the condemn window). The
+    /// reader is one that read its location out of the hashtable *before*
+    /// `drain_segment_from_hashtable` ran and is only now getting to its
+    /// acquire — `Draining` would have turned it away, but the evictor's own
+    /// CAS to `AwaitingRelease` puts the segment back inside `is_readable()`.
+    ///
+    /// Invariant: a reader holding a reference must never be looking at a
+    /// segment that has been published `Free`, because `Free` means the
+    /// segment is on the pool's free queue and can be handed to a writer.
+    #[test]
+    fn test_release_condemned_gate_respects_readers() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let ref_count = Arc::new(AtomicU32::new(0));
+            let metadata = Arc::new(AtomicU64::new(Metadata::new(State::AwaitingRelease).pack()));
+
+            // Reader: get_value_ref_raw's acquire sequence.
+            let rc1 = ref_count.clone();
+            let m1 = metadata.clone();
+            let reader = thread::spawn(move || {
+                let state = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                if !state.is_readable() || state.is_condemned() {
+                    return None;
+                }
+                rc1.fetch_add(1, Ordering::Acquire);
+                let state_after = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                if !state_after.is_readable() || state_after.is_condemned() {
+                    rc1.fetch_sub(1, Ordering::Release);
+                    return None;
+                }
+                // Reference held. This is where the caller reads item bytes:
+                // report the state the segment is in while we are reading them.
+                let observed = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                rc1.fetch_sub(1, Ordering::Release);
+                Some(observed)
+            });
+
+            // Evictor: `ref_count() == 0 && release_condemned()`.
+            let rc2 = ref_count.clone();
+            let m2 = metadata.clone();
+            let evictor = thread::spawn(move || {
+                if rc2.load(Ordering::Acquire) != 0 {
+                    return false;
+                }
+                // --- release_condemned() ---
+                let current = m2.load(Ordering::Acquire);
+                let current_meta = Metadata::unpack(current);
+                if current_meta.state != State::AwaitingRelease {
+                    return false;
+                }
+                let new_meta = current_meta
+                    .with_state(State::Free)
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+                    .bump_incarnation();
+                m2.compare_exchange(
+                    current,
+                    new_meta.pack(),
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            });
+
+            let observed = reader.join().unwrap();
+            let released = evictor.join().unwrap();
+
+            if let Some(state) = observed {
+                assert_ne!(
+                    state,
+                    State::Free,
+                    "reader held a reference while the segment was published Free \
+                     (released={released}) -- the evictor's ref_count == 0 check \
+                     went stale before release_condemned's CAS"
+                );
+            }
         });
     }
 }

@@ -436,7 +436,8 @@ impl Layer for DiskLayer {
         let segment = self.pool.get(segment_id)?;
 
         let state = segment.state();
-        if !state.is_readable() {
+        // Condemned: stale location, answer is a miss (#127).
+        if !state.is_readable() || state.is_condemned() {
             return None;
         }
 
