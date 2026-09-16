@@ -1205,8 +1205,16 @@ impl Cache for HeapCache {
         // Clear the hashtable first - makes all items "invisible"
         self.hashtable.clear();
 
-        // Reset all storage slots (frees entries and rebuilds free list)
+        // Reset all storage slots (frees entries and rebuilds free list).
+        //
+        // All four, not just strings: the hashtable clear above makes every
+        // entry unreachable, but a slot left occupied is never handed out
+        // again, so flushing a cache with data structures used to leak every
+        // hash, list and set for the life of the process.
         self.storage.reset_all();
+        self.hash_storage.reset_all();
+        self.list_storage.reset_all();
+        self.set_storage.reset_all();
 
         // Drop the eviction policy's queues. Their entries name buckets the
         // hashtable clear above just emptied, and a stale entry aborts an
@@ -2265,6 +2273,65 @@ mod tests {
         }
 
         assert!(cache.contains(b"post299"));
+    }
+
+    /// `flush()` must reclaim complex-type storage, not just string slots.
+    ///
+    /// The hashtable clear makes hash/list/set entries unreachable, but their
+    /// slots stay occupied: `SlotStorage::reset_all` only covers strings.
+    /// FLUSHALL then leaks every data structure, and the slots are gone for
+    /// the life of the process.
+    #[test]
+    fn test_flush_reclaims_complex_type_storage() {
+        let cache = create_test_cache();
+        let ttl = Some(Duration::from_secs(3600));
+
+        for i in 0..50 {
+            let key = format!("h{i}");
+            cache
+                .hset(key.as_bytes(), b"field", b"value", ttl)
+                .expect("hset");
+        }
+        for i in 0..50 {
+            let key = format!("l{i}");
+            cache
+                .rpush(key.as_bytes(), &[&b"item"[..]], ttl)
+                .expect("rpush");
+        }
+        for i in 0..50 {
+            let key = format!("s{i}");
+            cache
+                .sadd(key.as_bytes(), &[&b"member"[..]], ttl)
+                .expect("sadd");
+        }
+
+        assert!(
+            cache.hash_storage.occupied() > 0,
+            "hashes should occupy slots"
+        );
+        assert!(
+            cache.list_storage.occupied() > 0,
+            "lists should occupy slots"
+        );
+        assert!(cache.set_storage.occupied() > 0, "sets should occupy slots");
+
+        Cache::flush(&cache);
+
+        assert_eq!(
+            cache.hash_storage.occupied(),
+            0,
+            "flush left hash slots occupied; they are unreachable but never freed"
+        );
+        assert_eq!(
+            cache.list_storage.occupied(),
+            0,
+            "flush left list slots occupied"
+        );
+        assert_eq!(
+            cache.set_storage.occupied(),
+            0,
+            "flush left set slots occupied"
+        );
     }
 
     #[test]

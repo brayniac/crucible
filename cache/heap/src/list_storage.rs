@@ -146,6 +146,49 @@ impl ListStorage {
     }
 
     /// Deallocate a slot.
+    /// Free every slot and rebuild the free list, as if newly constructed.
+    ///
+    /// For flush only, and only after the hashtable has been cleared. Clearing
+    /// the hashtable makes these entries unreachable but leaves their slots
+    /// occupied -- without this, FLUSHALL leaks every list for the life
+    /// of the process.
+    ///
+    /// Generations are bumped rather than left alone: a `TypedLocation` names
+    /// (slot, generation), so a stale one from before the flush must stop
+    /// resolving. Skipping the bump would let it match a slot that has since
+    /// been handed to a different key.
+    pub fn reset_all(&self) {
+        for slot in &self.slots {
+            let occupied = {
+                let mut guard = slot.data.lock();
+                guard.take().is_some()
+            };
+            if occupied {
+                slot.increment_generation();
+            }
+        }
+
+        // Rebuild the free list: 0 -> 1 -> ... -> n-1 -> EMPTY.
+        let capacity = self.slots.len();
+        for (i, slot) in self.slots.iter().enumerate() {
+            let next = if i + 1 < capacity {
+                (i + 1) as u32
+            } else {
+                EMPTY_FREE_LIST
+            };
+            slot.next_free.store(next, Ordering::Release);
+        }
+
+        // Bump the version alongside the head so a racing `allocate` that
+        // still holds the old packed value loses its compare-exchange rather
+        // than splicing the old list back in.
+        let (_, version) = unpack_head(self.free_head.load(Ordering::Acquire));
+        self.free_head
+            .store(pack_head(0, version.wrapping_add(1)), Ordering::Release);
+
+        self.occupied_count.store(0, Ordering::Release);
+    }
+
     pub fn deallocate(&self, idx: u32) {
         if idx as usize >= self.slots.len() {
             return;
