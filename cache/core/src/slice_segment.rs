@@ -2998,7 +2998,7 @@ impl SegmentIter for SliceSegment<'_> {
 
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
-    use crate::state::{Metadata, State};
+    use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
     use loom::sync::Arc;
     use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use loom::thread;
@@ -3457,6 +3457,98 @@ mod loom_tests {
             // State should be either Live or Sealed
             let final_meta = Metadata::unpack(metadata.load(Ordering::Acquire));
             assert!(final_meta.state == State::Live || final_meta.state == State::Sealed);
+        });
+    }
+
+    /// The condemned-release gate: does the caller's `ref_count() == 0` check
+    /// still hold by the time `release_condemned` CASes to `Free`?
+    ///
+    /// Mirrors, line for line:
+    ///   - the reader, `SliceSegment::get_value_ref_raw` (check `is_readable`,
+    ///     `fetch_add`, re-check `is_readable`);
+    ///   - the evictor, the race-fix branch in
+    ///     `FifoLayer::process_evicted_segment_nonblocking`
+    ///     (`if segment.ref_count() == 0 && segment.release_condemned()`),
+    ///     with `release_condemned`'s body inlined — it checks the *state*
+    ///     and never re-reads `ref_count`.
+    ///
+    /// The model starts where that branch starts: state `AwaitingRelease`,
+    /// `ref_count` 0 (the last reader dropped during the condemn window). The
+    /// reader is one that read its location out of the hashtable *before*
+    /// `drain_segment_from_hashtable` ran and is only now getting to its
+    /// acquire — `Draining` would have turned it away, but the evictor's own
+    /// CAS to `AwaitingRelease` puts the segment back inside `is_readable()`.
+    ///
+    /// Invariant: a reader holding a reference must never be looking at a
+    /// segment that has been published `Free`, because `Free` means the
+    /// segment is on the pool's free queue and can be handed to a writer.
+    #[test]
+    fn test_release_condemned_gate_respects_readers() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let ref_count = Arc::new(AtomicU32::new(0));
+            let metadata = Arc::new(AtomicU64::new(Metadata::new(State::AwaitingRelease).pack()));
+
+            // Reader: get_value_ref_raw's acquire sequence.
+            let rc1 = ref_count.clone();
+            let m1 = metadata.clone();
+            let reader = thread::spawn(move || {
+                let state = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                if !state.is_readable() {
+                    return None;
+                }
+                rc1.fetch_add(1, Ordering::Acquire);
+                let state_after = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                if !state_after.is_readable() {
+                    rc1.fetch_sub(1, Ordering::Release);
+                    return None;
+                }
+                // Reference held. This is where the caller reads item bytes:
+                // report the state the segment is in while we are reading them.
+                let observed = Metadata::unpack(m1.load(Ordering::Acquire)).state;
+                rc1.fetch_sub(1, Ordering::Release);
+                Some(observed)
+            });
+
+            // Evictor: `ref_count() == 0 && release_condemned()`.
+            let rc2 = ref_count.clone();
+            let m2 = metadata.clone();
+            let evictor = thread::spawn(move || {
+                if rc2.load(Ordering::Acquire) != 0 {
+                    return false;
+                }
+                // --- release_condemned() ---
+                let current = m2.load(Ordering::Acquire);
+                let current_meta = Metadata::unpack(current);
+                if current_meta.state != State::AwaitingRelease {
+                    return false;
+                }
+                let new_meta = current_meta
+                    .with_state(State::Free)
+                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+                    .bump_incarnation();
+                m2.compare_exchange(
+                    current,
+                    new_meta.pack(),
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            });
+
+            let observed = reader.join().unwrap();
+            let released = evictor.join().unwrap();
+
+            if let Some(state) = observed {
+                assert_ne!(
+                    state,
+                    State::Free,
+                    "reader held a reference while the segment was published Free \
+                     (released={released}) -- the evictor's ref_count == 0 check \
+                     went stale before release_condemned's CAS"
+                );
+            }
         });
     }
 }
