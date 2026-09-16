@@ -13,8 +13,13 @@
 //! - generation: Provides ABA protection when slots are reused
 //! - slot_index: Index into the type-specific storage array
 //!
-//! Note: The original pool_id encoding is replaced by value type. Pool selection
-//! is now implicit based on the value type (all complex types use RAM only initially).
+//! # No pool id
+//!
+//! Bits 43-41 carry the value type, which is where every other backend keeps a
+//! 2-bit pool id (`ItemLocation`, `SlabLocation`). That collision is why the
+//! heap backend has no disk tier: a complex-type location and a disk location
+//! would be indistinguishable. Reclaiming the bits would mean shrinking
+//! slot_index, so this is a deliberate trade, not an oversight.
 
 use cache_core::Location;
 
@@ -177,41 +182,6 @@ impl TypedLocation {
 /// Provides backwards compatibility with code using the old SlotLocation name.
 pub type SlotLocation = TypedLocation;
 
-impl TypedLocation {
-    /// Legacy: Create a new slot location with pool_id (maps to type for compatibility).
-    ///
-    /// This method exists for backwards compatibility. Pool ID 0 maps to String type.
-    #[inline]
-    pub fn with_pool(pool_id: u8, slot_index: u32, generation: u16) -> Self {
-        // For backwards compatibility, pool_id 0 = RAM = String type
-        // pool_id 2 = disk tier, but disk tier is not supported for complex types
-        let value_type = if pool_id == 0 {
-            ValueType::String
-        } else {
-            // For disk tier (pool_id 2), still use String type
-            ValueType::String
-        };
-        Self::with_type(value_type, slot_index, generation)
-    }
-
-    /// Legacy: Extract pool_id from location (always returns 0 for RAM).
-    ///
-    /// This method exists for backwards compatibility with the tiered verifier.
-    #[inline]
-    pub fn pool_id_from_location(_loc: Location) -> u8 {
-        // All complex types are RAM-only, so always return 0
-        // For String type, the existing disk tier logic will handle it
-        0
-    }
-
-    /// Legacy: Get the pool ID (always 0 for RAM storage).
-    #[inline]
-    #[allow(dead_code)]
-    pub fn pool_id(&self) -> u8 {
-        0
-    }
-}
-
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
@@ -327,18 +297,6 @@ mod tests {
         assert_eq!(loc.slot_index(), 100);
         assert_eq!(loc.generation(), 50);
         assert_eq!(loc.value_type(), ValueType::String);
-    }
-
-    #[test]
-    fn test_legacy_pool_id_compatibility() {
-        // Legacy pool_id methods should work for backwards compatibility
-        let loc = SlotLocation::with_pool(0, 100, 50);
-        assert_eq!(loc.pool_id(), 0);
-        assert_eq!(loc.value_type(), ValueType::String);
-
-        // pool_id_from_location should return 0 (RAM)
-        let opaque = loc.to_location();
-        assert_eq!(SlotLocation::pool_id_from_location(opaque), 0);
     }
 
     #[test]

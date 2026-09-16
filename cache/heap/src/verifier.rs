@@ -4,11 +4,9 @@
 //!
 //! This module provides multiple verifiers:
 //! - `HeapCacheVerifier`: RAM-only verification using slot storage (strings only)
-//! - `HeapTieredVerifier`: Multi-tier verification supporting both RAM and disk
 //! - `MultiTypeVerifier`: Verification across all value types (strings, hashes, lists, sets)
 
-use cache_core::disk::FilePool;
-use cache_core::{ItemLocation, KeyVerifier, Location, RamPool, SegmentKeyVerify};
+use cache_core::{KeyVerifier, Location};
 
 use crate::hash_storage::HashStorage;
 use crate::list_storage::ListStorage;
@@ -53,109 +51,6 @@ impl KeyVerifier for HeapCacheVerifier<'_> {
         slot.release_read();
 
         key_matches
-    }
-}
-
-/// Tiered verifier that supports both RAM (heap slots) and disk storage.
-///
-/// This verifier dispatches to the appropriate storage backend based on
-/// the pool_id encoded in the location:
-/// - RAM pool (pool_id = ram_pool_id): Uses SlotLocation encoding
-/// - Disk pool (pool_id = disk_pool_id): Uses ItemLocation encoding
-pub struct HeapTieredVerifier<'a> {
-    storage: &'a SlotStorage,
-    ram_pool_id: u8,
-    disk_pool: Option<&'a FilePool>,
-    disk_pool_id: u8,
-}
-
-impl<'a> HeapTieredVerifier<'a> {
-    /// Create a new tiered verifier with only RAM storage.
-    pub fn new(storage: &'a SlotStorage, ram_pool_id: u8) -> Self {
-        Self {
-            storage,
-            ram_pool_id,
-            disk_pool: None,
-            disk_pool_id: 2,
-        }
-    }
-
-    /// Create a new tiered verifier with both RAM and disk storage.
-    pub fn with_disk(
-        storage: &'a SlotStorage,
-        ram_pool_id: u8,
-        disk_pool: &'a FilePool,
-        disk_pool_id: u8,
-    ) -> Self {
-        Self {
-            storage,
-            ram_pool_id,
-            disk_pool: Some(disk_pool),
-            disk_pool_id,
-        }
-    }
-
-    /// Verify a key in RAM storage.
-    fn verify_ram(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        let slot_loc = SlotLocation::from_location(location);
-        let slot = match self.storage.get(slot_loc.slot_index()) {
-            Some(s) => s,
-            None => return false,
-        };
-
-        // Get the entry (handles reader counting internally)
-        // Allow expired entries during verification to avoid race conditions
-        let entry = match slot.get_with_flags(slot_loc.generation(), true, allow_deleted) {
-            Some(e) => e,
-            None => return false,
-        };
-
-        let key_matches = entry.key() == key;
-        slot.release_read();
-        key_matches
-    }
-
-    /// Verify a key in disk storage.
-    fn verify_disk(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        let disk_pool = match self.disk_pool {
-            Some(pool) => pool,
-            None => return false,
-        };
-
-        let item_loc = ItemLocation::from_location(location);
-        // The disk pool's own layout: pools with different segment sizes split
-        // the location bits differently.
-        let (_, segment_id, incarnation, offset) = item_loc.unpack(disk_pool.layout());
-        let segment = match disk_pool.get(segment_id) {
-            Some(s) => s,
-            None => return false,
-        };
-
-        // Guard, then check the incarnation, then read -- see
-        // `SegmentKeyVerify::verify_key_guarded`. The guard stops the segment
-        // being recycled underneath the byte reads (#109).
-        segment.verify_key_guarded(offset, key, allow_deleted, incarnation)
-    }
-}
-
-impl KeyVerifier for HeapTieredVerifier<'_> {
-    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        // Don't verify ghost entries
-        if location.is_ghost() {
-            return false;
-        }
-
-        // Extract pool_id from the location (top 2 bits)
-        let pool_id = SlotLocation::pool_id_from_location(location);
-
-        if pool_id == self.ram_pool_id {
-            self.verify_ram(key, location, allow_deleted)
-        } else if pool_id == self.disk_pool_id {
-            self.verify_disk(key, location, allow_deleted)
-        } else {
-            // Unknown pool
-            false
-        }
     }
 }
 
@@ -238,64 +133,6 @@ mod tests {
     use super::*;
     use crate::entry::HeapEntry;
     use std::time::Duration;
-
-    /// A disk location from a previous incarnation must not resolve, even
-    /// though the key really is at that offset.
-    ///
-    /// That is the whole hazard: segments are append-only from a fixed start,
-    /// so the n-th item of the new incarnation lands where the n-th item of the
-    /// old one was. The key compare alone says yes; only the tag says no.
-    #[test]
-    fn test_tiered_verifier_rejects_a_stale_disk_incarnation() {
-        use cache_core::{FilePoolBuilder, ItemLocation, Segment, State};
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let disk_pool = FilePoolBuilder::new(2)
-            .path(dir.path().join("disk.dat"))
-            .segment_size(64 * 1024)
-            .size(256 * 1024)
-            .build()
-            .expect("disk pool");
-
-        // Age every segment through a used incarnation, so the tag on the item
-        // written below is non-zero and a predecessor tag exists.
-        for _ in 0..disk_pool.segment_count() {
-            let id = disk_pool.reserve().expect("free segment");
-            let segment = disk_pool.get(id).expect("segment");
-            assert!(segment.cas_metadata(State::Reserved, State::Locked, None, None));
-            disk_pool.release(id);
-        }
-
-        let id = disk_pool.reserve().expect("free segment");
-        let segment = disk_pool.get(id).expect("segment");
-        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
-        let offset = segment.append_item(b"key", b"value", &[]).expect("append");
-        let tag = segment.incarnation();
-        assert_ne!(tag, 0, "the segment must be past its first incarnation");
-
-        let layout = *disk_pool.layout();
-        let live = ItemLocation::new(&layout, 2, id, tag, offset);
-        let stale = ItemLocation::new(&layout, 2, id, tag - 1, offset);
-
-        let storage = SlotStorage::new(10);
-        let verifier = HeapTieredVerifier::with_disk(&storage, 0, &disk_pool, 2);
-
-        // `verify_disk` is called directly rather than through `verify`.
-        // `SlotLocation::pool_id_from_location` is hardcoded to return 0, so
-        // `verify`'s dispatch sends every location to `verify_ram` and the disk
-        // arm is unreachable whenever `ram_pool_id == 0` -- which is how
-        // `HeapCache` builds it. That is a pre-existing defect in the heap
-        // disk tier, not one this check introduces; going through `verify`
-        // here would only test the dead dispatch.
-        assert!(
-            verifier.verify_disk(b"key", live.to_location(), false),
-            "the current incarnation must resolve"
-        );
-        assert!(
-            !verifier.verify_disk(b"key", stale.to_location(), false),
-            "a location from a previous incarnation must not resolve"
-        );
-    }
 
     #[test]
     fn test_verifier_key_match() {
