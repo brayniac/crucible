@@ -691,9 +691,10 @@ impl Layer for FifoLayer {
         let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
         let segment = self.pool.get(segment_id)?;
 
-        // Check segment state
+        // Check segment state. Condemned is excluded: the hashtable entries are
+        // already gone, so this location is stale and the answer is a miss (#127).
         let state = segment.state();
-        if !state.is_readable() {
+        if !state.is_readable() || state.is_condemned() {
             return None;
         }
 

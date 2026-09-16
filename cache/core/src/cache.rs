@@ -142,7 +142,10 @@ impl CacheLayer {
                 }
                 let (_, segment_id, _, offset) = location.unpack(pool.layout());
                 let segment = pool.get(segment_id)?;
-                if !segment.state().is_readable() {
+                let state = segment.state();
+                // Condemned: hashtable entries are gone, so this location is
+                // stale and the answer is a miss (#127).
+                if !state.is_readable() || state.is_condemned() {
                     return None;
                 }
                 segment.get_value_ref_raw(offset, key).ok()

@@ -165,6 +165,18 @@ impl State {
         )
     }
 
+    /// Whether the segment has been condemned: its hashtable entries are already
+    /// gone and it is waiting only for its last reader to leave.
+    ///
+    /// A thread arriving at a condemned segment is holding a location it read
+    /// before the drain, so the correct answer is a miss. Admitting it would also
+    /// break the evictor's `ref_count == 0` gate, which is only sound while a
+    /// condemned segment's reference count cannot rise. See #127.
+    #[inline]
+    pub fn is_condemned(self) -> bool {
+        matches!(self, State::AwaitingRelease)
+    }
+
     /// Whether the segment's bytes are intact, so a reader holding a reference
     /// may read them.
     ///
@@ -485,6 +497,20 @@ mod tests {
         assert!(State::AwaitingRelease.is_readable());
         assert!(!State::Free.is_readable());
         assert!(!State::Draining.is_readable());
+
+        // Condemned is a *subset* of readable: the state exists so an in-flight
+        // reader can finish, but a fresh acquire must be turned away.
+        assert!(State::AwaitingRelease.is_condemned());
+        assert!(!State::Live.is_condemned());
+        assert!(!State::Sealed.is_condemned());
+        assert!(!State::Relinking.is_condemned());
+        assert!(!State::Draining.is_condemned());
+        assert!(!State::Free.is_condemned());
+        assert!(!State::Locked.is_condemned());
+        // Draining must stay inside holds_valid_data: the demoter verifies keys
+        // on a draining segment through it.
+        assert!(State::Draining.holds_valid_data());
+        assert!(State::AwaitingRelease.holds_valid_data());
 
         assert!(State::Live.is_writable());
         assert!(!State::Sealed.is_writable());
