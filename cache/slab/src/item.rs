@@ -533,6 +533,22 @@ pub fn unpack_slot_ref(packed: u32) -> (u32, u16) {
     ((packed >> 16), (packed & 0xFFFF) as u16)
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// A slot reference round-trips both halves.
+    #[kani::proof]
+    fn slot_ref_roundtrip() {
+        let slab_id: u32 = kani::any();
+        kani::assume(slab_id <= 0xFFFF);
+        let slot_index: u16 = kani::any();
+        let (id, idx) = unpack_slot_ref(pack_slot_ref(slab_id, slot_index));
+        assert_eq!(id, slab_id);
+        assert_eq!(idx, slot_index);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

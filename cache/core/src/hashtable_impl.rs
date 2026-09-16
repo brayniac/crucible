@@ -2049,6 +2049,71 @@ impl Default for Hashbucket {
     }
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// No live entry may pack to the all-zero word.
+    ///
+    /// Every slot scan in this file treats `packed == 0` as an empty slot, so
+    /// an entry that packs to zero is stored and then read back as absent.
+    #[kani::proof]
+    fn no_live_entry_packs_to_the_empty_sentinel() {
+        let hash: u64 = kani::any();
+        let tag = MultiChoiceHashtable::tag_from_hash(hash);
+
+        let freq: u8 = kani::any();
+
+        let raw: u64 = kani::any();
+        kani::assume(raw <= Location::MAX_RAW);
+
+        let packed = Hashbucket::pack(tag, freq, Location::new(raw));
+        assert!(
+            packed != 0,
+            "a live entry packed to the empty-slot sentinel"
+        );
+    }
+
+    /// `pack` round-trips all three fields.
+    #[kani::proof]
+    fn pack_roundtrip() {
+        let tag: u16 = kani::any();
+        kani::assume(tag <= 0xFFF);
+        let freq: u8 = kani::any();
+        let raw: u64 = kani::any();
+        kani::assume(raw <= Location::MAX_RAW);
+
+        let packed = Hashbucket::pack(tag, freq, Location::new(raw));
+        assert_eq!(Hashbucket::tag(packed), tag);
+        assert_eq!(Hashbucket::freq(packed), freq);
+        assert_eq!(Hashbucket::location(packed).as_raw(), raw);
+    }
+
+    /// A ghost slot is distinguishable from every live entry.
+    ///
+    /// `is_ghost` tests the location field alone, so a live entry may never
+    /// carry the all-ones location that marks a ghost.
+    #[kani::proof]
+    fn a_live_entry_is_never_mistaken_for_a_ghost() {
+        let tag: u16 = kani::any();
+        kani::assume(tag <= 0xFFF);
+        let freq: u8 = kani::any();
+        let raw: u64 = kani::any();
+        kani::assume(raw < Location::MAX_RAW); // a live location, not GHOST
+
+        let packed = Hashbucket::pack(tag, freq, Location::new(raw));
+        assert!(!Hashbucket::is_ghost(packed));
+        assert!(Hashbucket::is_ghost(Hashbucket::pack_ghost(tag, freq)));
+    }
+
+    /// `tag_from_hash` never returns the reserved 0, for any hash.
+    #[kani::proof]
+    fn tag_from_hash_never_zero() {
+        let hash: u64 = kani::any();
+        assert!(MultiChoiceHashtable::tag_from_hash(hash) != 0);
+    }
+}
+
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;

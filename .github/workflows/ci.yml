@@ -76,6 +76,56 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p cache-core --features loom
 
+  # Kani proves the bit-packing substrate the concurrency protocols rest on.
+  #
+  # These are deliberate LEAF-function proofs: exhaustive symbolic coverage of
+  # pure pack/unpack arithmetic over full input domains, where the unit tests
+  # were hand-picked cases. Kani explores no thread interleavings -- loom and
+  # TSan own that axis.
+  #
+  # The surface earned this. Reviewing one 150-line layout module turned up four
+  # arithmetic defects across three rounds, one Critical; and a live entry that
+  # packed to the hashtable's all-zero empty-slot sentinel silently lost 1 key in
+  # 4096 for every backend's first item (#115). Kani finds that one in 19ms.
+  #
+  # Hand-rolled install rather than model-checking/kani-github-action: the action
+  # pins an old Kani and compiles kani-verifier from source on every run.
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      KANI_VERSION: "0.67.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: ${{ runner.os }}-kani-${{ env.KANI_VERSION }}
+
+      # The guard is FUNCTIONAL, not just presence: `cargo kani setup` installs a
+      # pinned nightly under ~/.rustup and symlinks ~/.kani/kani-<ver>/toolchain
+      # to it. The cache restores ~/.kani but NOT ~/.rustup, so on a warm run the
+      # symlink dangles while `cargo kani --version` still answers -- checking
+      # rustc through the symlink is what makes warm runs re-heal.
+      - name: Install Kani
+        run: |
+          if ! command -v cargo-kani >/dev/null \
+             || [ "$(cargo kani --version | awk '{print $2}')" != "$KANI_VERSION" ] \
+             || ! "$HOME/.kani/kani-$KANI_VERSION/toolchain/bin/rustc" --version >/dev/null 2>&1; then
+            cargo install --version "$KANI_VERSION" --locked kani-verifier
+            cargo kani setup
+          fi
+
+      - name: Verify cache-core harnesses
+        run: cargo kani -p cache-core
+
+      - name: Verify slab harnesses
+        run: cargo kani -p slab-cache
+
   tsan:
     name: Test (tsan)
     runs-on: ubuntu-latest

@@ -91,6 +91,44 @@ impl fmt::Display for CasToken {
     }
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// A CAS token round-trips its location and generation.
+    ///
+    /// The token is what lets `cas` reject a write against a superseded item,
+    /// so a field that does not survive the round trip silently widens what
+    /// `cas` accepts.
+    #[kani::proof]
+    fn cas_token_roundtrip() {
+        let raw: u64 = kani::any();
+        kani::assume(raw <= Location::MAX_RAW);
+        let generation: u16 = kani::any();
+
+        let token = CasToken::new(Location::new(raw), generation);
+        assert_eq!(token.location().as_raw(), raw);
+        assert_eq!(token.generation(), generation);
+    }
+
+    /// Distinct (location, generation) pairs give distinct tokens.
+    #[kani::proof]
+    fn cas_token_injective() {
+        let raw_a: u64 = kani::any();
+        let raw_b: u64 = kani::any();
+        kani::assume(raw_a <= Location::MAX_RAW && raw_b <= Location::MAX_RAW);
+        let gen_a: u16 = kani::any();
+        let gen_b: u16 = kani::any();
+
+        kani::assume(
+            CasToken::new(Location::new(raw_a), gen_a)
+                == CasToken::new(Location::new(raw_b), gen_b),
+        );
+        assert_eq!(raw_a, raw_b);
+        assert_eq!(gen_a, gen_b);
+    }
+}
+
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;

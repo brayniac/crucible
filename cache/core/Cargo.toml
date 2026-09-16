@@ -35,3 +35,9 @@ criterion = { workspace = true }
 [[bench]]
 name = "hashtable"
 harness = false
+
+# `--cfg kani` is set by the Kani driver when verifying the #[kani::proof]
+# harnesses; declare it so normal builds don't flag the cfg as unexpected.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(kani)"]

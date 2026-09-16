@@ -156,6 +156,59 @@ impl SlabLocation {
     }
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// A slab location round-trips every field through the opaque 44-bit word.
+    ///
+    /// `pool_id` sits at bits 43..42, the same fixed position `ItemLocation`
+    /// uses, so a tiered verifier can read it before knowing which backend
+    /// owns the location.
+    #[kani::proof]
+    fn slab_location_roundtrip() {
+        let pool_id: u8 = kani::any();
+        kani::assume(pool_id <= 3);
+        let class_id: u8 = kani::any();
+        kani::assume(class_id <= 63);
+        let slab_id: u32 = kani::any();
+        kani::assume(slab_id <= 0xFFFFF);
+        let slot_index: u16 = kani::any();
+
+        let loc = SlabLocation::with_pool(pool_id, class_id, slab_id, slot_index);
+        let back = SlabLocation::from_location(loc.to_location());
+        assert_eq!(
+            back.unpack_with_pool(),
+            (pool_id, class_id, slab_id, slot_index)
+        );
+        assert_eq!(
+            SlabLocation::pool_id_from_location(loc.to_location()),
+            pool_id
+        );
+    }
+
+    /// Distinct coordinates give distinct location words.
+    ///
+    /// Two live items sharing a location word would make the hashtable
+    /// indistinguishable between them.
+    #[kani::proof]
+    fn slab_location_injective() {
+        let (p_a, c_a, s_a, i_a): (u8, u8, u32, u16) =
+            (kani::any(), kani::any(), kani::any(), kani::any());
+        let (p_b, c_b, s_b, i_b): (u8, u8, u32, u16) =
+            (kani::any(), kani::any(), kani::any(), kani::any());
+        kani::assume(p_a <= 3 && p_b <= 3);
+        kani::assume(c_a <= 63 && c_b <= 63);
+        kani::assume(s_a <= 0xFFFFF && s_b <= 0xFFFFF);
+
+        kani::assume(
+            SlabLocation::with_pool(p_a, c_a, s_a, i_a).to_location()
+                == SlabLocation::with_pool(p_b, c_b, s_b, i_b).to_location(),
+        );
+        assert_eq!((p_a, c_a, s_a, i_a), (p_b, c_b, s_b, i_b));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

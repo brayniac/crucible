@@ -382,6 +382,78 @@ const _: () = assert!(
     "incarnation tag does not fit above the state byte in the packed metadata word"
 );
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use crate::location_layout::TAG_MASK;
+
+    fn any_state() -> State {
+        let v: u8 = kani::any();
+        kani::assume(v <= 8);
+        State::from_u8(v)
+    }
+
+    /// Metadata round-trips every field, and the incarnation cannot bleed into
+    /// the state byte or the chain pointers.
+    ///
+    /// The tag was placed in the packed word's spare byte precisely so the bump
+    /// is atomic with the state transition; a shift error there would corrupt
+    /// the state machine rather than merely lose a tag.
+    #[kani::proof]
+    fn metadata_pack_unpack_roundtrip() {
+        let next: u32 = kani::any();
+        kani::assume(next <= 0xFF_FFFF);
+        let prev: u32 = kani::any();
+        kani::assume(prev <= 0xFF_FFFF);
+        let incarnation: u8 = kani::any();
+        kani::assume(incarnation <= TAG_MASK);
+        let state = any_state();
+
+        let meta = Metadata {
+            next,
+            prev,
+            state,
+            incarnation,
+        };
+        let back = Metadata::unpack(meta.pack());
+        assert_eq!(back.next, next);
+        assert_eq!(back.prev, prev);
+        assert_eq!(back.state, state);
+        assert_eq!(back.incarnation, incarnation);
+    }
+
+    /// Bumping the incarnation changes nothing else.
+    #[kani::proof]
+    fn bump_incarnation_touches_only_the_tag() {
+        let next: u32 = kani::any();
+        kani::assume(next <= 0xFF_FFFF);
+        let prev: u32 = kani::any();
+        kani::assume(prev <= 0xFF_FFFF);
+        let incarnation: u8 = kani::any();
+        kani::assume(incarnation <= TAG_MASK);
+        let state = any_state();
+
+        let meta = Metadata {
+            next,
+            prev,
+            state,
+            incarnation,
+        };
+        let bumped = meta.bump_incarnation();
+        assert_eq!(bumped.next, next);
+        assert_eq!(bumped.prev, prev);
+        assert_eq!(bumped.state, state);
+        assert!(bumped.incarnation <= TAG_MASK);
+    }
+
+    /// `State::from_u8` round-trips every valid discriminant.
+    #[kani::proof]
+    fn state_roundtrip() {
+        let s = any_state();
+        assert_eq!(State::from_u8(s as u8), s);
+    }
+}
+
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
