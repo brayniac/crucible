@@ -270,7 +270,7 @@ fn create_heap(
     config: &Config,
     policy: EvictionPolicy,
 ) -> Result<impl cache_core::Cache, Box<dyn std::error::Error>> {
-    use heap_cache::{DiskTierConfig, EvictionPolicy as HeapEvictionPolicy, HeapCache};
+    use heap_cache::{EvictionPolicy as HeapEvictionPolicy, HeapCache};
 
     let heap_policy = match policy {
         EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
@@ -279,21 +279,24 @@ fn create_heap(
         other => return Err(format!("unsupported policy '{other:?}' for heap backend").into()),
     };
 
-    let mut builder = HeapCache::builder()
+    let builder = HeapCache::builder()
         .memory_limit(config.cache.heap_size)
         .hashtable_power(config.cache.hashtable_power)
         .eviction_policy(heap_policy)
         .small_queue_percent(config.cache.small_queue_percent);
 
+    // The heap backend has no disk tier. Its location encoding spends bits
+    // 43-41 on the value type, which is where every other backend keeps a
+    // 2-bit pool id, so a complex-type location and a disk location would be
+    // indistinguishable. Reject rather than silently ignore -- before this,
+    // `enabled = true` here built a disk layer that nothing ever wrote to.
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled
     {
-        let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
-            .promotion_threshold(disk_config.promotion_threshold)
-            .sync_mode(disk_config.sync_mode.into())
-            .recover_on_startup(disk_config.recover_on_startup);
-
-        builder = builder.disk_tier(disk_tier);
+        return Err("the heap backend does not support a disk tier; use \
+                    backend = \"segment\" for disk tiering, or set \
+                    [cache.disk] enabled = false"
+            .into());
     }
 
     let cache = builder.build()?;
