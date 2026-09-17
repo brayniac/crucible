@@ -70,6 +70,12 @@ use std::time::Duration;
 ///
 /// `free_queue` must point to the pool's free queue and remain valid for the
 /// pool's lifetime; `segment_id` must be this segment's id within that pool.
+/// `#[inline]`: this sits on the hot path. `BasicItemGuard::drop` and
+/// `ValueRef::drop` reach it on every GET whose guard was the last reference,
+/// which is the common case, and the early return for a non-condemned segment
+/// is a single load and branch. It inlines at all six call sites today; the
+/// attribute is here so that stays deliberate.
+#[inline]
 pub(crate) unsafe fn try_free_condemned<F: FnOnce()>(
     ref_count: &AtomicU32,
     metadata: &AtomicU64,
