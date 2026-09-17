@@ -740,4 +740,56 @@ mod tests {
         };
         assert_eq!(meta.bump_incarnation().incarnation, 0);
     }
+
+    // `transition_excludes_readers` silently decides which `cas_metadata`
+    // transitions get `SeqCst` (#129). If it starts answering `false` for a
+    // transition that does shut readers out -- because a new state was added
+    // to `is_readable`/`holds_valid_data`, say -- the Dekker pairing
+    // disappears with no other symptom. This table is that alarm.
+    #[test]
+    fn transitions_that_shut_readers_out_are_recognized() {
+        use State::*;
+
+        // The four that end some class of fresh reader admission, and so must
+        // be ordered against the `ref_count` load that follows them.
+        for (from, to) in [
+            (Sealed, Draining),           // shuts out guard readers
+            (Draining, Locked),           // shuts out key-verify readers
+            (Draining, AwaitingRelease),  // condemn
+            (Relinking, AwaitingRelease), // the merge paths' condemn
+            (Live, Draining),
+            (Live, Locked),
+            (Sealed, Locked),
+            (Sealed, AwaitingRelease),
+        ] {
+            assert!(
+                transition_excludes_readers(from, to),
+                "{from:?} -> {to:?} ends reader admission but is not recognized --                  its cas_metadata would silently drop to AcqRel"
+            );
+        }
+
+        // Everything else. Marking these SeqCst would be pure cost: they
+        // either leave admission unchanged, are already exclusive, or widen.
+        for (from, to) in [
+            (Live, Sealed),
+            (Sealed, Relinking),
+            (Live, Live),
+            (Sealed, Sealed),
+            (Locked, Locked),
+            (Draining, Draining),
+            (Relinking, Relinking),
+            (Locked, Reserved),
+            (Reserved, Free),
+            (Reserved, Linking),
+            (Linking, Live),
+            (AwaitingRelease, Free),
+            (Free, Reserved),
+            (Draining, Sealed), // the chain's revert -- widens
+        ] {
+            assert!(
+                !transition_excludes_readers(from, to),
+                "{from:?} -> {to:?} does not end reader admission but is marked                  as if it did -- SeqCst here is noise"
+            );
+        }
+    }
 }
