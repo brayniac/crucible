@@ -2372,8 +2372,17 @@ mod tests {
     fn test_different_ttls() {
         let layer = create_test_layer();
 
-        // Write items with very different TTLs
-        let short_ttl = Duration::from_secs(5);
+        // Write items with very different TTLs.
+        //
+        // The short TTL is minutes, not seconds, on purpose: this test writes
+        // three items and then reads all three back, and `get_item` honours
+        // expiry (`now >= expire_at` misses). A five-second TTL made that a
+        // wall-clock race -- fine natively, but under miri on a loaded runner
+        // the two intervening writes can take longer than the TTL, and the
+        // read legitimately misses. The buckets are 8s/128s/2048s/32768s
+        // intervals, so 120s/300s/86400s still land in distinct buckets, which
+        // is what the test is actually about.
+        let short_ttl = Duration::from_secs(120);
         let medium_ttl = Duration::from_secs(300);
         let long_ttl = Duration::from_secs(86400);
 
