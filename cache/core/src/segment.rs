@@ -902,6 +902,22 @@ mod tests {
         );
     }
 
+    /// `Injector::steal` returns `Retry` transiently -- "another thread was
+    /// mid-operation, ask again", not "the queue is empty" -- and `.success()`
+    /// maps that to `None`. A single steal therefore reports an empty queue
+    /// spuriously, which miri's scheduling makes reproducible. Same bounded
+    /// retry as `MemoryPool::reserve`, for the same reason.
+    fn steal_one(q: &crossbeam_deque::Injector<u32>) -> Option<u32> {
+        for _ in 0..64 {
+            match q.steal() {
+                crossbeam_deque::Steal::Success(v) => return Some(v),
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return None,
+            }
+        }
+        None
+    }
+
     /// The other side of the same gate: the genuinely-last reference does
     /// free it, exactly once, ending the incarnation.
     #[test]
@@ -934,7 +950,7 @@ mod tests {
             8,
             "AwaitingRelease -> Free ends a used incarnation"
         );
-        assert_eq!(q.steal().success(), Some(42), "pushed to the free queue");
+        assert_eq!(steal_one(&q), Some(42), "pushed to the free queue");
 
         // Racing callers: the CAS admits exactly one winner, so a second
         // attempt declines and does not double-push.
