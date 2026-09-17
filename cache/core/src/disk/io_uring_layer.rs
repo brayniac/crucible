@@ -456,32 +456,47 @@ impl IoUringDiskLayer {
     /// condemned handoff if we were the last reader.
     ///
     /// A back-out can now land on a condemned segment (see #127); the last one
-    /// out has to release it or nobody will. The staging buffer is returned
-    /// only on that condemned path -- a back-out from a live segment must not
-    /// detach the buffer it is still writing into.
+    /// out has to release it or nobody will.
     fn release_segment_ref(&self, segment: &DiskSegmentMeta) {
         // SeqCst -- the release half of the handoff Dekker pair; see
         // `SliceSegment::release_ref` and `Segment::ref_count_seqcst` (#129).
         let prev = unsafe { (*segment.ref_count_ptr()).fetch_sub(1, Ordering::SeqCst) };
         if prev == 1 {
-            // Fence before reading the state, so we see the `AwaitingRelease`
-            // the evictor published -- same order as `SliceSegment::release_ref`.
-            fence(Ordering::SeqCst);
-            if segment.state_seqcst() != State::AwaitingRelease {
-                return;
-            }
-            // Re-validate `prev == 1` before detaching: it says the count *was*
-            // 1, and a reader may have pinned the segment again on a still-
-            // readable word before the evictor condemned it. Returning the
-            // staging buffer to the pool here would invalidate that reader's
-            // `write_buffer_ptr()`. See `SliceSegment::release_condemned`.
-            if segment.ref_count_seqcst() != 0 {
-                return;
-            }
-            if let Some(buf) = segment.detach_write_buffer() {
-                self.buffer_pool.lock().unwrap().release(buf);
-            }
-            segment.release_condemned();
+            self.free_condemned_returning_buffer(segment);
+        }
+    }
+
+    /// The condemned handoff for a disk segment, returning its staging buffer
+    /// to the pool on the way out.
+    ///
+    /// The buffer return rides in `try_free_condemned`'s `on_freed` hook
+    /// rather than in a pre-check of its own, and that placement is the whole
+    /// point. The hook runs only for the caller whose CAS won -- so the buffer
+    /// is returned exactly once, only for a segment that really was condemned
+    /// and really had no references left, and only after the same
+    /// `prev == 1` re-validation the free itself rests on. A back-out from a
+    /// live segment must not detach the buffer it is still writing into, and a
+    /// reader that pinned the segment again since the caller's decrement must
+    /// not have its `write_buffer_ptr()` pulled out from under it.
+    ///
+    /// The hook also runs *before* the push to the free queue, so no thread
+    /// can reserve the segment and attach a fresh buffer in between and have
+    /// that one returned instead.
+    fn free_condemned_returning_buffer(&self, segment: &DiskSegmentMeta) {
+        // SAFETY: the pointers come from this segment and outlive the call;
+        // `free_queue_ptr` is the pool's queue and `id` names this segment.
+        unsafe {
+            crate::segment::try_free_condemned(
+                &*segment.ref_count_ptr(),
+                &*segment.metadata_ptr(),
+                segment.free_queue_ptr(),
+                segment.id(),
+                || {
+                    if let Some(buf) = segment.detach_write_buffer() {
+                        self.buffer_pool.lock().unwrap().release(buf);
+                    }
+                },
+            );
         }
     }
 
@@ -495,19 +510,13 @@ impl IoUringDiskLayer {
             // `SliceSegment::release_ref` and `Segment::ref_count_seqcst`.
             let prev = unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::SeqCst) };
 
-            // Check if this was the last reader and segment is condemned
+            // Check if this was the last reader and segment is condemned.
+            // The state check, the `prev == 1` re-validation and the buffer
+            // return all live in `free_condemned_returning_buffer`; this used
+            // to detach the buffer on `prev == 1` alone, without even checking
+            // the state.
             if prev == 1 {
-                fence(Ordering::SeqCst);
-                // Re-validate `prev == 1` -- see `release_segment_ref`. A
-                // reader may have pinned the segment again since the decrement.
-                if segment.ref_count_seqcst() != 0 {
-                    return;
-                }
-                // Return write buffer before releasing condemned segment
-                if let Some(buf) = segment.detach_write_buffer() {
-                    self.buffer_pool.lock().unwrap().release(buf);
-                }
-                segment.release_condemned();
+                self.free_condemned_returning_buffer(segment);
             }
         }
     }
@@ -1213,6 +1222,73 @@ mod tests {
                 .write_item_with_buffers(key.as_bytes(), &value, b"", ttl)
                 .unwrap_or_else(|e| panic!("write {i} after reset failed: {e:?}"));
         }
+    }
+
+    /// `release_read` must complete the condemned handoff, and the staging
+    /// buffer must come back only on the path that actually frees the
+    /// segment (#129).
+    ///
+    /// Three things are pinned here, all of which used to be hand-rolled in
+    /// this file and now ride on `segment::try_free_condemned`:
+    ///
+    /// - the evictor's `release_condemned` race fix declines while a
+    ///   reference is live, so the segment is not recycled under a reader;
+    /// - the buffer is *not* returned on that declining path -- a live reader
+    ///   is still resolving `write_buffer_ptr()` into it;
+    /// - the last reference out frees the segment and returns the buffer.
+    ///
+    /// Before this, `release_read` detached the buffer on `prev == 1` alone,
+    /// without even checking the state.
+    #[test]
+    fn release_read_completes_the_handoff_and_returns_the_buffer_once() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (_keys, segment_id) = fill_one_segment(&layer, &hashtable);
+
+        let segment = layer.pool.get(segment_id).expect("segment");
+        assert!(
+            segment.has_write_buffer(),
+            "the item is still staged in RAM"
+        );
+        let buffers_free_before = layer.buffer_pool.lock().unwrap().available();
+
+        // A reader pins the segment, the way a buffer read does.
+        unsafe { (*segment.ref_count_ptr()).fetch_add(1, Ordering::SeqCst) };
+
+        // The evictor seals, claims and condemns it.
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Sealed, None, None));
+        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None));
+
+        // Its race fix must decline: the reader is still in.
+        assert!(
+            !segment.release_condemned(),
+            "recycled a disk segment out from under a live reference"
+        );
+        assert_eq!(segment.state(), State::AwaitingRelease);
+        assert!(
+            segment.has_write_buffer(),
+            "the staging buffer must not be returned while a reader is              resolving write_buffer_ptr() into it"
+        );
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            buffers_free_before
+        );
+
+        // The last reference out owes the free.
+        layer.release_read(segment_id);
+        assert_eq!(
+            segment.state(),
+            State::Free,
+            "release_read must complete the handoff, not strand the segment"
+        );
+        assert!(!segment.has_write_buffer());
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            buffers_free_before + 1,
+            "the staging buffer returns to the pool exactly once"
+        );
     }
 
     /// A location from a previous incarnation must not resolve, even though

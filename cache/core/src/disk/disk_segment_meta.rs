@@ -551,40 +551,20 @@ impl Segment for DiskSegmentMeta {
     }
 
     fn release_condemned(&self) -> bool {
-        // SeqCst throughout: the commit point of the condemned handoff,
-        // entered from both halves of the Dekker pair. The `ref_count` gate
-        // below is the condemner-half load and must be ordered after whatever
-        // transition or decrement the caller just published (#129).
-        let packed = self.metadata.load(Ordering::SeqCst);
-        let meta = Metadata::unpack(packed);
-
-        if meta.state != State::AwaitingRelease {
-            return false;
-        }
-
-        if self.ref_count.load(Ordering::SeqCst) != 0 {
-            return false;
-        }
-
-        // `AwaitingRelease -> Free` is unconditionally the end of a used
-        // incarnation: the segment was condemned while live and its last reader
-        // has just dropped. Always bump.
-        let new_meta = meta
-            .with_state(State::Free)
-            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
-            .bump_incarnation();
-        if self
-            .metadata
-            .compare_exchange(packed, new_meta.pack(), Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            // Push back to free queue
-            unsafe {
-                (*self.free_queue).push(self.id);
-            }
-            true
-        } else {
-            false
+        // The whole transition -- the state check, the `prev == 1`
+        // re-validation, the CAS and the push -- lives in
+        // `crate::segment::try_free_condemned`; see its note.
+        //
+        // SAFETY: `free_queue` is the pool's queue, valid for the pool's
+        // lifetime, and `self.id` is this segment's id within it.
+        unsafe {
+            crate::segment::try_free_condemned(
+                &self.ref_count,
+                &self.metadata,
+                self.free_queue,
+                self.id,
+                || {},
+            )
         }
     }
 

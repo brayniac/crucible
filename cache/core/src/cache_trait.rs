@@ -5,7 +5,6 @@
 //! protocol servers like iou-cache and tokio-cache.
 
 use crate::error::CacheError;
-use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
 use crate::sync::{AtomicU32, AtomicU64, Ordering};
 use bytes::Bytes;
 use std::time::Duration;
@@ -217,7 +216,8 @@ impl Drop for ValueRef {
     /// preventing double-free. The successful thread pushes the segment to
     /// the free queue.
     fn drop(&mut self) {
-        // SAFETY: ref_count is a valid AtomicU32 pointer from the segment
+        // SAFETY: ref_count is a valid AtomicU32 pointer from the segment.
+        //
         // SeqCst: the release half of the drain/condemn Dekker pair -- this
         // thread stores `ref_count` then loads the state, the condemner stores
         // `AwaitingRelease` then loads `ref_count`. Acquire/release permits
@@ -226,54 +226,25 @@ impl Drop for ValueRef {
         let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::SeqCst) };
 
         // If we were the last reader and this segment has auto-release info,
-        // check if the segment is condemned (AwaitingRelease) and free it.
+        // hand the condemned segment on. `prev_count == 1` is necessary but
+        // not sufficient -- a reader can have pinned the segment again since;
+        // `try_free_condemned` owns that re-validation, the state check, the
+        // CAS and the push.
+        //
+        // A null `metadata` means this `ValueRef` did not come from a segment
+        // (test mocks), so there is nothing to hand on.
         if prev_count == 1 && !self.metadata.is_null() {
-            // SeqCst fence, so the state load below is ordered after this
-            // thread's decrement in the single total order.
-            std::sync::atomic::fence(Ordering::SeqCst);
-
-            let packed = unsafe { (*self.metadata).load(Ordering::SeqCst) };
-            let meta = Metadata::unpack(packed);
-            if meta.state == State::AwaitingRelease {
-                // Re-validate `prev_count == 1` before the CAS -- it says the
-                // count *was* 1, and a reader may have pinned the segment again
-                // on a still-`Sealed` word before the evictor condemned it. See
-                // `SliceSegment::release_condemned` for the full argument.
-                if unsafe { (*self.ref_count).load(Ordering::SeqCst) } != 0 {
-                    return;
-                }
-
-                // AwaitingRelease -> Free ends a used incarnation, so the tag
-                // advances in the same CAS that publishes Free.
-                //
-                // This is the *main* condemned-free path, not an edge case: the
-                // layers condemn a segment with readers outstanding and leave
-                // the last guard drop to free it, calling `release_condemned`
-                // only as a fallback when the last reader vanished during the
-                // condemn window. A reader holding a location across this
-                // recycle is exactly what the tag defends against.
-                //
-                // `with_chain_ids` must stay: returning a freed segment to the
-                // free queue still linked to its neighbours is its own defect.
-                let new_meta = meta
-                    .with_state(State::Free)
-                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
-                    .bump_incarnation();
-                if unsafe {
-                    (*self.metadata).compare_exchange(
-                        packed,
-                        new_meta.pack(),
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
-                }
-                .is_ok()
-                {
-                    // Push segment back to free queue
-                    unsafe {
-                        (*self.free_queue).push(self.segment_id);
-                    }
-                }
+            // SAFETY: both pointers come from the segment this reference was
+            // taken on and outlive it; `free_queue` is the pool's queue and
+            // `segment_id` names this segment within it.
+            unsafe {
+                crate::segment::try_free_condemned(
+                    &*self.ref_count,
+                    &*self.metadata,
+                    self.free_queue,
+                    self.segment_id,
+                    || {},
+                );
             }
         }
     }
@@ -786,6 +757,7 @@ pub enum LookupResult {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
 
     /// `ValueRef::drop` frees a condemned segment, ending a used incarnation,
     /// so the tag must advance.

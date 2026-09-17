@@ -1520,83 +1520,23 @@ impl SliceSegment<'_> {
     /// AwaitingRelease state. Transitions to Free and pushes to the
     /// pool's free queue.
     ///
-    /// Returns true if the segment was released, false if it wasn't
-    /// in AwaitingRelease state.
-    ///
-    /// Safe to race: the CAS names the exact metadata word it loaded, so of any
-    /// number of concurrent callers -- `release_ref`'s handoff, a guard drop,
-    /// the evictor's race fix -- at most one can succeed, and only that one
-    /// pushes to the free queue. The losers observe the changed word and return
-    /// false.
-    ///    /// # Why `prev == 1` is not enough on its own
-    ///
-    /// The caller's `fetch_sub` returning 1 says the count *was* 1. By the time
-    /// the state load below runs, another reader may have pinned the segment
-    /// again -- legitimately, because the pin happens while the segment is
-    /// still `Sealed`, before the evictor condemns it. So the sequence
-    ///
-    /// ```text
-    /// reader A: fetch_sub -> prev == 1 (count now 0)
-    /// reader B: fetch_add on a still-Sealed segment, re-check passes -> pinned
-    /// evictor : sees ref_count == 1, condemns -> AwaitingRelease
-    /// reader A: loads the state, sees AwaitingRelease, frees
-    /// ```
-    ///
-    /// frees the segment under B's live reference. Re-reading `ref_count` here
-    /// is what closes it: A declines, and B's own drop -- which will see
-    /// `prev == 1` and `AwaitingRelease` -- completes the handoff. Under the
-    /// SeqCst orderings this path uses, B's pin cannot be missed by this load:
-    /// B's `fetch_add` precedes its re-check, which saw a pre-condemn state and
-    /// so precedes the condemn CAS, which precedes the state load above.
-    ///
-    /// Found by `shuttle_tests::shuttle_reader_never_coexists_with_committed_drain`.
-    /// `DiskSegmentMeta::release_condemned` already had this check.
+    /// Returns true if the segment was released, false if it wasn't in
+    /// AwaitingRelease state *or* a reader has pinned it again since the
+    /// caller's decrement. The whole transition, including that
+    /// re-validation and why it is needed, lives in
+    /// [`crate::segment::try_free_condemned`] -- this is the `SliceSegment`
+    /// entry point to it, which additionally zeroes `merge_count`.
     pub fn release_condemned(&self) -> bool {
-        // SeqCst on the load and the CAS: this is the commit point of the
-        // condemned handoff, reached from both halves of the Dekker pair (the
-        // last reader's `release_ref` and the evictor's `ref_count == 0` race
-        // fix). Its load has to be ordered after whichever of those the caller
-        // just performed, or a caller can observe a pre-condemn word and
-        // decline a release it owes. See `Segment::ref_count_seqcst`.
-        let current = self.metadata.load(Ordering::SeqCst);
-        let current_meta = Metadata::unpack(current);
-
-        if current_meta.state != State::AwaitingRelease {
-            return false;
-        }
-
-        // Re-validate the caller's `prev == 1`: a reader may have pinned the
-        // segment again, on a still-`Sealed` word, after that decrement and
-        // before the condemn. See the note on this function.
-        if self.ref_count.load(Ordering::SeqCst) != 0 {
-            return false;
-        }
-
-        // `AwaitingRelease -> Free` is unconditionally the end of a used
-        // incarnation: the segment was condemned while live and its last reader
-        // has just dropped. Always bump.
-        let new_meta = current_meta
-            .with_state(State::Free)
-            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
-            .bump_incarnation();
-
-        if self
-            .metadata
-            .compare_exchange(current, new_meta.pack(), Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            // Reset merge count
-            self.merge_count.store(0, Ordering::Relaxed);
-
-            // Push to free queue
-            // SAFETY: free_queue pointer is valid for the lifetime of the pool,
-            // and the segment is part of the pool
-            unsafe {
-                (*self.free_queue).push(self.id);
-            }
-            true
-        } else {
-            false
+        // SAFETY: `free_queue` is the pool's queue, valid for the pool's
+        // lifetime, and `self.id` is this segment's id within it.
+        unsafe {
+            crate::segment::try_free_condemned(
+                &self.ref_count,
+                &self.metadata,
+                self.free_queue,
+                self.id,
+                || self.merge_count.store(0, Ordering::Relaxed),
+            )
         }
     }
 }
@@ -1731,6 +1671,83 @@ mod tests {
     /// Dummy free queue for tests - segments won't actually be released back.
     static TEST_FREE_QUEUE: std::sync::LazyLock<crossbeam_deque::Injector<u32>> =
         std::sync::LazyLock::new(crossbeam_deque::Injector::new);
+
+    /// `SliceSegment::release_condemned` must decline while a reader is
+    /// pinned, and the pinned reader's own drop must then complete the
+    /// handoff (#129).
+    ///
+    /// This is the end-to-end wiring of `segment::try_free_condemned`'s
+    /// re-validation, driven through the real entry points: a real guard from
+    /// `get_item` holds the reference, the evictor's race-fix call is the one
+    /// that must decline, and `BasicItemGuard::drop` is what actually frees.
+    /// Deleting the re-validation makes the first assertion fail.
+    #[test]
+    fn release_condemned_declines_while_a_guard_is_held() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 0, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.append_item(b"key", b"value", &[]).expect("append");
+
+        let guard = segment.get_item(0, b"key").expect("guard");
+        assert_eq!(segment.ref_count(), 1, "the guard holds a reference");
+
+        // The evictor's sequence: seal, claim, condemn.
+        assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None));
+
+        // The race fix, running while the reader is still in. `prev == 1` is
+        // not what it checks -- but every caller that reaches here believed
+        // it, which is exactly the hazard.
+        assert!(
+            !segment.release_condemned(),
+            "released a condemned segment out from under a live guard"
+        );
+        assert_eq!(segment.state(), State::AwaitingRelease);
+        assert_eq!(segment.ref_count(), 1);
+
+        // The reader leaves: its drop is the one that owes the free.
+        drop(guard);
+        assert_eq!(segment.ref_count(), 0);
+        assert_eq!(
+            segment.state(),
+            State::Free,
+            "the last guard drop must complete the handoff, not strand the segment"
+        );
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// The same gate reached through `SliceSegment::release_ref`, the
+    /// back-out path -- a reference taken and dropped while another reader is
+    /// pinned must not free the segment.
+    #[test]
+    fn a_back_out_does_not_free_a_segment_another_reader_holds() {
+        let (segment, ptr, layout) = create_test_segment(0, false, 0, 64 * 1024);
+        assert!(segment.try_reserve());
+        assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+        segment.append_item(b"key", b"value", &[]).expect("append");
+
+        let guard = segment.get_item(0, b"key").expect("guard");
+        assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None));
+
+        // A second reader arrives, is refused by the condemned gate, and
+        // backs its transient reference out through `release_ref`.
+        assert!(segment.get_item(0, b"key").is_err());
+        assert_eq!(segment.ref_count(), 1, "only the first guard remains");
+        assert_eq!(
+            segment.state(),
+            State::AwaitingRelease,
+            "the back-out must not free a segment the first guard still holds"
+        );
+
+        drop(guard);
+        assert_eq!(segment.state(), State::Free);
+
+        unsafe { free_test_segment(ptr, layout) };
+    }
 
     /// A verify must hold a reference for the duration of its byte reads.
     ///
@@ -4148,6 +4165,31 @@ mod loom_tests {
 /// Keep both green. Every model here must be demonstrable red by some *logic*
 /// mutation (neuter the condemned gate, delete a post-CAS re-check); a model
 /// that no mutation can redden is vacuous.
+///
+/// # These models mirror the protocol; they do not execute it
+///
+/// Like the loom models above, and unlike cache-rs's shuttle suite, the models
+/// here are hand-written mirrors against the checker's own atomics -- not
+/// instantiations of `SliceSegment`. That is what lets them exist at all
+/// (shuttle cannot instrument `std` atomics, and rebuilding the whole crate
+/// against `shuttle::sync` would drag every `static` in `metrics.rs` into its
+/// thread-local state), but it has a sharp consequence worth stating plainly:
+///
+/// **reddening a model by mutating a mirror proves a property of the mirror,
+/// not of the shipped code.** A mutation has to be applied to production and
+/// the *whole* suite re-run for the claim "this check is load-bearing and
+/// covered" to mean anything. The exceptions are the few mirrors that call
+/// production predicates directly -- `admits_guard_reader` here goes through
+/// `State::is_readable`/`is_condemned`, so neutering those is a real
+/// production mutation.
+///
+/// The deterministic counterparts that *do* pin production live in
+/// `segment::tests` (`condemned_segment_is_not_freed_while_referenced` and
+/// friends, over `segment::try_free_condemned`, the single commit point every
+/// condemned-free path routes through), in
+/// `slice_segment::tests::release_condemned_declines_while_a_guard_is_held`,
+/// and in
+/// `disk::io_uring_layer::tests::release_read_completes_the_handoff_and_returns_the_buffer_once`.
 #[cfg(all(test, feature = "shuttle", not(feature = "loom")))]
 mod shuttle_tests {
     use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
@@ -4172,8 +4214,12 @@ mod shuttle_tests {
             return false;
         }
         // The caller's `prev == 1` only says the count *was* zero-after; a
-        // reader may have re-pinned on a still-Sealed word since. Dropping
-        // this line is the red proof for this model.
+        // reader may have re-pinned on a still-Sealed word since.
+        //
+        // Deleting this line reddens this model -- but that is a property of
+        // the mirror, not of the shipped check. The production one lives in
+        // `segment::try_free_condemned` and is pinned by
+        // `segment::tests::condemned_segment_is_not_freed_while_referenced`.
         if rc.load(Ordering::SeqCst) != 0 {
             return false;
         }
@@ -4200,6 +4246,14 @@ mod shuttle_tests {
 
     /// Mirror of the two-phase guard acquire: check the gate, `fetch_add`,
     /// re-check. Returns `true` if the pin is held on return.
+    ///
+    /// Mirror, not production: deleting the re-check here reddens the models,
+    /// but deleting it from `SliceSegment::get_item` / `try_acquire_read`
+    /// currently reddens nothing. That two-phase protocol (#127/#128) has no
+    /// deterministic test -- the window it closes is between the `fetch_add`
+    /// and the re-check, with no interposition point -- and closing that gap
+    /// would take the same treatment `try_free_condemned` got: extract the
+    /// decision into something a test can call.
     fn model_try_acquire_guard(rc: &AtomicU32, m: &AtomicU64) -> bool {
         let state = Metadata::unpack(m.load(Ordering::SeqCst)).state;
         if !admits_guard_reader(state) {
