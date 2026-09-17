@@ -120,6 +120,15 @@ pub(crate) fn try_claim_for_clear<S: Segment>(segment: &S) -> bool {
 /// [`try_claim_for_clear`] for why the claim has to precede the count, and
 /// [`wait_for_readers`] for why waiting under `Draining` would not have been
 /// exclusive.
+///
+/// `#[must_use]`: a `false` here means this thread never owned the segment, so
+/// everything the caller would do next -- rewriting the items, CASing
+/// `Locked -> Reserved`, returning it to the pool -- belongs to whoever won the
+/// claim. All four blocking callers used to drop this value (#142). The
+/// `Locked -> Reserved` CAS is the trap, because it *succeeds*: the winner is
+/// what put the segment in `Locked`, so a loser that carries on releases a
+/// segment the winner is still clearing.
+#[must_use]
 pub(crate) fn claim_and_wait_for_readers<S: Segment>(segment: &S) -> bool {
     if !try_claim_for_clear(segment) {
         return false;
