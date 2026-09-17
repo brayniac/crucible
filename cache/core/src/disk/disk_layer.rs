@@ -8,7 +8,7 @@ use crate::disk::config::DiskConfig;
 use crate::disk::file_pool::{FilePool, FilePoolBuilder};
 use crate::error::{CacheError, CacheResult};
 use crate::eviction::{ItemFate, determine_item_fate};
-use crate::hashtable::{Hashtable, KeyVerifier};
+use crate::hashtable::Hashtable;
 use crate::item::{BasicHeader, BasicItemGuard};
 use crate::item_location::ItemLocation;
 use crate::layer::Layer;
@@ -60,26 +60,6 @@ pub struct DiskLayer {
 
     /// Current write segment ID per bucket.
     current_write_segments: Vec<std::sync::atomic::AtomicU32>,
-}
-
-/// Helper struct for verifying keys in segments.
-struct SinglePoolVerifier<'a> {
-    pool: &'a FilePool,
-}
-
-impl KeyVerifier for SinglePoolVerifier<'_> {
-    fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
-        let item_loc = ItemLocation::from_location(location);
-        let (_, segment_id, incarnation, offset) = item_loc.unpack(self.pool.layout());
-        if let Some(segment) = self.pool.get(segment_id) {
-            // Guard, then check the incarnation, then read -- see
-            // `SegmentKeyVerify::verify_key_guarded`. The guard stops the
-            // segment being recycled underneath the byte reads (#109).
-            segment.verify_key_guarded(offset, key, allow_deleted, incarnation)
-        } else {
-            false
-        }
-    }
 }
 
 impl DiskLayer {
@@ -314,8 +294,25 @@ impl DiskLayer {
                             offset,
                         );
 
-                        let verifier = SinglePoolVerifier { pool: &self.pool };
-                        let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+                        // Location-matched, not verifier-backed (#138). This
+                        // arm runs under the `Locked` claim taken above, and
+                        // `State::admits_verify_reader` refuses `Locked` --
+                        // so `get_frequency`, which resolves the key through
+                        // `SinglePoolVerifier`, can only ever return `None`
+                        // here and the `unwrap_or(0)` turned that refusal into
+                        // a plausible-looking zero. Nothing failed and nothing
+                        // logged; the frequency was simply always 0.
+                        //
+                        // `get_item_frequency` matches on the location alone,
+                        // needs no verifier and is honest under any segment
+                        // state. Its `None` now means what it says -- no live
+                        // entry names this slot -- and 0 is the right answer
+                        // for that, because both arms below are themselves
+                        // location-matched and no-op on exactly the same
+                        // condition.
+                        let freq = hashtable
+                            .get_item_frequency(key, location.to_location())
+                            .unwrap_or(0);
 
                         let fate = determine_item_fate(freq, &self.config);
 
@@ -734,9 +731,39 @@ impl Default for DiskLayerBuilder {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::hashtable::KeyVerifier;
     use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::item::ItemGuard;
     use tempfile::tempdir;
+
+    /// Resolve a key against this layer's pool, the way `TieredCache`'s own
+    /// verifier would.
+    ///
+    /// This lives in the tests since #138. It used to sit beside the layer
+    /// because `process_evicted_segment`'s exclusive arm looked frequencies up
+    /// through it -- under the `Locked` claim, where
+    /// `State::admits_verify_reader` refuses it, so every one of those lookups
+    /// silently returned `None`. That call is location-matched now, and no
+    /// production path in this layer resolves a key: `TieredCache` owns the
+    /// hashtable and brings its own verifier.
+    struct SinglePoolVerifier<'a> {
+        pool: &'a FilePool,
+    }
+
+    impl KeyVerifier for SinglePoolVerifier<'_> {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            let item_loc = ItemLocation::from_location(location);
+            let (_, segment_id, incarnation, offset) = item_loc.unpack(self.pool.layout());
+            if let Some(segment) = self.pool.get(segment_id) {
+                // Guard, then check the incarnation, then read -- see
+                // `SegmentKeyVerify::verify_key_guarded`. The guard stops the
+                // segment being recycled underneath the byte reads (#109).
+                segment.verify_key_guarded(offset, key, allow_deleted, incarnation)
+            } else {
+                false
+            }
+        }
+    }
 
     fn create_test_layer() -> (tempfile::TempDir, DiskLayer) {
         let dir = tempdir().expect("Failed to create temp dir");
@@ -791,6 +818,153 @@ mod tests {
                 "{key} survived the walk -- it stopped short of that item"
             );
         }
+    }
+
+    /// The demotion threshold the frequency tests configure their layer with.
+    const DEMOTION_THRESHOLD: u8 = 4;
+
+    /// A layer wired to a tier *below* it.
+    ///
+    /// This is what makes the frequency the exclusive eviction arm reads
+    /// observable at all. With no `next_layer`, `determine_item_fate` never
+    /// reaches its frequency comparison, so the arm's answer is the same for
+    /// every value -- which is why the silent zero of #138 was latent, and why
+    /// a test built on the default layer cannot tell a correct frequency from
+    /// a constant. `set_next_layer` is the same call `TieredCacheBuilder::build`
+    /// makes when a layer is added below this one.
+    fn create_demoting_test_layer() -> (tempfile::TempDir, DiskLayer) {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let path = dir.path().join("test_disk_layer.dat");
+
+        let mut layer = DiskLayerBuilder::new()
+            .layer_id(2)
+            .pool_id(2)
+            .segment_size(64 * 1024)
+            .path(&path)
+            .size(640 * 1024)
+            .config(
+                LayerConfig::new()
+                    .with_ghosts(true)
+                    .with_demotion_threshold(DEMOTION_THRESHOLD),
+            )
+            .build()
+            .expect("Failed to create test layer");
+        layer.set_next_layer(3);
+        assert!(
+            layer.config.next_layer.is_some(),
+            "without a next layer `determine_item_fate` ignores the frequency \
+             and this test proves nothing"
+        );
+
+        (dir, layer)
+    }
+
+    /// Write one item, read it back `reads` times to build frequency, then run
+    /// it through the exclusive arm of `process_evicted_segment`.
+    ///
+    /// Returns the frequency the hashtable held going in, and the ghost
+    /// frequency left behind afterwards -- `None` meaning the entry was
+    /// removed outright, which on this layer is what demotion looks like
+    /// (disk is the last tier, so `Demote` and `Discard` share an arm).
+    ///
+    /// One item, one hashtable: `get_ghost_frequency` matches on the 12-bit
+    /// tag alone, so a second key in the table could answer for the first.
+    fn evict_one_item(layer: &DiskLayer, reads: usize) -> (u8, Option<u8>) {
+        let hashtable = MultiChoiceHashtable::new(10);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let key = b"solo";
+
+        let location = layer
+            .write_item(key, b"value", b"", Duration::from_secs(3600))
+            .expect("write");
+        hashtable
+            .insert(key, location.to_location(), &verifier)
+            .expect("insert");
+
+        // Reads go through the verifier, which is fine here -- the segment is
+        // still `Live`, so `admits_verify_reader` allows it.
+        for _ in 0..reads {
+            assert!(
+                hashtable.lookup(key, &verifier).is_some(),
+                "the warming read must hit, or no frequency accrues"
+            );
+        }
+        let freq = hashtable
+            .get_item_frequency(key, location.to_location())
+            .expect("the item must be indexed before eviction");
+
+        // The evictor hands `process_evicted_segment` a segment already
+        // unlinked into `Draining`.
+        let segment_id = location.segment_id(layer.pool.layout());
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Draining, None, None));
+
+        layer.process_evicted_segment(segment_id, &hashtable);
+
+        assert!(
+            hashtable
+                .get_item_frequency(key, location.to_location())
+                .is_none(),
+            "the item must not still be indexed as live at a segment that has \
+             been recycled"
+        );
+        (freq, hashtable.get_ghost_frequency(key))
+    }
+
+    /// An item hot enough to demote must be *removed*, not ghosted.
+    ///
+    /// This is #138's red proof. The exclusive arm runs under the `Locked`
+    /// claim it took a few lines earlier, and `State::admits_verify_reader`
+    /// refuses `Locked` -- so `get_frequency`, which resolves the key through
+    /// `SinglePoolVerifier`, returns `None` there every single time and the
+    /// `unwrap_or(0)` that followed it turned the refusal into a
+    /// plausible-looking zero. A zero is below any threshold, so a hot item
+    /// took the ghost arm instead of the demote arm.
+    ///
+    /// Red proof: restore
+    /// `hashtable.get_frequency(key, &SinglePoolVerifier { pool: &self.pool })`
+    /// in place of the location-matched lookup and this fails with a ghost.
+    #[test]
+    fn eviction_demotes_an_item_whose_frequency_clears_the_threshold() {
+        let (_dir, layer) = create_demoting_test_layer();
+
+        let (freq, ghost) = evict_one_item(&layer, DEMOTION_THRESHOLD as usize + 2);
+
+        assert!(
+            freq >= DEMOTION_THRESHOLD,
+            "the warming reads must carry the item past the threshold for this \
+             to test the demote arm, got {freq}"
+        );
+        assert_eq!(
+            ghost, None,
+            "a hot item was ghosted instead of demoted -- the exclusive arm \
+             read its frequency through the key verifier, which its own \
+             `Locked` claim refuses, and `unwrap_or(0)` turned that into a \
+             zero (#138)"
+        );
+    }
+
+    /// The control: a cold item must still be ghosted.
+    ///
+    /// Without this the test above passes for any fix that reports every item
+    /// as hot -- including replacing the lookup with a constant 255.
+    #[test]
+    fn eviction_ghosts_an_item_whose_frequency_is_below_the_threshold() {
+        let (_dir, layer) = create_demoting_test_layer();
+
+        let (freq, ghost) = evict_one_item(&layer, 0);
+
+        assert!(
+            freq < DEMOTION_THRESHOLD,
+            "an unread item must sit below the threshold for this to test the \
+             ghost arm, got {freq}"
+        );
+        assert_eq!(
+            ghost,
+            Some(freq),
+            "a cold item must become a ghost, carrying its frequency with it"
+        );
     }
 
     /// Tests that drive a race by hand through `segment::interpose`.
