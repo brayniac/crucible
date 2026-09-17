@@ -514,9 +514,27 @@ impl TtlLayer {
                             offset,
                         );
 
-                        // Get frequency from hashtable
-                        let verifier = SinglePoolVerifier { pool: &self.pool };
-                        let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+                        // Location-matched, not verifier-backed (#140). This loop runs
+                        // under the `Locked` claim `claim_and_wait_for_readers` took
+                        // above, and `State::admits_verify_reader` refuses `Locked` --
+                        // so `get_frequency`, which resolves the key through
+                        // `SinglePoolVerifier`, could only ever come back `None` here
+                        // and the `unwrap_or(0)` turned that refusal into a
+                        // plausible-looking zero. Nothing failed and nothing logged;
+                        // every item's fate was decided against a frequency of 0.
+                        //
+                        // `get_item_frequency` matches on the location alone, needs no
+                        // verifier and is honest under any segment state. The
+                        // `unwrap_or(0)` stays and is now correct rather than papering
+                        // over a refusal: `search_bucket_for_item_freq` and the fate
+                        // arms below use the identical predicate (non-ghost, tag match,
+                        // location match) against this same location, so a `None` here
+                        // and both arms no-opping coincide exactly. The segment is
+                        // `Locked`, so nothing can append into it and make an entry
+                        // start matching mid-scan.
+                        let freq = hashtable
+                            .get_item_frequency(key, location.to_location())
+                            .unwrap_or(0);
 
                         // Determine item fate
                         let fate = determine_item_fate(freq, &self.config);
@@ -893,9 +911,27 @@ impl TtlLayer {
                             offset,
                         );
 
-                        // Get frequency from hashtable
-                        let verifier = SinglePoolVerifier { pool: &self.pool };
-                        let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+                        // Location-matched, not verifier-backed (#140). This loop runs
+                        // under the `Locked` claim `claim_and_wait_for_readers` took
+                        // above, and `State::admits_verify_reader` refuses `Locked` --
+                        // so `get_frequency`, which resolves the key through
+                        // `SinglePoolVerifier`, could only ever come back `None` here
+                        // and the `unwrap_or(0)` turned that refusal into a
+                        // plausible-looking zero. Nothing failed and nothing logged;
+                        // every item's fate was decided against a frequency of 0.
+                        //
+                        // `get_item_frequency` matches on the location alone, needs no
+                        // verifier and is honest under any segment state. The
+                        // `unwrap_or(0)` stays and is now correct rather than papering
+                        // over a refusal: `search_bucket_for_item_freq` and the fate
+                        // arms below use the identical predicate (non-ghost, tag match,
+                        // location match) against this same location, so a `None` here
+                        // and both arms no-opping coincide exactly. The segment is
+                        // `Locked`, so nothing can append into it and make an entry
+                        // start matching mid-scan.
+                        let freq = hashtable
+                            .get_item_frequency(key, location.to_location())
+                            .unwrap_or(0);
 
                         // Determine item fate
                         let fate = determine_item_fate(freq, &self.config);
@@ -1721,6 +1757,258 @@ mod tests {
             .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer")
+    }
+
+    /// The frequency the *blocking* eviction paths read (#140).
+    ///
+    /// `process_evicted_segment` and `process_evicted_segment_with_demoter`
+    /// both take the exclusive `Locked` claim up front, via
+    /// `layer::claim_and_wait_for_readers`, and then decided every item's fate
+    /// from `hashtable.get_frequency(key, &verifier)` -- a lookup that resolves
+    /// the key through `SinglePoolVerifier`, which goes through
+    /// `try_acquire_read`, which `State::admits_verify_reader` refuses under
+    /// `Locked`. So the lookup returned `None` on every item, every time, and
+    /// the `unwrap_or(0)` turned that refusal into a plausible-looking zero.
+    ///
+    /// Unlike #138's disk sites this is not latent: a RAM layer does get a
+    /// `next_layer`, and `TieredCache::evict_from_layer` reaches
+    /// `emergency_evict` -- and so the blocking path -- inside the branch that
+    /// established `next_layer.is_some()`.
+    ///
+    /// These tests do not use `segment::interpose`, but they are gated the
+    /// same way as the module that does: they run a whole eviction pass over a
+    /// real pool, which is not a model the checkers should be asked to
+    /// explore.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    mod blocking_eviction_frequency {
+        use super::*;
+        use crate::hashtable_impl::MultiChoiceHashtable;
+
+        /// The demotion threshold these tests configure their layer with.
+        const DEMOTION_THRESHOLD: u8 = 4;
+
+        /// The single key each test stages. One item per hashtable is
+        /// deliberate: `get_ghost_frequency` matches on the 12-bit tag alone,
+        /// so a second key in the table could answer for the first.
+        const KEY: &[u8] = b"solo";
+
+        /// A layer wired to a tier *below* it.
+        ///
+        /// This is what makes the frequency observable at all.
+        /// `determine_item_fate` reaches its frequency comparison only when
+        /// `next_layer.is_some()`; without it every frequency produces the
+        /// same fate and a test proves nothing. `set_next_layer` is the same
+        /// call `TieredCacheBuilder::build` makes for any layer with a tier
+        /// below it.
+        fn create_demoting_test_layer() -> TtlLayer {
+            let mut layer = TtlLayerBuilder::new()
+                .layer_id(1)
+                .pool_id(1)
+                .segment_size(64 * 1024)
+                .heap_size(640 * 1024)
+                .config(
+                    LayerConfig::new()
+                        .with_ghosts(true)
+                        .with_demotion_threshold(DEMOTION_THRESHOLD),
+                )
+                .spare_capacity(0)
+                .build()
+                .expect("Failed to create test layer");
+            layer.set_next_layer(2);
+            assert!(
+                layer.config.next_layer.is_some(),
+                "without a next layer `determine_item_fate` ignores the \
+                 frequency and this test proves nothing"
+            );
+            layer
+        }
+
+        /// One item, warmed with `reads` hits, in a segment already unlinked
+        /// into `Draining` -- which is the state the evictor hands the
+        /// blocking paths.
+        struct Staged {
+            hashtable: MultiChoiceHashtable,
+            /// The frequency the hashtable holds for the item going in.
+            freq: u8,
+            /// Where the item sits, which is what both fate arms match on.
+            location: ItemLocation,
+            segment_id: u32,
+        }
+
+        fn stage_one_item(layer: &TtlLayer, reads: usize) -> Staged {
+            let hashtable = MultiChoiceHashtable::new(10);
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+
+            let location = layer
+                .write_item(KEY, b"value", b"", Duration::from_secs(3600))
+                .expect("write");
+            hashtable
+                .insert(KEY, location.to_location(), &verifier)
+                .expect("insert");
+
+            // The warming reads go through the verifier, which is fine here --
+            // the segment is still `Live`, so `admits_verify_reader` allows it.
+            for _ in 0..reads {
+                assert!(
+                    hashtable.lookup(KEY, &verifier).is_some(),
+                    "the warming read must hit, or no frequency accrues"
+                );
+            }
+            let freq = hashtable
+                .get_item_frequency(KEY, location.to_location())
+                .expect("the item must be indexed before eviction");
+
+            let segment_id = location.segment_id(layer.pool().layout());
+            let segment = layer.pool().get(segment_id).expect("segment");
+            let state = segment.state();
+            assert!(
+                segment.cas_metadata(state, State::Draining, None, None),
+                "the evictor hands these paths a segment already in `Draining`"
+            );
+
+            Staged {
+                hashtable,
+                freq,
+                location,
+                segment_id,
+            }
+        }
+
+        /// A hot item must be *removed* by the blocking non-demoting path, not
+        /// ghosted.
+        ///
+        /// Red proof: restore
+        /// `hashtable.get_frequency(key, &SinglePoolVerifier { pool: &self.pool })`
+        /// at the frequency read in `process_evicted_segment` and this fails
+        /// with a ghost, because the `Locked` claim taken a few lines above
+        /// refuses the verifier and `unwrap_or(0)` reports a zero.
+        #[test]
+        fn blocking_eviction_demotes_an_item_over_the_threshold() {
+            let layer = create_demoting_test_layer();
+            let staged = stage_one_item(&layer, DEMOTION_THRESHOLD as usize + 2);
+            assert!(
+                staged.freq >= DEMOTION_THRESHOLD,
+                "the warming reads must carry the item past the threshold for \
+                 this to test the demote arm, got {}",
+                staged.freq
+            );
+
+            layer.process_evicted_segment(staged.segment_id, &staged.hashtable);
+
+            assert!(
+                staged
+                    .hashtable
+                    .get_item_frequency(KEY, staged.location.to_location())
+                    .is_none(),
+                "the item must not still be indexed as live at a segment that \
+                 has been recycled"
+            );
+            assert_eq!(
+                staged.hashtable.get_ghost_frequency(KEY),
+                None,
+                "a hot item was ghosted instead of demoted -- the blocking \
+                 path read its frequency through the key verifier, which its \
+                 own `Locked` claim refuses, and `unwrap_or(0)` turned that \
+                 into a zero (#140)"
+            );
+        }
+
+        /// The control: a cold item must still be ghosted.
+        ///
+        /// Without this the test above passes for any "fix" that reports every
+        /// item as hot -- including replacing the lookup with a constant 255.
+        #[test]
+        fn blocking_eviction_ghosts_an_item_under_the_threshold() {
+            let layer = create_demoting_test_layer();
+            let staged = stage_one_item(&layer, 0);
+            assert!(
+                staged.freq < DEMOTION_THRESHOLD,
+                "an unread item must sit below the threshold for this to test \
+                 the ghost arm, got {}",
+                staged.freq
+            );
+
+            layer.process_evicted_segment(staged.segment_id, &staged.hashtable);
+
+            assert!(
+                staged
+                    .hashtable
+                    .get_item_frequency(KEY, staged.location.to_location())
+                    .is_none(),
+                "the item must not still be indexed as live at a segment that \
+                 has been recycled"
+            );
+            assert_eq!(
+                staged.hashtable.get_ghost_frequency(KEY),
+                Some(staged.freq),
+                "a cold item must become a ghost, carrying its frequency with it"
+            );
+        }
+
+        /// The demoting twin, where the silent zero is worse in kind:
+        /// `ItemFate::Demote` is the only arm that invokes the callback, so a
+        /// frequency stuck at 0 means the demoter never fires at all.
+        ///
+        /// Red proof: restore the verifier-backed lookup at the frequency read
+        /// in `process_evicted_segment_with_demoter` and the callback is never
+        /// called.
+        #[test]
+        fn blocking_demoting_eviction_hands_a_hot_item_to_the_demoter() {
+            let layer = create_demoting_test_layer();
+            let staged = stage_one_item(&layer, DEMOTION_THRESHOLD as usize + 2);
+            assert!(
+                staged.freq >= DEMOTION_THRESHOLD,
+                "the warming reads must carry the item past the threshold for \
+                 this to test the demote arm, got {}",
+                staged.freq
+            );
+
+            let mut demoted: Vec<Vec<u8>> = Vec::new();
+            layer.process_evicted_segment_with_demoter(
+                staged.segment_id,
+                &staged.hashtable,
+                |key, _value, _optional, _ttl, _location| demoted.push(key.to_vec()),
+            );
+
+            assert_eq!(
+                demoted,
+                vec![KEY.to_vec()],
+                "a hot item was not handed to the demoter -- the blocking \
+                 demoting path read its frequency through the key verifier, \
+                 which its own `Locked` claim refuses (#140)"
+            );
+        }
+
+        /// The control for the demoting twin: a cold item must be ghosted and
+        /// the callback must not fire for it.
+        #[test]
+        fn blocking_demoting_eviction_ghosts_a_cold_item() {
+            let layer = create_demoting_test_layer();
+            let staged = stage_one_item(&layer, 0);
+            assert!(
+                staged.freq < DEMOTION_THRESHOLD,
+                "an unread item must sit below the threshold for this to test \
+                 the ghost arm, got {}",
+                staged.freq
+            );
+
+            let mut demoted: Vec<Vec<u8>> = Vec::new();
+            layer.process_evicted_segment_with_demoter(
+                staged.segment_id,
+                &staged.hashtable,
+                |key, _value, _optional, _ttl, _location| demoted.push(key.to_vec()),
+            );
+
+            assert!(
+                demoted.is_empty(),
+                "a cold item must not be demoted, got {demoted:?}"
+            );
+            assert_eq!(
+                staged.hashtable.get_ghost_frequency(KEY),
+                Some(staged.freq),
+                "a cold item must become a ghost, carrying its frequency with it"
+            );
+        }
     }
 
     /// Tests that drive a race by hand through `segment::interpose`.
