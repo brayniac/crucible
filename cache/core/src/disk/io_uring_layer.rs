@@ -245,24 +245,10 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        // Increment ref_count before reading
+        // Pin the segment and resolve its staging buffer. Both back-outs in
+        // here return the reference; see `pin_for_buffer_read`.
         let ref_count_ptr = segment.ref_count_ptr();
-        // SeqCst, both halves -- the reader side of the Dekker pair with the
-        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
-        // both loads come back stale and both sides proceed. See
-        // `Segment::ref_count_seqcst` (#129).
-        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::SeqCst) };
-
-        // Double-check state after increment
-        let state_after = segment.state_seqcst();
-        if !state_after.is_readable() || state_after.is_condemned() {
-            self.release_segment_ref(segment);
-            return None;
-        }
-
-        fence(Ordering::Acquire);
-
-        let data_ptr = segment.write_buffer_ptr()?;
+        let data_ptr = self.pin_for_buffer_read(segment)?;
 
         // Parse header
         if offset as usize + BasicHeader::SIZE > segment.capacity() {
@@ -353,18 +339,9 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        // Increment ref_count to prevent eviction during async read
-        let ref_count_ptr = segment.ref_count_ptr();
-        // SeqCst, both halves -- the reader side of the Dekker pair with the
-        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
-        // both loads come back stale and both sides proceed. See
-        // `Segment::ref_count_seqcst` (#129).
-        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::SeqCst) };
-
-        // Double-check state after increment
-        let state_after = segment.state_seqcst();
-        if !state_after.is_readable() || state_after.is_condemned() {
-            self.release_segment_ref(segment);
+        // Pin the segment so it cannot be evicted while the read is in
+        // flight; `release_read` drops this again on completion.
+        if !self.pin_for_read(segment) {
             return None;
         }
 
@@ -449,6 +426,61 @@ impl IoUringDiskLayer {
             && let Some(buf) = segment.detach_write_buffer()
         {
             self.buffer_pool.lock().unwrap().release(buf);
+        }
+    }
+
+    /// Pin a segment against eviction for a read, re-validating the state
+    /// after the increment.
+    ///
+    /// Returns `false` -- reference already dropped -- if the segment stopped
+    /// being readable, or was condemned, in the window between the caller's
+    /// first look at the state and the increment.
+    fn pin_for_read(&self, segment: &DiskSegmentMeta) -> bool {
+        // SeqCst, both halves -- the reader side of the Dekker pair with the
+        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
+        // both loads come back stale and both sides proceed. See
+        // `Segment::ref_count_seqcst` (#129).
+        unsafe { (*segment.ref_count_ptr()).fetch_add(1, Ordering::SeqCst) };
+
+        // Double-check state after increment
+        let state_after = segment.state_seqcst();
+        if !state_after.is_readable() || state_after.is_condemned() {
+            self.release_segment_ref(segment);
+            return false;
+        }
+        true
+    }
+
+    /// Pin a segment and resolve the staging buffer a RAM read will be served
+    /// out of.
+    ///
+    /// Returns `None` -- reference already dropped -- when the segment stopped
+    /// being readable, and equally when the buffer went away: `complete_flush`
+    /// detaches it, and can land between the caller's `has_write_buffer()`
+    /// check and this resolve.
+    ///
+    /// That second back-out is why the pin and the resolve are one call. Both
+    /// callers used to resolve the pointer themselves with `?`, returning with
+    /// the reference still held (#130), and a segment that loses one never
+    /// reads `ref_count() == 0` again -- the evictor's gate never opens for it
+    /// again, so it is pinned for the life of the process: never evicted,
+    /// never condemned, never recycled. Handing the reference back through
+    /// `release_segment_ref` rather than a bare `fetch_sub` is the other half:
+    /// a back-out that drops the last reference on an already-condemned
+    /// segment owes it the free handoff (#131).
+    fn pin_for_buffer_read(&self, segment: &DiskSegmentMeta) -> Option<*const u8> {
+        if !self.pin_for_read(segment) {
+            return None;
+        }
+
+        fence(Ordering::Acquire);
+
+        match segment.write_buffer_ptr() {
+            Some(data_ptr) => Some(data_ptr),
+            None => {
+                self.release_segment_ref(segment);
+                None
+            }
         }
     }
 
@@ -870,22 +902,10 @@ impl Layer for IoUringDiskLayer {
 
         let header_info = segment.verify_key_unexpired(offset, key, now)?;
 
-        // Build a BasicItemGuard from the write buffer data
+        // Build a BasicItemGuard from the write buffer data. Both back-outs
+        // in here return the reference; see `pin_for_buffer_read`.
         let ref_count_ptr = segment.ref_count_ptr();
-        // SeqCst, both halves -- the reader side of the Dekker pair with the
-        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
-        // both loads come back stale and both sides proceed. See
-        // `Segment::ref_count_seqcst` (#129).
-        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::SeqCst) };
-
-        // Double-check state after increment
-        let state_after = segment.state_seqcst();
-        if !state_after.is_readable() || state_after.is_condemned() {
-            self.release_segment_ref(segment);
-            return None;
-        }
-
-        let data_ptr = segment.write_buffer_ptr()?;
+        let data_ptr = self.pin_for_buffer_read(segment)?;
 
         let (key_len, optional_len, value_len) = header_info;
 
@@ -1289,6 +1309,94 @@ mod tests {
             buffers_free_before + 1,
             "the staging buffer returns to the pool exactly once"
         );
+    }
+
+    /// A read whose pin lands after the condemner must hand its reference
+    /// back, and complete the free if it was the last one out.
+    ///
+    /// This is the other back-out inside the shared pin, and the one the
+    /// audit for #130 had to leave alone: it was already correct. It is worth
+    /// a test all the same, because a bare `fetch_sub` here would strand the
+    /// segment in `AwaitingRelease` forever -- the condemner already declined
+    /// the free on seeing this reference, so nobody else is coming (#131).
+    #[test]
+    fn a_pin_that_loses_the_condemn_race_completes_the_free() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (_keys, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let buffers_free_before = layer.buffer_pool.lock().unwrap().available();
+
+        // The condemner gets there first: sealed, drained, awaiting release.
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Sealed, None, None));
+        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None));
+
+        // The reader's increment lands after that, so its re-check sees the
+        // condemned state and backs out -- owing the segment its free.
+        assert!(
+            !layer.pin_for_read(segment),
+            "a condemned segment's entries are gone; the read is a miss"
+        );
+        assert_eq!(
+            segment.ref_count(),
+            0,
+            "the backed-out read kept its reference"
+        );
+        assert_eq!(
+            segment.state(),
+            State::Free,
+            "the last reference out owes the condemned segment its free"
+        );
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            buffers_free_before + 1,
+            "the staging buffer rides back out with the free"
+        );
+    }
+
+    /// A RAM read that loses the race with the flush must hand its reference
+    /// back (#130).
+    ///
+    /// `read_from_buffer` and `get_item` check `has_write_buffer()`, pin the
+    /// segment, and only then resolve the pointer -- and `complete_flush`
+    /// detaches the buffer, so it can land inside that window. Both used to
+    /// resolve it with `?` and return with the pin still held. A segment that
+    /// loses a reference that way never reads `ref_count() == 0` again, so the
+    /// evictor's gate never opens for it: not evicted, not condemned, not
+    /// recycled, for the life of the process.
+    ///
+    /// The window itself cannot be opened from a single thread -- it takes a
+    /// concurrent detach -- so the proof is on `pin_for_buffer_read`, the one
+    /// call both entry points now make for the pin and the resolve together.
+    #[test]
+    fn a_buffer_read_that_loses_the_flush_race_hands_its_reference_back() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (_keys, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+
+        // What the flush does when it lands in the window: the buffer goes
+        // away while the segment is still live and perfectly readable.
+        let buf = segment
+            .detach_write_buffer()
+            .expect("the item is staged in RAM");
+        assert!(segment.state().is_readable());
+        assert_eq!(segment.ref_count(), 0, "nothing holds this segment yet");
+
+        assert!(
+            layer.pin_for_buffer_read(segment).is_none(),
+            "there is no buffer left to read out of"
+        );
+        assert_eq!(
+            segment.ref_count(),
+            0,
+            "the backed-out read kept its reference -- this segment can never \
+             satisfy the evictor's ref_count == 0 gate again"
+        );
+
+        layer.buffer_pool.lock().unwrap().release(buf);
     }
 
     /// A location from a previous incarnation must not resolve, even though
