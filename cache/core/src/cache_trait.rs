@@ -235,6 +235,14 @@ impl Drop for ValueRef {
             let packed = unsafe { (*self.metadata).load(Ordering::SeqCst) };
             let meta = Metadata::unpack(packed);
             if meta.state == State::AwaitingRelease {
+                // Re-validate `prev_count == 1` before the CAS -- it says the
+                // count *was* 1, and a reader may have pinned the segment again
+                // on a still-`Sealed` word before the evictor condemned it. See
+                // `SliceSegment::release_condemned` for the full argument.
+                if unsafe { (*self.ref_count).load(Ordering::SeqCst) } != 0 {
+                    return;
+                }
+
                 // AwaitingRelease -> Free ends a used incarnation, so the tag
                 // advances in the same CAS that publishes Free.
                 //

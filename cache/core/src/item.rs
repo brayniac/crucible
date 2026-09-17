@@ -815,6 +815,19 @@ impl Drop for BasicItemGuard<'_> {
             let meta = Metadata::unpack(packed);
 
             if meta.state == State::AwaitingRelease {
+                // Re-validate `prev_count == 1` before the CAS. That value says
+                // the count *was* 1; a reader may have pinned the segment again
+                // in between, on a still-`Sealed` word, and the evictor may then
+                // have condemned it because of *that* pin. Freeing here would
+                // pull the segment out from under a live reference. See
+                // `SliceSegment::release_condemned`, which carries the full
+                // argument, and
+                // `shuttle_reader_never_coexists_with_committed_drain`, which
+                // found it.
+                if self.ref_count.load(Ordering::SeqCst) != 0 {
+                    return;
+                }
+
                 // AwaitingRelease -> Free ends a used incarnation, so the tag
                 // advances in the same CAS that publishes Free.
                 //

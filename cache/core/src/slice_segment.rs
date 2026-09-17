@@ -1528,6 +1528,29 @@ impl SliceSegment<'_> {
     /// the evictor's race fix -- at most one can succeed, and only that one
     /// pushes to the free queue. The losers observe the changed word and return
     /// false.
+    ///    /// # Why `prev == 1` is not enough on its own
+    ///
+    /// The caller's `fetch_sub` returning 1 says the count *was* 1. By the time
+    /// the state load below runs, another reader may have pinned the segment
+    /// again -- legitimately, because the pin happens while the segment is
+    /// still `Sealed`, before the evictor condemns it. So the sequence
+    ///
+    /// ```text
+    /// reader A: fetch_sub -> prev == 1 (count now 0)
+    /// reader B: fetch_add on a still-Sealed segment, re-check passes -> pinned
+    /// evictor : sees ref_count == 1, condemns -> AwaitingRelease
+    /// reader A: loads the state, sees AwaitingRelease, frees
+    /// ```
+    ///
+    /// frees the segment under B's live reference. Re-reading `ref_count` here
+    /// is what closes it: A declines, and B's own drop -- which will see
+    /// `prev == 1` and `AwaitingRelease` -- completes the handoff. Under the
+    /// SeqCst orderings this path uses, B's pin cannot be missed by this load:
+    /// B's `fetch_add` precedes its re-check, which saw a pre-condemn state and
+    /// so precedes the condemn CAS, which precedes the state load above.
+    ///
+    /// Found by `shuttle_tests::shuttle_reader_never_coexists_with_committed_drain`.
+    /// `DiskSegmentMeta::release_condemned` already had this check.
     pub fn release_condemned(&self) -> bool {
         // SeqCst on the load and the CAS: this is the commit point of the
         // condemned handoff, reached from both halves of the Dekker pair (the
@@ -1539,6 +1562,13 @@ impl SliceSegment<'_> {
         let current_meta = Metadata::unpack(current);
 
         if current_meta.state != State::AwaitingRelease {
+            return false;
+        }
+
+        // Re-validate the caller's `prev == 1`: a reader may have pinned the
+        // segment again, on a still-`Sealed` word, after that decrement and
+        // before the condemn. See the note on this function.
+        if self.ref_count.load(Ordering::SeqCst) != 0 {
             return false;
         }
 
@@ -3906,6 +3936,7 @@ mod loom_tests {
     /// Invariant: a reader holding a reference must never be looking at a
     /// segment that has been published `Free`, because `Free` means the
     /// segment is on the pool's free queue and can be handed to a writer.
+
     #[test]
     fn test_release_condemned_gate_respects_readers() {
         let mut builder = loom::model::Builder::new();

@@ -470,6 +470,14 @@ impl IoUringDiskLayer {
             if segment.state_seqcst() != State::AwaitingRelease {
                 return;
             }
+            // Re-validate `prev == 1` before detaching: it says the count *was*
+            // 1, and a reader may have pinned the segment again on a still-
+            // readable word before the evictor condemned it. Returning the
+            // staging buffer to the pool here would invalidate that reader's
+            // `write_buffer_ptr()`. See `SliceSegment::release_condemned`.
+            if segment.ref_count_seqcst() != 0 {
+                return;
+            }
             if let Some(buf) = segment.detach_write_buffer() {
                 self.buffer_pool.lock().unwrap().release(buf);
             }
@@ -490,6 +498,11 @@ impl IoUringDiskLayer {
             // Check if this was the last reader and segment is condemned
             if prev == 1 {
                 fence(Ordering::SeqCst);
+                // Re-validate `prev == 1` -- see `release_segment_ref`. A
+                // reader may have pinned the segment again since the decrement.
+                if segment.ref_count_seqcst() != 0 {
+                    return;
+                }
                 // Return write buffer before releasing condemned segment
                 if let Some(buf) = segment.detach_write_buffer() {
                     self.buffer_pool.lock().unwrap().release(buf);
