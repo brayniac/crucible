@@ -27,10 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   yields, which is exactly the shape that hung. Only a completion can free a
   pool slot, so that wait never ended
 
-### Note
-- `ringline` and `ringline-redis` are pinned to a git rev until a release
-  carries both of the above; the workspace switches back to the crates.io
-  versions once they are published
+- **Back on published crates**: `ringline` 0.6.1 and `ringline-redis` 0.7.0
+  from crates.io, replacing the temporary git pin taken while the two changes
+  above were unreleased. `ringline-redis` is unchanged at 0.7.0 and picks up
+  the new core through its own `ringline = "0.6"` requirement, so `--locked`
+  builds are reproducible from the registry again
 
 ## [0.4.1] - 2026-02-25
 
