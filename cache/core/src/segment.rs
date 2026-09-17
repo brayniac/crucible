@@ -123,6 +123,10 @@ pub(crate) unsafe fn try_free_condemned<F: FnOnce()>(
         unsafe {
             (*free_queue).push(segment_id);
         }
+
+        #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+        interpose::fire(interpose::FREE_AFTER_PUBLISH);
+
         true
     } else {
         false
@@ -254,6 +258,16 @@ pub(crate) mod interpose {
     /// segment's state here sees whether the blocking paths claim before they
     /// wait or after (#133).
     pub(crate) const WAIT_BEFORE_POLL: u8 = 3;
+    /// [`try_free_condemned`]: immediately after the freed segment is pushed
+    /// to the free queue, and only on the path that actually freed it.
+    ///
+    /// This is the instant the segment becomes another thread's to reserve. A
+    /// test parks here and reserves it by hand, which is the only way to make
+    /// *late* per-segment cleanup observable from one thread: anything a
+    /// caller does after `try_free_condemned` returns is already operating on
+    /// a segment someone else may own. `IoUringDiskLayer`'s staging-buffer
+    /// return is the cleanup that has to be inside `on_freed` for that reason.
+    pub(crate) const FREE_AFTER_PUBLISH: u8 = 4;
 
     /// What a test installs: called with the phase.
     pub(crate) type Hook = Box<dyn FnMut(u8)>;

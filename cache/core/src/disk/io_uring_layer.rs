@@ -435,20 +435,38 @@ impl IoUringDiskLayer {
     /// Returns `false` -- reference already dropped -- if the segment stopped
     /// being readable, or was condemned, in the window between the caller's
     /// first look at the state and the increment.
+    ///
+    /// The protocol itself lives in [`crate::segment::try_acquire_pin`], where
+    /// every other acquire in the crate already went (#134). This was the last
+    /// hand-rolled copy in the tree -- its own `fetch_add` followed by its own
+    /// `state_seqcst()` re-check, with no interposition point, which is exactly
+    /// why that re-check could be deleted and the whole suite stay green.
+    /// Routing through the shared body puts this site behind
+    /// `interpose::ACQUIRE_AFTER_INCREMENT`, so a test can condemn the segment
+    /// inside the window by hand; see
+    /// `a_pin_that_loses_the_condemn_race_completes_the_free`.
+    ///
+    /// [`State::admits_guard_reader`] is the predicate, not the wider
+    /// key-verify one: these are value reads, so `Draining` must refuse them.
+    /// It is the same `is_readable() && !is_condemned()` pair this used to
+    /// spell out by hand.
+    ///
+    /// The back-out goes through `release_segment_ref` rather than a bare
+    /// `fetch_sub`, because a back-out that drops the last reference on an
+    /// already-condemned segment owes it the `AwaitingRelease -> Free`
+    /// handoff -- the condemner that saw this reference has already declined
+    /// it (#131).
     fn pin_for_read(&self, segment: &DiskSegmentMeta) -> bool {
-        // SeqCst, both halves -- the reader side of the Dekker pair with the
-        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
-        // both loads come back stale and both sides proceed. See
-        // `Segment::ref_count_seqcst` (#129).
-        unsafe { (*segment.ref_count_ptr()).fetch_add(1, Ordering::SeqCst) };
-
-        // Double-check state after increment
-        let state_after = segment.state_seqcst();
-        if !state_after.is_readable() || state_after.is_condemned() {
-            self.release_segment_ref(segment);
-            return false;
+        // SAFETY: both pointers name this segment's own atomics, which live as
+        // long as the pool and therefore outlive the call.
+        unsafe {
+            crate::segment::try_acquire_pin(
+                &*segment.ref_count_ptr(),
+                &*segment.metadata_ptr(),
+                State::admits_guard_reader,
+                || self.release_segment_ref(segment),
+            )
         }
-        true
     }
 
     /// Pin a segment and resolve the staging buffer a RAM read will be served
@@ -514,7 +532,12 @@ impl IoUringDiskLayer {
     /// The hook also runs *before* the push to the free queue, so no thread
     /// can reserve the segment and attach a fresh buffer in between and have
     /// that one returned instead.
-    fn free_condemned_returning_buffer(&self, segment: &DiskSegmentMeta) {
+    ///
+    /// Returns `true` iff this call performed the `AwaitingRelease -> Free`
+    /// transition, which is what lets it stand in for
+    /// `Segment::release_condemned` as `layer::condemn_and_reclaim_with`'s
+    /// reclaim.
+    fn free_condemned_returning_buffer(&self, segment: &DiskSegmentMeta) -> bool {
         // SAFETY: the pointers come from this segment and outlive the call;
         // `free_queue_ptr` is the pool's queue and `id` names this segment.
         unsafe {
@@ -528,7 +551,7 @@ impl IoUringDiskLayer {
                         self.buffer_pool.lock().unwrap().release(buf);
                     }
                 },
-            );
+            )
         }
     }
 
@@ -716,6 +739,22 @@ impl IoUringDiskLayer {
     }
 
     /// Process items in an evicted segment.
+    ///
+    /// # Claim, then count (#133)
+    ///
+    /// The claim `Draining -> Locked` comes first and the `ref_count` read
+    /// second. The other way round -- which is what this was -- leaves a
+    /// window: `Draining` deliberately still admits key-verify readers, so a
+    /// reader can pin between the observation of zero and the claim, and this
+    /// thread then rewrites the segment's bytes and recycles it while that
+    /// reader is inside `verify_key_at_offset`. Every access involved is
+    /// already `SeqCst` and the bad outcome is still reachable under a full SC
+    /// total order, because it is a TOCTOU and not a Dekker pair. See
+    /// [`crate::layer::try_claim_for_clear`].
+    ///
+    /// Either failure -- losing the claim, or winning it and finding readers
+    /// -- takes the deferral arm, which clears nothing and hands the segment
+    /// to whoever drops the last reference.
     fn process_evicted_segment<H: Hashtable>(&self, segment_id: u32, hashtable: &H) {
         let segment = match self.pool.get(segment_id) {
             Some(s) => s,
@@ -730,27 +769,31 @@ impl IoUringDiskLayer {
             queue.retain(|req| req.segment_id != segment_id);
         }
 
-        // `ref_count_seqcst`: this thread reached here through a
-        // `Sealed -> Draining` CAS, the store half of the Dekker pair this
-        // load completes -- see `Segment::ref_count_seqcst` (#129).
-        if segment.ref_count_seqcst() > 0 {
+        // Claim before counting (#133). `try_claim_for_clear` publishes
+        // `Locked`, the only state that refuses every class of fresh reader;
+        // only then is a `ref_count` read final, because from here the count
+        // can only fall. `ref_count_seqcst` because the claim CAS is the store
+        // half of the Dekker pair this load completes (#129).
+        let claimed = crate::layer::try_claim_for_clear(segment);
+        if !claimed || segment.ref_count_seqcst() > 0 {
             self.drain_segment_from_hashtable(segment_id, hashtable);
-            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
 
-            // Re-check ref_count after CAS to handle race. SeqCst so the load
-            // is ordered after that CAS in the total order; otherwise it can
-            // miss a decrement already published and the segment strands in
-            // AwaitingRelease with ref_count == 0.
-            if segment.ref_count_seqcst() == 0 {
-                if let Some(buf) = segment.detach_write_buffer() {
-                    self.buffer_pool.lock().unwrap().release(buf);
-                }
-                segment.release_condemned();
-            }
+            // Nothing was cleared on this arm, so the segment's bytes are
+            // intact and the readers still in it stay valid. The condemn, its
+            // race fix and the staging-buffer return all live in
+            // `condemn_and_reclaim_with`; see its note for why the buffer
+            // release has to ride inside `try_free_condemned`'s `on_freed`
+            // hook rather than sit on either side of the condemn.
+            let held = if claimed {
+                State::Locked
+            } else {
+                State::Draining
+            };
+            crate::layer::condemn_and_reclaim_with(segment, held, |s| {
+                self.free_condemned_returning_buffer(s)
+            });
             return;
         }
-
-        segment.cas_metadata(State::Draining, State::Locked, None, None);
 
         // Process each item
         if segment.has_write_buffer() {
@@ -1122,16 +1165,25 @@ mod tests {
     use super::*;
     use crate::hashtable_impl::MultiChoiceHashtable;
 
-    /// Fill one segment with items and index them, returning keys + segment id.
+    /// Fill one segment with items and index them, returning keys, their
+    /// locations and the segment id.
+    ///
+    /// The locations are what lets a test ask whether an entry is still in the
+    /// hashtable *without* going through the verifier:
+    /// `Hashtable::get_item_frequency` matches on the location alone, so its
+    /// answer does not depend on the segment's state. A `lookup` would be
+    /// refused outright once the segment is `Locked` or `AwaitingRelease`, and
+    /// an assertion built on one is vacuous exactly when it matters.
     fn fill_one_segment(
         layer: &IoUringDiskLayer,
         hashtable: &MultiChoiceHashtable,
-    ) -> (Vec<String>, u32) {
+    ) -> (Vec<String>, Vec<ItemLocation>, u32) {
         let verifier = IoUringPoolVerifier { pool: &layer.pool };
         let ttl = Duration::from_secs(3600);
 
         const ITEMS: usize = 5;
         let mut keys = Vec::new();
+        let mut locations = Vec::new();
         let mut segment_id = None;
         for i in 0..ITEMS {
             let key = format!("key_{i:02}");
@@ -1148,8 +1200,34 @@ mod tests {
                 "all items must share one segment for this to test the walk"
             );
             keys.push(key);
+            locations.push(location);
         }
-        (keys, segment_id.expect("at least one item"))
+        (keys, locations, segment_id.expect("at least one item"))
+    }
+
+    /// Assert that none of `locations` is still indexed.
+    ///
+    /// Location-matched, so unlike [`assert_all_removed`] this stays honest on
+    /// a segment whose state the key verifier refuses.
+    ///
+    /// Only `mod interposed` uses this, and that module is compiled out under
+    /// the model checkers, so the helper has to carry the same gate or it is
+    /// dead code there.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    fn assert_none_indexed(
+        hashtable: &MultiChoiceHashtable,
+        keys: &[String],
+        locations: &[ItemLocation],
+    ) {
+        for (key, location) in keys.iter().zip(locations) {
+            assert!(
+                hashtable
+                    .get_item_frequency(key.as_bytes(), location.to_location())
+                    .is_none(),
+                "{key} is still indexed at a segment that is being taken away -- \
+                 the sweep did not run"
+            );
+        }
     }
 
     fn assert_all_removed(
@@ -1263,7 +1341,7 @@ mod tests {
     fn release_read_completes_the_handoff_and_returns_the_buffer_once() {
         let layer = test_layer();
         let hashtable = MultiChoiceHashtable::new(10);
-        let (_keys, segment_id) = fill_one_segment(&layer, &hashtable);
+        let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
 
         let segment = layer.pool.get(segment_id).expect("segment");
         assert!(
@@ -1311,51 +1389,6 @@ mod tests {
         );
     }
 
-    /// A read whose pin lands after the condemner must hand its reference
-    /// back, and complete the free if it was the last one out.
-    ///
-    /// This is the other back-out inside the shared pin, and the one the
-    /// audit for #130 had to leave alone: it was already correct. It is worth
-    /// a test all the same, because a bare `fetch_sub` here would strand the
-    /// segment in `AwaitingRelease` forever -- the condemner already declined
-    /// the free on seeing this reference, so nobody else is coming (#131).
-    #[test]
-    fn a_pin_that_loses_the_condemn_race_completes_the_free() {
-        let layer = test_layer();
-        let hashtable = MultiChoiceHashtable::new(10);
-        let (_keys, segment_id) = fill_one_segment(&layer, &hashtable);
-        let segment = layer.pool.get(segment_id).expect("segment");
-        let buffers_free_before = layer.buffer_pool.lock().unwrap().available();
-
-        // The condemner gets there first: sealed, drained, awaiting release.
-        let state = segment.state();
-        assert!(segment.cas_metadata(state, State::Sealed, None, None));
-        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
-        assert!(segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None));
-
-        // The reader's increment lands after that, so its re-check sees the
-        // condemned state and backs out -- owing the segment its free.
-        assert!(
-            !layer.pin_for_read(segment),
-            "a condemned segment's entries are gone; the read is a miss"
-        );
-        assert_eq!(
-            segment.ref_count(),
-            0,
-            "the backed-out read kept its reference"
-        );
-        assert_eq!(
-            segment.state(),
-            State::Free,
-            "the last reference out owes the condemned segment its free"
-        );
-        assert_eq!(
-            layer.buffer_pool.lock().unwrap().available(),
-            buffers_free_before + 1,
-            "the staging buffer rides back out with the free"
-        );
-    }
-
     /// A RAM read that loses the race with the flush must hand its reference
     /// back (#130).
     ///
@@ -1374,7 +1407,7 @@ mod tests {
     fn a_buffer_read_that_loses_the_flush_race_hands_its_reference_back() {
         let layer = test_layer();
         let hashtable = MultiChoiceHashtable::new(10);
-        let (_keys, segment_id) = fill_one_segment(&layer, &hashtable);
+        let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
         let segment = layer.pool.get(segment_id).expect("segment");
 
         // What the flush does when it lands in the window: the buffer goes
@@ -1459,7 +1492,7 @@ mod tests {
         );
 
         let hashtable = MultiChoiceHashtable::new(10);
-        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+        let (keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
 
         layer.drain_segment_from_hashtable(segment_id, &hashtable);
         assert_all_removed(&layer, &hashtable, &keys);
@@ -1471,7 +1504,7 @@ mod tests {
     fn test_evicting_a_segment_walks_every_item_at_the_disk_stride() {
         let layer = test_layer();
         let hashtable = MultiChoiceHashtable::new(10);
-        let (keys, segment_id) = fill_one_segment(&layer, &hashtable);
+        let (keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
 
         // The eviction path leaves its victim in `Draining`, which is the
         // state `process_evicted_segment` expects.
@@ -1481,5 +1514,408 @@ mod tests {
 
         layer.process_evicted_segment(segment_id, &hashtable);
         assert_all_removed(&layer, &hashtable, &keys);
+    }
+
+    /// `pin_for_read` is a *value* read, so it must refuse `Draining`.
+    ///
+    /// `Draining` is exactly the state the two acquire predicates disagree
+    /// about: it still admits key-verify readers, which is what lets the
+    /// demoter resolve keys on a segment it is draining, and it refuses guard
+    /// readers, because the evictor is about to rewrite the bytes. Widening
+    /// this site to [`State::admits_verify_reader`] would let a RAM read hold
+    /// a reference across the clear.
+    ///
+    /// Red proof: swap `State::admits_guard_reader` for
+    /// `State::admits_verify_reader` in `pin_for_read`.
+    #[test]
+    fn pin_for_read_refuses_a_draining_segment() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Sealed, None, None));
+        assert!(
+            layer.pin_for_read(segment),
+            "a sealed segment is still readable"
+        );
+        layer.release_segment_ref(segment);
+
+        assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+        assert!(
+            !layer.pin_for_read(segment),
+            "a draining segment is being processed for eviction -- only the \
+             key-verify acquire may hold it, never a value read"
+        );
+        assert_eq!(segment.ref_count(), 0, "a refused pin leaks no reference");
+    }
+
+    /// A read that backs out of a *live* segment must leave its staging
+    /// buffer alone.
+    ///
+    /// `free_condemned_returning_buffer` is reached from every `prev == 1`
+    /// decrement, condemned or not -- `release_segment_ref` runs it on the
+    /// back-outs in `read_from_buffer` and `get_item`, which happen on live
+    /// segments the writer is still appending to. That is why the buffer
+    /// return has to sit inside `try_free_condemned`'s `on_freed` hook and not
+    /// in a line before the call: detaching unconditionally hands a live
+    /// segment's staging buffer back to the pool, which then issues it to
+    /// another segment while the first is still writing into it.
+    ///
+    /// Red proof, in production: move the detach out of `on_freed` to ahead of
+    /// `try_free_condemned`.
+    #[test]
+    fn a_read_that_backs_out_of_a_live_segment_keeps_its_staging_buffer() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let buffers_free_before = layer.buffer_pool.lock().unwrap().available();
+
+        assert!(
+            layer.pin_for_read(segment),
+            "a live segment admits a value read"
+        );
+        assert_eq!(segment.ref_count(), 1);
+        layer.release_segment_ref(segment);
+
+        assert_eq!(segment.ref_count(), 0, "the reference came back");
+        assert_eq!(
+            segment.state(),
+            State::Live,
+            "nothing condemned this segment"
+        );
+        assert!(
+            segment.has_write_buffer(),
+            "the last reader leaving a live segment took its staging buffer -- the \
+             writer is still appending into that allocation"
+        );
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            buffers_free_before,
+            "a live segment's buffer must not be handed back to the pool"
+        );
+    }
+
+    /// Tests that drive a race by hand through `segment::interpose`.
+    ///
+    /// Every window in this file is only *entered* when the other side moves
+    /// inside it, which no single-threaded test can arrange and no
+    /// multi-threaded one can arrange deterministically. This tier has no
+    /// coverage on Linux-only paths from macOS either, so the hook is the only
+    /// route to these branches at all.
+    ///
+    /// Gated off under the model checkers for the same reason the hook itself
+    /// is: a `std` thread-local inside a loom or shuttle execution is state the
+    /// checker cannot see.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    mod interposed {
+        use super::*;
+        use crate::segment::interpose;
+
+        /// A read whose pin lands *inside* the condemn window must hand its
+        /// reference back, and complete the free if it was the last one out.
+        ///
+        /// This is the post-increment re-check, and until this test it was the
+        /// last deletable-and-green guard in the tree. The version this
+        /// replaces condemned the segment *before* calling `pin_for_read`, so
+        /// the pre-increment check answered and the re-check never ran -- a
+        /// pre-check test wearing a post-check name, which is precisely how
+        /// #134's mutation survived. The hook now condemns at
+        /// `ACQUIRE_AFTER_INCREMENT`: the reference is already taken, the
+        /// pre-check has already passed on a `Live` segment, and only the
+        /// re-check can still see the condemn.
+        ///
+        /// Red proofs, both in production:
+        ///
+        /// - delete the post-increment re-check in `segment::try_acquire_pin`
+        ///   -- the pin is granted on a condemned segment and never released;
+        /// - back out with a bare `fetch_sub` instead of
+        ///   `release_segment_ref` -- the condemner already declined the free
+        ///   on seeing this reference, so the segment strands in
+        ///   `AwaitingRelease` forever (#131).
+        #[test]
+        fn a_pin_that_loses_the_condemn_race_completes_the_free() {
+            let layer = test_layer();
+            let hashtable = MultiChoiceHashtable::new(10);
+            let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
+            let segment = layer.pool.get(segment_id).expect("segment");
+            let buffers_free_before = layer.buffer_pool.lock().unwrap().available();
+            assert_eq!(
+                segment.state(),
+                State::Live,
+                "the pre-increment check must pass, or the window is never entered"
+            );
+
+            let condemned = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let flag = std::rc::Rc::clone(&condemned);
+                let seg_ptr: *const DiskSegmentMeta = segment;
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::ACQUIRE_AFTER_INCREMENT && !flag.get() {
+                        // SAFETY: `layer` owns the pool this segment lives in
+                        // and outlives the hook guard, which is dropped at the
+                        // end of this block.
+                        let seg = unsafe { &*seg_ptr };
+                        assert!(seg.cas_metadata(State::Live, State::Sealed, None, None));
+                        assert!(seg.cas_metadata(State::Sealed, State::Draining, None, None));
+                        assert!(seg.cas_metadata(
+                            State::Draining,
+                            State::AwaitingRelease,
+                            None,
+                            None
+                        ));
+                        flag.set(true);
+                    }
+                }));
+
+                assert!(
+                    !layer.pin_for_read(segment),
+                    "the segment was condemned between the increment and the re-check; \
+                     its hashtable entries are gone, so the read is a miss"
+                );
+            }
+
+            assert!(condemned.get(), "the hook must have run");
+            assert_eq!(
+                segment.ref_count(),
+                0,
+                "the backed-out read kept its reference -- this segment can never \
+                 satisfy the evictor's ref_count == 0 gate again"
+            );
+            assert_eq!(
+                segment.state(),
+                State::Free,
+                "the last reference out owes the condemned segment its free"
+            );
+            assert_eq!(
+                layer.buffer_pool.lock().unwrap().available(),
+                buffers_free_before + 1,
+                "the staging buffer rides back out with the free"
+            );
+        }
+
+        /// The recycle must be gated on a count read taken *after* the
+        /// exclusive claim, never before it (#133).
+        ///
+        /// The reader here arrives at the one instant that separates the two
+        /// orders: after the evictor has decided to claim, before the claim is
+        /// published. The segment is still `Draining`, which admits a
+        /// key-verify reader on purpose, so the pin succeeds -- and a count
+        /// read taken *earlier* cannot see it.
+        ///
+        /// Claim first and the count that follows does see the pin, so the
+        /// evictor defers. Count first and the evictor believes the segment is
+        /// unreferenced, takes `Locked`, rewrites the segment's bytes and
+        /// hands it back to the pool while the reader is inside
+        /// `verify_key_at_offset`.
+        ///
+        /// Red proof, in production: put the count back in front of the claim
+        /// in `process_evicted_segment` --
+        ///
+        /// ```ignore
+        /// let unpinned = segment.ref_count_seqcst() == 0;
+        /// let claimed = crate::layer::try_claim_for_clear(segment);
+        /// if !claimed || !unpinned {
+        /// ```
+        ///
+        /// -- and the segment is recycled out from under the pin.
+        #[test]
+        fn eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
+            let layer = test_layer();
+            let hashtable = MultiChoiceHashtable::new(10);
+            let (keys, locations, segment_id) = fill_one_segment(&layer, &hashtable);
+            let segment = layer.pool.get(segment_id).expect("segment");
+            let buffers_free_before = layer.buffer_pool.lock().unwrap().available();
+
+            // The eviction path leaves its victim `Draining`, which is the
+            // state `process_evicted_segment` expects.
+            let state = segment.state();
+            assert!(segment.cas_metadata(state, State::Draining, None, None));
+
+            let pinned = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let flag = std::rc::Rc::clone(&pinned);
+                let seg_ptr: *const DiskSegmentMeta = segment;
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::CLAIM_BEFORE_CAS && !flag.get() {
+                        // SAFETY: `layer` outlives the hook guard.
+                        let seg = unsafe { &*seg_ptr };
+                        assert_eq!(
+                            seg.state(),
+                            State::Draining,
+                            "the claim window is entered with the segment still Draining"
+                        );
+                        assert!(
+                            seg.try_acquire_read(),
+                            "Draining admits a key-verify reader -- that is the whole \
+                             reason it is not an exclusive claim"
+                        );
+                        flag.set(true);
+                    }
+                }));
+
+                layer.process_evicted_segment(segment_id, &hashtable);
+            }
+
+            assert!(pinned.get(), "the hook must have run");
+
+            // The deferred arm owes the sweep: the segment is going away and
+            // every location naming it has to come out of the hashtable first,
+            // or the entries outlive the incarnation they point into.
+            assert_none_indexed(&hashtable, &keys, &locations);
+
+            assert_eq!(segment.ref_count(), 1, "the reader is still pinned");
+            assert_ne!(
+                segment.state(),
+                State::Reserved,
+                "the evictor recycled a segment while a reader was pinned -- its count \
+                 was read before the claim, so the reader's arrival was invisible (#133)"
+            );
+            assert_ne!(
+                segment.state(),
+                State::Free,
+                "the evictor published a pinned segment on the free queue (#133)"
+            );
+            assert_eq!(
+                segment.state(),
+                State::AwaitingRelease,
+                "the evictor must defer to the last reference out instead"
+            );
+            assert!(
+                segment.has_write_buffer(),
+                "the staging buffer must not be returned while a reader may still \
+                 resolve write_buffer_ptr() into it"
+            );
+            assert_eq!(
+                layer.buffer_pool.lock().unwrap().available(),
+                buffers_free_before,
+                "nothing was freed, so nothing may go back to the buffer pool"
+            );
+
+            // And the deferral completes when the reader leaves, buffer and all.
+            layer.release_read(segment_id);
+            assert_eq!(
+                segment.state(),
+                State::Free,
+                "the last reference out owes the AwaitingRelease -> Free handoff"
+            );
+            assert!(!segment.has_write_buffer());
+            assert_eq!(
+                layer.buffer_pool.lock().unwrap().available(),
+                buffers_free_before + 1,
+                "the staging buffer returns to the pool exactly once"
+            );
+        }
+
+        /// The staging buffer must be back in the pool *before* the freed
+        /// segment is published to the free queue.
+        ///
+        /// This is the ordering constraint no other condemn site in the tree
+        /// has. Once the segment is on the free queue it is anybody's: another
+        /// worker reserves it and stages a fresh buffer in it. A detach that
+        /// runs after that point takes the *new* owner's buffer and hands it
+        /// back to the pool, which will then issue it to a third segment while
+        /// the second is still writing into it -- and the original buffer is
+        /// leaked, because nothing ever detaches it.
+        ///
+        /// `free_condemned_returning_buffer` puts the release inside
+        /// `segment::try_free_condemned`'s `on_freed` hook, which runs after
+        /// the winning CAS and before the push, which is the only instant that
+        /// is both exactly-once and still exclusive.
+        ///
+        /// Red proof, in production: move the release out of the hook to after
+        /// the call --
+        ///
+        /// ```ignore
+        /// let freed = unsafe { crate::segment::try_free_condemned(.., || {}) };
+        /// if freed && let Some(buf) = segment.detach_write_buffer() {
+        ///     self.buffer_pool.lock().unwrap().release(buf);
+        /// }
+        /// freed
+        /// ```
+        ///
+        /// -- and the segment comes out of this test with no buffer at all.
+        #[test]
+        fn the_staging_buffer_is_returned_before_the_segment_is_published() {
+            let layer = test_layer();
+            let hashtable = MultiChoiceHashtable::new(10);
+            let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
+            let segment = layer.pool.get(segment_id).expect("segment");
+            assert!(segment.has_write_buffer(), "the items are staged in RAM");
+
+            // Empty the free queue, so the only id the racing reserve below
+            // can pick up is the one this free is about to publish.
+            let mut drained = Vec::new();
+            while let Some(id) = layer.pool.reserve() {
+                assert_ne!(id, segment_id, "this segment is not free yet");
+                drained.push(id);
+            }
+            assert!(!drained.is_empty(), "the pool had other free segments");
+
+            // A reader holds the segment while the evictor condemns it, so the
+            // free is deferred to `release_read` below.
+            unsafe { (*segment.ref_count_ptr()).fetch_add(1, Ordering::SeqCst) };
+            let state = segment.state();
+            assert!(segment.cas_metadata(state, State::Sealed, None, None));
+            assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+            assert!(segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None));
+
+            let buffers_free_before = layer.buffer_pool.lock().unwrap().available();
+
+            // The instant the free queue accepts the segment, another worker
+            // reserves it and stages a fresh buffer in it -- which is exactly
+            // what a late detach would then hand back to the pool.
+            let restaged = std::rc::Rc::new(std::cell::Cell::new(std::ptr::null::<u8>()));
+            {
+                let cell = std::rc::Rc::clone(&restaged);
+                let layer_ptr: *const IoUringDiskLayer = &layer;
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::FREE_AFTER_PUBLISH && cell.get().is_null() {
+                        // SAFETY: `layer` outlives the hook guard.
+                        let layer = unsafe { &*layer_ptr };
+                        let id = layer
+                            .pool
+                            .reserve()
+                            .expect("the segment was just published to the free queue");
+                        assert_eq!(id, segment_id, "the queue was drained to this one id");
+                        let buf = layer
+                            .buffer_pool
+                            .lock()
+                            .unwrap()
+                            .allocate()
+                            .expect("a spare staging buffer");
+                        cell.set(buf.as_ptr());
+                        layer
+                            .pool
+                            .get(id)
+                            .expect("segment")
+                            .attach_write_buffer(buf);
+                    }
+                }));
+
+                // The last reference out frees the segment.
+                layer.release_read(segment_id);
+            }
+
+            let fresh = restaged.get();
+            assert!(!fresh.is_null(), "the hook must have run");
+            assert!(
+                segment.has_write_buffer(),
+                "the free returned the buffer after publishing the segment, so it took \
+                 the buffer its next owner had already staged"
+            );
+            assert_eq!(
+                segment.write_buffer_ptr(),
+                Some(fresh),
+                "the segment must still hold the buffer its new owner attached"
+            );
+            assert_eq!(
+                layer.buffer_pool.lock().unwrap().available(),
+                buffers_free_before,
+                "one buffer out to the new owner, one back from the free"
+            );
+        }
     }
 }
