@@ -76,6 +76,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p cache-core --features loom
 
+  # Shuttle is the complement of loom, not a replacement. loom models weak
+  # memory and is the only check that no ordering is too weak, but it
+  # over-approximates SeqCst -- it reports the store-buffering outcome even for
+  # a pure-SeqCst litmus, which is why its models assert only SC-independent
+  # properties. Shuttle executes sequentially consistently, which makes the
+  # SC-total-order (Dekker) invariants assertable: a pinned reader never
+  # coexists with a committed drain, and a condemned segment is freed exactly
+  # once -- never stranded in AwaitingRelease, never twice. The trade is
+  # symmetric: shuttle can never catch an ordering that is too weak. Keep both
+  # green; neither subsumes the other. See crucible#129.
+  #
+  # The name filter matters: like loom's, these models panic outside their
+  # runner.
+  test-shuttle:
+    name: Test (shuttle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p cache-core --features shuttle --release -- shuttle_
+      # The `Clippy` job runs `--all-features`, which turns `loom` on and so
+      # compiles the shuttle module (gated `not(feature = "loom")`) straight
+      # out. Without this line the models are never linted.
+      - run: cargo clippy -p cache-core --features shuttle --all-targets -- -D warnings
+
   # Kani proves the bit-packing substrate the concurrency protocols rest on.
   #
   # These are deliberate LEAF-function proofs: exhaustive symbolic coverage of
