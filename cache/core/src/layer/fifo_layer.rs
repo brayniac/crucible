@@ -297,7 +297,14 @@ impl FifoLayer {
         // leaves a window for a fresh pin between the two; `Locked` refuses
         // every reader, so the count this returns on is final. See
         // `layer::claim_and_wait_for_readers`.
-        super::claim_and_wait_for_readers(segment);
+        // A lost claim means another thread owns this segment. Everything
+        // below -- rewriting the items, `Locked -> Reserved`, returning it to
+        // the pool -- would be acting on the winner's segment, and the
+        // `Locked -> Reserved` CAS would *succeed*, because the winner is what
+        // put it in `Locked` (#142).
+        if !super::claim_and_wait_for_readers(segment) {
+            return;
+        }
 
         // Process each item in the segment
         let now = Self::now_secs();
@@ -410,7 +417,14 @@ impl FifoLayer {
         // leaves a window for a fresh pin between the two; `Locked` refuses
         // every reader, so the count this returns on is final. See
         // `layer::claim_and_wait_for_readers`.
-        super::claim_and_wait_for_readers(segment);
+        // A lost claim means another thread owns this segment. Everything
+        // below -- rewriting the items, `Locked -> Reserved`, returning it to
+        // the pool -- would be acting on the winner's segment, and the
+        // `Locked -> Reserved` CAS would *succeed*, because the winner is what
+        // put it in `Locked` (#142).
+        if !super::claim_and_wait_for_readers(segment) {
+            return;
+        }
 
         // Process each item in the segment
         let now = Self::now_secs();
@@ -1101,7 +1115,7 @@ mod tests {
         /// same fate and a test proves nothing. `set_next_layer` is the same
         /// call `TieredCacheBuilder::build` makes for any layer with a tier
         /// below it.
-        fn create_demoting_test_layer() -> FifoLayer {
+        pub(super) fn create_demoting_test_layer() -> FifoLayer {
             let mut layer = FifoLayerBuilder::new()
                 .layer_id(0)
                 .pool_id(0)
@@ -1127,16 +1141,16 @@ mod tests {
         /// One item, warmed with `reads` hits, in a segment already unlinked
         /// into `Draining` -- which is the state the evictor hands the
         /// blocking paths.
-        struct Staged {
-            hashtable: MultiChoiceHashtable,
+        pub(super) struct Staged {
+            pub(super) hashtable: MultiChoiceHashtable,
             /// The frequency the hashtable holds for the item going in.
-            freq: u8,
+            pub(super) freq: u8,
             /// Where the item sits, which is what both fate arms match on.
-            location: ItemLocation,
-            segment_id: u32,
+            pub(super) location: ItemLocation,
+            pub(super) segment_id: u32,
         }
 
-        fn stage_one_item(layer: &FifoLayer, reads: usize) -> Staged {
+        pub(super) fn stage_one_item(layer: &FifoLayer, reads: usize) -> Staged {
             let hashtable = MultiChoiceHashtable::new(10);
             let verifier = SinglePoolVerifier { pool: layer.pool() };
 
@@ -1309,6 +1323,86 @@ mod tests {
                 Some(staged.freq),
                 "a cold item must become a ghost, carrying its frequency with it"
             );
+        }
+    }
+
+    /// A blocking eviction that *loses* the claim must leave the segment alone.
+    ///
+    /// Unreachable in production today -- every caller is gated on
+    /// `chain.try_remove`, whose `Sealed -> Draining` CAS admits exactly one
+    /// thread -- so this drives the path directly. The hazard it pins is #142:
+    /// the tail's `Locked -> Reserved` CAS *succeeds* for a loser, because the
+    /// winner is what put the segment in `Locked`, and the loser then returns
+    /// the winner's segment to the pool mid-clear.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    mod lost_claim {
+        use super::blocking_eviction_frequency::*;
+        use super::*;
+
+        /// Red proof: drop the `if !claim { return }` guard in
+        /// `process_evicted_segment` and this fails -- the segment lands in
+        /// `Reserved` and the pool gains a segment that is still being cleared.
+        #[test]
+        fn a_blocking_eviction_that_loses_the_claim_touches_nothing() {
+            let layer = create_demoting_test_layer();
+            let staged = stage_one_item(&layer, 0);
+
+            let segment = layer.pool().get(staged.segment_id).expect("segment");
+
+            // Stand in for the thread that won: it holds `Locked` and is
+            // partway through clearing.
+            assert!(
+                segment.cas_metadata(State::Draining, State::Locked, None, None),
+                "the winner takes the claim"
+            );
+            let free_before = layer.pool().free_count();
+
+            layer.process_evicted_segment(staged.segment_id, &staged.hashtable);
+
+            assert_eq!(
+                segment.state(),
+                State::Locked,
+                "the loser must not advance the winner's segment out of `Locked`"
+            );
+            assert_eq!(
+                layer.pool().free_count(),
+                free_before,
+                "the loser must not return the winner's segment to the pool"
+            );
+        }
+
+        /// The demoting twin. Same hazard, separate body, so it needs its own
+        /// proof -- deleting either guard alone must go red.
+        #[test]
+        fn a_blocking_demoting_eviction_that_loses_the_claim_touches_nothing() {
+            let layer = create_demoting_test_layer();
+            let staged = stage_one_item(&layer, 0);
+
+            let segment = layer.pool().get(staged.segment_id).expect("segment");
+            assert!(
+                segment.cas_metadata(State::Draining, State::Locked, None, None),
+                "the winner takes the claim"
+            );
+            let free_before = layer.pool().free_count();
+
+            let mut demoted = 0usize;
+            layer.process_evicted_segment_with_demoter(
+                staged.segment_id,
+                &staged.hashtable,
+                |_, _, _, _, _| demoted += 1,
+            );
+
+            assert_eq!(
+                segment.state(),
+                State::Locked,
+                "the loser must not advance the winner's segment out of `Locked`"
+            );
+            assert_eq!(
+                layer.pool().free_count(),
+                free_before,
+                "the loser must not return the winner's segment to the pool"
+            );
+            assert_eq!(demoted, 0, "a lost claim demotes nothing");
         }
     }
 
