@@ -263,18 +263,29 @@ impl DiskLayer {
             None => return,
         };
 
-        // `ref_count_seqcst`: this thread reached here through a
-        // `Sealed -> Draining` CAS, the store half of the Dekker pair this
-        // load completes -- see `Segment::ref_count_seqcst` (#129).
-        if segment.ref_count_seqcst() > 0 {
-            // Drain hashtable entries and defer to last reader's drop
+        // Claim before counting (#133). `Draining` still admits key-verify
+        // readers, so reading `ref_count` first and CASing to `Locked` only if
+        // it was zero leaves a window for a pin to land in between -- and the
+        // clearing loop below then runs under it. `Locked` refuses every fresh
+        // reader, so a zero read after the claim is final. See
+        // `layer::try_claim_for_clear`.
+        let claimed = crate::layer::try_claim_for_clear(segment);
+        if !claimed || segment.ref_count_seqcst() > 0 {
+            // Drain hashtable entries and defer to the last reference out.
+            // The sweep here removes entries outright and consults no
+            // verifier, so it is indifferent to the claim.
             self.drain_segment_from_hashtable(segment_id, hashtable);
-            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            let held = if claimed {
+                State::Locked
+            } else {
+                State::Draining
+            };
+            // Unlike the old code this also runs the race fix, so a last
+            // reader that dropped during the condemn window cannot strand the
+            // segment in `AwaitingRelease` with `ref_count == 0`.
+            crate::layer::condemn_and_reclaim(segment, held);
             return;
         }
-
-        // Transition to Locked for clearing
-        segment.cas_metadata(State::Draining, State::Locked, None, None);
 
         // Process each item in the segment
         let mut offset = 0u32;
