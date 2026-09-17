@@ -97,7 +97,9 @@ impl DiskSegmentMeta {
 
     /// The segment state, loaded `SeqCst` -- the reader half of the Dekker
     /// pair. Only for the post-increment re-check of a two-phase acquire; see
-    /// `SliceSegment::state_seqcst`.
+    /// [`crate::segment::try_acquire_pin`], which is that protocol's one body
+    /// and which the acquires in this file route through. The three remaining
+    /// hand-rolled re-checks in `disk::io_uring_layer` still call this.
     #[inline]
     pub(crate) fn state_seqcst(&self) -> State {
         Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
@@ -261,24 +263,17 @@ impl DiskSegmentMeta {
 
 impl SegmentKeyVerify for DiskSegmentMeta {
     fn try_acquire_read(&self) -> bool {
-        // See SliceSegment's impl: increment, then re-check. `Draining` stays
-        // admitted so the demoter can verify keys; `AwaitingRelease` does not
-        // -- its hashtable entries are gone and admitting a fresh reference
-        // would unstick the evictor's `ref_count == 0` gate (#127).
-        let state = self.state();
-        if !state.holds_valid_data() || state.is_condemned() {
-            return false;
-        }
-        // SeqCst, both halves -- the reader side of the Dekker pair with the
-        // condemner's (CAS state, load ref_count). See
-        // `Segment::ref_count_seqcst` (#129).
-        self.ref_count.fetch_add(1, Ordering::SeqCst);
-        let state_after = self.state_seqcst();
-        if !state_after.holds_valid_data() || state_after.is_condemned() {
-            self.release_ref();
-            return false;
-        }
-        true
+        // The same body every acquire site in the crate uses, with the
+        // key-verify predicate: `Draining` stays admitted so the demoter can
+        // verify keys; `AwaitingRelease` does not -- its hashtable entries are
+        // gone and admitting a fresh reference would unstick the evictor's
+        // `ref_count == 0` gate (#127). See `segment::try_acquire_pin`.
+        crate::segment::try_acquire_pin(
+            &self.ref_count,
+            &self.metadata,
+            State::admits_verify_reader,
+            || self.release_ref(),
+        )
     }
 
     fn release_read(&self) {
@@ -517,23 +512,28 @@ impl Segment for DiskSegmentMeta {
 
         let new_meta = meta.with_state(new_state).with_chain_ids(next, prev);
 
-        // *Leaving* `Locked` ends a used incarnation -- not merely being
-        // `Locked`. The layers recycle a drained segment as
-        // `Locked -> Reserved` before releasing it `Reserved -> Free`. Bumping
-        // inside the same CAS that publishes the new state means no thread can
-        // observe the new state paired with the old tag.
+        // *Recycling out of* `Locked` ends a used incarnation -- not merely
+        // being `Locked`, and not every way of leaving it. The layers recycle
+        // a drained segment as `Locked -> Reserved` before releasing it
+        // `Reserved -> Free`. Bumping inside the same CAS that publishes the
+        // new state means no thread can observe the new state paired with the
+        // old tag.
         //
-        // The `new_state != Locked` half is load-bearing: a chain-pointer-only
-        // rewrite that stays in `Locked` is mid-life, and eleven identity CASes
-        // in `organization/` take exactly that shape. Keying on the source
-        // state alone would advance the tag twice in one lifetime, halving the
-        // space the collision argument rests on. Every other transition is
-        // mid-life and preserves the tag.
-        let new_meta = if meta.state == State::Locked && new_state != State::Locked {
-            new_meta.bump_incarnation()
-        } else {
-            new_meta
-        };
+        // Naming the destinations is load-bearing twice over: a
+        // chain-pointer-only rewrite that stays in `Locked` is mid-life (the
+        // eleven identity CASes in `organization/` take exactly that shape),
+        // and `Locked -> AwaitingRelease` is #133's deferral, where nothing
+        // has been cleared and the incarnation ends later at
+        // `AwaitingRelease -> Free`. Keying on the source state alone would
+        // advance the tag twice in one lifetime, halving the space the
+        // collision argument rests on. See the matching note in
+        // `SliceSegment::cas_metadata`.
+        let new_meta =
+            if meta.state == State::Locked && matches!(new_state, State::Reserved | State::Free) {
+                new_meta.bump_incarnation()
+            } else {
+                new_meta
+            };
 
         // SeqCst for the transitions that end reader admission -- see the
         // matching note in `SliceSegment::cas_metadata` and

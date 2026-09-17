@@ -80,7 +80,19 @@ pub enum State {
     Relinking = 5,
     /// Being evicted, waiting for readers.
     Draining = 6,
-    /// Being cleared, all access rejected.
+    /// Claimed for clearing: all *fresh* access rejected.
+    ///
+    /// This is the exclusive claim, and the only state that refuses every
+    /// class of reader -- `Draining` still admits key-verify readers so the
+    /// demoter can work on a segment it is draining.
+    ///
+    /// Since #133 an evictor takes `Locked` **before** it reads `ref_count`,
+    /// not after. So `Locked` means *claimed*, not *being cleared*: a segment
+    /// can be `Locked` with live readers still holding references, in which
+    /// case the claimant hands it back as `AwaitingRelease` and clears
+    /// nothing. Bytes are only rewritten once the claim is held **and** the
+    /// count read after it came back zero. Nothing may infer "no readers" from
+    /// this state alone.
     Locked = 7,
     /// Segment is condemned (removed from chain, hashtable updated).
     /// Data remains valid for in-flight readers. When ref_count hits 0,
@@ -218,16 +230,25 @@ impl State {
 
     /// Whether a *fresh* guard acquire (`get_item`, `get_item_verified`,
     /// `get_value_ref_raw`) is admitted in this state.
+    ///
+    /// `pub(crate)`: this is the predicate the guard sites hand to
+    /// [`crate::segment::try_acquire_pin`], so the rule is stated once here
+    /// and every site is the same body applied to it.
     #[inline]
-    fn admits_guard_reader(self) -> bool {
+    pub(crate) fn admits_guard_reader(self) -> bool {
         self.is_readable() && !self.is_condemned()
     }
 
     /// Whether a *fresh* key-verify acquire (`try_acquire_read`) is admitted
     /// in this state. Wider than [`Self::admits_guard_reader`] by `Draining`,
     /// which is what lets the demoter verify keys on a segment it is draining.
+    ///
+    /// That width is the whole reason `Draining` is *not* an exclusive claim.
+    /// An evictor that wants to rewrite the segment's bytes has to take
+    /// `Locked`, which this predicate refuses, and only then read `ref_count`
+    /// -- see [`crate::layer::try_claim_for_clear`] (#133).
     #[inline]
-    fn admits_verify_reader(self) -> bool {
+    pub(crate) fn admits_verify_reader(self) -> bool {
         self.holds_valid_data() && !self.is_condemned()
     }
 }
@@ -253,10 +274,27 @@ impl State {
 /// `organization/` do not change state at all, `Locked -> Reserved` and
 /// `Reserved -> Free` are already exclusive, and `Draining -> Sealed` (the
 /// chain's revert) *widens*. Marking those `SeqCst` would be noise.
+///
+/// # The second clause: publishing the condemned handoff
+///
+/// `to.is_condemned()` is a separate reason for the same ordering, and it is
+/// not implied by the narrowing test. `AwaitingRelease` is the word the
+/// *release* side of the protocol reads: a guard drop stores `ref_count` then
+/// loads the state, while the condemner stores `AwaitingRelease` then loads
+/// `ref_count`. That is the pair `try_free_condemned` documents, and it needs
+/// the SC total order for the same reason -- otherwise both loads go stale,
+/// each side concludes the other owes the free, and the segment strands.
+///
+/// It only *adds* `Locked -> AwaitingRelease`, which #133's claim-before-count
+/// order made reachable: the evictor now takes `Locked` before it reads
+/// `ref_count`, so when readers turn out to still be present it condemns from
+/// `Locked` rather than from `Draining`. Every other condemn transition is
+/// already covered by the narrowing clause.
 #[inline]
 pub(crate) fn transition_excludes_readers(from: State, to: State) -> bool {
     (from.admits_guard_reader() && !to.admits_guard_reader())
         || (from.admits_verify_reader() && !to.admits_verify_reader())
+        || to.is_condemned()
 }
 
 /// Packed representation of segment metadata in a single AtomicU64.
@@ -757,6 +795,11 @@ mod tests {
             (Draining, Locked),           // shuts out key-verify readers
             (Draining, AwaitingRelease),  // condemn
             (Relinking, AwaitingRelease), // the merge paths' condemn
+            // #133: the evictor claims `Locked` before it reads `ref_count`,
+            // so the deferral condemns from `Locked`. Not narrowing -- nothing
+            // is admitted in `Locked` to begin with -- but it publishes the
+            // `AwaitingRelease` word the last reader's drop reads.
+            (Locked, AwaitingRelease),
             (Live, Draining),
             (Live, Locked),
             (Sealed, Locked),

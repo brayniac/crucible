@@ -197,10 +197,35 @@ impl FifoLayer {
         }
     }
 
-    /// Non-blocking eviction: process an evicted segment without spinning on ref_count.
+    /// Non-blocking eviction: process an evicted segment without spinning on
+    /// `ref_count`.
     ///
-    /// Returns `true` if the segment was fully processed (ref_count was 0),
-    /// `false` if it was deferred (transitioned to AwaitingRelease for last reader to free).
+    /// Returns `true` if the segment was fully processed and returned to the
+    /// pool, `false` if it was deferred (condemned, for the last reader to
+    /// free).
+    ///
+    /// # Order of operations
+    ///
+    /// 1. sweep this segment's items out of the hashtable, while the segment
+    ///    is still `Draining` -- the sweep resolves each item's own location
+    ///    through a key-verify acquire, which `Draining` admits and `Locked`
+    ///    does not;
+    /// 2. claim `Draining -> Locked`, which refuses every fresh reader;
+    /// 3. *then* read `ref_count`.
+    ///
+    /// Steps 2 and 3 used to be the other way round, which is #133: with the
+    /// count read first, a key-verify reader can pin between the observation
+    /// of zero and the claim, and then be mid-`verify_key_at_offset` while
+    /// this thread recycles the segment. Reachable under a full SC total
+    /// order, so no memory ordering fixes it. See `layer::try_claim_for_clear`.
+    ///
+    /// The sweep is unconditional, where it used to be duplicated verbatim
+    /// into both arms -- the deferred arm ran it under `Draining` and the
+    /// exclusive arm ran the identical loop under `Locked`, where every
+    /// `get_frequency` silently came back `None`. Hoisting it above the claim
+    /// gives one copy and one state. In production that changes no outcome:
+    /// this path is reached only for a layer with no `next_layer`, and
+    /// `determine_item_fate` is frequency-independent there.
     fn process_evicted_segment_nonblocking<H: Hashtable>(
         &self,
         segment_id: u32,
@@ -211,87 +236,25 @@ impl FifoLayer {
             None => return true,
         };
 
-        // `ref_count_seqcst`, not `ref_count`: the caller reached here through
-        // the chain's `Sealed -> Draining` CAS, which shuts out fresh guard
-        // acquires. That CAS is the store and this is the load of a Dekker
-        // pair with every reader's (store ref_count, load state). Under
-        // acquire/release both loads may go stale, and the zero branch below
-        // takes the segment to `Locked` and rewrites its bytes under a reader
-        // that still believes its pin is good. See `Segment::ref_count_seqcst`.
-        if segment.ref_count_seqcst() > 0 {
-            // Segment pinned by readers — remove hashtable entries and defer
-            self.drain_segment_from_hashtable(segment_id, hashtable);
-            // Draining → AwaitingRelease (last reader's ValueRef::drop will free it)
-            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
-            // Race fix: if the last reader dropped between our ref_count check
-            // and the CAS above, the segment is now AwaitingRelease with
-            // ref_count == 0 and nobody will free it. Reclaim it now.
-            // The condemner half of the Dekker pair: this load must be ordered
-            // after the CAS above in the SC total order, or it can miss a
-            // decrement the last reader had already published and the segment
-            // strands in AwaitingRelease with ref_count == 0 (#129).
-            if segment.ref_count_seqcst() == 0 && segment.release_condemned() {
-                return true;
-            }
-            return false;
+        self.drain_segment_from_hashtable(segment_id, hashtable);
+
+        // Claim before counting (#133).
+        let claimed = super::try_claim_for_clear(segment);
+        if claimed && segment.ref_count_seqcst() == 0 {
+            segment.cas_metadata(State::Locked, State::Reserved, None, None);
+            self.pool.release(segment_id);
+            return true;
         }
 
-        // Normal path: ref_count == 0, process immediately
-        segment.cas_metadata(State::Draining, State::Locked, None, None);
-
-        let now = Self::now_secs();
-        let mut offset = 0u32;
-        let write_offset = segment.write_offset();
-
-        while offset < write_offset {
-            if let Some(data) = segment.header_ptr(offset, TtlHeader::SIZE) {
-                if let Some(header) = unsafe { TtlHeader::try_from_ptr(data) } {
-                    // The segment's stride, not the 8-byte padded body size: a scan
-                    // that advances by anything but what the append advanced by
-                    // desyncs after the first item on a coarser-aligned pool.
-                    let item_size = segment.item_stride(header.padded_size());
-
-                    if !header.is_deleted() && !header.is_expired(now) {
-                        let key_start =
-                            offset as usize + TtlHeader::SIZE + header.optional_len() as usize;
-                        let key_len = header.key_len() as usize;
-
-                        if let Some(key) = segment.data_slice(key_start as u32, key_len) {
-                            let location = ItemLocation::new(
-                                self.pool.layout(),
-                                self.pool.pool_id(),
-                                segment_id,
-                                segment.incarnation(),
-                                offset,
-                            );
-
-                            let verifier = SinglePoolVerifier { pool: &self.pool };
-                            let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
-                            let fate = determine_item_fate(freq, &self.config);
-
-                            match fate {
-                                ItemFate::Ghost => {
-                                    hashtable.convert_to_ghost(key, location.to_location());
-                                }
-                                ItemFate::Demote | ItemFate::Discard => {
-                                    hashtable.remove(key, location.to_location());
-                                }
-                            }
-                        }
-                    }
-
-                    offset += item_size;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        segment.cas_metadata(State::Locked, State::Reserved, None, None);
-        self.pool.release(segment_id);
-        true
+        // Either the claim was lost (someone else owns the segment) or readers
+        // are still holding it. Nothing was cleared either way; hand the
+        // segment to whoever drops the last reference.
+        let held = if claimed {
+            State::Locked
+        } else {
+            State::Draining
+        };
+        super::condemn_and_reclaim(segment, held)
     }
 
     /// Emergency eviction: find any Sealed segment with ref_count == 0 and evict it.
@@ -329,11 +292,12 @@ impl FifoLayer {
             None => return,
         };
 
-        // Wait for readers to finish
-        super::wait_for_readers(segment);
-
-        // Transition to Locked for clearing
-        segment.cas_metadata(State::Draining, State::Locked, None, None);
+        // Claim first, then wait (#133). `Draining` still admits key-verify
+        // readers, so waiting for zero under it and only then taking `Locked`
+        // leaves a window for a fresh pin between the two; `Locked` refuses
+        // every reader, so the count this returns on is final. See
+        // `layer::claim_and_wait_for_readers`.
+        super::claim_and_wait_for_readers(segment);
 
         // Process each item in the segment
         let now = Self::now_secs();
@@ -423,11 +387,12 @@ impl FifoLayer {
             None => return,
         };
 
-        // Wait for readers to finish
-        super::wait_for_readers(segment);
-
-        // Transition to Locked for clearing
-        segment.cas_metadata(State::Draining, State::Locked, None, None);
+        // Claim first, then wait (#133). `Draining` still admits key-verify
+        // readers, so waiting for zero under it and only then taking `Locked`
+        // leaves a window for a fresh pin between the two; `Locked` refuses
+        // every reader, so the count this returns on is final. See
+        // `layer::claim_and_wait_for_readers`.
+        super::claim_and_wait_for_readers(segment);
 
         // Process each item in the segment
         let now = Self::now_secs();
@@ -607,28 +572,26 @@ impl FifoLayer {
             }
         }
 
-        // All items processed. Try to release the segment.
-        // `ref_count_seqcst`: ordered after the `Sealed -> Draining` CAS the
-        // caller took, so a reader that pinned before it cannot be missed here
-        // and then have its bytes rewritten by the `Locked` branch (#129).
-        if segment.ref_count_seqcst() == 0 {
-            segment.cas_metadata(State::Draining, State::Locked, None, None);
+        // All items processed. Claim before counting (#133): the count this
+        // recycle turns on must be read *after* the transition that refuses
+        // fresh readers, not before it. Reading it first leaves a window in
+        // which a key-verify reader pins the still-`Draining` segment and is
+        // then recycled out from under mid-`verify_key_at_offset`.
+        let claimed = super::try_claim_for_clear(segment);
+        if claimed && segment.ref_count_seqcst() == 0 {
             segment.cas_metadata(State::Locked, State::Reserved, None, None);
             self.pool.release(segment_id);
             return true;
         }
 
-        // Readers still active — let last reader free it.
-        segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
-        // Race fix: reclaim if last reader dropped during the window above.
-        // The condemner half of the Dekker pair: this load must be ordered
-        // after the CAS above in the SC total order, or it can miss a
-        // decrement the last reader had already published and the segment
-        // strands in AwaitingRelease with ref_count == 0 (#129).
-        if segment.ref_count_seqcst() == 0 && segment.release_condemned() {
-            return true;
-        }
-        false
+        // Readers still active (or the claim was lost) -- let the last
+        // reference out free it.
+        let held = if claimed {
+            State::Locked
+        } else {
+            State::Draining
+        };
+        super::condemn_and_reclaim(segment, held)
     }
 }
 
@@ -1059,6 +1022,377 @@ mod tests {
             .spare_capacity(0) // No spare for tests
             .build()
             .expect("Failed to create test layer")
+    }
+
+    /// Tests that drive a race by hand through `segment::interpose`.
+    ///
+    /// Gated off under the model checkers for the same reason the hook itself
+    /// is: a `std` thread-local inside a loom or shuttle execution is state
+    /// the checker cannot see.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    mod interposed {
+        use super::*;
+        use crate::hashtable_impl::MultiChoiceHashtable;
+        use crate::segment::interpose;
+
+        // ---- claim before count, and the deferral tail (#133 / #134) --------
+
+        /// A `FifoLayer` holding `count` items keyed `k{i:03}`, all registered in
+        /// the returned hashtable.
+        fn filled_layer(count: usize, value_len: usize) -> (FifoLayer, MultiChoiceHashtable) {
+            let layer = create_test_layer();
+            let hashtable = MultiChoiceHashtable::new(10);
+            let value = vec![b'v'; value_len];
+            for i in 0..count {
+                let key = format!("k{i:03}");
+                let loc = layer
+                    .write_item(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .expect("write");
+                let verifier = SinglePoolVerifier { pool: layer.pool() };
+                let _ = hashtable.insert(key.as_bytes(), loc.to_location(), &verifier);
+            }
+            (layer, hashtable)
+        }
+
+        /// The recycle must be gated on a count read *after* the exclusive claim,
+        /// never before it (#133).
+        ///
+        /// The reader here arrives at the one instant that separates the two
+        /// orders: after the evictor has decided to claim, before the claim is
+        /// published. The segment is still `Draining`, which admits a key-verify
+        /// reader on purpose, so the pin succeeds -- and a count read taken
+        /// *earlier* cannot see it.
+        ///
+        /// Claim first, and the count that follows does see the pin, so the
+        /// evictor defers. Count first, and the evictor believes the segment is
+        /// unreferenced, takes `Locked`, and recycles it while the reader is
+        /// inside `verify_key_at_offset`.
+        ///
+        /// Red proof: swap the two lines in
+        /// `process_evicted_segment_nonblocking` to
+        ///
+        /// ```ignore
+        /// let unpinned = segment.ref_count_seqcst() == 0;
+        /// let claimed = super::try_claim_for_clear(segment);
+        /// if claimed && unpinned {
+        /// ```
+        ///
+        /// and the segment is recycled out from under the pin.
+        #[test]
+        fn eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
+            let (layer, hashtable) = filled_layer(24, 4096);
+            assert!(
+                layer.chain.segment_count() > 1,
+                "the fill must chain more than one segment, or there is nothing to evict"
+            );
+            let head = layer.chain.head().expect("a chain head to evict");
+
+            let pinned = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let flag = std::rc::Rc::clone(&pinned);
+                let pool_ptr: *const MemoryPool = layer.pool();
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::CLAIM_BEFORE_CAS && !flag.get() {
+                        // SAFETY: `layer` outlives the hook guard, which is
+                        // dropped at the end of this block.
+                        let seg = unsafe { &*pool_ptr }.get(head).expect("head segment");
+                        assert_eq!(
+                            seg.state(),
+                            State::Draining,
+                            "the claim window is entered with the segment still Draining"
+                        );
+                        assert!(
+                            seg.try_acquire_read(),
+                            "Draining admits a key-verify reader -- that is the whole \
+                             reason it is not an exclusive claim"
+                        );
+                        flag.set(true);
+                    }
+                }));
+
+                let _ = layer.evict_nonblocking(&hashtable);
+            }
+
+            assert!(pinned.get(), "the hook must have run");
+
+            let seg = layer.pool().get(head).expect("head segment");
+            assert_eq!(seg.ref_count(), 1, "the reader is still pinned");
+            assert_ne!(
+                seg.state(),
+                State::Reserved,
+                "the evictor recycled a segment while a reader was pinned -- its count was \
+                 read before the claim, so the reader's arrival was invisible (#133)"
+            );
+            assert_ne!(
+                seg.state(),
+                State::Free,
+                "the evictor published a pinned segment on the free queue (#133)"
+            );
+            assert_eq!(
+                seg.state(),
+                State::AwaitingRelease,
+                "the evictor must defer to the last reference out instead"
+            );
+
+            // And the deferral completes when the reader leaves.
+            seg.release_read();
+            assert_eq!(seg.ref_count(), 0);
+            assert_eq!(
+                seg.state(),
+                State::Free,
+                "the last reference out owes the AwaitingRelease -> Free handoff"
+            );
+        }
+
+        /// The same inversion on the demoting eviction path.
+        ///
+        /// `evict_nonblocking_with_demoter` is the path `TieredCache` uses for
+        /// any layer with a `next_layer` -- the one that produces the disk
+        /// tier's demotions -- and it carried its own copy of the count gate.
+        ///
+        /// Red proof: swap the two lines in
+        /// `process_evicted_segment_with_demoter_nonblocking`.
+        #[test]
+        fn demoting_eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
+            let (layer, hashtable) = filled_layer(24, 4096);
+            assert!(layer.chain.segment_count() > 1, "need something to evict");
+            let head = layer.chain.head().expect("head");
+
+            let pinned = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let flag = std::rc::Rc::clone(&pinned);
+                let pool_ptr: *const MemoryPool = layer.pool();
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::CLAIM_BEFORE_CAS && !flag.get() {
+                        // SAFETY: `layer` outlives this hook guard.
+                        let seg = unsafe { &*pool_ptr }.get(head).expect("head segment");
+                        assert_eq!(seg.state(), State::Draining);
+                        assert!(seg.try_acquire_read());
+                        flag.set(true);
+                    }
+                }));
+
+                let _ = layer.evict_nonblocking_with_demoter(&hashtable, |_, _, _, _, _| {});
+            }
+
+            assert!(pinned.get(), "the hook must have run");
+            let seg = layer.pool().get(head).expect("head segment");
+            assert_eq!(seg.ref_count(), 1, "the reader is still pinned");
+            assert_eq!(
+                seg.state(),
+                State::AwaitingRelease,
+                "the demoting evictor recycled a segment pinned during its claim (#133)"
+            );
+            seg.release_read();
+            assert_eq!(seg.state(), State::Free);
+        }
+
+        /// The state the blocking paths are in while they wait out readers.
+        ///
+        /// `wait_for_readers` fires `WAIT_BEFORE_POLL` from inside itself, so
+        /// the probe moves with the wait: whatever the caller does before
+        /// calling it is already published when this fires. `Locked` means the
+        /// claim came first. `Draining` means the wait came first, which is
+        /// #133 on the blocking path -- `Draining` still admits key-verify
+        /// readers, so the zero the spin converges on can be invalidated by an
+        /// arrival before the `Locked` CAS lands.
+        ///
+        /// Red proof: put `wait_for_readers` back in front of the claim in
+        /// `layer::claim_and_wait_for_readers`.
+        #[test]
+        fn blocking_eviction_holds_the_claim_while_it_waits() {
+            for demoting in [false, true] {
+                let (layer, hashtable) = filled_layer(24, 4096);
+                assert!(layer.chain.segment_count() > 1);
+
+                let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+                {
+                    let cell = std::rc::Rc::clone(&observed);
+                    let pool_ptr: *const MemoryPool = layer.pool();
+                    let _hook = interpose::install(Box::new(move |phase| {
+                        if phase == interpose::WAIT_BEFORE_POLL && cell.get().is_none() {
+                            // SAFETY: `layer` outlives this hook guard.
+                            let pool = unsafe { &*pool_ptr };
+                            for id in 0..pool.segment_count() as u32 {
+                                if let Some(seg) = pool.get(id)
+                                    && matches!(seg.state(), State::Draining | State::Locked)
+                                {
+                                    cell.set(Some(seg.state()));
+                                    return;
+                                }
+                            }
+                        }
+                    }));
+
+                    if demoting {
+                        layer.evict_with_demoter(&hashtable, |_, _, _, _, _| {});
+                    } else {
+                        layer.evict(&hashtable);
+                    }
+                }
+
+                assert_eq!(
+                    observed.get(),
+                    Some(State::Locked),
+                    "the blocking eviction path (demoting={demoting}) waited for readers \
+                     while the segment was still admitting them -- it must claim first \
+                     (#133)"
+                );
+            }
+        }
+
+        /// The exclusive claim must refuse every class of fresh reader.
+        ///
+        /// This is what makes a post-claim count read final: `Draining` admits
+        /// key-verify readers, so only `Locked` can carry the claim.
+        #[test]
+        fn the_clear_claim_refuses_every_fresh_reader() {
+            let (layer, _hashtable) = filled_layer(4, 64);
+            let head = layer.chain.head().expect("head");
+            let seg = layer.pool().get(head).expect("segment");
+
+            assert!(seg.cas_metadata(State::Live, State::Sealed, None, None));
+            assert!(seg.cas_metadata(State::Sealed, State::Draining, None, None));
+            assert!(
+                seg.try_acquire_read(),
+                "Draining admits the key-verify reader the demoter needs"
+            );
+            seg.release_read();
+
+            assert!(crate::layer::try_claim_for_clear(seg), "the claim must win");
+            assert_eq!(seg.state(), State::Locked);
+            assert!(
+                !seg.try_acquire_read(),
+                "a claimed segment must admit no fresh key-verify reader -- otherwise the \
+                 count read after the claim can still go stale"
+            );
+            assert!(
+                seg.get_item(0, b"k000").is_err(),
+                "nor a fresh guard reader"
+            );
+            assert_eq!(seg.ref_count(), 0, "a refused acquire leaks no reference");
+        }
+
+        /// The deferral tail must reclaim a segment whose last reader left during
+        /// the condemn window, rather than stranding it.
+        ///
+        /// `AwaitingRelease` with `ref_count == 0` is a permanent leak: nothing
+        /// sweeps it, and the reader that would have discharged the handoff saw a
+        /// state that was not yet `AwaitingRelease` and declined.
+        ///
+        /// This is the one call a test can make directly, which is the point of
+        /// hoisting the tail out of its four copies: on `main` the branch was only
+        /// reachable through a race.
+        ///
+        /// Red proof: replace the second line of `layer::condemn_and_reclaim` with
+        /// `false` -- the "delete the evictor's post-CAS race fix" mutation -- and
+        /// the segment strands.
+        #[test]
+        fn condemn_and_reclaim_discharges_the_handoff_when_the_last_reader_already_left() {
+            let (layer, _hashtable) = filled_layer(4, 64);
+            let head = layer.chain.head().expect("head");
+            let seg = layer.pool().get(head).expect("segment");
+
+            assert!(seg.cas_metadata(State::Live, State::Sealed, None, None));
+            assert!(seg.cas_metadata(State::Sealed, State::Draining, None, None));
+            assert_eq!(seg.ref_count(), 0, "the reader has already gone");
+
+            assert!(
+                crate::layer::condemn_and_reclaim(seg, State::Draining),
+                "with no reader left, the condemner itself owes the free"
+            );
+            assert_eq!(
+                seg.state(),
+                State::Free,
+                "the segment stranded in AwaitingRelease with ref_count == 0 -- nothing \
+                 sweeps that state, so this is a permanent leak of one segment"
+            );
+        }
+
+        /// The same tail, entered from the `Locked` claim rather than `Draining`.
+        ///
+        /// #133's order makes this the common deferral: the evictor claims, finds
+        /// readers, and hands the segment back from `Locked`. The transition must
+        /// still publish `AwaitingRelease`, and must **not** advance the
+        /// incarnation on the way -- the readers' pins are still good and nothing
+        /// has been cleared, so the incarnation has not ended.
+        ///
+        /// Red proof: restore `cas_metadata`'s old bump rule
+        /// (`state == Locked && new_state != Locked`).
+        #[test]
+        fn condemning_from_a_claim_does_not_end_the_incarnation() {
+            let (layer, _hashtable) = filled_layer(4, 64);
+            let head = layer.chain.head().expect("head");
+            let seg = layer.pool().get(head).expect("segment");
+
+            assert!(seg.cas_metadata(State::Live, State::Sealed, None, None));
+            assert!(seg.cas_metadata(State::Sealed, State::Draining, None, None));
+            assert!(seg.try_acquire_read(), "pin it before the claim");
+            let incarnation = seg.incarnation();
+
+            assert!(crate::layer::try_claim_for_clear(seg));
+            assert!(
+                !crate::layer::condemn_and_reclaim(seg, State::Locked),
+                "a reader is still in, so the last reference out owes the free"
+            );
+            assert_eq!(seg.state(), State::AwaitingRelease);
+            assert_eq!(
+                seg.incarnation(),
+                incarnation,
+                "the deferral hands a claim back; it is not the end of the segment's life. \
+                 Bumping here would make every location the still-pinned readers hold stop \
+                 resolving, and would burn the 6-bit tag twice per lifetime"
+            );
+
+            seg.release_read();
+            assert_eq!(seg.state(), State::Free);
+            assert_ne!(
+                seg.incarnation(),
+                incarnation,
+                "the incarnation ends at AwaitingRelease -> Free, exactly once"
+            );
+        }
+
+        /// The blocking path must claim before it waits.
+        ///
+        /// Waiting under `Draining` converges on a zero a fresh key-verify pin can
+        /// invalidate before the `Locked` CAS lands; waiting under `Locked` cannot,
+        /// because no fresh pin is admitted.
+        ///
+        /// Red proof: put `wait_for_readers` back in front of the claim in
+        /// `layer::claim_and_wait_for_readers`.
+        #[test]
+        fn claim_and_wait_holds_the_claim_while_it_waits() {
+            let (layer, _hashtable) = filled_layer(4, 64);
+            let head = layer.chain.head().expect("head");
+            let seg = layer.pool().get(head).expect("segment");
+
+            assert!(seg.cas_metadata(State::Live, State::Sealed, None, None));
+            assert!(seg.cas_metadata(State::Sealed, State::Draining, None, None));
+
+            // A reader is admitted right up to the claim...
+            assert!(seg.try_acquire_read());
+            seg.release_read();
+
+            assert!(crate::layer::claim_and_wait_for_readers(seg));
+            assert_eq!(
+                seg.state(),
+                State::Locked,
+                "the wait must run with the claim already published, or the zero it \
+                 returns on can be invalidated by an arrival (#133)"
+            );
+            assert!(
+                !seg.try_acquire_read(),
+                "...and refused from the claim onwards, for the whole of the wait"
+            );
+
+            // A second claimant finds the segment already taken and must not
+            // proceed to clear it.
+            assert!(
+                !crate::layer::claim_and_wait_for_readers(seg),
+                "the claim is exclusive -- exactly one caller may clear"
+            );
+        }
     }
 
     /// A layer must accept writes again after `reset()`.

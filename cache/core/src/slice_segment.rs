@@ -129,25 +129,6 @@ impl<'a> SliceSegment<'a> {
     const POOL_ID_MASK: u8 = 0x03;
     const PER_ITEM_TTL_BIT: u8 = 0x04;
 
-    /// The segment state, loaded `SeqCst` -- the reader half of the Dekker
-    /// pair with the condemner.
-    ///
-    /// Only for the *post-increment re-check* of a two-phase acquire. Pairing
-    /// a `SeqCst` `fetch_add` with an `Acquire` re-check buys nothing: both
-    /// accesses have to sit in the single total order for it to forbid the
-    /// outcome where the reader's re-check sees an admitting state while the
-    /// condemner's `ref_count` load sees zero. See
-    /// [`crate::segment::Segment::ref_count_seqcst`] for the full argument and
-    /// for why no in-tree tool can turn it red.
-    ///
-    /// The *pre*-increment check stays `Acquire`: it is a pure fast path whose
-    /// answer is re-derived after the increment, and it is ordered against
-    /// nothing this thread has stored.
-    #[inline]
-    fn state_seqcst(&self) -> State {
-        Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
-    }
-
     /// Create a new segment from a data pointer.
     ///
     /// # Safety
@@ -497,26 +478,18 @@ impl<'a> SliceSegment<'a> {
     /// the caller must ensure it is decremented when done (typically by
     /// constructing a `ValueRef` from the returned pointers).
     pub fn get_value_ref_raw(&self, offset: u32, key: &[u8]) -> Result<ValueRefRaw, CacheError> {
-        // Check state and increment ref count
-        let state = self.state();
-        // A condemned segment is readable only for a reference already held; a
-        // fresh acquire here is a stale location and must miss (#127).
-        if !state.is_readable() || state.is_condemned() {
-            return Err(CacheError::SegmentNotAccessible);
-        }
-
-        // SeqCst, both halves. This increment and the re-check below race the
-        // condemner's mirror image (CAS the state, then load `ref_count`) --
-        // store-buffering / Dekker. Acquire/release permits both loads to come
-        // back stale, so the condemner frees or clears the segment while this
-        // reader believes it holds a valid pin. Only the SeqCst total order
-        // forbids it. See `Segment::ref_count_seqcst` (#129).
-        self.ref_count.fetch_add(1, Ordering::SeqCst);
-
-        // Double-check state after increment
-        let state_after = self.state_seqcst();
-        if !state_after.is_readable() || state_after.is_condemned() {
-            self.release_ref();
+        // The two-phase pin, with the guard predicate: a condemned segment is
+        // readable only for a reference already held, so a fresh acquire here
+        // is a stale location and must miss (#127). One body for every acquire
+        // site in the crate -- see `segment::try_acquire_pin` for why the
+        // post-increment re-check is the load-bearing half and how a test
+        // reaches the window between the two (#134).
+        if !crate::segment::try_acquire_pin(
+            &self.ref_count,
+            &self.metadata,
+            State::admits_guard_reader,
+            || self.release_ref(),
+        ) {
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -784,29 +757,24 @@ impl<'a> SliceSegment<'a> {
 // Implement SegmentKeyVerify
 impl SegmentKeyVerify for SliceSegment<'_> {
     fn try_acquire_read(&self) -> bool {
-        // Increment first, then re-check: an evictor that already observed
-        // ref_count == 0 may be mid-condemn, and only the post-increment check
-        // can see the state it published.
-        // `Draining` stays admitted on purpose -- that is what lets the demoter
-        // verify keys on a segment it is draining. `AwaitingRelease` does not:
-        // the hashtable entries are already gone, so an arriving thread holds a
-        // stale location, and admitting it would unstick the evictor's
-        // `ref_count == 0` gate (#127).
-        let state = self.state();
-        if !state.holds_valid_data() || state.is_condemned() {
-            return false;
-        }
-        // SeqCst, both halves -- see `get_item`. Same Dekker pair, with a
-        // wider admitting predicate: `Draining` is admitted here, so this pin
-        // is only ordered against the `AwaitingRelease` and `Locked`
-        // transitions, not against `Sealed -> Draining`.
-        self.ref_count.fetch_add(1, Ordering::SeqCst);
-        let state_after = self.state_seqcst();
-        if !state_after.holds_valid_data() || state_after.is_condemned() {
-            self.release_ref();
-            return false;
-        }
-        true
+        // The two-phase pin, with the key-verify predicate. `Draining` stays
+        // admitted on purpose -- that is what lets the demoter verify keys on
+        // a segment it is draining, and removing it regressed demotions to
+        // zero once already. `AwaitingRelease` does not: the hashtable entries
+        // are gone, so an arriving thread holds a stale location, and
+        // admitting it would unstick the evictor's `ref_count == 0` gate
+        // (#127).
+        //
+        // Because `Draining` is admitted, `Draining` is *not* an exclusive
+        // claim. The evictor's claim is `Locked`, which this predicate
+        // refuses, and it takes that claim before it reads `ref_count` --
+        // see `layer::try_claim_for_clear` (#133).
+        crate::segment::try_acquire_pin(
+            &self.ref_count,
+            &self.metadata,
+            State::admits_verify_reader,
+            || self.release_ref(),
+        )
     }
 
     fn release_read(&self) {
@@ -1041,20 +1009,31 @@ impl Segment for SliceSegment<'_> {
             new_prev.unwrap_or(current_meta.prev),
         );
 
-        // *Leaving* `Locked` ends a used incarnation -- not merely being
-        // `Locked`. The segment has been drained and cleared, and the layers
-        // recycle it as `Locked -> Reserved` before releasing it
-        // `Reserved -> Free`. Bumping here, inside the same CAS that publishes
-        // the new state, is what makes a stale location stop resolving -- and
-        // no thread can observe the new state paired with the old tag.
+        // *Recycling out of* `Locked` ends a used incarnation -- not merely
+        // being `Locked`, and not every way of leaving it. The segment has
+        // been drained and cleared, and the layers recycle it as
+        // `Locked -> Reserved` before releasing it `Reserved -> Free`. Bumping
+        // here, inside the same CAS that publishes the new state, is what
+        // makes a stale location stop resolving -- and no thread can observe
+        // the new state paired with the old tag.
         //
-        // The `new_state != Locked` half is load-bearing: a chain-pointer-only
-        // rewrite that stays in `Locked` is mid-life, and eleven identity CASes
-        // in `organization/` take exactly that shape. Keying on the source
-        // state alone would advance the tag twice in one lifetime, halving the
-        // space the collision argument rests on. Every other transition is
-        // mid-life and carries the tag forward unchanged.
-        let new_meta = if current_meta.state == State::Locked && new_state != State::Locked {
+        // Naming the destinations is load-bearing twice over:
+        //
+        // * a chain-pointer-only rewrite that stays in `Locked` is mid-life,
+        //   and eleven identity CASes in `organization/` take exactly that
+        //   shape;
+        // * `Locked -> AwaitingRelease` is the #133 deferral -- the evictor
+        //   claimed `Locked`, found readers still holding the segment, and is
+        //   handing it back. Nothing has been cleared and the readers' pins
+        //   are still good, so the incarnation has *not* ended; it ends later,
+        //   at `AwaitingRelease -> Free`, where `try_free_condemned` bumps it.
+        //
+        // Keying on the source state alone would advance the tag twice in one
+        // lifetime, halving the space the collision argument rests on. Every
+        // other transition is mid-life and carries the tag forward unchanged.
+        let new_meta = if current_meta.state == State::Locked
+            && matches!(new_state, State::Reserved | State::Free)
+        {
             new_meta.bump_incarnation()
         } else {
             new_meta
@@ -1549,26 +1528,18 @@ impl SegmentGuard for SliceSegment<'_> {
         Self: 'a;
 
     fn get_item(&self, offset: u32, key: &[u8]) -> Result<Self::Guard<'_>, CacheError> {
-        // Check state and increment ref count
-        let state = self.state();
-        // A condemned segment is readable only for a reference already held; a
-        // fresh acquire here is a stale location and must miss (#127).
-        if !state.is_readable() || state.is_condemned() {
-            return Err(CacheError::SegmentNotAccessible);
-        }
-
-        // SeqCst, both halves. This increment and the re-check below race the
-        // condemner's mirror image (CAS the state, then load `ref_count`) --
-        // store-buffering / Dekker. Acquire/release permits both loads to come
-        // back stale, so the condemner frees or clears the segment while this
-        // reader believes it holds a valid pin. Only the SeqCst total order
-        // forbids it. See `Segment::ref_count_seqcst` (#129).
-        self.ref_count.fetch_add(1, Ordering::SeqCst);
-
-        // Double-check state after increment
-        let state_after = self.state_seqcst();
-        if !state_after.is_readable() || state_after.is_condemned() {
-            self.release_ref();
+        // The two-phase pin, with the guard predicate: a condemned segment is
+        // readable only for a reference already held, so a fresh acquire here
+        // is a stale location and must miss (#127). One body for every acquire
+        // site in the crate -- see `segment::try_acquire_pin` for why the
+        // post-increment re-check is the load-bearing half and how a test
+        // reaches the window between the two (#134).
+        if !crate::segment::try_acquire_pin(
+            &self.ref_count,
+            &self.metadata,
+            State::admits_guard_reader,
+            || self.release_ref(),
+        ) {
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -1586,26 +1557,18 @@ impl SegmentGuard for SliceSegment<'_> {
         offset: u32,
         header_info: (u8, u8, u32),
     ) -> Result<Self::Guard<'_>, CacheError> {
-        // Check state and increment ref count
-        let state = self.state();
-        // A condemned segment is readable only for a reference already held; a
-        // fresh acquire here is a stale location and must miss (#127).
-        if !state.is_readable() || state.is_condemned() {
-            return Err(CacheError::SegmentNotAccessible);
-        }
-
-        // SeqCst, both halves. This increment and the re-check below race the
-        // condemner's mirror image (CAS the state, then load `ref_count`) --
-        // store-buffering / Dekker. Acquire/release permits both loads to come
-        // back stale, so the condemner frees or clears the segment while this
-        // reader believes it holds a valid pin. Only the SeqCst total order
-        // forbids it. See `Segment::ref_count_seqcst` (#129).
-        self.ref_count.fetch_add(1, Ordering::SeqCst);
-
-        // Double-check state after increment
-        let state_after = self.state_seqcst();
-        if !state_after.is_readable() || state_after.is_condemned() {
-            self.release_ref();
+        // The two-phase pin, with the guard predicate: a condemned segment is
+        // readable only for a reference already held, so a fresh acquire here
+        // is a stale location and must miss (#127). One body for every acquire
+        // site in the crate -- see `segment::try_acquire_pin` for why the
+        // post-increment re-check is the load-bearing half and how a test
+        // reaches the window between the two (#134).
+        if !crate::segment::try_acquire_pin(
+            &self.ref_count,
+            &self.metadata,
+            State::admits_guard_reader,
+            || self.release_ref(),
+        ) {
             return Err(CacheError::SegmentNotAccessible);
         }
 
@@ -1747,6 +1710,232 @@ mod tests {
         assert_eq!(segment.state(), State::Free);
 
         unsafe { free_test_segment(ptr, layout) };
+    }
+
+    /// Tests that drive a race by hand through `segment::interpose`.
+    ///
+    /// Gated off under the model checkers for the same reason the hook itself
+    /// is: a `std` thread-local inside a loom or shuttle execution is state
+    /// the checker cannot see.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    mod interposed {
+        use super::*;
+        use crate::segment::interpose;
+
+        // ---- the two-phase acquire's post-increment re-check (#134) ----------
+        //
+        // The window these cover is between `try_acquire_pin`'s `fetch_add` and
+        // its re-check. No single-threaded caller enters it and no multi-threaded
+        // one enters it *deterministically*, which is why the check was
+        // deletable-and-green on `main`: every existing condemned-refusal test
+        // above is satisfied by the *pre*-increment check alone.
+        //
+        // `segment::interpose` puts the racing transition inside the window by
+        // hand. The call under test is the real production entry point, so these
+        // pin the shipped body, not a mirror of it.
+        //
+        // `Rc` only so the hook closure can own a handle to the segment (the hook
+        // slot is `'static`); the whole test runs on one thread.
+
+        /// A guard acquire must refuse a condemn published inside its own
+        /// increment/re-check window -- and, being the last reference out of a
+        /// segment that is now condemned, must complete the handoff rather than
+        /// strand it.
+        ///
+        /// Red proof: delete the `if !admits(...)` re-check in
+        /// `segment::try_acquire_pin` and the acquire returns a live guard on an
+        /// `AwaitingRelease` segment.
+        #[test]
+        fn guard_acquire_refuses_a_condemn_published_inside_its_window() {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let (segment, ptr, layout) = create_test_segment(0, false, 0, 64 * 1024);
+            let segment = Rc::new(segment);
+            assert!(segment.try_reserve());
+            assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+            segment.append_item(b"key", b"value", &[]).expect("append");
+            assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+
+            // The evictor, run by hand at the one instant that matters: the
+            // reader has taken its transient reference and has not yet re-checked.
+            let condemned = Rc::new(Cell::new(false));
+            let observed_count = Rc::new(Cell::new(u32::MAX));
+            {
+                let seg = Rc::clone(&segment);
+                let flag = Rc::clone(&condemned);
+                let count = Rc::clone(&observed_count);
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::ACQUIRE_AFTER_INCREMENT {
+                        count.set(seg.ref_count());
+                        assert!(seg.cas_metadata(
+                            State::Sealed,
+                            State::AwaitingRelease,
+                            None,
+                            None
+                        ));
+                        flag.set(true);
+                    }
+                }));
+
+                assert!(
+                    segment.get_item(0, b"key").is_err(),
+                    "the acquire pinned a segment condemned inside its own window -- \
+                     only the post-increment re-check can see that transition"
+                );
+            }
+
+            assert!(condemned.get(), "the hook must have run");
+            assert_eq!(
+                observed_count.get(),
+                1,
+                "the window is entered with the transient reference already taken"
+            );
+            assert_eq!(segment.ref_count(), 0, "the back-out must leave no pin");
+            assert_eq!(
+                segment.state(),
+                State::Free,
+                "the back-out removed the LAST reference from a condemned segment, so it \
+                 owes the AwaitingRelease -> Free handoff; nothing sweeps AwaitingRelease"
+            );
+
+            drop(segment);
+            unsafe { free_test_segment(ptr, layout) };
+        }
+
+        /// The same window, reached through the *key-verify* acquire and closed by
+        /// the evictor's exclusive claim rather than by a condemn.
+        ///
+        /// This is the pairing #133 turns on: `Draining` deliberately admits this
+        /// reader, so `Locked` is the claim that shuts it out, and the re-check is
+        /// the only read on the reader's side that can see it.
+        ///
+        /// Red proof: delete `try_acquire_pin`'s re-check and the verify reader
+        /// pins a segment whose bytes the evictor is about to rewrite.
+        #[test]
+        fn verify_acquire_refuses_a_clear_claim_published_inside_its_window() {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let (segment, ptr, layout) = create_test_segment(0, false, 0, 64 * 1024);
+            let segment = Rc::new(segment);
+            assert!(segment.try_reserve());
+            assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+            segment.append_item(b"key", b"value", &[]).expect("append");
+            assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+            assert!(segment.cas_metadata(State::Sealed, State::Draining, None, None));
+
+            // Sanity: `Draining` admits this reader when nothing races it. That is
+            // what the demoter depends on, and what makes `Locked` -- not
+            // `Draining` -- the exclusive claim.
+            assert!(segment.try_acquire_read(), "Draining must admit a verify");
+            segment.release_read();
+
+            let claimed = Rc::new(Cell::new(false));
+            {
+                let seg = Rc::clone(&segment);
+                let flag = Rc::clone(&claimed);
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::ACQUIRE_AFTER_INCREMENT {
+                        assert!(seg.cas_metadata(State::Draining, State::Locked, None, None));
+                        flag.set(true);
+                    }
+                }));
+
+                assert!(
+                    !segment.try_acquire_read(),
+                    "the verify acquire pinned a segment claimed for clearing inside its \
+                     own window"
+                );
+            }
+
+            assert!(claimed.get(), "the hook must have run");
+            assert_eq!(segment.ref_count(), 0, "the back-out must leave no pin");
+            assert_eq!(
+                segment.state(),
+                State::Locked,
+                "a refused verify must leave the evictor's claim alone"
+            );
+
+            drop(segment);
+            unsafe { free_test_segment(ptr, layout) };
+        }
+
+        /// Every acquire entry point must route through the one body, not carry
+        /// its own copy of the protocol.
+        ///
+        /// Four separate copies is how #134 happened: there was no single place a
+        /// test could aim at, and each copy was independently deletable. This runs
+        /// the same in-window condemn against each entry point in turn; a site
+        /// that stops calling `segment::try_acquire_pin` stops being refused.
+        #[test]
+        fn every_acquire_entry_point_routes_through_the_shared_body() {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            #[derive(Clone, Copy, Debug)]
+            enum Entry {
+                GetItem,
+                GetItemVerified,
+                GetValueRefRaw,
+                TryAcquireRead,
+            }
+
+            for entry in [
+                Entry::GetItem,
+                Entry::GetItemVerified,
+                Entry::GetValueRefRaw,
+                Entry::TryAcquireRead,
+            ] {
+                let (segment, ptr, layout) = create_test_segment(0, false, 0, 64 * 1024);
+                let segment = Rc::new(segment);
+                assert!(segment.try_reserve());
+                assert!(segment.cas_metadata(State::Reserved, State::Live, None, None));
+                segment.append_item(b"key", b"value", &[]).expect("append");
+                assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+
+                let fired = Rc::new(Cell::new(false));
+                {
+                    let seg = Rc::clone(&segment);
+                    let flag = Rc::clone(&fired);
+                    let _hook = interpose::install(Box::new(move |phase| {
+                        if phase == interpose::ACQUIRE_AFTER_INCREMENT {
+                            assert!(seg.cas_metadata(
+                                State::Sealed,
+                                State::AwaitingRelease,
+                                None,
+                                None
+                            ));
+                            flag.set(true);
+                        }
+                    }));
+
+                    let admitted = match entry {
+                        Entry::GetItem => segment.get_item(0, b"key").is_ok(),
+                        // key_len 3, optional_len 0, value_len 5 -- "key"/"value".
+                        Entry::GetItemVerified => segment.get_item_verified(0, (3, 0, 5)).is_ok(),
+                        Entry::GetValueRefRaw => segment.get_value_ref_raw(0, b"key").is_ok(),
+                        Entry::TryAcquireRead => segment.try_acquire_read(),
+                    };
+                    assert!(
+                        !admitted,
+                        "{entry:?} admitted a condemn published inside the \
+                         increment/re-check window -- it is not going through \
+                         segment::try_acquire_pin"
+                    );
+                }
+
+                assert!(
+                    fired.get(),
+                    "the hook must have run for {entry:?} -- if it did not, the entry \
+                     point never reached the shared acquire body at all"
+                );
+                assert_eq!(segment.ref_count(), 0, "{entry:?} left a pin behind");
+
+                drop(segment);
+                unsafe { free_test_segment(ptr, layout) };
+            }
+        }
     }
 
     /// A verify must hold a reference for the duration of its byte reads.
@@ -4036,107 +4225,123 @@ mod loom_tests {
         });
     }
 
-    /// The condemned-release gate: does the caller's `ref_count() == 0` check
-    /// still hold by the time `release_condemned` CASes to `Free`?
+    /// #133's claim path, in the half loom can adjudicate: a verify reader
+    /// turned away by the evictor's **`Locked` claim** must still complete the
+    /// `AwaitingRelease` handoff when it turns out to be the last reference
+    /// out.
     ///
-    /// Mirrors, line for line:
-    ///   - the reader, `SliceSegment::get_value_ref_raw` (check the fresh-acquire
-    ///     gate, `fetch_add`, re-check it) -- the gate is
-    ///     `is_readable() && !is_condemned()`, the fix for #127;
-    ///   - the evictor, the race-fix branch in
-    ///     `FifoLayer::process_evicted_segment_nonblocking`
-    ///     (`if segment.ref_count() == 0 && segment.release_condemned()`),
-    ///     with `release_condemned`'s body inlined — it checks the *state*
-    ///     and never re-reads `ref_count`.
+    /// # Why this replaces `test_release_condemned_gate_respects_readers`
     ///
-    /// The model starts where that branch starts: state `AwaitingRelease`,
-    /// `ref_count` 0 (the last reader dropped during the condemn window). The
-    /// reader is one that read its location out of the hashtable *before*
-    /// `drain_segment_from_hashtable` ran and is only now getting to its
-    /// acquire — `Draining` would have turned it away, but the evictor's own
-    /// CAS to `AwaitingRelease` puts the segment back inside `is_readable()`.
-    ///
-    /// Invariant: a reader holding a reference must never be looking at a
-    /// segment that has been published `Free`, because `Free` means the
-    /// segment is on the pool's free queue and can be handed to a writer.
-    ///
-    /// NOTE (#129): this model is now **vacuous**, and deliberately kept as a
-    /// regression guard rather than as live coverage. It starts in
-    /// `AwaitingRelease`, and #127's `is_condemned()` gate turns the reader
-    /// away at its *first* check, so `observed` is always `None` and the
-    /// assertion body never runs. (Verified by replacing the body with a
-    /// `panic!` and watching the model still pass.) What it used to cover --
-    /// a reader holding a reference while the evictor's `ref_count == 0` check
-    /// goes stale -- is covered with teeth by
+    /// That model was **vacuous**: it started in `AwaitingRelease`, where
+    /// #127's `is_condemned()` gate turns the reader away at its *first*
+    /// check, so `observed` was always `None` and the assertion body never
+    /// ran. (Confirmed by replacing the body with a `panic!` and watching it
+    /// still pass.) It was kept as a "regression guard"; a test that cannot
+    /// fail is not one. Its property -- a pinned reader never coexists with a
+    /// committed drain -- is SC-dependent and belongs to
     /// `shuttle_tests::shuttle_reader_never_coexists_with_committed_drain`,
-    /// which starts in `Sealed` so the reader can actually pin, and which
-    /// loom structurally cannot assert. If the gate here ever regresses to
-    /// admitting condemned segments, this model becomes live again.
+    /// which loom structurally cannot assert.
+    ///
+    /// This model is live in the same place the old one was dead. It starts in
+    /// `Draining`, which `State::admits_verify_reader` really does admit, so
+    /// the reader reaches its `fetch_add`; the evictor then claims `Locked`
+    /// and, seeing the pin, condemns from `Locked` -- the transition #133's
+    /// claim-before-count order introduced. The reader's re-check sees
+    /// `AwaitingRelease`, backs out as the last reference, and owes the free.
+    ///
+    /// # What is asserted, and what is not
+    ///
+    /// Only the SC-independent half: *if* the reader reports backing out as
+    /// the last reference from a condemned segment, the segment must not be
+    /// left in `AwaitingRelease`. Nothing sweeps that state, so a strand is a
+    /// permanent leak of one segment. The evictor deliberately does **not**
+    /// run its race fix, so nothing else can discharge the obligation.
+    ///
+    /// Not asserted: that a pinned reader never sees the claim committed.
+    /// Modelling the evictor's `ref_count` read alongside the reader's
+    /// re-check reopens the store-buffering question, and loom reports that
+    /// outcome even with `SeqCst` throughout.
     #[test]
-    fn test_release_condemned_gate_respects_readers() {
+    fn test_claim_refused_backout_hands_the_segment_on() {
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = Some(3);
         builder.check(|| {
             let ref_count = Arc::new(AtomicU32::new(0));
-            let metadata = Arc::new(AtomicU64::new(Metadata::new(State::AwaitingRelease).pack()));
+            let metadata = Arc::new(AtomicU64::new(Metadata::new(State::Draining).pack()));
 
-            // Reader: get_value_ref_raw's acquire sequence.
+            // Reader: the key-verify acquire, through the production
+            // predicate. `Draining` is admitted here and not by
+            // `model_admits_fresh_reader` -- that width is exactly why the
+            // evictor's claim has to be `Locked`.
             let rc1 = ref_count.clone();
             let m1 = metadata.clone();
             let reader = thread::spawn(move || {
                 let state = Metadata::unpack(m1.load(Ordering::Acquire)).state;
-                if !state.is_readable() || state.is_condemned() {
-                    return None;
+                if !state.admits_verify_reader() {
+                    return false;
                 }
-                rc1.fetch_add(1, Ordering::Acquire);
-                let state_after = Metadata::unpack(m1.load(Ordering::Acquire)).state;
-                if !state_after.is_readable() || state_after.is_condemned() {
-                    rc1.fetch_sub(1, Ordering::Release);
-                    return None;
+                rc1.fetch_add(1, Ordering::SeqCst);
+                let state_after = Metadata::unpack(m1.load(Ordering::SeqCst)).state;
+                if !state_after.admits_verify_reader() {
+                    let prev = model_release_ref(&rc1, &m1);
+                    return state_after.is_condemned() && prev == 1;
                 }
-                // Reference held. This is where the caller reads item bytes:
-                // report the state the segment is in while we are reading them.
-                let observed = Metadata::unpack(m1.load(Ordering::Acquire)).state;
-                rc1.fetch_sub(1, Ordering::Release);
-                Some(observed)
+                model_release_ref(&rc1, &m1);
+                false
             });
 
-            // Evictor: `ref_count() == 0 && release_condemned()`.
+            // Evictor: claim `Draining -> Locked`, and on finding the segment
+            // pinned hand it back as `Locked -> AwaitingRelease`. No race fix,
+            // so the reader's obligation is the only one that can discharge.
             let rc2 = ref_count.clone();
             let m2 = metadata.clone();
             let evictor = thread::spawn(move || {
-                if rc2.load(Ordering::Acquire) != 0 {
-                    return false;
-                }
-                // --- release_condemned() ---
                 let current = m2.load(Ordering::Acquire);
                 let current_meta = Metadata::unpack(current);
-                if current_meta.state != State::AwaitingRelease {
-                    return false;
+                if current_meta.state != State::Draining {
+                    return;
                 }
-                let new_meta = current_meta
-                    .with_state(State::Free)
-                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
-                    .bump_incarnation();
-                m2.compare_exchange(
+                if m2
+                    .compare_exchange(
+                        current,
+                        current_meta.with_state(State::Locked).pack(),
+                        Ordering::SeqCst,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                // Claim held: only now is the count read.
+                if rc2.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                let current = m2.load(Ordering::Acquire);
+                let current_meta = Metadata::unpack(current);
+                if current_meta.state != State::Locked {
+                    return;
+                }
+                let _ = m2.compare_exchange(
                     current,
-                    new_meta.pack(),
-                    Ordering::Release,
+                    current_meta.with_state(State::AwaitingRelease).pack(),
+                    Ordering::SeqCst,
                     Ordering::Acquire,
-                )
-                .is_ok()
+                );
             });
 
-            let observed = reader.join().unwrap();
-            let released = evictor.join().unwrap();
+            let backed_out_as_last = reader.join().unwrap();
+            evictor.join().unwrap();
 
-            if let Some(state) = observed {
+            assert_eq!(ref_count.load(Ordering::Acquire), 0);
+
+            if backed_out_as_last {
+                let final_state = Metadata::unpack(metadata.load(Ordering::Acquire)).state;
                 assert_ne!(
-                    state,
-                    State::Free,
-                    "reader held a reference while the segment was published Free \
-                     (released={released}) -- the evictor's ref_count == 0 check \
-                     went stale before release_condemned's CAS"
+                    final_state,
+                    State::AwaitingRelease,
+                    "the last reference out backed off a segment condemned from the \
+                     evictor's claim and left it stranded in AwaitingRelease with \
+                     ref_count == 0 -- the back-out did not complete the handoff"
                 );
             }
         });
@@ -4247,13 +4452,15 @@ mod shuttle_tests {
     /// Mirror of the two-phase guard acquire: check the gate, `fetch_add`,
     /// re-check. Returns `true` if the pin is held on return.
     ///
-    /// Mirror, not production: deleting the re-check here reddens the models,
-    /// but deleting it from `SliceSegment::get_item` / `try_acquire_read`
-    /// currently reddens nothing. That two-phase protocol (#127/#128) has no
-    /// deterministic test -- the window it closes is between the `fetch_add`
-    /// and the re-check, with no interposition point -- and closing that gap
-    /// would take the same treatment `try_free_condemned` got: extract the
-    /// decision into something a test can call.
+    /// Still a mirror, so reddening it by deleting the re-check here proves a
+    /// property of the mirror. What changed since #134 is that the production
+    /// side is no longer uncovered: all five acquire entry points now route
+    /// through the single `segment::try_acquire_pin`, whose window a test
+    /// enters directly via `segment::interpose`. Deleting the re-check *in
+    /// production* reddens
+    /// `slice_segment::tests::{guard_acquire_refuses_a_condemn_published_inside_its_window,
+    /// verify_acquire_refuses_a_clear_claim_published_inside_its_window,
+    /// every_acquire_entry_point_routes_through_the_shared_body}`.
     fn model_try_acquire_guard(rc: &AtomicU32, m: &AtomicU64) -> bool {
         let state = Metadata::unpack(m.load(Ordering::SeqCst)).state;
         if !admits_guard_reader(state) {
@@ -4262,6 +4469,27 @@ mod shuttle_tests {
         rc.fetch_add(1, Ordering::SeqCst);
         let state_after = Metadata::unpack(m.load(Ordering::SeqCst)).state;
         if !admits_guard_reader(state_after) {
+            model_release_ref(rc, m);
+            return false;
+        }
+        true
+    }
+
+    /// The same two phases with the *key-verify* predicate, straight off
+    /// `State::admits_verify_reader` -- production, not a copy of it.
+    ///
+    /// The difference from [`model_try_acquire_guard`] is one state:
+    /// `Draining` is admitted, because the demoter verifies keys on a segment
+    /// it is draining. That is what makes `Draining` unusable as an exclusive
+    /// claim and what #133 is about.
+    fn model_try_acquire_verify(rc: &AtomicU32, m: &AtomicU64) -> bool {
+        let state = Metadata::unpack(m.load(Ordering::SeqCst)).state;
+        if !state.admits_verify_reader() {
+            return false;
+        }
+        rc.fetch_add(1, Ordering::SeqCst);
+        let state_after = Metadata::unpack(m.load(Ordering::SeqCst)).state;
+        if !state_after.admits_verify_reader() {
             model_release_ref(rc, m);
             return false;
         }
@@ -4340,13 +4568,15 @@ mod shuttle_tests {
     /// loads come back stale (with `SeqCst` throughout, too)". Under shuttle's
     /// SC execution it is assertable, and it holds.
     ///
-    /// The evictor is `FifoLayer::process_evicted_segment_nonblocking` in full:
-    /// claim `Sealed -> Draining`, load `ref_count`, and either condemn (pinned)
-    /// or take `Draining -> Locked` and rewrite the segment's bytes (unpinned).
-    /// `committed` stands for that rewrite. The soundness argument is that
-    /// under the SC total order at most one of the two rechecks can be stale:
-    /// a reader whose re-check saw `Sealed` ordered its increment before the
-    /// `Draining` CAS, so the evictor's load cannot come back zero.
+    /// The evictor is `FifoLayer::process_evicted_segment_nonblocking` in
+    /// full, in #133's order: claim `Sealed -> Draining`, sweep, claim
+    /// `Draining -> Locked`, and only *then* load `ref_count` -- rewriting the
+    /// segment's bytes if it is zero and condemning from `Locked` if it is
+    /// not. `committed` stands for that rewrite. The soundness argument is
+    /// that under the SC total order at most one of the two rechecks can be
+    /// stale: a reader whose re-check saw an admitting state ordered its
+    /// increment before the claim CAS, so the evictor's load cannot come back
+    /// zero.
     ///
     /// Also asserts, at the end, that the segment did not strand in
     /// `AwaitingRelease` with `ref_count == 0` -- invariant (b) in the shape
@@ -4379,12 +4609,20 @@ mod shuttle_tests {
                                  evictor took Draining -> Locked and rewrote segment \
                                  bytes under a live reference (#129 invariant a)"
                             );
+                            // `Locked` is deliberately not excluded: since
+                            // #133 it means *claimed*, not *being cleared*.
+                            // The evictor takes it before it knows whether
+                            // anyone is pinned, and hands it back as
+                            // `AwaitingRelease` when someone is -- so a pinned
+                            // reader seeing `Locked` is precisely the case in
+                            // which nothing gets rewritten. `committed` above
+                            // is the invariant with teeth.
                             let observed = Metadata::unpack(m.load(Ordering::SeqCst)).state;
-                            assert!(
-                                observed != State::Locked && observed != State::Free,
-                                "a pinned reader observed {observed:?}: the segment was \
-                                 published mid-clear or back on the free queue while a \
-                                 reference was held"
+                            assert_ne!(
+                                observed,
+                                State::Free,
+                                "a pinned reader observed the segment back on the free \
+                                 queue while a reference was held"
                             );
                             if model_release_ref(&rc, &m) {
                                 f.fetch_add(1, Ordering::SeqCst);
@@ -4402,16 +4640,20 @@ mod shuttle_tests {
                         if !model_cas_state(&m, State::Sealed, State::Draining) {
                             return;
                         }
-                        // the condemner half of the Dekker pair
-                        if rc.load(Ordering::SeqCst) > 0 {
-                            model_cas_state(&m, State::Draining, State::AwaitingRelease);
+                        // Claim before counting (#133): `Draining -> Locked`
+                        // is the store, and the `ref_count` load below is the
+                        // load, of the condemner half of the Dekker pair.
+                        if !model_cas_state(&m, State::Draining, State::Locked) {
+                            return;
+                        }
+                        if rc.load(Ordering::SeqCst) == 0 {
+                            c.store(1, Ordering::SeqCst);
+                        } else {
+                            model_cas_state(&m, State::Locked, State::AwaitingRelease);
                             // race fix
                             if rc.load(Ordering::SeqCst) == 0 && model_release_condemned(&rc, &m) {
                                 f.fetch_add(1, Ordering::SeqCst);
                             }
-                        } else {
-                            model_cas_state(&m, State::Draining, State::Locked);
-                            c.store(1, Ordering::SeqCst);
                         }
                     })
                 };
@@ -4508,9 +4750,17 @@ mod shuttle_tests {
     /// blocking claimer's shape.**
     ///
     /// The other production drain path: `process_evicted_segment` claims
-    /// `Sealed -> Draining` and then *waits* -- `layer::wait_for_readers`
-    /// spins on `ref_count_seqcst()` -- before taking `Draining -> Locked` and
+    /// `Sealed -> Draining`, then takes `Draining -> Locked`, and only then
+    /// *waits* -- `layer::claim_and_wait_for_readers`, which spins on
+    /// `ref_count_seqcst()` with the claim already published -- before
     /// rewriting the segment's bytes. `committed` stands for that rewrite.
+    ///
+    /// The claim has to come first here too (#133). `Draining` still admits
+    /// key-verify readers, so a spin that converges to zero under it says
+    /// nothing about the instant after: a fresh pin can land between the
+    /// observation and the `Locked` CAS. Under `Locked` the count is
+    /// monotonically non-increasing, so the spin terminates on a zero that
+    /// stays true.
     ///
     /// Repeating the load does not rescue a weaker ordering here: the property
     /// needed is that an *observation of zero* cannot coexist with a reader
@@ -4552,11 +4802,11 @@ mod shuttle_tests {
                         if !model_cas_state(&m, State::Sealed, State::Draining) {
                             return;
                         }
-                        // layer::wait_for_readers
+                        // layer::claim_and_wait_for_readers: claim, then wait.
+                        assert!(model_cas_state(&m, State::Draining, State::Locked));
                         while rc.load(Ordering::SeqCst) > 0 {
                             thread::yield_now();
                         }
-                        assert!(model_cas_state(&m, State::Draining, State::Locked));
                         c.store(1, Ordering::SeqCst);
                     })
                 };
@@ -4569,6 +4819,117 @@ mod shuttle_tests {
                 assert_eq!(ref_count.load(Ordering::SeqCst), 0);
             },
             shuttle_iters(20_000),
+        );
+    }
+
+    /// **A key-verify reader never coexists with a committed clear (#133).**
+    ///
+    /// The other three models here use `model_try_acquire_guard`, whose
+    /// predicate excludes `Draining` -- so none of them can express #133 at
+    /// all. This one uses `State::admits_verify_reader`, the production
+    /// predicate the demoter's verifier goes through, which admits `Draining`
+    /// deliberately. That width is the entire bug: `Draining` is not an
+    /// exclusive claim, so an evictor that reads `ref_count` while holding
+    /// only `Draining` is reading a number that can still go up.
+    ///
+    /// The evictor is `process_evicted_segment_nonblocking`'s tail in the
+    /// order this branch introduced: claim `Draining -> Locked`, *then* load
+    /// `ref_count`, and either clear (`committed`) or condemn from `Locked`.
+    ///
+    /// Not vacuous, and not green by construction: reverse the two evictor
+    /// steps in this model --
+    ///
+    /// ```ignore
+    /// let unpinned = rc.load(Ordering::SeqCst) == 0;
+    /// let claimed = model_cas_state(&m, State::Draining, State::Locked);
+    /// if claimed && unpinned { ... }
+    /// ```
+    ///
+    /// -- and shuttle reports a pinned reader observing `committed == 1`
+    /// within a few thousand schedules. That is a *mirror* mutation and proves
+    /// a property of the mirror; the production red proof for the same
+    /// inversion is
+    /// `fifo_layer::tests::eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming`.
+    #[test]
+    fn shuttle_verify_reader_never_coexists_with_a_committed_clear() {
+        shuttle::check_random(
+            || {
+                let ref_count = Arc::new(AtomicU32::new(0));
+                let metadata = Arc::new(AtomicU64::new(Metadata::new(State::Draining).pack()));
+                let committed = Arc::new(AtomicU32::new(0));
+
+                let readers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let rc = Arc::clone(&ref_count);
+                        let m = Arc::clone(&metadata);
+                        let c = Arc::clone(&committed);
+                        thread::spawn(move || {
+                            if !model_try_acquire_verify(&rc, &m) {
+                                return;
+                            }
+                            // Pin held. This is where `verify_key_at_offset`
+                            // reads the item's bytes.
+                            assert_eq!(
+                                c.load(Ordering::SeqCst),
+                                0,
+                                "a pinned key-verify reader observed a COMMITTED clear -- \
+                                 the evictor read ref_count while it held only `Draining`, \
+                                 which still admits this reader (#133)"
+                            );
+                            // NOT asserted: that the observed state is never
+                            // `Locked`. Since #133 `Locked` means *claimed*,
+                            // not *being cleared* -- the evictor takes it
+                            // before it knows whether anyone is pinned, and
+                            // backs out to `AwaitingRelease` when someone is.
+                            // A pinned reader can therefore see it, and that
+                            // is exactly the case in which nothing is
+                            // rewritten. `committed` above is the real
+                            // invariant.
+                            let observed = Metadata::unpack(m.load(Ordering::SeqCst)).state;
+                            assert_ne!(
+                                observed,
+                                State::Free,
+                                "a pinned key-verify reader observed the segment back on \
+                                 the free queue"
+                            );
+                            model_release_ref(&rc, &m);
+                        })
+                    })
+                    .collect();
+
+                let evictor = {
+                    let rc = Arc::clone(&ref_count);
+                    let m = Arc::clone(&metadata);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        // Claim before counting.
+                        if !model_cas_state(&m, State::Draining, State::Locked) {
+                            return;
+                        }
+                        if rc.load(Ordering::SeqCst) == 0 {
+                            c.store(1, Ordering::SeqCst);
+                        } else {
+                            model_cas_state(&m, State::Locked, State::AwaitingRelease);
+                            if rc.load(Ordering::SeqCst) == 0 {
+                                model_release_condemned(&rc, &m);
+                            }
+                        }
+                    })
+                };
+
+                for r in readers {
+                    r.join().unwrap();
+                }
+                evictor.join().unwrap();
+
+                assert_eq!(ref_count.load(Ordering::SeqCst), 0);
+                assert_ne!(
+                    Metadata::unpack(metadata.load(Ordering::SeqCst)).state,
+                    State::AwaitingRelease,
+                    "the segment stranded in AwaitingRelease with ref_count == 0"
+                );
+            },
+            shuttle_iters(50_000),
         );
     }
 }

@@ -263,18 +263,29 @@ impl DiskLayer {
             None => return,
         };
 
-        // `ref_count_seqcst`: this thread reached here through a
-        // `Sealed -> Draining` CAS, the store half of the Dekker pair this
-        // load completes -- see `Segment::ref_count_seqcst` (#129).
-        if segment.ref_count_seqcst() > 0 {
-            // Drain hashtable entries and defer to last reader's drop
+        // Claim before counting (#133). `Draining` still admits key-verify
+        // readers, so reading `ref_count` first and CASing to `Locked` only if
+        // it was zero leaves a window for a pin to land in between -- and the
+        // clearing loop below then runs under it. `Locked` refuses every fresh
+        // reader, so a zero read after the claim is final. See
+        // `layer::try_claim_for_clear`.
+        let claimed = crate::layer::try_claim_for_clear(segment);
+        if !claimed || segment.ref_count_seqcst() > 0 {
+            // Drain hashtable entries and defer to the last reference out.
+            // The sweep here removes entries outright and consults no
+            // verifier, so it is indifferent to the claim.
             self.drain_segment_from_hashtable(segment_id, hashtable);
-            segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
+            let held = if claimed {
+                State::Locked
+            } else {
+                State::Draining
+            };
+            // Unlike the old code this also runs the race fix, so a last
+            // reader that dropped during the condemn window cannot strand the
+            // segment in `AwaitingRelease` with `ref_count == 0`.
+            crate::layer::condemn_and_reclaim(segment, held);
             return;
         }
-
-        // Transition to Locked for clearing
-        segment.cas_metadata(State::Draining, State::Locked, None, None);
 
         // Process each item in the segment
         let mut offset = 0u32;
@@ -778,6 +789,84 @@ mod tests {
             assert!(
                 hashtable.lookup(key.as_bytes(), &verifier).is_none(),
                 "{key} survived the walk -- it stopped short of that item"
+            );
+        }
+    }
+
+    /// Tests that drive a race by hand through `segment::interpose`.
+    ///
+    /// Gated off under the model checkers for the same reason the hook itself
+    /// is: a `std` thread-local inside a loom or shuttle execution is state
+    /// the checker cannot see.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    mod interposed {
+        use super::*;
+        use crate::segment::interpose;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        /// A segment pinned during the evictor's claim window must not be
+        /// recycled -- the disk tier's copy of #133.
+        ///
+        /// Red proof: swap the two lines in
+        /// `DiskLayer::process_evicted_segment` so the count is read before
+        /// the claim.
+        #[test]
+        fn eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
+            let (_dir, layer) = create_test_layer();
+            let hashtable = MultiChoiceHashtable::new(10);
+            let ttl = Duration::from_secs(3600);
+            let value = vec![b'v'; 4096];
+            for i in 0..24 {
+                let key = format!("k{i:03}");
+                let loc = layer
+                    .write_item(key.as_bytes(), &value, b"", ttl)
+                    .expect("write");
+                let verifier = SinglePoolVerifier { pool: &layer.pool };
+                let _ = hashtable.insert(key.as_bytes(), loc.to_location(), &verifier);
+            }
+
+            let pinned = Rc::new(Cell::new(None));
+            {
+                let flag = Rc::clone(&pinned);
+                let pool_ptr: *const FilePool = &layer.pool;
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase != interpose::CLAIM_BEFORE_CAS || flag.get().is_some() {
+                        return;
+                    }
+                    // SAFETY: `layer` outlives this hook guard.
+                    let pool = unsafe { &*pool_ptr };
+                    for id in 0..pool.segment_count() as u32 {
+                        if let Some(seg) = pool.get(id)
+                            && seg.state() == State::Draining
+                        {
+                            assert!(seg.try_acquire_read());
+                            flag.set(Some(id));
+                            return;
+                        }
+                    }
+                    panic!("the claim window must be entered with the segment still Draining");
+                }));
+
+                layer.evict(&hashtable);
+            }
+
+            let id = pinned.get().expect("the hook must have run");
+            let seg = layer.pool.get(id).expect("segment");
+            assert_eq!(seg.ref_count(), 1, "the reader is still pinned");
+            assert_eq!(
+                seg.state(),
+                State::AwaitingRelease,
+                "the disk evictor recycled a segment pinned during its claim -- its \
+                 count was read before the claim, so the arrival was invisible (#133)"
+            );
+            seg.release_read();
+            assert_eq!(
+                seg.state(),
+                State::Free,
+                "the last reference out owes the AwaitingRelease -> Free handoff -- \
+                 before #133 this path condemned without a race fix at all, so a reader \
+                 that left during the condemn window stranded the segment"
             );
         }
     }

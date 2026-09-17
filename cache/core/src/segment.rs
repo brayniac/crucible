@@ -129,6 +129,172 @@ pub(crate) unsafe fn try_free_condemned<F: FnOnce()>(
     }
 }
 
+/// The two-phase reader pin, in one body: check the state, `fetch_add`, then
+/// re-check.
+///
+/// Returns `true` iff the caller leaves holding a reference.
+///
+/// # Why the second check exists
+///
+/// The pin and the evictor's claim are mirror images of each other:
+///
+/// ```text
+/// reader : W(ref_count)  then R(state)
+/// evictor: W(state)      then R(ref_count)
+/// ```
+///
+/// The pre-increment check is a pure fast path -- its answer is re-derived
+/// below, and it buys only the cost of an RMW on an obviously-inaccessible
+/// segment. The *post*-increment check is the load-bearing one: it is the
+/// only read that can see a claim published after this thread's increment,
+/// and it is what the evictor's `ref_count` load pairs against. Delete it and
+/// a reader pins a segment the evictor has already claimed -- the hazard
+/// #127/#128 closed and #133 finished.
+///
+/// # One body, five call sites
+///
+/// `SliceSegment::{get_item, get_item_verified, get_value_ref_raw,
+/// try_acquire_read}` and `DiskSegmentMeta::try_acquire_read` each used to
+/// carry their own copy of this sequence, which is why #134 could delete any
+/// one of them and watch the whole suite stay green: there was no single
+/// place a test could aim at. `admits` is the only thing that differed -- the
+/// guard sites pass [`State::admits_guard_reader`], the key-verify sites the
+/// wider [`State::admits_verify_reader`], which still admits `Draining` so
+/// the demoter can verify keys on a segment it is draining.
+///
+/// `back_out` is the caller's `release_ref`: the decrement *plus* the
+/// `AwaitingRelease -> Free` handoff, because a back-out that removed the
+/// last reference from a condemned segment owes that free and nothing else
+/// will ever do it (#127 part 2).
+///
+/// # Testability
+///
+/// The window this protocol closes -- between the `fetch_add` and the
+/// re-check -- cannot be entered by any single-threaded caller and cannot be
+/// entered *deterministically* by threads. [`interpose`] is the interposition
+/// point: a test installs a closure that runs the racing transition by hand at
+/// exactly that instant, with no scheduler, and drives the real production
+/// body rather than a copy of it.
+///
+/// # Cost
+///
+/// `#[inline]`, and generic over `admits` so the predicate is a direct call
+/// that folds into a pair of compares rather than an indirect one. This is
+/// the GET path; a release build must emit no standalone symbol for it.
+#[inline]
+pub(crate) fn try_acquire_pin<A, B>(
+    ref_count: &AtomicU32,
+    metadata: &AtomicU64,
+    admits: A,
+    back_out: B,
+) -> bool
+where
+    A: Fn(State) -> bool,
+    B: FnOnce(),
+{
+    // `Acquire`: a pure fast path whose answer is re-derived below, ordered
+    // against nothing this thread has stored yet.
+    if !admits(Metadata::unpack(metadata.load(Ordering::Acquire)).state) {
+        return false;
+    }
+
+    // SeqCst, both halves. Acquire/release permits both loads of the Dekker
+    // pair above to come back stale, so the evictor clears or frees the
+    // segment while this reader believes its pin is good. Only the SeqCst
+    // total order forbids it -- and pairing a SeqCst `fetch_add` with an
+    // `Acquire` re-check buys nothing, because both accesses have to sit in
+    // the one total order. See [`Segment::ref_count_seqcst`] (#129).
+    ref_count.fetch_add(1, Ordering::SeqCst);
+
+    #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+    interpose::fire(interpose::ACQUIRE_AFTER_INCREMENT);
+
+    if !admits(Metadata::unpack(metadata.load(Ordering::SeqCst)).state) {
+        #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+        interpose::fire(interpose::ACQUIRE_BEFORE_BACKOUT);
+
+        back_out();
+        return false;
+    }
+
+    true
+}
+
+/// Interposition points inside the reader/evictor handshake, for tests only.
+///
+/// The windows this protocol is built around are only entered when the other
+/// side moves inside them, which no single-threaded test can arrange and no
+/// multi-threaded one can arrange *deterministically*. This hook lets a test
+/// park one side at a named instant and run the other by hand, with no
+/// scheduler -- the same "put the race where it happens" idiom cache-rs uses.
+///
+/// Ambient (a thread-local) rather than a parameter, so every hooked function
+/// keeps its exact production signature and body: the test drives the real
+/// `SliceSegment::get_item` / `FifoLayer::evict_nonblocking`, not a copy.
+///
+/// Compiled out of every non-test build, and deliberately also out of the
+/// model-checking ones: a `std` thread-local inside a loom or shuttle
+/// execution is state the checker cannot see.
+#[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+pub(crate) mod interpose {
+    use std::cell::RefCell;
+
+    /// [`try_acquire_pin`]: after the `ref_count` increment, before the state
+    /// re-check.
+    pub(crate) const ACQUIRE_AFTER_INCREMENT: u8 = 0;
+    /// [`try_acquire_pin`]: after the re-check failed, before the back-out.
+    pub(crate) const ACQUIRE_BEFORE_BACKOUT: u8 = 1;
+    /// `layer::try_claim_for_clear`: after the caller decided to claim,
+    /// before the `Draining -> Locked` CAS is published. A reader pinned here
+    /// is one that arrives while the segment is still admitting -- the arrival
+    /// a `ref_count` read taken *before* the claim would miss (#133).
+    pub(crate) const CLAIM_BEFORE_CAS: u8 = 2;
+    /// `layer::wait_for_readers`: before the first `ref_count` poll. Fired
+    /// from inside the wait, so it moves with it: a test that reads the
+    /// segment's state here sees whether the blocking paths claim before they
+    /// wait or after (#133).
+    pub(crate) const WAIT_BEFORE_POLL: u8 = 3;
+
+    /// What a test installs: called with the phase.
+    pub(crate) type Hook = Box<dyn FnMut(u8)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls the hook when dropped, so a failing test cannot leak it
+    /// onto the next test sharing this thread.
+    pub(crate) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Install `hook` on this thread until the returned guard drops.
+    pub(crate) fn install(hook: Hook) -> Installed {
+        HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        Installed
+    }
+
+    /// Run the installed hook, if any. It is taken out of the slot for the
+    /// duration of the call, so an acquire reached from *inside* the hook
+    /// runs unhooked (and cannot re-borrow the cell).
+    pub(crate) fn fire(phase: u8) {
+        let taken = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = taken {
+            hook(phase);
+            HOOK.with(|h| {
+                let mut slot = h.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
+}
+
 /// Minimal trait for key verification, used by hashtables.
 ///
 /// This is the only segment functionality the hashtable needs. By using this
