@@ -1209,6 +1209,11 @@ mod tests {
     ///
     /// Location-matched, so unlike [`assert_all_removed`] this stays honest on
     /// a segment whose state the key verifier refuses.
+    ///
+    /// Only `mod interposed` uses this, and that module is compiled out under
+    /// the model checkers, so the helper has to carry the same gate or it is
+    /// dead code there.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
     fn assert_none_indexed(
         hashtable: &MultiChoiceHashtable,
         keys: &[String],
