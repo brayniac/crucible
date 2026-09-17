@@ -249,6 +249,11 @@ pub(crate) mod interpose {
     /// is one that arrives while the segment is still admitting -- the arrival
     /// a `ref_count` read taken *before* the claim would miss (#133).
     pub(crate) const CLAIM_BEFORE_CAS: u8 = 2;
+    /// `layer::wait_for_readers`: before the first `ref_count` poll. Fired
+    /// from inside the wait, so it moves with it: a test that reads the
+    /// segment's state here sees whether the blocking paths claim before they
+    /// wait or after (#133).
+    pub(crate) const WAIT_BEFORE_POLL: u8 = 3;
 
     /// What a test installs: called with the phase.
     pub(crate) type Hook = Box<dyn FnMut(u8)>;

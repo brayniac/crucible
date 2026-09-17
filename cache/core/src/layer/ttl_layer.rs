@@ -1723,6 +1723,194 @@ mod tests {
             .expect("Failed to create test layer")
     }
 
+    /// Tests that drive a race by hand through `segment::interpose`.
+    ///
+    /// Gated off under the model checkers for the same reason the hook itself
+    /// is: a `std` thread-local inside a loom or shuttle execution is state
+    /// the checker cannot see.
+    #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
+    mod interposed {
+        use super::*;
+        use crate::hashtable_impl::MultiChoiceHashtable;
+        use crate::segment::interpose;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        fn filled_layer(count: usize, value_len: usize) -> (TtlLayer, MultiChoiceHashtable) {
+            let layer = create_test_layer();
+            let hashtable = MultiChoiceHashtable::new(10);
+            let value = vec![b'v'; value_len];
+            for i in 0..count {
+                let key = format!("k{i:03}");
+                let loc = layer
+                    .write_item(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .expect("write");
+                let verifier = SinglePoolVerifier { pool: &layer.pool };
+                let _ = hashtable.insert(key.as_bytes(), loc.to_location(), &verifier);
+            }
+            (layer, hashtable)
+        }
+
+        /// Install a reader that pins whichever segment is `Draining` at the
+        /// instant the evictor reaches its claim -- the one moment that
+        /// separates claim-before-count from count-before-claim. Returns the
+        /// cell naming the segment it pinned, and the hook guard, which must
+        /// outlive the call under test.
+        fn pin_inside_the_claim_window(
+            pool: &MemoryPool,
+        ) -> (Rc<Cell<Option<u32>>>, interpose::Installed) {
+            let pinned = Rc::new(Cell::new(None));
+            let flag = Rc::clone(&pinned);
+            let pool_ptr: *const MemoryPool = pool;
+            let hook = interpose::install(Box::new(move |phase| {
+                if phase != interpose::CLAIM_BEFORE_CAS || flag.get().is_some() {
+                    return;
+                }
+                // SAFETY: the caller keeps the layer alive at least as long as
+                // the returned guard, and the guard uninstalls this closure.
+                let pool = unsafe { &*pool_ptr };
+                for id in 0..pool.segment_count() as u32 {
+                    if let Some(seg) = pool.get(id)
+                        && seg.state() == State::Draining
+                    {
+                        assert!(
+                            seg.try_acquire_read(),
+                            "Draining admits a key-verify reader -- that is the whole \
+                             reason it is not an exclusive claim"
+                        );
+                        flag.set(Some(id));
+                        return;
+                    }
+                }
+                panic!("the claim window must be entered with the segment still Draining");
+            }));
+            (pinned, hook)
+        }
+
+        /// A segment pinned during the claim window must not be recycled.
+        ///
+        /// Red proof: swap the two lines in
+        /// `TtlLayer::process_evicted_segment_nonblocking` so the count is
+        /// read before the claim.
+        #[test]
+        fn eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
+            let (layer, hashtable) = filled_layer(24, 4096);
+            assert!(
+                layer.buckets.total_segment_count() > 1,
+                "the fill must chain more than one segment"
+            );
+
+            let id;
+            {
+                let (pinned, _hook) = pin_inside_the_claim_window(&layer.pool);
+                let _ = layer.evict_nonblocking(&hashtable);
+                id = pinned.get().expect("the hook must have run");
+            }
+
+            let seg = layer.pool.get(id).expect("segment");
+            assert_eq!(seg.ref_count(), 1, "the reader is still pinned");
+            assert_eq!(
+                seg.state(),
+                State::AwaitingRelease,
+                "the evictor recycled a segment pinned during its claim -- its count was \
+                 read before the claim, so the arrival was invisible (#133)"
+            );
+            seg.release_read();
+            assert_eq!(
+                seg.state(),
+                State::Free,
+                "the last reference out owes the AwaitingRelease -> Free handoff"
+            );
+        }
+
+        /// The same inversion on the demoting eviction path, which carried its
+        /// own copy of the count gate.
+        ///
+        /// Red proof: swap the two lines in
+        /// `TtlLayer::process_evicted_segment_with_demoter_nonblocking`.
+        #[test]
+        fn demoting_eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
+            let (layer, hashtable) = filled_layer(24, 4096);
+            assert!(layer.buckets.total_segment_count() > 1);
+
+            let id;
+            {
+                let (pinned, _hook) = pin_inside_the_claim_window(&layer.pool);
+                let _ = layer.evict_nonblocking_with_demoter(&hashtable, |_, _, _, _, _| {});
+                id = pinned.get().expect("the hook must have run");
+            }
+
+            let seg = layer.pool.get(id).expect("segment");
+            assert_eq!(seg.ref_count(), 1);
+            assert_eq!(
+                seg.state(),
+                State::AwaitingRelease,
+                "the demoting evictor recycled a segment pinned during its claim (#133)"
+            );
+            seg.release_read();
+            assert_eq!(seg.state(), State::Free);
+        }
+
+        /// And on the eager empty-segment reclaim, a third copy of the same
+        /// gate.
+        ///
+        /// Red proof: swap the two lines in `TtlLayer::try_free_empty_segment`.
+        #[test]
+        fn freeing_an_empty_segment_does_not_recycle_it_while_pinned_during_the_claim() {
+            let (layer, _hashtable) = filled_layer(24, 4096);
+            assert!(layer.buckets.total_segment_count() > 1);
+
+            // `try_free_empty_segment` only acts on a Sealed segment with no
+            // live items, so empty the head by hand -- going through the
+            // layer's own `mark_deleted` would trip the reclaim before the
+            // hook is installed.
+            let bucket = layer
+                .buckets
+                .iter()
+                .find(|b| b.segment_count() > 1)
+                .expect("a bucket whose head is sealed");
+            let head = bucket.head().expect("head");
+            let seg = layer.pool.get(head).expect("segment");
+            let mut offset = 0u32;
+            while offset < seg.write_offset() {
+                let Some(data) = seg.header_ptr(offset, BasicHeader::SIZE) else {
+                    break;
+                };
+                let Some(header) = (unsafe { BasicHeader::try_from_ptr(data) }) else {
+                    break;
+                };
+                let stride = seg.item_stride(header.padded_size());
+                let key_start =
+                    offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
+                let key = seg
+                    .data_slice(key_start as u32, header.key_len() as usize)
+                    .expect("key bytes")
+                    .to_vec();
+                seg.mark_deleted(offset, &key).expect("mark deleted");
+                offset += stride;
+            }
+            assert_eq!(seg.live_items(), 0, "the head must be empty");
+            assert_eq!(seg.state(), State::Sealed);
+
+            let id;
+            {
+                let (pinned, _hook) = pin_inside_the_claim_window(&layer.pool);
+                layer.try_free_empty_segment(head);
+                id = pinned.get().expect("the hook must have run");
+            }
+            assert_eq!(id, head);
+
+            assert_eq!(seg.ref_count(), 1);
+            assert_eq!(
+                seg.state(),
+                State::AwaitingRelease,
+                "the eager reclaim recycled a segment pinned during its claim (#133)"
+            );
+            seg.release_read();
+            assert_eq!(seg.state(), State::Free);
+        }
+    }
+
     /// A layer must accept writes again after `reset()`.
     ///
     /// `reset()` backs FLUSHALL. Resetting the pool alone leaves the TTL

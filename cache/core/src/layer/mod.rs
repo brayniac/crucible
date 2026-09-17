@@ -57,6 +57,9 @@ use crate::state::State;
 /// reader whose re-check saw an admitting state, and only the SC total order
 /// gives that. See [`crate::segment::Segment::ref_count_seqcst`] (#129).
 pub(crate) fn wait_for_readers<S: Segment>(segment: &S) {
+    #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+    crate::segment::interpose::fire(crate::segment::interpose::WAIT_BEFORE_POLL);
+
     let mut spins = 0u32;
     while segment.ref_count_seqcst() > 0 {
         if spins < 64 {

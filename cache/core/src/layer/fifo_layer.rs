@@ -1144,6 +1144,103 @@ mod tests {
             );
         }
 
+        /// The same inversion on the demoting eviction path.
+        ///
+        /// `evict_nonblocking_with_demoter` is the path `TieredCache` uses for
+        /// any layer with a `next_layer` -- the one that produces the disk
+        /// tier's demotions -- and it carried its own copy of the count gate.
+        ///
+        /// Red proof: swap the two lines in
+        /// `process_evicted_segment_with_demoter_nonblocking`.
+        #[test]
+        fn demoting_eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
+            let (layer, hashtable) = filled_layer(24, 4096);
+            assert!(layer.chain.segment_count() > 1, "need something to evict");
+            let head = layer.chain.head().expect("head");
+
+            let pinned = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let flag = std::rc::Rc::clone(&pinned);
+                let pool_ptr: *const MemoryPool = layer.pool();
+                let _hook = interpose::install(Box::new(move |phase| {
+                    if phase == interpose::CLAIM_BEFORE_CAS && !flag.get() {
+                        // SAFETY: `layer` outlives this hook guard.
+                        let seg = unsafe { &*pool_ptr }.get(head).expect("head segment");
+                        assert_eq!(seg.state(), State::Draining);
+                        assert!(seg.try_acquire_read());
+                        flag.set(true);
+                    }
+                }));
+
+                let _ = layer.evict_nonblocking_with_demoter(&hashtable, |_, _, _, _, _| {});
+            }
+
+            assert!(pinned.get(), "the hook must have run");
+            let seg = layer.pool().get(head).expect("head segment");
+            assert_eq!(seg.ref_count(), 1, "the reader is still pinned");
+            assert_eq!(
+                seg.state(),
+                State::AwaitingRelease,
+                "the demoting evictor recycled a segment pinned during its claim (#133)"
+            );
+            seg.release_read();
+            assert_eq!(seg.state(), State::Free);
+        }
+
+        /// The state the blocking paths are in while they wait out readers.
+        ///
+        /// `wait_for_readers` fires `WAIT_BEFORE_POLL` from inside itself, so
+        /// the probe moves with the wait: whatever the caller does before
+        /// calling it is already published when this fires. `Locked` means the
+        /// claim came first. `Draining` means the wait came first, which is
+        /// #133 on the blocking path -- `Draining` still admits key-verify
+        /// readers, so the zero the spin converges on can be invalidated by an
+        /// arrival before the `Locked` CAS lands.
+        ///
+        /// Red proof: put `wait_for_readers` back in front of the claim in
+        /// `layer::claim_and_wait_for_readers`.
+        #[test]
+        fn blocking_eviction_holds_the_claim_while_it_waits() {
+            for demoting in [false, true] {
+                let (layer, hashtable) = filled_layer(24, 4096);
+                assert!(layer.chain.segment_count() > 1);
+
+                let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+                {
+                    let cell = std::rc::Rc::clone(&observed);
+                    let pool_ptr: *const MemoryPool = layer.pool();
+                    let _hook = interpose::install(Box::new(move |phase| {
+                        if phase == interpose::WAIT_BEFORE_POLL && cell.get().is_none() {
+                            // SAFETY: `layer` outlives this hook guard.
+                            let pool = unsafe { &*pool_ptr };
+                            for id in 0..pool.segment_count() as u32 {
+                                if let Some(seg) = pool.get(id)
+                                    && matches!(seg.state(), State::Draining | State::Locked)
+                                {
+                                    cell.set(Some(seg.state()));
+                                    return;
+                                }
+                            }
+                        }
+                    }));
+
+                    if demoting {
+                        layer.evict_with_demoter(&hashtable, |_, _, _, _, _| {});
+                    } else {
+                        layer.evict(&hashtable);
+                    }
+                }
+
+                assert_eq!(
+                    observed.get(),
+                    Some(State::Locked),
+                    "the blocking eviction path (demoting={demoting}) waited for readers \
+                     while the segment was still admitting them -- it must claim first \
+                     (#133)"
+                );
+            }
+        }
+
         /// The exclusive claim must refuse every class of fresh reader.
         ///
         /// This is what makes a post-claim count read final: `Draining` admits
