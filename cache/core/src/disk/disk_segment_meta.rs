@@ -95,16 +95,6 @@ unsafe impl Sync for DiskSegmentMeta {}
 impl DiskSegmentMeta {
     const INVALID_BUCKET_ID: u16 = 0xFFFF;
 
-    /// The segment state, loaded `SeqCst` -- the reader half of the Dekker
-    /// pair. Only for the post-increment re-check of a two-phase acquire; see
-    /// [`crate::segment::try_acquire_pin`], which is that protocol's one body
-    /// and which the acquires in this file route through. The three remaining
-    /// hand-rolled re-checks in `disk::io_uring_layer` still call this.
-    #[inline]
-    pub(crate) fn state_seqcst(&self) -> State {
-        Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
-    }
-
     /// Create a new disk segment metadata entry.
     ///
     /// # Parameters
