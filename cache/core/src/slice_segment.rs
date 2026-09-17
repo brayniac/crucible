@@ -1524,7 +1524,7 @@ impl SliceSegment<'_> {
     /// AwaitingRelease state *or* a reader has pinned it again since the
     /// caller's decrement. The whole transition, including that
     /// re-validation and why it is needed, lives in
-    /// [`crate::segment::try_free_condemned`] -- this is the `SliceSegment`
+    /// `segment::try_free_condemned` -- this is the `SliceSegment`
     /// entry point to it, which additionally zeroes `merge_count`.
     pub fn release_condemned(&self) -> bool {
         // SAFETY: `free_queue` is the pool's queue, valid for the pool's
