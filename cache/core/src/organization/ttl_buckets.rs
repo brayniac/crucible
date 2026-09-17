@@ -670,10 +670,16 @@ impl TtlBucket {
 
         // Race fix: if readers dropped during the transition window above,
         // the segments would be stuck in AwaitingRelease with ref_count == 0.
-        if src_a.ref_count() == 0 {
+        //
+        // `ref_count_seqcst`: the condemner half of the Dekker pair. These
+        // loads must be ordered after the `Relinking -> AwaitingRelease` CASes
+        // above in the SC total order, or they can miss a decrement the last
+        // reader had already published -- and nothing sweeps AwaitingRelease,
+        // so the segment leaks (#129).
+        if src_a.ref_count_seqcst() == 0 {
             src_a.release_condemned();
         }
-        if src_b.ref_count() == 0 {
+        if src_b.ref_count_seqcst() == 0 {
             src_b.release_condemned();
         }
 
@@ -794,7 +800,12 @@ impl TtlBucket {
 
                 // Race fix: if last reader dropped during the transition window,
                 // the segment would be stuck in AwaitingRelease with ref_count == 0.
-                if src.ref_count() == 0 {
+                //
+                // `ref_count_seqcst`: ordered after the
+                // `Relinking -> AwaitingRelease` CAS just above -- see the
+                // matching note in `replace_pair_with_spare` and
+                // `Segment::ref_count_seqcst` (#129).
+                if src.ref_count_seqcst() == 0 {
                     src.release_condemned();
                 }
             }

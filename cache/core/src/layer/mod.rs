@@ -38,9 +38,18 @@ use crate::segment::Segment;
 /// Spins briefly using `spin_loop` hints for low-latency cases, then
 /// falls back to `thread::yield_now()` to avoid starving other work
 /// on the core.
+///
+/// `ref_count_seqcst`, not `ref_count`. Every caller reaches here after a
+/// `Sealed -> Draining` CAS and leaves it to take `Draining -> Locked` and
+/// rewrite the segment's bytes, so this spin is the load half of the Dekker
+/// pair with each reader's (store `ref_count`, load state). Repeating the load
+/// does not rescue an `Acquire` one: the guarantee needed is that the
+/// *observation of zero* cannot coexist with a reader whose re-check saw an
+/// admitting state, and only the SC total order gives that. See
+/// [`crate::segment::Segment::ref_count_seqcst`] (#129).
 pub(crate) fn wait_for_readers<S: Segment>(segment: &S) {
     let mut spins = 0u32;
-    while segment.ref_count() > 0 {
+    while segment.ref_count_seqcst() > 0 {
         if spins < 64 {
             std::hint::spin_loop();
         } else {

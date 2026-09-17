@@ -211,6 +211,10 @@ impl Segment for FileSegment<'_> {
         self.inner.ref_count()
     }
 
+    fn ref_count_seqcst(&self) -> u32 {
+        self.inner.ref_count_seqcst()
+    }
+
     #[inline]
     fn state(&self) -> State {
         self.inner.state()

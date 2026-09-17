@@ -215,6 +215,48 @@ impl State {
     pub fn is_evictable(self) -> bool {
         matches!(self, State::Sealed)
     }
+
+    /// Whether a *fresh* guard acquire (`get_item`, `get_item_verified`,
+    /// `get_value_ref_raw`) is admitted in this state.
+    #[inline]
+    fn admits_guard_reader(self) -> bool {
+        self.is_readable() && !self.is_condemned()
+    }
+
+    /// Whether a *fresh* key-verify acquire (`try_acquire_read`) is admitted
+    /// in this state. Wider than [`Self::admits_guard_reader`] by `Draining`,
+    /// which is what lets the demoter verify keys on a segment it is draining.
+    #[inline]
+    fn admits_verify_reader(self) -> bool {
+        self.holds_valid_data() && !self.is_condemned()
+    }
+}
+
+/// Whether a state transition *narrows* fresh reader admission -- i.e. some
+/// class of reader that could pin the segment before it cannot after.
+///
+/// This is the test for whether a `cas_metadata` is the condemner half of the
+/// drain/pin Dekker pair, and therefore whether it must be `SeqCst`. A
+/// narrowing CAS is the store the condemner performs immediately before
+/// loading `ref_count`; the reader performs the mirror image (store
+/// `ref_count`, load the state). Acquire/release permits both loads to come
+/// back stale, letting both sides proceed. See
+/// [`crate::segment::Segment::ref_count_seqcst`] for the full argument.
+///
+/// True for `Sealed -> Draining` (shuts out guard readers),
+/// `Draining -> Locked` and `Draining -> AwaitingRelease` (shut out the
+/// key-verify readers `Draining` still admitted), and
+/// `Relinking -> AwaitingRelease` (the merge paths).
+///
+/// False for everything else: `Live -> Sealed` and `Sealed -> Relinking` do
+/// not change admission, the eleven chain-pointer identity CASes in
+/// `organization/` do not change state at all, `Locked -> Reserved` and
+/// `Reserved -> Free` are already exclusive, and `Draining -> Sealed` (the
+/// chain's revert) *widens*. Marking those `SeqCst` would be noise.
+#[inline]
+pub(crate) fn transition_excludes_readers(from: State, to: State) -> bool {
+    (from.admits_guard_reader() && !to.admits_guard_reader())
+        || (from.admits_verify_reader() && !to.admits_verify_reader())
 }
 
 /// Packed representation of segment metadata in a single AtomicU64.

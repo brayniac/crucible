@@ -800,12 +800,18 @@ impl Drop for BasicItemGuard<'_> {
     fn drop(&mut self) {
         use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
 
-        let prev_count = self.ref_count.fetch_sub(1, Ordering::Release);
+        // SeqCst: the release half of the drain/condemn Dekker pair. This
+        // thread stores `ref_count` then loads the state; the condemner stores
+        // `AwaitingRelease` then loads `ref_count`. Under acquire/release both
+        // loads may go stale, so each side concludes the other will free the
+        // segment and it strands in `AwaitingRelease` with `ref_count == 0`.
+        // See `Segment::ref_count_seqcst` (#129).
+        let prev_count = self.ref_count.fetch_sub(1, Ordering::SeqCst);
 
         // If we were the last reader (prev_count == 1 means new count is 0)
         if prev_count == 1 {
             // Check if segment is condemned and needs release
-            let packed = self.metadata.load(Ordering::Acquire);
+            let packed = self.metadata.load(Ordering::SeqCst);
             let meta = Metadata::unpack(packed);
 
             if meta.state == State::AwaitingRelease {
@@ -828,12 +834,7 @@ impl Drop for BasicItemGuard<'_> {
 
                 if self
                     .metadata
-                    .compare_exchange(
-                        packed,
-                        new_meta.pack(),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange(packed, new_meta.pack(), Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
                     // Push to free queue

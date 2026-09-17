@@ -276,11 +276,20 @@ impl TtlLayer {
             None => return true,
         };
 
-        if segment.ref_count() > 0 {
+        // `ref_count_seqcst`: this thread reached here through the bucket's
+        // `Sealed -> Draining` CAS, which shuts out fresh guard acquires. That
+        // CAS is the store and this is the load of the Dekker pair with every
+        // reader's (store ref_count, load state) -- see
+        // `Segment::ref_count_seqcst` (#129).
+        if segment.ref_count_seqcst() > 0 {
             self.drain_segment_from_hashtable(segment_id, hashtable);
             segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
             // Race fix: reclaim if last reader dropped during the window above.
-            if segment.ref_count() == 0 && segment.release_condemned() {
+            // The condemner half of the Dekker pair: this load must be ordered
+            // after the CAS above in the SC total order, or it can miss a
+            // decrement the last reader had already published and the segment
+            // strands in AwaitingRelease with ref_count == 0 (#129).
+            if segment.ref_count_seqcst() == 0 && segment.release_condemned() {
                 return true;
             }
             return false;
@@ -435,7 +444,10 @@ impl TtlLayer {
         }
 
         // All items processed. Try to release the segment.
-        if segment.ref_count() == 0 {
+        // `ref_count_seqcst`: ordered after the `Sealed -> Draining` CAS the
+        // caller took, so a reader that pinned before it cannot be missed here
+        // and then have its bytes rewritten by the `Locked` branch (#129).
+        if segment.ref_count_seqcst() == 0 {
             segment.cas_metadata(State::Draining, State::Locked, None, None);
             segment.cas_metadata(State::Locked, State::Reserved, None, None);
             self.pool.release(segment_id);
@@ -445,13 +457,22 @@ impl TtlLayer {
         // Readers still active — let last reader free it.
         segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
         // Race fix: reclaim if last reader dropped during the window above.
-        if segment.ref_count() == 0 && segment.release_condemned() {
+        // The condemner half of the Dekker pair: this load must be ordered
+        // after the CAS above in the SC total order, or it can miss a
+        // decrement the last reader had already published and the segment
+        // strands in AwaitingRelease with ref_count == 0 (#129).
+        if segment.ref_count_seqcst() == 0 && segment.release_condemned() {
             return true;
         }
         false
     }
 
     /// Emergency eviction: find any Sealed segment with ref_count == 0 and evict it.
+    ///
+    /// Plain `ref_count()` on purpose -- see `FifoLayer::emergency_evict`.
+    /// The scan publishes no transition of its own, so the load is ordered
+    /// against nothing; the exclusive claim is downstream in
+    /// `evict_head_segment`/`remove_segment` and `process_evicted_segment`.
     fn emergency_evict_from_buckets<H: Hashtable>(&self, hashtable: &H) -> bool {
         let num_segments = self.pool.segment_count();
         for i in 0..num_segments {
@@ -811,11 +832,16 @@ impl TtlLayer {
 
         if let Some(id) = removed_id {
             if let Some(seg) = self.pool.get(id) {
-                if seg.ref_count() > 0 {
+                // `ref_count_seqcst`: `evict_head_segment`/`remove_segment`
+                // just CASed `Sealed -> Draining`, which is the store half of
+                // the Dekker pair this load completes (#129).
+                if seg.ref_count_seqcst() > 0 {
                     // Segment has active readers - defer to last reader's drop
                     seg.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
-                    // Race fix: reclaim if last reader dropped during the window above.
-                    if seg.ref_count() == 0 {
+                    // Race fix: reclaim if last reader dropped during the window
+                    // above. SeqCst so the load is ordered after that CAS, or a
+                    // segment strands in AwaitingRelease with ref_count == 0.
+                    if seg.ref_count_seqcst() == 0 {
                         seg.release_condemned();
                     }
                 } else {

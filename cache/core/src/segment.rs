@@ -232,7 +232,47 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     fn live_bytes(&self) -> u32;
 
     /// Get the current reference count (active readers).
+    ///
+    /// `Acquire`. Use this for statistics, diagnostics, and heuristic scans --
+    /// anywhere a stale answer is merely suboptimal. When the answer *gates* an
+    /// action that is exclusive against readers, use [`Self::ref_count_seqcst`].
     fn ref_count(&self) -> u32;
+
+    /// Get the current reference count, ordered after a preceding `SeqCst`
+    /// state transition -- the condemner half of the Dekker pair.
+    ///
+    /// The drain/condemn protocol is a store-buffering (Dekker) pattern:
+    ///
+    /// ```text
+    /// reader (try_acquire_read / get_item / get_value_ref_raw):
+    ///     ref_count.fetch_add(1)   // store
+    ///     load state               // load  -> back out if inaccessible
+    ///
+    /// condemner (the layers' evict paths):
+    ///     cas state -> Draining / AwaitingRelease   // store
+    ///     load ref_count                            // load -> act if zero
+    /// ```
+    ///
+    /// Acquire/release does **not** forbid the outcome where both loads come
+    /// back stale: the reader's re-check still sees an admitting state while
+    /// the condemner sees `ref_count == 0`, so both proceed and the condemner
+    /// clears or frees the segment under a live reader. Only the `SeqCst`
+    /// total order rules it out, and only if *both* halves are `SeqCst` --
+    /// which is why the reader's `fetch_add` and re-check are `SeqCst` too.
+    /// This is the same reason crossbeam-epoch's `pin()` is `SeqCst`.
+    ///
+    /// Note that no in-tree tool can *prove* the distinction. loom
+    /// over-approximates and reports the store-buffering outcome even for a
+    /// pure-`SeqCst` litmus, so it is green either way; shuttle executes
+    /// sequentially consistently and so treats an AcqRel program as `SeqCst`,
+    /// so it is green either way too. The justification is the memory model
+    /// plus precedent (pelikan-io/cache-rs `SegmentHeader::ref_count_seqcst`),
+    /// not a red test. See crucible#129.
+    ///
+    /// A load that is *not* preceded by a transition it must be ordered
+    /// against gains nothing from `SeqCst` -- see the call sites for which are
+    /// which.
+    fn ref_count_seqcst(&self) -> u32;
 
     // ========== State Machine ==========
 

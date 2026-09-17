@@ -202,12 +202,14 @@ impl Drop for ValueRef {
     ///
     /// ## Memory Ordering
     ///
-    /// - `Ordering::Release` on fetch_sub: ensures all reads complete before
-    ///   checking the state
-    /// - `Ordering::Acquire` fence: ensures we see the AwaitingRelease state
-    ///   written by the eviction thread
-    /// - `Ordering::AcqRel` on CAS: combines acquire (see other threads' writes)
-    ///   and release (make our changes visible)
+    /// - `Ordering::SeqCst` on fetch_sub: releases our reads *and* puts the
+    ///   decrement in the single total order, so it cannot be missed by a
+    ///   condemner that stored `AwaitingRelease` before loading `ref_count`.
+    ///   A plain `Release` leaves the store half unordered against that load
+    ///   and lets both sides defer the free to the other (#129).
+    /// - `Ordering::SeqCst` fence and state load: the load half of the same
+    ///   pair; it must be ordered after our own decrement in that total order.
+    /// - `Ordering::SeqCst` on CAS: the commit point of the handoff.
     ///
     /// ## Safety
     ///
@@ -216,15 +218,21 @@ impl Drop for ValueRef {
     /// the free queue.
     fn drop(&mut self) {
         // SAFETY: ref_count is a valid AtomicU32 pointer from the segment
-        let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::Release) };
+        // SeqCst: the release half of the drain/condemn Dekker pair -- this
+        // thread stores `ref_count` then loads the state, the condemner stores
+        // `AwaitingRelease` then loads `ref_count`. Acquire/release permits
+        // both loads to go stale, which is the `AwaitingRelease` strand of
+        // #129. See `Segment::ref_count_seqcst`.
+        let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::SeqCst) };
 
         // If we were the last reader and this segment has auto-release info,
         // check if the segment is condemned (AwaitingRelease) and free it.
         if prev_count == 1 && !self.metadata.is_null() {
-            // Acquire fence to see the AwaitingRelease state written by eviction thread
-            std::sync::atomic::fence(Ordering::Acquire);
+            // SeqCst fence, so the state load below is ordered after this
+            // thread's decrement in the single total order.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
-            let packed = unsafe { (*self.metadata).load(Ordering::Acquire) };
+            let packed = unsafe { (*self.metadata).load(Ordering::SeqCst) };
             let meta = Metadata::unpack(packed);
             if meta.state == State::AwaitingRelease {
                 // AwaitingRelease -> Free ends a used incarnation, so the tag
@@ -247,8 +255,8 @@ impl Drop for ValueRef {
                     (*self.metadata).compare_exchange(
                         packed,
                         new_meta.pack(),
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
                     )
                 }
                 .is_ok()

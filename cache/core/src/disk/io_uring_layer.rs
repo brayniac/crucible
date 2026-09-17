@@ -247,10 +247,14 @@ impl IoUringDiskLayer {
 
         // Increment ref_count before reading
         let ref_count_ptr = segment.ref_count_ptr();
-        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::Acquire) };
+        // SeqCst, both halves -- the reader side of the Dekker pair with the
+        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
+        // both loads come back stale and both sides proceed. See
+        // `Segment::ref_count_seqcst` (#129).
+        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::SeqCst) };
 
         // Double-check state after increment
-        let state_after = segment.state();
+        let state_after = segment.state_seqcst();
         if !state_after.is_readable() || state_after.is_condemned() {
             self.release_segment_ref(segment);
             return None;
@@ -351,10 +355,14 @@ impl IoUringDiskLayer {
 
         // Increment ref_count to prevent eviction during async read
         let ref_count_ptr = segment.ref_count_ptr();
-        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::Acquire) };
+        // SeqCst, both halves -- the reader side of the Dekker pair with the
+        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
+        // both loads come back stale and both sides proceed. See
+        // `Segment::ref_count_seqcst` (#129).
+        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::SeqCst) };
 
         // Double-check state after increment
-        let state_after = segment.state();
+        let state_after = segment.state_seqcst();
         if !state_after.is_readable() || state_after.is_condemned() {
             self.release_segment_ref(segment);
             return None;
@@ -452,12 +460,14 @@ impl IoUringDiskLayer {
     /// only on that condemned path -- a back-out from a live segment must not
     /// detach the buffer it is still writing into.
     fn release_segment_ref(&self, segment: &DiskSegmentMeta) {
-        let prev = unsafe { (*segment.ref_count_ptr()).fetch_sub(1, Ordering::Release) };
+        // SeqCst -- the release half of the handoff Dekker pair; see
+        // `SliceSegment::release_ref` and `Segment::ref_count_seqcst` (#129).
+        let prev = unsafe { (*segment.ref_count_ptr()).fetch_sub(1, Ordering::SeqCst) };
         if prev == 1 {
             // Fence before reading the state, so we see the `AwaitingRelease`
             // the evictor published -- same order as `SliceSegment::release_ref`.
-            fence(Ordering::Acquire);
-            if segment.state() != State::AwaitingRelease {
+            fence(Ordering::SeqCst);
+            if segment.state_seqcst() != State::AwaitingRelease {
                 return;
             }
             if let Some(buf) = segment.detach_write_buffer() {
@@ -473,11 +483,13 @@ impl IoUringDiskLayer {
     pub fn release_read(&self, segment_id: u32) {
         if let Some(segment) = self.pool.get(segment_id) {
             let ref_count_ptr = segment.ref_count_ptr();
-            let prev = unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::Release) };
+            // SeqCst -- the release half of the handoff Dekker pair; see
+            // `SliceSegment::release_ref` and `Segment::ref_count_seqcst`.
+            let prev = unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::SeqCst) };
 
             // Check if this was the last reader and segment is condemned
             if prev == 1 {
-                fence(Ordering::Acquire);
+                fence(Ordering::SeqCst);
                 // Return write buffer before releasing condemned segment
                 if let Some(buf) = segment.detach_write_buffer() {
                     self.buffer_pool.lock().unwrap().release(buf);
@@ -664,12 +676,18 @@ impl IoUringDiskLayer {
             queue.retain(|req| req.segment_id != segment_id);
         }
 
-        if segment.ref_count() > 0 {
+        // `ref_count_seqcst`: this thread reached here through a
+        // `Sealed -> Draining` CAS, the store half of the Dekker pair this
+        // load completes -- see `Segment::ref_count_seqcst` (#129).
+        if segment.ref_count_seqcst() > 0 {
             self.drain_segment_from_hashtable(segment_id, hashtable);
             segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
 
-            // Re-check ref_count after CAS to handle race
-            if segment.ref_count() == 0 {
+            // Re-check ref_count after CAS to handle race. SeqCst so the load
+            // is ordered after that CAS in the total order; otherwise it can
+            // miss a decrement already published and the segment strands in
+            // AwaitingRelease with ref_count == 0.
+            if segment.ref_count_seqcst() == 0 {
                 if let Some(buf) = segment.detach_write_buffer() {
                     self.buffer_pool.lock().unwrap().release(buf);
                 }
@@ -832,10 +850,14 @@ impl Layer for IoUringDiskLayer {
 
         // Build a BasicItemGuard from the write buffer data
         let ref_count_ptr = segment.ref_count_ptr();
-        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::Acquire) };
+        // SeqCst, both halves -- the reader side of the Dekker pair with the
+        // condemner's (CAS the state, load `ref_count`). Acquire/release lets
+        // both loads come back stale and both sides proceed. See
+        // `Segment::ref_count_seqcst` (#129).
+        unsafe { (*ref_count_ptr).fetch_add(1, Ordering::SeqCst) };
 
         // Double-check state after increment
-        let state_after = segment.state();
+        let state_after = segment.state_seqcst();
         if !state_after.is_readable() || state_after.is_condemned() {
             self.release_segment_ref(segment);
             return None;

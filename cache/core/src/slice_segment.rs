@@ -129,6 +129,25 @@ impl<'a> SliceSegment<'a> {
     const POOL_ID_MASK: u8 = 0x03;
     const PER_ITEM_TTL_BIT: u8 = 0x04;
 
+    /// The segment state, loaded `SeqCst` -- the reader half of the Dekker
+    /// pair with the condemner.
+    ///
+    /// Only for the *post-increment re-check* of a two-phase acquire. Pairing
+    /// a `SeqCst` `fetch_add` with an `Acquire` re-check buys nothing: both
+    /// accesses have to sit in the single total order for it to forbid the
+    /// outcome where the reader's re-check sees an admitting state while the
+    /// condemner's `ref_count` load sees zero. See
+    /// [`crate::segment::Segment::ref_count_seqcst`] for the full argument and
+    /// for why no in-tree tool can turn it red.
+    ///
+    /// The *pre*-increment check stays `Acquire`: it is a pure fast path whose
+    /// answer is re-derived after the increment, and it is ordered against
+    /// nothing this thread has stored.
+    #[inline]
+    fn state_seqcst(&self) -> State {
+        Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
+    }
+
     /// Create a new segment from a data pointer.
     ///
     /// # Safety
@@ -486,10 +505,16 @@ impl<'a> SliceSegment<'a> {
             return Err(CacheError::SegmentNotAccessible);
         }
 
-        self.ref_count.fetch_add(1, Ordering::Acquire);
+        // SeqCst, both halves. This increment and the re-check below race the
+        // condemner's mirror image (CAS the state, then load `ref_count`) --
+        // store-buffering / Dekker. Acquire/release permits both loads to come
+        // back stale, so the condemner frees or clears the segment while this
+        // reader believes it holds a valid pin. Only the SeqCst total order
+        // forbids it. See `Segment::ref_count_seqcst` (#129).
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
 
         // Double-check state after increment
-        let state_after = self.state();
+        let state_after = self.state_seqcst();
         if !state_after.is_readable() || state_after.is_condemned() {
             self.release_ref();
             return Err(CacheError::SegmentNotAccessible);
@@ -771,8 +796,12 @@ impl SegmentKeyVerify for SliceSegment<'_> {
         if !state.holds_valid_data() || state.is_condemned() {
             return false;
         }
-        self.ref_count.fetch_add(1, Ordering::Acquire);
-        let state_after = self.state();
+        // SeqCst, both halves -- see `get_item`. Same Dekker pair, with a
+        // wider admitting predicate: `Draining` is admitted here, so this pin
+        // is only ordered against the `AwaitingRelease` and `Locked`
+        // transitions, not against `Sealed -> Draining`.
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
+        let state_after = self.state_seqcst();
         if !state_after.holds_valid_data() || state_after.is_condemned() {
             self.release_ref();
             return false;
@@ -895,6 +924,10 @@ impl Segment for SliceSegment<'_> {
 
     fn ref_count(&self) -> u32 {
         self.ref_count.load(Ordering::Acquire)
+    }
+
+    fn ref_count_seqcst(&self) -> u32 {
+        self.ref_count.load(Ordering::SeqCst)
     }
 
     fn state(&self) -> State {
@@ -1027,13 +1060,32 @@ impl Segment for SliceSegment<'_> {
             new_meta
         };
 
+        // The transitions that *end* reader admission are the condemner half
+        // of the Dekker pair with every two-phase acquire: this CAS is the
+        // store, and the `ref_count_seqcst()` load the caller makes next is
+        // the load. Both have to sit in the SC total order, so the CAS is
+        // `SeqCst` for those and `AcqRel` for the rest.
+        //
+        // `Draining -> AwaitingRelease` shuts out every reader;
+        // `Draining -> Locked` shuts out the `holds_valid_data` readers that
+        // `Draining` still admitted and is the point past which the evictor
+        // rewrites segment bytes. `Sealed -> Draining` is the store the
+        // guard-path readers (`is_readable()`, which excludes `Draining`)
+        // pair against, and the layers load `ref_count` right after it.
+        //
+        // Everything else -- chain-pointer rewrites, `Locked -> Reserved`,
+        // `Reserved -> Free`, the `Relinking` shuffles -- is either mid-life
+        // or already exclusive, and stays `AcqRel`. Blanket-SeqCst here would
+        // be noise on the merge paths' eleven identity CASes.
+        let (success, failure) =
+            if crate::state::transition_excludes_readers(expected_state, new_state) {
+                (Ordering::SeqCst, Ordering::SeqCst)
+            } else {
+                (Ordering::AcqRel, Ordering::Acquire)
+            };
+
         self.metadata
-            .compare_exchange(
-                current,
-                new_meta.pack(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(current, new_meta.pack(), success, failure)
             .is_ok()
     }
 
@@ -1444,10 +1496,17 @@ impl SliceSegment<'_> {
     /// now land on a condemned segment (see #127), and the last one out has to
     /// release it or nobody will.
     fn release_ref(&self) {
-        let prev = self.ref_count.fetch_sub(1, Ordering::Release);
+        // SeqCst: the release side of the handoff is the other Dekker pair.
+        // This thread stores `ref_count` then loads the state; the condemner
+        // stores `AwaitingRelease` then loads `ref_count`. If both loads may
+        // go stale, each side concludes the other will free the segment and
+        // neither does -- the `AwaitingRelease` strand of #129. The
+        // `fetch_sub`'s store half is what has to be in the total order, so
+        // `Release` is not enough. See `Segment::ref_count_seqcst`.
+        let prev = self.ref_count.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
-            fence(Ordering::Acquire);
-            if Metadata::unpack(self.metadata.load(Ordering::Acquire)).state
+            fence(Ordering::SeqCst);
+            if Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
                 == State::AwaitingRelease
             {
                 self.release_condemned();
@@ -1470,7 +1529,13 @@ impl SliceSegment<'_> {
     /// pushes to the free queue. The losers observe the changed word and return
     /// false.
     pub fn release_condemned(&self) -> bool {
-        let current = self.metadata.load(Ordering::Acquire);
+        // SeqCst on the load and the CAS: this is the commit point of the
+        // condemned handoff, reached from both halves of the Dekker pair (the
+        // last reader's `release_ref` and the evictor's `ref_count == 0` race
+        // fix). Its load has to be ordered after whichever of those the caller
+        // just performed, or a caller can observe a pre-condemn word and
+        // decline a release it owes. See `Segment::ref_count_seqcst`.
+        let current = self.metadata.load(Ordering::SeqCst);
         let current_meta = Metadata::unpack(current);
 
         if current_meta.state != State::AwaitingRelease {
@@ -1487,12 +1552,7 @@ impl SliceSegment<'_> {
 
         if self
             .metadata
-            .compare_exchange(
-                current,
-                new_meta.pack(),
-                Ordering::Release,
-                Ordering::Acquire,
-            )
+            .compare_exchange(current, new_meta.pack(), Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
             // Reset merge count
@@ -1527,10 +1587,16 @@ impl SegmentGuard for SliceSegment<'_> {
             return Err(CacheError::SegmentNotAccessible);
         }
 
-        self.ref_count.fetch_add(1, Ordering::Acquire);
+        // SeqCst, both halves. This increment and the re-check below race the
+        // condemner's mirror image (CAS the state, then load `ref_count`) --
+        // store-buffering / Dekker. Acquire/release permits both loads to come
+        // back stale, so the condemner frees or clears the segment while this
+        // reader believes it holds a valid pin. Only the SeqCst total order
+        // forbids it. See `Segment::ref_count_seqcst` (#129).
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
 
         // Double-check state after increment
-        let state_after = self.state();
+        let state_after = self.state_seqcst();
         if !state_after.is_readable() || state_after.is_condemned() {
             self.release_ref();
             return Err(CacheError::SegmentNotAccessible);
@@ -1558,10 +1624,16 @@ impl SegmentGuard for SliceSegment<'_> {
             return Err(CacheError::SegmentNotAccessible);
         }
 
-        self.ref_count.fetch_add(1, Ordering::Acquire);
+        // SeqCst, both halves. This increment and the re-check below race the
+        // condemner's mirror image (CAS the state, then load `ref_count`) --
+        // store-buffering / Dekker. Acquire/release permits both loads to come
+        // back stale, so the condemner frees or clears the segment while this
+        // reader believes it holds a valid pin. Only the SeqCst total order
+        // forbids it. See `Segment::ref_count_seqcst` (#129).
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
 
         // Double-check state after increment
-        let state_after = self.state();
+        let state_after = self.state_seqcst();
         if !state_after.is_readable() || state_after.is_condemned() {
             self.release_ref();
             return Err(CacheError::SegmentNotAccessible);
