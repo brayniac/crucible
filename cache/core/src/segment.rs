@@ -12,8 +12,122 @@
 
 use crate::error::CacheError;
 use crate::item::ItemGuard;
-use crate::state::State;
+use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
+use crate::sync::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
+
+/// The single commit point for `AwaitingRelease -> Free`: free a condemned
+/// segment and return it to the pool's free queue, iff it is genuinely
+/// unreferenced.
+///
+/// Every condemned-free path in the crate routes through here --
+/// `SliceSegment::release_condemned` (and through it `release_ref` and the
+/// layers' race fixes), `DiskSegmentMeta::release_condemned`,
+/// `BasicItemGuard::drop`, and `ValueRef::drop`. They used to carry four
+/// copies of this CAS, which is how the re-validation below came to be needed
+/// in four places at once; one body means one place to get it right and one
+/// place to test.
+///
+/// `on_freed` runs after a winning CAS and before the push, for per-segment
+/// bookkeeping the caller owns (`SliceSegment` zeroes `merge_count` there).
+/// It must not run when the CAS loses, and it must not be visible to whoever
+/// picks the segment off the free queue -- hence before the push, not after.
+///
+/// Returns `true` only for the caller that actually performed the transition.
+///
+/// # Safe to race
+///
+/// The CAS names the exact metadata word it loaded, so of any number of
+/// concurrent callers at most one can succeed, and only that one pushes to
+/// the free queue. The losers observe the changed word and return `false`.
+///
+/// # Why `prev == 1` is not enough on its own
+///
+/// Callers reach here off a `fetch_sub` that returned 1. That says the count
+/// *was* 1. By the time the state load below runs, another reader may have
+/// pinned the segment again -- legitimately, because the pin happens while
+/// the segment is still `Sealed`, before the evictor condemns it. So the
+/// sequence
+///
+/// ```text
+/// reader A: fetch_sub -> prev == 1 (count now 0)
+/// reader B: fetch_add on a still-Sealed segment, re-check passes -> pinned
+/// evictor : sees ref_count == 1, condemns -> AwaitingRelease
+/// reader A: loads the state, sees AwaitingRelease, frees
+/// ```
+///
+/// frees the segment under B's live reference. Re-reading `ref_count` here is
+/// what closes it: A declines, and B's own drop -- which will see
+/// `prev == 1` and `AwaitingRelease` -- completes the handoff. Under the
+/// SeqCst orderings this path uses, B's pin cannot be missed by this load:
+/// B's `fetch_add` precedes its re-check, which saw a pre-condemn state and so
+/// precedes the condemn CAS, which precedes the state load below.
+///
+/// Found by `shuttle_reader_never_coexists_with_committed_drain`; pinned
+/// deterministically by `segment::tests::condemned_segment_is_not_freed_*`.
+///
+/// # Safety
+///
+/// `free_queue` must point to the pool's free queue and remain valid for the
+/// pool's lifetime; `segment_id` must be this segment's id within that pool.
+/// `#[inline]`: this sits on the hot path. `BasicItemGuard::drop` and
+/// `ValueRef::drop` reach it on every GET whose guard was the last reference,
+/// which is the common case, and the early return for a non-condemned segment
+/// is a single load and branch. It inlines at all six call sites today; the
+/// attribute is here so that stays deliberate.
+#[inline]
+pub(crate) unsafe fn try_free_condemned<F: FnOnce()>(
+    ref_count: &AtomicU32,
+    metadata: &AtomicU64,
+    free_queue: *const crossbeam_deque::Injector<u32>,
+    segment_id: u32,
+    on_freed: F,
+) -> bool {
+    // SeqCst on the load and the CAS: this is the commit point of the
+    // condemned handoff, reached from both halves of the Dekker pair (the last
+    // reader's decrement and the evictor's `ref_count == 0` race fix). This
+    // load has to be ordered after whichever of those the caller just
+    // performed, or a caller can observe a pre-condemn word and decline a
+    // release it owes. See [`Segment::ref_count_seqcst`].
+    let packed = metadata.load(Ordering::SeqCst);
+    let meta = Metadata::unpack(packed);
+
+    if meta.state != State::AwaitingRelease {
+        return false;
+    }
+
+    // Re-validate the caller's `prev == 1` -- see the note above. Deleting
+    // this is caught by `condemned_segment_is_not_freed_while_referenced`.
+    if ref_count.load(Ordering::SeqCst) != 0 {
+        return false;
+    }
+
+    // `AwaitingRelease -> Free` is unconditionally the end of a used
+    // incarnation: the segment was condemned while live and its last reader
+    // has just dropped. Always bump.
+    //
+    // `with_chain_ids` must stay: returning a freed segment to the free queue
+    // still linked to its neighbours is its own defect.
+    let new_meta = meta
+        .with_state(State::Free)
+        .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
+        .bump_incarnation();
+
+    if metadata
+        .compare_exchange(packed, new_meta.pack(), Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        on_freed();
+        // SAFETY: the caller guarantees `free_queue` is the pool's queue and
+        // valid for its lifetime, and that `segment_id` names this segment.
+        unsafe {
+            (*free_queue).push(segment_id);
+        }
+        true
+    } else {
+        false
+    }
+}
 
 /// Minimal trait for key verification, used by hashtables.
 ///
@@ -232,7 +346,47 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     fn live_bytes(&self) -> u32;
 
     /// Get the current reference count (active readers).
+    ///
+    /// `Acquire`. Use this for statistics, diagnostics, and heuristic scans --
+    /// anywhere a stale answer is merely suboptimal. When the answer *gates* an
+    /// action that is exclusive against readers, use [`Self::ref_count_seqcst`].
     fn ref_count(&self) -> u32;
+
+    /// Get the current reference count, ordered after a preceding `SeqCst`
+    /// state transition -- the condemner half of the Dekker pair.
+    ///
+    /// The drain/condemn protocol is a store-buffering (Dekker) pattern:
+    ///
+    /// ```text
+    /// reader (try_acquire_read / get_item / get_value_ref_raw):
+    ///     ref_count.fetch_add(1)   // store
+    ///     load state               // load  -> back out if inaccessible
+    ///
+    /// condemner (the layers' evict paths):
+    ///     cas state -> Draining / AwaitingRelease   // store
+    ///     load ref_count                            // load -> act if zero
+    /// ```
+    ///
+    /// Acquire/release does **not** forbid the outcome where both loads come
+    /// back stale: the reader's re-check still sees an admitting state while
+    /// the condemner sees `ref_count == 0`, so both proceed and the condemner
+    /// clears or frees the segment under a live reader. Only the `SeqCst`
+    /// total order rules it out, and only if *both* halves are `SeqCst` --
+    /// which is why the reader's `fetch_add` and re-check are `SeqCst` too.
+    /// This is the same reason crossbeam-epoch's `pin()` is `SeqCst`.
+    ///
+    /// Note that no in-tree tool can *prove* the distinction. loom
+    /// over-approximates and reports the store-buffering outcome even for a
+    /// pure-`SeqCst` litmus, so it is green either way; shuttle executes
+    /// sequentially consistently and so treats an AcqRel program as `SeqCst`,
+    /// so it is green either way too. The justification is the memory model
+    /// plus precedent (pelikan-io/cache-rs `SegmentHeader::ref_count_seqcst`),
+    /// not a red test. See crucible#129.
+    ///
+    /// A load that is *not* preceded by a transition it must be ordered
+    /// against gains nothing from `SeqCst` -- see the call sites for which are
+    /// which.
+    fn ref_count_seqcst(&self) -> u32;
 
     // ========== State Machine ==========
 
@@ -689,6 +843,140 @@ pub trait SegmentIter: Segment {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::state::INVALID_SEGMENT_ID;
+
+    /// A condemned segment with a live reference, and the queue it would be
+    /// pushed to. `try_free_condemned` is the single commit point every
+    /// condemned-free path routes through, so these tests cover
+    /// `SliceSegment::release_condemned`, `DiskSegmentMeta::release_condemned`,
+    /// `BasicItemGuard::drop` and `ValueRef::drop` at once.
+    fn condemned(ref_count: u32) -> (AtomicU32, AtomicU64, crossbeam_deque::Injector<u32>) {
+        let meta = Metadata {
+            next: INVALID_SEGMENT_ID,
+            prev: INVALID_SEGMENT_ID,
+            state: State::AwaitingRelease,
+            incarnation: 7,
+        };
+        (
+            AtomicU32::new(ref_count),
+            AtomicU64::new(meta.pack()),
+            crossbeam_deque::Injector::new(),
+        )
+    }
+
+    fn state_of(m: &AtomicU64) -> State {
+        Metadata::unpack(m.load(Ordering::SeqCst)).state
+    }
+
+    /// The production re-validation, pinned deterministically (#129).
+    ///
+    /// A caller arrives having seen `prev == 1` from its own `fetch_sub` --
+    /// which is why every call site reaches here -- but a reader has pinned
+    /// the segment again since, on a still-`Sealed` word, before the evictor
+    /// condemned it. Freeing now would return the segment to the pool under a
+    /// live reference, and the pool can hand it straight to a writer.
+    ///
+    /// The shuttle models cover this hazard against a *mirror* of this logic;
+    /// this is the one that fails if the check leaves the shipped code.
+    #[test]
+    fn condemned_segment_is_not_freed_while_referenced() {
+        let (rc, m, q) = condemned(1);
+
+        let freed = unsafe { try_free_condemned(&rc, &m, &q, 42, || unreachable!()) };
+
+        assert!(
+            !freed,
+            "freed a condemned segment that still has a live reference"
+        );
+        assert_eq!(
+            state_of(&m),
+            State::AwaitingRelease,
+            "the segment must stay condemned so the real last reader can free it"
+        );
+        assert_eq!(rc.load(Ordering::SeqCst), 1, "the reference is untouched");
+        assert!(q.is_empty(), "a referenced segment must not reach the pool");
+        assert_eq!(
+            Metadata::unpack(m.load(Ordering::SeqCst)).incarnation,
+            7,
+            "a declined release must not advance the incarnation"
+        );
+    }
+
+    /// `Injector::steal` returns `Retry` transiently -- "another thread was
+    /// mid-operation, ask again", not "the queue is empty" -- and `.success()`
+    /// maps that to `None`. A single steal therefore reports an empty queue
+    /// spuriously, which miri's scheduling makes reproducible. Same bounded
+    /// retry as `MemoryPool::reserve`, for the same reason.
+    fn steal_one(q: &crossbeam_deque::Injector<u32>) -> Option<u32> {
+        for _ in 0..64 {
+            match q.steal() {
+                crossbeam_deque::Steal::Success(v) => return Some(v),
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return None,
+            }
+        }
+        None
+    }
+
+    /// The other side of the same gate: the genuinely-last reference does
+    /// free it, exactly once, ending the incarnation.
+    #[test]
+    fn condemned_segment_is_freed_when_unreferenced() {
+        let (rc, m, q) = condemned(0);
+        let mut hook_ran = 0;
+
+        let freed = unsafe {
+            try_free_condemned(&rc, &m, &q, 42, || {
+                hook_ran += 1;
+                // The hook must run BEFORE the push, not after: `IoUringDiskLayer`
+                // returns the segment's staging buffer here, and a segment that is
+                // already on the free queue can be reserved by another thread and
+                // given a fresh buffer, which the hook would then return instead.
+                assert!(
+                    q.is_empty(),
+                    "on_freed ran after the segment was published to the free queue"
+                );
+            })
+        };
+
+        assert!(freed);
+        assert_eq!(
+            hook_ran, 1,
+            "the on_freed hook runs once on the winning CAS"
+        );
+        assert_eq!(state_of(&m), State::Free);
+        assert_eq!(
+            Metadata::unpack(m.load(Ordering::SeqCst)).incarnation,
+            8,
+            "AwaitingRelease -> Free ends a used incarnation"
+        );
+        assert_eq!(steal_one(&q), Some(42), "pushed to the free queue");
+
+        // Racing callers: the CAS admits exactly one winner, so a second
+        // attempt declines and does not double-push.
+        let again = unsafe { try_free_condemned(&rc, &m, &q, 42, || unreachable!()) };
+        assert!(
+            !again,
+            "only the caller that performed the CAS returns true"
+        );
+        assert!(q.is_empty(), "no double-push to the free queue");
+    }
+
+    /// A segment that was never condemned is not freed, whatever its count.
+    #[test]
+    fn a_live_segment_is_never_freed() {
+        for state in [State::Live, State::Sealed, State::Draining, State::Locked] {
+            let m = AtomicU64::new(Metadata::new(state).pack());
+            let rc = AtomicU32::new(0);
+            let q = crossbeam_deque::Injector::new();
+
+            let freed = unsafe { try_free_condemned(&rc, &m, &q, 42, || unreachable!()) };
+
+            assert!(!freed, "{state:?} is not condemned but was freed");
+            assert_eq!(state_of(&m), state);
+            assert!(q.is_empty());
+        }
+    }
 
     // Tests will be added when we have a concrete Segment implementation
     // For now, just verify the trait is object-safe where applicable

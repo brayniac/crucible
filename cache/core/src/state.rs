@@ -215,6 +215,48 @@ impl State {
     pub fn is_evictable(self) -> bool {
         matches!(self, State::Sealed)
     }
+
+    /// Whether a *fresh* guard acquire (`get_item`, `get_item_verified`,
+    /// `get_value_ref_raw`) is admitted in this state.
+    #[inline]
+    fn admits_guard_reader(self) -> bool {
+        self.is_readable() && !self.is_condemned()
+    }
+
+    /// Whether a *fresh* key-verify acquire (`try_acquire_read`) is admitted
+    /// in this state. Wider than [`Self::admits_guard_reader`] by `Draining`,
+    /// which is what lets the demoter verify keys on a segment it is draining.
+    #[inline]
+    fn admits_verify_reader(self) -> bool {
+        self.holds_valid_data() && !self.is_condemned()
+    }
+}
+
+/// Whether a state transition *narrows* fresh reader admission -- i.e. some
+/// class of reader that could pin the segment before it cannot after.
+///
+/// This is the test for whether a `cas_metadata` is the condemner half of the
+/// drain/pin Dekker pair, and therefore whether it must be `SeqCst`. A
+/// narrowing CAS is the store the condemner performs immediately before
+/// loading `ref_count`; the reader performs the mirror image (store
+/// `ref_count`, load the state). Acquire/release permits both loads to come
+/// back stale, letting both sides proceed. See
+/// [`crate::segment::Segment::ref_count_seqcst`] for the full argument.
+///
+/// True for `Sealed -> Draining` (shuts out guard readers),
+/// `Draining -> Locked` and `Draining -> AwaitingRelease` (shut out the
+/// key-verify readers `Draining` still admitted), and
+/// `Relinking -> AwaitingRelease` (the merge paths).
+///
+/// False for everything else: `Live -> Sealed` and `Sealed -> Relinking` do
+/// not change admission, the eleven chain-pointer identity CASes in
+/// `organization/` do not change state at all, `Locked -> Reserved` and
+/// `Reserved -> Free` are already exclusive, and `Draining -> Sealed` (the
+/// chain's revert) *widens*. Marking those `SeqCst` would be noise.
+#[inline]
+pub(crate) fn transition_excludes_readers(from: State, to: State) -> bool {
+    (from.admits_guard_reader() && !to.admits_guard_reader())
+        || (from.admits_verify_reader() && !to.admits_verify_reader())
 }
 
 /// Packed representation of segment metadata in a single AtomicU64.
@@ -697,5 +739,57 @@ mod tests {
             incarnation: 0x3F,
         };
         assert_eq!(meta.bump_incarnation().incarnation, 0);
+    }
+
+    // `transition_excludes_readers` silently decides which `cas_metadata`
+    // transitions get `SeqCst` (#129). If it starts answering `false` for a
+    // transition that does shut readers out -- because a new state was added
+    // to `is_readable`/`holds_valid_data`, say -- the Dekker pairing
+    // disappears with no other symptom. This table is that alarm.
+    #[test]
+    fn transitions_that_shut_readers_out_are_recognized() {
+        use State::*;
+
+        // The four that end some class of fresh reader admission, and so must
+        // be ordered against the `ref_count` load that follows them.
+        for (from, to) in [
+            (Sealed, Draining),           // shuts out guard readers
+            (Draining, Locked),           // shuts out key-verify readers
+            (Draining, AwaitingRelease),  // condemn
+            (Relinking, AwaitingRelease), // the merge paths' condemn
+            (Live, Draining),
+            (Live, Locked),
+            (Sealed, Locked),
+            (Sealed, AwaitingRelease),
+        ] {
+            assert!(
+                transition_excludes_readers(from, to),
+                "{from:?} -> {to:?} ends reader admission but is not recognized --                  its cas_metadata would silently drop to AcqRel"
+            );
+        }
+
+        // Everything else. Marking these SeqCst would be pure cost: they
+        // either leave admission unchanged, are already exclusive, or widen.
+        for (from, to) in [
+            (Live, Sealed),
+            (Sealed, Relinking),
+            (Live, Live),
+            (Sealed, Sealed),
+            (Locked, Locked),
+            (Draining, Draining),
+            (Relinking, Relinking),
+            (Locked, Reserved),
+            (Reserved, Free),
+            (Reserved, Linking),
+            (Linking, Live),
+            (AwaitingRelease, Free),
+            (Free, Reserved),
+            (Draining, Sealed), // the chain's revert -- widens
+        ] {
+            assert!(
+                !transition_excludes_readers(from, to),
+                "{from:?} -> {to:?} does not end reader admission but is marked                  as if it did -- SeqCst here is noise"
+            );
+        }
     }
 }

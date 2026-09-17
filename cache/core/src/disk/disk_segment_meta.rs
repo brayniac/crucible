@@ -95,6 +95,14 @@ unsafe impl Sync for DiskSegmentMeta {}
 impl DiskSegmentMeta {
     const INVALID_BUCKET_ID: u16 = 0xFFFF;
 
+    /// The segment state, loaded `SeqCst` -- the reader half of the Dekker
+    /// pair. Only for the post-increment re-check of a two-phase acquire; see
+    /// `SliceSegment::state_seqcst`.
+    #[inline]
+    pub(crate) fn state_seqcst(&self) -> State {
+        Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
+    }
+
     /// Create a new disk segment metadata entry.
     ///
     /// # Parameters
@@ -229,10 +237,14 @@ impl DiskSegmentMeta {
     /// segment was condemned before it was flushed, which the layer handles on
     /// its own paths.
     pub(crate) fn release_ref(&self) {
-        let prev = self.ref_count.fetch_sub(1, Ordering::Release);
+        // SeqCst -- see `SliceSegment::release_ref`. The store half of this
+        // decrement is the reader side of the release Dekker pair; `Release`
+        // leaves it out of the SC total order and lets both sides conclude
+        // the other owes the free (#129).
+        let prev = self.ref_count.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
-            fence(Ordering::Acquire);
-            if Metadata::unpack(self.metadata.load(Ordering::Acquire)).state
+            fence(Ordering::SeqCst);
+            if Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
                 == State::AwaitingRelease
             {
                 self.release_condemned();
@@ -257,8 +269,11 @@ impl SegmentKeyVerify for DiskSegmentMeta {
         if !state.holds_valid_data() || state.is_condemned() {
             return false;
         }
-        self.ref_count.fetch_add(1, Ordering::Acquire);
-        let state_after = self.state();
+        // SeqCst, both halves -- the reader side of the Dekker pair with the
+        // condemner's (CAS state, load ref_count). See
+        // `Segment::ref_count_seqcst` (#129).
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
+        let state_after = self.state_seqcst();
         if !state_after.holds_valid_data() || state_after.is_condemned() {
             self.release_ref();
             return false;
@@ -417,6 +432,10 @@ impl Segment for DiskSegmentMeta {
         self.ref_count.load(Ordering::Acquire)
     }
 
+    fn ref_count_seqcst(&self) -> u32 {
+        self.ref_count.load(Ordering::SeqCst)
+    }
+
     fn state(&self) -> State {
         let packed = self.metadata.load(Ordering::Acquire);
         Metadata::unpack(packed).state
@@ -516,42 +535,36 @@ impl Segment for DiskSegmentMeta {
             new_meta
         };
 
+        // SeqCst for the transitions that end reader admission -- see the
+        // matching note in `SliceSegment::cas_metadata` and
+        // `Segment::ref_count_seqcst`. Everything else stays `AcqRel`.
+        let (success, failure) =
+            if crate::state::transition_excludes_readers(expected_state, new_state) {
+                (Ordering::SeqCst, Ordering::SeqCst)
+            } else {
+                (Ordering::AcqRel, Ordering::Relaxed)
+            };
+
         self.metadata
-            .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(packed, new_meta.pack(), success, failure)
             .is_ok()
     }
 
     fn release_condemned(&self) -> bool {
-        let packed = self.metadata.load(Ordering::Acquire);
-        let meta = Metadata::unpack(packed);
-
-        if meta.state != State::AwaitingRelease {
-            return false;
-        }
-
-        if self.ref_count.load(Ordering::Acquire) != 0 {
-            return false;
-        }
-
-        // `AwaitingRelease -> Free` is unconditionally the end of a used
-        // incarnation: the segment was condemned while live and its last reader
-        // has just dropped. Always bump.
-        let new_meta = meta
-            .with_state(State::Free)
-            .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
-            .bump_incarnation();
-        if self
-            .metadata
-            .compare_exchange(packed, new_meta.pack(), Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Push back to free queue
-            unsafe {
-                (*self.free_queue).push(self.id);
-            }
-            true
-        } else {
-            false
+        // The whole transition -- the state check, the `prev == 1`
+        // re-validation, the CAS and the push -- lives in
+        // `crate::segment::try_free_condemned`; see its note.
+        //
+        // SAFETY: `free_queue` is the pool's queue, valid for the pool's
+        // lifetime, and `self.id` is this segment's id within it.
+        unsafe {
+            crate::segment::try_free_condemned(
+                &self.ref_count,
+                &self.metadata,
+                self.free_queue,
+                self.id,
+                || {},
+            )
         }
     }
 

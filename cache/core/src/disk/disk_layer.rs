@@ -263,7 +263,10 @@ impl DiskLayer {
             None => return,
         };
 
-        if segment.ref_count() > 0 {
+        // `ref_count_seqcst`: this thread reached here through a
+        // `Sealed -> Draining` CAS, the store half of the Dekker pair this
+        // load completes -- see `Segment::ref_count_seqcst` (#129).
+        if segment.ref_count_seqcst() > 0 {
             // Drain hashtable entries and defer to last reader's drop
             self.drain_segment_from_hashtable(segment_id, hashtable);
             segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);

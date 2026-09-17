@@ -10,6 +10,28 @@ description = "Redesigned cache-core with layer-based architecture"
 [features]
 default = []
 loom = ["dep:loom"]
+# Randomized concurrency testing under sequential consistency. Deliberately
+# complementary to `loom`, not a replacement:
+#
+#   loom models weak memory but over-approximates SeqCst -- it reports the
+#   store-buffering outcome even for a pure-SeqCst litmus (see
+#   `shuttle_tests::shuttle_seqcst_store_buffering_forbidden`, which loom
+#   fails), so the loom models can only assert SC-independent properties.
+#
+#   shuttle executes sequentially consistently, treating every ordering as
+#   SeqCst. That makes the SC-total-order halves of the protocol invariants
+#   assertable -- a pinned reader never coexists with a committed drain, a
+#   condemned segment is freed exactly once -- which is this module's entire
+#   purpose. The trade is symmetric: shuttle can NEVER catch an ordering that
+#   is too weak (a Release degraded to Relaxed), which is what loom covers.
+#
+# Keep both suites green; neither subsumes the other. `loom` wins when both
+# features are on, so the shuttle module is gated `not(feature = "loom")`.
+#
+#   cargo test -p cache-core --features shuttle -- shuttle_
+#
+# The name filter matters: like loom's, these models panic outside their runner.
+shuttle = ["dep:shuttle"]
 # Adds magic bytes and checksums to item headers for corruption detection.
 # Useful for debugging but adds overhead to every read operation.
 validation = []
@@ -27,6 +49,9 @@ tracing = { workspace = true }
 
 # Optional loom support for concurrency testing
 loom = { workspace = true, features = ["checkpoint"], optional = true }
+
+# Optional shuttle support for randomized SC concurrency testing
+shuttle = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

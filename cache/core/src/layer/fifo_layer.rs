@@ -211,7 +211,14 @@ impl FifoLayer {
             None => return true,
         };
 
-        if segment.ref_count() > 0 {
+        // `ref_count_seqcst`, not `ref_count`: the caller reached here through
+        // the chain's `Sealed -> Draining` CAS, which shuts out fresh guard
+        // acquires. That CAS is the store and this is the load of a Dekker
+        // pair with every reader's (store ref_count, load state). Under
+        // acquire/release both loads may go stale, and the zero branch below
+        // takes the segment to `Locked` and rewrites its bytes under a reader
+        // that still believes its pin is good. See `Segment::ref_count_seqcst`.
+        if segment.ref_count_seqcst() > 0 {
             // Segment pinned by readers — remove hashtable entries and defer
             self.drain_segment_from_hashtable(segment_id, hashtable);
             // Draining → AwaitingRelease (last reader's ValueRef::drop will free it)
@@ -219,7 +226,11 @@ impl FifoLayer {
             // Race fix: if the last reader dropped between our ref_count check
             // and the CAS above, the segment is now AwaitingRelease with
             // ref_count == 0 and nobody will free it. Reclaim it now.
-            if segment.ref_count() == 0 && segment.release_condemned() {
+            // The condemner half of the Dekker pair: this load must be ordered
+            // after the CAS above in the SC total order, or it can miss a
+            // decrement the last reader had already published and the segment
+            // strands in AwaitingRelease with ref_count == 0 (#129).
+            if segment.ref_count_seqcst() == 0 && segment.release_condemned() {
                 return true;
             }
             return false;
@@ -287,6 +298,13 @@ impl FifoLayer {
     ///
     /// This is called when the policy-selected segment was deferred due to active readers.
     /// Scans the pool for an alternative segment that can be freed immediately.
+    ///
+    /// Plain `ref_count()` on purpose. This scan publishes no state transition
+    /// of its own, so there is nothing for the load to be ordered against --
+    /// it only picks a candidate. The exclusive claim happens downstream, in
+    /// `try_remove`'s `Sealed -> Draining` CAS and `process_evicted_segment`'s
+    /// `wait_for_readers`, which is where the Dekker pair actually lives. A
+    /// stale answer here costs at most one wasted candidate.
     fn emergency_evict<H: Hashtable>(&self, hashtable: &H) -> bool {
         let num_segments = self.pool.segment_count();
         for i in 0..num_segments {
@@ -590,7 +608,10 @@ impl FifoLayer {
         }
 
         // All items processed. Try to release the segment.
-        if segment.ref_count() == 0 {
+        // `ref_count_seqcst`: ordered after the `Sealed -> Draining` CAS the
+        // caller took, so a reader that pinned before it cannot be missed here
+        // and then have its bytes rewritten by the `Locked` branch (#129).
+        if segment.ref_count_seqcst() == 0 {
             segment.cas_metadata(State::Draining, State::Locked, None, None);
             segment.cas_metadata(State::Locked, State::Reserved, None, None);
             self.pool.release(segment_id);
@@ -600,7 +621,11 @@ impl FifoLayer {
         // Readers still active — let last reader free it.
         segment.cas_metadata(State::Draining, State::AwaitingRelease, None, None);
         // Race fix: reclaim if last reader dropped during the window above.
-        if segment.ref_count() == 0 && segment.release_condemned() {
+        // The condemner half of the Dekker pair: this load must be ordered
+        // after the CAS above in the SC total order, or it can miss a
+        // decrement the last reader had already published and the segment
+        // strands in AwaitingRelease with ref_count == 0 (#129).
+        if segment.ref_count_seqcst() == 0 && segment.release_condemned() {
             return true;
         }
         false

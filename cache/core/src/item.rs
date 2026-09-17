@@ -798,50 +798,39 @@ impl<'a> ItemGuard<'a> for BasicItemGuard<'a> {
 
 impl Drop for BasicItemGuard<'_> {
     fn drop(&mut self) {
-        use crate::state::{INVALID_SEGMENT_ID, Metadata, State};
+        // SeqCst: the release half of the drain/condemn Dekker pair. This
+        // thread stores `ref_count` then loads the state; the condemner stores
+        // `AwaitingRelease` then loads `ref_count`. Under acquire/release both
+        // loads may go stale, so each side concludes the other will free the
+        // segment and it strands in `AwaitingRelease` with `ref_count == 0`.
+        // See `Segment::ref_count_seqcst` (#129).
+        let prev_count = self.ref_count.fetch_sub(1, Ordering::SeqCst);
 
-        let prev_count = self.ref_count.fetch_sub(1, Ordering::Release);
-
-        // If we were the last reader (prev_count == 1 means new count is 0)
+        // If we were the last reader (prev_count == 1 means the new count is
+        // 0), and the segment was condemned while we held it, we owe it the
+        // free.
+        //
+        // This is the *main* condemned-free path, not an edge case: the layers
+        // condemn a segment with readers outstanding and leave the last guard
+        // drop to free it, calling `release_condemned` only as a fallback when
+        // the last reader vanished during the condemn window. A reader holding
+        // a location across this recycle is what the incarnation tag defends
+        // against.
+        //
+        // `prev_count == 1` is necessary but not sufficient -- a reader can
+        // have pinned the segment again since. `try_free_condemned` owns that
+        // re-validation, the state check, the CAS and the push; see its note.
         if prev_count == 1 {
-            // Check if segment is condemned and needs release
-            let packed = self.metadata.load(Ordering::Acquire);
-            let meta = Metadata::unpack(packed);
-
-            if meta.state == State::AwaitingRelease {
-                // AwaitingRelease -> Free ends a used incarnation, so the tag
-                // advances in the same CAS that publishes Free.
-                //
-                // This is the *main* condemned-free path, not an edge case: the
-                // layers condemn a segment with readers outstanding and leave
-                // the last guard drop to free it, calling `release_condemned`
-                // only as a fallback when the last reader vanished during the
-                // condemn window. A reader holding a location across this
-                // recycle is exactly what the tag defends against.
-                //
-                // `with_chain_ids` must stay: returning a freed segment to the
-                // free queue still linked to its neighbours is its own defect.
-                let new_meta = meta
-                    .with_state(State::Free)
-                    .with_chain_ids(INVALID_SEGMENT_ID, INVALID_SEGMENT_ID)
-                    .bump_incarnation();
-
-                if self
-                    .metadata
-                    .compare_exchange(
-                        packed,
-                        new_meta.pack(),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    // Push to free queue
-                    // SAFETY: free_queue pointer is valid for the lifetime of the pool
-                    unsafe {
-                        (*self.free_queue).push(self.segment_id);
-                    }
-                }
+            // SAFETY: `free_queue` is the pool's queue, valid for the pool's
+            // lifetime, and `segment_id` names this segment within it.
+            unsafe {
+                crate::segment::try_free_condemned(
+                    self.ref_count,
+                    self.metadata,
+                    self.free_queue,
+                    self.segment_id,
+                    || {},
+                );
             }
         }
     }
