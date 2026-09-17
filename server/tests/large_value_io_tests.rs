@@ -11,7 +11,7 @@ use serial_test::serial;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -143,15 +143,40 @@ fn generate_large_value(size: usize) -> Vec<u8> {
 
 /// Verify a value matches the expected pattern.
 fn verify_value(data: &[u8], expected_size: usize) -> bool {
+    describe_mismatch(data, expected_size).is_none()
+}
+
+/// Say *how* a retrieved value differs from the pattern, or `None` if it does
+/// not.
+///
+/// A bool is enough to fail a test; it is not enough to read a CI log a week
+/// later (#132). A short length says truncation, a single wrong byte says
+/// corruption, and the offset of the first bad byte is the thing worth having
+/// -- one landing on a 16 KiB boundary points at ring buffer handoff, one in
+/// the middle of a buffer does not.
+fn describe_mismatch(data: &[u8], expected_size: usize) -> Option<String> {
     if data.len() != expected_size {
-        return false;
+        return Some(format!(
+            "length {} bytes, expected {}",
+            data.len(),
+            expected_size
+        ));
     }
-    for (i, &byte) in data.iter().enumerate() {
-        if byte != (i % 256) as u8 {
-            return false;
-        }
-    }
-    true
+    let (offset, &got) = data
+        .iter()
+        .enumerate()
+        .find(|&(i, &b)| b != (i % 256) as u8)?;
+    let wrong = data
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| b != (i % 256) as u8)
+        .count();
+    Some(format!(
+        "{wrong} of {expected_size} bytes wrong; first at offset {offset} \
+         (expected {:#04x}, got {got:#04x}; offset % 16 KiB = {})",
+        (offset % 256) as u8,
+        offset % (16 * 1024),
+    ))
 }
 
 /// Build a RESP SET command for large values.
@@ -395,6 +420,126 @@ fn run_large_value_test(config: LargeValueTestConfig) {
     }
 }
 
+/// One connection's turn through the concurrent test.
+///
+/// The assertion used to print a count and nothing else, which is how #132
+/// came to be reported with "1 errors (7 successes)" and no way to tell what
+/// the one was. Every field here exists to be printed on failure.
+struct ConnOutcome {
+    conn_id: usize,
+    /// How far it got: `connect`, `SET`, `GET`, `verify`, or `ok`.
+    stage: &'static str,
+    /// Wall time in the SET, and in the GET. A failure at the 120s read
+    /// timeout reads very differently from one at 0.02s, and the successes'
+    /// timings are the baseline that says which it was.
+    set_elapsed: Option<Duration>,
+    get_elapsed: Option<Duration>,
+    /// Exactly what the failing operation returned; `None` on success.
+    error: Option<String>,
+}
+
+impl ConnOutcome {
+    fn new(conn_id: usize) -> Self {
+        Self {
+            conn_id,
+            stage: "connect",
+            set_elapsed: None,
+            get_elapsed: None,
+            error: None,
+        }
+    }
+
+    fn failed(mut self, stage: &'static str, error: String) -> Self {
+        self.stage = stage;
+        self.error = Some(error);
+        self
+    }
+
+    fn succeeded(mut self) -> Self {
+        self.stage = "ok";
+        self
+    }
+
+    fn line(&self) -> String {
+        fn elapsed(d: Option<Duration>) -> String {
+            d.map_or_else(|| "-".to_string(), |d| format!("{:.3}s", d.as_secs_f64()))
+        }
+        format!(
+            "  conn {:>2}  {:<7}  set={:>8}  get={:>8}  {}",
+            self.conn_id,
+            self.stage,
+            elapsed(self.set_elapsed),
+            elapsed(self.get_elapsed),
+            match &self.error {
+                Some(e) => format!("ERROR: {e}"),
+                None => String::new(),
+            },
+        )
+        .trim_end()
+        .to_string()
+    }
+}
+
+/// SET then GET then verify one large value on its own connection, reporting
+/// where it got to rather than just whether it got there.
+fn run_one_connection(conn_id: usize, addr: SocketAddr, value_size: usize) -> ConnOutcome {
+    let outcome = ConnOutcome::new(conn_id);
+
+    let mut stream = match TcpStream::connect(addr) {
+        Ok(s) => s,
+        Err(e) => return outcome.failed("connect", format!("{e} (kind {:?})", e.kind())),
+    };
+
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+
+    let key = format!("concurrent_key_{conn_id}");
+    let value = generate_large_value(value_size);
+
+    let mut outcome = outcome;
+    let started = Instant::now();
+    let set = send_large_set(&mut stream, &key, &value);
+    outcome.set_elapsed = Some(started.elapsed());
+    if let Err(e) = set {
+        return outcome.failed("SET", e);
+    }
+
+    let started = Instant::now();
+    let get = send_large_get(&mut stream, &key, value_size);
+    outcome.get_elapsed = Some(started.elapsed());
+    match get {
+        Ok(retrieved) => match describe_mismatch(&retrieved, value_size) {
+            Some(how) => outcome.failed("verify", how),
+            None => outcome.succeeded(),
+        },
+        Err(e) => outcome.failed("GET", e),
+    }
+}
+
+/// The whole picture, printed by whichever assertion fires.
+///
+/// Every connection gets a line, not just the failing ones: the successes'
+/// timings are what say whether a failure stalled or flapped.
+fn failure_report(connections: usize, value_size: usize, outcomes: &[ConnOutcome]) -> String {
+    let err_count = outcomes.iter().filter(|o| o.error.is_some()).count();
+    let success_count = outcomes.len() - err_count;
+    // A thread that panicked outright leaves no outcome at all, which is why
+    // the reported total is printed alongside the expected one.
+    std::iter::once(format!(
+        "{value_size}-byte value on each of {connections} connections; \
+         {} reported, {err_count} failed, {success_count} ok",
+        outcomes.len()
+    ))
+    .chain(outcomes.iter().map(ConnOutcome::line))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
 /// Run a concurrent large value test with multiple connections.
 fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
     let port = get_available_port();
@@ -415,58 +560,19 @@ fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
         "Server failed to start"
     );
 
-    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let successes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let mut handles = Vec::new();
 
     for conn_id in 0..connections {
-        let errors = Arc::clone(&errors);
-        let successes = Arc::clone(&successes);
+        let outcomes = Arc::clone(&outcomes);
 
         let handle = thread::spawn(move || {
-            let mut stream = match TcpStream::connect(addr) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Connection {} failed to connect: {}", conn_id, e);
-                    errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            stream.set_nodelay(true).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(120)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(120)))
-                .unwrap();
-
-            let key = format!("concurrent_key_{}", conn_id);
-            let value = generate_large_value(value_size);
-
-            // SET
-            if let Err(e) = send_large_set(&mut stream, &key, &value) {
-                eprintln!("Connection {} SET failed: {}", conn_id, e);
-                errors.fetch_add(1, Ordering::Relaxed);
-                return;
+            let outcome = run_one_connection(conn_id, addr, value_size);
+            if let Some(error) = &outcome.error {
+                eprintln!("Connection {conn_id} failed at {}: {error}", outcome.stage);
             }
-
-            // GET and verify
-            match send_large_get(&mut stream, &key, value_size) {
-                Ok(retrieved) => {
-                    if verify_value(&retrieved, value_size) {
-                        successes.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        eprintln!("Connection {} data corruption", conn_id);
-                        errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Connection {} GET failed: {}", conn_id, e);
-                    errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            outcomes.lock().unwrap().push(outcome);
         });
         handles.push(handle);
     }
@@ -475,18 +581,25 @@ fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
         let _ = handle.join();
     }
 
-    let err_count = errors.load(Ordering::Relaxed);
-    let success_count = successes.load(Ordering::Relaxed);
+    let mut outcomes = Arc::try_unwrap(outcomes)
+        .unwrap_or_else(|_| unreachable!("every worker thread has been joined"))
+        .into_inner()
+        .unwrap();
+    outcomes.sort_by_key(|o| o.conn_id);
 
-    assert_eq!(
-        err_count, 0,
-        "Concurrent test had {} errors ({} successes)",
-        err_count, success_count
-    );
+    let err_count = outcomes.iter().filter(|o| o.error.is_some()).count();
+    let success_count = outcomes.iter().filter(|o| o.error.is_none()).count();
+
+    let report = failure_report(connections, value_size, &outcomes);
+
+    // Deliberately still exact. The point of #132 is that an intermittent red
+    // must be readable, not that it must be tolerated -- a retry loop or a
+    // loosened threshold here would bury whatever produces the error under
+    // load, which is the thing worth knowing.
+    assert_eq!(err_count, 0, "Concurrent test had errors\n{report}");
     assert_eq!(
         success_count, connections,
-        "Not all connections succeeded: {} of {}",
-        success_count, connections
+        "Not all connections succeeded\n{report}"
     );
 }
 
@@ -735,4 +848,75 @@ fn test_uring_buffer_boundary_sizes() {
             size
         );
     }
+}
+
+// =============================================================================
+// Diagnosability of the concurrent failure path (#132)
+// =============================================================================
+//
+// These two run anywhere -- they are about what the assertion says, not about
+// io_uring, and the point of #132 is that the next occurrence has to be
+// readable from the CI log alone.
+
+/// The failure report must name the connection, the stage it died at, and
+/// what the operation actually returned.
+#[test]
+fn the_failure_report_names_what_actually_failed() {
+    let outcomes = vec![
+        ConnOutcome {
+            conn_id: 0,
+            stage: "ok",
+            set_elapsed: Some(Duration::from_millis(12)),
+            get_elapsed: Some(Duration::from_millis(31)),
+            error: None,
+        },
+        ConnOutcome {
+            conn_id: 3,
+            stage: "GET",
+            set_elapsed: Some(Duration::from_millis(20)),
+            get_elapsed: Some(Duration::from_secs(120)),
+            error: Some("Timeout waiting for GET response (received 65536 bytes)".to_string()),
+        },
+    ];
+
+    let report = failure_report(8, 1024 * 1024, &outcomes);
+
+    assert!(report.contains("2 reported, 1 failed, 1 ok"), "{report}");
+    assert!(
+        report.contains("conn  3"),
+        "the failing connection: {report}"
+    );
+    assert!(report.contains("GET"), "the stage it died at: {report}");
+    assert!(
+        report.contains("Timeout waiting for GET response (received 65536 bytes)"),
+        "what the operation returned: {report}"
+    );
+    assert!(
+        report.contains("120.000s") && report.contains("0.031s"),
+        "the stall and the baseline it stalled against: {report}"
+    );
+    assert!(
+        report.contains("conn  0"),
+        "the successes are the baseline: {report}"
+    );
+}
+
+/// A corrupt value must say how it was corrupt, not just that it was.
+#[test]
+fn a_mismatch_describes_itself() {
+    let size = 32 * 1024;
+    let good = generate_large_value(size);
+    assert_eq!(describe_mismatch(&good, size), None);
+
+    let mut truncated = good.clone();
+    truncated.truncate(size - 1);
+    let how = describe_mismatch(&truncated, size).expect("a short value is a mismatch");
+    assert!(how.contains(&format!("length {} bytes", size - 1)), "{how}");
+
+    let mut corrupt = good.clone();
+    corrupt[16 * 1024] ^= 0xff;
+    let how = describe_mismatch(&corrupt, size).expect("a flipped byte is a mismatch");
+    assert!(how.contains("first at offset 16384"), "{how}");
+    assert!(how.contains("offset % 16 KiB = 0"), "{how}");
+    assert!(how.starts_with("1 of "), "{how}");
 }
