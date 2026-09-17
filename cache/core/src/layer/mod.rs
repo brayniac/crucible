@@ -155,7 +155,18 @@ pub(crate) fn claim_and_wait_for_readers<S: Segment>(segment: &S) -> bool {
 /// This was written out four times -- both layers, both non-blocking paths --
 /// which is why deleting any one copy left the suite green (#134). One body
 /// means one place a test can call directly:
-/// `condemn_and_reclaim_discharges_the_handoff_when_the_last_reader_already_left`.
+/// `condemn_and_reclaim_discharges_the_handoff_when_the_last_reader_already_left`,
+/// which reddens when the reclaim attempt is dropped.
+///
+/// The `ref_count_seqcst() == 0` *gate* is a fast path and nothing more, and
+/// is stated as such because a mutation matrix will otherwise report it as
+/// uncovered. Since #131 the load-bearing copy of that check lives inside
+/// `segment::try_free_condemned`, which re-reads `ref_count` (SeqCst) after
+/// loading the state and declines if a reader has pinned since. Deleting the
+/// gate here therefore changes no outcome and reddens nothing -- it only saves
+/// a call on the common "readers still in" path. The check that does the work
+/// is pinned by
+/// `segment::tests::condemned_segment_is_not_freed_while_referenced`.
 pub(crate) fn condemn_and_reclaim<S: Segment>(segment: &S, from: State) -> bool {
     segment.cas_metadata(from, State::AwaitingRelease, None, None);
     segment.ref_count_seqcst() == 0 && segment.release_condemned()
