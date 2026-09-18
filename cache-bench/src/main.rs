@@ -521,7 +521,13 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
     }
 
     builder = match config.cache.policy {
-        EvictionPolicy::S3Fifo => builder.s3fifo(),
+        EvictionPolicy::S3Fifo => {
+            let mut b = builder.s3fifo();
+            if let Some(main) = config.cache.main_policy {
+                b = b.main_eviction(main.into());
+            }
+            b
+        }
         EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),
         EvictionPolicy::Random => builder.eviction_policy(SegEvictionPolicy::Random),
         EvictionPolicy::Cte => builder.eviction_policy(SegEvictionPolicy::Cte),
@@ -530,6 +536,15 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         }
         other => return Err(format!("invalid policy '{other}' for segment backend").into()),
     };
+
+    // Accepting a main-cache policy the topology has no layer 1 for would run
+    // the arm as whatever the single-layer default is and report it under the
+    // name that was asked for.
+    if config.cache.main_policy.is_some() && config.cache.policy != EvictionPolicy::S3Fifo {
+        return Err("main_policy applies only to policy = \"s3fifo\"; the \
+                    single-layer policies configure their own layer directly"
+            .into());
+    }
 
     if let Some(ref disk_config) = config.cache.disk
         && disk_config.enabled

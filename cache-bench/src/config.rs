@@ -48,6 +48,12 @@ pub struct CacheConfig {
     /// floor that any policy difference has to clear.
     #[serde(default)]
     pub hashtable_seed: Option<[u64; 4]>,
+    /// How the S3-FIFO main cache (layer 1) reclaims segments.
+    ///
+    /// Only meaningful for `backend = "segment"` with `policy = "s3fifo"`.
+    /// Unset leaves the built-in default, adaptive merge.
+    #[serde(default)]
+    pub main_policy: Option<MainPolicy>,
     /// Optional disk tier configuration.
     #[serde(default)]
     pub disk: Option<DiskConfig>,
@@ -180,6 +186,39 @@ impl std::fmt::Display for CacheBackend {
             CacheBackend::Segment => write!(f, "segment"),
             CacheBackend::Slab => write!(f, "slab"),
             CacheBackend::Heap => write!(f, "heap"),
+        }
+    }
+}
+
+/// How the S3-FIFO main cache reclaims segments.
+///
+/// Both run the same machinery; see the merge-vs-CLOCK design spec.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum MainPolicy {
+    /// Adaptive merge: frequency histogram over a segment chain.
+    Merge,
+    /// CLOCK second chance: one segment, threshold pinned above the baseline.
+    Clock,
+    /// Merge's adaptive threshold over a one-segment chain.
+    ///
+    /// Not a policy anyone would ship. It exists to decompose the merge-vs-
+    /// CLOCK result: those two differ in both the prune threshold and the
+    /// chain length, so a difference between them cannot be attributed to
+    /// either on its own. This arm holds the chain at one segment and varies
+    /// only the threshold.
+    MergeSingle,
+}
+
+impl From<MainPolicy> for cache_core::EvictionStrategy {
+    fn from(p: MainPolicy) -> Self {
+        match p {
+            MainPolicy::Merge => Self::Merge(cache_core::MergeConfig::default()),
+            MainPolicy::Clock => Self::Clock,
+            MainPolicy::MergeSingle => Self::Merge(cache_core::MergeConfig {
+                min_segments: 1,
+                ..cache_core::MergeConfig::default()
+            }),
         }
     }
 }

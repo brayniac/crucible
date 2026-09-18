@@ -231,6 +231,76 @@ overwrites), `onboarding_task_service` (1.2% overwrites, and a 1-byte mean
 value). Also excluded: `ibis_cache`, which is 99.8% `add` with zero-length
 values.
 
+
+## First results (2026-09-18)
+
+Single-threaded replay, 15M-record window (5M warmup / 10M measured), hash
+seed pinned, `set_errors == 0`, noise floor 0.0000. Every point below passed
+`envelope_verdict`; saturated points are marked where they were rejected.
+
+### Merge beats CLOCK, and the margin tracks the overwrite rate
+
+    timelines_real_time_aggregates (69.8% overwrite)
+      heap     merge     clock     gap
+      32 MB    0.3061    0.3861    0.0800
+      48 MB    0.2810    0.3662    0.0852
+      64 MB    0.2653    0.3534    0.0881
+
+    wtf_req_cache (0.0% overwrite, negative control)
+      64 MB    0.8126    0.8158    0.0032
+     128 MB    rejected (saturated, 0 evictions)
+     256 MB    rejected (saturated, 0 evictions)
+
+The gap collapses 26x when there are no dead bytes to reclaim, which is the
+mechanism the design predicted rather than merely the effect. The control
+earned its place: without it this would read as "merge is better", full stop.
+
+### But the cause is not the one the comparison was built around
+
+Merge and CLOCK differ in two things, not one: the prune threshold *and* the
+chain length (`min_segments` 4 vs 1). A third arm holds the chain at one
+segment and varies only the threshold:
+
+    timelines_real_time_aggregates, 48 MB
+      arm            chain   threshold    miss ratio   evictions
+      merge            4     adaptive       0.2810        188
+      merge-single     1     adaptive       0.3662        585
+      clock            1     pinned at 1    0.3662        585
+
+`merge-single` and `clock` are identical to four decimals with identical
+eviction counts. **The whole 0.0852 is chain length. The pruning rule
+contributes nothing here.**
+
+The threshold is not an inert knob -- on a low-reuse trace, where items
+actually sit at frequency 1, it moves the result:
+
+    wtf_req_cache (reuse 1.7), 64 MB
+      merge-single   0.8146
+      clock          0.8164
+
+0.0018, against 0.0852 for chain length. Roughly a 47x difference in
+leverage.
+
+### What this means
+
+The headline is not "merge's adaptive threshold beats CLOCK's second
+chance". It is **"compacting four segments per pass beats compacting one"** —
+a four-segment chain folds four partly-dead segments into roughly one, while
+a one-segment chain can only reclaim the dead bytes inside a single segment.
+cache-rs's main pool is disadvantaged by reclaiming one segment at a time,
+not by its frequency rule.
+
+That makes `min_segments` the lever worth tuning, and it is already a
+configuration knob rather than a code change. It also reopens the design's
+own question about `MergeConfig::default()`: if chain length carries the
+effect, `min_segments: 4` is the parameter that should be swept before
+either policy is called better.
+
+Not yet measured: whether the chain-length advantage keeps scaling past 4,
+where it costs more in eviction latency than it returns in hit ratio, and
+whether any of this survives on `simclusters` (49.7% writes, 2 KB values)
+or `botmaker_2` (the only candidate with real TTL diversity).
+
 ## Steady state
 
 The existing logs report cumulative hit ratio from a cold cache, which rises

@@ -202,7 +202,7 @@ impl MergeConfig {
 }
 
 /// Eviction strategy for a layer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum EvictionStrategy {
     /// Evict expired segments first (no item-level decisions needed).
     ExpireFirst,
