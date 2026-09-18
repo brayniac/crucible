@@ -410,6 +410,21 @@ fn print_replay_report(
         eprintln!("  evictions:      {}", stats.evictions);
         eprintln!("  demotions:      {}", stats.demotions);
         eprintln!("  demotion fails: {}", stats.demotion_failures);
+
+        // Independent of the write-latency histogram above: that one times
+        // every record from the replay's side, this one times the eviction
+        // path from inside the cache. They should agree on the tail, and
+        // disagreeing would mean one of them is measuring the wrong thing.
+        let ev = &stats.eviction_latency;
+        match (ev.count(), ev.max_ns()) {
+            (0, _) | (_, None) => eprintln!("  evict pass us: (no passes timed)"),
+            (n, Some(max)) => eprintln!(
+                "  evict pass us: n={n}  p50={:.1}  p99={:.1}  max={:.1}",
+                ev.percentile_ns(50.0).unwrap_or(0) as f64 / 1000.0,
+                ev.percentile_ns(99.0).unwrap_or(0) as f64 / 1000.0,
+                max as f64 / 1000.0,
+            ),
+        }
     }
 
     // The tail is where steady state is judged. A window still trending at its

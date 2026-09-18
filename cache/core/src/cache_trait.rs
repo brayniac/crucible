@@ -730,6 +730,12 @@ pub struct CacheInternalStats {
     pub evictions: u64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: u64,
+    /// How long eviction passes took.
+    ///
+    /// Merge eviction runs inline in the write path, so each sample is a stall
+    /// some `set` absorbed (crucible#152). `evictions` says how many passes
+    /// ran; this says what they cost.
+    pub eviction_latency: crate::latency::LatencySnapshot,
 }
 
 /// Result of a cache lookup that may require async I/O.
