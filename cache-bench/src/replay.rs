@@ -487,6 +487,7 @@ mod tests {
             demotions: 0,
             evictions,
             demotion_failures: 0,
+            ..Default::default()
         }
     }
 
@@ -509,6 +510,7 @@ mod tests {
             demotions: 376_122,
             evictions: 0,
             demotion_failures: 0,
+            ..Default::default()
         };
 
         let msg = envelope_verdict(&stats_with_gets(), Some(internal))
