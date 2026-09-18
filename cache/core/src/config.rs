@@ -143,6 +143,16 @@ pub struct MergeConfig {
     /// Target retention ratio (0.0 - 1.0, typically 0.5).
     /// Lower = more aggressive pruning, higher = more retention.
     pub target_ratio: f64,
+
+    /// Frequency an item must exceed to survive, before any adaptive rise.
+    ///
+    /// Not zero-by-default-and-forget: a fresh insert is packed with
+    /// frequency 1 and nothing ever lowers it, so a threshold of 0 retains
+    /// every still-indexed item and prunes only dead bytes. Merge gets away
+    /// with starting at 0 because its threshold climbs past the baseline on
+    /// its own; a policy that pins the threshold must start above the
+    /// baseline or it prunes nothing live.
+    pub initial_threshold: u8,
 }
 
 impl Default for MergeConfig {
@@ -150,6 +160,7 @@ impl Default for MergeConfig {
         Self {
             min_segments: 4,
             target_ratio: 0.5,
+            initial_threshold: 0,
         }
     }
 }
@@ -169,6 +180,7 @@ impl MergeConfig {
     pub const CLOCK: Self = Self {
         min_segments: 1,
         target_ratio: 1.0,
+        initial_threshold: 1,
     };
 
     /// Create a new merge config with default values.
@@ -243,7 +255,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clock_params_pin_the_prune_threshold_at_zero() {
+    fn clock_prunes_at_the_insert_baseline_rather_than_at_zero() {
+        // A fresh insert carries frequency 1 and nothing lowers it, so
+        // `freq > 0` retains every live item and reclaims only dead bytes.
+        // CLOCK's intent -- a second chance for anything touched since
+        // admission -- is `freq > 1` in this convention.
+        assert_eq!(MergeConfig::CLOCK.initial_threshold, 1);
+    }
+
+    #[test]
+    fn merge_still_starts_its_adaptive_threshold_at_zero() {
+        assert_eq!(MergeConfig::default().initial_threshold, 0);
+    }
+
+    #[test]
+    fn clock_params_stop_the_threshold_rising_above_its_baseline() {
         // `try_merge_eviction` raises its threshold only while
         // `retained / total > target_ratio`. Retention is a ratio of two item
         // counts, so it cannot exceed 1.0 and the comparison is never true.
@@ -254,8 +280,9 @@ mod tests {
             let ratio = retained as f64 / 1000.0;
             assert!(
                 ratio <= clock.target_ratio,
-                "retention {ratio} raised the threshold above zero, so CLOCK \
-                 would prune by frequency rather than give second chances"
+                "retention {ratio} would raise the threshold above its \
+                 baseline, so CLOCK would prune adaptively like merge \
+                 instead of holding a fixed second-chance rule"
             );
         }
     }

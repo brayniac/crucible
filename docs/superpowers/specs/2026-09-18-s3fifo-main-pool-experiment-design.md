@@ -69,11 +69,31 @@ Running the two binaries against one trace and reading off two miss ratios
 produces a precise number about the sum of six differences.
 
 **Therefore the primary comparison is within crucible**, where five of the six
-can be held fixed. That requires implementing `EvictionStrategy::Clock` in
-`TtlLayer` — crucible has no second-chance-copy strategy today (the strategy set
-is `ExpireFirst | Merge | Fifo | Random | Cte`, `cache/core/src/config.rs:178`).
-That is the main build cost of this experiment and it is not optional; without it
-there is no single-variable arm.
+can be held fixed. This was expected to cost a separate `EvictionStrategy::Clock`
+implementation. It did not: CLOCK is `Merge` with the chain pinned to one segment
+and the threshold pinned, reached through `EvictionStrategy::merge_params`. Both
+arms then execute the *same* claim protocol, item scan, copy and relink, differing
+in two constants — a stronger single-variable comparison than two independently
+written code paths could be.
+
+**The prune threshold is not zero, and this is the subtlety that nearly voided
+the arm.** A fresh insert is packed with frequency 1 and nothing ever lowers it:
+`apply_frequency_decay` is unit-tested and called from no production path, and
+`LayerConfig::frequency_decay` is stored and never read (crucible#150). Zero is
+therefore unreachable for a live item, so a `freq > 0` rule retains everything
+still indexed and reclaims only dead bytes — compaction, not second chance.
+
+cache-rs has the identical property for the same two reasons:
+`Hashbucket::pack(tag, 1, location)` on insert, and no decay function anywhere
+despite `docs/s3fifo.md` asserting that "the hash table's frequency smoothing
+handles decay over time". So its `s3fifo_evict_main` sweep also keeps every live
+item.
+
+CLOCK therefore prunes at `freq > 1` — touched since admission, not merely
+present — via `MergeConfig::initial_threshold`. That is the faithful translation
+of the published rule into a convention whose baseline is 1 rather than 0.
+Merge keeps `initial_threshold: 0` because its threshold climbs past the
+baseline on its own, which is the only reason it prunes live items at all.
 
 cache-rs stays in as a cross-check arm. If within-crucible merge-vs-CLOCK and
 cross-codebase crucible-vs-cache-rs disagree in sign, something in the other five
@@ -86,7 +106,7 @@ Trace and cache size fixed within a sweep point; one variable per pair.
 | Arm | Layer 0 | Layer 1 | Varies vs baseline |
 |---|---|---|---|
 | `A-merge` (baseline) | FIFO admission, defer-promote | Merge (default config) | — |
-| `A-clock` | FIFO admission, defer-promote | **CLOCK** | main-pool algorithm |
+| `A-clock` | FIFO admission, defer-promote | **CLOCK** (`min_segments: 1`, threshold pinned at 1) | main-pool algorithm |
 | `A-merge-route` | FIFO admission, **promote-on-insert** | Merge | #148 routing |
 | `A-clock-route` | FIFO admission, promote-on-insert | CLOCK | both (interaction check) |
 | `X-cachers` | cache-rs `Policy::S3Fifo { admission_ratio: 0.10 }` | | cross-check, confounded |

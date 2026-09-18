@@ -1147,8 +1147,11 @@ impl TtlLayer {
 
         let verifier = SinglePoolVerifier { pool: &self.pool };
 
-        // Adaptive threshold: start conservative, increase if retaining too much
-        let mut threshold: u8 = 0;
+        // Adaptive threshold: start at the policy's baseline, increase if
+        // retaining too much. The baseline is not always zero -- a fresh
+        // insert carries frequency 1, so a zero threshold retains every live
+        // item and a policy that pins its threshold must start above that.
+        let mut threshold: u8 = merge_config.initial_threshold;
         let mut total_retained = 0u32;
         let mut total_pruned = 0u32;
 
@@ -3291,34 +3294,12 @@ mod clock_eviction {
         );
     }
 
-    /// The control, and it records a finding rather than the behaviour first
-    /// expected of it.
-    ///
-    /// A never-read item still survives CLOCK reclamation, because a fresh
-    /// insert is packed with frequency 1 (`Hashbucket::pack(tag, 1, loc)`) and
-    /// nothing ever lowers it: `apply_frequency_decay` exists, is unit-tested,
-    /// and is called from no production path, while `LayerConfig::
-    /// frequency_decay` is stored and never read. Frequency is therefore
-    /// monotonic, zero is unreachable for a live item, and a `freq > 0` test
-    /// retains everything that is still indexed.
-    ///
-    /// pelikan-io/cache-rs has the same property, for the same two reasons --
-    /// `pack(tag, 1, location)` on insert and no decay function anywhere --
-    /// so its `s3fifo_evict_main` "second chance" sweep also keeps every live
-    /// item. What either implementation actually reclaims is *dead* bytes,
-    /// which is compaction rather than second chance.
-    ///
-    /// The consequence for the merge-vs-CLOCK comparison is in the design
-    /// spec: crucible's merge prunes live items only because its threshold
-    /// climbs adaptively above the insert baseline, and CLOCK pins that
-    /// threshold at zero, so the two arms differ by more than the design
-    /// assumed.
-    #[test]
-    fn clock_retains_a_never_read_item_because_a_fresh_insert_starts_above_zero() {
-        let layer = clock_layer();
+    /// Fill several segments and return the layer's hashtable. The bucket
+    /// head is then not also its tail, which is what `select_merge_candidates`
+    /// requires -- it stops at the tail, the live write segment.
+    fn filled(layer: &TtlLayer) -> MultiChoiceHashtable {
         let hashtable = MultiChoiceHashtable::new(12);
         let value = vec![b'v'; 6 * 1024];
-
         for i in 0..30u32 {
             let key = format!("k{i:03}");
             let verifier = SinglePoolVerifier { pool: &layer.pool };
@@ -3329,19 +3310,45 @@ mod clock_eviction {
                 .insert(key.as_bytes(), loc.to_location(), &verifier)
                 .expect("insert");
         }
+        hashtable
+    }
 
-        let baseline = hashtable
-            .get_ghost_frequency(b"k000")
-            .or_else(|| {
-                let verifier = SinglePoolVerifier { pool: &layer.pool };
-                hashtable.lookup(b"k000", &verifier).map(|_| 1)
-            })
-            .expect("the item must be indexed before eviction");
+    /// The second-chance rule, stated against the insert baseline.
+    ///
+    /// A fresh insert is packed with frequency 1 and nothing ever lowers it:
+    /// `apply_frequency_decay` is unit-tested and called from no production
+    /// path, and `LayerConfig::frequency_decay` is stored and never read. So
+    /// zero is unreachable for a live item and a `freq > 0` rule prunes
+    /// nothing, reclaiming only dead bytes. CLOCK therefore prunes at
+    /// `freq > 1`: touched since admission, not merely present.
+    #[test]
+    fn clock_drops_an_item_not_read_since_admission() {
+        let layer = clock_layer();
+        let hashtable = filled(&layer);
+
+        let result = layer.evict_nonblocking(&hashtable);
+        assert!(matches!(result, EvictResult::Freed), "{result:?}");
+
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
         assert!(
-            baseline >= 1,
-            "a fresh insert is expected to carry a non-zero frequency; if this \
-             ever becomes 0, CLOCK starts pruning live items and the arm's \
-             meaning changes"
+            hashtable.lookup(b"k000", &verifier).is_none(),
+            "an item never read since admission survived: the prune threshold \
+             is at or below the insert baseline, so every live item earns a \
+             second chance and CLOCK reclaims only dead bytes"
+        );
+    }
+
+    /// The control: one read must be enough to earn the second chance, or the
+    /// rule above is just "drop everything".
+    #[test]
+    fn clock_retains_an_item_read_once_since_admission() {
+        let layer = clock_layer();
+        let hashtable = filled(&layer);
+
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        assert!(
+            hashtable.lookup(b"k000", &verifier).is_some(),
+            "the warming read must hit, or no frequency accrues"
         );
 
         let result = layer.evict_nonblocking(&hashtable);
@@ -3350,8 +3357,7 @@ mod clock_eviction {
         let verifier = SinglePoolVerifier { pool: &layer.pool };
         assert!(
             hashtable.lookup(b"k000", &verifier).is_some(),
-            "a never-read item was pruned, which would mean frequency can \
-             reach zero for a live item -- re-check the decay paths"
+            "a single read did not earn a second chance"
         );
     }
 
