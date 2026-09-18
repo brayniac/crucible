@@ -411,13 +411,12 @@ fn print_replay_report(
         for (i, r) in outcome.intervals.iter().enumerate() {
             eprintln!("  [{i:>3}] {r:.4}");
         }
-        let n = outcome.intervals.len();
-        if n >= 3 {
-            let third = n / 3;
-            let last = &outcome.intervals[n - third..];
-            let lo = last.iter().cloned().fold(f64::INFINITY, f64::min);
-            let hi = last.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            eprintln!("  last third spread: {:.4}", hi - lo);
+        match replay::tail_spread(&outcome.intervals) {
+            Some(spread) => eprintln!("  last third spread: {spread:.4}"),
+            None => eprintln!(
+                "  last third spread: n/a (need >= 9 intervals; \
+                 lower report_interval_records or lengthen the window)"
+            ),
         }
     }
     eprintln!();

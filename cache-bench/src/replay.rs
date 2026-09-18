@@ -246,15 +246,66 @@ pub fn envelope_verdict(
         return Err("measured window contains no GETs; there is no miss ratio to report".into());
     }
 
+    // A refused write is not an eviction-policy outcome. An undersized
+    // hashtable rejects insertions, which changes what is resident for a
+    // reason orthogonal to the policy under test, and the shift is the same
+    // size as the effects being looked for. Sizing is also what makes the
+    // replay deterministic: with no refusals, hash placement stops mattering
+    // and repeated runs agree exactly.
+    if measured.set_errors > 0 {
+        return Err(format!(
+            "the hashtable refused {} of {} writes: it is undersized for this \
+             trace and cache size, and table pressure will read as a policy \
+             effect (raise hashtable_power until set errors reach zero)",
+            measured.set_errors,
+            measured.sets + measured.set_errors
+        ));
+    }
+
+    // `evictions` counts only a layer with no demotion target -- the main
+    // cache in the two-layer RAM topology. Layer 0's promotions land in
+    // `demotions` and keep happening above the working set, so requiring
+    // "evicted OR demoted" accepts a point where the main pool never
+    // reclaimed anything and no eviction policy decision was ever made. That
+    // is exactly the saturated region of a sweep, where every policy scores
+    // identically and the agreement carries no information.
+    //
+    // With a disk tier, layer 1 demotes rather than evicts and this would be
+    // the wrong test; the experiment targets the two-layer configuration and
+    // the check is scoped to it.
     match internal {
-        Some(stats) if stats.evictions == 0 && stats.demotions == 0 => Err(format!(
-            "no segment was evicted or demoted in the measured window \
-             ({} sets, {} set errors): this cache size is above the trace's \
-             working set, so the point measures allocation rather than eviction",
-            measured.sets, measured.set_errors
+        Some(stats) if stats.evictions == 0 => Err(format!(
+            "the main layer never evicted in the measured window \
+             ({} demotions, {} sets, {} set errors): this cache size is at or \
+             above the trace's working set, so the point measures allocation \
+             rather than eviction",
+            stats.demotions, measured.sets, measured.set_errors
         )),
         _ => Ok(()),
     }
+}
+
+/// Spread of the measured window's tail, or `None` when the window is too
+/// short to judge.
+///
+/// A window still trending at its end was too short, and its average is a
+/// value that occurs nowhere in the run. But the check needs enough intervals
+/// in the tail to say anything: with three intervals the last third is one
+/// interval, whose spread is zero by construction, and a printed 0.0000 reads
+/// as "perfectly flat" while measuring nothing at all.
+pub fn tail_spread(intervals: &[f64]) -> Option<f64> {
+    /// Fewest intervals the tail must hold for its spread to mean anything.
+    const MIN_TAIL: usize = 3;
+
+    let tail_len = intervals.len() / 3;
+    if tail_len < MIN_TAIL {
+        return None;
+    }
+
+    let tail = &intervals[intervals.len() - tail_len..];
+    let lo = tail.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = tail.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Some(hi - lo)
 }
 
 /// TTL to hand the cache for a record, `None` for "no expiry".
@@ -410,6 +461,44 @@ mod tests {
     }
 
     #[test]
+    fn a_run_whose_main_layer_never_reclaimed_is_rejected_even_when_layer_zero_promoted() {
+        // Above the working set, layer 0 still demotes into layer 1 while
+        // layer 1 never evicts. The cache "works", but no main-pool eviction
+        // decision was ever made -- which is the entire quantity a
+        // merge-vs-CLOCK comparison is trying to read. Accepting the point is
+        // how a saturated region of a sweep reads as "the policies agree".
+        let internal = cache_core::CacheInternalStats {
+            demotions: 376_122,
+            evictions: 0,
+            demotion_failures: 0,
+        };
+
+        let msg = envelope_verdict(&stats_with_gets(), Some(internal))
+            .expect_err("no main-layer eviction means no policy decision");
+        assert!(msg.contains("evict"), "{msg}");
+    }
+
+    #[test]
+    fn a_run_whose_hashtable_refused_writes_is_rejected() {
+        // An undersized table refuses insertions, which changes what is
+        // resident for a reason that has nothing to do with eviction policy.
+        // Measured on timelines_real_time_aggregates at 48 MB: hash_power 12
+        // gave 57,271 set errors and a miss ratio of 0.2958 against 0.2810 at
+        // power 22 -- a 5% shift indistinguishable from a policy effect.
+        let stats = ReplayStats {
+            hits: 90,
+            misses: 10,
+            set_errors: 57_271,
+            sets: 1_021_283,
+            ..Default::default()
+        };
+
+        let msg = envelope_verdict(&stats, Some(internal(176)))
+            .expect_err("table pressure is not an eviction-policy result");
+        assert!(msg.contains("hashtable"), "{msg}");
+    }
+
+    #[test]
     fn a_run_with_evictions_and_gets_passes_the_envelope_check() {
         assert_eq!(
             envelope_verdict(&stats_with_gets(), Some(internal(1234))),
@@ -427,6 +516,30 @@ mod tests {
         let msg = envelope_verdict(&no_gets, Some(internal(1234)))
             .expect_err("a window with no GETs has no miss ratio to report");
         assert!(msg.contains("GET"), "{msg}");
+    }
+
+    #[test]
+    fn a_window_too_short_to_judge_has_no_tail_spread() {
+        // Three intervals put one interval in the last third; its spread is
+        // zero whatever the run did.
+        assert_eq!(tail_spread(&[0.9, 0.5, 0.1]), None);
+    }
+
+    #[test]
+    fn tail_spread_measures_only_the_last_third() {
+        // A large swing early and a flat tail is a converged run.
+        let intervals = vec![0.9, 0.8, 0.5, 0.30, 0.31, 0.30, 0.31, 0.30, 0.31];
+        let spread = tail_spread(&intervals).expect("nine intervals is enough to judge");
+
+        assert!(spread < 0.02, "flat tail reported spread {spread}");
+    }
+
+    #[test]
+    fn a_still_trending_tail_reports_its_drift() {
+        let intervals = vec![0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
+        let spread = tail_spread(&intervals).expect("nine intervals is enough to judge");
+
+        assert!(spread > 0.15, "drifting tail reported spread {spread}");
     }
 
     #[test]

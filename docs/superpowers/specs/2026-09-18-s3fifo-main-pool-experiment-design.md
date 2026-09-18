@@ -99,7 +99,7 @@ hash ghost queue.
 
 ## Traces
 
-Two formats exist in `s3-replay/src/main.rs`, and they are not
+Two formats are supported by `cache-bench/src/trace.rs`, and they are not
 interchangeable for this question.
 
 - **Twitter cluster native** (20-byte records: timestamp, key id, key/value
@@ -117,8 +117,13 @@ interchangeable for this question.
 > `promoted: 0` for the first 240M operations. Do not use them as a baseline or
 > as evidence that the rig works.
 
-Traces live on `/Volumes/cachetrace/oracle/`, currently unmounted. Confirm mount
-and checksum before any run.
+Traces live on delta's NFS export, mounted read-only:
+
+    sudo mount -t nfs -o ro,resvport delta:/mnt/cachetrace /Volumes/cachetrace
+
+`twoday/` and `bin/` and `nsdi/` hold `.sbin.zst` — the native 20-byte layout
+with op codes and TTLs. `oracle/` holds the oracleGeneral form of the same
+clusters, for the reference curves only.
 
 ## Measurement envelope
 
@@ -126,23 +131,85 @@ Establish this before producing any comparison number.
 
 **Characterize each trace first**, and write the numbers down: unique keys,
 total and unique byte footprint, key and value size distributions, GET/SET/DELETE
-split, overwrite rate per key, TTL distribution. `s3-replay`'s
-`print_summary` already computes most of these. A trace with a negligible
+split, overwrite rate per key, TTL distribution. A trace with a negligible
 overwrite rate cannot distinguish merge from CLOCK on the mechanism that
 separates them, and should be excluded rather than run and reported as "no
 difference".
 
-**Then sweep cache size to find the working band.** The comparison is only
-meaningful where the policy is actually deciding, which is roughly the 80–95%
-hit-ratio band. Sweep in powers of two until the band is bracketed, then take
-at least four points inside it. Report the whole curve, not a single size —
-a policy can win at one capacity and lose at another, and a single point hides
-that.
+**Then sweep cache size against the compulsory miss floor, not against an
+absolute hit ratio.** An earlier draft of this document said to target the
+80-95% hit band. That heuristic is wrong and the first real sweep showed why.
 
-**Reject any sweep point above the working set.** If an arm reports
-`demotions == 0` or `evictions == 0` for the measured window, that point
-measured allocation, not eviction. Fail the point loudly rather than averaging
-it in.
+Sweep upward until the miss-ratio curve flattens. The value it flattens to is
+the **compulsory miss floor** for that window: every object's first access
+misses no matter how large the cache, so no policy can do better. On
+`timelines_real_time_aggregates` over a 10M-record window the floor is 0.1834,
+which caps hit ratio at 81.66% — a cache sized for "80% hit" is sitting at
+1.04x the floor with almost no eviction pressure, and would have been read as
+a healthy operating point.
+
+Express the target as a multiple of the floor. The discriminating region is
+roughly **1.3x to 2x**; below that the cache is barely evicting, above it the
+cache is thrashing and the compulsory misses stop dominating. Measured:
+
+    heap     miss ratio   x floor   evictions   verdict
+      8 MB     1.0000      5.45x        0       rejected (see cliff below)
+     16 MB     1.0000      5.45x        0       rejected
+     24 MB     1.0000      5.45x        0       rejected
+     32 MB     0.3061      1.67x      196       ok
+     48 MB     0.2810      1.53x      188       ok
+     64 MB     0.2653      1.45x      182       ok
+     96 MB     0.2116      1.15x       82       marginal
+    128 MB     0.1906      1.04x       40       marginal
+    256 MB     0.1834      1.00x        0       rejected (saturated)
+
+**A minimum cache size is imposed by a separate bug.** S3-FIFO wedges when
+layer 0 holds fewer than 3 segments — 100% miss at one segment, 99.46% at two.
+At `small_queue_percent = 10` and 1 MB segments that is any heap below ~30 MB,
+which is why the three smallest points above return a 1.0 miss ratio rather
+than a large one. Until that is fixed, the bottom of every sweep is unusable
+and the envelope check is what stops it being reported.
+
+**Reject any sweep point whose main layer never evicted.** `envelope_verdict`
+enforces this. Note it tests `evictions`, not `evictions || demotions`: layer
+0 keeps promoting into layer 1 above the working set, so the weaker test
+accepts a saturated point where no main-pool eviction decision was ever made —
+which is the whole quantity this experiment reads. That false negative was
+live until the 256 MB point above exposed it.
+
+## Trace selection
+
+Screened the 18 largest `twoday` traces over a 600k-record prefix. Prefix
+length understates both reuse and overwrite rate, so these rank traces rather
+than characterise them.
+
+Selected, on write mix and overwrite rate — merge's advantage over CLOCK is
+dead-byte reclamation, and dead bytes come from overwrites and deletes:
+
+| trace | writes | overwrites | reuse | mean value | TTLs |
+|---|---|---|---|---|---|
+| `timelines_real_time_aggregates` | 10.7% | **69.8%** | 9.8 | 359 B | 2 |
+| `simclusters_v2_entity_cluster_scores` | **49.7%** | 32.9% | 3.0 | 2087 B | 2 |
+| `botmaker_2` | 42.2% | 16.7% | 2.8 | 89 B | 16 |
+| `pinkfloyd` | 12.5% | 24.1% | 3.6 | 575 B | 6 |
+
+`timelines_real_time_aggregates` is the primary: the highest overwrite rate in
+the corpus with enough reuse to have a working set, and a small enough mean
+value to fit a laptop-scale sweep. `simclusters` is the opposite shape — half
+writes with 2 KB values — and needs a multi-GB sweep to reach its band.
+`botmaker_2` is the only candidate with real TTL diversity.
+
+**Negative control: `wtf_req_cache`** — 4.9% writes and a **0.0%** overwrite
+rate. Merge and CLOCK should be indistinguishable there, because the mechanism
+that separates them never fires. If an arm pair differs on this trace, the rig
+is wrong rather than the policies.
+
+Excluded for no overwrite rate, and so unable to discriminate:
+`timelines_content_features` (0.1% writes), `conversation_timeline_metadata`
+(1.0%), `pushservice_core_svcs` (1.2%), `content_recommender` (2.5%
+overwrites), `onboarding_task_service` (1.2% overwrites, and a 1-byte mean
+value). Also excluded: `ibis_cache`, which is 99.8% `add` with zero-length
+values.
 
 ## Steady state
 
@@ -162,20 +229,37 @@ monotonically and converges to something that occurs nowhere in the run.
 
 ## Determinism and the noise floor
 
-Neither implementation is deterministic across processes: both build their
-hashtable with `RandomState::new()` in release builds, and `Random` eviction
-draws from an unseeded RNG.
+**Measured, not assumed: the noise floor is zero at correct hashtable sizing.**
 
-1. **Add a seed knob.** `MultiChoiceHashtable::with_seeds(power, choices, seeds)`,
-   plumbed to a CLI flag. Same treatment for the eviction RNG. Fixed seed makes a
-   run reproducible.
-2. **Measure the floor before quoting any delta.** Run the baseline arm at a
-   fixed sweep point across at least 10 seeds. The spread of that set is the
-   noise floor. A merge-vs-CLOCK difference smaller than it is not a result.
-3. **Replay single-threaded for all hit-ratio arms.** Concurrency changes
-   eviction interleaving, which changes which items are resident, which changes
-   the number we are trying to read. Throughput is a separate experiment with a
-   separate rig; do not read hit ratio off a multi-threaded run.
+Neither engine seeds its hashtable deterministically in release builds, so the
+concern was real. `MultiChoiceHashtable::with_seeds` was added to size it.
+Result on `timelines_real_time_aggregates`, 48 MB, 15M-record window:
+
+    hash_power   set errors   seeds 1-4 miss ratio              spread
+       10          381,722    0.4151 0.4252 0.4183 0.4165       0.0101
+       12           57,271    0.2948 0.2959 0.2954 0.2961       0.0013
+       14+               0    0.2810 0.2810 0.2810 0.2810       0.0000
+
+Hash placement matters only while the table is oversubscribed enough to refuse
+insertions. Once `set_errors` reaches zero the single-threaded replay is
+**exactly reproducible**, and ten seeds agree to four decimal places.
+
+Two consequences:
+
+1. **No seed averaging is needed for the policy arms.** At a correctly sized
+   table any measured merge-vs-CLOCK difference is real by construction. This
+   is a large simplification and it is why the knob was worth building even
+   though the answer turned out to be zero — the floor cannot be known to be
+   zero without the ability to vary the seed.
+2. **`set_errors > 0` is a contamination mode, now a hard reject.** At
+   `hash_power` 12 table pressure alone moved the miss ratio 0.2810 -> 0.2958.
+   That is the same magnitude as the effects being looked for and would have
+   been read as a policy difference.
+
+Scope of the claim: single-threaded replay, one trace. Determinism does not
+survive multi-threading, which reorders how evictions interleave with reads —
+another reason the hit-ratio arms stay single-threaded. On a new trace, verify
+`set_errors == 0` before assuming reproducibility rather than inheriting it.
 
 ## Comparability of the denominator
 
