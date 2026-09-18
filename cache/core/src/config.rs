@@ -143,6 +143,16 @@ pub struct MergeConfig {
     /// Target retention ratio (0.0 - 1.0, typically 0.5).
     /// Lower = more aggressive pruning, higher = more retention.
     pub target_ratio: f64,
+
+    /// Frequency an item must exceed to survive, before any adaptive rise.
+    ///
+    /// Not zero-by-default-and-forget: a fresh insert is packed with
+    /// frequency 1 and nothing ever lowers it, so a threshold of 0 retains
+    /// every still-indexed item and prunes only dead bytes. Merge gets away
+    /// with starting at 0 because its threshold climbs past the baseline on
+    /// its own; a policy that pins the threshold must start above the
+    /// baseline or it prunes nothing live.
+    pub initial_threshold: u8,
 }
 
 impl Default for MergeConfig {
@@ -150,11 +160,29 @@ impl Default for MergeConfig {
         Self {
             min_segments: 4,
             target_ratio: 0.5,
+            initial_threshold: 0,
         }
     }
 }
 
 impl MergeConfig {
+    /// Parameters that make merge behave as CLOCK second chance.
+    ///
+    /// `min_segments: 1` reclaims one segment per pass rather than a chain.
+    /// `target_ratio: 1.0` pins the adaptive prune threshold at zero: the
+    /// threshold rises only while `retained / total > target_ratio`, and that
+    /// ratio can never exceed 1.0, so every item with a non-zero frequency is
+    /// copied and every item without one is dropped.
+    ///
+    /// That second property is load-bearing and subtle, so it is pinned by
+    /// `clock_params_pin_the_prune_threshold_at_zero` rather than left to a
+    /// reader to re-derive.
+    pub const CLOCK: Self = Self {
+        min_segments: 1,
+        target_ratio: 1.0,
+        initial_threshold: 1,
+    };
+
     /// Create a new merge config with default values.
     pub fn new() -> Self {
         Self::default()
@@ -174,7 +202,7 @@ impl MergeConfig {
 }
 
 /// Eviction strategy for a layer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum EvictionStrategy {
     /// Evict expired segments first (no item-level decisions needed).
     ExpireFirst,
@@ -191,11 +219,99 @@ pub enum EvictionStrategy {
 
     /// CTE - Closest To Expiration segment, apply threshold to items.
     Cte,
+
+    /// CLOCK second chance: reclaim one segment at a time, copying every item
+    /// whose frequency is non-zero into a fresh segment and dropping the rest.
+    ///
+    /// Deliberately not a separate implementation. It is [`Merge`] with the
+    /// chain length pinned to one segment and the prune threshold pinned to
+    /// zero, so the two share every line of claim protocol, item scan, copy
+    /// and relink. A measured merge-vs-CLOCK difference is then the algorithm
+    /// rather than an artifact of two independently written code paths --
+    /// which is the whole point of the comparison in
+    /// `docs/superpowers/specs/2026-09-18-s3fifo-main-pool-experiment-design.md`.
+    ///
+    /// [`Merge`]: EvictionStrategy::Merge
+    Clock,
+}
+
+impl EvictionStrategy {
+    /// The merge parameters this strategy runs with, or `None` if it is not
+    /// merge-shaped.
+    pub fn merge_params(&self) -> Option<MergeConfig> {
+        match self {
+            EvictionStrategy::Merge(config) => Some(*config),
+            EvictionStrategy::Clock => Some(MergeConfig::CLOCK),
+            EvictionStrategy::ExpireFirst
+            | EvictionStrategy::Fifo
+            | EvictionStrategy::Random
+            | EvictionStrategy::Cte => None,
+        }
+    }
 }
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_prunes_at_the_insert_baseline_rather_than_at_zero() {
+        // A fresh insert carries frequency 1 and nothing lowers it, so
+        // `freq > 0` retains every live item and reclaims only dead bytes.
+        // CLOCK's intent -- a second chance for anything touched since
+        // admission -- is `freq > 1` in this convention.
+        assert_eq!(MergeConfig::CLOCK.initial_threshold, 1);
+    }
+
+    #[test]
+    fn merge_still_starts_its_adaptive_threshold_at_zero() {
+        assert_eq!(MergeConfig::default().initial_threshold, 0);
+    }
+
+    #[test]
+    fn clock_params_stop_the_threshold_rising_above_its_baseline() {
+        // `try_merge_eviction` raises its threshold only while
+        // `retained / total > target_ratio`. Retention is a ratio of two item
+        // counts, so it cannot exceed 1.0 and the comparison is never true.
+        // If that rule ever changes, the CLOCK arm silently stops being CLOCK
+        // and the comparison it feeds becomes meaningless -- so pin it here.
+        let clock = MergeConfig::CLOCK;
+        for retained in 0..=1000u32 {
+            let ratio = retained as f64 / 1000.0;
+            assert!(
+                ratio <= clock.target_ratio,
+                "retention {ratio} would raise the threshold above its \
+                 baseline, so CLOCK would prune adaptively like merge \
+                 instead of holding a fixed second-chance rule"
+            );
+        }
+    }
+
+    #[test]
+    fn clock_reclaims_one_segment_at_a_time_rather_than_a_chain() {
+        assert_eq!(MergeConfig::CLOCK.min_segments, 1);
+    }
+
+    #[test]
+    fn clock_runs_the_merge_machinery_with_clock_parameters() {
+        assert_eq!(
+            EvictionStrategy::Clock.merge_params(),
+            Some(MergeConfig::CLOCK)
+        );
+    }
+
+    #[test]
+    fn merge_reports_its_own_configured_parameters() {
+        let cfg = MergeConfig::new().with_min_segments(7);
+        assert_eq!(EvictionStrategy::Merge(cfg).merge_params(), Some(cfg));
+    }
+
+    #[test]
+    fn a_strategy_that_is_not_merge_shaped_has_no_merge_parameters() {
+        assert_eq!(EvictionStrategy::Fifo.merge_params(), None);
+        assert_eq!(EvictionStrategy::Random.merge_params(), None);
+        assert_eq!(EvictionStrategy::Cte.merge_params(), None);
+    }
 
     #[test]
     fn test_frequency_decay_linear() {

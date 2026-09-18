@@ -87,6 +87,26 @@ impl MultiChoiceHashtable {
         }
     }
 
+    /// Create a hashtable whose key placement is reproducible across processes.
+    ///
+    /// [`Self::new`] and [`Self::with_choices`] seed from the OS, so bucket
+    /// occupancy — and therefore which keys collide, which ghosts survive a
+    /// bucket's slot pressure, and what gets evicted — differs run to run. That
+    /// variance is the noise floor any measured eviction-policy difference has
+    /// to clear, so it must be controllable rather than merely present. A
+    /// benchmark pins the seed to make one run repeatable, then varies it
+    /// deliberately to measure the floor.
+    ///
+    /// Not the default: a fixed seed in production would make key placement
+    /// predictable from outside, which is a collision-attack surface.
+    pub fn with_seeds(power: u8, num_choices: u8, seeds: [u64; 4]) -> Self {
+        let mut table = Self::with_choices(power, num_choices);
+        table.hash_builder = Box::new(RandomState::with_seeds(
+            seeds[0], seeds[1], seeds[2], seeds[3],
+        ));
+        table
+    }
+
     /// Get the number of bucket choices.
     #[inline]
     pub fn num_choices(&self) -> u8 {
@@ -2117,6 +2137,40 @@ mod verification {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+
+    /// Placement across several keys, as the thing a seed has to reproduce.
+    fn placements(table: &MultiChoiceHashtable, keys: &[&[u8]]) -> Vec<[usize; 8]> {
+        keys.iter()
+            .map(|k| table.bucket_indices(table.hash_key(k)))
+            .collect()
+    }
+
+    const KEYS: [&[u8]; 6] = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon", b"zeta"];
+
+    #[test]
+    fn two_tables_built_with_one_seed_place_every_key_identically() {
+        let seeds = [1u64, 2, 3, 4];
+        let a = MultiChoiceHashtable::with_seeds(12, 2, seeds);
+        let b = MultiChoiceHashtable::with_seeds(12, 2, seeds);
+
+        assert_eq!(
+            placements(&a, &KEYS),
+            placements(&b, &KEYS),
+            "a pinned seed must make bucket placement reproducible across tables"
+        );
+    }
+
+    #[test]
+    fn two_tables_built_with_different_seeds_place_some_key_differently() {
+        let a = MultiChoiceHashtable::with_seeds(12, 2, [1, 2, 3, 4]);
+        let b = MultiChoiceHashtable::with_seeds(12, 2, [5, 6, 7, 8]);
+
+        assert_ne!(
+            placements(&a, &KEYS),
+            placements(&b, &KEYS),
+            "if the seed did not reach the hasher, varying it cannot measure a noise floor"
+        );
+    }
 
     // Mock verifier for testing
     struct MockVerifier {

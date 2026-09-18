@@ -1373,8 +1373,23 @@ impl<H: Hashtable> TieredCache<H> {
                 self.evict_from_layer(disk_idx);
             }
 
-            // 2. Evict from Layer 1 if full (demotes to disk)
-            if self.layers.len() > 2
+            // 2. Evict from Layer 1 if full, so layer 0's demotions have
+            //    somewhere to land.
+            //
+            //    This was `len() > 2`, which asked whether layer 1 has a disk
+            //    tier to demote *into*. That is the wrong question: the reason
+            //    to reclaim layer 1 is that layer 0 demotes into *it*, which is
+            //    true in every tiered topology. Gated on a disk tier, the
+            //    two-layer S3-FIFO default never reclaimed its main cache at
+            //    all -- layer 1 filled once and froze, `write_item` failed for
+            //    every subsequent promotion, and the demoter discarded each one
+            //    (80-92% of them under pressure). Nothing failed loudly: the
+            //    admission filter kept selecting hot items and the cache kept
+            //    throwing them away.
+            //
+            //    A terminal layer 1 is fine here -- `evict_from_layer` falls
+            //    through to its discard path when there is no next layer.
+            if self.layers.len() > 1
                 && let Some(layer1) = self.layers.get(1)
                 && layer1.free_segment_count() == 0
             {
@@ -2342,6 +2357,66 @@ mod tests {
             .with_ttl_layer(ttl_layer)
             .eviction_threshold(1)
             .build()
+    }
+
+    /// Drive a two-layer cache well past capacity, reading each key once so it
+    /// qualifies for demotion, and report what the cascade did.
+    ///
+    /// Reads matter: `determine_item_fate` demotes only at
+    /// `freq >= demotion_threshold`, and a write leaves frequency at zero, so
+    /// a write-only workload ghosts everything and exercises nothing.
+    fn drive_past_capacity(cache: &TieredCache<MultiChoiceHashtable>) -> CacheInternalStats {
+        let value = vec![0xABu8; 1024];
+        for i in 0..3000u32 {
+            let key = format!("key-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                // Raise the frequency so this item is worth promoting.
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        cache.stats().snapshot()
+    }
+
+    #[test]
+    fn a_two_layer_cache_evicts_from_its_main_layer_once_that_layer_fills() {
+        let cache = create_test_cache();
+
+        let stats = drive_past_capacity(&cache);
+
+        // `stats.evictions` only counts a layer with no demotion target, which
+        // in this topology is layer 1 alone. Zero means layer 1 was never
+        // evicted from at all: it filled once and froze, and every later
+        // promotion had nowhere to land.
+        assert!(
+            stats.evictions > 0,
+            "layer 1 never evicted (evictions={}, demotions={}, failures={}); \
+             a main cache that stops reclaiming is not a policy, it is a stall",
+            stats.evictions,
+            stats.demotions,
+            stats.demotion_failures,
+        );
+    }
+
+    #[test]
+    fn most_items_chosen_for_demotion_reach_the_main_layer() {
+        let cache = create_test_cache();
+
+        let stats = drive_past_capacity(&cache);
+
+        // The demoter discards an item whose target write fails. If the main
+        // layer is never reclaimed, that is most of them -- the admission
+        // filter keeps selecting hot items and the cache keeps throwing them
+        // away, which looks like a working S3-FIFO from the outside.
+        assert!(
+            stats.demotions > stats.demotion_failures,
+            "more demotions were discarded than landed \
+             (demotions={}, failures={})",
+            stats.demotions,
+            stats.demotion_failures,
+        );
     }
 
     #[test]
