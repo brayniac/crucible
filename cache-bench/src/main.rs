@@ -7,6 +7,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod config;
 mod metrics;
 mod ratelimit;
+mod replay;
+mod trace;
 mod worker;
 
 use crate::config::{CacheBackend, Config, EvictionPolicy};
@@ -70,6 +72,10 @@ fn run_with_cache<C: Cache>(
     config: Config,
     cache: Arc<C>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if config.workload.trace.is_some() {
+        return run_trace_replay(config, cache);
+    }
+
     let num_threads = config.general.threads;
     let warmup = config.general.warmup;
     let duration = config.general.duration;
@@ -309,6 +315,114 @@ fn run_with_cache<C: Cache>(
     Ok(())
 }
 
+/// Replay a trace, then report the measured window and whether it is usable.
+///
+/// Single-threaded on purpose: concurrency reorders how evictions interleave
+/// with reads, which changes which items are resident, which changes the miss
+/// ratio being measured. Throughput belongs to a different rig.
+fn run_trace_replay<C: Cache>(
+    config: Config,
+    cache: Arc<C>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let trace_cfg = config.workload.trace.as_ref().expect("checked by caller");
+
+    let opts = replay::ReplayOptions {
+        warmup_records: trace_cfg.warmup_records,
+        max_records: trace_cfg.max_records,
+        report_interval_records: trace_cfg.report_interval_records,
+        max_value_bytes: trace_cfg.max_value_bytes,
+        insert_on_miss: trace_cfg.format.insert_on_miss(),
+    };
+
+    eprintln!("replaying {}", trace_cfg.path.display());
+    eprintln!("  warmup:     {} records", opts.warmup_records);
+    eprintln!(
+        "  measured:   {}",
+        match opts.max_records {
+            Some(n) => format!("{n} records"),
+            None => "to end of trace".to_string(),
+        }
+    );
+    eprintln!("  insert on miss: {}", opts.insert_on_miss);
+    eprintln!();
+
+    let mut reader = trace::TraceReader::open(&trace_cfg.path, trace_cfg.format.into())?;
+
+    let started = Instant::now();
+    let outcome = replay::run_replay(cache.as_ref(), &mut reader, &opts)?;
+    let elapsed = started.elapsed();
+
+    let internal = cache.internal_stats();
+    print_replay_report(&outcome, internal.clone(), elapsed);
+
+    // The envelope check is a hard gate, not a warning: a point that measured
+    // no eviction is not a weaker result, it is a different measurement.
+    match replay::envelope_verdict(&outcome.measured, internal) {
+        Ok(()) => Ok(()),
+        Err(reason) => Err(format!("run rejected: {reason}").into()),
+    }
+}
+
+fn print_replay_report(
+    outcome: &replay::ReplayOutcome,
+    internal: Option<cache_core::CacheInternalStats>,
+    elapsed: Duration,
+) {
+    let m = &outcome.measured;
+    let w = &outcome.warmup;
+
+    eprintln!("=== Replay ===");
+    eprintln!("  records read:   {}", outcome.records_read);
+    eprintln!("  elapsed:        {elapsed:?}");
+    eprintln!(
+        "  warmup:         {} gets ({} miss), {} sets",
+        w.hits + w.misses,
+        w.misses,
+        w.sets
+    );
+    eprintln!();
+    eprintln!("=== Measured window ===");
+    eprintln!("  gets:           {}", m.hits + m.misses);
+    eprintln!("  sets:           {} (errors: {})", m.sets, m.set_errors);
+    eprintln!("  deletes:        {}", m.deletes);
+    eprintln!("  oversized:      {}", m.oversized);
+    match m.miss_ratio() {
+        Some(r) => eprintln!(
+            "  MISS RATIO:     {:.4}  (hit {:.2}%)",
+            r,
+            (1.0 - r) * 100.0
+        ),
+        None => eprintln!("  MISS RATIO:     n/a (no GETs)"),
+    }
+
+    if let Some(stats) = internal {
+        eprintln!();
+        eprintln!("=== Cache internals ===");
+        eprintln!("  evictions:      {}", stats.evictions);
+        eprintln!("  demotions:      {}", stats.demotions);
+        eprintln!("  demotion fails: {}", stats.demotion_failures);
+    }
+
+    // The tail is where steady state is judged. A window still trending at its
+    // end was too short, and its average is a value that occurs nowhere in it.
+    if !outcome.intervals.is_empty() {
+        eprintln!();
+        eprintln!("=== Miss ratio per interval ===");
+        for (i, r) in outcome.intervals.iter().enumerate() {
+            eprintln!("  [{i:>3}] {r:.4}");
+        }
+        let n = outcome.intervals.len();
+        if n >= 3 {
+            let third = n / 3;
+            let last = &outcome.intervals[n - third..];
+            let lo = last.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = last.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            eprintln!("  last third spread: {:.4}", hi - lo);
+        }
+    }
+    eprintln!();
+}
+
 fn print_config(config: &Config) {
     eprintln!("cache-bench configuration:");
     eprintln!("  backend:    {}", config.cache.backend);
@@ -403,6 +517,10 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         .segment_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power);
 
+    if let Some(seed) = config.cache.hashtable_seed {
+        builder = builder.hashtable_seed(seed);
+    }
+
     builder = match config.cache.policy {
         EvictionPolicy::S3Fifo => builder.s3fifo(),
         EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),
@@ -430,6 +548,13 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
 
 fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
     use slab_cache::{DiskTierConfig, EvictionStrategy, SlabCache};
+
+    // Accepting the seed and not applying it would make a noise-floor sweep
+    // report a floor of zero, which makes every policy difference look
+    // significant. Reject instead.
+    if config.cache.hashtable_seed.is_some() {
+        return Err("the slab backend does not support hashtable_seed yet".into());
+    }
 
     let eviction_strategy = match config.cache.policy {
         EvictionPolicy::Lra => EvictionStrategy::SLAB_LRA,
@@ -462,6 +587,11 @@ fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
 
 fn create_heap(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
     use heap_cache::{EvictionPolicy as HeapEvictionPolicy, HeapCache};
+
+    // See `create_slab` on why this is rejected rather than ignored.
+    if config.cache.hashtable_seed.is_some() {
+        return Err("the heap backend does not support hashtable_seed yet".into());
+    }
 
     let heap_policy = match config.cache.policy {
         EvictionPolicy::S3Fifo => HeapEvictionPolicy::S3Fifo,
