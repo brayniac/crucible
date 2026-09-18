@@ -523,9 +523,18 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
     builder = match config.cache.policy {
         EvictionPolicy::S3Fifo => {
             let mut b = builder.s3fifo();
-            if let Some(main) = config.cache.main_policy {
-                b = b.main_eviction(main.into());
+            let mut strategy = config.cache.main_policy.map(Into::into).unwrap_or(
+                cache_core::EvictionStrategy::Merge(cache_core::MergeConfig::default()),
+            );
+            // Chain length is the lever the first results identified, so it
+            // overrides the policy's default rather than the policy silently
+            // winning. Rejected for clock in config validation.
+            if let Some(n) = config.cache.main_merge_segments
+                && let cache_core::EvictionStrategy::Merge(ref mut cfg) = strategy
+            {
+                cfg.min_segments = n;
             }
+            b = b.main_eviction(strategy);
             b
         }
         EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),

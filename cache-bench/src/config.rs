@@ -54,6 +54,13 @@ pub struct CacheConfig {
     /// Unset leaves the built-in default, adaptive merge.
     #[serde(default)]
     pub main_policy: Option<MainPolicy>,
+    /// Segments merge folds into one per eviction pass (layer 1).
+    ///
+    /// The lever the first results identified: the merge-vs-CLOCK gap was
+    /// entirely chain length, not the prune threshold. Unset leaves
+    /// `MergeConfig::default()`, which is 4.
+    #[serde(default)]
+    pub main_merge_segments: Option<usize>,
     /// Optional disk tier configuration.
     #[serde(default)]
     pub disk: Option<DiskConfig>,
@@ -308,7 +315,27 @@ impl Config {
         if config.workload.trace.is_none() {
             Self::validate_command_mix(&config)?;
         }
+        Self::validate_main_cache(&config)?;
         Ok(config)
+    }
+
+    /// Reject a merge chain length that cannot mean what it says.
+    fn validate_main_cache(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(n) = config.cache.main_merge_segments {
+            if n == 0 {
+                // `select_merge_candidates(_, 0, _)` returns nothing, merge
+                // falls back to whole-segment eviction, and the run reports
+                // itself as a merge arm while measuring something else.
+                return Err("main_merge_segments must be at least 1".into());
+            }
+            if config.cache.main_policy == Some(MainPolicy::Clock) {
+                return Err("main_merge_segments does not apply to \
+                            main_policy = \"clock\", which pins its chain at \
+                            one segment by definition"
+                    .into());
+            }
+        }
+        Ok(())
     }
 
     fn validate_command_mix(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -429,6 +456,48 @@ path = "/tmp/t.bin"
 format = "twitter"
 warmup_records = 1000
 "#;
+
+    #[test]
+    fn a_zero_length_merge_chain_is_rejected() {
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\nmain_merge_segments = 0",
+        );
+
+        let err = match Config::from_toml(&toml) {
+            Ok(_) => panic!("a zero-segment chain silently disables merge"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("at least 1"), "{err}");
+    }
+
+    #[test]
+    fn a_merge_chain_length_is_rejected_for_the_clock_policy() {
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\nmain_policy = \"clock\"\nmain_merge_segments = 4",
+        );
+
+        let err = match Config::from_toml(&toml) {
+            Ok(_) => panic!("clock pins its chain at one segment; 4 is meaningless"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("clock"), "{err}");
+    }
+
+    #[test]
+    fn a_merge_chain_length_is_accepted_for_the_default_main_policy() {
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\nmain_merge_segments = 8",
+        );
+
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(config.cache.main_merge_segments, Some(8));
+    }
 
     #[test]
     fn a_trace_config_does_not_require_a_synthetic_command_mix() {

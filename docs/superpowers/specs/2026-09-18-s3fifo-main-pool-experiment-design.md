@@ -301,6 +301,54 @@ where it costs more in eviction latency than it returns in hit ratio, and
 whether any of this survives on `simclusters` (49.7% writes, 2 KB values)
 or `botmaker_2` (the only candidate with real TTL diversity).
 
+
+### The chain-length sweep
+
+`min_segments` is the variable, so it was swept. timelines_real_time_aggregates:
+
+    heap    chain=1   2        4        8        16       32
+    48 MB   0.3662   0.2831   0.2810   0.2788   0.2798   0.3008
+    64 MB   0.3534   0.2661   0.2653   0.2636   0.2608   0.2738
+    96 MB       --       --       --   0.2104   0.2095   0.2168
+
+Three things fall out.
+
+**Almost all of the benefit is the first step.** 1 -> 2 is 0.083 of the
+0.085 total gap at 48 MB. Everything from 2 to 16 is worth another 0.004.
+The lever is not "longer chains are better", it is "do not use a chain of
+one" -- which is exactly where cache-rs's main pool sits.
+
+**Total scan work is flat.** Segments scanned per run (evictions x chain)
+stays in 704-756 at 48 MB across chains 2-32, while eviction passes fall
+from 378 to 22. A longer chain does not do more work; it batches the same
+work into fewer, larger passes. The cost is per-pass latency, not
+throughput, which this rig does not measure.
+
+**There is an optimum and it degrades past it** -- 8 at 48 MB, 16 at 64 MB
+and 96 MB, worse at 32 everywhere. The default of 4 is within 1-2% of the
+best on both sizes.
+
+Two mechanisms are candidates for the right-hand degradation and they have
+not been separated:
+
+1. *Candidate starvation.* `try_merge_eviction` falls back to whole-segment
+   eviction when a bucket holds fewer candidates than `min_segments`. This
+   trace has two distinct TTLs, so its segments concentrate in ~2 buckets and
+   long chains outrun them. Predicted that raising the heap to 96 MB (~43
+   segments per bucket) would rescue chain 32; it did not (0.2168 against
+   0.2095 at 16), so this is at most a partial explanation.
+2. *TTL truncation, and this one is a defect.* The compacted target takes
+   `min(candidate.expire_at)` (`ttl_layer.rs:1107`). Segments in one bucket
+   share a TTL but differ in creation time, so merging N of them truncates
+   every item's remaining lifetime to that of the oldest candidate. The
+   longer the chain, the wider the creation spread thrown away. Filed
+   separately; it is a correctness-adjacent issue in its own right, not an
+   artifact of this experiment.
+
+Verified by reading for (2); not isolated experimentally, because both
+mechanisms strengthen with chain length and the rig has no counter that
+separates an expiry from an eviction.
+
 ## Steady state
 
 The existing logs report cumulative hit ratio from a cold cache, which rises
