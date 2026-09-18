@@ -92,6 +92,33 @@ fn start_test_server_full_with_max_value(
     segment_size_mb: usize,
     max_value_size_mb: usize,
 ) -> thread::JoinHandle<()> {
+    // Metrics on an ephemeral port: unreachable, but no test below needs it.
+    start_test_server_with_metrics(
+        port,
+        0,
+        worker_threads,
+        heap_size_mb,
+        segment_size_mb,
+        max_value_size_mb,
+    )
+}
+
+/// As above, but with the admin/metrics listener on a *known* port so a test
+/// can scrape it.
+///
+/// `metrics_port` of 0 keeps the ephemeral behaviour. This exists for #132:
+/// when a connection fails, the client-side report says what that connection
+/// saw, which cannot distinguish "the server never received the request" from
+/// "the server answered and the response was never sent". The server's own
+/// counters can.
+fn start_test_server_with_metrics(
+    port: u16,
+    metrics_port: u16,
+    worker_threads: usize,
+    heap_size_mb: usize,
+    segment_size_mb: usize,
+    max_value_size_mb: usize,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let config_str = format!(
             r#"
@@ -110,7 +137,7 @@ fn start_test_server_full_with_max_value(
             address = "127.0.0.1:{port}"
 
             [metrics]
-            address = "127.0.0.1:0"
+            address = "127.0.0.1:{metrics_port}"
             "#,
         );
 
@@ -124,6 +151,21 @@ fn start_test_server_full_with_max_value(
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_timeout = Duration::from_secs(5);
+
+        // The admin/metrics listener is started by the server *binary*, not by
+        // `async_native::run`, so a test that calls `run` directly has no
+        // metrics endpoint unless it starts one itself. Only worth doing when a
+        // caller asked for a known port.
+        let _admin = if metrics_port != 0 {
+            server::admin::start(server::admin::AdminConfig {
+                address: config.metrics.address,
+                shutdown: shutdown.clone(),
+                cache_stats_fn: None,
+            })
+            .ok()
+        } else {
+            None
+        };
 
         let _ = server::async_native::run(&config, cache, shutdown, drain_timeout);
     })
@@ -525,6 +567,70 @@ fn run_one_connection(conn_id: usize, addr: SocketAddr, value_size: usize) -> Co
 ///
 /// Every connection gets a line, not just the failing ones: the successes'
 /// timings are what say whether a failure stalled or flapped.
+/// Scrape the server's own counters, for a failure report that can say more
+/// than what one client saw.
+///
+/// Raw HTTP/1.0 over TCP rather than a client crate: this is a test, the
+/// endpoint is on loopback, and a dev-dependency for six lines is not worth
+/// it. Returns `None` rather than failing -- this runs only on a path that has
+/// already failed, and losing the scrape must not replace the real diagnosis
+/// with a scrape error.
+fn scrape_metrics(metrics_port: u16) -> Option<String> {
+    let addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .ok()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body).ok()?;
+    Some(body)
+}
+
+/// The counters that discriminate between the ways a GET can produce nothing.
+///
+/// `cache_gets` is the load-bearing one. If it counted every GET the test
+/// issued, the server read and parsed the request, and the response either was
+/// never produced or never sent. If it is short, the request never reached
+/// command dispatch at all -- a recv or backpressure problem, not a send one.
+/// `cache_hits`/`cache_misses` separate a third possibility: the item was
+/// evicted between the SET and the GET, and the miss path failed to answer.
+///
+/// **`cache_sets` reads 0 here and that is not a symptom.** The streaming
+/// large-value SET path in `connection.rs` never increments it -- only
+/// `execute.rs` does, and these values do not go through it. See #145. It is
+/// printed anyway because a *non-zero* value would mean a small-value SET took
+/// a path this test does not expect.
+fn metrics_summary(body: &str) -> String {
+    const KEYS: [&str; 8] = [
+        "cache_gets",
+        "cache_sets",
+        "cache_hits",
+        "cache_misses",
+        "protocol_errors",
+        "set_errors",
+        "connections_accepted",
+        "connections_active",
+    ];
+    let mut lines: Vec<String> = Vec::new();
+    for key in KEYS {
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            if line.split_whitespace().next().is_some_and(|n| n == key) {
+                lines.push(format!("  {line}"));
+            }
+        }
+    }
+    if lines.is_empty() {
+        "  (no counters matched; endpoint reachable but body unrecognised)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 fn failure_report(connections: usize, value_size: usize, outcomes: &[ConnOutcome]) -> String {
     let err_count = outcomes.iter().filter(|o| o.error.is_some()).count();
     let success_count = outcomes.len() - err_count;
@@ -543,16 +649,19 @@ fn failure_report(connections: usize, value_size: usize, outcomes: &[ConnOutcome
 /// Run a concurrent large value test with multiple connections.
 fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
     let port = get_available_port();
+    let metrics_port = get_available_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Larger heap for concurrent tests
     let heap_size_mb = std::cmp::max(512, (value_size * connections * 2) / (1024 * 1024) + 128);
 
-    let _server_handle = start_test_server_full(
+    let _server_handle = start_test_server_with_metrics(
         port,
+        metrics_port,
         4, // More workers for concurrent load
         heap_size_mb,
-        64, // 64MB segments
+        64,     // 64MB segments
+        64 - 1, // max_value_size, as start_test_server_full derives it
     );
 
     assert!(
@@ -590,7 +699,22 @@ fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
     let err_count = outcomes.iter().filter(|o| o.error.is_some()).count();
     let success_count = outcomes.iter().filter(|o| o.error.is_none()).count();
 
-    let report = failure_report(connections, value_size, &outcomes);
+    let mut report = failure_report(connections, value_size, &outcomes);
+
+    // Only on failure: the scrape costs a connection and a read, and on the
+    // happy path there is nothing to explain. See #132 -- the client-side
+    // report alone cannot tell "the server never saw the request" from "the
+    // server answered and the response never left".
+    if err_count != 0 {
+        let scraped = match scrape_metrics(metrics_port) {
+            Some(body) => metrics_summary(&body),
+            None => format!(
+                "  (metrics endpoint 127.0.0.1:{metrics_port} unreachable; \
+                 the server may be wedged, which is itself a datum)"
+            ),
+        };
+        report = format!("{report}\nserver counters:\n{scraped}");
+    }
 
     // Deliberately still exact. The point of #132 is that an intermittent red
     // must be readable, not that it must be tolerated -- a retry loop or a
