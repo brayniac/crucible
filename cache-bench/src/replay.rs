@@ -147,6 +147,17 @@ pub struct ReplayOutcome {
     pub measured: ReplayStats,
     /// Records consumed from the trace, warmup included.
     pub records_read: u64,
+    /// Per-operation latency over the measured window, reads and writes
+    /// separately.
+    ///
+    /// Split because merge eviction runs *inline* in the write path --
+    /// `TieredCache::set` calls `ensure_space` as its first statement -- so a
+    /// reclamation pass is a stall on whichever `set` happened to trigger it.
+    /// Pooling reads and writes would bury that: with a 10% write mix, the
+    /// write p99 lands around the pooled p99.9 and the shape is lost.
+    pub read_latency: Option<metriken::histogram::Histogram>,
+    /// See [`Self::read_latency`].
+    pub write_latency: Option<metriken::histogram::Histogram>,
     /// Miss ratio per interval across the measured window.
     ///
     /// Reported so the tail can be checked for flatness: a window still
@@ -170,6 +181,12 @@ pub fn run_replay<C: Cache>(
     let value_pool = vec![0xA5u8; opts.max_value_bytes];
     let mut measured_records = 0u64;
 
+    // 7/64 matches the histograms in `metrics`: ~1% relative error, and a
+    // range that reaches seconds, which an inline multi-segment merge pass
+    // can plausibly need on a slow core.
+    let read_hist = metriken::AtomicHistogram::new(7, 64);
+    let write_hist = metriken::AtomicHistogram::new(7, 64);
+
     while let Some(result) = reader.next_record() {
         // A read error ends the replay rather than truncating it silently: a
         // short trace produces a complete-looking run over a fraction of the
@@ -188,6 +205,16 @@ pub fn run_replay<C: Cache>(
         // two of our own numbers disagreeing is the failure this rig exists
         // to surface rather than reproduce.
         let before = *stats;
+
+        // Only the measured window is timed; `Instant::now` twice per record
+        // through a 5M-record warmup is pure overhead that also perturbs the
+        // thing being measured.
+        let started = if in_warmup {
+            None
+        } else {
+            Some(std::time::Instant::now())
+        };
+
         apply_record(
             cache,
             &record,
@@ -196,6 +223,15 @@ pub fn run_replay<C: Cache>(
             opts.insert_on_miss,
             stats,
         );
+
+        if let Some(started) = started {
+            let elapsed = started.elapsed().as_nanos() as u64;
+            // A GET that misses under `insert_on_miss` performs a write, so it
+            // is classified by what it did rather than by its op code.
+            let wrote = measured.sets + measured.set_errors > before.sets + before.set_errors;
+            let hist = if wrote { &write_hist } else { &read_hist };
+            let _ = hist.increment(elapsed);
+        }
 
         if in_warmup {
             continue;
@@ -228,6 +264,8 @@ pub fn run_replay<C: Cache>(
         warmup,
         measured,
         records_read: reader.records_read(),
+        read_latency: read_hist.load(),
+        write_latency: write_hist.load(),
         intervals,
     })
 }
@@ -540,6 +578,50 @@ mod tests {
         let spread = tail_spread(&intervals).expect("nine intervals is enough to judge");
 
         assert!(spread > 0.15, "drifting tail reported spread {spread}");
+    }
+
+    #[test]
+    fn writes_and_reads_are_timed_into_separate_histograms() {
+        // Two GETs of one key under insert_on_miss: the first misses and
+        // writes, the second hits. They must land in different histograms, or
+        // an inline eviction stall on a write is diluted by the read mix.
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            bytes.extend_from_slice(&twitter_bytes(1, 64, Op::Get));
+        }
+        let cache = small_cache();
+        let mut reader = reader_over(bytes);
+
+        let out = run_replay(&cache, &mut reader, &opts(0, 100)).unwrap();
+
+        let reads = out.read_latency.expect("read samples");
+        let writes = out.write_latency.expect("write samples");
+        assert_eq!(total_samples(&writes), 1, "the miss performed the write");
+        assert_eq!(total_samples(&reads), 1, "the hit performed no write");
+    }
+
+    #[test]
+    fn warmup_records_are_not_timed() {
+        let mut bytes = Vec::new();
+        for _ in 0..4 {
+            bytes.extend_from_slice(&twitter_bytes(1, 64, Op::Get));
+        }
+        let cache = small_cache();
+        let mut reader = reader_over(bytes);
+
+        let out = run_replay(&cache, &mut reader, &opts(3, 100)).unwrap();
+
+        let reads = out.read_latency.map(|h| total_samples(&h)).unwrap_or(0);
+        let writes = out.write_latency.map(|h| total_samples(&h)).unwrap_or(0);
+        assert_eq!(
+            reads + writes,
+            1,
+            "only the single measured record may be timed"
+        );
+    }
+
+    fn total_samples(hist: &metriken::histogram::Histogram) -> u64 {
+        hist.into_iter().map(|bucket| bucket.count()).sum()
     }
 
     #[test]

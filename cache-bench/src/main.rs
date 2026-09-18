@@ -395,6 +395,15 @@ fn print_replay_report(
         None => eprintln!("  MISS RATIO:     n/a (no GETs)"),
     }
 
+    // Merge eviction runs inline in `set`, so a reclamation pass is a stall on
+    // whichever write triggered it. The tail is the whole signal here: at ~200
+    // evictions per 10M records the stall is a 1-in-50,000 event, invisible in
+    // p50 and p99 and potentially brutal above them.
+    eprintln!();
+    eprintln!("=== Latency (us) ===");
+    print_replay_latency("READ ", outcome.read_latency.as_ref());
+    print_replay_latency("WRITE", outcome.write_latency.as_ref());
+
     if let Some(stats) = internal {
         eprintln!();
         eprintln!("=== Cache internals ===");
@@ -420,6 +429,22 @@ fn print_replay_report(
         }
     }
     eprintln!();
+}
+
+/// Print one latency distribution, tail-weighted.
+fn print_replay_latency(label: &str, hist: Option<&Histogram>) {
+    let Some(hist) = hist else {
+        eprintln!("  {label}  (no samples)");
+        return;
+    };
+    eprintln!(
+        "  {label}  p50={:.1}  p99={:.1}  p99.9={:.1}  p99.99={:.1}  max={:.1}",
+        percentile_from_histogram(hist, 50.0) / 1000.0,
+        percentile_from_histogram(hist, 99.0) / 1000.0,
+        percentile_from_histogram(hist, 99.9) / 1000.0,
+        percentile_from_histogram(hist, 99.99) / 1000.0,
+        max_from_histogram(hist) / 1000.0,
+    );
 }
 
 fn print_config(config: &Config) {
