@@ -727,6 +727,72 @@ fn run_concurrent_large_value_test(connections: usize, value_size: usize) {
     );
 }
 
+/// A streaming large-value SET must be counted.
+///
+/// Regression test for #145. The streaming path in `connection.rs` -- which is
+/// where every value too big for the inline path lands -- incremented neither
+/// `SETS` on success nor `SET_ERRORS` on a failed commit; only `execute.rs`
+/// touched `SETS`, and these never reach it. The counter therefore read 0
+/// while SETs plainly succeeded, which is worse than an absent counter: a zero
+/// reads as "no SETs happened" rather than "this path is not instrumented".
+///
+/// Asserts against `cache_gets` as a control. If the scrape or the endpoint
+/// broke, both would read 0 and a `cache_sets` assertion alone would look like
+/// the bug it is testing for.
+#[test]
+fn a_streaming_set_is_counted() {
+    let port = get_available_port();
+    let metrics_port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let _server = start_test_server_with_metrics(port, metrics_port, 2, 512, 64, 63);
+    assert!(
+        wait_for_server(addr, Duration::from_secs(10)),
+        "server failed to start"
+    );
+
+    let value = generate_large_value(1024 * 1024);
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+
+    send_large_set(&mut stream, "counted_key", &value).expect("the SET must succeed");
+    send_large_get(&mut stream, "counted_key", value.len()).expect("the GET must succeed");
+
+    let body = scrape_metrics(metrics_port).expect("metrics endpoint must be reachable");
+    let summary = metrics_summary(&body);
+
+    let value_of = |name: &str| -> u64 {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| {
+                let mut parts = l.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some(n), Some(v)) if n == name => v.parse::<u64>().ok(),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| panic!("counter {name} not present in:\n{summary}"))
+    };
+
+    // The control: if this is 0 the harness is broken, not the counter.
+    assert!(
+        value_of("cache_gets") >= 1,
+        "control failed -- the GET was not counted either, so this test is \
+         measuring the harness rather than #145:\n{summary}"
+    );
+    assert!(
+        value_of("cache_sets") >= 1,
+        "a streaming large-value SET was not counted (#145):\n{summary}"
+    );
+}
+
 // =============================================================================
 // Large Value Tests
 // =============================================================================
