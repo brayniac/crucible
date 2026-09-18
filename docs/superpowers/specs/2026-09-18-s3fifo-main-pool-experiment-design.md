@@ -349,6 +349,54 @@ Verified by reading for (2); not isolated experimentally, because both
 mechanisms strengthen with chain length and the rig has no counter that
 separates an expiry from an eviction.
 
+
+### Replication across the trace set
+
+The chain sweep was repeated on the other two selected traces. Neither
+saturates within a practical heap, so the comparison sits in the
+eviction-active region rather than at a fixed multiple of a compulsory floor;
+zero-eviction points were rejected by `envelope_verdict`.
+
+    trace / heap                chain=1  2       4       8       16      clock
+    timelines_rta   / 48 MB     0.3662  0.2831  0.2810  0.2788  0.2798  0.3662
+    timelines_rta   / 64 MB     0.3534  0.2661  0.2653  0.2636  0.2608  0.3534
+    botmaker_2      / 64 MB     0.6665  0.6228  0.5966  0.5883  0.6067  0.6696
+    botmaker_2      /128 MB     0.5634  0.5485  0.5460  0.5383  0.5384  0.5635
+    simclusters     /512 MB     0.6732  0.6038  0.5713  0.5652  0.5614  0.6734
+    simclusters     /  1 GB     0.4504  0.4354  0.4334  0.4327  0.4327  0.4506
+
+**CLOCK equals a chain of one, on every trace.** 0.3662/0.3662,
+0.6665/0.6696, 0.6732/0.6734, 0.5634/0.5635, 0.4504/0.4506. Three traces
+spanning 16.7% to 69.8% overwrite and 89 B to 2 KB values, and the prune
+threshold never separates from chain length. The decomposition result was
+not a property of one trace.
+
+**The chain-of-one penalty is large and universal**: 0.088, 0.078 and 0.112
+absolute on the three real traces, against 0.0032 on the zero-overwrite
+control. It is the single biggest effect this experiment found.
+
+**Chain 8 beat chain 4 at every measured point**, by 0.0007 to 0.0083:
+
+    timelines 48 MB   0.2810 -> 0.2788
+    timelines 64 MB   0.2653 -> 0.2636
+    botmaker  64 MB   0.5966 -> 0.5883
+    botmaker 128 MB   0.5460 -> 0.5383
+    simclusters 512MB 0.5713 -> 0.5652
+    simclusters  1 GB 0.4334 -> 0.4327
+
+Six of six, noise floor 0.0000. That is a case for changing
+`MergeConfig::default().min_segments` from 4 to 8, subject to the per-pass
+latency this rig does not measure: a chain of 8 does the same total scan
+work in half as many passes, so each pass is twice as long.
+
+**The degradation past the optimum is not universal.** It appears at
+timelines/32, botmaker/64 MB/16 — and not at all on simclusters up to
+chain 16, where layer 1 holds ~230 segments per TTL bucket. That is
+consistent with both candidate mechanisms in crucible#151 (starvation and
+TTL truncation) scaling with chain length *relative to bucket depth*, and it
+still does not separate them. Chain 8 never degraded anywhere, which is the
+practical reason to prefer it over 16.
+
 ## Steady state
 
 The existing logs report cumulative hit ratio from a cold cache, which rises
