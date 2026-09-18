@@ -10,7 +10,7 @@
 //! - Weighted random eviction by bucket segment count
 //! - Optional merge eviction for segment compaction
 
-use crate::config::{EvictionStrategy, LayerConfig};
+use crate::config::LayerConfig;
 use crate::error::{CacheError, CacheResult};
 use crate::eviction::{ItemFate, determine_item_fate};
 use crate::hashtable::{Hashtable, KeyVerifier};
@@ -1431,12 +1431,12 @@ impl Layer for TtlLayer {
             return true;
         }
 
-        // Check eviction strategy from config
-        match &self.config.eviction_strategy {
-            EvictionStrategy::Merge(merge_config) => {
-                self.try_merge_eviction(merge_config, hashtable)
-            }
-            _ => self.evict_randomfifo(hashtable),
+        // Merge and Clock run the same machinery, differing only in the
+        // parameters `merge_params` hands over -- see `EvictionStrategy::Clock`
+        // on why CLOCK is not a second implementation.
+        match self.config.eviction_strategy.merge_params() {
+            Some(merge_config) => self.try_merge_eviction(&merge_config, hashtable),
+            None => self.evict_randomfifo(hashtable),
         }
     }
 
@@ -1576,11 +1576,12 @@ impl TtlLayer {
             return EvictResult::Freed;
         }
 
-        // Dispatch based on eviction strategy
-        if let EvictionStrategy::Merge(ref merge_config) = self.config.eviction_strategy {
+        // Dispatch based on eviction strategy. Merge and Clock share this
+        // path; they differ only in the parameters `merge_params` returns.
+        if let Some(merge_config) = self.config.eviction_strategy.merge_params() {
             // Merge eviction prunes items in-place without reclaiming whole segments,
             // so it is inherently non-blocking (no ref_count wait needed).
-            return if self.try_merge_eviction(merge_config, hashtable) {
+            return if self.try_merge_eviction(&merge_config, hashtable) {
                 EvictResult::Freed
             } else {
                 EvictResult::NoCandidate
@@ -3214,6 +3215,180 @@ mod tests {
             "Free segments should increase after merge eviction. Before: {}, After: {}",
             free_before,
             free_after,
+        );
+    }
+}
+
+#[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+mod clock_eviction {
+    use super::*;
+    use crate::config::EvictionStrategy;
+    use crate::hashtable_impl::MultiChoiceHashtable;
+
+    /// A layer that reclaims with CLOCK second chance and has a spare to
+    /// compact into. `spare_capacity(0)` would make `reserve_spare` fail and
+    /// silently fall back to whole-segment eviction, which is the behaviour
+    /// this module exists to distinguish CLOCK from.
+    fn clock_layer() -> TtlLayer {
+        TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(640 * 1024)
+            .config(
+                LayerConfig::new()
+                    .with_ghosts(true)
+                    .with_eviction_strategy(EvictionStrategy::Clock),
+            )
+            .spare_capacity(1)
+            .build()
+            .expect("failed to build clock layer")
+    }
+
+    #[test]
+    fn clock_copies_a_hot_item_out_of_the_segment_it_reclaims() {
+        let layer = clock_layer();
+        let hashtable = MultiChoiceHashtable::new(12);
+        let value = vec![b'v'; 6 * 1024];
+
+        // Fill several segments so the bucket head is not also its tail --
+        // `select_merge_candidates` stops at the tail, which is the live
+        // write segment.
+        for i in 0..30u32 {
+            let key = format!("k{i:03}");
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+        }
+
+        // Warm the first key so it carries a non-zero frequency, and leave the
+        // second cold. Both sit in the oldest segment, which is what CLOCK
+        // reclaims first.
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        for _ in 0..4 {
+            assert!(
+                hashtable.lookup(b"k000", &verifier).is_some(),
+                "the warming read must hit, or no frequency accrues"
+            );
+        }
+
+        let result = layer.evict_nonblocking(&hashtable);
+        assert!(
+            matches!(result, EvictResult::Freed),
+            "clock eviction did not reclaim anything: {result:?}"
+        );
+
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        assert!(
+            hashtable.lookup(b"k000", &verifier).is_some(),
+            "a hot item was dropped: CLOCK must copy every non-zero-frequency \
+             item into the fresh segment, so this is the whole-segment \
+             discard path running instead of the merge machinery"
+        );
+    }
+
+    /// The control, and it records a finding rather than the behaviour first
+    /// expected of it.
+    ///
+    /// A never-read item still survives CLOCK reclamation, because a fresh
+    /// insert is packed with frequency 1 (`Hashbucket::pack(tag, 1, loc)`) and
+    /// nothing ever lowers it: `apply_frequency_decay` exists, is unit-tested,
+    /// and is called from no production path, while `LayerConfig::
+    /// frequency_decay` is stored and never read. Frequency is therefore
+    /// monotonic, zero is unreachable for a live item, and a `freq > 0` test
+    /// retains everything that is still indexed.
+    ///
+    /// pelikan-io/cache-rs has the same property, for the same two reasons --
+    /// `pack(tag, 1, location)` on insert and no decay function anywhere --
+    /// so its `s3fifo_evict_main` "second chance" sweep also keeps every live
+    /// item. What either implementation actually reclaims is *dead* bytes,
+    /// which is compaction rather than second chance.
+    ///
+    /// The consequence for the merge-vs-CLOCK comparison is in the design
+    /// spec: crucible's merge prunes live items only because its threshold
+    /// climbs adaptively above the insert baseline, and CLOCK pins that
+    /// threshold at zero, so the two arms differ by more than the design
+    /// assumed.
+    #[test]
+    fn clock_retains_a_never_read_item_because_a_fresh_insert_starts_above_zero() {
+        let layer = clock_layer();
+        let hashtable = MultiChoiceHashtable::new(12);
+        let value = vec![b'v'; 6 * 1024];
+
+        for i in 0..30u32 {
+            let key = format!("k{i:03}");
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+        }
+
+        let baseline = hashtable
+            .get_ghost_frequency(b"k000")
+            .or_else(|| {
+                let verifier = SinglePoolVerifier { pool: &layer.pool };
+                hashtable.lookup(b"k000", &verifier).map(|_| 1)
+            })
+            .expect("the item must be indexed before eviction");
+        assert!(
+            baseline >= 1,
+            "a fresh insert is expected to carry a non-zero frequency; if this \
+             ever becomes 0, CLOCK starts pruning live items and the arm's \
+             meaning changes"
+        );
+
+        let result = layer.evict_nonblocking(&hashtable);
+        assert!(matches!(result, EvictResult::Freed), "{result:?}");
+
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        assert!(
+            hashtable.lookup(b"k000", &verifier).is_some(),
+            "a never-read item was pruned, which would mean frequency can \
+             reach zero for a live item -- re-check the decay paths"
+        );
+    }
+
+    /// What CLOCK does reclaim: bytes whose item is no longer indexed.
+    #[test]
+    fn clock_does_not_carry_a_deleted_item_into_the_fresh_segment() {
+        let layer = clock_layer();
+        let hashtable = MultiChoiceHashtable::new(12);
+        let value = vec![b'v'; 6 * 1024];
+        let mut first_loc = None;
+
+        for i in 0..30u32 {
+            let key = format!("k{i:03}");
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+            if i == 0 {
+                first_loc = Some(loc);
+            }
+        }
+
+        let loc = first_loc.expect("first location");
+        layer.mark_deleted(loc);
+        hashtable.remove(b"k000", loc.to_location());
+
+        let result = layer.evict_nonblocking(&hashtable);
+        assert!(matches!(result, EvictResult::Freed), "{result:?}");
+
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        assert!(
+            hashtable.lookup(b"k000", &verifier).is_none(),
+            "a deleted item was carried forward; dead-byte reclamation is the \
+             only pruning this path performs"
         );
     }
 }

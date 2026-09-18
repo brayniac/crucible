@@ -155,6 +155,22 @@ impl Default for MergeConfig {
 }
 
 impl MergeConfig {
+    /// Parameters that make merge behave as CLOCK second chance.
+    ///
+    /// `min_segments: 1` reclaims one segment per pass rather than a chain.
+    /// `target_ratio: 1.0` pins the adaptive prune threshold at zero: the
+    /// threshold rises only while `retained / total > target_ratio`, and that
+    /// ratio can never exceed 1.0, so every item with a non-zero frequency is
+    /// copied and every item without one is dropped.
+    ///
+    /// That second property is load-bearing and subtle, so it is pinned by
+    /// `clock_params_pin_the_prune_threshold_at_zero` rather than left to a
+    /// reader to re-derive.
+    pub const CLOCK: Self = Self {
+        min_segments: 1,
+        target_ratio: 1.0,
+    };
+
     /// Create a new merge config with default values.
     pub fn new() -> Self {
         Self::default()
@@ -191,11 +207,84 @@ pub enum EvictionStrategy {
 
     /// CTE - Closest To Expiration segment, apply threshold to items.
     Cte,
+
+    /// CLOCK second chance: reclaim one segment at a time, copying every item
+    /// whose frequency is non-zero into a fresh segment and dropping the rest.
+    ///
+    /// Deliberately not a separate implementation. It is [`Merge`] with the
+    /// chain length pinned to one segment and the prune threshold pinned to
+    /// zero, so the two share every line of claim protocol, item scan, copy
+    /// and relink. A measured merge-vs-CLOCK difference is then the algorithm
+    /// rather than an artifact of two independently written code paths --
+    /// which is the whole point of the comparison in
+    /// `docs/superpowers/specs/2026-09-18-s3fifo-main-pool-experiment-design.md`.
+    ///
+    /// [`Merge`]: EvictionStrategy::Merge
+    Clock,
+}
+
+impl EvictionStrategy {
+    /// The merge parameters this strategy runs with, or `None` if it is not
+    /// merge-shaped.
+    pub fn merge_params(&self) -> Option<MergeConfig> {
+        match self {
+            EvictionStrategy::Merge(config) => Some(*config),
+            EvictionStrategy::Clock => Some(MergeConfig::CLOCK),
+            EvictionStrategy::ExpireFirst
+            | EvictionStrategy::Fifo
+            | EvictionStrategy::Random
+            | EvictionStrategy::Cte => None,
+        }
+    }
 }
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_params_pin_the_prune_threshold_at_zero() {
+        // `try_merge_eviction` raises its threshold only while
+        // `retained / total > target_ratio`. Retention is a ratio of two item
+        // counts, so it cannot exceed 1.0 and the comparison is never true.
+        // If that rule ever changes, the CLOCK arm silently stops being CLOCK
+        // and the comparison it feeds becomes meaningless -- so pin it here.
+        let clock = MergeConfig::CLOCK;
+        for retained in 0..=1000u32 {
+            let ratio = retained as f64 / 1000.0;
+            assert!(
+                ratio <= clock.target_ratio,
+                "retention {ratio} raised the threshold above zero, so CLOCK \
+                 would prune by frequency rather than give second chances"
+            );
+        }
+    }
+
+    #[test]
+    fn clock_reclaims_one_segment_at_a_time_rather_than_a_chain() {
+        assert_eq!(MergeConfig::CLOCK.min_segments, 1);
+    }
+
+    #[test]
+    fn clock_runs_the_merge_machinery_with_clock_parameters() {
+        assert_eq!(
+            EvictionStrategy::Clock.merge_params(),
+            Some(MergeConfig::CLOCK)
+        );
+    }
+
+    #[test]
+    fn merge_reports_its_own_configured_parameters() {
+        let cfg = MergeConfig::new().with_min_segments(7);
+        assert_eq!(EvictionStrategy::Merge(cfg).merge_params(), Some(cfg));
+    }
+
+    #[test]
+    fn a_strategy_that_is_not_merge_shaped_has_no_merge_parameters() {
+        assert_eq!(EvictionStrategy::Fifo.merge_params(), None);
+        assert_eq!(EvictionStrategy::Random.merge_params(), None);
+        assert_eq!(EvictionStrategy::Cte.merge_params(), None);
+    }
 
     #[test]
     fn test_frequency_decay_linear() {
