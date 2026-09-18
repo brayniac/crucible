@@ -353,6 +353,7 @@ pub struct SegCacheBuilder {
 
     /// Hashtable power (2^power buckets).
     hashtable_power: u8,
+    hashtable_seed: Option<[u64; 4]>,
 
     /// Hugepage size preference.
     hugepage_size: HugepageSize,
@@ -393,6 +394,7 @@ impl SegCacheBuilder {
             heap_size: 64 * 1024 * 1024, // 64MB
             segment_size: 1024 * 1024,   // 1MB
             hashtable_power: 16,         // 64K buckets
+            hashtable_seed: None,
             hugepage_size: HugepageSize::None,
             enable_ghosts: false,
             numa_node: None,
@@ -426,6 +428,17 @@ impl SegCacheBuilder {
     /// - power 20 = 1M buckets = 7M items
     pub fn hashtable_power(mut self, power: u8) -> Self {
         self.hashtable_power = power;
+        self
+    }
+
+    /// Pin the hashtable's hash seed so key placement is reproducible.
+    ///
+    /// Unseeded, the table seeds from the OS and bucket occupancy differs run
+    /// to run. That variance is the noise floor a measured eviction difference
+    /// has to clear, so a benchmark pins it to make one run repeatable and
+    /// varies it deliberately to size the floor. Leave unset in production.
+    pub fn hashtable_seed(mut self, seed: [u64; 4]) -> Self {
+        self.hashtable_seed = Some(seed);
         self
     }
 
@@ -519,7 +532,10 @@ impl SegCacheBuilder {
     /// Returns an error if memory allocation fails or configuration is invalid.
     pub fn build(self) -> Result<SegCache, std::io::Error> {
         // Create hashtable
-        let hashtable = Arc::new(MultiChoiceHashtable::new(self.hashtable_power));
+        let hashtable = Arc::new(match self.hashtable_seed {
+            Some(seed) => MultiChoiceHashtable::with_seeds(self.hashtable_power, 2, seed),
+            None => MultiChoiceHashtable::new(self.hashtable_power),
+        });
 
         // Build based on eviction policy
         let inner = match self.eviction_policy {
@@ -965,6 +981,37 @@ mod tests {
 
         let missing = cache.with_item(b"missing", |guard| guard.value().len());
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn a_pinned_hashtable_seed_reaches_the_table_it_builds() {
+        // The behavioural consequence -- how much run-to-run spread the seed
+        // accounts for -- is what the noise-floor sweep measures. What is
+        // asserted here is only that the knob is wired, because a setter that
+        // silently dropped its argument would make that sweep report a floor
+        // of zero and every policy difference look significant.
+        let builder = SegCacheBuilder::new().hashtable_seed([9, 8, 7, 6]);
+
+        assert_eq!(builder.hashtable_seed, Some([9, 8, 7, 6]));
+    }
+
+    #[test]
+    fn an_unseeded_builder_leaves_the_table_seeded_from_the_os() {
+        assert_eq!(SegCacheBuilder::new().hashtable_seed, None);
+    }
+
+    #[test]
+    fn a_seeded_builder_still_builds_a_working_cache() {
+        let cache = SegCacheBuilder::new()
+            .heap_size(1024 * 1024)
+            .segment_size(64 * 1024)
+            .hashtable_power(10)
+            .hashtable_seed([1, 2, 3, 4])
+            .build()
+            .expect("a seeded cache must build");
+
+        cache.set(b"k", b"v", Duration::from_secs(60)).unwrap();
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"v"[..]));
     }
 
     #[test]
