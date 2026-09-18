@@ -71,6 +71,7 @@ pub mod sync;
 
 // Segment-specific location interpretation
 mod item_location;
+pub mod latency;
 
 // Phase 2 - Item and Segment types
 mod item;

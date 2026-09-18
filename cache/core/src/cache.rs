@@ -394,6 +394,8 @@ pub struct CacheStats {
     pub evictions: AtomicU64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: AtomicU64,
+    /// Duration of eviction passes. See [`CacheInternalStats::eviction_latency`].
+    pub eviction_latency: crate::latency::LatencyHistogram,
 }
 
 impl CacheStats {
@@ -403,6 +405,7 @@ impl CacheStats {
             demotions: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             demotion_failures: AtomicU64::new(0),
+            eviction_latency: crate::latency::LatencyHistogram::new(),
         }
     }
 
@@ -412,6 +415,7 @@ impl CacheStats {
             demotions: self.demotions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             demotion_failures: self.demotion_failures.load(Ordering::Relaxed),
+            eviction_latency: self.eviction_latency.snapshot(),
         }
     }
 }
@@ -1362,6 +1366,17 @@ impl<H: Hashtable> TieredCache<H> {
         // Find disk layer index
         let disk_layer_idx = self.layers.iter().position(|l| l.is_disk());
 
+        // Timed from here, after the free-segment early return above, so the
+        // histogram holds eviction passes rather than every `set`. Timing the
+        // early return too would bury a rare multi-millisecond stall under
+        // millions of ~0 ns samples.
+        //
+        // `std::time::Instant`, deliberately, and NOT `clocksource::coarse`
+        // which this crate uses for every TTL: coarse is 1-second resolution,
+        // so a sub-millisecond pass would measure as 0 or as exactly one
+        // second -- a plausible-looking number that is pure artifact.
+        let started = std::time::Instant::now();
+
         // Try to evict until we have enough space
         for _ in 0..self.max_eviction_attempts {
             // Cascading: ensure downstream layers have space (bottom-up)
@@ -1407,11 +1422,20 @@ impl<H: Hashtable> TieredCache<H> {
             }
 
             if layer.free_segment_count() > self.eviction_threshold {
+                self.stats
+                    .eviction_latency
+                    .record(started.elapsed().as_nanos() as u64);
                 return Ok(());
             }
         }
 
-        // Still no space after max attempts
+        // Still no space after max attempts. Timed too: a pass that ran the
+        // full attempt budget and failed is the longest stall a `set` can
+        // absorb, and excluding it would understate the tail precisely where
+        // it is worst.
+        self.stats
+            .eviction_latency
+            .record(started.elapsed().as_nanos() as u64);
         Err(CacheError::OutOfMemory)
     }
 
@@ -2378,6 +2402,46 @@ mod tests {
             }
         }
         cache.stats().snapshot()
+    }
+
+    /// The stall crucible#152 is about is the one a `set` absorbs, so the
+    /// histogram times the eviction path rather than every `ensure_space`
+    /// call. Most calls return immediately on the free-segment check; timing
+    /// those would bury the stall under millions of ~0 ns samples and make
+    /// every percentile below the maximum meaningless.
+    #[test]
+    fn an_eviction_pass_is_timed() {
+        let cache = create_test_cache();
+
+        let stats = drive_past_capacity(&cache);
+
+        let samples = stats.eviction_latency.count();
+        assert!(
+            samples > 0,
+            "no eviction pass was timed despite {} demotions and {} evictions",
+            stats.demotions,
+            stats.evictions,
+        );
+        assert!(
+            stats.eviction_latency.max_ns().is_some(),
+            "a timed pass must produce a readable maximum"
+        );
+    }
+
+    /// The control: a cache under no pressure must record nothing, or the
+    /// histogram is measuring `set` rather than eviction and its percentiles
+    /// describe the fast path.
+    #[test]
+    fn a_cache_that_never_evicted_records_no_eviction_latency() {
+        let cache = create_test_cache();
+
+        cache
+            .set(b"k", b"v", b"", Duration::from_secs(3600))
+            .unwrap();
+
+        let stats = cache.stats().snapshot();
+        assert_eq!(stats.eviction_latency.count(), 0);
+        assert_eq!(stats.eviction_latency.max_ns(), None);
     }
 
     #[test]
