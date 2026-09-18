@@ -397,6 +397,81 @@ TTL truncation) scaling with chain length *relative to bucket depth*, and it
 still does not separate them. Chain 8 never degraded anywhere, which is the
 practical reason to prefer it over 16.
 
+
+### Eviction latency: the axis the rig could not see
+
+Everything above is hit ratio. Merge eviction runs *inline* in the write path
+-- `TieredCache::set` calls `ensure_space` as its first statement, on five
+write entry points -- so a reclamation pass is a stall on whichever `set`
+triggered it, and no arm had ever measured that.
+
+Measured on pi11 (Raspberry Pi 4B, Cortex-A72, 8 GB, Debian 13, bare metal via
+SystemsLab), `timelines_real_time_aggregates` at 48 MB, 15M-record window,
+4 reps per chain **interleaved on one host** -- not a matrix, because Pi
+thermal drift is the dominant noise term and only same-host interleaving
+controls for it.
+
+    chain  evicts  p50    p99    p99.9  | p99.99 mean  | max mean  max min  max max
+      1      585   1.62   2.80   8.70   |     2195     |   6742      3211     8978
+      2      378   1.62   2.77   8.82   |     2761     |   6562      4456     9896
+      4      188   1.62   2.85   9.12   |     2224     |   6595      5603     8520
+      8       92   1.62   2.80   8.72   |    10519*    |  10519      8651    14680
+     16       45   1.62   2.80   8.90   |     1585     |  13861     11338    16908
+
+(microseconds; * see the p99.99 warning below)
+
+**The common path is untouched.** p50 is 1.62 us at every chain length, p99
+within 2.77-2.85, p99.9 within 8.70-9.12. Chain length costs nothing until
+four nines out, which is exactly why a hit-ratio-only rig never saw it.
+
+**No thermal drift to correct for.** p50 held at 1.62 us across all 20
+interleaved runs over nine minutes. The control was still necessary to know
+that.
+
+**Stalls are milliseconds.** 3.2 to 16.9 ms against a 1.62 us median -- four
+orders of magnitude, inline in `set()`. Chains 1, 2 and 4 are
+indistinguishable at ~6.6 ms mean with heavily overlapping ranges; chain 16's
+*minimum* (11338) exceeds chain 4's *maximum* (8520), so that separation is
+real rather than noise.
+
+**p99.99 is a trap here and must not be quoted alone.** It reads
+2195 / 2761 / 2224 / 1622 / 1585 -- non-monotonic, with chain 2 worst and the
+long chains apparently best, the opposite of the max story. The measured
+window holds ~1.078M writes, so p99.99 sits at roughly the 108th largest
+sample. Once the eviction count falls below that (chain 8 = 92, chain 16 = 45)
+the percentile falls off the stall population entirely and is measuring
+ordinary writes. Chains 1/2/4 have 585/378/188 stalls and therefore sample
+*different percentiles within their own stall distributions*, which is why
+they cross. **`max` tracks stall duration; p99.99 tracks stall frequency
+against the percentile's sample budget.** Neither alone describes the system.
+
+**Determinism held across architectures.** Every miss ratio is identical
+across all four reps and identical to the x86 figures earlier in this
+document, to four decimals, on aarch64 with NEON rather than AVX2 and a
+different compiler profile. The zero noise floor is structural, not an
+artifact of one machine -- which also means any host-to-host difference in the
+latency columns cannot be hiding a workload difference.
+
+### What this settles
+
+**`min_segments: 4` is the knee and should stay.** It captures essentially all
+the hit-ratio win (0.3662 -> 0.2810) while holding worst-case stall
+statistically identical to a chain of one. Moving to 8 buys 0.8% hit ratio
+(0.2810 -> 0.2788) for a 60% worse worst-case stall (6.6 -> 10.5 ms). On a
+cache whose stated premise is latency predictability that is the wrong trade.
+
+This reverses the recommendation made earlier in this document from the
+hit-ratio sweep alone, where chain 8 beat chain 4 at all six measured points.
+That result was not wrong; it was measured on the only axis the rig had. The
+lesson is the one the design opened with -- a comparison that changes one
+variable can still be read on the wrong axis, and "six of six" is not a
+defence against that.
+
+Caveats: Pi 4B, so absolute milliseconds do not transfer even though the shape
+does; one trace, one cache size; and `max` is a single-sample statistic, which
+is why min and max across four reps are reported rather than a mean with a
+confident sign.
+
 ## Steady state
 
 The existing logs report cumulative hit ratio from a cold cache, which rises
