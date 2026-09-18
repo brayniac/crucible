@@ -353,6 +353,8 @@ pub struct SegCacheBuilder {
 
     /// Hashtable power (2^power buckets).
     hashtable_power: u8,
+    hashtable_seed: Option<[u64; 4]>,
+    main_eviction: EvictionStrategy,
 
     /// Hugepage size preference.
     hugepage_size: HugepageSize,
@@ -393,6 +395,8 @@ impl SegCacheBuilder {
             heap_size: 64 * 1024 * 1024, // 64MB
             segment_size: 1024 * 1024,   // 1MB
             hashtable_power: 16,         // 64K buckets
+            hashtable_seed: None,
+            main_eviction: EvictionStrategy::Merge(MergeConfig::default()),
             hugepage_size: HugepageSize::None,
             enable_ghosts: false,
             numa_node: None,
@@ -426,6 +430,17 @@ impl SegCacheBuilder {
     /// - power 20 = 1M buckets = 7M items
     pub fn hashtable_power(mut self, power: u8) -> Self {
         self.hashtable_power = power;
+        self
+    }
+
+    /// Pin the hashtable's hash seed so key placement is reproducible.
+    ///
+    /// Unseeded, the table seeds from the OS and bucket occupancy differs run
+    /// to run. That variance is the noise floor a measured eviction difference
+    /// has to clear, so a benchmark pins it to make one run repeatable and
+    /// varies it deliberately to size the floor. Leave unset in production.
+    pub fn hashtable_seed(mut self, seed: [u64; 4]) -> Self {
+        self.hashtable_seed = Some(seed);
         self
     }
 
@@ -465,6 +480,20 @@ impl SegCacheBuilder {
     /// - `EvictionPolicy::S3Fifo { .. }` - Two-tier S3-FIFO architecture
     pub fn eviction_policy(mut self, policy: EvictionPolicy) -> Self {
         self.eviction_policy = policy;
+        self
+    }
+
+    /// Choose how the S3-FIFO main cache (layer 1) reclaims segments.
+    ///
+    /// Defaults to adaptive merge. [`EvictionStrategy::Clock`] runs the same
+    /// machinery with the chain pinned to one segment and the prune threshold
+    /// pinned above the insert baseline, which is the comparison in
+    /// `docs/superpowers/specs/2026-09-18-s3fifo-main-pool-experiment-design.md`.
+    ///
+    /// Ignored unless the eviction policy is `S3Fifo`; the single-layer
+    /// policies configure their own layer directly.
+    pub fn main_eviction(mut self, strategy: EvictionStrategy) -> Self {
+        self.main_eviction = strategy;
         self
     }
 
@@ -519,7 +548,10 @@ impl SegCacheBuilder {
     /// Returns an error if memory allocation fails or configuration is invalid.
     pub fn build(self) -> Result<SegCache, std::io::Error> {
         // Create hashtable
-        let hashtable = Arc::new(MultiChoiceHashtable::new(self.hashtable_power));
+        let hashtable = Arc::new(match self.hashtable_seed {
+            Some(seed) => MultiChoiceHashtable::with_seeds(self.hashtable_power, 2, seed),
+            None => MultiChoiceHashtable::new(self.hashtable_power),
+        });
 
         // Build based on eviction policy
         let inner = match self.eviction_policy {
@@ -661,7 +693,7 @@ impl SegCacheBuilder {
         // If disk tier is enabled, configure demotion to disk layer (layer 2)
         let mut layer1_config = LayerConfig::new()
             .with_ghosts(true)
-            .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default()));
+            .with_eviction_strategy(self.main_eviction);
 
         let has_disk = self.disk_tier.is_some() || self.io_uring_disk_tier.is_some();
         if has_disk {
@@ -965,6 +997,73 @@ mod tests {
 
         let missing = cache.with_item(b"missing", |guard| guard.value().len());
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn a_pinned_hashtable_seed_reaches_the_table_it_builds() {
+        // The behavioural consequence -- how much run-to-run spread the seed
+        // accounts for -- is what the noise-floor sweep measures. What is
+        // asserted here is only that the knob is wired, because a setter that
+        // silently dropped its argument would make that sweep report a floor
+        // of zero and every policy difference look significant.
+        let builder = SegCacheBuilder::new().hashtable_seed([9, 8, 7, 6]);
+
+        assert_eq!(builder.hashtable_seed, Some([9, 8, 7, 6]));
+    }
+
+    #[test]
+    fn an_unseeded_builder_leaves_the_table_seeded_from_the_os() {
+        assert_eq!(SegCacheBuilder::new().hashtable_seed, None);
+    }
+
+    #[test]
+    fn a_seeded_builder_still_builds_a_working_cache() {
+        let cache = SegCacheBuilder::new()
+            .heap_size(1024 * 1024)
+            .segment_size(64 * 1024)
+            .hashtable_power(10)
+            .hashtable_seed([1, 2, 3, 4])
+            .build()
+            .expect("a seeded cache must build");
+
+        cache.set(b"k", b"v", Duration::from_secs(60)).unwrap();
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn the_main_cache_reclaims_with_merge_unless_told_otherwise() {
+        assert_eq!(
+            SegCacheBuilder::new().main_eviction,
+            EvictionStrategy::Merge(MergeConfig::default())
+        );
+    }
+
+    #[test]
+    fn a_chosen_main_eviction_strategy_reaches_the_layer_it_builds() {
+        // A setter that dropped its argument would silently run both arms of
+        // the merge-vs-CLOCK comparison as merge and report that the policies
+        // agree.
+        let builder = SegCacheBuilder::new().main_eviction(EvictionStrategy::Clock);
+
+        assert_eq!(builder.main_eviction, EvictionStrategy::Clock);
+    }
+
+    #[test]
+    fn a_clock_main_cache_still_builds_a_working_s3fifo() {
+        // 64 KiB segments so layer 0 gets 12 of them. At 1 MiB segments this
+        // heap gives layer 0 a single segment, where S3-FIFO wedges and every
+        // write returns OutOfMemory -- the sub-3-segment cliff.
+        let cache = SegCacheBuilder::new()
+            .heap_size(8 * 1024 * 1024)
+            .segment_size(64 * 1024)
+            .hashtable_power(12)
+            .s3fifo()
+            .main_eviction(EvictionStrategy::Clock)
+            .build()
+            .expect("a clock-main s3fifo must build");
+
+        cache.set(b"k", b"v", Duration::from_secs(60)).unwrap();
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"v"[..]));
     }
 
     #[test]
