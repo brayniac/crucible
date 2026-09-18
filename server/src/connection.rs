@@ -715,11 +715,18 @@ impl Connection {
                 // Extract reservation and commit
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::ReceivingSegment { reservation, .. } = state {
+                    // The streaming path is where every large SET lands, and it
+                    // was counting neither outcome: `SETS` was incremented only
+                    // in `execute.rs`, which these never reach, and the commit
+                    // failure below only logged. See #145.
+                    use crate::metrics::{SET_ERRORS, SETS};
                     if let Err(e) = cache.commit_segment_set(reservation) {
+                        SET_ERRORS.increment();
                         tracing::warn!(error = %e, "commit_segment_set failed");
                         self.write_buf
                             .extend_from_slice(b"-ERR Failed to store value\r\n");
                     } else {
+                        SETS.increment();
                         self.write_buf.extend_from_slice(b"+OK\r\n");
                     }
                 }
@@ -767,11 +774,18 @@ impl Connection {
                 // Extract reservation and commit (Vec-based uses commit_set)
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::ReceivingVec { reservation, .. } = state {
+                    // The streaming path is where every large SET lands, and it
+                    // was counting neither outcome: `SETS` was incremented only
+                    // in `execute.rs`, which these never reach, and the commit
+                    // failure below only logged. See #145.
+                    use crate::metrics::{SET_ERRORS, SETS};
                     if let Err(e) = cache.commit_set(reservation) {
+                        SET_ERRORS.increment();
                         tracing::warn!(error = %e, "commit_set failed");
                         self.write_buf
                             .extend_from_slice(b"-ERR Failed to store value\r\n");
                     } else {
+                        SETS.increment();
                         self.write_buf.extend_from_slice(b"+OK\r\n");
                     }
                 }
@@ -1036,13 +1050,17 @@ impl Connection {
                 let noreply_val = *noreply;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheAsciiSegment { reservation, .. } = state {
+                    // #145: the streaming commit counted neither outcome.
+                    use crate::metrics::{SET_ERRORS, SETS};
                     match cache.commit_segment_set(reservation) {
                         Ok(()) => {
+                            SETS.increment();
                             if !noreply_val {
                                 self.write_buf.extend_from_slice(b"STORED\r\n");
                             }
                         }
                         Err(e) => {
+                            SET_ERRORS.increment();
                             tracing::warn!(error = %e, "commit_segment_set failed");
                             if !noreply_val {
                                 self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
@@ -1092,13 +1110,17 @@ impl Connection {
                 let noreply_val = *noreply;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheAsciiVec { reservation, .. } = state {
+                    // #145: the streaming commit counted neither outcome.
+                    use crate::metrics::{SET_ERRORS, SETS};
                     match cache.commit_set(reservation) {
                         Ok(()) => {
+                            SETS.increment();
                             if !noreply_val {
                                 self.write_buf.extend_from_slice(b"STORED\r\n");
                             }
                         }
                         Err(e) => {
+                            SET_ERRORS.increment();
                             tracing::warn!(error = %e, "commit_set failed");
                             if !noreply_val {
                                 self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
@@ -1423,8 +1445,11 @@ impl Connection {
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheBinarySegment { reservation, .. } = state {
                     use memcache_proto::binary::BinaryResponse;
+                    // #145: the streaming commit counted neither outcome.
+                    use crate::metrics::{SET_ERRORS, SETS};
                     match cache.commit_segment_set(reservation) {
                         Ok(()) => {
+                            SETS.increment();
                             if !opcode_val.is_quiet() {
                                 let response_len = BinaryResponse::encode_stored(
                                     &mut [0u8; 32],
@@ -1446,6 +1471,7 @@ impl Connection {
                             }
                         }
                         Err(e) => {
+                            SET_ERRORS.increment();
                             tracing::warn!(error = %e, "commit_segment_set failed");
                             if !opcode_val.is_quiet() {
                                 use memcache_proto::binary::Status;
@@ -1500,8 +1526,11 @@ impl Connection {
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheBinaryVec { reservation, .. } = state {
                     use memcache_proto::binary::BinaryResponse;
+                    // #145: the streaming commit counted neither outcome.
+                    use crate::metrics::{SET_ERRORS, SETS};
                     match cache.commit_set(reservation) {
                         Ok(()) => {
+                            SETS.increment();
                             if !opcode_val.is_quiet() {
                                 let response_len = BinaryResponse::encode_stored(
                                     &mut [0u8; 32],
@@ -1523,6 +1552,7 @@ impl Connection {
                             }
                         }
                         Err(e) => {
+                            SET_ERRORS.increment();
                             tracing::warn!(error = %e, "commit_set failed");
                             if !opcode_val.is_quiet() {
                                 use memcache_proto::binary::Status;
