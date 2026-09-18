@@ -429,10 +429,15 @@ interleaved runs over nine minutes. The control was still necessary to know
 that.
 
 **Stalls are milliseconds.** 3.2 to 16.9 ms against a 1.62 us median -- four
-orders of magnitude, inline in `set()`. Chains 1, 2 and 4 are
-indistinguishable at ~6.6 ms mean with heavily overlapping ranges; chain 16's
-*minimum* (11338) exceeds chain 4's *maximum* (8520), so that separation is
-real rather than noise.
+orders of magnitude, inline in `set()`.
+
+> **Correction.** This section first read "chains 1, 2 and 4 are
+> indistinguishable at ~6.6 ms with heavily overlapping ranges". That was a
+> single-host artifact and it is wrong. pi11's chain-1 cell is the outlier in
+> the whole set, and pi11 is the only host of three where the series is not
+> monotonic in chain length. Two independent replications put chain 1 at
+> ~0.60x of chain 4. See the cross-host table below; the claim survived
+> exactly as long as it took to run a second host.
 
 **p99.99 is a trap here and must not be quoted alone.** It reads
 2195 / 2761 / 2224 / 1622 / 1585 -- non-monotonic, with chain 2 worst and the
@@ -452,11 +457,55 @@ different compiler profile. The zero noise floor is structural, not an
 artifact of one machine -- which also means any host-to-host difference in the
 latency columns cannot be hiding a workload difference.
 
+
+### Replication: pi12 and delta
+
+The same sweep, same interleaved design, on a second Pi and on `delta`
+(bare-metal Zen 4, x86-64) -- the closest thing in this lab to a deployment
+target. Mean of the per-rep `max`, in microseconds:
+
+    chain | pi11   pi12   delta | as a multiple of that host's chain 4
+      1   | 6742   3790   3408  | 1.02   0.60   0.61
+      2   | 6562   6270   4272  | 1.00   1.00   0.76
+      4   | 6595   6291   5628  | 1.00   1.00   1.00
+      8   |10519   9683   7250  | 1.60   1.54   1.29
+     16   |13861  13517  11321  | 2.10   2.15   2.01
+
+    monotonic in chain length?   pi11 NO    pi12 yes   delta yes
+
+(pi12's chain-1 and chain-2 cells are n=3 rather than n=4; the three chain-1
+values span 3637-3932, so the mean is not carrying the disagreement.)
+
+**What replicates:** the chain-8 and chain-16 penalties, at 1.60/1.54/1.29 and
+2.10/2.15/2.01 across three machines and two architectures. Longer chains cost
+worst-case stall, reliably.
+
+**What did not:** pi11's flat chain-1/2/4 region. Both other hosts make chain 1
+about 40% better than chain 4 on worst-case stall, and both are monotonic.
+
+**The cliff is relatively worse on better hardware, which is the opposite of
+reassuring.** delta's common path is 5x faster than a Pi's (p50 0.30 us
+against 1.62), but its worst-case stall improved only 2x. Expressed against
+each host's own median write:
+
+    pi11   chain-4 max =  4,071 x p50
+    pi12   chain-4 max =  3,860 x p50
+    delta  chain-4 max = 18,760 x p50
+
+On server-class hardware a single `set()` blocks for 5.6 ms while the median
+write costs 300 ns. That is the shipping default, not a tuned extreme, and
+nothing in the cache measures or bounds it. Filed as crucible#152.
+
+**Revised conclusion on `min_segments`.** 4 still stands, but not for the
+reason the pi11-only data gave. It is not free: chain 4 costs roughly 65% more
+worst-case stall than chain 1, and buys 23% fewer misses (0.3662 -> 0.2810)
+for it. That is a defensible trade. It is a trade.
+
 ### What this settles
 
-**`min_segments: 4` is the knee and should stay.** It captures essentially all
-the hit-ratio win (0.3662 -> 0.2810) while holding worst-case stall
-statistically identical to a chain of one. Moving to 8 buys 0.8% hit ratio
+**`min_segments: 4` is the knee and should stay** -- see the revised wording
+above. It captures essentially all the hit-ratio win (0.3662 -> 0.2810), at a
+cost of roughly 65% more worst-case stall than a chain of one. Moving to 8 buys 0.8% hit ratio
 (0.2810 -> 0.2788) for a 60% worse worst-case stall (6.6 -> 10.5 ms). On a
 cache whose stated premise is latency predictability that is the wrong trade.
 
