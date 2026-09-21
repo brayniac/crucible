@@ -37,6 +37,10 @@ fn bucket_upper_ns(index: usize) -> u64 {
 #[derive(Debug, Default)]
 pub struct LatencyHistogram {
     buckets: [AtomicU64; LATENCY_BUCKETS],
+    /// Sum of all recorded durations, in nanoseconds. Paired with `count()`
+    /// this gives an exact mean -- the log2 buckets alone cannot resolve the
+    /// 10-30% shifts in mean eviction-pass cost this is for (crucible#154).
+    total_ns: AtomicU64,
 }
 
 impl LatencyHistogram {
@@ -52,6 +56,7 @@ impl LatencyHistogram {
     /// thousand writes, so the two atomics it costs are not on any hot path.
     pub fn record(&self, nanos: u64) {
         self.buckets[bucket_index(nanos)].fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(nanos, Ordering::Relaxed);
     }
 
     /// Take a consistent-enough snapshot for reporting.
@@ -65,7 +70,8 @@ impl LatencyHistogram {
         for (out, b) in buckets.iter_mut().zip(self.buckets.iter()) {
             *out = b.load(Ordering::Relaxed);
         }
-        LatencySnapshot { buckets }
+        let total_ns = self.total_ns.load(Ordering::Relaxed);
+        LatencySnapshot { buckets, total_ns }
     }
 }
 
@@ -74,6 +80,8 @@ impl LatencyHistogram {
 pub struct LatencySnapshot {
     /// Per-bucket counts.
     pub buckets: [u64; LATENCY_BUCKETS],
+    /// Sum of all recorded durations, in nanoseconds.
+    pub total_ns: u64,
 }
 
 impl LatencySnapshot {
@@ -101,6 +109,21 @@ impl LatencySnapshot {
             }
         }
         Some(bucket_upper_ns(LATENCY_BUCKETS - 1))
+    }
+
+    /// Exact arithmetic mean of all recorded durations, in nanoseconds.
+    ///
+    /// Unlike `percentile_ns` and `max_ns`, this is not a bucket bound --
+    /// it comes from an accumulated total kept alongside the buckets, so it
+    /// is exact rather than resolved to 2x. `None` when nothing has been
+    /// recorded -- an empty histogram has no mean, and reporting 0 would
+    /// read as "instant" rather than "no data".
+    pub fn mean_ns(&self) -> Option<u64> {
+        let total = self.count();
+        if total == 0 {
+            return None;
+        }
+        Some(self.total_ns / total)
     }
 
     /// Upper bound of the highest non-empty bucket.
@@ -170,6 +193,56 @@ mod tests {
             s.buckets[LATENCY_BUCKETS - 1],
             1,
             "an absurd duration must land in the last bucket, not index out of range"
+        );
+    }
+
+    #[test]
+    fn an_empty_histogram_has_no_mean_rather_than_zero() {
+        let s = LatencyHistogram::new().snapshot();
+        assert_eq!(s.mean_ns(), None);
+    }
+
+    #[test]
+    fn mean_ns_is_the_exact_arithmetic_mean_not_a_bucket_estimate() {
+        // Both durations land in the same log2 bucket ([2^15, 2^16) =
+        // [32768, 65536)), so any bucket-derived estimate -- the bucket's
+        // upper bound (65536) or its midpoint (49152) -- would be identical
+        // for both and wrong either way. The true mean, 50000, is neither.
+        let h = LatencyHistogram::new();
+        h.record(40_000);
+        h.record(60_000);
+
+        let s = h.snapshot();
+        assert_eq!(
+            bucket_index(40_000),
+            bucket_index(60_000),
+            "test premise: both samples share a bucket"
+        );
+        assert_eq!(s.mean_ns(), Some(50_000));
+    }
+
+    #[test]
+    fn a_ten_percent_difference_in_mean_is_distinguishable() {
+        // The actual requirement driving this work: detect a 10-30% shift in
+        // mean eviction-pass cost, which the log2 buckets cannot resolve.
+        let baseline = LatencyHistogram::new();
+        baseline.record(100_000);
+        baseline.record(100_000);
+
+        let shifted = LatencyHistogram::new();
+        shifted.record(110_000);
+        shifted.record(110_000);
+
+        let baseline_mean = baseline.snapshot().mean_ns().unwrap();
+        let shifted_mean = shifted.snapshot().mean_ns().unwrap();
+
+        assert_eq!(baseline_mean, 100_000);
+        assert_eq!(shifted_mean, 110_000);
+        let pct_change =
+            (shifted_mean as f64 - baseline_mean as f64) / baseline_mean as f64 * 100.0;
+        assert!(
+            (9.9..=10.1).contains(&pct_change),
+            "expected ~10% change, got {pct_change}%"
         );
     }
 }

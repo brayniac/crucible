@@ -61,6 +61,16 @@ pub struct CacheConfig {
     /// `MergeConfig::default()`, which is 4.
     #[serde(default)]
     pub main_merge_segments: Option<usize>,
+    /// Retention cap for merge, as a fraction of the chain's live bytes.
+    ///
+    /// Since #154 the spare's free space bounds a pass structurally, so this
+    /// is a policy cap layered on top: `budget = min(spare, live * ratio)`.
+    /// At 1.0 a pass keeps everything that fits, which is compaction; below
+    /// that it discards live items there was room for. Unset leaves
+    /// `MergeConfig::default()`, currently 0.5 -- see the reasoning on that
+    /// default, which is a latency choice rather than a correctness one.
+    #[serde(default)]
+    pub main_target_ratio: Option<f64>,
     /// Optional disk tier configuration.
     #[serde(default)]
     pub disk: Option<DiskConfig>,
@@ -179,12 +189,15 @@ pub struct ValuesConfig {
 }
 
 /// Cache backend type.
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheBackend {
     Segment,
     Slab,
     Heap,
+    /// pelikan-io/cache-rs, for engine-vs-engine ranking.
+    #[serde(rename = "cachers")]
+    CacheRs,
 }
 
 impl std::fmt::Display for CacheBackend {
@@ -193,6 +206,7 @@ impl std::fmt::Display for CacheBackend {
             CacheBackend::Segment => write!(f, "segment"),
             CacheBackend::Slab => write!(f, "slab"),
             CacheBackend::Heap => write!(f, "heap"),
+            CacheBackend::CacheRs => write!(f, "cachers"),
         }
     }
 }
@@ -334,6 +348,15 @@ impl Config {
                             one segment by definition"
                     .into());
             }
+        }
+        if let Some(r) = config.cache.main_target_ratio
+            && !(r > 0.0 && r <= 1.0)
+        {
+            // Zero would retain nothing and make every merge pass a
+            // whole-segment eviction wearing merge's name; above one is not
+            // a fraction of anything. `MergeConfig` clamps silently, which
+            // is the wrong behaviour for a measurement rig.
+            return Err(format!("main_target_ratio must be in (0.0, 1.0], got {r}").into());
         }
         Ok(())
     }
@@ -531,5 +554,51 @@ warmup_records = 1000
         assert!(!TraceFormatConfig::Twitter.insert_on_miss());
         assert!(TraceFormatConfig::OracleGeneral.insert_on_miss());
         assert!(TraceFormatConfig::OracleGeneralCsv.insert_on_miss());
+    }
+
+    #[test]
+    fn a_cache_rs_backend_parses() {
+        let toml = TRACE_TOML.replace("backend = \"segment\"", "backend = \"cachers\"");
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(config.cache.backend, CacheBackend::CacheRs);
+    }
+
+    #[test]
+    fn a_merge_retention_ratio_parses() {
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\nmain_target_ratio = 1.0",
+        );
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(config.cache.main_target_ratio, Some(1.0));
+    }
+
+    #[test]
+    fn a_retention_ratio_outside_the_unit_interval_is_rejected() {
+        // `MergeConfig::with_target_ratio` clamps silently. For a
+        // measurement rig that is the wrong behaviour: an arm asking for 1.5
+        // would quietly run at 1.0 and be reported under the label it asked
+        // for, so the sweep would contain two identical points wearing
+        // different names.
+        for bad in ["0.0", "1.5", "-0.2"] {
+            let toml = TRACE_TOML.replace(
+                "hashtable_power = 20",
+                &format!("hashtable_power = 20\nmain_target_ratio = {bad}"),
+            );
+            let err = match Config::from_toml(&toml) {
+                Ok(_) => panic!("main_target_ratio = {bad} was accepted"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("main_target_ratio"),
+                "the rejection must name the knob: {err}"
+            );
+        }
     }
 }

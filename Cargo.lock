@@ -202,8 +202,9 @@ dependencies = [
  "metrics",
  "metriken",
  "rand 0.9.2",
- "rand_xoshiro",
- "segcache",
+ "rand_xoshiro 0.7.0",
+ "segcache 0.4.2-alpha.0",
+ "segcache 0.4.5",
  "serde",
  "slab-cache",
  "tempfile",
@@ -218,7 +219,7 @@ version = "0.4.2-alpha.0"
 dependencies = [
  "ahash",
  "bytes",
- "clocksource",
+ "clocksource 1.0.0",
  "criterion",
  "crossbeam-deque",
  "libc",
@@ -260,6 +261,17 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "ciborium"
@@ -330,6 +342,17 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "clocksource"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46a4f8c23584e9dc6e40de1406e8c776ae727c49f7cb85c0bb23fb8c2096f7e0"
+dependencies = [
+ "libc",
+ "time",
+ "winapi",
+]
+
+[[package]]
+name = "clocksource"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb5afc823a6b84ac006c1784b06c54daa7454934591bff909fc6eebff9569eec"
@@ -362,6 +385,15 @@ dependencies = [
  "libc",
  "scopeguard",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cpufeatures"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -619,6 +651,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -653,7 +686,7 @@ name = "heap-cache"
 version = "0.4.2-alpha.0"
 dependencies = [
  "cache-core",
- "clocksource",
+ "clocksource 1.0.0",
  "loom",
  "parking_lot",
  "smallvec",
@@ -875,6 +908,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02477b4e4b5454c404fa7ef505c85cacb89fee3987793f9a3a2bd9ab556c4e3b"
 
 [[package]]
+name = "keyvalue"
+version = "0.4.0"
+source = "git+https://github.com/pelikan-io/cache-rs?rev=2af1aff1020ba94cb3e58a2722e41b1403e390d1#2af1aff1020ba94cb3e58a2722e41b1403e390d1"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -977,9 +1015,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memmap2"
-version = "0.9.9"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744133e4a0e0a658e1374cf3bf8e415c4052a15a111acd372764c55b4177d490"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
@@ -1323,7 +1361,7 @@ dependencies = [
  "resp-proto",
  "ringline",
  "ringline-redis",
- "segcache",
+ "segcache 0.4.2-alpha.0",
  "serde",
  "slab",
  "tikv-jemallocator",
@@ -1382,6 +1420,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1420,6 +1469,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
 name = "rand_pcg"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,6 +1490,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662effc7698e08ea324d3acccf8d9d7f7bf79b9785e270a174ea36e56900c91d"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1655,8 +1719,26 @@ name = "segcache"
 version = "0.4.2-alpha.0"
 dependencies = [
  "cache-core",
- "clocksource",
+ "clocksource 1.0.0",
  "tempfile",
+]
+
+[[package]]
+name = "segcache"
+version = "0.4.5"
+source = "git+https://github.com/pelikan-io/cache-rs?rev=2af1aff1020ba94cb3e58a2722e41b1403e390d1#2af1aff1020ba94cb3e58a2722e41b1403e390d1"
+dependencies = [
+ "ahash",
+ "clocksource 0.8.3",
+ "crossbeam-deque",
+ "crossbeam-utils",
+ "keyvalue",
+ "log",
+ "memmap2",
+ "metriken",
+ "rand 0.10.2",
+ "rand_xoshiro 0.8.1",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1781,7 +1863,7 @@ dependencies = [
  "resp-proto",
  "ringline",
  "rustls",
- "segcache",
+ "segcache 0.4.2-alpha.0",
  "serde",
  "serial_test",
  "slab-cache",
@@ -1893,7 +1975,7 @@ name = "slab-cache"
 version = "0.4.2-alpha.0"
 dependencies = [
  "cache-core",
- "clocksource",
+ "clocksource 1.0.0",
  "criterion",
  "crossbeam-deque",
  "loom",
@@ -2052,10 +2134,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
+ "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
  "time-core",
+ "time-macros",
 ]
 
 [[package]]
@@ -2063,6 +2147,16 @@ name = "time-core"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
+
+[[package]]
+name = "time-macros"
+version = "0.2.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
+dependencies = [
+ "num-conv",
+ "time-core",
+]
 
 [[package]]
 name = "tinytemplate"

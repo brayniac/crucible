@@ -35,8 +35,16 @@ ctrlc = { version = "3", features = ["termination"] }
 humantime = "2.1"
 zstd = "0.13"
 
+# Renamed: crucible already has a crate called `segcache`. Optional so the
+# default build does not pay for a second cache engine.
+cache_rs = { package = "segcache", version = "0.4", optional = true }
+
 # Jemalloc
 tikv-jemallocator = { workspace = true }
+
+[features]
+default = []
+cache-rs = ["dep:cache_rs"]
 
 [dev-dependencies]
 tempfile = "3"

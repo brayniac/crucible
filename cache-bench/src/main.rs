@@ -4,6 +4,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod cachers;
 mod config;
 mod metrics;
 mod ratelimit;
@@ -63,6 +64,10 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         CacheBackend::Heap => {
             let cache = create_heap(&config)?;
+            run_with_cache(config, Arc::new(cache))
+        }
+        CacheBackend::CacheRs => {
+            let cache = create_cachers(&config)?;
             run_with_cache(config, Arc::new(cache))
         }
     }
@@ -410,6 +415,20 @@ fn print_replay_report(
         eprintln!("  evictions:      {}", stats.evictions);
         eprintln!("  demotions:      {}", stats.demotions);
         eprintln!("  demotion fails: {}", stats.demotion_failures);
+        eprintln!("  resident items: {}", stats.resident_items);
+        // Same figures `envelope_verdict`'s fill check reads, printed here so
+        // a thin cell (the cache never filled) is visible to the analysis
+        // step even on a run that passes the check.
+        if stats.total_segments > 0 {
+            eprintln!(
+                "  segments:       {} free / {} total ({:.1}% free)",
+                stats.free_segments,
+                stats.total_segments,
+                stats.free_segments as f64 / stats.total_segments as f64 * 100.0,
+            );
+        } else {
+            eprintln!("  segments:       (not reported)");
+        }
 
         // Independent of the write-latency histogram above: that one times
         // every record from the replay's side, this one times the eviction
@@ -419,7 +438,8 @@ fn print_replay_report(
         match (ev.count(), ev.max_ns()) {
             (0, _) | (_, None) => eprintln!("  evict pass us: (no passes timed)"),
             (n, Some(max)) => eprintln!(
-                "  evict pass us: n={n}  p50={:.1}  p99={:.1}  max={:.1}",
+                "  evict pass us: n={n}  mean={:.1}  p50={:.1}  p99={:.1}  max={:.1}",
+                ev.mean_ns().unwrap_or(0) as f64 / 1000.0,
                 ev.percentile_ns(50.0).unwrap_or(0) as f64 / 1000.0,
                 ev.percentile_ns(99.0).unwrap_or(0) as f64 / 1000.0,
                 max as f64 / 1000.0,
@@ -574,6 +594,11 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
             {
                 cfg.min_segments = n;
             }
+            if let Some(r) = config.cache.main_target_ratio
+                && let cache_core::EvictionStrategy::Merge(ref mut cfg) = strategy
+            {
+                cfg.target_ratio = r;
+            }
             b = b.main_eviction(strategy);
             b
         }
@@ -581,7 +606,19 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         EvictionPolicy::Random => builder.eviction_policy(SegEvictionPolicy::Random),
         EvictionPolicy::Cte => builder.eviction_policy(SegEvictionPolicy::Cte),
         EvictionPolicy::Merge => {
-            builder.eviction_policy(SegEvictionPolicy::Merge(MergeConfig::default()))
+            // The single-layer merge arm took `MergeConfig::default()` and
+            // ignored every knob, so a sweep over chain length or retention
+            // silently measured the compiled default on every point. Both
+            // knobs are read here for the same reason they are read for the
+            // s3fifo main layer.
+            let mut cfg = MergeConfig::default();
+            if let Some(n) = config.cache.main_merge_segments {
+                cfg.min_segments = n;
+            }
+            if let Some(r) = config.cache.main_target_ratio {
+                cfg.target_ratio = r;
+            }
+            builder.eviction_policy(SegEvictionPolicy::Merge(cfg))
         }
         other => return Err(format!("invalid policy '{other}' for segment backend").into()),
     };
@@ -607,6 +644,46 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
 
     let cache = builder.build()?;
     Ok(cache)
+}
+
+#[cfg(feature = "cache-rs")]
+fn create_cachers(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
+    let policy = cachers::cachers_policy(config.cache.policy).ok_or_else(|| {
+        format!(
+            "policy '{}' has no cache-rs counterpart",
+            config.cache.policy
+        )
+    })?;
+
+    let inner = cache_rs::Segcache::builder()
+        .heap_size(config.cache.heap_size)
+        .segment_size(segment_size_i32(config.cache.segment_size)?)
+        // Converted, not copied. See `cachers_hash_power`.
+        .hash_power(cachers::cachers_hash_power(config.cache.hashtable_power))
+        .eviction(policy)
+        .build()?;
+
+    Ok(cachers::CacheRs::new(inner))
+}
+
+#[cfg(not(feature = "cache-rs"))]
+fn create_cachers(_config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
+    // Rejected rather than ignored: a config naming a backend the binary
+    // cannot provide must fail, not silently run a different engine.
+    Err::<crate::cachers::Unavailable, _>(
+        "this binary was built without the `cache-rs` feature; \
+         rebuild with --features cache-rs"
+            .into(),
+    )
+}
+
+/// crucible's `segment_size` is `usize`; cache-rs's builder takes `i32`. A
+/// bare `as` cast would silently wrap a segment size above 2 GiB to
+/// negative, so this rejects the config instead.
+#[cfg(feature = "cache-rs")]
+fn segment_size_i32(bytes: usize) -> Result<i32, Box<dyn std::error::Error>> {
+    i32::try_from(bytes)
+        .map_err(|_| format!("segment_size {bytes} exceeds cache-rs's i32 limit").into())
 }
 
 fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {

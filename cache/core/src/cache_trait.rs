@@ -736,6 +736,31 @@ pub struct CacheInternalStats {
     /// some `set` absorbed (crucible#152). `evictions` says how many passes
     /// ran; this says what they cost.
     pub eviction_latency: crate::latency::LatencySnapshot,
+    /// Approximate count of items currently resident in the cache.
+    ///
+    /// This is a gauge (gauged at read time), not a counter, and is read
+    /// without pinning against concurrent writers, so it can be off by
+    /// roughly a segment's worth of items. It exists to separate eviction
+    /// algorithm effects from item-header-size effects when comparing
+    /// engines at a fixed memory budget: two engines can differ in hit ratio
+    /// either because one has a better eviction policy, or merely because a
+    /// smaller per-item header let it fit more items in the same bytes. This
+    /// field is what lets that question be asked instead of assumed.
+    pub resident_items: u64,
+    /// Free RAM segments at the time of the snapshot (disk tiers excluded).
+    ///
+    /// Exists to answer "did the cache fill up?" directly, rather than by
+    /// proxy through eviction-pass counts, which are not comparable across
+    /// engines or policies (a pass reclaims a variable number of segments --
+    /// crucible#158). Paired with [`total_segments`](Self::total_segments),
+    /// this distinguishes a cache that filled and exercised its eviction
+    /// policy from one that never reached capacity and so mostly measured
+    /// allocation instead.
+    pub free_segments: u64,
+    /// Total RAM segments at the time of the snapshot (disk tiers excluded).
+    ///
+    /// See [`free_segments`](Self::free_segments).
+    pub total_segments: u64,
 }
 
 /// Result of a cache lookup that may require async I/O.

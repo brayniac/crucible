@@ -410,12 +410,19 @@ impl CacheStats {
     }
 
     /// Snapshot the current values as a `CacheInternalStats`.
+    ///
+    /// `CacheStats` holds only atomic counters and has no access to the
+    /// layers, so it cannot report `resident_items` (a gauge over live
+    /// segments, not a counter) -- callers with layer access (e.g.
+    /// `SegCache::internal_stats`) must fill that field in themselves via
+    /// `TieredCache::resident_items()`.
     pub fn snapshot(&self) -> CacheInternalStats {
         CacheInternalStats {
             demotions: self.demotions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             demotion_failures: self.demotion_failures.load(Ordering::Relaxed),
             eviction_latency: self.eviction_latency.snapshot(),
+            ..Default::default()
         }
     }
 }
@@ -515,6 +522,58 @@ impl<H: Hashtable> TieredCache<H> {
     /// Get mutable access to a layer by index.
     pub fn layer_mut(&mut self, index: usize) -> Option<&mut CacheLayer> {
         self.layers.get_mut(index)
+    }
+
+    /// Sum live item counts across every segment of every layer.
+    ///
+    /// Segment IDs within a layer's pool are 0-based (see
+    /// `MemoryPool::get`, which indexes `segments` directly by `id as
+    /// usize`), so this iterates `0..total_segment_count()`. Disk layers
+    /// have no addressable `SliceSegment` (`CacheLayer::get_segment` always
+    /// returns `None` for them), so they contribute nothing here and this
+    /// counts RAM-resident items only.
+    ///
+    /// This is a gauge, not a counter: it is read without pinning against
+    /// concurrent writers/evictors, so a segment can be double- or
+    /// under-counted mid-transition. See [`CacheInternalStats::resident_items`]
+    /// for why an approximate figure is still worth reporting.
+    pub fn resident_items(&self) -> u64 {
+        let mut total = 0u64;
+        for layer in &self.layers {
+            for segment_id in 0..layer.total_segment_count() as u32 {
+                if let Some(segment) = layer.get_segment(segment_id) {
+                    total += segment.live_items() as u64;
+                }
+            }
+        }
+        total
+    }
+
+    /// Sum of free segments across RAM layers only.
+    ///
+    /// Skips disk-backed layers the same way `resident_items` does (see its
+    /// doc comment): a disk tier's fill dynamic is a different question from
+    /// "did the in-memory cache reach capacity", which is what
+    /// [`crate::cache_trait::CacheInternalStats::free_segments`] and
+    /// [`total_segments`](crate::cache_trait::CacheInternalStats::total_segments)
+    /// exist to answer.
+    pub fn ram_free_segment_count(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter(|layer| !layer.is_disk())
+            .map(|layer| layer.free_segment_count() as u64)
+            .sum()
+    }
+
+    /// Sum of total segments across RAM layers only. See
+    /// [`ram_free_segment_count`](Self::ram_free_segment_count) for why disk
+    /// layers are excluded.
+    pub fn ram_total_segment_count(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter(|layer| !layer.is_disk())
+            .map(|layer| layer.total_segment_count() as u64)
+            .sum()
     }
 
     /// Store an item in the cache.
@@ -3019,6 +3078,110 @@ mod tests {
         let layer = cache.layer(0).unwrap();
         // Segment 0 should exist after writing
         let _segment = layer.get_segment(0);
+    }
+
+    #[test]
+    fn resident_items_counts_inserted_small_items_without_overcounting() {
+        let cache = create_ttl_only_cache();
+
+        let num_items = 20;
+        for i in 0..num_items {
+            let key = format!("resident_{i}");
+            cache
+                .set(key.as_bytes(), b"v", b"", Duration::from_secs(3600))
+                .unwrap();
+        }
+
+        let resident = cache.resident_items();
+        assert!(
+            resident > 0,
+            "expected resident_items > 0 after inserting {num_items} items, got {resident}"
+        );
+        assert!(
+            resident <= num_items as u64,
+            "expected resident_items <= {num_items} inserted items, got {resident}"
+        );
+    }
+
+    #[test]
+    fn ram_segment_counts_report_free_and_total_across_ram_layers() {
+        let cache = create_test_cache();
+
+        let total = cache.ram_total_segment_count();
+        let free = cache.ram_free_segment_count();
+
+        assert!(total > 0);
+        assert!(free <= total);
+        assert_eq!(
+            total,
+            cache.layer(0).unwrap().total_segment_count() as u64
+                + cache.layer(1).unwrap().total_segment_count() as u64
+        );
+
+        // Write until layer 0 has a used segment, so free < total proves the
+        // method reads live state rather than a value cached at construction.
+        cache
+            .set(b"k", b"v", b"", Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            cache.ram_free_segment_count() < total,
+            "expected a write to reduce free segments below the total"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file-backed mmap is unsupported under Miri")]
+    fn ram_segment_counts_exclude_disk_layers() {
+        use crate::disk::DiskLayerBuilder;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(256 * 1024) // 4 segments
+            .spare_capacity(0)
+            .build()
+            .expect("fifo layer");
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(512 * 1024) // 8 segments
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+        // Deliberately far larger than the RAM total (12 segments): if the
+        // disk layer leaked into the RAM-only sum, this test would fail by a
+        // large margin rather than an easily-missed small one.
+        let disk_layer = DiskLayerBuilder::new()
+            .layer_id(2)
+            .pool_id(2)
+            .segment_size(64 * 1024)
+            .path(dir.path().join("disk.dat"))
+            .size(64 * 64 * 1024) // 64 segments
+            .build()
+            .expect("disk layer");
+
+        let cache: TieredCache<MultiChoiceHashtable> =
+            TieredCacheBuilder::new(Arc::new(MultiChoiceHashtable::new(10)))
+                .with_fifo_layer(fifo_layer)
+                .with_ttl_layer(ttl_layer)
+                .with_disk_layer(disk_layer)
+                .build();
+
+        let ram_total = cache.ram_total_segment_count();
+        let expected_ram_total = cache.layer(0).unwrap().total_segment_count() as u64
+            + cache.layer(1).unwrap().total_segment_count() as u64;
+        let disk_total = cache.layer(2).unwrap().total_segment_count() as u64;
+
+        assert_eq!(ram_total, expected_ram_total);
+        assert!(
+            ram_total < disk_total,
+            "fixture must make the disk layer's segment count dwarf the RAM \
+             total for this test to be meaningful (ram={ram_total}, disk={disk_total})"
+        );
     }
 
     #[test]

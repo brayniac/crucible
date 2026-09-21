@@ -140,8 +140,21 @@ pub struct MergeConfig {
     /// Minimum segments needed to trigger merge.
     pub min_segments: usize,
 
-    /// Target retention ratio (0.0 - 1.0, typically 0.5).
-    /// Lower = more aggressive pruning, higher = more retention.
+    /// Optional policy cap on retention, as a fraction of the chain's live
+    /// bytes (0.0 - 1.0).
+    ///
+    /// This is *not* what keeps a pass inside its spare. A pass reserves one
+    /// spare and the retained set is bounded by that spare's free space
+    /// (#154), so capacity is enforced structurally whatever this is set to.
+    /// The two budgets compose as a minimum, so this can only ever prune
+    /// further than capacity requires -- it is a "throw away live data the
+    /// cache had room for" knob, and the reason to reach for it is a
+    /// deliberate one, such as keeping a chain's occupancy low.
+    ///
+    /// At `1.0` the cap asks for nothing: the pass prunes exactly what the
+    /// spare cannot hold, so a fragmented chain whose live set fits is
+    /// compacted with every live item intact and only the dead bytes
+    /// reclaimed.
     pub target_ratio: f64,
 
     /// Frequency an item must exceed to survive, before any adaptive rise.
@@ -159,6 +172,31 @@ impl Default for MergeConfig {
     fn default() -> Self {
         Self {
             min_segments: 4,
+            // Prune half the live set, even where capacity would allow
+            // keeping it. This is a latency choice, not a correctness one,
+            // and it is held here deliberately.
+            //
+            // Before #154 the ratio did double duty: it was the only thing
+            // stopping a pass from over-subscribing its spare, and 0.5 was
+            // the margin that bought. #154 made the spare's free space the
+            // budget, bounding the pass structurally, and left the ratio as
+            // a cap on top -- `budget = min(spare_bytes, live * ratio)`.
+            //
+            // So a ratio below 1.0 no longer protects anything; it only
+            // discards live items there was room to keep. Raising it to 1.0
+            // turns the pass into pure compaction wherever the live set
+            // fits, which is what #155 asks for -- and that was measured on
+            // a quiet ARM board as **-7.3% miss ratio for +80.7%
+            // eviction cost**, worst-case stall 4.9ms -> 8.6ms. Retaining
+            // more means copying more; there is no free lunch in the ratio
+            // alone.
+            //
+            // While #152 (merge stalls on the write path) is open that is
+            // the wrong default, so it stays at 0.5 until #155's second half
+            // lands: choosing the chain length from measured occupancy, so
+            // a pass frees more segments per byte copied instead of simply
+            // copying more. The knob still reaches 1.0 explicitly for
+            // deployments that want the hit ratio.
             target_ratio: 0.5,
             initial_threshold: 0,
         }
@@ -169,14 +207,21 @@ impl MergeConfig {
     /// Parameters that make merge behave as CLOCK second chance.
     ///
     /// `min_segments: 1` reclaims one segment per pass rather than a chain.
-    /// `target_ratio: 1.0` pins the adaptive prune threshold at zero: the
-    /// threshold rises only while `retained / total > target_ratio`, and that
-    /// ratio can never exceed 1.0, so every item with a non-zero frequency is
-    /// copied and every item without one is dropped.
+    /// `target_ratio: 1.0` pins the prune threshold at its floor, by two
+    /// separate routes that both have to hold:
     ///
-    /// That second property is load-bearing and subtle, so it is pinned by
-    /// `clock_params_pin_the_prune_threshold_at_zero` rather than left to a
-    /// reader to re-derive.
+    /// - The retention budget is `live_bytes * target_ratio`, which at 1.0 is
+    ///   the whole live set, so the policy cap prunes nothing.
+    /// - A single candidate's live bytes cannot exceed its own capacity, and
+    ///   the spare has the same capacity, so the capacity bound prunes
+    ///   nothing either.
+    ///
+    /// What is left is `initial_threshold`, and CLOCK's second chance is
+    /// exactly that fixed rule. Both properties are load-bearing and subtle,
+    /// so they are pinned by
+    /// `clock_params_stop_the_threshold_rising_above_its_baseline` here and by
+    /// `clock_parameters_prune_exactly_the_items_untouched_since_admission`
+    /// in `layer::ttl_layer`, rather than left to a reader to re-derive.
     pub const CLOCK: Self = Self {
         min_segments: 1,
         target_ratio: 1.0,
@@ -270,19 +315,20 @@ mod tests {
 
     #[test]
     fn clock_params_stop_the_threshold_rising_above_its_baseline() {
-        // `try_merge_eviction` raises its threshold only while
-        // `retained / total > target_ratio`. Retention is a ratio of two item
-        // counts, so it cannot exceed 1.0 and the comparison is never true.
-        // If that rule ever changes, the CLOCK arm silently stops being CLOCK
-        // and the comparison it feeds becomes meaningless -- so pin it here.
+        // `try_merge_eviction` derives its retention budget as
+        // `live_bytes * target_ratio` and prunes only what will not fit in
+        // it. At 1.0 the budget must come out as the whole live set --
+        // exactly, with no floating-point shortfall, or the cap would clip
+        // the coldest class and CLOCK would silently start pruning
+        // adaptively like merge instead of holding a fixed second-chance
+        // rule.
         let clock = MergeConfig::CLOCK;
-        for retained in 0..=1000u32 {
-            let ratio = retained as f64 / 1000.0;
-            assert!(
-                ratio <= clock.target_ratio,
-                "retention {ratio} would raise the threshold above its \
-                 baseline, so CLOCK would prune adaptively like merge \
-                 instead of holding a fixed second-chance rule"
+        for live_bytes in [0u64, 1, 7, 1023, 65536, 1 << 20, (1 << 32) + 1] {
+            let budget = (live_bytes as f64 * clock.target_ratio) as u64;
+            assert_eq!(
+                budget, live_bytes,
+                "a retention budget of {budget} for {live_bytes} live bytes \
+                 would prune under CLOCK parameters"
             );
         }
     }
@@ -379,6 +425,13 @@ mod tests {
     fn test_merge_config_defaults() {
         let config = MergeConfig::default();
         assert_eq!(config.min_segments, 4);
+        // 1.0, not 0.5: capacity is enforced by the spare's byte budget
+        // (#154), so the ratio is a pure "prune more than capacity forces"
+        // Held at 0.5 while the occupancy-adaptive chain length (#155's
+        // second half) is built. Raising it to 1.0 was measured as
+        // -7.3% miss ratio for +80.7% eviction cost and a worst-case stall
+        // of 8.6ms against 4.9ms, which is the wrong trade while #152 is
+        // open. The knob still reaches that behaviour explicitly.
         assert!((config.target_ratio - 0.5).abs() < f64::EPSILON);
     }
 

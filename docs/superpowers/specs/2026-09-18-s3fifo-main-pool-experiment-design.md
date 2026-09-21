@@ -137,9 +137,9 @@ interchangeable for this question.
 > `promoted: 0` for the first 240M operations. Do not use them as a baseline or
 > as evidence that the rig works.
 
-Traces live on delta's NFS export, mounted read-only:
-
-    sudo mount -t nfs -o ro,resvport the trace mount /Volumes/cachetrace
+Traces live on an NFS export mounted read-only on the measurement
+hosts. Mount instructions and the spec definitions live in the
+private `crucible-experiments` repository.
 
 `twoday/` and `bin/` and `nsdi/` hold `.sbin.zst` — the native 20-byte layout
 with op codes and TTLs. `oracle/` holds the oracleGeneral form of the same
@@ -163,7 +163,7 @@ absolute hit ratio.** An earlier draft of this document said to target the
 Sweep upward until the miss-ratio curve flattens. The value it flattens to is
 the **compulsory miss floor** for that window: every object's first access
 misses no matter how large the cache, so no policy can do better. On
-`the high-overwrite trace` over a 10M-record window the floor is 0.1834,
+the high-overwrite trace over a 10M-record window the floor is 0.1834,
 which caps hit ratio at 81.66% — a cache sized for "80% hit" is sitting at
 1.04x the floor with almost no eviction pressure, and would have been read as
 a healthy operating point.
@@ -208,24 +208,24 @@ dead-byte reclamation, and dead bytes come from overwrites and deletes:
 
 | trace | writes | overwrites | reuse | mean value | TTLs |
 |---|---|---|---|---|---|
-| `the high-overwrite trace` | 10.7% | **69.8%** | 9.8 | 359 B | 2 |
-| `a mid-overwrite trace` | **49.7%** | 32.9% | 3.0 | 2087 B | 2 |
-| `a second mid-overwrite trace` | 42.2% | 16.7% | 2.8 | 89 B | 16 |
+| high-overwrite | 10.7% | **69.8%** | 9.8 | 359 B | 2 |
+| a mid-overwrite trace_v2_entity_cluster_scores` | **49.7%** | 32.9% | 3.0 | 2087 B | 2 |
+| mid-overwrite 2 | 42.2% | 16.7% | 2.8 | 89 B | 16 |
 | `pinkfloyd` | 12.5% | 24.1% | 3.6 | 575 B | 6 |
 
-`the high-overwrite trace` is the primary: the highest overwrite rate in
+the high-overwrite trace is the primary: the highest overwrite rate in
 the corpus with enough reuse to have a working set, and a small enough mean
-value to fit a laptop-scale sweep. `a mid-overwrite trace` is the opposite shape — half
+value to fit a laptop-scale sweep. a mid-overwrite trace is the opposite shape — half
 writes with 2 KB values — and needs a multi-GB sweep to reach its band.
-`a second mid-overwrite trace` is the only candidate with real TTL diversity.
+a second mid-overwrite trace is the only candidate with real TTL diversity.
 
-**Negative control: `the low-overwrite control`** — 4.9% writes and a **0.0%** overwrite
+**Negative control: the low-overwrite control_cache`** — 4.9% writes and a **0.0%** overwrite
 rate. Merge and CLOCK should be indistinguishable there, because the mechanism
 that separates them never fires. If an arm pair differs on this trace, the rig
 is wrong rather than the policies.
 
 Excluded for no overwrite rate, and so unable to discriminate:
-`a low-write workload` (0.1% writes), `another workload`
+the high-overwrite trace_content_features` (0.1% writes), `conversation_timeline_metadata`
 (1.0%), `pushservice_core_svcs` (1.2%), `content_recommender` (2.5%
 overwrites), `onboarding_task_service` (1.2% overwrites, and a 1-byte mean
 value). Also excluded: `ibis_cache`, which is 99.8% `add` with zero-length
@@ -246,7 +246,7 @@ seed pinned, `set_errors == 0`, noise floor 0.0000. Every point below passed
       48 MB    0.2810    0.3662    0.0852
       64 MB    0.2653    0.3534    0.0881
 
-    the low-overwrite control (0.0% overwrite)
+    the low-overwrite control_cache (0.0% overwrite, negative control)
       64 MB    0.8126    0.8158    0.0032
      128 MB    rejected (saturated, 0 evictions)
      256 MB    rejected (saturated, 0 evictions)
@@ -274,7 +274,7 @@ contributes nothing here.**
 The threshold is not an inert knob -- on a low-reuse trace, where items
 actually sit at frequency 1, it moves the result:
 
-    the low-overwrite control (reuse 1.7), 64 MB
+    the low-overwrite control_cache (reuse 1.7), 64 MB
       merge-single   0.8146
       clock          0.8164
 
@@ -298,8 +298,8 @@ either policy is called better.
 
 Not yet measured: whether the chain-length advantage keeps scaling past 4,
 where it costs more in eviction latency than it returns in hit ratio, and
-whether any of this survives on `a mid-overwrite trace` (49.7% writes, 2 KB values)
-or `a second mid-overwrite trace` (the only candidate with real TTL diversity).
+whether any of this survives on a mid-overwrite trace (49.7% writes, 2 KB values)
+or a second mid-overwrite trace (the only candidate with real TTL diversity).
 
 
 ### The chain-length sweep
@@ -358,8 +358,8 @@ eviction-active region rather than at a fixed multiple of a compulsory floor;
 zero-eviction points were rejected by `envelope_verdict`.
 
     trace / heap                chain=1  2       4       8       16      clock
-    high-overwrite   / 48 MB     0.3662  0.2831  0.2810  0.2788  0.2798  0.3662
-    high-overwrite   / 64 MB     0.3534  0.2661  0.2653  0.2636  0.2608  0.3534
+    the high-overwrite trace_rta   / 48 MB     0.3662  0.2831  0.2810  0.2788  0.2798  0.3662
+    the high-overwrite trace_rta   / 64 MB     0.3534  0.2661  0.2653  0.2636  0.2608  0.3534
     a second mid-overwrite trace      / 64 MB     0.6665  0.6228  0.5966  0.5883  0.6067  0.6696
     a second mid-overwrite trace      /128 MB     0.5634  0.5485  0.5460  0.5383  0.5384  0.5635
     a mid-overwrite trace     /512 MB     0.6732  0.6038  0.5713  0.5652  0.5614  0.6734
@@ -379,8 +379,8 @@ control. It is the single biggest effect this experiment found.
 
     the high-overwrite trace 48 MB   0.2810 -> 0.2788
     the high-overwrite trace 64 MB   0.2653 -> 0.2636
-    a mid-overwrite trace  64 MB   0.5966 -> 0.5883
-    a mid-overwrite trace 128 MB   0.5460 -> 0.5383
+    mid-overwrite  64 MB   0.5966 -> 0.5883
+    mid-overwrite 128 MB   0.5460 -> 0.5383
     a mid-overwrite trace 512MB 0.5713 -> 0.5652
     a mid-overwrite trace  1 GB 0.4334 -> 0.4327
 
@@ -390,7 +390,7 @@ latency this rig does not measure: a chain of 8 does the same total scan
 work in half as many passes, so each pass is twice as long.
 
 **The degradation past the optimum is not universal.** It appears at
-the high-overwrite trace/32, a mid-overwrite trace/64 MB/16 — and not at all on a mid-overwrite trace up to
+high-overwrite/32, mid-overwrite/64 MB/16 — and not at all on a mid-overwrite trace up to
 chain 16, where layer 1 holds ~230 segments per TTL bucket. That is
 consistent with both candidate mechanisms in crucible#151 (starvation and
 TTL truncation) scaling with chain length *relative to bucket depth*, and it
@@ -406,7 +406,7 @@ write entry points -- so a reclamation pass is a stall on whichever `set`
 triggered it, and no arm had ever measured that.
 
 Measured on board A (Raspberry Pi 4B, Cortex-A72, 8 GB, Debian 13, bare metal via
-SystemsLab), `the high-overwrite trace` at 48 MB, 15M-record window,
+SystemsLab), the high-overwrite trace at 48 MB, 15M-record window,
 4 reps per chain **interleaved on one host** -- not a matrix, because Pi
 thermal drift is the dominant noise term and only same-host interleaving
 controls for it.
@@ -543,7 +543,7 @@ monotonically and converges to something that occurs nowhere in the run.
 
 Neither engine seeds its hashtable deterministically in release builds, so the
 concern was real. `MultiChoiceHashtable::with_seeds` was added to size it.
-Result on `the high-overwrite trace`, 48 MB, 15M-record window:
+Result on the high-overwrite trace, 48 MB, 15M-record window:
 
     hash_power   set errors   seeds 1-4 miss ratio              spread
        10          381,722    0.4151 0.4252 0.4183 0.4165       0.0101

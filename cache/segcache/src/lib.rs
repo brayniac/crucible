@@ -779,7 +779,12 @@ impl Cache for SegCache {
     }
 
     fn internal_stats(&self) -> Option<CacheInternalStats> {
-        Some(self.inner.stats().snapshot())
+        Some(CacheInternalStats {
+            resident_items: self.inner.resident_items(),
+            free_segments: self.inner.ram_free_segment_count(),
+            total_segments: self.inner.ram_total_segment_count(),
+            ..self.inner.stats().snapshot()
+        })
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
@@ -966,6 +971,78 @@ mod tests {
         let deleted = cache.delete(b"key");
         assert!(deleted);
         assert!(!cache.contains(b"key"));
+    }
+
+    #[test]
+    fn internal_stats_reports_ram_segment_fill() {
+        let cache = create_test_cache();
+
+        let before = cache.internal_stats().expect("segcache reports stats");
+        assert!(
+            before.total_segments > 0,
+            "expected total_segments > 0 for a built cache, got {}",
+            before.total_segments
+        );
+        assert!(
+            before.free_segments <= before.total_segments,
+            "free_segments ({}) must not exceed total_segments ({})",
+            before.free_segments,
+            before.total_segments
+        );
+
+        // Fill layer 0 (12 * 64KB segments at this heap/segment size) so at
+        // least one segment moves from free to used, proving the field
+        // reflects live pool state rather than a value fixed at build time.
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 32 * 1024];
+        for i in 0..8u32 {
+            let key = format!("fill_{i}");
+            let _ = cache.set(key.as_bytes(), &value, ttl);
+        }
+
+        let after = cache.internal_stats().expect("segcache reports stats");
+        assert_eq!(
+            after.total_segments, before.total_segments,
+            "total_segments should not change from writes alone"
+        );
+        assert!(
+            after.free_segments < before.free_segments,
+            "expected free_segments to drop after filling segments \
+             (before={}, after={})",
+            before.free_segments,
+            after.free_segments
+        );
+    }
+
+    #[test]
+    fn internal_stats_total_segments_sums_every_layer_not_just_one() {
+        // `create_test_cache()` (used above) builds a single-layer cache by
+        // default -- an implementation that only ever read layer 0 would
+        // still pass that test. Build explicitly with `.s3fifo()` to get the
+        // FIFO admission + TTL main two-layer topology, so a wiring that
+        // summed only one layer is caught here.
+        let cache = SegCacheBuilder::new()
+            .heap_size(1024 * 1024)
+            .segment_size(64 * 1024)
+            .hashtable_power(10)
+            .s3fifo()
+            .build()
+            .expect("failed to build s3fifo test cache");
+
+        assert_eq!(cache.layer_count(), 2);
+        let expected_total = cache.layer(0).unwrap().total_segment_count() as u64
+            + cache.layer(1).unwrap().total_segment_count() as u64;
+
+        let stats = cache.internal_stats().expect("segcache reports stats");
+        assert_eq!(
+            stats.total_segments, expected_total,
+            "total_segments must sum every RAM layer, not just one"
+        );
+        assert!(
+            expected_total > cache.layer(0).unwrap().total_segment_count() as u64,
+            "fixture must have a nonzero layer 1 for this test to be \
+             meaningful"
+        );
     }
 
     #[test]
@@ -1397,6 +1474,33 @@ mod tests {
         let layer = &metrics.layers[0];
         assert_eq!(layer.layer_id, 0);
         assert!(layer.pool.total_segments > 0);
+    }
+
+    #[test]
+    fn internal_stats_reports_resident_items_within_inserted_bound() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+
+        let num_items = 20;
+        for i in 0..num_items {
+            let key = format!("resident_{i}");
+            cache.set(key.as_bytes(), b"v", ttl).unwrap();
+        }
+
+        let stats = cache
+            .internal_stats()
+            .expect("internal_stats should be Some for segcache");
+
+        assert!(
+            stats.resident_items > 0,
+            "expected resident_items > 0 after inserting {num_items} items, got {}",
+            stats.resident_items
+        );
+        assert!(
+            stats.resident_items <= num_items as u64,
+            "expected resident_items <= {num_items} inserted items, got {}",
+            stats.resident_items
+        );
     }
 
     #[test]

@@ -8,6 +8,12 @@
 //! kept because its next-access field is what yields a Belady reference curve,
 //! not because it can compare eviction policies.
 //!
+//! The Twitter layout is the one released with the cluster traces at
+//! <https://github.com/twitter/cache-trace>, whose own documentation
+//! specifies the 20-byte record. Note the public release identifies clusters
+//! by number; any internal service naming is not part of that dataset and is
+//! deliberately absent here.
+//!
 //! See `docs/superpowers/specs/2026-09-18-s3fifo-main-pool-experiment-design.md`.
 
 /// Which on-disk layout a trace file carries.

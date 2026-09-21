@@ -78,6 +78,93 @@ impl KeyVerifier for SinglePoolVerifier<'_> {
     }
 }
 
+/// Where the parts of a `BasicHeader` item sit inside its segment.
+///
+/// Both halves of a merge pass need this: the scan reads the key to look the
+/// frequency up, and the copy reads the key, value and optional bytes back
+/// out. Parsing is a handful of loads from segment memory, which is why the
+/// pass memoizes the *frequency* -- a hashtable probe -- and not this.
+#[derive(Clone, Copy)]
+struct BasicItemSpan {
+    optional_start: u32,
+    optional_len: usize,
+    key_start: u32,
+    key_len: usize,
+    value_start: u32,
+    value_len: usize,
+    /// Bytes from this item's start to the next item's start.
+    stride: u32,
+    deleted: bool,
+}
+
+impl BasicItemSpan {
+    fn parse<S: Segment + ?Sized>(segment: &S, offset: u32) -> Option<Self> {
+        let data = segment.header_ptr(offset, BasicHeader::SIZE)?;
+        let header = unsafe { BasicHeader::try_from_ptr(data) }?;
+
+        // The segment's stride, not the 8-byte padded body size: a scan that
+        // advances by anything but what the append advanced by desyncs after
+        // the first item on a coarser-aligned pool.
+        let stride = segment.item_stride(header.padded_size());
+
+        let optional_start = offset as usize + BasicHeader::SIZE;
+        let optional_len = header.optional_len() as usize;
+        let key_start = optional_start + optional_len;
+        let key_len = header.key_len() as usize;
+        let value_start = key_start + key_len;
+        let value_len = header.value_len() as usize;
+
+        Some(Self {
+            optional_start: optional_start as u32,
+            optional_len,
+            key_start: key_start as u32,
+            key_len,
+            value_start: value_start as u32,
+            value_len,
+            stride,
+            deleted: header.is_deleted(),
+        })
+    }
+}
+
+/// One live item a merge pass found, with the frequency it probed for.
+struct ScannedItem {
+    /// Index into the pass's candidate list, not a segment id.
+    candidate: u32,
+    offset: u32,
+    freq: u8,
+}
+
+/// The lowest prune threshold whose retained bytes still fit `budget`, and
+/// the bytes that threshold retains.
+///
+/// An item survives when `freq > threshold`, so the retained set is a suffix
+/// of the frequency classes. Accumulate from the hottest class downwards and
+/// stop at the first class that would not fit whole: the threshold returned
+/// is then guaranteed to fit. Empty classes cost nothing, so the walk passes
+/// straight over them and stops at the first *populated* class that
+/// overflows -- the class that straddles the budget.
+///
+/// Frequency-zero items are never retained: the threshold cannot go below
+/// zero and survival is strict.
+///
+/// The threshold returned is the class the walk stopped at, so it names the
+/// straddling class directly -- and when nothing at all fits, it is the
+/// hottest populated class and the retained bytes are zero.
+fn threshold_for_budget(class_bytes: &[u64; 256], budget: u64) -> (u8, u64) {
+    let mut retained = 0u64;
+    let mut threshold = u8::MAX;
+    for freq in (1..=u8::MAX).rev() {
+        let class = class_bytes[freq as usize];
+        if retained + class > budget {
+            break;
+        }
+        retained += class;
+        threshold = freq - 1;
+    }
+    (threshold, retained)
+}
+
 impl TtlLayer {
     /// Create a new TTL layer builder.
     pub fn builder() -> TtlLayerBuilder {
@@ -1064,10 +1151,23 @@ impl TtlLayer {
     /// Selects N candidate segments from the head of a bucket, reserves a spare,
     /// copies high-frequency items into the spare, frees the candidates.
     ///
-    /// Uses adaptive threshold:
-    /// - Start with threshold = 0 (conservative)
-    /// - After each segment, check retention ratio
-    /// - Increase threshold for remaining segments if retention is above target
+    /// The retained set has to fit *one* spare, which is `1/N` of the chain's
+    /// capacity, so the threshold is chosen before anything is copied:
+    ///
+    /// - **Phase A** walks the chain once and memoizes each live item's
+    ///   frequency, accumulating bytes per frequency class as it goes. That
+    ///   is one hashtable probe per item, and the only one the pass makes.
+    /// - **Phase B** reads the threshold off the histogram: the lowest one
+    ///   whose retained bytes fit the spare, floored by `initial_threshold`
+    ///   and capped further by `target_ratio`.
+    /// - **Phase C** copies the memoized survivors.
+    ///
+    /// Reacting to the retention ratio *after* each segment, as this used to,
+    /// commits the pass to overshooting before it can adapt; the spare then
+    /// fills mid-chain and the remainder is discarded by position rather than
+    /// by frequency (#154). Choosing up front, in bytes, makes the capacity
+    /// bound structural: position can now only decide *within* the single
+    /// class that straddles the boundary, where order is arbitrary anyway.
     fn try_merge_eviction<H: Hashtable>(
         &self,
         merge_config: &crate::config::MergeConfig,
@@ -1147,141 +1247,180 @@ impl TtlLayer {
 
         let verifier = SinglePoolVerifier { pool: &self.pool };
 
-        // Adaptive threshold: start at the policy's baseline, increase if
-        // retaining too much. The baseline is not always zero -- a fresh
-        // insert carries frequency 1, so a zero threshold retains every live
-        // item and a policy that pins its threshold must start above that.
-        let mut threshold: u8 = merge_config.initial_threshold;
-        let mut total_retained = 0u32;
-        let mut total_pruned = 0u32;
+        // ---- Phase A: scan the chain once, memoizing every live item.
+        //
+        // One `get_frequency` probe per item, here and nowhere else. The
+        // probe resolves the key through the hashtable and back into segment
+        // memory, so it dominates the pass; phase C reads the frequency back
+        // out of this vector rather than asking again.
+        let estimated_items: usize = candidates
+            .iter()
+            .filter_map(|&id| self.pool.get(id))
+            .map(|seg| seg.live_items() as usize)
+            .sum();
+        let mut scanned: Vec<ScannedItem> = Vec::with_capacity(estimated_items);
+        // Bytes per frequency class. Frequency is a `u8`, so every class has
+        // a slot and no bucketing is needed.
+        let mut class_bytes = [0u64; 256];
 
-        // Copy surviving items from each candidate into the spare
-        for &cand_id in &candidates {
+        for (cand_idx, &cand_id) in candidates.iter().enumerate() {
             let segment = match self.pool.get(cand_id) {
                 Some(s) => s,
                 None => continue,
             };
 
-            let mut seg_retained = 0u32;
-            let mut seg_pruned = 0u32;
             let mut offset = 0u32;
             let write_offset = segment.write_offset();
 
             while offset < write_offset {
-                let data = match segment.header_ptr(offset, BasicHeader::SIZE) {
-                    Some(d) => d,
+                let span = match BasicItemSpan::parse(segment, offset) {
+                    Some(s) => s,
                     None => break,
                 };
-                let header = match unsafe { BasicHeader::try_from_ptr(data) } {
-                    Some(h) => h,
-                    None => break,
-                };
-                // The segment's stride, not the 8-byte padded body size: a scan
-                // that advances by anything but what the append advanced by
-                // desyncs after the first item on a coarser-aligned pool.
-                let item_size = segment.item_stride(header.padded_size());
 
-                if header.is_deleted() {
-                    offset += item_size;
+                if span.deleted {
+                    offset += span.stride;
                     continue;
                 }
 
-                let optional_start = offset as usize + BasicHeader::SIZE;
-                let optional_len = header.optional_len() as usize;
-                let key_start = optional_start + optional_len;
-                let key_len = header.key_len() as usize;
-                let value_start = key_start + key_len;
-                let value_len = header.value_len() as usize;
-
-                let key = match segment.data_slice(key_start as u32, key_len) {
+                let key = match segment.data_slice(span.key_start, span.key_len) {
                     Some(k) => k,
                     None => break,
                 };
 
                 let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
 
-                if freq > threshold {
-                    // Copy to spare
-                    let optional = segment
-                        .data_slice(optional_start as u32, optional_len)
-                        .unwrap_or(&[]);
-                    let value = segment
-                        .data_slice(value_start as u32, value_len)
-                        .unwrap_or(&[]);
+                class_bytes[freq as usize] += span.stride as u64;
+                scanned.push(ScannedItem {
+                    candidate: cand_idx as u32,
+                    offset,
+                    freq,
+                });
 
-                    if let Some(new_offset) = spare.append_item(key, value, optional) {
-                        let old_loc = ItemLocation::new(
-                            self.pool.layout(),
-                            self.pool.pool_id(),
-                            cand_id,
-                            segment.incarnation(),
-                            offset,
-                        );
-                        let new_loc = ItemLocation::new(
-                            self.pool.layout(),
-                            self.pool.pool_id(),
-                            spare_id,
-                            spare.incarnation(),
-                            new_offset,
-                        );
+                offset += span.stride;
+            }
+        }
 
-                        // Update hashtable (preserve frequency)
-                        if !hashtable.cas_location(
-                            key,
-                            old_loc.to_location(),
-                            new_loc.to_location(),
-                            true,
-                        ) {
-                            // CAS failed (concurrent overwrite), mark spare copy as deleted
-                            spare.mark_deleted_at_offset(new_offset);
-                        }
-                        seg_retained += 1;
-                    } else {
-                        // Spare is full — discard remaining items
-                        let location = ItemLocation::new(
-                            self.pool.layout(),
-                            self.pool.pool_id(),
-                            cand_id,
-                            segment.incarnation(),
-                            offset,
-                        );
-                        if self.config.create_ghosts {
-                            hashtable.convert_to_ghost(key, location.to_location());
-                        } else {
-                            hashtable.remove(key, location.to_location());
-                        }
-                        seg_pruned += 1;
-                    }
-                } else {
-                    // Frequency too low — discard (convert to ghost or remove)
-                    let location = ItemLocation::new(
+        // ---- Phase B: choose the threshold before copying anything.
+        //
+        // The spare is freshly reserved, so its whole capacity is available;
+        // `free_space` says so without assuming the write offset is zero.
+        // Because the candidates and the spare come from the same pool they
+        // share an alignment, so the stride measured during the scan is
+        // exactly what `append_item` will consume.
+        let spare_budget = spare.free_space() as u64;
+        let live_bytes: u64 = class_bytes.iter().sum();
+
+        // `target_ratio` is a policy cap on top of the capacity bound, in the
+        // same currency (bytes, not items -- an item ratio that looks safe
+        // can still overflow when items vary in size). Whichever of the two
+        // prunes more wins; since `threshold_for_budget` is monotone in its
+        // budget, taking the tighter budget is exactly that. So capacity is
+        // enforced structurally, the policy can only ever prune further, and
+        // `min_segments` and `target_ratio` are independent knobs again.
+        let ratio_budget = (live_bytes as f64 * merge_config.target_ratio) as u64;
+        let budget = spare_budget.min(ratio_budget);
+
+        let (bound_threshold, bound_bytes) = threshold_for_budget(&class_bytes, budget);
+
+        // `initial_threshold` is a floor under both bounds.
+        //
+        // This is what keeps `MergeConfig::CLOCK` intact: one candidate into
+        // one spare always fits and a `target_ratio` of 1.0 caps nothing, so
+        // `bound_threshold` is 0 and the floor of 1 carries through.
+        let threshold = merge_config.initial_threshold.max(bound_threshold);
+
+        // The bound stops at a whole class, so it usually leaves a slice of
+        // the spare unfilled. That slice goes to the class that straddles the
+        // boundary -- and only to it. Those items all carry the same
+        // frequency, so taking them in scan order discards nothing the
+        // frequency ordering had anything to say about; that is the one place
+        // position is still allowed to decide (#154).
+        //
+        // Only when the *bound* is what binds: if the floor raised the
+        // threshold, the straddling class is below the floor and must go.
+        // And never at threshold 0, whose class is the items the hashtable
+        // no longer knows about.
+        let mut straddle_budget = if threshold == bound_threshold && threshold > 0 {
+            budget - bound_bytes
+        } else {
+            0
+        };
+
+        // ---- Phase C: copy the survivors, in the order they were scanned.
+        for item in &scanned {
+            let cand_id = candidates[item.candidate as usize];
+            let segment = match self.pool.get(cand_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let span = match BasicItemSpan::parse(segment, item.offset) {
+                Some(s) => s,
+                None => continue,
+            };
+            let key = match segment.data_slice(span.key_start, span.key_len) {
+                Some(k) => k,
+                None => continue,
+            };
+            let old_loc = ItemLocation::new(
+                self.pool.layout(),
+                self.pool.pool_id(),
+                cand_id,
+                segment.incarnation(),
+                item.offset,
+            );
+
+            // The memoized frequency -- probing again here would double the
+            // hashtable work the pass does for no new information.
+            let retain = if item.freq > threshold {
+                true
+            } else if item.freq == threshold && straddle_budget >= span.stride as u64 {
+                straddle_budget -= span.stride as u64;
+                true
+            } else {
+                false
+            };
+
+            if retain {
+                let optional = segment
+                    .data_slice(span.optional_start, span.optional_len)
+                    .unwrap_or(&[]);
+                let value = segment
+                    .data_slice(span.value_start, span.value_len)
+                    .unwrap_or(&[]);
+
+                if let Some(new_offset) = spare.append_item(key, value, optional) {
+                    let new_loc = ItemLocation::new(
                         self.pool.layout(),
                         self.pool.pool_id(),
-                        cand_id,
-                        segment.incarnation(),
-                        offset,
+                        spare_id,
+                        spare.incarnation(),
+                        new_offset,
                     );
-                    if self.config.create_ghosts {
-                        hashtable.convert_to_ghost(key, location.to_location());
-                    } else {
-                        hashtable.remove(key, location.to_location());
-                    }
-                    seg_pruned += 1;
-                }
 
-                offset += item_size;
+                    // Update hashtable (preserve frequency)
+                    if !hashtable.cas_location(
+                        key,
+                        old_loc.to_location(),
+                        new_loc.to_location(),
+                        true,
+                    ) {
+                        // CAS failed (concurrent overwrite), mark spare copy as deleted
+                        spare.mark_deleted_at_offset(new_offset);
+                    }
+                    continue;
+                }
+                // Unreachable in the common case: phase B sized the retained
+                // set against the spare, so the appends fit by construction.
+                // A concurrent writer racing the same spare is the only way
+                // here, and dropping the item is the safe answer.
             }
 
-            total_retained += seg_retained;
-            total_pruned += seg_pruned;
-
-            // Adjust threshold for next segment based on running retention ratio
-            let total_items = total_retained + total_pruned;
-            if total_items > 0 && threshold < 255 {
-                let retention_ratio = total_retained as f64 / total_items as f64;
-                if retention_ratio > merge_config.target_ratio {
-                    threshold += 1;
-                }
+            // Pruned: below the threshold, or the defensive overflow above.
+            if self.config.create_ghosts {
+                hashtable.convert_to_ghost(key, old_loc.to_location());
+            } else {
+                hashtable.remove(key, old_loc.to_location());
             }
         }
 
@@ -3061,8 +3200,20 @@ mod tests {
         );
     }
 
+    /// A pass must stay inside its retention target, not discover afterwards
+    /// that it overshot.
+    ///
+    /// This used to be `test_merge_eviction_adapts_threshold`, and it
+    /// asserted only that *some* hot item survived -- a claim the reactive
+    /// mechanism satisfied while overshooting its target by a wide margin.
+    /// Here the two candidates hold 30 hot items and 20 cold ones, so a
+    /// target of 0.3 leaves room for 30% of the bytes: the reactive rule
+    /// copied all 25 hot items in the first segment before it ever consulted
+    /// the ratio, retaining half the chain. Choosing the threshold up front
+    /// from the frequency histogram (#154) is what makes the target mean
+    /// something, so that is what this test now measures.
     #[test]
-    fn test_merge_eviction_adapts_threshold() {
+    fn test_merge_eviction_stays_within_its_retention_target() {
         use crate::config::{EvictionStrategy, MergeConfig};
         use crate::hashtable_impl::MultiChoiceHashtable;
 
@@ -3090,14 +3241,18 @@ mod tests {
         let verifier = SinglePoolVerifier { pool: &layer.pool };
         let ttl = Duration::from_secs(3600);
 
-        // Write items and register them in hashtable
+        // Write items and register them in hashtable. Every item is the same
+        // size, so a share of the items is also a share of the bytes and the
+        // byte-denominated target can be checked by counting.
         let mut keys = Vec::new();
+        let mut segment_of = Vec::new();
         for i in 0..100 {
             let key = format!("adapt_key_{:04}", i);
             let value = format!("adapt_value_{:04}", i);
             if let Ok(loc) = layer.write_item(key.as_bytes(), value.as_bytes(), b"", ttl) {
                 let _ = hashtable.insert(key.as_bytes(), loc.to_location(), &verifier);
                 keys.push(key);
+                segment_of.push(loc.segment_id(layer.pool.layout()));
             }
         }
 
@@ -3114,19 +3269,51 @@ mod tests {
             .unwrap_or(0);
         assert!(hot_freq > 1, "Hot items should have freq > 1");
 
-        // Trigger eviction - threshold should adapt
+        // The chain in write order; `select_merge_candidates` takes the two
+        // oldest and stops short of the live tail.
+        let mut chain: Vec<u32> = Vec::new();
+        for &seg in &segment_of {
+            if chain.last() != Some(&seg) {
+                chain.push(seg);
+            }
+        }
+        assert!(chain.len() > 2, "chain too short to merge two: {chain:?}");
+        let candidates = &chain[..2];
+        let in_candidates: Vec<usize> = (0..keys.len())
+            .filter(|&i| candidates.contains(&segment_of[i]))
+            .collect();
+
         let _ = layer.evict(&hashtable);
 
-        // Hot items (higher freq) should survive via relocation to spare.
-        // Verify via hashtable lookup (items are at new locations now).
-        let hot_found = keys
+        let retained = in_candidates
             .iter()
-            .take(30)
-            .filter(|key| hashtable.lookup(key.as_bytes(), &verifier).is_some())
+            .filter(|&&i| hashtable.lookup(keys[i].as_bytes(), &verifier).is_some())
             .count();
 
-        // At least some hot items should survive
-        assert!(hot_found > 0, "Some hot items should survive eviction");
+        assert!(
+            retained > 0,
+            "the pass kept nothing, so it is not compacting by frequency at all"
+        );
+        assert!(
+            retained as f64 <= 0.3 * in_candidates.len() as f64,
+            "the pass kept {retained} of {} candidate items, over its 0.3 \
+             retention target -- the target is being checked after the fact \
+             instead of deciding the threshold",
+            in_candidates.len(),
+        );
+        // What it kept has to be the hot end: the hot items are the only
+        // class above the baseline, and the target leaves no room for
+        // anything below them.
+        let cold_retained = in_candidates
+            .iter()
+            .filter(|&&i| i >= 30)
+            .filter(|&&i| hashtable.lookup(keys[i].as_bytes(), &verifier).is_some())
+            .count();
+        assert_eq!(
+            cold_retained, 0,
+            "items never read since admission were kept while hot ones were \
+             discarded"
+        );
     }
 
     /// Regression test: evict_nonblocking must use merge eviction when configured.
@@ -3139,6 +3326,15 @@ mod tests {
     /// The SSD GC style merge eviction copies high-frequency items to a spare
     /// segment and frees the source segments. Items are relocated (new location)
     /// but remain accessible via hashtable lookup.
+    ///
+    /// The config below asks for `target_ratio: 1.0`, not the 0.5 it once
+    /// did. This test's claim is about which *path* runs, and 0.5 no longer
+    /// leaves that claim testable: a retention target is now honoured up
+    /// front (#154), so with a single candidate and a single frequency class
+    /// a 0.5 target legitimately discards half the segment and the test
+    /// could no longer tell relocation from whole-segment eviction. A target
+    /// of 1.0 asks the pass to keep what it can, which is what "did merge
+    /// run at all" needs.
     #[test]
     fn test_evict_nonblocking_uses_merge_strategy() {
         use crate::config::{EvictionStrategy, MergeConfig};
@@ -3156,7 +3352,7 @@ mod tests {
                 LayerConfig::new().with_ghosts(true).with_eviction_strategy(
                     EvictionStrategy::Merge(
                         MergeConfig::new()
-                            .with_target_ratio(0.5)
+                            .with_target_ratio(1.0)
                             .with_min_segments(1),
                     ),
                 ),
@@ -3396,5 +3592,1023 @@ mod clock_eviction {
             "a deleted item was carried forward; dead-byte reclamation is the \
              only pruning this path performs"
         );
+    }
+}
+
+/// What a merge pass is allowed to carry into its single spare segment.
+///
+/// A pass takes `min_segments` candidates and reserves exactly one spare, so
+/// the retained set is bounded by one segment's capacity no matter what
+/// `target_ratio` asks for. These tests pin what happens when the ask exceeds
+/// the bound: the pass must still retain by frequency, top class first, and
+/// never fall back on the order the scan happened to reach items in.
+#[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+mod merge_retention_budget {
+    use super::*;
+    use crate::config::{EvictionStrategy, MergeConfig};
+    use crate::hashtable_impl::MultiChoiceHashtable;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SEGMENT_SIZE: usize = 1024;
+
+    /// `BasicHeader::SIZE` (9) + a 7-byte key + a 16-byte value, rounded to
+    /// the 8-byte stride. Every item costs the same, so a frequency class's
+    /// share of the items is also its share of the bytes -- which is what
+    /// lets these tests reason about a byte budget by counting items.
+    const ITEM_BYTES: usize = 32;
+
+    /// A layer small enough that a few hundred writes fill a chain, with
+    /// spares available to compact into.
+    fn layer_with(merge: MergeConfig) -> TtlLayer {
+        TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(SEGMENT_SIZE)
+            .heap_size(64 * SEGMENT_SIZE)
+            .config(
+                LayerConfig::new()
+                    .with_ghosts(true)
+                    .with_eviction_strategy(EvictionStrategy::Merge(merge)),
+            )
+            .spare_capacity(2)
+            .build()
+            .expect("failed to build merge layer")
+    }
+
+    /// One written item: its key and the segment it landed in.
+    struct Written {
+        key: String,
+        segment: u32,
+    }
+
+    /// Write `count` equal-sized items into a single TTL bucket.
+    fn fill<H: Hashtable>(layer: &TtlLayer, hashtable: &H, count: usize) -> Vec<Written> {
+        fill_sized(layer, hashtable, count, |_| ITEM_BYTES - 9 - 7)
+    }
+
+    /// Write `count` items whose value length `value_len` chooses, so that a
+    /// frequency class's share of the items is *not* its share of the bytes.
+    fn fill_sized<H: Hashtable>(
+        layer: &TtlLayer,
+        hashtable: &H,
+        count: usize,
+        value_len: impl Fn(usize) -> usize,
+    ) -> Vec<Written> {
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let key = format!("k{i:06}");
+            let value = vec![b'v'; value_len(i)];
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+            out.push(Written {
+                key,
+                segment: loc.segment_id(layer.pool.layout()),
+            });
+        }
+        out
+    }
+
+    /// The chain's segment ids in write order -- head first, which is the
+    /// order `select_merge_candidates` walks and the order a positional
+    /// discard would favour.
+    fn chain(written: &[Written]) -> Vec<u32> {
+        let mut ids: Vec<u32> = Vec::new();
+        for w in written {
+            if ids.last() != Some(&w.segment) {
+                ids.push(w.segment);
+            }
+        }
+        ids
+    }
+
+    /// Raise `key` to `freq`. An insert already leaves it at 1, and the
+    /// frequency counter increments deterministically below 16.
+    fn warm<H: Hashtable>(layer: &TtlLayer, hashtable: &H, key: &str, freq: u8) {
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        for _ in 1..freq {
+            assert!(
+                hashtable.lookup(key.as_bytes(), &verifier).is_some(),
+                "the warming read must hit, or no frequency accrues"
+            );
+        }
+        assert_eq!(
+            hashtable.get_frequency(key.as_bytes(), &verifier),
+            Some(freq),
+            "frequency for {key} did not reach the value this test needs"
+        );
+    }
+
+    fn survived<H: Hashtable>(layer: &TtlLayer, hashtable: &H, key: &str) -> bool {
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        hashtable.lookup(key.as_bytes(), &verifier).is_some()
+    }
+
+    /// The bug, stated directly.
+    ///
+    /// Four full candidates are compacted into one spare, so three quarters
+    /// of the live bytes cannot be kept. `target_ratio: 1.0` caps nothing, so
+    /// the only thing choosing what survives is the spare's capacity -- and
+    /// what survives must be the top frequency classes that fit. Eight
+    /// classes are spread evenly over the chain, so a positional prefix
+    /// contains every class and a frequency-ordered retention contains only
+    /// the hottest few. The two answers cannot be confused.
+    #[test]
+    fn an_overflowing_pass_keeps_the_hottest_classes_not_a_positional_prefix() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        // Seven segments' worth: the four at the head are candidates and the
+        // live tail stays out of reach of `select_merge_candidates`.
+        let written = fill(&layer, &hashtable, 7 * (SEGMENT_SIZE / ITEM_BYTES));
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+
+        let mut freq_of: HashMap<&str, u8> = HashMap::new();
+        for (i, w) in written.iter().enumerate() {
+            let freq = 1 + (i % 8) as u8;
+            warm(&layer, &hashtable, &w.key, freq);
+            freq_of.insert(w.key.as_str(), freq);
+        }
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let in_candidates: Vec<&Written> = written
+            .iter()
+            .filter(|w| candidates.contains(&w.segment))
+            .collect();
+        let mut kept: Vec<u8> = Vec::new();
+        let mut dropped: Vec<u8> = Vec::new();
+        for w in &in_candidates {
+            let freq = freq_of[w.key.as_str()];
+            if survived(&layer, &hashtable, &w.key) {
+                kept.push(freq);
+            } else {
+                dropped.push(freq);
+            }
+        }
+
+        assert!(!kept.is_empty(), "the pass kept nothing at all");
+        assert!(
+            !dropped.is_empty(),
+            "the pass kept everything, so the spare was never over-subscribed \
+             and this test proves nothing"
+        );
+
+        // The whole claim: the survivors are a frequency cut, not a
+        // positional one. No discarded item may be hotter than a retained
+        // one, and at most one class -- the one straddling the spare's
+        // capacity, where every item has the same frequency and order is
+        // arbitrary -- may be split across the cut.
+        let coldest_kept = *kept.iter().min().expect("kept is non-empty");
+        let hottest_dropped = *dropped.iter().max().expect("dropped is non-empty");
+        assert!(
+            hottest_dropped <= coldest_kept,
+            "retention stopped following frequency: an item at frequency \
+             {hottest_dropped} was discarded while an item at frequency \
+             {coldest_kept} was kept. kept classes {:?}, dropped classes {:?}",
+            class_counts(&kept),
+            class_counts(&dropped),
+        );
+        assert!(
+            split_classes(&kept, &dropped) <= 1,
+            "more than one frequency class was split across the cut, so the \
+             cut is not a frequency cut. kept classes {:?}, dropped classes {:?}",
+            class_counts(&kept),
+            class_counts(&dropped),
+        );
+
+        // And the cut has to have bitten, or the spare was never actually
+        // over-subscribed and none of the above proves anything.
+        assert!(
+            coldest_kept > 1,
+            "the coldest class survived, so the spare was never over-subscribed"
+        );
+    }
+
+    /// How many frequency classes have items on both sides of the cut.
+    fn split_classes(kept: &[u8], dropped: &[u8]) -> usize {
+        let kept_classes: std::collections::HashSet<u8> = kept.iter().copied().collect();
+        dropped
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<u8>>()
+            .intersection(&kept_classes)
+            .count()
+    }
+
+    fn class_counts(freqs: &[u8]) -> Vec<(u8, usize)> {
+        let mut counts: HashMap<u8, usize> = HashMap::new();
+        for &f in freqs {
+            *counts.entry(f).or_default() += 1;
+        }
+        let mut out: Vec<(u8, usize)> = counts.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// An item the hashtable no longer knows about must not be carried into
+    /// the spare, even when there is room for it.
+    ///
+    /// `get_frequency` returns `None` for such an item and the pass reads
+    /// that as frequency zero. Zero is below every threshold, so the class
+    /// cut already excludes it -- but the leftover room the cut leaves
+    /// behind must not be handed to it either. Copying it would spend spare
+    /// capacity on bytes whose `cas_location` is then guaranteed to fail.
+    #[test]
+    fn an_item_the_hashtable_has_lost_is_never_carried_forward() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(1)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+
+        // Four items the hashtable never learns about, written first so they
+        // land at the head of the chain, which is what a pass reclaims.
+        for i in 0..4 {
+            let key = format!("orphan{i:01}");
+            let value = vec![b'v'; ITEM_BYTES - 9 - 7];
+            layer
+                .write_item(key.as_bytes(), &value, b"", ttl)
+                .expect("write");
+        }
+
+        let written = fill(&layer, &hashtable, 3 * (SEGMENT_SIZE / ITEM_BYTES));
+        let ids = chain(&written);
+        assert!(ids.len() >= 2, "chain too short to merge one: {ids:?}");
+        let head = ids[0];
+        let indexed_in_head = written.iter().filter(|w| w.segment == head).count();
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        // Everything indexed fits a single spare, so all of it survives and
+        // the spare is wherever the first survivor now lives.
+        let survivor = written
+            .iter()
+            .find(|w| w.segment == head)
+            .expect("the head segment held indexed items");
+        let (location, _) = hashtable
+            .lookup(survivor.key.as_bytes(), &verifier)
+            .expect("an indexed item in the head segment should have survived");
+        let spare_id = ItemLocation::from_location(location).segment_id(layer.pool.layout());
+        let spare = layer.pool.get(spare_id).expect("spare segment");
+
+        assert_eq!(
+            spare.write_offset() as usize,
+            indexed_in_head * ITEM_BYTES,
+            "the spare holds more than the {indexed_in_head} indexed items              from the head segment: unindexed bytes were copied into it and              the capacity they took is gone for good"
+        );
+    }
+
+    /// The retention target is a fraction of what is *live*, not of what the
+    /// segment happens to still hold.
+    ///
+    /// Dead bytes are reclaimed by the pass for free -- nothing is copied for
+    /// them -- so counting them towards the budget would loosen the target in
+    /// exact proportion to how much garbage the chain had accumulated, which
+    /// is the opposite of what a retention target is for.
+    #[test]
+    fn deleted_bytes_do_not_inflate_the_retention_budget() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(1)
+                .with_target_ratio(0.5),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+
+        let written = fill(&layer, &hashtable, 3 * (SEGMENT_SIZE / ITEM_BYTES));
+        let ids = chain(&written);
+        assert!(ids.len() >= 2, "chain too short to merge one: {ids:?}");
+        let head = ids[0];
+        let in_head: Vec<&Written> = written.iter().filter(|w| w.segment == head).collect();
+
+        // Half the head segment is dead, and the live half splits evenly
+        // between two frequency classes. A budget of half the *live* bytes
+        // leaves room for the hotter class alone; a budget of half of
+        // everything would leave room for both.
+        let mut hot: Vec<&str> = Vec::new();
+        let mut warm_: Vec<&str> = Vec::new();
+        for (j, w) in in_head.iter().enumerate() {
+            match j % 4 {
+                0 | 1 => {
+                    let (location, _) = hashtable
+                        .lookup(w.key.as_bytes(), &verifier)
+                        .expect("written item");
+                    layer.mark_deleted(ItemLocation::from_location(location));
+                    hashtable.remove(w.key.as_bytes(), location);
+                }
+                2 => {
+                    warm(&layer, &hashtable, &w.key, 2);
+                    warm_.push(w.key.as_str());
+                }
+                _ => {
+                    warm(&layer, &hashtable, &w.key, 3);
+                    hot.push(w.key.as_str());
+                }
+            }
+        }
+        assert_eq!(hot.len(), warm_.len(), "the live classes must be equal");
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let hot_kept = hot
+            .iter()
+            .filter(|k| survived(&layer, &hashtable, k))
+            .count();
+        let warm_kept = warm_
+            .iter()
+            .filter(|k| survived(&layer, &hashtable, k))
+            .count();
+        assert_eq!(
+            (hot_kept, warm_kept),
+            (hot.len(), 0),
+            "a 0.5 target over {} live items leaves room for the {} hottest              only; keeping more means the {} dead items were counted into the              budget",
+            hot.len() + warm_.len(),
+            hot.len(),
+            in_head.len() - hot.len() - warm_.len(),
+        );
+    }
+
+    /// A hashtable that counts the frequency probes made through it.
+    ///
+    /// A merge pass is allowed exactly one probe per live item. The probe
+    /// resolves the key through the table and back into segment memory, so
+    /// it is the pass's dominant cost and a second one buys nothing -- the
+    /// frequency cannot have changed in a way the pass is entitled to act
+    /// on. No retention decision can distinguish one probe from two, so the
+    /// budget is pinned by counting rather than by behaviour.
+    struct ProbeCounting {
+        inner: MultiChoiceHashtable,
+        freq_probes: AtomicUsize,
+    }
+
+    impl ProbeCounting {
+        fn new(power: u8) -> Self {
+            Self {
+                inner: MultiChoiceHashtable::new(power),
+                freq_probes: AtomicUsize::new(0),
+            }
+        }
+
+        fn take_probes(&self) -> usize {
+            self.freq_probes.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    impl Hashtable for ProbeCounting {
+        fn get_frequency(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<u8> {
+            self.freq_probes.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_frequency(key, verifier)
+        }
+
+        fn lookup(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<(Location, u8)> {
+            self.inner.lookup(key, verifier)
+        }
+
+        fn contains(&self, key: &[u8], verifier: &impl KeyVerifier) -> bool {
+            self.inner.contains(key, verifier)
+        }
+
+        fn insert(
+            &self,
+            key: &[u8],
+            location: Location,
+            verifier: &impl KeyVerifier,
+        ) -> CacheResult<Option<Location>> {
+            self.inner.insert(key, location, verifier)
+        }
+
+        fn insert_if_absent(
+            &self,
+            key: &[u8],
+            location: Location,
+            verifier: &impl KeyVerifier,
+        ) -> CacheResult<()> {
+            self.inner.insert_if_absent(key, location, verifier)
+        }
+
+        fn update_if_present(
+            &self,
+            key: &[u8],
+            location: Location,
+            verifier: &impl KeyVerifier,
+        ) -> CacheResult<Location> {
+            self.inner.update_if_present(key, location, verifier)
+        }
+
+        fn remove(&self, key: &[u8], expected: Location) -> bool {
+            self.inner.remove(key, expected)
+        }
+
+        fn convert_to_ghost(&self, key: &[u8], expected: Location) -> bool {
+            self.inner.convert_to_ghost(key, expected)
+        }
+
+        fn cas_location(
+            &self,
+            key: &[u8],
+            old_location: Location,
+            new_location: Location,
+            preserve_freq: bool,
+        ) -> bool {
+            self.inner
+                .cas_location(key, old_location, new_location, preserve_freq)
+        }
+
+        fn get_item_frequency(&self, key: &[u8], location: Location) -> Option<u8> {
+            self.inner.get_item_frequency(key, location)
+        }
+
+        fn get_ghost_frequency(&self, key: &[u8]) -> Option<u8> {
+            self.inner.get_ghost_frequency(key)
+        }
+
+        fn clear(&self) {
+            self.inner.clear()
+        }
+    }
+
+    /// One probe per live item in the chain, and not one more.
+    #[test]
+    fn a_pass_probes_each_items_frequency_exactly_once() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = ProbeCounting::new(12);
+
+        let written = fill(&layer, &hashtable, 7 * (SEGMENT_SIZE / ITEM_BYTES));
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+
+        for (i, w) in written.iter().enumerate() {
+            warm(&layer, &hashtable, &w.key, 1 + (i % 8) as u8);
+        }
+
+        // Every item in the candidates is live -- nothing here is overwritten
+        // or deleted -- so the pass has exactly this many frequencies to
+        // learn.
+        let live = written
+            .iter()
+            .filter(|w| candidates.contains(&w.segment))
+            .count();
+
+        hashtable.take_probes();
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        assert_eq!(
+            hashtable.take_probes(),
+            live,
+            "the pass did not probe each of its {live} live items exactly              once: the scan memoizes frequency precisely so the copy does not              have to ask again"
+        );
+    }
+
+    /// The same claim with items of two different sizes, which is where a
+    /// retention budget counted in *items* comes apart from the constraint,
+    /// which is in bytes.
+    ///
+    /// Frequency and size are assigned on different cycles, so no frequency
+    /// class has the same byte weight as its item count suggests. A budget
+    /// that counts items therefore mispredicts what the spare holds --
+    /// admitting more than fits, which the copy can only resolve by dropping
+    /// whatever it reaches last.
+    #[test]
+    fn a_budget_counted_in_items_cannot_hold_with_items_of_mixed_size() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        // 32-byte and 128-byte items alternating on a 3-cycle against an
+        // 8-cycle of frequencies: 24 items per repeat, no class uniform.
+        let value_len = |i: usize| if i.is_multiple_of(3) { 112 } else { 16 };
+        let written = fill_sized(&layer, &hashtable, 220, value_len);
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+
+        let mut freq_of: HashMap<&str, u8> = HashMap::new();
+        for (i, w) in written.iter().enumerate() {
+            let freq = 1 + (i % 8) as u8;
+            warm(&layer, &hashtable, &w.key, freq);
+            freq_of.insert(w.key.as_str(), freq);
+        }
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let mut kept: Vec<u8> = Vec::new();
+        let mut dropped: Vec<u8> = Vec::new();
+        for w in written.iter().filter(|w| candidates.contains(&w.segment)) {
+            let freq = freq_of[w.key.as_str()];
+            if survived(&layer, &hashtable, &w.key) {
+                kept.push(freq);
+            } else {
+                dropped.push(freq);
+            }
+        }
+        assert!(!kept.is_empty() && !dropped.is_empty());
+
+        let coldest_kept = *kept.iter().min().expect("kept is non-empty");
+        let hottest_dropped = *dropped.iter().max().expect("dropped is non-empty");
+        assert!(
+            hottest_dropped <= coldest_kept && split_classes(&kept, &dropped) <= 1,
+            "with mixed item sizes the retained set is no longer a frequency \
+             cut: an item at frequency {hottest_dropped} was discarded while \
+             one at {coldest_kept} was kept. kept classes {:?}, dropped \
+             classes {:?}",
+            class_counts(&kept),
+            class_counts(&dropped),
+        );
+        assert!(
+            coldest_kept > 1,
+            "the coldest class survived, so the spare was never over-subscribed"
+        );
+    }
+
+    /// The defect in one sentence: a cold item at the head of the chain must
+    /// lose to a hot item at the far end of it.
+    ///
+    /// Every item in the *last* candidate is warmed and everything else in
+    /// the chain stays at the insert baseline. The warmed set is one full
+    /// segment, which is exactly what a spare holds, so it fits and leaves
+    /// less than one item's worth of room behind it -- the only way a cold
+    /// item can survive is if a positional scan filled the spare before ever
+    /// reaching the hot ones.
+    #[test]
+    fn a_hot_item_at_the_end_of_the_chain_beats_a_cold_one_at_its_head() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        let written = fill(&layer, &hashtable, 7 * (SEGMENT_SIZE / ITEM_BYTES));
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+        let last = candidates[3];
+
+        let mut hot: Vec<&str> = Vec::new();
+        let mut cold: Vec<&str> = Vec::new();
+        for w in &written {
+            if w.segment == last {
+                warm(&layer, &hashtable, &w.key, 5);
+                hot.push(w.key.as_str());
+            } else if candidates.contains(&w.segment) {
+                cold.push(w.key.as_str());
+            }
+        }
+        assert!(!hot.is_empty() && !cold.is_empty());
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let hot_lost: Vec<&&str> = hot
+            .iter()
+            .filter(|k| !survived(&layer, &hashtable, k))
+            .collect();
+        let cold_kept: Vec<&&str> = cold
+            .iter()
+            .filter(|k| survived(&layer, &hashtable, k))
+            .collect();
+
+        assert!(
+            hot_lost.is_empty(),
+            "{} of {} frequency-5 items in the last candidate segment were \
+             discarded while {} of {} frequency-1 items were kept: the spare \
+             filled up in scan order, so position decided the outcome instead \
+             of frequency",
+            hot_lost.len(),
+            hot.len(),
+            cold_kept.len(),
+            cold.len(),
+        );
+        assert!(
+            cold_kept.is_empty(),
+            "{} of {} frequency-1 items survived alongside the frequency-5 \
+             set, which fits the spare on its own",
+            cold_kept.len(),
+            cold.len(),
+        );
+    }
+
+    /// CLOCK is `{min_segments: 1, target_ratio: 1.0, initial_threshold: 1}`.
+    ///
+    /// One candidate into one spare always fits, so the capacity-derived
+    /// threshold is 0; `target_ratio: 1.0` caps nothing; and the floor is 1.
+    /// The effective threshold must therefore stay exactly 1 -- prune what was
+    /// never read since admission, keep everything else.
+    #[test]
+    fn clock_parameters_prune_exactly_the_items_untouched_since_admission() {
+        let layer = layer_with(MergeConfig::CLOCK);
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        let written = fill(&layer, &hashtable, 3 * (SEGMENT_SIZE / ITEM_BYTES));
+        let ids = chain(&written);
+        assert!(ids.len() >= 2, "chain too short to merge one: {ids:?}");
+        let head = ids[0];
+
+        let mut touched: Vec<&str> = Vec::new();
+        let mut untouched: Vec<&str> = Vec::new();
+        for (i, w) in written.iter().enumerate() {
+            if w.segment != head {
+                continue;
+            }
+            if i % 3 == 0 {
+                warm(&layer, &hashtable, &w.key, 2);
+                touched.push(w.key.as_str());
+            } else {
+                untouched.push(w.key.as_str());
+            }
+        }
+        assert!(!touched.is_empty() && !untouched.is_empty());
+
+        assert!(layer.evict(&hashtable), "clock eviction did not run");
+
+        let lost = touched
+            .iter()
+            .filter(|k| !survived(&layer, &hashtable, k))
+            .count();
+        let kept = untouched
+            .iter()
+            .filter(|k| survived(&layer, &hashtable, k))
+            .count();
+        assert_eq!(
+            (lost, kept),
+            (0, 0),
+            "CLOCK must prune at exactly the insert baseline: {lost} of {} \
+             items read since admission were dropped, and {kept} of {} never \
+             read survived",
+            touched.len(),
+            untouched.len(),
+        );
+    }
+
+    /// `target_ratio` is a policy cap layered on the capacity bound, not a
+    /// replacement for it: it must still prune further than capacity alone
+    /// requires.
+    ///
+    /// One candidate always fits one spare -- a segment's live bytes cannot
+    /// exceed its own capacity -- so the capacity bound asks for nothing here
+    /// and everything would survive on its own account. Four equal-sized
+    /// frequency classes and a ratio of 0.3 leave room for the hottest class
+    /// and a sliver of the next.
+    #[test]
+    fn target_ratio_prunes_further_than_the_capacity_bound_requires() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(1)
+                .with_target_ratio(0.3),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        let written = fill(&layer, &hashtable, 3 * (SEGMENT_SIZE / ITEM_BYTES));
+        let ids = chain(&written);
+        assert!(ids.len() >= 2, "chain too short to merge one: {ids:?}");
+        let head = ids[0];
+
+        let mut freq_of: HashMap<&str, u8> = HashMap::new();
+        let mut in_head: Vec<&Written> = Vec::new();
+        for w in written.iter().filter(|w| w.segment == head) {
+            in_head.push(w);
+        }
+        for (j, w) in in_head.iter().enumerate() {
+            let freq = 1 + (j % 4) as u8;
+            warm(&layer, &hashtable, &w.key, freq);
+            freq_of.insert(w.key.as_str(), freq);
+        }
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let mut kept: Vec<u8> = Vec::new();
+        let mut dropped: Vec<u8> = Vec::new();
+        for w in &in_head {
+            let freq = freq_of[w.key.as_str()];
+            if survived(&layer, &hashtable, &w.key) {
+                kept.push(freq);
+            } else {
+                dropped.push(freq);
+            }
+        }
+
+        // Capacity alone would have kept every one of these, so anything
+        // pruned here is the policy cap doing work.
+        assert!(
+            !dropped.is_empty(),
+            "the pass kept the whole candidate: `target_ratio` is being \
+             ignored once the capacity bound is satisfied"
+        );
+        // The coldest class is a quarter of the bytes and the budget is
+        // three tenths, so no frequency-1 item can be reached -- the cap has
+        // to bite before the scan ever gets there.
+        assert_eq!(
+            dropped.iter().filter(|&&f| f == 1).count(),
+            in_head
+                .iter()
+                .filter(|w| freq_of[w.key.as_str()] == 1)
+                .count(),
+            "frequency-1 items survived a 0.3 retention target; kept {:?}, \
+             dropped {:?}",
+            class_counts(&kept),
+            class_counts(&dropped),
+        );
+
+        // What survives is still a frequency cut, and it is inside the
+        // budget: at most three tenths of the bytes, which with equal-sized
+        // items is at most three tenths of the count.
+        let coldest_kept = *kept.iter().min().expect("kept is non-empty");
+        let hottest_dropped = *dropped.iter().max().expect("dropped is non-empty");
+        assert!(
+            hottest_dropped <= coldest_kept && split_classes(&kept, &dropped) <= 1,
+            "retention under the policy cap is not a frequency cut: kept {:?}, \
+             dropped {:?}",
+            class_counts(&kept),
+            class_counts(&dropped),
+        );
+        assert!(
+            kept.len() as f64 <= 0.3 * in_head.len() as f64,
+            "the pass kept {} of {} items, over its 0.3 retention target",
+            kept.len(),
+            in_head.len(),
+        );
+    }
+
+    /// The issue in one test (#155): reclaiming dead bytes must not cost
+    /// live items.
+    ///
+    /// Four candidate segments are four fifths dead, so everything still
+    /// live in them fits inside the single spare with room to spare. There
+    /// is therefore no capacity reason to discard anything: the pass can
+    /// free four segments and give one back holding every live item. Under
+    /// the old `target_ratio` default of 0.5 the policy cap halved the
+    /// budget anyway and threw away the colder half of the live set, which
+    /// is the only reason a compaction ever lost data.
+    ///
+    /// The config below takes `MergeConfig`'s default ratio on purpose --
+    /// that default is what this test is about.
+    #[test]
+    fn a_fragmented_chain_whose_live_set_fits_the_spare_keeps_every_live_item() {
+        // Explicit rather than inherited: this test is about compaction,
+        // which is what target_ratio 1.0 expresses. The default is 0.5
+        // (see #155) and the claim here must not move when it changes.
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+
+        let per_segment = SEGMENT_SIZE / ITEM_BYTES;
+        let written = fill(&layer, &hashtable, 7 * per_segment);
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+
+        // Keep one item in five and delete the rest, so the chain is mostly
+        // dead bytes. Two frequency classes among the survivors, so a budget
+        // that cannot hold them both has to drop one of them entirely and
+        // the loss is unmistakable.
+        let mut live: Vec<(&str, u8)> = Vec::new();
+        for (i, w) in written
+            .iter()
+            .filter(|w| candidates.contains(&w.segment))
+            .enumerate()
+        {
+            if i % 5 == 0 {
+                let freq = 1 + (live.len() % 2) as u8;
+                warm(&layer, &hashtable, &w.key, freq);
+                live.push((w.key.as_str(), freq));
+            } else {
+                let (location, _) = hashtable
+                    .lookup(w.key.as_bytes(), &verifier)
+                    .expect("written item");
+                layer.mark_deleted(ItemLocation::from_location(location));
+                hashtable.remove(w.key.as_bytes(), location);
+            }
+        }
+
+        let live_bytes = live.len() * ITEM_BYTES;
+        assert!(
+            live_bytes <= SEGMENT_SIZE,
+            "the live set ({live_bytes} bytes) must fit one spare \
+             ({SEGMENT_SIZE} bytes) or the premise of this test is gone"
+        );
+        assert!(
+            live.iter().any(|&(_, f)| f == 1) && live.iter().any(|&(_, f)| f == 2),
+            "both frequency classes must be populated"
+        );
+
+        let free_before = layer.free_segment_count();
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let lost: Vec<(&str, u8)> = live
+            .iter()
+            .copied()
+            .filter(|&(k, _)| !survived(&layer, &hashtable, k))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "{} of {} live items were discarded by a pass that had room for \
+             all of them: {:?}. Reclaiming dead bytes must not cost live \
+             data (#155)",
+            lost.len(),
+            live.len(),
+            class_counts(&lost.iter().map(|&(_, f)| f).collect::<Vec<u8>>()),
+        );
+
+        // And the dead bytes really were reclaimed: four candidates went
+        // back to the pool and one spare came out of it.
+        let free_after = layer.free_segment_count();
+        assert!(
+            free_after > free_before,
+            "no segment was reclaimed: free went {free_before} -> {free_after}"
+        );
+
+        // The spare holds the live set and nothing else.
+        let (location, _) = hashtable
+            .lookup(live[0].0.as_bytes(), &verifier)
+            .expect("a survivor");
+        let spare_id = ItemLocation::from_location(location).segment_id(layer.pool.layout());
+        let spare = layer.pool.get(spare_id).expect("spare segment");
+        assert_eq!(
+            spare.write_offset() as usize,
+            live_bytes,
+            "the compacted segment holds {} bytes, not the {live_bytes} the \
+             live set weighs",
+            spare.write_offset(),
+        );
+    }
+
+    /// Raising the default did not switch pruning off where capacity still
+    /// demands it.
+    ///
+    /// Here the live set is one and a half spares, so half a spare's worth
+    /// has to go -- and exactly that much, chosen by frequency. Three equal
+    /// classes of 512 bytes against a 1024-byte spare: the top two fit whole
+    /// and the coldest cannot. Under the old 0.5 default the cap would have
+    /// cut the budget to 768 and taken two thirds of the middle class with
+    /// it, pruning more than capacity ever required.
+    #[test]
+    fn a_chain_that_overflows_the_spare_still_prunes_to_the_capacity_bound() {
+        // Explicit rather than inherited: this test is about compaction,
+        // which is what target_ratio 1.0 expresses. The default is 0.5
+        // (see #155) and the claim here must not move when it changes.
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+
+        let per_segment = SEGMENT_SIZE / ITEM_BYTES;
+        let written = fill(&layer, &hashtable, 7 * per_segment);
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+
+        // Keep 48 of the 128 items in the chain: 1536 live bytes against a
+        // 1024-byte spare. Three classes of 16 items each.
+        let keep = 48;
+        let mut live: Vec<(&str, u8)> = Vec::new();
+        for (i, w) in written
+            .iter()
+            .filter(|w| candidates.contains(&w.segment))
+            .enumerate()
+        {
+            if i % 8 < 3 && live.len() < keep {
+                let freq = 1 + (live.len() % 3) as u8;
+                warm(&layer, &hashtable, &w.key, freq);
+                live.push((w.key.as_str(), freq));
+            } else {
+                let (location, _) = hashtable
+                    .lookup(w.key.as_bytes(), &verifier)
+                    .expect("written item");
+                layer.mark_deleted(ItemLocation::from_location(location));
+                hashtable.remove(w.key.as_bytes(), location);
+            }
+        }
+        assert_eq!(live.len(), keep, "the live set is not the size planned");
+        assert!(
+            live.len() * ITEM_BYTES > SEGMENT_SIZE,
+            "the live set must overflow one spare or this test proves nothing"
+        );
+        for class in 1..=3u8 {
+            assert_eq!(
+                live.iter().filter(|&&(_, f)| f == class).count(),
+                keep / 3,
+                "class {class} is not an even third of the live set"
+            );
+        }
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let mut kept: Vec<u8> = Vec::new();
+        let mut dropped: Vec<u8> = Vec::new();
+        for &(key, freq) in &live {
+            if survived(&layer, &hashtable, key) {
+                kept.push(freq);
+            } else {
+                dropped.push(freq);
+            }
+        }
+
+        // Exactly the capacity bound: the two hottest classes fill the spare
+        // to the byte, the coldest cannot be carried.
+        assert_eq!(
+            class_counts(&kept),
+            vec![(2, keep / 3), (3, keep / 3)],
+            "the pass did not retain exactly what the spare holds. kept {:?}, \
+             dropped {:?}",
+            class_counts(&kept),
+            class_counts(&dropped),
+        );
+        assert_eq!(
+            class_counts(&dropped),
+            vec![(1, keep / 3)],
+            "the pass did not prune exactly the coldest class. kept {:?}, \
+             dropped {:?}",
+            class_counts(&kept),
+            class_counts(&dropped),
+        );
+    }
+}
+
+/// Direct tests for the threshold choice, which the end-to-end merge tests
+/// can only observe through a whole eviction pass.
+#[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+mod threshold_choice {
+    use super::threshold_for_budget;
+
+    fn histogram(classes: &[(u8, u64)]) -> [u64; 256] {
+        let mut out = [0u64; 256];
+        for &(freq, bytes) in classes {
+            out[freq as usize] = bytes;
+        }
+        out
+    }
+
+    #[test]
+    fn a_budget_that_holds_everything_prunes_only_the_unindexed() {
+        let hist = histogram(&[(0, 500), (1, 100), (4, 200)]);
+        // Frequency 0 is excluded by the `freq > threshold` rule itself, so
+        // the budget only has to cover the 300 bytes that are still indexed.
+        assert_eq!(threshold_for_budget(&hist, 300), (0, 300));
+    }
+
+    #[test]
+    fn a_budget_too_small_for_the_hottest_class_retains_nothing() {
+        let hist = histogram(&[(1, 100), (9, 200)]);
+        // The threshold names the class that did not fit, and no whole class
+        // is retained. Nothing has a frequency above 9, so on its own this
+        // keeps nothing -- what the spare's leftover room then goes to is
+        // class 9, the straddling class.
+        assert_eq!(threshold_for_budget(&hist, 199), (9, 0));
+    }
+
+    #[test]
+    fn the_cut_falls_at_the_first_class_that_does_not_fit_whole() {
+        let hist = histogram(&[(1, 400), (2, 300), (3, 200), (4, 100)]);
+        // 100 + 200 fits in 350; adding 300 does not.
+        assert_eq!(threshold_for_budget(&hist, 350), (2, 300));
+    }
+
+    #[test]
+    fn empty_classes_between_populated_ones_cost_nothing() {
+        let hist = histogram(&[(1, 400), (200, 100)]);
+        // The walk must pass over classes 255..201 and stop at 1, not give up
+        // at the first empty class it meets.
+        assert_eq!(threshold_for_budget(&hist, 150), (1, 100));
+    }
+
+    #[test]
+    fn bytes_decide_the_cut_rather_than_item_counts() {
+        // Class 3 has the most items but the fewest bytes; class 2 is one
+        // large item. A count-based rule would keep class 3 and stop, a
+        // byte-based one keeps both.
+        let hist = histogram(&[(2, 100), (3, 60)]);
+        assert_eq!(threshold_for_budget(&hist, 160), (0, 160));
+        // And a budget that admits the small class but not the large one
+        // must stop at the large one.
+        assert_eq!(threshold_for_budget(&hist, 100), (2, 60));
     }
 }
