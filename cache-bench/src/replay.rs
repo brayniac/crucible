@@ -262,9 +262,15 @@ pub fn run_replay<C: Cache>(
         // Set per record rather than per interval: expiry is checked on
         // every read, so a clock that lagged the record being applied would
         // expire items late by however far it lagged.
+        // Both engines, or neither. A comparison that advanced one side's
+        // clock and left the other on wall time would penalise the engine
+        // that honours expiry for the hits it correctly discards, which is
+        // the same bias as before with the sign flipped.
         #[cfg(feature = "virtual-clock")]
         if let Some(secs) = record.timestamp_secs {
             cache_core::clock::set_virtual_now(secs);
+            #[cfg(feature = "cache-rs")]
+            cache_rs::clock::set_virtual_now(secs);
         }
 
         let in_warmup = reader.records_read() <= opts.warmup_records;
@@ -688,6 +694,52 @@ mod tests {
             "clock should sit at the last record's timestamp"
         );
         cache_core::clock::clear_virtual_now();
+    }
+
+    /// Both engines' clocks must advance, not just crucible's.
+    ///
+    /// This is the fairness property the whole feature exists for. If only
+    /// one side follows the trace, that side expires items and loses the
+    /// hits it correctly discards while the other keeps serving them -- the
+    /// same bias the wall clock produced, with the sign flipped. A silent
+    /// regression here would look like a clean result.
+    #[test]
+    #[cfg(all(feature = "virtual-clock", feature = "cache-rs"))]
+    fn replaying_advances_both_engines_clocks() {
+        let mut bytes = Vec::new();
+        for (i, ts) in [1_585_565_987u32, 1_585_566_047].iter().enumerate() {
+            bytes.extend_from_slice(&twitter_bytes_at(i as u64, 64, Op::Set, 300, *ts));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        cache_core::clock::clear_virtual_now();
+        cache_rs::clock::clear_virtual_now();
+
+        let mut reader =
+            crate::trace::TraceReader::open(&path, crate::trace::TraceFormat::Twitter).unwrap();
+        run_replay(&small_cache(), &mut reader, &opts(0, 1000)).expect("replay");
+
+        assert_eq!(
+            cache_core::clock::virtual_now(),
+            Some(1_585_566_047),
+            "crucible's clock should sit at the last record"
+        );
+        // cache-rs anchors trace seconds onto an opaque monotonic instant,
+        // so the readable assertion is that it moved, and moved by the same
+        // 60 seconds the trace did.
+        let rs = cache_rs::clock::virtual_now().expect("cache-rs clock should be driven too");
+        cache_rs::clock::set_virtual_now(1_585_565_987);
+        let rs_start = cache_rs::clock::virtual_now().expect("set");
+        assert_eq!(
+            rs.duration_since(rs_start).as_secs(),
+            60,
+            "cache-rs should have advanced by the trace's own 60 seconds"
+        );
+
+        cache_core::clock::clear_virtual_now();
+        cache_rs::clock::clear_virtual_now();
     }
 
     fn opts(warmup: u64, interval: u64) -> ReplayOptions {
