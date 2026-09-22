@@ -1135,7 +1135,7 @@ impl IoUringDiskLayerBuilder {
         );
 
         let num_buckets = crate::organization::MAX_TTL_BUCKETS;
-        let buckets = TtlBuckets::new();
+        let buckets = TtlBuckets::with_seed(self.config.eviction_seed);
 
         let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 

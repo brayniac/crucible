@@ -10,7 +10,7 @@
 //! - Weighted random eviction by bucket segment count
 //! - Optional merge eviction for segment compaction
 
-use crate::config::LayerConfig;
+use crate::config::{EvictionStrategy, LayerConfig};
 use crate::error::{CacheError, CacheResult};
 use crate::eviction::{ItemFate, determine_item_fate};
 use crate::hashtable::{Hashtable, KeyVerifier};
@@ -20,7 +20,7 @@ use crate::layer::Layer;
 use crate::layer::fifo_layer::EvictResult;
 use crate::location::Location;
 use crate::memory_pool::{MemoryPool, MemoryPoolBuilder};
-use crate::organization::TtlBuckets;
+use crate::organization::{TtlBucket, TtlBuckets};
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentGuard, SegmentKeyVerify};
 use crate::slice_segment::SliceSegment;
@@ -1106,43 +1106,188 @@ impl TtlLayer {
         expired_count
     }
 
-    /// Default eviction: weighted random bucket selection, evict head segment
-    fn evict_randomfifo<H: Hashtable>(&self, hashtable: &H) -> bool {
-        // Select a bucket for eviction (weighted by segment count)
-        let (_, bucket) = match self.buckets.select_bucket_for_eviction() {
-            Some(b) => b,
-            None => return false,
-        };
+    // --- Victim selection (#156) ---------------------------------------
+    //
+    // One function per eviction strategy, each answering the same question:
+    // which segment goes next. They were one function until #156 -- `Fifo`,
+    // `Random` and `Cte` were three config names for `evict_randomfifo`, and
+    // a sweep measured all three byte-identical at every heap size.
 
-        // Evict head segment from selected bucket
-        match bucket.evict_head_segment(&self.pool) {
-            Ok(segment_id) => {
-                self.process_evicted_segment(segment_id, hashtable);
-                true
+    /// The segment the configured strategy would evict next, or `None` if
+    /// nothing is evictable.
+    fn pick_victim(&self) -> Option<u32> {
+        match self.config.eviction_strategy {
+            EvictionStrategy::Fifo => self.pick_fifo(),
+            EvictionStrategy::Cte => self.pick_cte(),
+            EvictionStrategy::Random => self.pick_uniform(self.buckets.next_random()),
+            // Merge and Clock reach `evict` through `try_merge_eviction` and
+            // only land here when it declines; random-FIFO is the fallback
+            // they have always had.
+            EvictionStrategy::RandomFifo | EvictionStrategy::Merge(_) | EvictionStrategy::Clock => {
+                self.pick_randomfifo(self.buckets.next_random())
             }
-            Err(_) => false,
         }
     }
 
-    /// Default eviction with demoter callback
-    fn evict_randomfifo_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> bool
+    /// Visit every segment eviction may legally take right now.
+    ///
+    /// Three conditions, and all three matter:
+    ///
+    /// - `Sealed`, so the segment is neither the bucket's Live write target
+    ///   nor mid-transition in someone else's merge;
+    /// - still carrying a bucket id, so there is a chain to unlink it from;
+    /// - in a bucket holding at least two segments, because a bucket must
+    ///   keep a Live tail and `evict_head_segment` refuses otherwise.
+    ///
+    /// The scan is over the pool rather than the chains, because `Random`,
+    /// `Fifo` and `Cte` all rank segments layer-wide and a chain walk would
+    /// visit the same segments plus 1024 bucket headers. It is still O(pool
+    /// segments) per eviction, against O(1024) for `RandomFifo`, so on a
+    /// large heap these three rules cost more per eviction than the default
+    /// does -- the price of ranking every candidate, and the same price
+    /// cache-rs pays for them.
+    fn for_each_evictable<F>(&self, mut visit: F)
+    where
+        F: FnMut(u32, &SliceSegment<'static>, &TtlBucket),
+    {
+        for id in 0..self.pool.segment_count() as u32 {
+            let Some(segment) = self.pool.get(id) else {
+                continue;
+            };
+            if segment.state() != State::Sealed {
+                continue;
+            }
+            let Some(bucket_id) = segment.bucket_id() else {
+                continue;
+            };
+            let bucket = self.buckets.get_bucket_by_index(bucket_id as usize);
+            if bucket.segment_count() < 2 {
+                continue;
+            }
+            visit(id, segment, bucket);
+        }
+    }
+
+    /// The oldest segment in the layer, across every bucket.
+    ///
+    /// Age is [`SliceSegment::create_seq`]: the order segments entered
+    /// service, which for a merge destination is the merge. Unlike
+    /// [`pick_randomfifo`], the bucket a segment lives in has no say.
+    ///
+    /// [`pick_randomfifo`]: Self::pick_randomfifo
+    fn pick_fifo(&self) -> Option<u32> {
+        let mut best: Option<(u32, u32)> = None;
+        self.for_each_evictable(|id, segment, _| {
+            let seq = segment.create_seq();
+            if best.is_none_or(|(best_seq, _)| crate::slice_segment::is_older(seq, best_seq)) {
+                best = Some((seq, id));
+            }
+        });
+        best.map(|(_, id)| id)
+    }
+
+    /// The segment whose items expire soonest.
+    ///
+    /// `expire_at == 0` means the segment carries no segment-level expiry, so
+    /// it sorts last rather than first. Ties -- and a bucket's segments share
+    /// an `expire_at` to within the second they were allocated in -- go to
+    /// the older segment, which keeps the choice deterministic and makes CTE
+    /// degrade to FIFO within a TTL range rather than to scan order.
+    fn pick_cte(&self) -> Option<u32> {
+        let mut best: Option<(u32, u32, u32)> = None;
+        self.for_each_evictable(|id, segment, _| {
+            let expire_at = match segment.expire_at() {
+                0 => u32::MAX,
+                at => at,
+            };
+            let seq = segment.create_seq();
+            let better = match best {
+                None => true,
+                Some((best_expire, best_seq, _)) => {
+                    expire_at < best_expire
+                        || (expire_at == best_expire
+                            && crate::slice_segment::is_older(seq, best_seq))
+                }
+            };
+            if better {
+                best = Some((expire_at, seq, id));
+            }
+        });
+        best.map(|(_, _, id)| id)
+    }
+
+    /// An evictable segment chosen uniformly at random.
+    ///
+    /// Uniform over segments, not over buckets, and with no preference for
+    /// chain heads -- so this is the one rule that can take a segment out of
+    /// the middle of a chain. Two passes, because the candidate count is not
+    /// known until the first one finishes and materialising the list would
+    /// allocate on every eviction.
+    fn pick_uniform(&self, draw: u64) -> Option<u32> {
+        let mut count = 0u64;
+        self.for_each_evictable(|_, _, _| count += 1);
+        if count == 0 {
+            return None;
+        }
+
+        let target = draw % count;
+        let mut seen = 0u64;
+        let mut chosen = None;
+        self.for_each_evictable(|id, _, _| {
+            if seen == target {
+                chosen = Some(id);
+            }
+            seen += 1;
+        });
+        chosen
+    }
+
+    /// The head of a bucket chosen at random, weighted by segment count.
+    ///
+    /// This is what the layer did for every non-merge strategy before #156.
+    fn pick_randomfifo(&self, draw: u64) -> Option<u32> {
+        let (_, bucket) = self.buckets.select_bucket_for_eviction_with(draw)?;
+        bucket.head()
+    }
+
+    /// Unlink `segment_id` from its bucket chain, leaving it Draining.
+    fn detach(&self, segment_id: u32) -> Option<u32> {
+        let segment = self.pool.get(segment_id)?;
+        let bucket = self
+            .buckets
+            .get_bucket_by_index(segment.bucket_id()? as usize);
+        if bucket.head() == Some(segment_id) {
+            bucket.evict_head_segment(&self.pool).ok()
+        } else {
+            bucket.remove_segment(segment_id, &self.pool).ok()
+        }
+    }
+
+    /// Evict whichever segment the configured strategy chose.
+    fn evict_selected<H: Hashtable>(&self, hashtable: &H) -> bool {
+        match self.pick_victim().and_then(|id| self.detach(id)) {
+            Some(segment_id) => {
+                self.process_evicted_segment(segment_id, hashtable);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`evict_selected`] with a demotion callback.
+    ///
+    /// [`evict_selected`]: Self::evict_selected
+    fn evict_selected_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> bool
     where
         H: Hashtable,
         F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
     {
-        // Select a bucket for eviction (weighted by segment count)
-        let (_, bucket) = match self.buckets.select_bucket_for_eviction() {
-            Some(b) => b,
-            None => return false,
-        };
-
-        // Evict head segment from selected bucket
-        match bucket.evict_head_segment(&self.pool) {
-            Ok(segment_id) => {
+        match self.pick_victim().and_then(|id| self.detach(id)) {
+            Some(segment_id) => {
                 self.process_evicted_segment_with_demoter(segment_id, hashtable, demoter);
                 true
             }
-            Err(_) => false,
+            None => false,
         }
     }
 
@@ -1187,13 +1332,13 @@ impl TtlLayer {
         // Need at least min_segments candidates
         if candidates.len() < merge_config.min_segments {
             // Fall back to random eviction
-            return self.evict_randomfifo(hashtable);
+            return self.evict_selected(hashtable);
         }
 
         // Reserve a spare segment for compaction
         let spare_id = match self.pool.reserve_spare() {
             Some(id) => id,
-            None => return self.evict_randomfifo(hashtable),
+            None => return self.evict_selected(hashtable),
         };
 
         let spare = match self.pool.get(spare_id) {
@@ -1576,10 +1721,11 @@ impl Layer for TtlLayer {
         // Merge and Clock run the same machinery, differing only in the
         // parameters `merge_params` hands over -- see `EvictionStrategy::Clock`
         // on why CLOCK is not a second implementation.
-        match self.config.eviction_strategy.merge_params() {
-            Some(merge_config) => self.try_merge_eviction(&merge_config, hashtable),
-            None => self.evict_randomfifo(hashtable),
+        if let Some(merge_config) = self.config.eviction_strategy.merge_params() {
+            return self.try_merge_eviction(&merge_config, hashtable);
         }
+
+        self.evict_selected(hashtable)
     }
 
     fn evict_with_demoter<H, F>(&self, hashtable: &H, demoter: F) -> bool
@@ -1592,9 +1738,9 @@ impl Layer for TtlLayer {
             return true;
         }
 
-        // For now, only support randomfifo with demoter
-        // Merge eviction with demoter can be added if needed
-        self.evict_randomfifo_with_demoter(hashtable, demoter)
+        // Whole-segment eviction only: merge would have to run the demoter
+        // over the items it prunes, which it does not yet do.
+        self.evict_selected_with_demoter(hashtable, demoter)
     }
 
     fn expire<H: Hashtable>(&self, hashtable: &H) -> usize {
@@ -1730,21 +1876,17 @@ impl TtlLayer {
             };
         }
 
-        // Randomfifo eviction with non-blocking path
-        let (_, bucket) = match self.buckets.select_bucket_for_eviction() {
-            Some(b) => b,
-            None => return EvictResult::NoCandidate,
-        };
-
-        match bucket.evict_head_segment(&self.pool) {
-            Ok(segment_id) => {
+        // Whole-segment eviction, non-blocking path. The strategy chooses
+        // the victim exactly as it does for the blocking `evict` (#156).
+        match self.pick_victim().and_then(|id| self.detach(id)) {
+            Some(segment_id) => {
                 if self.process_evicted_segment_nonblocking(segment_id, hashtable) {
                     EvictResult::Freed
                 } else {
                     EvictResult::Deferred
                 }
             }
-            Err(_) => EvictResult::NoCandidate,
+            None => EvictResult::NoCandidate,
         }
     }
 
@@ -1759,13 +1901,8 @@ impl TtlLayer {
             return EvictResult::Freed;
         }
 
-        let (_, bucket) = match self.buckets.select_bucket_for_eviction() {
-            Some(b) => b,
-            None => return EvictResult::NoCandidate,
-        };
-
-        match bucket.evict_head_segment(&self.pool) {
-            Ok(segment_id) => {
+        match self.pick_victim().and_then(|id| self.detach(id)) {
+            Some(segment_id) => {
                 if self.process_evicted_segment_with_demoter_nonblocking(
                     segment_id, hashtable, demoter,
                 ) {
@@ -1774,7 +1911,7 @@ impl TtlLayer {
                     EvictResult::Deferred
                 }
             }
-            Err(_) => EvictResult::NoCandidate,
+            None => EvictResult::NoCandidate,
         }
     }
 
@@ -1883,11 +2020,13 @@ impl TtlLayerBuilder {
             .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
             .collect();
 
+        let buckets = TtlBuckets::with_seed(self.config.eviction_seed);
+
         Ok(TtlLayer {
             layer_id: self.layer_id,
             config: self.config,
             pool,
-            buckets: TtlBuckets::new(),
+            buckets,
             current_write_segments,
         })
     }
@@ -4610,5 +4749,632 @@ mod threshold_choice {
         // And a budget that admits the small class but not the large one
         // must stop at the large one.
         assert_eq!(threshold_for_budget(&hist, 100), (2, 60));
+    }
+}
+
+/// Which segment each eviction strategy takes, and why they are four rules
+/// rather than one.
+///
+/// Before #156 `Fifo`, `Random` and `Cte` were three names for
+/// `evict_randomfifo`: the config layer kept them apart, the eviction path
+/// never looked. A sweep measured them byte-identical -- same miss ratio,
+/// same resident count, same eviction count -- at every heap size. These
+/// tests pin each rule to a state where the rules must disagree.
+#[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+mod eviction_strategy_selection {
+    use super::*;
+    use crate::config::EvictionStrategy;
+    use crate::hashtable_impl::MultiChoiceHashtable;
+    use std::collections::BTreeSet;
+
+    const SEGMENT_SIZE: usize = 1024;
+    const SEGMENTS: usize = 32;
+
+    /// Two TTLs far enough apart to land in different buckets with different
+    /// bucket TTLs, so a segment's chain also fixes its `expire_at`.
+    const LONG_TTL: u64 = 10_000;
+    const SHORT_TTL: u64 = 10;
+
+    /// Four TTLs in four buckets, for the tests that want several chains.
+    const TTLS: [u64; 4] = [10, 100, 1000, 10_000];
+
+    fn layer_with(strategy: EvictionStrategy) -> TtlLayer {
+        layer_seeded(strategy, crate::config::DEFAULT_EVICTION_SEED)
+    }
+
+    fn layer_seeded(strategy: EvictionStrategy, seed: u64) -> TtlLayer {
+        TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(SEGMENT_SIZE)
+            .heap_size(SEGMENTS * SEGMENT_SIZE)
+            .config(
+                LayerConfig::new()
+                    .with_ghosts(false)
+                    .with_eviction_strategy(strategy)
+                    .with_eviction_seed(seed),
+            )
+            .spare_capacity(0)
+            .build()
+            .expect("failed to build layer")
+    }
+
+    /// Write `count` equal-sized items at `ttl`. Eight fit in a segment, so
+    /// the counts below translate directly into chain lengths.
+    fn write_n(
+        layer: &TtlLayer,
+        hashtable: &MultiChoiceHashtable,
+        prefix: char,
+        ttl: u64,
+        count: usize,
+    ) {
+        let value = vec![b'v'; 100];
+        for i in 0..count {
+            let key = format!("{prefix}{i:06}");
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", Duration::from_secs(ttl))
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+        }
+    }
+
+    /// The segment ids in one bucket's chain, head (oldest) first.
+    fn chain_of(layer: &TtlLayer, ttl: u64) -> Vec<u32> {
+        let bucket = layer.buckets.get_bucket(Duration::from_secs(ttl));
+        let mut out = Vec::new();
+        let mut cur = bucket.head();
+        while let Some(id) = cur {
+            out.push(id);
+            cur = layer.pool.get(id).and_then(|s| s.next());
+        }
+        out
+    }
+
+    /// Every chain head in the layer -- the only segments a head-based rule
+    /// can name.
+    fn heads(layer: &TtlLayer) -> BTreeSet<u32> {
+        layer.buckets.iter().filter_map(|b| b.head()).collect()
+    }
+
+    /// Two chains whose age order and expiry order disagree: the long-TTL
+    /// bucket is written first, so it holds the layer's oldest segments, and
+    /// the short-TTL bucket is written after, so its segments expire first.
+    ///
+    /// Returns `(long_chain, short_chain)`, each head first. The last entry
+    /// of each is the Live write segment and is not evictable.
+    fn two_bucket_state(
+        layer: &TtlLayer,
+        hashtable: &MultiChoiceHashtable,
+        long_items: usize,
+        short_items: usize,
+    ) -> (Vec<u32>, Vec<u32>) {
+        write_n(layer, hashtable, 'L', LONG_TTL, long_items);
+        write_n(layer, hashtable, 'S', SHORT_TTL, short_items);
+        (chain_of(layer, LONG_TTL), chain_of(layer, SHORT_TTL))
+    }
+
+    /// Write `per_ttl` items into each of the four TTL buckets, **longest TTL
+    /// first**.
+    ///
+    /// The order is load-bearing. Written shortest-first, the oldest segments
+    /// would also be the soonest-expiring ones and FIFO and CTE would agree
+    /// on every victim -- truthfully, but the agreement would say nothing
+    /// about whether they are the same rule. Reversed, age order and expiry
+    /// order are opposites and the two rules drain the layer from opposite
+    /// ends.
+    fn fill_four(layer: &TtlLayer, hashtable: &MultiChoiceHashtable, per_ttl: usize) {
+        for (t, ttl) in TTLS.iter().rev().enumerate() {
+            let prefix = (b'a' + t as u8) as char;
+            write_n(layer, hashtable, prefix, *ttl, per_ttl);
+        }
+    }
+
+    /// Every segment the pool has handed out and not taken back.
+    fn occupied(layer: &TtlLayer) -> BTreeSet<u32> {
+        (0..layer.pool.segment_count() as u32)
+            .filter(|&id| layer.pool.get(id).is_some_and(|s| s.state() != State::Free))
+            .collect()
+    }
+
+    /// The one segment `before` holds that `after` does not.
+    fn sole_difference(before: &BTreeSet<u32>, after: &BTreeSet<u32>) -> u32 {
+        let mut gone = before.difference(after);
+        let id = *gone
+            .next()
+            .expect("an eviction must free exactly one segment");
+        assert!(
+            gone.next().is_none(),
+            "an eviction must free exactly one segment"
+        );
+        id
+    }
+
+    /// One eviction, driven through one of the layer's four entry points.
+    type EvictOnce = dyn Fn(&TtlLayer, &MultiChoiceHashtable) -> bool;
+
+    /// The segments `count` evictions took, in order.
+    fn victims(layer: &TtlLayer, hashtable: &MultiChoiceHashtable, count: usize) -> Vec<u32> {
+        victims_via(layer, hashtable, count, &|l, h| l.evict(h))
+    }
+
+    /// [`victims`], driven through a chosen entry point.
+    fn victims_via(
+        layer: &TtlLayer,
+        hashtable: &MultiChoiceHashtable,
+        count: usize,
+        evict_once: &EvictOnce,
+    ) -> Vec<u32> {
+        let mut out = Vec::with_capacity(count);
+        for n in 0..count {
+            let before = occupied(layer);
+            assert!(evict_once(layer, hashtable), "eviction {n} found no victim");
+            let after = occupied(layer);
+            out.push(sole_difference(&before, &after));
+        }
+        out
+    }
+
+    /// The whole eviction sequence a strategy produces from an identical
+    /// starting state.
+    fn sequence(strategy: EvictionStrategy, count: usize) -> Vec<u32> {
+        sequence_seeded(strategy, crate::config::DEFAULT_EVICTION_SEED, count)
+    }
+
+    fn sequence_seeded(strategy: EvictionStrategy, seed: u64, count: usize) -> Vec<u32> {
+        sequence_via(strategy, seed, count, &|l, h| l.evict(h))
+    }
+
+    fn sequence_via(
+        strategy: EvictionStrategy,
+        seed: u64,
+        count: usize,
+        evict_once: &EvictOnce,
+    ) -> Vec<u32> {
+        let layer = layer_seeded(strategy, seed);
+        let hashtable = MultiChoiceHashtable::new(12);
+        fill_four(&layer, &hashtable, 56);
+        victims_via(&layer, &hashtable, count, evict_once)
+    }
+
+    /// **The bug, stated directly.**
+    ///
+    /// Three policy names, one code path. Given the same starting state the
+    /// four rules must not produce the same sequence of victims -- that
+    /// identity is exactly what the leaderboard sweep measured.
+    #[test]
+    fn the_segment_policies_no_longer_evict_the_same_segments() {
+        let fifo = sequence(EvictionStrategy::Fifo, 12);
+        let cte = sequence(EvictionStrategy::Cte, 12);
+        let random = sequence(EvictionStrategy::Random, 12);
+        let random_fifo = sequence(EvictionStrategy::RandomFifo, 12);
+
+        for (a, an, b, bn) in [
+            (&fifo, "fifo", &cte, "cte"),
+            (&fifo, "fifo", &random, "random"),
+            (&fifo, "fifo", &random_fifo, "randomfifo"),
+            (&cte, "cte", &random, "random"),
+            (&cte, "cte", &random_fifo, "randomfifo"),
+            (&random, "random", &random_fifo, "randomfifo"),
+        ] {
+            assert_ne!(
+                a, b,
+                "{an} and {bn} evicted the same segments in the same order: \
+                 they are still one rule wearing two names"
+            );
+        }
+    }
+
+    /// The single-decision form of the same claim: one state, three rules,
+    /// three answers -- and `Random` can name a segment no head-based rule
+    /// can reach at all.
+    #[test]
+    fn fifo_cte_and_random_choose_different_victims_from_one_state() {
+        let layer = layer_with(EvictionStrategy::RandomFifo);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
+        assert_eq!(
+            long.len(),
+            3,
+            "the long chain must be [sealed, sealed, live]"
+        );
+        assert_eq!(short.len(), 2, "the short chain must be [sealed, live]");
+        let (oldest, middle, soonest) = (long[0], long[1], short[0]);
+
+        let fifo = layer.pick_fifo().expect("fifo found no victim");
+        let cte = layer.pick_cte().expect("cte found no victim");
+
+        assert_eq!(
+            fifo, oldest,
+            "Fifo must take the oldest segment in the layer"
+        );
+        assert_eq!(
+            cte, soonest,
+            "Cte must take the segment whose items expire soonest"
+        );
+        assert_ne!(fifo, cte, "Fifo and Cte cannot both be right here");
+
+        // Sweeping the draw space says what each randomised rule *can*
+        // reach, rather than sampling it once.
+        let uniform: BTreeSet<u32> = (0..64).filter_map(|d| layer.pick_uniform(d)).collect();
+        let random_fifo: BTreeSet<u32> = (0..64).filter_map(|d| layer.pick_randomfifo(d)).collect();
+
+        assert_eq!(
+            uniform,
+            BTreeSet::from([oldest, middle, soonest]),
+            "Random must be able to reach every evictable segment, including \
+             {middle}, which sits in the middle of a chain"
+        );
+        assert_eq!(
+            random_fifo,
+            BTreeSet::from([oldest, soonest]),
+            "RandomFifo only ever takes a chain head"
+        );
+        assert!(
+            !random_fifo.contains(&middle),
+            "RandomFifo reached a mid-chain segment, which is Random's job"
+        );
+    }
+
+    /// CTE means closest to expiration, so the victim is the minimum
+    /// `expire_at` -- wherever it sits in a chain.
+    #[test]
+    fn cte_evicts_the_soonest_expiring_segment_not_a_chain_head() {
+        let layer = layer_with(EvictionStrategy::Cte);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
+        let (head, middle, other) = (long[0], long[1], short[0]);
+
+        // Put the earliest expiry on the mid-chain segment: no head-based
+        // rule can name it, and the maximum is a different segment again.
+        let now = TtlLayer::now_secs();
+        layer.pool.get(head).unwrap().set_expire_at(now + 4000);
+        layer.pool.get(middle).unwrap().set_expire_at(now + 1000);
+        layer.pool.get(other).unwrap().set_expire_at(now + 2000);
+
+        assert_eq!(
+            layer.pick_cte(),
+            Some(middle),
+            "Cte took something other than the minimum expire_at"
+        );
+    }
+
+    /// `expire_at == 0` is "no segment-level expiry", not "expires at the
+    /// epoch": a segment that never expires is never the closest to it.
+    #[test]
+    fn a_segment_with_no_expiry_is_never_the_closest_to_expiring() {
+        let layer = layer_with(EvictionStrategy::Cte);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
+        let (head, middle, other) = (long[0], long[1], short[0]);
+
+        let now = TtlLayer::now_secs();
+        layer.pool.get(head).unwrap().set_expire_at(0);
+        layer.pool.get(middle).unwrap().set_expire_at(now + 5000);
+        layer.pool.get(other).unwrap().set_expire_at(now + 9000);
+
+        assert_eq!(
+            layer.pick_cte(),
+            Some(middle),
+            "a segment with no expiry was treated as expiring first"
+        );
+    }
+
+    /// FIFO is the oldest segment in the layer. RandomFifo is the oldest
+    /// segment of a randomly chosen bucket. Stack the short bucket with most
+    /// of the segments and the two rules part company: the random draw goes
+    /// to the short bucket most of the time, FIFO never does.
+    #[test]
+    fn fifo_evicts_the_oldest_segment_in_the_layer_not_a_random_buckets_head() {
+        let layer = layer_with(EvictionStrategy::Fifo);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let (long, short) = two_bucket_state(&layer, &hashtable, 17, 81);
+        assert!(short.len() > long.len(), "the short chain must dominate");
+
+        assert_eq!(
+            layer.pick_fifo(),
+            Some(long[0]),
+            "Fifo must take the layer's oldest segment, which is the head of \
+             the chain that was written first"
+        );
+
+        let random_fifo: BTreeSet<u32> = (0..64).filter_map(|d| layer.pick_randomfifo(d)).collect();
+        assert!(
+            random_fifo.contains(&short[0]),
+            "RandomFifo must be able to reach the busier bucket's head"
+        );
+        assert!(
+            random_fifo.len() > 1,
+            "RandomFifo must not be pinned to one bucket, or this comparison \
+             says nothing"
+        );
+    }
+
+    /// Age is the order segments entered service, so evicting the oldest
+    /// repeatedly walks the chain that was written first, oldest out.
+    #[test]
+    fn fifo_takes_the_next_oldest_segment_on_each_pass() {
+        let layer = layer_with(EvictionStrategy::Fifo);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let (long, short) = two_bucket_state(&layer, &hashtable, 33, 17);
+
+        // Sealed segments of the long chain, oldest first, then the short
+        // chain's -- exactly the order Fifo must produce.
+        let mut expected: Vec<u32> = long[..long.len() - 1].to_vec();
+        expected.extend_from_slice(&short[..short.len() - 1]);
+
+        assert_eq!(
+            victims(&layer, &hashtable, expected.len()),
+            expected,
+            "Fifo did not drain the layer oldest-first"
+        );
+    }
+
+    /// A chain is written oldest-first, so the tickets along it must
+    /// increase. If reservation stopped stamping them they would all read
+    /// zero and every age comparison would silently become "whichever the
+    /// scan reached first".
+    #[test]
+    fn a_segment_allocated_later_carries_a_newer_ticket() {
+        let layer = layer_with(EvictionStrategy::Fifo);
+        let hashtable = MultiChoiceHashtable::new(12);
+        write_n(&layer, &hashtable, 'L', LONG_TTL, 8 * 5);
+
+        let chain = chain_of(&layer, LONG_TTL);
+        assert!(chain.len() >= 3, "need a chain to compare along");
+        let tickets: Vec<u32> = chain
+            .iter()
+            .map(|&id| layer.pool.get(id).expect("segment").create_seq())
+            .collect();
+
+        assert!(
+            tickets
+                .windows(2)
+                .all(|w| crate::slice_segment::is_older(w[0], w[1])),
+            "tickets along the chain are not strictly increasing: {tickets:?}"
+        );
+    }
+
+    /// The same recycled-id state for FIFO. Ranking by scan order instead of
+    /// by the creation ticket gives the right answer only while segment ids
+    /// happen to be issued in age order, which stops being true after the
+    /// first eviction.
+    #[test]
+    fn fifo_ranks_by_age_not_by_segment_id() {
+        let (layer, hashtable, oldest, first_scanned) = recycled_id_state();
+        assert_ne!(
+            oldest, first_scanned,
+            "the fixture must put the oldest segment somewhere other than the \
+             front of the scan, or this test cannot see the difference"
+        );
+        let _ = &hashtable;
+
+        assert_eq!(
+            layer.pick_fifo(),
+            Some(oldest),
+            "Fifo took the first segment in scan order rather than the oldest"
+        );
+    }
+
+    /// A layer whose lowest segment ids have been evicted and re-issued, so
+    /// the pool scan no longer visits segments in age order.
+    ///
+    /// Returns the layer, its hashtable (which must outlive it for the
+    /// locations to stay valid), the id of the oldest evictable segment and
+    /// the id of the first one the scan reaches.
+    fn recycled_id_state() -> (TtlLayer, MultiChoiceHashtable, u32, u32) {
+        let layer = layer_with(EvictionStrategy::Fifo);
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        // Fill the pool but for one segment, evict three so their ids return
+        // to the free queue, then write again so those ids are re-issued to
+        // the newest segments.
+        write_n(&layer, &hashtable, 'L', LONG_TTL, 8 * (SEGMENTS - 1));
+        victims(&layer, &hashtable, 3);
+        write_n(&layer, &hashtable, 'M', LONG_TTL, 8 * 4);
+
+        let mut ages: Vec<(u32, u32)> = Vec::new();
+        layer.for_each_evictable(|id, segment, _| ages.push((id, segment.create_seq())));
+        let oldest = ages
+            .iter()
+            .copied()
+            .min_by(|a, b| a.1.cmp(&b.1))
+            .expect("some segment must be evictable")
+            .0;
+        let first_scanned = ages[0].0;
+        (layer, hashtable, oldest, first_scanned)
+    }
+
+    /// Segment ids are recycled, so scan order stops tracking age as soon as
+    /// anything has been evicted. A CTE tie then has to be broken by age
+    /// explicitly; falling through to scan order would silently evict the
+    /// *newest* segment of a TTL range whose ids happened to come back first.
+    ///
+    /// The state is built by evicting with FIFO until the lowest ids are back
+    /// in the free queue, then writing again so they are re-issued to the
+    /// newest segments.
+    #[test]
+    fn cte_breaks_an_expiry_tie_by_age_not_by_scan_order() {
+        let (layer, hashtable, oldest, first_scanned) = recycled_id_state();
+        assert_ne!(
+            oldest, first_scanned,
+            "the fixture must put the oldest segment somewhere other than the \
+             front of the scan, or this test cannot see the tie-break"
+        );
+        let _ = &hashtable;
+
+        // One expiry for every segment, exactly, so the tie is the only thing
+        // left to decide on.
+        let now = TtlLayer::now_secs();
+        layer.for_each_evictable(|_, segment, _| segment.set_expire_at(now + 5000));
+
+        assert_eq!(
+            layer.pick_cte(),
+            Some(oldest),
+            "with every expiry equal, Cte must fall back to age, not to the \
+             order the pool happens to be scanned in"
+        );
+    }
+
+    /// The behaviour that used to answer to three other names still exists,
+    /// under its own: pick a bucket weighted by segment count, take its head.
+    #[test]
+    fn random_fifo_still_takes_a_bucket_head_weighted_by_segment_count() {
+        let layer = layer_with(EvictionStrategy::RandomFifo);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
+
+        let reachable: BTreeSet<u32> = (0..64).filter_map(|d| layer.pick_randomfifo(d)).collect();
+        assert_eq!(
+            reachable,
+            BTreeSet::from([long[0], short[0]]),
+            "RandomFifo must reach exactly the two chain heads"
+        );
+
+        // Five segments, three of them in the long chain, so three draws in
+        // five land there. That weighting is the whole point of the rule.
+        let long_draws = (0..5)
+            .filter(|&d| layer.pick_randomfifo(d) == Some(long[0]))
+            .count();
+        assert_eq!(
+            long_draws, 3,
+            "the bucket choice must stay weighted by segment count"
+        );
+    }
+
+    /// End-to-end preservation: driven through `evict`, the default strategy
+    /// never takes a mid-chain segment.
+    #[test]
+    fn the_default_strategy_evicts_only_chain_heads() {
+        let layer = layer_with(EvictionStrategy::default());
+        let hashtable = MultiChoiceHashtable::new(12);
+        fill_four(&layer, &hashtable, 56);
+
+        for n in 0..12 {
+            let before = occupied(&layer);
+            let chain_heads = heads(&layer);
+            assert!(layer.evict(&hashtable), "eviction {n} found no victim");
+            let victim = sole_difference(&before, &occupied(&layer));
+            assert!(
+                chain_heads.contains(&victim),
+                "eviction {n} took {victim}, which was not a chain head"
+            );
+        }
+    }
+
+    /// And `Random` is the rule that does not respect chain heads -- the
+    /// mirror image of the test above, so neither passes by accident.
+    #[test]
+    fn random_eventually_evicts_a_segment_that_was_not_a_chain_head() {
+        let layer = layer_with(EvictionStrategy::Random);
+        let hashtable = MultiChoiceHashtable::new(12);
+        fill_four(&layer, &hashtable, 56);
+
+        let mut took_a_non_head = false;
+        for n in 0..12 {
+            let before = occupied(&layer);
+            let chain_heads = heads(&layer);
+            assert!(layer.evict(&hashtable), "eviction {n} found no victim");
+            let victim = sole_difference(&before, &occupied(&layer));
+            took_a_non_head |= !chain_heads.contains(&victim);
+        }
+        assert!(
+            took_a_non_head,
+            "Random never left a chain head in 12 evictions, so it is not \
+             choosing uniformly over segments"
+        );
+    }
+
+    /// The layer has four eviction entry points, and the one `TieredCache`
+    /// actually drives is `evict_nonblocking`, not `evict`. Before #156 the
+    /// strategy was consulted in `evict` alone and the other three hardcoded
+    /// random-FIFO, so a policy could be honoured in a unit test and ignored
+    /// in production. All four must agree.
+    #[test]
+    fn every_eviction_entry_point_honours_the_strategy() {
+        let seed = crate::config::DEFAULT_EVICTION_SEED;
+        let reference = sequence_via(EvictionStrategy::Fifo, seed, 12, &|l, h| l.evict(h));
+
+        let entry_points: [(&str, &EvictOnce); 3] = [
+            ("evict_nonblocking", &|l, h| {
+                matches!(l.evict_nonblocking(h), EvictResult::Freed)
+            }),
+            ("evict_with_demoter", &|l, h| {
+                l.evict_with_demoter(h, |_, _, _, _, _| {})
+            }),
+            ("evict_nonblocking_with_demoter", &|l, h| {
+                matches!(
+                    l.evict_nonblocking_with_demoter(h, |_, _, _, _, _| {}),
+                    EvictResult::Freed
+                )
+            }),
+        ];
+
+        for (name, evict_once) in entry_points {
+            assert_eq!(
+                sequence_via(EvictionStrategy::Fifo, seed, 12, evict_once),
+                reference,
+                "{name} did not evict what Fifo asked for"
+            );
+            assert_ne!(
+                sequence_via(EvictionStrategy::Cte, seed, 12, evict_once),
+                reference,
+                "{name} gave Cte the same victims as Fifo, so it is not \
+                 reading the strategy"
+            );
+        }
+    }
+
+    /// A fixed seed makes a randomised policy reproducible, and a single
+    /// arbitrary sample of itself. The way to tell a real policy difference
+    /// from one sequence's luck is to re-run across seeds, so the seed has to
+    /// actually reach the draws.
+    #[test]
+    fn a_different_eviction_seed_takes_different_victims() {
+        for strategy in [EvictionStrategy::Random, EvictionStrategy::RandomFifo] {
+            let a = sequence_seeded(strategy, crate::config::DEFAULT_EVICTION_SEED, 12);
+            let b = sequence_seeded(strategy, 0x5EED_5EED_5EED_5EED, 12);
+            assert_ne!(
+                a, b,
+                "{strategy:?} evicted the same segments under two different                  seeds: the seed is not reaching the random draws, so a sweep                  over seeds would measure nothing"
+            );
+        }
+    }
+
+    /// And the seed must reach *only* the random draws: a deterministic rule
+    /// that moved with it would be drawing randomness it has no business
+    /// drawing.
+    #[test]
+    fn the_eviction_seed_does_not_move_a_deterministic_policy() {
+        for strategy in [EvictionStrategy::Fifo, EvictionStrategy::Cte] {
+            assert_eq!(
+                sequence_seeded(strategy, crate::config::DEFAULT_EVICTION_SEED, 12),
+                sequence_seeded(strategy, 0x5EED_5EED_5EED_5EED, 12),
+                "{strategy:?} changed with the eviction seed"
+            );
+        }
+    }
+
+    /// Reproducibility is the property every measurement in this project
+    /// leans on, and an eviction policy seeded from the wall clock does not
+    /// have it: the same trace replayed twice takes different victims.
+    #[test]
+    fn the_same_workload_evicts_the_same_segments_on_every_run() {
+        for strategy in [
+            EvictionStrategy::Fifo,
+            EvictionStrategy::Cte,
+            EvictionStrategy::Random,
+            EvictionStrategy::RandomFifo,
+        ] {
+            assert_eq!(
+                sequence(strategy, 12),
+                sequence(strategy, 12),
+                "two identical runs of {strategy:?} took different victims: \
+                 eviction is drawing its randomness from something that is \
+                 not the cache's own state"
+            );
+        }
     }
 }

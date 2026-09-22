@@ -214,7 +214,7 @@ policy = "s3fifo"    # Eviction policy (depends on backend)
 ```
 
 **Eviction policies by backend:**
-- `segment`: s3fifo (default), fifo, random, cte, merge
+- `segment`: s3fifo (default), fifo, random, randomfifo, cte, merge
 - `slab`: lra (default), lrc, random, none
 - `heap`: s3fifo (default), lfu
 

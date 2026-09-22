@@ -48,6 +48,15 @@ pub struct CacheConfig {
     /// floor that any policy difference has to clear.
     #[serde(default)]
     pub hashtable_seed: Option<[u64; 4]>,
+    /// Pin the eviction PRNG seed for the segment backend.
+    ///
+    /// Which bucket `randomfifo` picks, and which segment `random` picks.
+    /// Unset, the layers use a fixed built-in default, so a run is
+    /// reproducible either way -- this is the knob for sweeping seeds, which
+    /// is how a policy difference is told apart from the luck of one random
+    /// sequence.
+    #[serde(default)]
+    pub eviction_seed: Option<u64>,
     /// How the S3-FIFO main cache (layer 1) reclaims segments.
     ///
     /// Only meaningful for `backend = "segment"` with `policy = "s3fifo"`.
@@ -251,6 +260,7 @@ pub enum EvictionPolicy {
     S3Fifo,
     Fifo,
     Random,
+    RandomFifo,
     Cte,
     Merge,
     Lra,
@@ -303,6 +313,7 @@ impl std::fmt::Display for EvictionPolicy {
             EvictionPolicy::S3Fifo => write!(f, "s3fifo"),
             EvictionPolicy::Fifo => write!(f, "fifo"),
             EvictionPolicy::Random => write!(f, "random"),
+            EvictionPolicy::RandomFifo => write!(f, "randomfifo"),
             EvictionPolicy::Cte => write!(f, "cte"),
             EvictionPolicy::Merge => write!(f, "merge"),
             EvictionPolicy::Lra => write!(f, "lra"),
@@ -532,6 +543,41 @@ warmup_records = 1000
         let trace = config.workload.trace.expect("trace section");
         assert_eq!(trace.warmup_records, 1000);
         assert_eq!(config.cache.hashtable_seed, Some([1, 2, 3, 4]));
+    }
+
+    /// A seed that parsed but never reached the cache would make a sweep
+    /// over seeds report a spread of zero.
+    #[test]
+    fn an_eviction_seed_is_read_from_the_config() {
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\neviction_seed = 12345",
+        );
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(config.cache.eviction_seed, Some(12345));
+    }
+
+    /// Unset means "use the built-in fixed default", not "seed from the OS".
+    #[test]
+    fn an_absent_eviction_seed_stays_absent() {
+        let config = Config::from_toml(TRACE_TOML).expect("parse");
+        assert_eq!(config.cache.eviction_seed, None);
+    }
+
+    /// `randomfifo` is the honest name for what `fifo`, `random` and `cte`
+    /// all used to do (#156), so the config surface has to accept it.
+    #[test]
+    fn randomfifo_is_a_policy_the_config_accepts() {
+        let toml = TRACE_TOML.replace("policy = \"s3fifo\"", "policy = \"randomfifo\"");
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert!(config.cache.policy == EvictionPolicy::RandomFifo);
+        assert_eq!(config.cache.policy.to_string(), "randomfifo");
     }
 
     #[test]

@@ -712,11 +712,13 @@ impl DiskLayerBuilder {
             .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
             .collect();
 
+        let buckets = TtlBuckets::with_seed(self.config.eviction_seed);
+
         Ok(DiskLayer {
             layer_id: self.layer_id,
             config: self.config,
             pool,
-            buckets: TtlBuckets::new(),
+            buckets,
             current_write_segments,
         })
     }

@@ -293,6 +293,7 @@ impl CacheBackend {
                 EvictionPolicy::S3Fifo
                     | EvictionPolicy::Fifo
                     | EvictionPolicy::Random
+                    | EvictionPolicy::RandomFifo
                     | EvictionPolicy::Cte
                     | EvictionPolicy::Merge
             ),
@@ -316,7 +317,7 @@ impl CacheBackend {
 /// Eviction policy selection.
 ///
 /// Not all policies are valid for all backends:
-/// - Segment: s3fifo, fifo, random, cte, merge
+/// - Segment: s3fifo, fifo, random, randomfifo, cte, merge
 /// - Heap: s3fifo, lfu, random
 /// - Slab: lra, lrc, random, none
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -328,9 +329,14 @@ pub enum EvictionPolicy {
     /// Simple FIFO eviction
     /// Valid for: segment
     Fifo,
-    /// Random eviction
+    /// Random eviction: a segment chosen uniformly at random
     /// Valid for: segment, slab
     Random,
+    /// Random-FIFO: a bucket chosen at random weighted by segment count,
+    /// then that bucket's oldest segment. The segment backend's default
+    /// behaviour before #156, under its own name.
+    /// Valid for: segment
+    RandomFifo,
     /// Closest to expiration (TTL-aware)
     /// Valid for: segment
     Cte,

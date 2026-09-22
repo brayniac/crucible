@@ -79,7 +79,9 @@ mod segment;
 mod state;
 
 // Re-exports
-pub use config::{EvictionStrategy, FrequencyDecay, LayerConfig, LayerId, MergeConfig};
+pub use config::{
+    DEFAULT_EVICTION_SEED, EvictionStrategy, FrequencyDecay, LayerConfig, LayerId, MergeConfig,
+};
 pub use error::{CacheError, CacheResult};
 
 // Location re-exports

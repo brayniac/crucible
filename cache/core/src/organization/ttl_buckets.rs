@@ -35,7 +35,7 @@
 use crate::pool::RamPool;
 use crate::segment::Segment;
 use crate::state::{INVALID_SEGMENT_ID, State};
-use crate::sync::{AtomicU32, Ordering};
+use crate::sync::{AtomicU32, AtomicU64, Ordering};
 use parking_lot::Mutex;
 use std::time::Duration;
 
@@ -80,14 +80,39 @@ pub enum TtlBucketError {
     ActiveReaders,
 }
 
+/// The step splitmix64 advances its state by. Any odd constant does; this one
+/// is the golden-ratio word the algorithm is usually written with.
+const RNG_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// TTL buckets manager for organizing segments by expiration time.
 pub struct TtlBuckets {
     buckets: Box<[TtlBucket]>,
+
+    /// State for the eviction-time random choices, seeded by the layer.
+    ///
+    /// This used to be `SystemTime::now().as_nanos()`, read fresh inside
+    /// `select_bucket_for_eviction`. A wall clock in the eviction path makes
+    /// every randomised policy irreproducible: the same trace replayed twice
+    /// takes different victims, so miss ratios stop being comparable between
+    /// runs, machines and builds. A counter stepped by the cache's own
+    /// operations gives the same spread and replays identically (#156).
+    rng: AtomicU64,
 }
 
 impl TtlBuckets {
-    /// Create a new set of TTL buckets.
+    /// Create a new set of TTL buckets with the default eviction seed.
     pub fn new() -> Self {
+        Self::with_seed(crate::config::DEFAULT_EVICTION_SEED)
+    }
+
+    /// Create a new set of TTL buckets seeding eviction randomness with
+    /// `seed`.
+    ///
+    /// See [`LayerConfig::with_eviction_seed`] for why this is a knob rather
+    /// than a constant.
+    ///
+    /// [`LayerConfig::with_eviction_seed`]: crate::config::LayerConfig::with_eviction_seed
+    pub fn with_seed(seed: u64) -> Self {
         let intervals = [
             TTL_BUCKET_INTERVAL_1,
             TTL_BUCKET_INTERVAL_2,
@@ -108,7 +133,23 @@ impl TtlBuckets {
         }
 
         let buckets = buckets.into_boxed_slice();
-        Self { buckets }
+        Self {
+            buckets,
+            rng: AtomicU64::new(seed),
+        }
+    }
+
+    /// The next value in this instance's eviction randomness stream.
+    ///
+    /// A Weyl step plus splitmix64's finalizer: one `fetch_add`, so
+    /// concurrent callers get distinct inputs rather than racing a
+    /// load-modify-store, and a single-threaded replay gets the same
+    /// sequence every time.
+    pub fn next_random(&self) -> u64 {
+        let mut z = self.rng.fetch_add(RNG_STEP, Ordering::Relaxed);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 
     /// Get the bucket index for a given TTL duration.
@@ -165,6 +206,17 @@ impl TtlBuckets {
     /// Buckets with more segments are more likely to be selected.
     /// Returns the bucket index and reference, or None if all buckets are empty.
     pub fn select_bucket_for_eviction(&self) -> Option<(usize, &TtlBucket)> {
+        self.select_bucket_for_eviction_with(self.next_random())
+    }
+
+    /// [`select_bucket_for_eviction`] with the random draw supplied.
+    ///
+    /// Splitting the draw out lets a test sweep the whole draw space and say
+    /// which buckets the rule can and cannot reach, instead of asserting on
+    /// one sample of it.
+    ///
+    /// [`select_bucket_for_eviction`]: Self::select_bucket_for_eviction
+    pub fn select_bucket_for_eviction_with(&self, draw: u64) -> Option<(usize, &TtlBucket)> {
         // First pass: count total segments
         let total: usize = self.buckets.iter().map(|b| b.segment_count()).sum();
         if total == 0 {
@@ -172,11 +224,7 @@ impl TtlBuckets {
         }
 
         // Simple random selection weighted by segment count
-        // Uses current time as a simple source of randomness
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let random = (now.as_nanos() as usize) % total;
+        let random = (draw % total as u64) as usize;
 
         // Walk through buckets accumulating counts until we hit the random target
         let mut accumulated = 0;

@@ -24,6 +24,30 @@ pub type ValueRefRaw = (
     u32,
 );
 
+/// Tickets handed to segments as they enter service, oldest lowest.
+///
+/// Deliberately a `std` atomic rather than `crate::sync`: loom cannot build a
+/// `static` from its own atomics, and a counter shared by every pool in the
+/// process is not the kind of state a loom model has anything to say about.
+///
+/// It starts at 1 so that 0 keeps its meaning of "never reserved".
+static SEGMENT_CREATE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The next creation ticket.
+fn next_create_seq() -> u32 {
+    SEGMENT_CREATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Is `a` an older ticket than `b`?
+///
+/// Tickets wrap after 2^32 reservations, so this compares the signed
+/// difference rather than the values -- correct as long as the tickets being
+/// compared were issued within 2^31 of each other, which holds because only
+/// live segments are ever compared and a pool holds far fewer than that.
+pub fn is_older(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
 /// Retry configuration for CAS operations.
 struct CasRetryConfig {
     max_attempts: u32,
@@ -112,6 +136,13 @@ pub struct SliceSegment<'a> {
     /// Generation counter - incremented on reuse to prevent ABA.
     generation: AtomicU16,
 
+    /// When this segment entered service, as a ticket from a process-wide
+    /// counter. See [`SliceSegment::create_seq`].
+    ///
+    /// This sits in what was four bytes of tail padding before `free_queue`,
+    /// so the segment header is still one 64-byte line.
+    create_seq: AtomicU32,
+
     /// Pointer to the pool's main free queue for guard-based release.
     /// When a segment in AwaitingRelease state has its last reader drop,
     /// the guard pushes the segment to this queue.
@@ -189,9 +220,34 @@ impl<'a> SliceSegment<'a> {
             align_shift: align_bytes.trailing_zeros() as u8,
             merge_count: AtomicU16::new(0),
             generation: AtomicU16::new(0),
+            // Stamped for real by `try_reserve`; a segment that has never
+            // been reserved has no age to compare.
+            create_seq: AtomicU32::new(0),
             free_queue,
             _lifetime: std::marker::PhantomData,
         }
+    }
+
+    /// When this segment entered service, as a monotonically increasing
+    /// ticket. Lower is older; compare with [`is_older`], not `<`.
+    ///
+    /// This is a proxy for cache-rs's "the later of its creation and
+    /// last-merge timestamps", and a deliberately better one than a clock
+    /// reading would be. A coarse seconds timestamp ties across every segment
+    /// created in the same second, which under a fill-rate of hundreds of
+    /// segments per second is nearly all of them, and a tie in a FIFO rule is
+    /// a silent fallback to whatever order the scan happened to run in.
+    /// Tickets induce the same order at a granularity that never ties, and
+    /// they are read without touching a clock -- which the eviction path must
+    /// not do if replays are to be reproducible (#156).
+    ///
+    /// Not on the [`Segment`] trait: the only rule that needs it is
+    /// `EvictionStrategy::Fifo` in `TtlLayer`, which works against this
+    /// concrete type. The disk segment types would have to carry a field they
+    /// have no reader for.
+    #[inline]
+    pub fn create_seq(&self) -> u32 {
+        self.create_seq.load(Ordering::Relaxed)
     }
 
     /// Check if this segment uses per-item TTL.
@@ -923,6 +979,13 @@ impl Segment for SliceSegment<'_> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                // Free -> Reserved is the one funnel every segment passes
+                // through on its way into service, whether it is about to
+                // take writes or to be a merge destination. Stamping the age
+                // here is therefore "the later of its creation and its last
+                // merge" without either being tracked separately.
+                self.create_seq.store(next_create_seq(), Ordering::Relaxed);
+
                 // Reset statistics
                 self.write_offset.store(0, Ordering::Relaxed);
                 self.live_items.store(0, Ordering::Relaxed);
@@ -1630,6 +1693,41 @@ mod tests {
     use super::*;
     use crate::item::ItemGuard;
     use std::alloc::{Layout, alloc, dealloc};
+
+    /// The segment header is read on every lookup, so it is sized to one
+    /// cache line and must stay there. `create_seq` (#156) went into the tail
+    /// padding before `free_queue`; the next field added will not fit, and
+    /// will silently double this to 128 bytes because of `align(64)`.
+    #[test]
+    fn the_segment_header_still_fits_one_cache_line() {
+        assert_eq!(std::mem::size_of::<SliceSegment<'_>>(), 64);
+    }
+
+    /// Reservation is what puts a segment into service, so it is what dates
+    /// it -- and a later reservation must date later, whether the segment is
+    /// taking writes or standing in as a merge destination.
+    #[test]
+    fn a_reserved_segment_is_dated_after_one_reserved_before_it() {
+        let first = next_create_seq();
+        let second = next_create_seq();
+        assert!(
+            is_older(first, second),
+            "tickets must increase: {first} was not older than {second}"
+        );
+        assert!(!is_older(second, first));
+        assert!(!is_older(first, first), "a ticket is not older than itself");
+    }
+
+    /// Tickets wrap, and a wrapped comparison must still answer by distance
+    /// rather than by magnitude.
+    #[test]
+    fn ticket_comparison_survives_the_counter_wrapping() {
+        assert!(
+            is_older(u32::MAX - 1, 3),
+            "a pre-wrap ticket is the older one"
+        );
+        assert!(!is_older(3, u32::MAX - 1));
+    }
 
     /// Dummy free queue for tests - segments won't actually be released back.
     static TEST_FREE_QUEUE: std::sync::LazyLock<crossbeam_deque::Injector<u32>> =

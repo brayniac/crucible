@@ -66,20 +66,31 @@ pub use cache_core::{
 /// This determines the overall cache architecture and eviction strategy.
 #[derive(Debug, Clone, Default)]
 pub enum EvictionPolicy {
-    /// Random segment selection within TTL buckets (default).
+    /// Pick a bucket at random, weighted by segment count, and evict its
+    /// oldest segment (default).
     ///
-    /// Simple and efficient, good for general-purpose caching.
+    /// Weights eviction toward the TTL ranges holding the most memory while
+    /// preserving the TTL distribution. Before #156 this was the only segment
+    /// policy implemented, and `Random`, `Fifo` and `Cte` were all aliases
+    /// for it.
     #[default]
+    RandomFifo,
+
+    /// Evict a segment chosen uniformly at random.
+    ///
+    /// Simple and fast, but blind to item value. The only policy here that
+    /// can take a segment from the middle of a bucket chain.
     Random,
 
     /// Strict FIFO segment eviction.
     ///
-    /// Evicts oldest segments first, regardless of access frequency.
+    /// Evicts the oldest segment in the cache, across all TTL buckets. Since
+    /// segments are append-only this behaves like LRU at segment granularity.
     Fifo,
 
     /// Closest to expiration eviction.
     ///
-    /// Prioritizes evicting segments closest to their TTL expiration.
+    /// Evicts the segment whose items expire soonest.
     Cte,
 
     /// Adaptive merge eviction.
@@ -354,6 +365,7 @@ pub struct SegCacheBuilder {
     /// Hashtable power (2^power buckets).
     hashtable_power: u8,
     hashtable_seed: Option<[u64; 4]>,
+    eviction_seed: Option<u64>,
     main_eviction: EvictionStrategy,
 
     /// Hugepage size preference.
@@ -373,6 +385,43 @@ pub struct SegCacheBuilder {
 
     /// io_uring disk tier configuration (optional, Direct I/O).
     io_uring_disk_tier: Option<IoUringDiskTierConfig>,
+}
+
+/// The layer strategy a single-layer policy runs.
+///
+/// Lifted out of `build_single_layer` and pinned by
+/// `every_single_layer_policy_maps_to_its_own_strategy`, because #156 was
+/// exactly this mapping collapsing: `fifo`, `random` and `cte` were three
+/// accepted names that all reached one behaviour, and nothing said so.
+///
+/// # Panics
+///
+/// On [`EvictionPolicy::S3Fifo`], which is a two-layer topology and never
+/// reaches the single-layer builder.
+fn single_layer_strategy(policy: &EvictionPolicy) -> EvictionStrategy {
+    match policy {
+        EvictionPolicy::RandomFifo => EvictionStrategy::RandomFifo,
+        EvictionPolicy::Random => EvictionStrategy::Random,
+        EvictionPolicy::Fifo => EvictionStrategy::Fifo,
+        EvictionPolicy::Cte => EvictionStrategy::Cte,
+        EvictionPolicy::Merge(config) => EvictionStrategy::Merge(*config),
+        EvictionPolicy::S3Fifo { .. } => {
+            unreachable!("s3fifo builds two layers, not one")
+        }
+    }
+}
+
+/// [`LayerConfig::new`] with the builder's eviction seed applied, if it set
+/// one.
+///
+/// Every layer a `SegCacheBuilder` constructs goes through here, so a seeded
+/// build seeds the disk tiers and the S3-FIFO admission queue too, not just
+/// the main cache.
+fn seeded_layer_config(seed: Option<u64>) -> LayerConfig {
+    match seed {
+        Some(seed) => LayerConfig::new().with_eviction_seed(seed),
+        None => LayerConfig::new(),
+    }
 }
 
 impl Default for SegCacheBuilder {
@@ -396,6 +445,7 @@ impl SegCacheBuilder {
             segment_size: 1024 * 1024,   // 1MB
             hashtable_power: 16,         // 64K buckets
             hashtable_seed: None,
+            eviction_seed: None,
             main_eviction: EvictionStrategy::Merge(MergeConfig::default()),
             hugepage_size: HugepageSize::None,
             enable_ghosts: false,
@@ -442,6 +492,31 @@ impl SegCacheBuilder {
     pub fn hashtable_seed(mut self, seed: [u64; 4]) -> Self {
         self.hashtable_seed = Some(seed);
         self
+    }
+
+    /// Seed every layer's eviction randomness.
+    ///
+    /// Which bucket `RandomFifo` picks, and which segment `Random` picks.
+    /// Unset, the layers use [`DEFAULT_EVICTION_SEED`], which is fixed -- so
+    /// a run is reproducible either way. Set it to sweep: a policy difference
+    /// that survives a spread of seeds is a policy difference, one that does
+    /// not is the luck of a single sequence. The same reason
+    /// [`hashtable_seed`](Self::hashtable_seed) is exposed.
+    ///
+    /// [`DEFAULT_EVICTION_SEED`]: cache_core::DEFAULT_EVICTION_SEED
+    pub fn eviction_seed(mut self, seed: u64) -> Self {
+        self.eviction_seed = Some(seed);
+        self
+    }
+
+    /// The eviction seed this builder will apply, if any.
+    ///
+    /// A readback, so a caller that plumbs the seed through from a config
+    /// file can assert the plumbing without building a cache. A seed that
+    /// parses but never reaches the builder makes a sweep over seeds report a
+    /// spread of zero, which is the one failure the seed exists to rule out.
+    pub fn configured_eviction_seed(&self) -> Option<u64> {
+        self.eviction_seed
     }
 
     /// Set the hugepage size preference.
@@ -571,17 +646,11 @@ impl SegCacheBuilder {
         self,
         hashtable: Arc<MultiChoiceHashtable>,
     ) -> Result<TieredCache<MultiChoiceHashtable>, std::io::Error> {
-        // Convert EvictionPolicy to EvictionStrategy
-        let eviction_strategy = match &self.eviction_policy {
-            EvictionPolicy::Random => EvictionStrategy::Random,
-            EvictionPolicy::Fifo => EvictionStrategy::Fifo,
-            EvictionPolicy::Cte => EvictionStrategy::Cte,
-            EvictionPolicy::Merge(config) => EvictionStrategy::Merge(*config),
-            EvictionPolicy::S3Fifo { .. } => unreachable!(),
-        };
+        let eviction_seed = self.eviction_seed;
+        let eviction_strategy = single_layer_strategy(&self.eviction_policy);
 
         // If disk tier is enabled, configure demotion to disk layer (layer 1)
-        let mut layer_config = LayerConfig::new()
+        let mut layer_config = seeded_layer_config(eviction_seed)
             .with_ghosts(self.enable_ghosts)
             .with_eviction_strategy(eviction_strategy);
 
@@ -610,9 +679,9 @@ impl SegCacheBuilder {
 
         // Add disk layer if configured
         if let Some(disk_config) = self.disk_tier {
-            let disk_layer_config = LayerConfig::new()
+            let disk_layer_config = seeded_layer_config(eviction_seed)
                 .with_ghosts(self.enable_ghosts)
-                .with_eviction_strategy(EvictionStrategy::Random);
+                .with_eviction_strategy(EvictionStrategy::RandomFifo);
 
             let disk_layer = DiskLayerBuilder::new()
                 .layer_id(1)
@@ -626,9 +695,9 @@ impl SegCacheBuilder {
 
             builder = builder.with_disk_layer(disk_layer);
         } else if let Some(io_uring_config) = self.io_uring_disk_tier {
-            let disk_layer_config = LayerConfig::new()
+            let disk_layer_config = seeded_layer_config(eviction_seed)
                 .with_ghosts(self.enable_ghosts)
-                .with_eviction_strategy(EvictionStrategy::Random);
+                .with_eviction_strategy(EvictionStrategy::RandomFifo);
 
             let io_uring_layer = IoUringDiskLayerBuilder::new()
                 .layer_id(1)
@@ -653,6 +722,8 @@ impl SegCacheBuilder {
         small_queue_percent: u8,
         demotion_threshold: u8,
     ) -> Result<TieredCache<MultiChoiceHashtable>, std::io::Error> {
+        let eviction_seed = self.eviction_seed;
+
         // Calculate segment counts
         let total_segments = self.heap_size / self.segment_size;
         let small_percent = small_queue_percent.clamp(1, 50) as usize;
@@ -670,7 +741,7 @@ impl SegCacheBuilder {
         let main_cache_size = main_cache_segments * self.segment_size;
 
         // Layer 0: FIFO small queue with ghosts and demotion to layer 1
-        let layer0_config = LayerConfig::new()
+        let layer0_config = seeded_layer_config(eviction_seed)
             .with_ghosts(true)
             .with_next_layer(1)
             .with_demotion_threshold(demotion_threshold);
@@ -691,7 +762,7 @@ impl SegCacheBuilder {
 
         // Layer 1: TTL-organized main cache with merge eviction
         // If disk tier is enabled, configure demotion to disk layer (layer 2)
-        let mut layer1_config = LayerConfig::new()
+        let mut layer1_config = seeded_layer_config(eviction_seed)
             .with_ghosts(true)
             .with_eviction_strategy(self.main_eviction);
 
@@ -721,9 +792,9 @@ impl SegCacheBuilder {
 
         // Add disk layer if configured
         if let Some(disk_config) = self.disk_tier {
-            let disk_layer_config = LayerConfig::new()
+            let disk_layer_config = seeded_layer_config(eviction_seed)
                 .with_ghosts(true)
-                .with_eviction_strategy(EvictionStrategy::Random);
+                .with_eviction_strategy(EvictionStrategy::RandomFifo);
 
             let disk_layer = DiskLayerBuilder::new()
                 .layer_id(2)
@@ -737,9 +808,9 @@ impl SegCacheBuilder {
 
             builder = builder.with_disk_layer(disk_layer);
         } else if let Some(io_uring_config) = self.io_uring_disk_tier {
-            let disk_layer_config = LayerConfig::new()
+            let disk_layer_config = seeded_layer_config(eviction_seed)
                 .with_ghosts(true)
-                .with_eviction_strategy(EvictionStrategy::Random);
+                .with_eviction_strategy(EvictionStrategy::RandomFifo);
 
             let io_uring_layer = IoUringDiskLayerBuilder::new()
                 .layer_id(2)
@@ -1091,6 +1162,64 @@ mod tests {
     #[test]
     fn an_unseeded_builder_leaves_the_table_seeded_from_the_os() {
         assert_eq!(SegCacheBuilder::new().hashtable_seed, None);
+    }
+
+    /// The eviction seed has to reach every layer the builder makes, not just
+    /// the main cache: a sweep over seeds that left the admission queue and
+    /// the disk tier pinned would under-report the spread it is measuring.
+    /// One name, one strategy, and no two names sharing one. This is the
+    /// claim #156 found to be false.
+    #[test]
+    fn every_single_layer_policy_maps_to_its_own_strategy() {
+        let cases = [
+            (EvictionPolicy::RandomFifo, EvictionStrategy::RandomFifo),
+            (EvictionPolicy::Random, EvictionStrategy::Random),
+            (EvictionPolicy::Fifo, EvictionStrategy::Fifo),
+            (EvictionPolicy::Cte, EvictionStrategy::Cte),
+        ];
+        for (policy, expected) in &cases {
+            assert_eq!(
+                single_layer_strategy(policy),
+                *expected,
+                "{policy:?} reached the wrong strategy"
+            );
+        }
+
+        // And no two of them reach the same one -- the property that actually
+        // failed, which per-case equality alone would not catch if two
+        // expectations were wrong together.
+        let mapped: Vec<EvictionStrategy> = cases
+            .iter()
+            .map(|(p, _)| single_layer_strategy(p))
+            .collect();
+        for i in 0..mapped.len() {
+            for j in (i + 1)..mapped.len() {
+                assert_ne!(
+                    mapped[i], mapped[j],
+                    "{:?} and {:?} resolve to the same strategy",
+                    cases[i].0, cases[j].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_eviction_seed_reaches_every_layer_config_the_builder_makes() {
+        assert_eq!(
+            seeded_layer_config(Some(42)).eviction_seed,
+            42,
+            "the builder's eviction seed must reach the layer config"
+        );
+        assert_eq!(
+            seeded_layer_config(None).eviction_seed,
+            cache_core::DEFAULT_EVICTION_SEED,
+            "an unset seed must leave the fixed default, not zero"
+        );
+        assert_eq!(SegCacheBuilder::new().eviction_seed, None);
+        assert_eq!(
+            SegCacheBuilder::new().eviction_seed(7).eviction_seed,
+            Some(7)
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub fn cachers_policy(policy: crate::config::EvictionPolicy) -> Option<cache_rs:
         P::Fifo => cache_rs::Policy::Fifo,
         P::Cte => cache_rs::Policy::Cte,
         P::Random => cache_rs::Policy::Random,
+        P::RandomFifo => cache_rs::Policy::RandomFifo,
         // Defaults on both sides, so the pair compares each engine as shipped
         // rather than as tuned. Chain length is the dominant variable here
         // (see the S3-FIFO design), so it is held at each engine's default

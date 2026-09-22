@@ -568,6 +568,25 @@ fn print_latency_summary(label: &str, hist: &AtomicHistogram) {
 
 // --- Cache constructors ---
 
+/// Apply the seeds a config pins to a segment-backend builder.
+///
+/// Split out from `create_segment` so the plumbing has a seam: a seed that
+/// parses and is then dropped on the way to the builder would make a sweep
+/// over seeds report a spread of zero, and every policy difference inside
+/// that spread look significant.
+fn apply_reproducibility_seeds(
+    mut builder: segcache::SegCacheBuilder,
+    cache: &crate::config::CacheConfig,
+) -> segcache::SegCacheBuilder {
+    if let Some(seed) = cache.hashtable_seed {
+        builder = builder.hashtable_seed(seed);
+    }
+    if let Some(seed) = cache.eviction_seed {
+        builder = builder.eviction_seed(seed);
+    }
+    builder
+}
+
 fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
     use segcache::{DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache};
 
@@ -576,9 +595,7 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         .segment_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power);
 
-    if let Some(seed) = config.cache.hashtable_seed {
-        builder = builder.hashtable_seed(seed);
-    }
+    builder = apply_reproducibility_seeds(builder, &config.cache);
 
     builder = match config.cache.policy {
         EvictionPolicy::S3Fifo => {
@@ -604,6 +621,7 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         }
         EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),
         EvictionPolicy::Random => builder.eviction_policy(SegEvictionPolicy::Random),
+        EvictionPolicy::RandomFifo => builder.eviction_policy(SegEvictionPolicy::RandomFifo),
         EvictionPolicy::Cte => builder.eviction_policy(SegEvictionPolicy::Cte),
         EvictionPolicy::Merge => {
             // The single-layer merge arm took `MergeConfig::default()` and
@@ -696,6 +714,10 @@ fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
         return Err("the slab backend does not support hashtable_seed yet".into());
     }
 
+    if config.cache.eviction_seed.is_some() {
+        return Err("the slab backend does not support eviction_seed yet".into());
+    }
+
     let eviction_strategy = match config.cache.policy {
         EvictionPolicy::Lra => EvictionStrategy::SLAB_LRA,
         EvictionPolicy::Lrc => EvictionStrategy::SLAB_LRC,
@@ -731,6 +753,10 @@ fn create_heap(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
     // See `create_slab` on why this is rejected rather than ignored.
     if config.cache.hashtable_seed.is_some() {
         return Err("the heap backend does not support hashtable_seed yet".into());
+    }
+
+    if config.cache.eviction_seed.is_some() {
+        return Err("the heap backend does not support eviction_seed yet".into());
     }
 
     let heap_policy = match config.cache.policy {
@@ -822,4 +848,66 @@ fn pin_to_cpu(cpu_id: usize) -> std::io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn pin_to_cpu(_cpu_id: usize) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod seed_plumbing_tests {
+    use super::*;
+
+    /// The seed has to survive the trip from the parsed config to the
+    /// builder. Accepting it and dropping it here would leave a sweep over
+    /// seeds reporting a spread of zero, which makes every policy difference
+    /// inside the real spread look significant.
+    #[test]
+    fn a_configured_eviction_seed_reaches_the_segment_builder() {
+        let toml = r#"
+[general]
+duration = "1s"
+warmup = "0s"
+threads = 1
+
+[cache]
+backend = "segment"
+policy = "randomfifo"
+heap_size = "16MB"
+segment_size = "256KB"
+hashtable_power = 16
+eviction_seed = 4242
+
+[workload.trace]
+path = "/tmp/t.bin"
+format = "twitter"
+warmup_records = 0
+"#;
+        let config = crate::config::Config::from_toml(toml).expect("parse");
+        let builder = apply_reproducibility_seeds(segcache::SegCache::builder(), &config.cache);
+        assert_eq!(builder.configured_eviction_seed(), Some(4242));
+    }
+
+    /// And an unset seed must leave the builder alone, so the layer default
+    /// applies rather than some stand-in value chosen here.
+    #[test]
+    fn an_unset_eviction_seed_leaves_the_builder_untouched() {
+        let toml = r#"
+[general]
+duration = "1s"
+warmup = "0s"
+threads = 1
+
+[cache]
+backend = "segment"
+policy = "randomfifo"
+heap_size = "16MB"
+segment_size = "256KB"
+hashtable_power = 16
+
+[workload.trace]
+path = "/tmp/t.bin"
+format = "twitter"
+warmup_records = 0
+"#;
+        let config = crate::config::Config::from_toml(toml).expect("parse");
+        let builder = apply_reproducibility_seeds(segcache::SegCache::builder(), &config.cache);
+        assert_eq!(builder.configured_eviction_seed(), None);
+    }
 }
