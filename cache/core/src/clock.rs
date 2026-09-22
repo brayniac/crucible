@@ -42,10 +42,15 @@ use core::cell::Cell;
 
 #[cfg(feature = "virtual-clock")]
 thread_local! {
-    /// Unix seconds to report on this thread instead of the system clock,
-    /// or 0 for "use the system clock". Zero is safe as the sentinel: it is
-    /// the epoch itself, and no live cache entry can carry it.
-    static VIRTUAL_NOW: Cell<u32> = const { Cell::new(0) };
+    /// Seconds to report on this thread instead of the system clock.
+    ///
+    /// `Option` rather than a zero sentinel. Trace timestamps are seconds
+    /// from the start of the trace, so a trace legitimately begins at 0,
+    /// and a sentinel would silently hand those records the system clock --
+    /// then jump the cache backwards by decades on the first non-zero one,
+    /// stranding everything written during the gap with an expiry no
+    /// subsequent read could reach.
+    static VIRTUAL_NOW: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// Current time in unix seconds, as every expiry check sees it.
@@ -53,8 +58,7 @@ thread_local! {
 pub fn now_unix_secs() -> u32 {
     #[cfg(feature = "virtual-clock")]
     {
-        let virtual_secs = VIRTUAL_NOW.with(Cell::get);
-        if virtual_secs != 0 {
+        if let Some(virtual_secs) = VIRTUAL_NOW.with(Cell::get) {
             return virtual_secs;
         }
     }
@@ -69,26 +73,25 @@ pub fn system_now_unix_secs() -> u32 {
         .as_secs()
 }
 
-/// Drive this thread's expiry from a caller-supplied clock, in unix seconds.
+/// Drive this thread's expiry from a caller-supplied clock.
 ///
 /// Intended for trace replay, where the caller advances it from record
-/// timestamps. Passing 0 restores the system clock.
+/// timestamps. The value need not be unix seconds: the cache only ever
+/// compares it against expiries derived from it, so any monotonic seconds
+/// count works, which is what trace-relative timestamps are.
 #[cfg(feature = "virtual-clock")]
-pub fn set_virtual_now(unix_secs: u32) {
-    VIRTUAL_NOW.with(|now| now.set(unix_secs));
+pub fn set_virtual_now(secs: u32) {
+    VIRTUAL_NOW.with(|now| now.set(Some(secs)));
 }
 
 /// Restore the system clock on this thread.
 #[cfg(feature = "virtual-clock")]
 pub fn clear_virtual_now() {
-    VIRTUAL_NOW.with(|now| now.set(0));
+    VIRTUAL_NOW.with(|now| now.set(None));
 }
 
 /// The virtual time in force on this thread, or `None` for the system clock.
 #[cfg(feature = "virtual-clock")]
 pub fn virtual_now() -> Option<u32> {
-    match VIRTUAL_NOW.with(Cell::get) {
-        0 => None,
-        secs => Some(secs),
-    }
+    VIRTUAL_NOW.with(Cell::get)
 }

@@ -263,8 +263,8 @@ pub fn run_replay<C: Cache>(
         // every read, so a clock that lagged the record being applied would
         // expire items late by however far it lagged.
         #[cfg(feature = "virtual-clock")]
-        if record.timestamp_secs != 0 {
-            cache_core::clock::set_virtual_now(record.timestamp_secs);
+        if let Some(secs) = record.timestamp_secs {
+            cache_core::clock::set_virtual_now(secs);
         }
 
         let in_warmup = reader.records_read() <= opts.warmup_records;
@@ -617,7 +617,7 @@ mod tests {
             value_len,
             op,
             ttl_secs,
-            timestamp_secs: 0,
+            timestamp_secs: None,
         }
     }
 
@@ -651,7 +651,7 @@ mod tests {
     fn a_record_carries_its_timestamp_and_ttl() {
         let bytes = twitter_bytes_at(7, 64, Op::Set, 300, 1_700_000_000);
         let record = crate::trace::TraceRecord::from_twitter_bytes(&bytes).expect("decode");
-        assert_eq!(record.timestamp_secs, 1_700_000_000, "timestamp");
+        assert_eq!(record.timestamp_secs, Some(1_700_000_000), "timestamp");
         assert_eq!(record.ttl_secs, 300, "ttl");
         assert_eq!(record.key_id, 7, "key id");
         assert_eq!(record.op, Op::Set, "op");
