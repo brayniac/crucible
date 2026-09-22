@@ -888,6 +888,12 @@ impl Layer for FifoLayer {
         // FIFO layer doesn't do compaction - just mark deleted
         self.mark_deleted(location);
     }
+
+    fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        // Same reason: this layer reclaims by evicting whole segments in
+        // order, so there is no partial reclamation to do here.
+        self.mark_deleted(location);
+    }
 }
 
 /// Result of a non-blocking eviction attempt.

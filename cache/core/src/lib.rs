@@ -82,6 +82,7 @@ mod state;
 // Re-exports
 pub use config::{
     DEFAULT_EVICTION_SEED, EvictionStrategy, FrequencyDecay, LayerConfig, LayerId, MergeConfig,
+    OverwriteReclaim,
 };
 pub use error::{CacheError, CacheResult};
 

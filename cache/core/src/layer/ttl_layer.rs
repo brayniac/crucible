@@ -1823,6 +1823,28 @@ impl Layer for TtlLayer {
         }
     }
 
+    fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        if location.pool_id() != self.pool.pool_id() {
+            return;
+        }
+
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id)
+            && let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE)
+            && let Some(header) = unsafe { BasicHeader::try_from_ptr(data) }
+        {
+            let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
+            let key_len = header.key_len() as usize;
+            if let Some(key) = segment.data_slice(key_start as u32, key_len) {
+                let _ = segment.mark_deleted(offset, key);
+                // Whole segments only. Compacting a partly-used segment into
+                // its predecessor is the expensive half and is what
+                // `mark_deleted_and_compact` adds.
+                self.try_free_empty_segment(segment_id);
+            }
+        }
+    }
+
     fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H) {
         if location.pool_id() != self.pool.pool_id() {
             return;

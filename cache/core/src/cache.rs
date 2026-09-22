@@ -175,6 +175,11 @@ impl CacheLayer {
         dispatch!(self, mark_deleted_and_compact(location, hashtable))
     }
 
+    /// Mark an item deleted and free its segment if that emptied it.
+    pub fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        dispatch!(self, mark_deleted_and_free_empty(location))
+    }
+
     /// Get the remaining TTL for an item.
     pub fn item_ttl(&self, location: ItemLocation) -> Option<Duration> {
         dispatch!(self, item_ttl(location))
@@ -489,6 +494,9 @@ pub struct TieredCache<H: Hashtable> {
     /// Maximum eviction attempts per write.
     max_eviction_attempts: usize,
 
+    /// What an overwrite does with the superseded copy's bytes.
+    overwrite_reclaim: crate::config::OverwriteReclaim,
+
     /// Atomic counters for demotion and eviction events.
     stats: CacheStats,
 }
@@ -604,7 +612,7 @@ impl<H: Hashtable> TieredCache<H> {
         {
             Ok(Some(old_location)) => {
                 // Key existed, mark old location as deleted
-                self.mark_deleted_at(old_location);
+                self.supersede_at(old_location);
             }
             Ok(None) => {
                 // New key or ghost resurrection
@@ -695,7 +703,7 @@ impl<H: Hashtable> TieredCache<H> {
         {
             Ok(Some(old_location)) => {
                 // Key existed, mark old location as deleted
-                self.mark_deleted_at(old_location);
+                self.supersede_at(old_location);
             }
             Ok(None) => {
                 // New key or ghost resurrection
@@ -786,7 +794,7 @@ impl<H: Hashtable> TieredCache<H> {
             .update_if_present(key, location.to_location(), &verifier)
         {
             Ok(old_location) => {
-                self.mark_deleted_at(old_location);
+                self.supersede_at(old_location);
                 Ok(())
             }
             Err(e) => {
@@ -1089,7 +1097,7 @@ impl<H: Hashtable> TieredCache<H> {
             .hashtable
             .cas_location(key, current_location, new_location.to_location(), true)
         {
-            self.mark_deleted_at(current_location);
+            self.supersede_at(current_location);
             return Ok(true);
         }
 
@@ -1561,6 +1569,32 @@ impl<H: Hashtable> TieredCache<H> {
     }
 
     /// Mark an item as deleted at the given location.
+    /// Supersede an item, reclaiming its space according to the configured
+    /// policy.
+    ///
+    /// The four overwrite paths -- `set`, `replace`, `cas` and a committed
+    /// streaming set -- all route through here so they cannot drift apart
+    /// from each other, which is how the deferred behaviour came to differ
+    /// from `delete` in the first place.
+    fn supersede_at(&self, location: Location) {
+        match self.overwrite_reclaim {
+            crate::config::OverwriteReclaim::Deferred => self.mark_deleted_at(location),
+            crate::config::OverwriteReclaim::FreeEmpty => self.mark_deleted_at_free_empty(location),
+            crate::config::OverwriteReclaim::Compact => self.mark_deleted_at_with_compact(location),
+        }
+    }
+
+    /// Mark deleted and free the segment if that emptied it, without
+    /// attempting predecessor compaction.
+    fn mark_deleted_at_free_empty(&self, location: Location) {
+        let item_loc = ItemLocation::from_location(location);
+        if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
+            && let Some(layer) = self.layers.get(layer_idx)
+        {
+            layer.mark_deleted_and_free_empty(item_loc);
+        }
+    }
+
     fn mark_deleted_at(&self, location: Location) {
         let item_loc = ItemLocation::from_location(location);
         if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
@@ -1853,6 +1887,7 @@ pub struct TieredCacheBuilder<H: Hashtable> {
     pool_map: [Option<usize>; 4],
     eviction_threshold: usize,
     max_eviction_attempts: usize,
+    overwrite_reclaim: crate::config::OverwriteReclaim,
 }
 
 impl<H: Hashtable> TieredCacheBuilder<H> {
@@ -1862,6 +1897,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
             hashtable,
             layers: Vec::new(),
             pool_map: [None; 4],
+            overwrite_reclaim: crate::config::OverwriteReclaim::default(),
             eviction_threshold: 1,
             max_eviction_attempts: 10,
         }
@@ -1934,6 +1970,16 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
         self
     }
 
+    /// What an overwrite does with the superseded copy's bytes.
+    ///
+    /// Defaults to `Deferred`, which is the behaviour every overwrite path
+    /// has always had: mark the old copy deleted and leave its bytes until a
+    /// merge pass sweeps the segment. `delete` alone reclaims eagerly.
+    pub fn overwrite_reclaim(mut self, policy: crate::config::OverwriteReclaim) -> Self {
+        self.overwrite_reclaim = policy;
+        self
+    }
+
     /// Build the tiered cache.
     pub fn build(mut self) -> TieredCache<H> {
         // Wire each layer to demote into the next one added, unless the caller
@@ -1962,6 +2008,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
             pool_map: self.pool_map,
             eviction_threshold: self.eviction_threshold,
             max_eviction_attempts: self.max_eviction_attempts,
+            overwrite_reclaim: self.overwrite_reclaim,
             stats: CacheStats::new(),
         }
     }
@@ -1970,6 +2017,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::config::OverwriteReclaim;
     use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::layer::{FifoLayerBuilder, TtlLayerBuilder};
 
@@ -2403,6 +2451,38 @@ mod tests {
         );
     }
 
+    fn create_test_cache_with_reclaim(
+        policy: OverwriteReclaim,
+    ) -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
+        let fifo_config = LayerConfig::new()
+            .with_next_layer(1)
+            .with_demotion_threshold(1);
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(256 * 1024)
+            .spare_capacity(0)
+            .config(fifo_config)
+            .build()
+            .expect("fifo layer");
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(512 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+        TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo_layer)
+            .with_ttl_layer(ttl_layer)
+            .eviction_threshold(1)
+            .overwrite_reclaim(policy)
+            .build()
+    }
+
     fn create_test_cache() -> TieredCache<MultiChoiceHashtable> {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10)); // 2^10 = 1024 buckets
 
@@ -2827,6 +2907,64 @@ mod tests {
         // Run expiration (shouldn't expire anything with 1 hour TTL)
         let expired = cache.expire();
         assert_eq!(expired, 0);
+    }
+
+    /// Every reclamation policy must preserve the live set.
+    ///
+    /// This pins correctness, not benefit. The benefit is a capacity effect
+    /// that needs a realistic segment count to appear: at this fixture's
+    /// eight segments in layer 1, all three policies return identical
+    /// survivor and free-segment counts, because merge already reclaims
+    /// everything the workload frees. The measurement that motivated the
+    /// policy ran 128 segments on a real trace, and belongs on the rig
+    /// rather than here -- a unit test tuned until it showed a difference
+    /// would be measuring the tuning.
+    #[test]
+    fn every_reclamation_policy_preserves_the_live_set() {
+        fn survivors(policy: OverwriteReclaim) -> u64 {
+            let cache = create_test_cache_with_reclaim(policy);
+            let value = vec![0xABu8; 1024];
+            for i in 0..200u32 {
+                let key = format!("key-{i:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    let _ = cache.get(key.as_bytes());
+                }
+            }
+            // Rewrite repeatedly: every one of these supersedes a copy that
+            // is still resident, which is the path that never reclaimed.
+            let bigger = vec![0xCDu8; 1024];
+            for _round in 0..20 {
+                for i in 0..200u32 {
+                    let key = format!("key-{i:08}");
+                    let _ = cache.set(key.as_bytes(), &bigger, b"", Duration::from_secs(3600));
+                }
+            }
+            let mut alive = 0u64;
+            for i in 0..200u32 {
+                let key = format!("key-{i:08}");
+                if let Some(v) = cache.get(key.as_bytes()) {
+                    // The survivor must be the copy written last, or a
+                    // policy could "preserve" the live set by serving a
+                    // superseded copy.
+                    let bytes: &[u8] = &v;
+                    assert_eq!(bytes[0], 0xCD, "{policy:?} served a superseded copy");
+                    alive += 1;
+                }
+            }
+            alive
+        }
+
+        let deferred = survivors(OverwriteReclaim::Deferred);
+        for policy in [OverwriteReclaim::FreeEmpty, OverwriteReclaim::Compact] {
+            assert_eq!(
+                survivors(policy),
+                deferred,
+                "{policy:?} lost live items the deferred policy kept"
+            );
+        }
     }
 
     #[test]

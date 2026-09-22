@@ -1052,6 +1052,13 @@ impl Layer for IoUringDiskLayer {
         // Disk layer doesn't compact
         self.mark_deleted(location);
     }
+
+    fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        // Nor does it reclaim a file region early: space here is recovered
+        // when the whole region is rewritten, so there is nothing an
+        // overwrite can free on its own.
+        self.mark_deleted(location);
+    }
 }
 
 /// Builder for [`IoUringDiskLayer`].

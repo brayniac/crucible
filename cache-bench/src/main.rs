@@ -609,6 +609,12 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
 
     builder = apply_reproducibility_seeds(builder, &config.cache);
 
+    // Applied before the policy selection below, so it holds whichever
+    // layer topology the policy chooses.
+    if let Some(policy) = config.cache.overwrite_reclaim {
+        builder = builder.overwrite_reclaim(policy.into());
+    }
+
     builder = match config.cache.policy {
         EvictionPolicy::S3Fifo => {
             let mut b = builder.s3fifo();

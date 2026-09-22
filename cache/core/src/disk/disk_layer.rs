@@ -599,6 +599,13 @@ impl Layer for DiskLayer {
         // Disk layer doesn't do compaction - just mark deleted
         self.mark_deleted(location);
     }
+
+    fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        // Nor does it reclaim a file region early: space here is recovered
+        // when the whole region is rewritten, so there is nothing an
+        // overwrite can free on its own.
+        self.mark_deleted(location);
+    }
 }
 
 /// Builder for [`DiskLayer`].

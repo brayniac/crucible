@@ -567,3 +567,28 @@ mod tests {
         assert!(config.target_ratio.abs() < f64::EPSILON);
     }
 }
+
+/// What an overwrite does with the space the superseded copy held.
+///
+/// `set`, `replace`, `cas` and a committed streaming set all supersede an
+/// existing item, and all four historically marked the old copy deleted and
+/// left its bytes in place until a merge pass happened to sweep the segment.
+/// `delete` alone reclaimed eagerly.
+///
+/// That asymmetry is measurable. On an overwrite-heavy trace (80% SET) the
+/// cache held 1673 bytes per resident item against a comparable engine's
+/// 909, and the figure grew with heap size -- a larger heap gives dead bytes
+/// more room to accumulate before pressure forces a merge -- while the
+/// comparable engine's stayed flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverwriteReclaim {
+    /// Mark the old copy deleted and leave its bytes for the next merge.
+    #[default]
+    Deferred,
+    /// Also free the segment if the overwrite emptied it. This is what the
+    /// comparable engine does on the same operation.
+    FreeEmpty,
+    /// Also attempt compaction with the predecessor segment, which is what
+    /// `delete` has always done.
+    Compact,
+}

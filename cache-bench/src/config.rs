@@ -80,6 +80,15 @@ pub struct CacheConfig {
     /// default, which is a latency choice rather than a correctness one.
     #[serde(default)]
     pub main_target_ratio: Option<f64>,
+    /// What an overwrite does with the superseded copy's bytes.
+    ///
+    /// `set`, `replace`, `cas` and a committed streaming set all supersede
+    /// an existing item; all four leave its bytes for the next merge, while
+    /// `delete` reclaims eagerly. On an 80%-SET trace that asymmetry showed
+    /// as 1673 bytes per resident item against a comparable engine's 909,
+    /// widening with heap size. Unset leaves the historical behaviour.
+    #[serde(default)]
+    pub overwrite_reclaim: Option<OverwriteReclaimConfig>,
     /// Optional disk tier configuration.
     #[serde(default)]
     pub disk: Option<DiskConfig>,
@@ -216,6 +225,31 @@ impl std::fmt::Display for CacheBackend {
             CacheBackend::Slab => write!(f, "slab"),
             CacheBackend::Heap => write!(f, "heap"),
             CacheBackend::CacheRs => write!(f, "cachers"),
+        }
+    }
+}
+
+/// What an overwrite does with the superseded copy's bytes.
+///
+/// `delete` has always reclaimed eagerly; the four overwrite paths never
+/// did. See the field on `CacheConfig` for what that costs.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverwriteReclaimConfig {
+    /// Leave the superseded bytes for the next merge pass.
+    Deferred,
+    /// Free the segment if the overwrite emptied it.
+    FreeEmpty,
+    /// Also attempt compaction with the predecessor, as `delete` does.
+    Compact,
+}
+
+impl From<OverwriteReclaimConfig> for cache_core::OverwriteReclaim {
+    fn from(value: OverwriteReclaimConfig) -> Self {
+        match value {
+            OverwriteReclaimConfig::Deferred => cache_core::OverwriteReclaim::Deferred,
+            OverwriteReclaimConfig::FreeEmpty => cache_core::OverwriteReclaim::FreeEmpty,
+            OverwriteReclaimConfig::Compact => cache_core::OverwriteReclaim::Compact,
         }
     }
 }
@@ -503,6 +537,43 @@ warmup_records = 1000
             Err(e) => e,
         };
         assert!(err.to_string().contains("at least 1"), "{err}");
+    }
+
+    #[test]
+    fn an_overwrite_reclaim_policy_parses() {
+        for (text, expected) in [
+            ("deferred", OverwriteReclaimConfig::Deferred),
+            ("free-empty", OverwriteReclaimConfig::FreeEmpty),
+            ("compact", OverwriteReclaimConfig::Compact),
+        ] {
+            let toml = TRACE_TOML.replace(
+                "hashtable_power = 20",
+                &format!("hashtable_power = 20\noverwrite_reclaim = \"{text}\""),
+            );
+            let cfg =
+                Config::from_toml(&toml).unwrap_or_else(|e| panic!("{text} should parse: {e}"));
+            assert_eq!(cfg.cache.overwrite_reclaim, Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_overwrite_reclaim_policy_is_rejected() {
+        // A typo must not fall back to the historical behaviour while the
+        // run reports itself as having used the policy that was asked for.
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\noverwrite_reclaim = \"eager\"",
+        );
+        assert!(
+            Config::from_toml(&toml).is_err(),
+            "an unknown reclaim policy should be rejected, not defaulted"
+        );
+    }
+
+    #[test]
+    fn overwrite_reclaim_defaults_to_the_historical_behaviour() {
+        let cfg = Config::from_toml(TRACE_TOML).expect("parse");
+        assert_eq!(cfg.cache.overwrite_reclaim, None);
     }
 
     #[test]

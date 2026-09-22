@@ -385,6 +385,7 @@ pub struct SegCacheBuilder {
 
     /// io_uring disk tier configuration (optional, Direct I/O).
     io_uring_disk_tier: Option<IoUringDiskTierConfig>,
+    overwrite_reclaim: cache_core::OverwriteReclaim,
 }
 
 /// The layer strategy a single-layer policy runs.
@@ -441,6 +442,7 @@ impl SegCacheBuilder {
     /// - Disk tier: disabled
     pub fn new() -> Self {
         Self {
+            overwrite_reclaim: cache_core::OverwriteReclaim::default(),
             heap_size: 64 * 1024 * 1024, // 64MB
             segment_size: 1024 * 1024,   // 1MB
             hashtable_power: 16,         // 64K buckets
@@ -621,6 +623,16 @@ impl SegCacheBuilder {
     /// # Errors
     ///
     /// Returns an error if memory allocation fails or configuration is invalid.
+    /// What an overwrite does with the superseded copy's bytes.
+    ///
+    /// Defaults to the behaviour every overwrite path has always had:
+    /// mark the old copy deleted and leave its bytes until a merge pass
+    /// sweeps the segment. `delete` alone reclaims eagerly.
+    pub fn overwrite_reclaim(mut self, policy: cache_core::OverwriteReclaim) -> Self {
+        self.overwrite_reclaim = policy;
+        self
+    }
+
     pub fn build(self) -> Result<SegCache, std::io::Error> {
         // Create hashtable
         let hashtable = Arc::new(match self.hashtable_seed {
@@ -675,7 +687,9 @@ impl SegCacheBuilder {
 
         let layer = layer_builder.build()?;
 
-        let mut builder = TieredCacheBuilder::new(hashtable).with_layer(CacheLayer::Ttl(layer));
+        let mut builder = TieredCacheBuilder::new(hashtable)
+            .with_layer(CacheLayer::Ttl(layer))
+            .overwrite_reclaim(self.overwrite_reclaim);
 
         // Add disk layer if configured
         if let Some(disk_config) = self.disk_tier {
