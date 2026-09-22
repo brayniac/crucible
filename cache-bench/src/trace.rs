@@ -48,6 +48,8 @@ pub enum Op {
     Append = 7,
     Prepend = 8,
     Delete = 9,
+    Incr = 10,
+    Decr = 11,
 }
 
 impl Op {
@@ -56,6 +58,14 @@ impl Op {
     /// Returns the offending byte rather than defaulting to `Get`: a trace
     /// whose op codes we cannot read is a trace we are misinterpreting, and a
     /// silent default would turn that into a plausible-looking hit ratio.
+    ///
+    /// The format defines eleven operations. Codes 1-9 are cross-checked
+    /// against twitter/rpc-perf's replay decoder, which maps 6 to `Replace`
+    /// and so fixes the numbering that the dataset's prose listing leaves
+    /// ambiguous; 10 and 11 are `incr` and `decr`. Note rpc-perf *skips*
+    /// codes it does not implement, which is why its own table is shorter
+    /// than this one -- a shorter table there is not evidence of a shorter
+    /// format.
     pub fn from_u8(v: u8) -> Result<Self, u8> {
         match v {
             1 => Ok(Op::Get),
@@ -67,6 +77,8 @@ impl Op {
             7 => Ok(Op::Append),
             8 => Ok(Op::Prepend),
             9 => Ok(Op::Delete),
+            10 => Ok(Op::Incr),
+            11 => Ok(Op::Decr),
             other => Err(other),
         }
     }
@@ -301,6 +313,25 @@ mod tests {
         let op_ttl_packed = ((op as u32) << 24) | (ttl & 0x00FF_FFFF);
         out[16..20].copy_from_slice(&op_ttl_packed.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn incr_and_decr_are_decoded_rather_than_rejected() {
+        // The format defines eleven operations; op 10 and 11 are incr and
+        // decr, confirmed against twitter/rpc-perf's replay decoder and the
+        // dataset's own documentation. Rejecting them failed the whole run
+        // on any trace that used a counter, which is two of the corpus.
+        assert_eq!(Op::from_u8(10), Ok(Op::Incr));
+        assert_eq!(Op::from_u8(11), Ok(Op::Decr));
+    }
+
+    #[test]
+    fn an_undefined_op_code_is_still_rejected() {
+        // The point of decoding strictly is unchanged: a code the format does
+        // not define means we are misreading the trace, and a silent default
+        // would turn that into a plausible-looking hit ratio.
+        assert_eq!(Op::from_u8(12), Err(12));
+        assert_eq!(Op::from_u8(0), Err(0));
     }
 
     #[test]

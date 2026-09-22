@@ -106,7 +106,10 @@ pub fn apply_record<C: Cache>(
     write_key(key_buf, record.key_id, record.key_len);
 
     let value_len = record.value_len as usize;
-    let needs_value = !matches!(record.op, Op::Get | Op::Gets | Op::Delete);
+    let needs_value = !matches!(
+        record.op,
+        Op::Get | Op::Gets | Op::Delete | Op::Incr | Op::Decr
+    );
     if (needs_value || insert_on_miss) && value_len > value_pool.len() {
         // Storing a short value would understate the trace's memory footprint
         // and therefore overstate how many items fit — the denominator of
@@ -129,6 +132,24 @@ pub fn apply_record<C: Cache>(
         Op::Delete => {
             cache.delete(key_buf);
             stats.deletes += 1;
+        }
+        Op::Incr | Op::Decr => {
+            // A counter operation reads, modifies and writes back in place.
+            // It is replayed as a lookup for three reasons: on a miss the
+            // real operation fails rather than creating the key, so writing
+            // here would invent residency the workload never had; the item's
+            // size does not change, so it moves nothing between segments;
+            // and the trace records a value size but not the increment
+            // amount, so the arithmetic cannot be reproduced anyway.
+            //
+            // It goes through the same read path as `Get` rather than
+            // `contains` so that it bumps the frequency counter -- an access
+            // is an access, and eviction policy depends on that.
+            if cache.with_value(key_buf, |_| ()).is_some() {
+                stats.hits += 1;
+            } else {
+                stats.misses += 1;
+            }
         }
         Op::Set | Op::Add | Op::Cas | Op::Replace | Op::Append | Op::Prepend => {
             store(cache, key_buf, &value_pool[..value_len], record, stats);
@@ -510,6 +531,69 @@ mod tests {
             .hashtable_power(12)
             .build()
             .expect("failed to build test cache")
+    }
+
+    #[test]
+    fn a_counter_operation_is_a_lookup_not_an_insert() {
+        // incr/decr read-modify-write an existing counter. On a miss the
+        // real operation fails rather than creating the key, so replaying it
+        // as a write would invent residency the workload never had.
+        let cache = small_cache();
+        let mut stats = ReplayStats::default();
+        let mut key = Vec::new();
+        let pool = vec![0u8; 4096];
+
+        apply_record(
+            &cache,
+            &record(1, Op::Incr, 8, 0),
+            &mut key,
+            &pool,
+            false,
+            &mut stats,
+        );
+        assert_eq!(stats.misses, 1, "a counter op on an absent key is a miss");
+        assert_eq!(stats.sets, 0, "it must not insert on miss");
+
+        apply_record(
+            &cache,
+            &record(2, Op::Set, 64, 0),
+            &mut key,
+            &pool,
+            false,
+            &mut stats,
+        );
+        apply_record(
+            &cache,
+            &record(2, Op::Incr, 8, 0),
+            &mut key,
+            &pool,
+            false,
+            &mut stats,
+        );
+        assert_eq!(stats.hits, 1, "a counter op on a present key is a hit");
+        assert_eq!(stats.sets, 1, "the counter op must not have written again");
+    }
+
+    #[test]
+    fn a_trace_carrying_a_counter_operation_replays_to_the_end() {
+        // The regression this exists for: before incr was decoded, a trace
+        // using counters aborted the run with "unknown op code 10" and
+        // reported nothing at all.
+        let mut bytes = twitter_bytes(1, 64, Op::Set).to_vec();
+        bytes.extend_from_slice(&twitter_bytes(1, 8, Op::Incr));
+        bytes.extend_from_slice(&twitter_bytes(1, 64, Op::Get));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counters.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader =
+            crate::trace::TraceReader::open(&path, crate::trace::TraceFormat::Twitter).unwrap();
+        let mut n = 0;
+        while let Some(r) = reader.next_record() {
+            r.expect("a counter operation must not abort the replay");
+            n += 1;
+        }
+        assert_eq!(n, 3, "all three records should decode");
     }
 
     fn record(key_id: u64, op: Op, value_len: u32, ttl_secs: u32) -> TraceRecord {
