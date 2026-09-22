@@ -97,6 +97,14 @@ pub struct TraceRecord {
     pub op: Op,
     /// TTL in seconds; 0 means no expiry.
     pub ttl_secs: u32,
+    /// Record timestamp, in the trace's own seconds.
+    ///
+    /// Carried so a replay can drive the cache's clock from the trace rather
+    /// than the wall clock. Without it a run consumes hours of recorded time
+    /// in seconds and no TTL shorter than the run ever fires, which measures
+    /// expiry -- and every policy that depends on it -- as absent. Zero for
+    /// formats that carry no timestamp.
+    pub timestamp_secs: u32,
 }
 
 impl TraceRecord {
@@ -116,6 +124,7 @@ impl TraceRecord {
             value_len: kv_packed & 0x003F_FFFF,
             op: Op::from_u8((op_ttl_packed >> 24) as u8)?,
             ttl_secs: op_ttl_packed & 0x00FF_FFFF,
+            timestamp_secs: u32::from_le_bytes(data[0..4].try_into().expect("4 bytes")),
         })
     }
 
@@ -132,6 +141,11 @@ impl TraceRecord {
             value_len: u32::from_le_bytes(data[12..16].try_into().expect("4 bytes")),
             op: Op::Get,
             ttl_secs: 0,
+            // This layout's leading field is a virtual time, not unix
+            // seconds, so it cannot drive a wall-clock-shaped clock. Every
+            // record here carries ttl_secs 0 in any case, so expiry never
+            // applies and there is nothing for a clock to decide.
+            timestamp_secs: 0,
         }
     }
 }
@@ -295,6 +309,8 @@ fn parse_oracle_general_csv_line(line: &str) -> Option<TraceRecord> {
         value_len,
         op: Op::Get,
         ttl_secs: 0,
+        // Virtual time again, and no TTLs; see `from_oracle_general_bytes`.
+        timestamp_secs: 0,
     })
 }
 

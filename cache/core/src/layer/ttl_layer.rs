@@ -193,9 +193,7 @@ impl TtlLayer {
 
     /// Get current time as coarse seconds.
     fn now_secs() -> u32 {
-        clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs()
+        crate::clock::now_unix_secs()
     }
 
     /// Reset the layer to its freshly built state: empty TTL buckets, no

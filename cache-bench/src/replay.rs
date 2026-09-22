@@ -253,6 +253,20 @@ pub fn run_replay<C: Cache>(
         // workload, which is the failure this whole rig exists to avoid.
         let record = result?;
 
+        // Cache time follows trace time, one second for one second, so a TTL
+        // expires after as many records as it did in production. Otherwise
+        // the cache expires against the wall clock while this loop consumes
+        // hours of recorded time in seconds, and a TTL shorter than the run
+        // never fires at all.
+        //
+        // Set per record rather than per interval: expiry is checked on
+        // every read, so a clock that lagged the record being applied would
+        // expire items late by however far it lagged.
+        #[cfg(feature = "virtual-clock")]
+        if record.timestamp_secs != 0 {
+            cache_core::clock::set_virtual_now(record.timestamp_secs);
+        }
+
         let in_warmup = reader.records_read() <= opts.warmup_records;
         let stats = if in_warmup {
             &mut warmup
@@ -603,6 +617,7 @@ mod tests {
             value_len,
             op,
             ttl_secs,
+            timestamp_secs: 0,
         }
     }
 
@@ -613,6 +628,66 @@ mod tests {
         out[12..16].copy_from_slice(&kv_packed.to_le_bytes());
         out[16..20].copy_from_slice(&((op as u32) << 24).to_le_bytes());
         out
+    }
+
+    /// Like `twitter_bytes`, but carrying the timestamp and TTL fields the
+    /// clock work depends on. Kept separate so the existing callers keep
+    /// stating only what they care about.
+    fn twitter_bytes_at(
+        key_id: u64,
+        value_len: u32,
+        op: Op,
+        ttl_secs: u32,
+        timestamp_secs: u32,
+    ) -> [u8; 20] {
+        let mut out = twitter_bytes(key_id, value_len, op);
+        out[0..4].copy_from_slice(&timestamp_secs.to_le_bytes());
+        out[16..20]
+            .copy_from_slice(&(((op as u32) << 24) | (ttl_secs & 0x00FF_FFFF)).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_record_carries_its_timestamp_and_ttl() {
+        let bytes = twitter_bytes_at(7, 64, Op::Set, 300, 1_700_000_000);
+        let record = crate::trace::TraceRecord::from_twitter_bytes(&bytes).expect("decode");
+        assert_eq!(record.timestamp_secs, 1_700_000_000, "timestamp");
+        assert_eq!(record.ttl_secs, 300, "ttl");
+        assert_eq!(record.key_id, 7, "key id");
+        assert_eq!(record.op, Op::Set, "op");
+    }
+
+    /// The replay must move the cache's clock to the record it is applying.
+    ///
+    /// This is the whole point of carrying the timestamp: with the clock
+    /// left on wall time, a 60s TTL in a trace spanning hours outlives the
+    /// entire run, and expiry -- the mechanism TTL-bucketed segments exist
+    /// to exploit -- is measured as if it never happened.
+    #[test]
+    #[cfg(feature = "virtual-clock")]
+    fn replaying_advances_the_cache_clock_to_trace_time() {
+        let mut bytes = Vec::new();
+        for (i, ts) in [1_700_000_000u32, 1_700_000_060, 1_700_000_120]
+            .iter()
+            .enumerate()
+        {
+            bytes.extend_from_slice(&twitter_bytes_at(i as u64, 64, Op::Set, 300, *ts));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timestamps.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader =
+            crate::trace::TraceReader::open(&path, crate::trace::TraceFormat::Twitter).unwrap();
+        let cache = small_cache();
+        run_replay(&cache, &mut reader, &opts(0, 1000)).expect("replay");
+
+        assert_eq!(
+            cache_core::clock::virtual_now(),
+            Some(1_700_000_120),
+            "clock should sit at the last record's timestamp"
+        );
+        cache_core::clock::clear_virtual_now();
     }
 
     fn opts(warmup: u64, interval: u64) -> ReplayOptions {

@@ -350,9 +350,7 @@ impl<'a> SliceSegment<'a> {
         key: &[u8],
     ) -> Result<BasicItemGuard<'_>, CacheError> {
         // Check segment expiration
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         let expire_at = self.expire_at.load(Ordering::Acquire);
         if expire_at > 0 && now >= expire_at {
             self.release_ref();
@@ -466,9 +464,7 @@ impl<'a> SliceSegment<'a> {
         }
 
         // Check per-item expiration
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         if header.is_expired(now) {
             self.release_ref();
             return Err(CacheError::Expired);
@@ -561,9 +557,7 @@ impl<'a> SliceSegment<'a> {
     /// Get raw value reference for BasicHeader segments.
     fn get_value_ref_raw_basic(&self, offset: u32, key: &[u8]) -> Result<ValueRefRaw, CacheError> {
         // Check segment expiration
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         let expire_at = self.expire_at.load(Ordering::Acquire);
         if expire_at > 0 && now >= expire_at {
             self.release_ref();
@@ -664,9 +658,7 @@ impl<'a> SliceSegment<'a> {
         }
 
         // Check item-level TTL
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         if header.is_expired(now) {
             self.release_ref();
             return Err(CacheError::Expired);
@@ -2689,10 +2681,7 @@ mod tests {
         let (segment, ptr, layout) = create_test_segment(0, true, 0, 4096);
         segment.try_reserve();
 
-        let expire_at = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs()
-            + 3600;
+        let expire_at = crate::clock::now_unix_secs() + 3600;
 
         let offset = segment.append_item_with_ttl(b"test_key", b"test_value", b"", expire_at);
         assert!(offset.is_some());
@@ -2725,9 +2714,7 @@ mod tests {
         segment.try_reserve();
 
         // Set far-future expiration
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         segment.set_expire_at(now + 3600);
 
         // Transition to Live for reads
@@ -2771,9 +2758,7 @@ mod tests {
         let (segment, ptr, layout) = create_test_segment(0, true, 0, 4096);
         segment.try_reserve();
 
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         let expire_at = now + 3600;
 
         let offset = segment
@@ -2895,9 +2880,7 @@ mod tests {
         let (segment, ptr, layout) = create_test_segment(0, false, 0, 1024);
 
         // No expire_at set yet
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         assert!(segment.segment_ttl(now).is_none());
 
         // Set far future expiration
@@ -2996,12 +2979,7 @@ mod tests {
     fn test_get_item_key_mismatch() {
         let (segment, ptr, layout) = create_test_segment(0, false, 0, 4096);
         segment.try_reserve();
-        segment.set_expire_at(
-            clocksource::coarse::UnixInstant::now()
-                .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-                .as_secs()
-                + 3600,
-        );
+        segment.set_expire_at(crate::clock::now_unix_secs() + 3600);
         segment.cas_metadata(State::Reserved, State::Live, None, None);
 
         let offset = segment.append_item(b"correct_key", b"value", b"").unwrap();
@@ -3038,12 +3016,7 @@ mod tests {
     fn test_get_item_deleted() {
         let (segment, ptr, layout) = create_test_segment(0, false, 0, 4096);
         segment.try_reserve();
-        segment.set_expire_at(
-            clocksource::coarse::UnixInstant::now()
-                .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-                .as_secs()
-                + 3600,
-        );
+        segment.set_expire_at(crate::clock::now_unix_secs() + 3600);
         segment.cas_metadata(State::Reserved, State::Live, None, None);
 
         let offset = segment.append_item(b"key", b"value", b"").unwrap();
@@ -3062,12 +3035,7 @@ mod tests {
     fn test_get_item_invalid_offset() {
         let (segment, ptr, layout) = create_test_segment(0, false, 0, 4096);
         segment.try_reserve();
-        segment.set_expire_at(
-            clocksource::coarse::UnixInstant::now()
-                .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-                .as_secs()
-                + 3600,
-        );
+        segment.set_expire_at(crate::clock::now_unix_secs() + 3600);
         segment.cas_metadata(State::Reserved, State::Live, None, None);
 
         // Offset beyond capacity
@@ -3086,9 +3054,7 @@ mod tests {
         segment.try_reserve();
         segment.cas_metadata(State::Reserved, State::Live, None, None);
 
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         let expire_at = now + 3600;
 
         let offset = segment
@@ -3180,9 +3146,7 @@ mod tests {
         let (segment, ptr, layout) = create_test_segment(0, true, 0, 4096);
         segment.try_reserve();
 
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
 
         let offset = segment
             .append_item_with_ttl(b"key", b"value", b"", now + 3600)
@@ -3250,9 +3214,7 @@ mod tests {
         let (segment, ptr, layout) = create_test_segment(0, false, 0, 4096);
         segment.try_reserve();
 
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         segment.set_expire_at(now + 3600);
 
         let offset = segment.append_item(b"key", b"value", b"").unwrap();
@@ -3272,9 +3234,7 @@ mod tests {
         let (segment, ptr, layout) = create_test_segment(0, true, 0, 1024);
 
         // Invalid offset for per-item TTL
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
         let ttl = segment.item_ttl(5000, now);
         assert!(ttl.is_none());
 
@@ -3435,9 +3395,7 @@ impl SegmentPrune for SliceSegment<'_> {
             BasicHeader::SIZE
         };
 
-        let now = clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs();
+        let now = crate::clock::now_unix_secs();
 
         let mut offset = 0u32;
         let write_offset = self.write_offset();

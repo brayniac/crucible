@@ -349,6 +349,18 @@ fn run_trace_replay<C: Cache>(
         }
     );
     eprintln!("  insert on miss: {}", opts.insert_on_miss);
+    // A result that does not say whether expiry was live is not comparable
+    // with one that does: with the clock on wall time, a TTL shorter than
+    // the run never fires, and every policy that consults expiry is
+    // measured against a mechanism that was effectively switched off.
+    eprintln!(
+        "  clock:      {}",
+        if cfg!(feature = "virtual-clock") {
+            "trace time (TTLs fire as recorded)"
+        } else {
+            "wall clock (TTLs shorter than the run never fire)"
+        }
+    );
     eprintln!();
 
     let mut reader = trace::TraceReader::open(&trace_cfg.path, trace_cfg.format.into())?;

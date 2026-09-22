@@ -9,6 +9,12 @@ description = "Redesigned cache-core with layer-based architecture"
 
 [features]
 default = []
+# Let a caller drive expiry from its own clock instead of the system one.
+# Gated because the check sits on the read path: with it off, the clock
+# helper compiles to the same system call the code made before it existed.
+# Trace replay needs it -- a replay consumes hours of recorded time in
+# seconds, so wall-clock expiry never fires.
+virtual-clock = []
 loom = ["dep:loom"]
 # Randomized concurrency testing under sequential consistency. Deliberately
 # complementary to `loom`, not a replacement:

@@ -63,6 +63,7 @@
 #![warn(clippy::all)]
 
 // Core types
+pub mod clock;
 mod config;
 mod error;
 mod location;

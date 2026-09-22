@@ -45,6 +45,12 @@ tikv-jemallocator = { workspace = true }
 [features]
 default = []
 cache-rs = ["dep:cache_rs"]
+# Drive the cache's expiry clock from the trace's own timestamps. Without
+# it the cache expires against the wall clock while the replay consumes
+# hours of recorded time in seconds, so no TTL shorter than the run ever
+# fires and every policy that consults expiry is measured as though the
+# mechanism were absent.
+virtual-clock = ["cache-core/virtual-clock"]
 
 [dev-dependencies]
 tempfile = "3"
