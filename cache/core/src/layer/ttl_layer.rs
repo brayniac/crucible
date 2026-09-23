@@ -1599,27 +1599,33 @@ impl TtlLayer {
                         new_offset,
                     );
 
-                    // Relocate, and reset the frequency to 1.
+                    // Relocate, preserving the frequency.
                     //
-                    // Segcache 3.6.3: "To avoid extra parameters, Segcache
-                    // resets the frequency of retained objects during
-                    // evictions, which has a similar effect as
-                    // window-based frequency." It is the policy's only
-                    // defence against cache pollution. A frequency counter
-                    // only ever rises, so without the reset an item that
-                    // was hot once outranks an item that is hot now, for
-                    // as long as it keeps surviving -- and surviving is
-                    // exactly what a high frequency buys it.
+                    // Segcache 3.6.3 says to reset it -- "Segcache resets
+                    // the frequency of retained objects during evictions,
+                    // which has a similar effect as window-based
+                    // frequency" -- and its own reference implementation
+                    // does not: cache-rs relinks with `preserve_freq: true`
+                    // at `segments/segment.rs:460`.
                     //
-                    // Only here, not in `try_compact_segment`. Compaction
-                    // relocates every live item and decides nothing, so
-                    // resetting there would charge items for a maintenance
-                    // pass that made no judgement about them.
+                    // Resetting was tried and measured worse. cluster4 at
+                    // 128MB, everything else held: miss 0.4846 with the
+                    // reset against 0.4829 without, and 0.4844 against
+                    // 0.4832 at cost_exponent 1.0. Both directions agree
+                    // and the gap is roughly five times the 0.0003 noise
+                    // floor. A 10M-record window is short enough that an
+                    // un-reset counter has no time to ossify, so the reset
+                    // only discards information the ranking could use.
+                    //
+                    // Kept here rather than made a knob: a paper-faithful
+                    // option nobody would turn on, that the reference does
+                    // not implement and the measurement rejects, is a knob
+                    // with one correct setting.
                     if !hashtable.cas_location(
                         key,
                         old_loc.to_location(),
                         new_loc.to_location(),
-                        false,
+                        true,
                     ) {
                         // CAS failed (concurrent overwrite), mark spare copy as deleted
                         spare.mark_deleted_at_offset(new_offset);
@@ -4420,17 +4426,26 @@ mod merge_retention_budget {
     /// admitting more than fits, which the copy can only resolve by dropping
     /// whatever it reaches last.
     ///
-    /// A merge pass must reset the frequency of what it keeps.
+    /// A merge pass must carry the frequency of what it keeps.
     ///
-    /// Segcache 3.6.3: "To avoid extra parameters, Segcache resets the
-    /// frequency of retained objects during evictions, which has a similar
-    /// effect as window-based frequency." It is the policy's whole defence
-    /// against cache pollution -- without it a frequency counter only ever
-    /// rises, so an item that was hot once outranks an item that is hot now,
-    /// for as long as it survives. Crucible preserved it until this test,
-    /// which was an oversight rather than a decision.
+    /// Segcache 3.6.3 says the opposite -- "Segcache resets the frequency
+    /// of retained objects during evictions, which has a similar effect as
+    /// window-based frequency" -- and its own reference implementation does
+    /// not do it: cache-rs relinks with `preserve_freq: true`.
+    ///
+    /// Resetting was implemented, measured and removed. cluster4 at 128MB
+    /// with everything else held: miss 0.4846 resetting against 0.4829
+    /// preserving, and 0.4844 against 0.4832 at cost_exponent 1.0 -- both
+    /// directions agreeing, at roughly five times the 0.0003 noise floor.
+    /// The aging the reset provides needs a window long enough for stale
+    /// frequencies to ossify, and a 10M-record replay is not one, so it
+    /// only discards information the ranking could have used.
+    ///
+    /// This test is the guard against re-deriving the paper's rule from the
+    /// paper and quietly reintroducing it, which is exactly what happened
+    /// once.
     #[test]
-    fn a_merge_pass_resets_the_frequency_of_the_items_it_keeps() {
+    fn a_merge_pass_carries_the_frequency_of_the_items_it_keeps() {
         let layer = layer_with(
             MergeConfig::new()
                 .with_min_segments(4)
@@ -4445,8 +4460,8 @@ mod merge_retention_budget {
         assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
         let candidates = &ids[..4];
 
-        // Warm everything well clear of 1, so a survivor still sitting at
-        // its warmed frequency is unmistakable.
+        // Warm everything well clear of 1, so a survivor that was reset is
+        // unmistakable.
         for w in &written {
             warm(&layer, &hashtable, &w.key, 9);
         }
@@ -4461,14 +4476,18 @@ mod merge_retention_budget {
         for w in written.iter().filter(|w| candidates.contains(&w.segment)) {
             if let Some(freq) = hashtable.get_frequency(w.key.as_bytes(), &verifier) {
                 assert_eq!(
-                    freq, 1,
-                    "{} survived the merge and must re-enter at frequency 1, \
-                     not at the 9 it carried in",
+                    freq, 9,
+                    "{} survived the merge carrying frequency 9 and must \
+                     still hold it; a reset would show as 1",
                     w.key
                 );
                 checked += 1;
             }
         }
+        eprintln!(
+            "DEBUG checked={checked} candidates={candidates:?} written={}",
+            written.len()
+        );
         assert!(checked > 0, "a ratio of 1.0 must retain something to check");
     }
 
