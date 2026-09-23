@@ -83,6 +83,33 @@ pub struct MultiChoiceHashtable {
 }
 
 impl MultiChoiceHashtable {
+    /// The coarse epoch stamped on an entry, for tests and diagnostics.
+    ///
+    /// Not on the `Hashtable` trait: nothing in the cache reads it, and the
+    /// rate limit is applied inside `try_update_freq` rather than by any
+    /// caller. It exists so a test can assert the epoch survives operations
+    /// that rebuild the packed word.
+    pub fn entry_epoch(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<u8> {
+        let hash = self.hash_key(key);
+        let tag = Self::tag_from_hash(hash);
+        let buckets = self.bucket_indices(hash);
+        for &bucket_index in &buckets[..self.num_choices as usize] {
+            let bucket = self.bucket(bucket_index);
+            for slot in 0..8 {
+                let packed = bucket.items[slot].load(Ordering::Acquire);
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+                if Hashbucket::tag(packed) == tag
+                    && verifier.verify(key, Hashbucket::location(packed), false)
+                {
+                    return Some(Hashbucket::epoch(packed));
+                }
+            }
+        }
+        None
+    }
+
     /// Create a new hashtable with two-choice hashing (default).
     ///
     /// # Parameters
@@ -1242,12 +1269,27 @@ impl MultiChoiceHashtable {
                     break;
                 }
 
-                let freq = if preserve_freq {
-                    Hashbucket::freq(packed)
+                // Carry the epoch with the frequency. A relink republishes
+                // the same logical item at a new address; it is not an
+                // access, and `pack` would stamp the current epoch and hand
+                // the item a fresh rate limit -- so its next read would
+                // count again inside a second that had already counted one.
+                // Items that merges happen to relocate would then accrue
+                // frequency faster than items that sit still.
+                //
+                // Resetting the frequency is the other case: that treats
+                // the entry as newly admitted, so it takes an insert's
+                // stamp rather than keeping the old one.
+                let new_packed = if preserve_freq {
+                    Hashbucket::pack_at_epoch(
+                        tag,
+                        Hashbucket::freq(packed),
+                        new_location,
+                        Hashbucket::epoch(packed),
+                    )
                 } else {
-                    1
+                    Hashbucket::pack(tag, 1, new_location)
                 };
-                let new_packed = Hashbucket::pack(tag, freq, new_location);
 
                 if slot
                     .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
@@ -3131,6 +3173,52 @@ mod tests {
         assert_eq!(Hashbucket::freq(updated), 50);
         assert_eq!(Hashbucket::tag(updated), 0x123);
         assert_eq!(Hashbucket::location(updated), Location::new(100));
+    }
+
+    /// Relocating an item must not clear its rate limit.
+    ///
+    /// A merge relink republishes an item at a new location through
+    /// `cas_location`, which rebuilds the packed word. `pack` stamps the
+    /// epoch from the clock, so a naive rebuild hands every relocated item a
+    /// fresh limiter -- its next read counts even if it has already been
+    /// counted this second. Relocation is not an access, and an item would
+    /// then accrue frequency faster for having been merged, which is a bias
+    /// toward whatever the merge passes happen to touch.
+    ///
+    /// Caught by cherry-picking the epoch layout onto a branch whose merge
+    /// relinks with `preserve_freq: true`; the two commits were each correct
+    /// and their combination was not.
+    #[test]
+    fn relocating_an_item_carries_its_epoch_with_its_frequency() {
+        let ht = MultiChoiceHashtable::new(10);
+        let key = b"relocated";
+        let old = Location::new(0x1000);
+        let new = Location::new(0x2000);
+        let mut verifier = MockVerifier::new();
+        verifier.add(key, old, false);
+        verifier.add(key, new, false);
+        ht.insert(key, old, &verifier).expect("insert");
+
+        // Read it once so it carries a counted epoch, then find that epoch.
+        let clock = crate::clock::TestClock::start();
+        clock.tick();
+        assert!(ht.lookup(key, &verifier).is_some());
+        let before = ht
+            .entry_epoch(key, &verifier)
+            .expect("the entry must be findable");
+
+        assert!(
+            ht.cas_location(key, old, new, true),
+            "the relink must succeed"
+        );
+        let after = ht
+            .entry_epoch(key, &verifier)
+            .expect("the entry must still be findable");
+        assert_eq!(
+            after, before,
+            "the relink rebuilt the entry and handed it a fresh epoch, so \
+             its next read will count again inside a second that already did"
+        );
     }
 
     /// A burst inside one epoch counts once.
