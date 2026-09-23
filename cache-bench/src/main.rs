@@ -831,6 +831,22 @@ fn print_retention_trace() {
         "  overall:  {:.1}% kept ({total_kept} of {judged} decisions)",
         100.0 * total_kept as f64 / judged as f64
     );
+
+    // Raw counts as well as the rendered table. Reparsing percentages back
+    // into counts loses the denominator, and a cell at 100% over three
+    // decisions is not the same finding as one at 100% over thirty
+    // thousand -- which is exactly the distinction this table exists to
+    // support.
+    for band in 0..SIZE_BANDS {
+        for f in 0..FREQ_BANDS {
+            if considered[band][f] > 0 {
+                println!(
+                    "TRACECELL\t{who}\t{band}\t{f}\t{}\t{}",
+                    considered[band][f], kept[band][f]
+                );
+            }
+        }
+    }
 }
 
 fn merge_config_from(
