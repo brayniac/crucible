@@ -16,6 +16,56 @@ use ahash::RandomState;
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
 
+// ---------------------------------------------------------------------------
+// Entry layout
+//
+// One entry is a single u64, fully packed with no spare bits:
+//
+//     [ TAG_BITS tag ][ EPOCH_BITS epoch ][ 8 freq ][ 44 location ]
+//
+// These were twelve hardcoded `0xFFF0_0000_0000_0000` and `<< 52` literals
+// spread across two SIMD paths and six scalar ones. Changing the split
+// meant finding all of them, and missing one in a SIMD mask would
+// mis-filter probes rather than fail to compile.
+// ---------------------------------------------------------------------------
+
+/// Bits of hash suffix kept per entry, to filter probes before verifying
+/// the key. Fewer bits means more spurious matches, each costing one key
+/// verification -- a segment read and a compare -- but never a wrong answer.
+pub(crate) const TAG_BITS: u32 = 9;
+
+/// Bits of coarse timestamp kept per entry, taken from the tag's share.
+///
+/// Segcache rate-limits frequency increments to at most one per second
+/// (3.6.3, "Smoothed counter"), so a burst of reads cannot inflate an item
+/// the way a raw access count does. It keeps that timestamp in a per-bucket
+/// metadata slot; crucible's bucket is eight item slots with no metadata,
+/// so the epoch is carried per entry instead -- which costs tag bits rather
+/// than 12.5% of hashtable capacity, and is *more* accurate than the
+/// reference, since a shared bucket timestamp under-counts every item in a
+/// busy bucket.
+///
+/// Three bits wrap every 8 seconds. An item whose accesses land on an exact
+/// 8-second stride can therefore find its stored epoch already equal to the
+/// current one and skip an increment, under-counting by up to one in eight.
+/// That biases cold items, which the paper says are the ones the counter
+/// most needs to resolve -- so the width is a measured trade, not a free
+/// choice.
+pub(crate) const EPOCH_BITS: u32 = 3;
+
+const FREQ_BITS: u32 = 8;
+const LOCATION_BITS: u32 = 44;
+
+const _: () = assert!(TAG_BITS + EPOCH_BITS + FREQ_BITS + LOCATION_BITS == 64);
+
+pub(crate) const TAG_SHIFT: u32 = 64 - TAG_BITS;
+pub(crate) const TAG_MASK: u64 = (((1u64 << TAG_BITS) - 1) << TAG_SHIFT);
+/// The tag as a `u16`, before shifting into place.
+pub(crate) const TAG_VALUE_MASK: u64 = (1u64 << TAG_BITS) - 1;
+pub(crate) const EPOCH_SHIFT: u32 = TAG_SHIFT - EPOCH_BITS;
+pub(crate) const EPOCH_VALUE_MASK: u64 = (1u64 << EPOCH_BITS) - 1;
+pub(crate) const EPOCH_MASK: u64 = EPOCH_VALUE_MASK << EPOCH_SHIFT;
+
 /// Lock-free hashtable for caches.
 ///
 /// Each entry stores:
@@ -216,7 +266,7 @@ impl MultiChoiceHashtable {
     /// as any other, and a tag collision only costs one `verify` call.
     #[inline]
     fn tag_from_hash(hash: u64) -> u16 {
-        let tag = ((hash >> 32) & 0xFFF) as u16;
+        let tag = ((hash >> 32) & TAG_VALUE_MASK) as u16;
         if tag == 0 { 1 } else { tag }
     }
 
@@ -259,7 +309,7 @@ impl MultiChoiceHashtable {
             let slots_4_7 = _mm256_load_si256(items_ptr.add(32) as *const __m256i);
 
             // Tag mask and broadcast tag
-            let tag_mask_val = 0xFFF0_0000_0000_0000_u64 as i64;
+            let tag_mask_val = TAG_MASK as i64;
             let tag_shifted_i64 = tag_shifted as i64;
 
             let tag_mask = _mm256_set1_epi64x(tag_mask_val);
@@ -309,7 +359,6 @@ impl MultiChoiceHashtable {
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::aarch64::*;
 
-        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
 
         // SAFETY: Bucket is 64-byte aligned, items start at offset 0.
@@ -427,7 +476,6 @@ impl MultiChoiceHashtable {
     ))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
-        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
 
         let mut result = 0u8;
@@ -512,7 +560,6 @@ impl MultiChoiceHashtable {
         allow_deleted: bool,
         mut packed: u64,
     ) -> Option<(u64, Location)> {
-        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         // Bound only the in-flight-publish case: a slot that keeps publishing
         // a tombstone of our key resolves within a publish, and if it never
@@ -591,9 +638,8 @@ impl MultiChoiceHashtable {
     ) -> Option<(Location, u8)> {
         let bucket = self.bucket(bucket_index);
 
-        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
-        let tag_shifted = (tag as u64) << 52;
+        let tag_shifted = (tag as u64) << TAG_SHIFT;
 
         // Use SIMD to find slots with matching tags (filters out empty/ghost)
         let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted);
@@ -622,8 +668,15 @@ impl MultiChoiceHashtable {
             {
                 // Update frequency (best effort)
                 let freq = Hashbucket::freq(packed);
+                // The clock the whole cache reads, so a replay's frequency
+                // smoothing follows trace time exactly as its expiry does.
+                // Reading wall time here would compress the rate limit out
+                // of existence -- a replay consumes hours in seconds, so
+                // every access would land in one epoch and the counter
+                // would increment once for the entire run.
+                let now_epoch = Hashbucket::epoch_of(crate::clock::now_unix_secs());
                 if freq < 127
-                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
+                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq, now_epoch)
                 {
                     let _ = bucket.items[slot_index].compare_exchange(
                         packed,
@@ -650,9 +703,8 @@ impl MultiChoiceHashtable {
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
-        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
-        let tag_shifted = (tag as u64) << 52;
+        let tag_shifted = (tag as u64) << TAG_SHIFT;
 
         // Use SIMD to find slots with matching tags (filters out empty/ghost)
         let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted);
@@ -694,9 +746,8 @@ impl MultiChoiceHashtable {
     ) -> Option<u64> {
         let bucket = self.bucket(bucket_index);
 
-        const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
-        let tag_shifted = (tag as u64) << 52;
+        let tag_shifted = (tag as u64) << TAG_SHIFT;
 
         // Use SIMD to find slots with matching tags (filters out empty/ghost)
         let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted);
@@ -764,8 +815,15 @@ impl MultiChoiceHashtable {
 
             if packed != 0 && Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
                 let freq = Hashbucket::freq(packed);
+                // The clock the whole cache reads, so a replay's frequency
+                // smoothing follows trace time exactly as its expiry does.
+                // Reading wall time here would compress the rate limit out
+                // of existence -- a replay consumes hours in seconds, so
+                // every access would land in one epoch and the counter
+                // would increment once for the entire run.
+                let now_epoch = Hashbucket::epoch_of(crate::clock::now_unix_secs());
                 if freq < 127
-                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
+                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq, now_epoch)
                 {
                     let _ = bucket.items[slot_index].compare_exchange(
                         packed,
@@ -1974,12 +2032,44 @@ impl Hashbucket {
         }
     }
 
-    /// Pack an entry into a u64.
+    /// Pack an entry into a u64, stamped with the current epoch.
     ///
-    /// Layout: `[12 bits tag][8 bits freq][44 bits location]`
+    /// Layout: `[TAG_BITS tag][EPOCH_BITS epoch][8 freq][44 location]`
+    ///
+    /// Stamped with the epoch *before* the current one, deliberately.
+    ///
+    /// Leaving it at zero is wrong: a fresh entry inserted in epoch 0 has
+    /// its first read suppressed, a one-in-eight bias that reads as noise.
+    ///
+    /// Stamping the current epoch is also wrong, and less obviously. It
+    /// suppresses a read landing in the insert's own second, so an item
+    /// written and immediately read is indistinguishable from one never
+    /// read at all -- both sit at frequency 1. That is precisely the
+    /// distinction `MergeConfig::CLOCK` is, and what ghost resurrection and
+    /// the demotion thresholds test for. Segcache can afford it because its
+    /// timestamp is per bucket and already smeared across unrelated items;
+    /// a per-entry epoch makes the suppression exact and so systematic.
+    ///
+    /// One epoch back means any first read counts and further reads in that
+    /// same second do not, which is the rate limit doing its job without
+    /// erasing the signal it exists to smooth.
     #[inline]
     pub fn pack(tag: u16, freq: u8, location: Location) -> u64 {
-        let tag_64 = (tag as u64 & 0xFFF) << 52;
+        let now = Self::epoch_of(crate::clock::now_unix_secs());
+        let previous = now.wrapping_sub(1) & (EPOCH_VALUE_MASK as u8);
+        Self::pack_at_epoch(tag, freq, location, previous)
+    }
+
+    /// `pack`, with the epoch given rather than read from the clock.
+    #[inline]
+    pub fn pack_at_epoch(tag: u16, freq: u8, location: Location, epoch: u8) -> u64 {
+        Self::with_epoch(Self::pack_raw(tag, freq, location), epoch)
+    }
+
+    /// The bit-packing alone, epoch left zero.
+    #[inline]
+    fn pack_raw(tag: u16, freq: u8, location: Location) -> u64 {
+        let tag_64 = (tag as u64 & TAG_VALUE_MASK) << TAG_SHIFT;
         let freq_64 = (freq as u64 & 0xFF) << 44;
         let loc_64 = location.as_raw() & Location::MAX_RAW;
         tag_64 | freq_64 | loc_64
@@ -1988,7 +2078,7 @@ impl Hashbucket {
     /// Extract tag (12 bits).
     #[inline(always)]
     pub fn tag(packed: u64) -> u16 {
-        (packed >> 52) as u16
+        (packed >> TAG_SHIFT) as u16
     }
 
     /// Extract frequency (8 bits).
@@ -2028,12 +2118,39 @@ impl Hashbucket {
         (packed & !freq_mask) | ((freq as u64) << 44)
     }
 
+    /// The coarse epoch stamped on an entry by its last counted read.
+    #[inline]
+    pub fn epoch(packed: u64) -> u8 {
+        ((packed >> EPOCH_SHIFT) & EPOCH_VALUE_MASK) as u8
+    }
+
+    /// The epoch a read at `now_secs` belongs to.
+    #[inline]
+    pub fn epoch_of(now_secs: u32) -> u8 {
+        (now_secs as u64 & EPOCH_VALUE_MASK) as u8
+    }
+
+    /// Replace an entry's epoch.
+    #[inline]
+    pub fn with_epoch(packed: u64, epoch: u8) -> u64 {
+        (packed & !EPOCH_MASK) | (((epoch as u64) & EPOCH_VALUE_MASK) << EPOCH_SHIFT)
+    }
+
     /// Try to update frequency using ASFC algorithm.
     ///
     /// Returns `Some(new_packed)` if frequency should increment.
+    ///
+    /// `now_epoch` rate-limits the counter to one increment per epoch, which
+    /// is Segcache's smoothed counter: without it a burst of reads on one
+    /// item raises its frequency as far as a steady stream over minutes
+    /// does, and the ranking cannot tell "hot" from "briefly hammered".
+    /// An entry already stamped with this epoch has been counted already.
     #[inline]
-    pub fn try_update_freq(packed: u64, freq: u8) -> Option<u64> {
+    pub fn try_update_freq(packed: u64, freq: u8, now_epoch: u8) -> Option<u64> {
         if freq >= 127 {
+            return None;
+        }
+        if EPOCH_BITS > 0 && Self::epoch(packed) == now_epoch {
             return None;
         }
 
@@ -2053,7 +2170,14 @@ impl Hashbucket {
         };
 
         if should_increment {
-            Some(Self::with_freq(packed, freq + 1))
+            // Stamp the epoch with the increment, not on every read: an
+            // entry that was rate-limited out keeps the epoch of the read
+            // that last counted, so a long-idle item is not held back by a
+            // read that changed nothing.
+            Some(Self::with_epoch(
+                Self::with_freq(packed, freq + 1),
+                now_epoch,
+            ))
         } else {
             None
         }
@@ -2098,7 +2222,7 @@ mod verification {
     #[kani::proof]
     fn pack_roundtrip() {
         let tag: u16 = kani::any();
-        kani::assume(tag <= 0xFFF);
+        kani::assume((tag as u64) <= TAG_VALUE_MASK);
         let freq: u8 = kani::any();
         let raw: u64 = kani::any();
         kani::assume(raw <= Location::MAX_RAW);
@@ -2116,7 +2240,7 @@ mod verification {
     #[kani::proof]
     fn a_live_entry_is_never_mistaken_for_a_ghost() {
         let tag: u16 = kani::any();
-        kani::assume(tag <= 0xFFF);
+        kani::assume((tag as u64) <= TAG_VALUE_MASK);
         let freq: u8 = kani::any();
         let raw: u64 = kani::any();
         kani::assume(raw < Location::MAX_RAW); // a live location, not GHOST
@@ -2502,7 +2626,7 @@ mod tests {
     /// An entry must never pack to the all-zero word, which every slot scan
     /// reads as "empty".
     ///
-    /// `pack(tag, freq, location)` is `(tag << 52) | (freq << 44) | location`.
+    /// `pack(tag, freq, location)` is `(tag << TAG_SHIFT) | (epoch << EPOCH_SHIFT) | (freq << 44) | location`.
     /// With tag 0, freq 0 and location 0 that is exactly zero, so the entry is
     /// stored and then read back as an empty slot: `insert` reports success and
     /// `lookup` can never find the key again.
@@ -2535,7 +2659,7 @@ mod tests {
     ///
     /// "probe2491" is such a key under the fixed test seed -- it was the first
     /// one found when this bug was isolated. Proven red by reverting
-    /// `tag_from_hash` to `((hash >> 32) & 0xFFF)`.
+    /// `tag_from_hash` to `((hash >> 32) & TAG_VALUE_MASK)`.
     #[test]
     fn a_raw_tag_zero_key_at_location_zero_is_findable() {
         struct Yes;
@@ -2548,7 +2672,7 @@ mod tests {
         let ht = MultiChoiceHashtable::new(10);
         // Precondition: this key really does have raw tag 0, so the test cannot
         // decay into asserting something trivial if the seed ever changes.
-        let raw_tag = ((ht.hash_key(b"probe2491") >> 32) & 0xFFF) as u16;
+        let raw_tag = ((ht.hash_key(b"probe2491") >> 32) & TAG_VALUE_MASK) as u16;
         assert_eq!(
             raw_tag, 0,
             "probe2491 no longer has raw tag 0; pick a new key"
@@ -2597,7 +2721,7 @@ mod tests {
         // Fill the first-choice bucket with entries belonging to some other
         // key, so the subject cannot land there. A different tag keeps them
         // from ever matching the subject's scans.
-        let other_tag = tag ^ 0xFFF;
+        let other_tag = tag ^ TAG_VALUE_MASK as u16;
         for slot in 0..Hashbucket::NUM_ITEM_SLOTS {
             ht.bucket(first).items[slot].store(
                 Hashbucket::pack(other_tag, 1, Location::new(0x100 + slot as u64)),
@@ -2654,7 +2778,7 @@ mod tests {
 
     #[test]
     fn test_pack_basic() {
-        let tag = 0xABC;
+        let tag = 0x0BC;
         let freq = 42;
         let location = Location::new(0x123_4567_89AB);
 
@@ -2667,7 +2791,7 @@ mod tests {
 
     #[test]
     fn test_pack_max_values() {
-        let tag = 0xFFF;
+        let tag = TAG_VALUE_MASK as u16;
         let freq = 0xFF;
         let location = Location::new(Location::MAX_RAW - 1); // Not ghost
 
@@ -2694,11 +2818,11 @@ mod tests {
 
     #[test]
     fn test_to_ghost() {
-        let packed = Hashbucket::pack(0x456, 75, Location::new(1000));
+        let packed = Hashbucket::pack(0x156, 75, Location::new(1000));
         let ghost = Hashbucket::to_ghost(packed);
 
         assert!(Hashbucket::is_ghost(ghost));
-        assert_eq!(Hashbucket::tag(ghost), 0x456);
+        assert_eq!(Hashbucket::tag(ghost), 0x156);
         assert_eq!(Hashbucket::freq(ghost), 75);
     }
 
@@ -2805,7 +2929,12 @@ mod tests {
         ht.insert(b"test", location, &verifier).unwrap();
 
         // Lookup to increase frequency
+        // once however many there are. Each read gets its own second.
+        // smoothed counter), so reads inside one second raise the frequency
+        // The counter is rate-limited to one increment per epoch (Segcache's
+        let _tick_clock = crate::clock::TestClock::start();
         for _ in 0..5 {
+            _tick_clock.tick();
             ht.lookup(b"test", &verifier);
         }
 
@@ -3004,18 +3133,110 @@ mod tests {
         assert_eq!(Hashbucket::location(updated), Location::new(100));
     }
 
+    /// A burst inside one epoch counts once.
+    ///
+    /// This is Segcache's smoothed counter (3.6.3): the rate limit is what
+    /// stops a burst of reads raising an item's frequency as far as a
+    /// steady stream over minutes does. Without it "hot" and "briefly
+    /// hammered" are the same number, and merge retention cannot tell them
+    /// apart.
+    #[test]
+    fn a_burst_within_one_epoch_increments_the_counter_once() {
+        // Stamped into a known epoch, then read in the next one: `pack`
+        // takes the current epoch, so a test that assumed zero would be
+        // measuring whichever second it happened to run in.
+        let mut packed = Hashbucket::pack_at_epoch(0x123, 5, Location::new(100), 0);
+        let epoch = 1u8;
+
+        let first = Hashbucket::try_update_freq(packed, Hashbucket::freq(packed), epoch)
+            .expect("the first read in an epoch must count");
+        packed = first;
+        assert_eq!(Hashbucket::freq(packed), 6);
+        assert_eq!(
+            Hashbucket::epoch(packed),
+            epoch,
+            "the increment stamps the epoch"
+        );
+
+        for _ in 0..50 {
+            assert!(
+                Hashbucket::try_update_freq(packed, Hashbucket::freq(packed), epoch).is_none(),
+                "further reads in the same epoch must not count"
+            );
+        }
+        assert_eq!(
+            Hashbucket::freq(packed),
+            6,
+            "50 more reads moved it not at all"
+        );
+    }
+
+    /// And the next epoch counts again, so a steady stream still accrues.
+    ///
+    /// The companion to the burst case: a rate limit that never released
+    /// would freeze every counter after one read, which passes the burst
+    /// test and destroys the policy.
+    #[test]
+    fn a_read_in_the_next_epoch_counts_again() {
+        let mut packed = Hashbucket::pack_at_epoch(0x123, 5, Location::new(100), 7);
+        for second in 1_000u32..1_006 {
+            let epoch = Hashbucket::epoch_of(second);
+            if let Some(next) = Hashbucket::try_update_freq(packed, Hashbucket::freq(packed), epoch)
+            {
+                packed = next;
+            }
+        }
+        assert_eq!(
+            Hashbucket::freq(packed),
+            11,
+            "six consecutive seconds must count six times"
+        );
+    }
+
+    /// The epoch must not disturb the fields it shares a word with.
+    #[test]
+    fn stamping_an_epoch_leaves_the_tag_frequency_and_location_intact() {
+        let mut packed = Hashbucket::pack_at_epoch(0x123, 42, Location::new(12345), 0);
+        // Stamped onto the running value, not onto a fresh one each time,
+        // and descending as well as ascending. An implementation that ORed
+        // the epoch in without clearing the old bits passes an ascending
+        // walk over fresh values and accumulates set bits here.
+        for epoch in [1u8, 7, 3, 0, 6, 2, 5, 4] {
+            let stamped = Hashbucket::with_epoch(packed, epoch);
+            packed = stamped;
+            assert_eq!(Hashbucket::epoch(stamped), epoch);
+            assert_eq!(
+                Hashbucket::tag(stamped),
+                0x123,
+                "epoch {epoch} clobbered the tag"
+            );
+            assert_eq!(
+                Hashbucket::freq(stamped),
+                42,
+                "epoch {epoch} clobbered the frequency"
+            );
+            assert_eq!(
+                Hashbucket::location(stamped),
+                Location::new(12345),
+                "epoch {epoch} clobbered the location"
+            );
+        }
+    }
+
     #[test]
     fn test_try_update_freq_max() {
-        let packed = Hashbucket::pack(0x123, 127, Location::new(100));
+        let packed = Hashbucket::pack_at_epoch(0x123, 127, Location::new(100), 0);
         // At max frequency, should return None
-        assert!(Hashbucket::try_update_freq(packed, 127).is_none());
+        assert!(Hashbucket::try_update_freq(packed, 127, 1).is_none());
     }
 
     #[test]
     fn test_try_update_freq_low() {
-        let packed = Hashbucket::pack(0x123, 5, Location::new(100));
-        // Low frequency always increments
-        let result = Hashbucket::try_update_freq(packed, 5);
+        let packed = Hashbucket::pack_at_epoch(0x123, 5, Location::new(100), 0);
+        // Low frequency always increments -- read in a different epoch from
+        // the one it was packed in, since a read inside the packing epoch is
+        // the insert's own access and must not count twice.
+        let result = Hashbucket::try_update_freq(packed, 5, 1);
         assert!(result.is_some());
         let new_packed = result.unwrap();
         assert_eq!(Hashbucket::freq(new_packed), 6);
@@ -3047,7 +3268,12 @@ mod tests {
         ht.insert(b"test", location1, &verifier).unwrap();
 
         // Access to build up frequency
+        // once however many there are. Each read gets its own second.
+        // smoothed counter), so reads inside one second raise the frequency
+        // The counter is rate-limited to one increment per epoch (Segcache's
+        let _tick_clock = crate::clock::TestClock::start();
         for _ in 0..10 {
+            _tick_clock.tick();
             ht.lookup(b"test", &verifier);
         }
 
@@ -4081,7 +4307,7 @@ mod loom_tests {
             let hash = ht.hash_key(KEY);
             let tag = MultiChoiceHashtable::tag_from_hash(hash);
             let choices = ht.bucket_indices(hash);
-            let filler_tag = tag ^ 0xFFF;
+            let filler_tag = tag ^ TAG_VALUE_MASK as u16;
             let mut filled = 0u64;
             for (n, &b) in choices[..2].iter().enumerate() {
                 for slot in 0..Hashbucket::NUM_ITEM_SLOTS {
