@@ -557,6 +557,42 @@ impl<H: Hashtable> TieredCache<H> {
         total
     }
 
+    /// Live item bytes and the segment bytes they sit in, across RAM layers.
+    ///
+    /// Returns `(live_bytes, written_bytes, capacity_bytes)` over RAM layers.
+    ///
+    /// Three numbers rather than one, because "why does this engine hold
+    /// fewer items in the same heap" has two different answers that a single
+    /// ratio cannot separate:
+    ///
+    /// - `written / capacity` is how full the segments are. Low means the
+    ///   bytes are sitting there unused -- a packing problem.
+    /// - `live / written` is how much of what was written is still live.
+    ///   Low means the segments are full of superseded or expired items that
+    ///   nothing has reclaimed -- a reclamation problem.
+    ///
+    /// Dividing heap size by resident items conflates those with a third
+    /// possibility, that the policy simply retained fewer items on purpose,
+    /// and the three have different fixes.
+    ///
+    /// A gauge, read without pinning exactly as `resident_items` is, so the
+    /// same caveat about mid-transition segments applies.
+    pub fn resident_bytes(&self) -> (u64, u64, u64) {
+        let mut live = 0u64;
+        let mut written = 0u64;
+        let mut capacity = 0u64;
+        for layer in &self.layers {
+            for segment_id in 0..layer.total_segment_count() as u32 {
+                if let Some(segment) = layer.get_segment(segment_id) {
+                    live += segment.live_bytes() as u64;
+                    written += segment.write_offset() as u64;
+                    capacity += segment.capacity() as u64;
+                }
+            }
+        }
+        (live, written, capacity)
+    }
+
     /// Sum of free segments across RAM layers only.
     ///
     /// Skips disk-backed layers the same way `resident_items` does (see its
@@ -2965,6 +3001,53 @@ mod tests {
                 "{policy:?} lost live items the deferred policy kept"
             );
         }
+    }
+
+    /// The three byte figures must tell apart the two things that look
+    /// identical in a resident-item count.
+    ///
+    /// Overwriting the same keys leaves superseded copies behind: the
+    /// segments stay just as full of written bytes, but fewer of those bytes
+    /// are live. A resident-item count cannot see that -- the live set is
+    /// unchanged -- while `live / written` drops. That is the distinction
+    /// the metric exists to make.
+    #[test]
+    fn written_and_live_bytes_separate_packing_from_reclamation() {
+        let cache = create_test_cache_with_reclaim(OverwriteReclaim::Deferred);
+        let value = vec![0xABu8; 1024];
+        for i in 0..150u32 {
+            let key = format!("key-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        let (live_before, written_before, capacity) = cache.resident_bytes();
+        assert!(capacity > 0, "a built cache has segment capacity");
+        assert!(
+            live_before > 0 && written_before >= live_before,
+            "live {live_before} cannot exceed written {written_before}"
+        );
+
+        // Same keys, same sizes: the live set does not grow, but each write
+        // appends a new copy and strands the previous one.
+        for _round in 0..12 {
+            for i in 0..150u32 {
+                let key = format!("key-{i:08}");
+                let _ = cache.set(key.as_bytes(), &value, b"", Duration::from_secs(3600));
+            }
+        }
+        let (live_after, written_after, _) = cache.resident_bytes();
+
+        let before = live_before as f64 / written_before as f64;
+        let after = live_after as f64 / written_after as f64;
+        assert!(
+            after < before,
+            "overwriting should lower the live share of written bytes: \
+             {after:.3} against {before:.3}"
+        );
     }
 
     #[test]

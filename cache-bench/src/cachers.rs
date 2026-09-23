@@ -301,6 +301,19 @@ impl cache_core::Cache for Unavailable {
 mod tests {
     use super::*;
 
+    /// Serializes tests that build a cache-rs instance.
+    ///
+    /// cache-rs reports through metriken's process-global registry, so two
+    /// instances alive at once share `segment_free`, `segment_current` and
+    /// `item_current`. Cargo runs tests in parallel threads, so without this
+    /// the segment-fill assertions read another test's cache: observed at
+    /// roughly one run in six, on this branch and before it.
+    #[cfg(feature = "cache-rs")]
+    fn cachers_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[cfg(feature = "cache-rs")]
     fn small_cachers() -> CacheRs {
         CacheRs {
@@ -316,6 +329,7 @@ mod tests {
     #[cfg(feature = "cache-rs")]
     #[test]
     fn a_stored_value_reads_back_through_with_value() {
+        let _guard = cachers_lock();
         use cache_core::Cache;
         let c = small_cachers();
         c.set(b"k", b"hello", Some(std::time::Duration::from_secs(60)))
@@ -328,6 +342,7 @@ mod tests {
     #[cfg(feature = "cache-rs")]
     #[test]
     fn a_missing_key_reads_back_as_none() {
+        let _guard = cachers_lock();
         use cache_core::Cache;
         let c = small_cachers();
         assert!(c.with_value(b"absent", |v| v.to_vec()).is_none());
@@ -336,6 +351,7 @@ mod tests {
     #[cfg(feature = "cache-rs")]
     #[test]
     fn a_deleted_key_stops_reading_back() {
+        let _guard = cachers_lock();
         use cache_core::Cache;
         let c = small_cachers();
         c.set(b"k", b"v", None).expect("set");
@@ -346,6 +362,7 @@ mod tests {
     #[cfg(feature = "cache-rs")]
     #[test]
     fn an_oversized_value_is_reported_as_value_too_long_not_out_of_memory() {
+        let _guard = cachers_lock();
         use cache_core::{Cache, CacheError};
         let c = small_cachers();
         // small_cachers() builds a 1MiB segment size; a value bigger than
@@ -420,6 +437,7 @@ mod tests {
     #[cfg(feature = "cache-rs")]
     #[test]
     fn internal_stats_reports_ram_segment_fill_from_the_segment_gauges() {
+        let _guard = cachers_lock();
         use cache_core::Cache;
         // `segment_current` is SET (not incremented) once at construction to
         // the instance's total segment count -- "current total number of
@@ -475,6 +493,7 @@ mod tests {
     #[cfg(feature = "cache-rs")]
     #[test]
     fn resident_items_is_read_from_the_item_current_gauge() {
+        let _guard = cachers_lock();
         use cache_core::Cache;
         // `item_current` lives in metriken's process-global registry, same as
         // `segment_evict` above, so a sibling test running in parallel in
@@ -543,6 +562,7 @@ mod tests {
     #[cfg(feature = "cache-rs")]
     #[test]
     fn evictions_are_reported_so_the_envelope_check_can_see_them() {
+        let _guard = cachers_lock();
         use cache_core::Cache;
         // A cache far smaller than what is written to it must evict, and must
         // say so. Without this, `envelope_verdict` reads an all-zero snapshot

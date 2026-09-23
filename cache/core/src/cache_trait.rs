@@ -761,6 +761,23 @@ pub struct CacheInternalStats {
     ///
     /// See [`free_segments`](Self::free_segments).
     pub total_segments: u64,
+    /// Bytes held by live items across RAM layers.
+    ///
+    /// With [`written_bytes`](Self::written_bytes) and
+    /// [`capacity_bytes`](Self::capacity_bytes), this separates the two
+    /// reasons an engine holds fewer items in the same heap. Dividing heap
+    /// size by [`resident_items`](Self::resident_items) cannot: a low figure
+    /// there could mean segments are packed loosely, or full of superseded
+    /// items nothing reclaimed, or that the policy retained fewer items on
+    /// purpose. Those have different fixes.
+    pub live_bytes: u64,
+    /// Bytes appended into RAM segments, live or superseded.
+    ///
+    /// `written / capacity` is how full the segments are;
+    /// `live / written` is how much of that is still worth keeping.
+    pub written_bytes: u64,
+    /// Total addressable bytes in RAM segments.
+    pub capacity_bytes: u64,
 }
 
 /// Result of a cache lookup that may require async I/O.

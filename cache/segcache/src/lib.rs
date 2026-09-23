@@ -864,10 +864,14 @@ impl Cache for SegCache {
     }
 
     fn internal_stats(&self) -> Option<CacheInternalStats> {
+        let (live_bytes, written_bytes, capacity_bytes) = self.inner.resident_bytes();
         Some(CacheInternalStats {
             resident_items: self.inner.resident_items(),
             free_segments: self.inner.ram_free_segment_count(),
             total_segments: self.inner.ram_total_segment_count(),
+            live_bytes,
+            written_bytes,
+            capacity_bytes,
             ..self.inner.stats().snapshot()
         })
     }

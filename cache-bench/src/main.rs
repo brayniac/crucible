@@ -428,6 +428,37 @@ fn print_replay_report(
         eprintln!("  demotions:      {}", stats.demotions);
         eprintln!("  demotion fails: {}", stats.demotion_failures);
         eprintln!("  resident items: {}", stats.resident_items);
+        // Printed as a decomposition rather than a ratio, because the
+        // question it answers -- why does this engine hold fewer items in
+        // the same heap -- has three answers that one number cannot tell
+        // apart: segments packed loosely, segments full of superseded items
+        // nothing reclaimed, or a policy that retained fewer on purpose.
+        if stats.capacity_bytes > 0 {
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            let packed = 100.0 * stats.written_bytes as f64 / stats.capacity_bytes as f64;
+            let live_share = if stats.written_bytes > 0 {
+                100.0 * stats.live_bytes as f64 / stats.written_bytes as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  segment bytes:  {:.1} MiB live / {:.1} MiB written / {:.1} MiB capacity",
+                mib(stats.live_bytes),
+                mib(stats.written_bytes),
+                mib(stats.capacity_bytes)
+            );
+            eprintln!("    packed:       {packed:.1}% of capacity written  (low = loose packing)");
+            eprintln!(
+                "    live:         {live_share:.1}% of written still live  (low = unreclaimed)"
+            );
+            if stats.resident_items > 0 {
+                eprintln!(
+                    "    per item:     {:.0} B live, {:.0} B of capacity",
+                    stats.live_bytes as f64 / stats.resident_items as f64,
+                    stats.capacity_bytes as f64 / stats.resident_items as f64
+                );
+            }
+        }
         // Same figures `envelope_verdict`'s fill check reads, printed here so
         // a thin cell (the cache never filled) is visible to the analysis
         // step even on a run that passes the check.
