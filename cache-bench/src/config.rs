@@ -80,6 +80,22 @@ pub struct CacheConfig {
     /// default, which is a latency choice rather than a correctness one.
     #[serde(default)]
     pub main_target_ratio: Option<f64>,
+    /// How strongly an item's size counts against it when merge ranks items
+    /// for retention: `frequency * (mean_size / size)^e`.
+    ///
+    /// Two assumptions about what a miss costs, not a tuning range. `1.0`
+    /// is cost-per-request, which is what Segcache specifies (NSDI '21
+    /// 3.6.3, frequency-over-size, after greedy dual size frequency); it
+    /// keeps small items and minimises the request miss ratio. `0.0` is
+    /// cost-proportional-to-size, which cancels to raw frequency; it keeps
+    /// large hot items and minimises something closer to the byte miss
+    /// ratio. Unset leaves `MergeConfig::default()`, which is 1.0.
+    ///
+    /// Read `MISS RATIO` and `BYTE MISS` together across a sweep of this:
+    /// raising it improves one at the other's expense, so a comparison on
+    /// the request ratio alone will always flatter `1.0`.
+    #[serde(default)]
+    pub main_cost_exponent: Option<f64>,
     /// What an overwrite does with the superseded copy's bytes.
     ///
     /// `set`, `replace`, `cas` and a committed streaming set all supersede
@@ -410,6 +426,17 @@ impl Config {
             // a fraction of anything. `MergeConfig` clamps silently, which
             // is the wrong behaviour for a measurement rig.
             return Err(format!("main_target_ratio must be in (0.0, 1.0], got {r}").into());
+        }
+        if let Some(e) = config.cache.main_cost_exponent
+            && !(0.0..=1.0).contains(&e)
+        {
+            // Outside the range the ranking either inverts -- a negative
+            // exponent prefers large cold items over small hot ones -- or
+            // amplifies size past what any cost model motivates.
+            // `MergeConfig` clamps silently, which is the wrong behaviour
+            // for a measurement rig: a sweep would report several points
+            // that all secretly ran at 1.0.
+            return Err(format!("main_cost_exponent must be in [0.0, 1.0], got {e}").into());
         }
         Ok(())
     }

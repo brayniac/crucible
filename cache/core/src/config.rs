@@ -220,6 +220,31 @@ pub struct MergeConfig {
     /// its own; a policy that pins the threshold must start above the
     /// baseline or it prunes nothing live.
     pub initial_threshold: u8,
+
+    /// How strongly an item's size counts against it when ranking for
+    /// retention: items are ranked by `frequency * (mean_size / size)^e`.
+    ///
+    /// This is the cost exponent of greedy dual size frequency, which ranks
+    /// by `frequency * cost / size`. The two ends are not a tuning range but
+    /// two different assumptions about what a miss costs:
+    ///
+    /// - **`1.0`** -- cost is per request. Equivalent to GDSF with unit
+    ///   cost, which is what Segcache specifies (NSDI '21 3.6.3: "Segcache
+    ///   uses the frequency-over-size ratio to rank objects"). Keeps small
+    ///   items, and minimises the *request* miss ratio.
+    /// - **`0.0`** -- cost is proportional to size, so it cancels and items
+    ///   rank by raw frequency. Keeps large hot items, and minimises
+    ///   something closer to the *byte* miss ratio. Right when refilling a
+    ///   miss costs in bandwidth rather than per round trip.
+    ///
+    /// Read both miss ratios together when changing this: raising it
+    /// improves one at the other's expense, so a run reporting only the
+    /// request ratio cannot show the trade.
+    ///
+    /// Defaults to `1.0`. Crucible ranked by raw frequency until this
+    /// existed, which was a deviation from the paper rather than a choice;
+    /// `0.0` restores that behaviour exactly.
+    pub cost_exponent: f64,
 }
 
 impl Default for MergeConfig {
@@ -253,6 +278,7 @@ impl Default for MergeConfig {
             // deployments that want the hit ratio.
             target_ratio: 0.5,
             initial_threshold: 0,
+            cost_exponent: 1.0,
         }
     }
 }
@@ -280,6 +306,11 @@ impl MergeConfig {
         min_segments: 1,
         target_ratio: 1.0,
         initial_threshold: 1,
+        // CLOCK's second chance is "was this touched since admission", a
+        // question about the frequency alone. Weighting by size would make
+        // a large untouched item rank below a small untouched one, and
+        // there is no ordering between them to express.
+        cost_exponent: 0.0,
     };
 
     /// Create a new merge config with default values.
@@ -296,6 +327,20 @@ impl MergeConfig {
     /// Set the target retention ratio.
     pub fn with_target_ratio(mut self, ratio: f64) -> Self {
         self.target_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the size-cost exponent used when ranking items for retention.
+    ///
+    /// Clamped to `0.0 ..= 1.0`: outside that range the ranking either
+    /// inverts (a negative exponent prefers large cold items over small hot
+    /// ones) or amplifies size beyond what any cost model motivates.
+    pub fn with_cost_exponent(mut self, exponent: f64) -> Self {
+        self.cost_exponent = if exponent.is_nan() {
+            0.0
+        } else {
+            exponent.clamp(0.0, 1.0)
+        };
         self
     }
 }

@@ -730,6 +730,13 @@ pub struct CacheInternalStats {
     pub evictions: u64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: u64,
+    /// Compaction passes that actually ran.
+    ///
+    /// Zero here with compaction configured means it never found an
+    /// eligible pair, which is a different problem from compaction running
+    /// and not helping. Read it beside
+    /// [`occupancy_deciles`](Self::occupancy_deciles).
+    pub compactions: u64,
     /// How long eviction passes took.
     ///
     /// Merge eviction runs inline in the write path, so each sample is a stall

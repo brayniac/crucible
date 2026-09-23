@@ -171,7 +171,11 @@ impl CacheLayer {
     ///
     /// This is like `mark_deleted` but additionally attempts to compact the
     /// segment with its predecessor when the deletion creates enough free space.
-    pub fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H) {
+    pub fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        hashtable: &H,
+    ) -> bool {
         dispatch!(self, mark_deleted_and_compact(location, hashtable))
     }
 
@@ -399,6 +403,15 @@ pub struct CacheStats {
     pub evictions: AtomicU64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: AtomicU64,
+    /// Compaction passes that actually ran.
+    ///
+    /// `try_compact_segment` declines far more often than it fires: it
+    /// needs a sealed predecessor whose combined live set fits in 90% of
+    /// one segment. A cache can therefore be configured for compaction,
+    /// report nothing unusual, and never compact once -- which is
+    /// indistinguishable from compaction running and not helping unless
+    /// this is counted.
+    pub compactions: AtomicU64,
     /// Duration of eviction passes. See [`CacheInternalStats::eviction_latency`].
     pub eviction_latency: crate::latency::LatencyHistogram,
 }
@@ -410,6 +423,7 @@ impl CacheStats {
             demotions: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             demotion_failures: AtomicU64::new(0),
+            compactions: AtomicU64::new(0),
             eviction_latency: crate::latency::LatencyHistogram::new(),
         }
     }
@@ -426,6 +440,7 @@ impl CacheStats {
             demotions: self.demotions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             demotion_failures: self.demotion_failures.load(Ordering::Relaxed),
+            compactions: self.compactions.load(Ordering::Relaxed),
             eviction_latency: self.eviction_latency.snapshot(),
             ..Default::default()
         }
@@ -1712,7 +1727,9 @@ impl<H: Hashtable> TieredCache<H> {
         if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
             && let Some(layer) = self.layers.get(layer_idx)
         {
-            layer.mark_deleted_and_compact(item_loc, self.hashtable.as_ref());
+            if layer.mark_deleted_and_compact(item_loc, self.hashtable.as_ref()) {
+                self.stats.compactions.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -3067,7 +3084,225 @@ mod tests {
         }
     }
 
-    /// The three byte figures must tell apart the two things that look
+    /// Compaction must relocate items without touching their frequency.
+    ///
+    /// The counterpart to `a_merge_pass_resets_the_frequency_of_the_items_it_keeps`.
+    /// A merge pass judges items and resets what it keeps, which is
+    /// Segcache's substitute for aging. Compaction judges nothing -- it
+    /// relocates every live item to reclaim dead bytes -- so resetting
+    /// there would charge items for a maintenance pass, repeatedly
+    /// flattening the frequencies the eviction policy depends on, and more
+    /// often the more fragmented the cache is.
+    ///
+    /// Added because mutating the compaction path to reset left all 607
+    /// other tests passing: the distinction was asserted only in a comment.
+    #[test]
+    fn compaction_relocates_items_without_resetting_their_frequency() {
+        // A purpose-built cache rather than the shared fixture. Compaction
+        // needs three segments in one TTL bucket, a sealed predecessor, a
+        // spare to copy into, and a combined live set under 90% of one
+        // segment -- and the shared fixture's eight spare-less segments
+        // never satisfy all four, so the first version of this test passed
+        // without compacting once.
+        let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(16 * 1024)
+            .heap_size(64 * 1024)
+            .spare_capacity(0)
+            .config(
+                LayerConfig::new()
+                    .with_next_layer(1)
+                    .with_demotion_threshold(1),
+            )
+            .build()
+            .expect("fifo layer");
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(16 * 1024)
+            .heap_size(1024 * 1024)
+            .spare_capacity(4)
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo_layer)
+            .with_ttl_layer(ttl_layer)
+            .eviction_threshold(1)
+            .overwrite_reclaim(OverwriteReclaim::Compact)
+            .build();
+        let value = vec![0xABu8; 512];
+        let mut keys = Vec::new();
+        for i in 0..400u32 {
+            let key = format!("comp-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                keys.push(key);
+            }
+        }
+        assert!(!keys.is_empty(), "the fixture must store something");
+
+        // Warm every key well clear of 1. `get` bumps the counter, so the
+        // reads are the warming.
+        for key in &keys {
+            for _ in 0..6 {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+
+        // Delete most of them. `delete` runs the compaction path directly,
+        // and draining segments this hard is what puts adjacent pairs under
+        // the combined-live bound so a pass can actually fire.
+        let survivors: Vec<&String> = keys.iter().step_by(8).collect();
+        for key in &keys {
+            if !survivors.contains(&key) {
+                cache.delete(key.as_bytes());
+            }
+        }
+
+        // The survivors are what compaction relocated. Their frequency must
+        // be whatever the warming reads left it at, never reset to 1. Read
+        // through `frequency`, not `get`, which would bump it.
+        let mut checked = 0;
+        let mut at_floor = 0;
+        for key in survivors {
+            if let Some(freq) = cache.frequency(key.as_bytes()) {
+                checked += 1;
+                if freq <= 1 {
+                    at_floor += 1;
+                }
+            }
+        }
+        // Without this the test is vacuous: if no compaction ran, nothing
+        // was relocated and every frequency is trivially intact. The
+        // mutation that resets frequency during compaction passed the first
+        // version of this test for exactly that reason.
+        assert!(
+            cache.stats().snapshot().compactions > 0,
+            "no compaction ran, so this fixture proves nothing about what \
+             compaction does to frequencies"
+        );
+        assert!(checked > 0, "some untouched keys must still be resident");
+        assert_eq!(
+            at_floor, 0,
+            "{at_floor} of {checked} untouched items came back at frequency \
+             1 or below: compaction reset what it merely relocated"
+        );
+    }
+
+    /// The compaction counter must count compactions, not delete calls.
+    ///
+    /// `delete` runs the compaction path on every call regardless of
+    /// `OverwriteReclaim`, so "a delete happened" and "a compaction ran" are
+    /// easy to conflate -- and a counter incremented once per delete passes
+    /// every test that only asks whether it is above zero. That matters
+    /// because this counter is what answers "is compaction reachable on
+    /// this workload at all", where a false yes is worse than no counter.
+    ///
+    /// The control is a working set too small to fill three segments.
+    /// `try_compact_segment` needs a segment with a sealed *predecessor*
+    /// that is not the bucket tail, so it returns early when
+    /// `bucket.segment_count() < 3` -- while the deletes still run exactly
+    /// as they do in the other arm.
+    ///
+    /// An earlier version used a layer with no spare capacity, on the
+    /// assumption that compaction could not reserve a destination. It can:
+    /// the pool hands out free segments, and that arm compacted nine times.
+    #[test]
+    fn the_compaction_counter_counts_passes_not_deletes() {
+        let build = || {
+            let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+            let fifo_layer = FifoLayerBuilder::new()
+                .layer_id(0)
+                .pool_id(0)
+                .segment_size(16 * 1024)
+                .heap_size(64 * 1024)
+                .spare_capacity(0)
+                .config(
+                    LayerConfig::new()
+                        .with_next_layer(1)
+                        .with_demotion_threshold(1),
+                )
+                .build()
+                .expect("fifo layer");
+            let ttl_layer = TtlLayerBuilder::new()
+                .layer_id(1)
+                .pool_id(1)
+                .segment_size(16 * 1024)
+                .heap_size(1024 * 1024)
+                .spare_capacity(4)
+                .build()
+                .expect("ttl layer");
+            TieredCacheBuilder::new(hashtable)
+                .with_fifo_layer(fifo_layer)
+                .with_ttl_layer(ttl_layer)
+                .eviction_threshold(1)
+                .overwrite_reclaim(OverwriteReclaim::Compact)
+                .build()
+        };
+
+        // (compactions, deletes issued, segments released)
+        let run = |n_items: u32| -> (u64, u64, u64) {
+            let cache = build();
+            let value = vec![0xABu8; 512];
+            let mut keys = Vec::new();
+            for i in 0..n_items {
+                let key = format!("cnt-{i:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    keys.push(key);
+                }
+            }
+            for key in &keys {
+                for _ in 0..6 {
+                    let _ = cache.get(key.as_bytes());
+                }
+            }
+            let survivors: Vec<&String> = keys.iter().step_by(8).collect();
+            let free_before = cache.ram_free_segment_count();
+            let mut deletes = 0u64;
+            for key in &keys {
+                if !survivors.contains(&key) {
+                    cache.delete(key.as_bytes());
+                    deletes += 1;
+                }
+            }
+            let released = cache.ram_free_segment_count().saturating_sub(free_before);
+            (cache.stats().snapshot().compactions, deletes, released)
+        };
+
+        let (many, deletes, released) = run(400);
+        let (few, deletes_control, _) = run(16);
+
+        assert!(deletes > 0 && deletes_control > 0, "both arms must delete");
+        assert!(
+            many > 0,
+            "the large arm must actually compact, or the control proves nothing"
+        );
+        assert_eq!(
+            few, 0,
+            "a working set under three segments cannot compact -- {few} were \
+             counted across {deletes_control} deletes, so the counter is \
+             tracking delete calls rather than compaction passes"
+        );
+        // A real pass retires two segments and takes one spare, so it nets
+        // one release. Deletes release segments too, by emptying them, which
+        // only makes this a looser bound -- and it still catches a count
+        // that reports a pass whenever it merely reaches the call site,
+        // which is what "compaction happened" degrades into otherwise.
+        assert!(
+            many <= released,
+            "each compaction nets one released segment, so {many} passes \
+             cannot be reconciled with {released} segments released across \
+             {deletes} deletes -- the counter is reporting attempts, not passes"
+        );
+    }
+
     /// Occupancy must be reported per segment, not as a cache-wide mean.
     ///
     /// Compaction pairs two adjacent sealed segments, so what decides
@@ -3146,6 +3381,7 @@ mod tests {
         );
     }
 
+    /// The three byte figures must tell apart the two things that look
     /// identical in a resident-item count.
     ///
     /// Overwriting the same keys leaves superseded copies behind: the

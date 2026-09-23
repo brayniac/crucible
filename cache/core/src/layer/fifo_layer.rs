@@ -884,9 +884,15 @@ impl Layer for FifoLayer {
         }
     }
 
-    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, _hashtable: &H) {
+    fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        _hashtable: &H,
+    ) -> bool {
         // FIFO layer doesn't do compaction - just mark deleted
         self.mark_deleted(location);
+        // The admission queue has no compaction path: it is FIFO-organised, so pairing neighbours would reorder the queue it exists to preserve.
+        false
     }
 
     fn mark_deleted_and_free_empty(&self, location: ItemLocation) {

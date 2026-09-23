@@ -465,6 +465,11 @@ fn print_replay_report(
         eprintln!("  evictions:      {}", stats.evictions);
         eprintln!("  demotions:      {}", stats.demotions);
         eprintln!("  demotion fails: {}", stats.demotion_failures);
+        // Zero here with compaction configured means it never found an
+        // eligible pair -- a different problem from compaction running and
+        // not helping, and the two were indistinguishable before this was
+        // counted.
+        eprintln!("  compactions:    {}", stats.compactions);
         eprintln!("  resident items: {}", stats.resident_items);
         // Printed as a decomposition rather than a ratio, because the
         // question it answers -- why does this engine hold fewer items in
@@ -696,6 +701,30 @@ fn apply_reproducibility_seeds(
     builder
 }
 
+/// The merge knobs from config, applied over a base.
+///
+/// One function rather than two call sites, because there were two: the
+/// s3fifo main layer read these and the single-layer merge arm did not, so
+/// a sweep over chain length silently measured the compiled default on
+/// every point. Duplicated plumbing is how that happens, and adding a third
+/// knob to two places is how it happens again.
+fn merge_config_from(
+    cache: &config::CacheConfig,
+    base: cache_core::MergeConfig,
+) -> cache_core::MergeConfig {
+    let mut cfg = base;
+    if let Some(n) = cache.main_merge_segments {
+        cfg.min_segments = n;
+    }
+    if let Some(r) = cache.main_target_ratio {
+        cfg.target_ratio = r;
+    }
+    if let Some(e) = cache.main_cost_exponent {
+        cfg.cost_exponent = e;
+    }
+    cfg
+}
+
 fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
     use segcache::{DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache};
 
@@ -721,15 +750,8 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
             // Chain length is the lever the first results identified, so it
             // overrides the policy's default rather than the policy silently
             // winning. Rejected for clock in config validation.
-            if let Some(n) = config.cache.main_merge_segments
-                && let cache_core::EvictionStrategy::Merge(ref mut cfg) = strategy
-            {
-                cfg.min_segments = n;
-            }
-            if let Some(r) = config.cache.main_target_ratio
-                && let cache_core::EvictionStrategy::Merge(ref mut cfg) = strategy
-            {
-                cfg.target_ratio = r;
+            if let cache_core::EvictionStrategy::Merge(ref mut cfg) = strategy {
+                *cfg = merge_config_from(&config.cache, *cfg);
             }
             b = b.main_eviction(strategy);
             b
@@ -744,13 +766,7 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
             // silently measured the compiled default on every point. Both
             // knobs are read here for the same reason they are read for the
             // s3fifo main layer.
-            let mut cfg = MergeConfig::default();
-            if let Some(n) = config.cache.main_merge_segments {
-                cfg.min_segments = n;
-            }
-            if let Some(r) = config.cache.main_target_ratio {
-                cfg.target_ratio = r;
-            }
+            let cfg = merge_config_from(&config.cache, MergeConfig::default());
             builder.eviction_policy(SegEvictionPolicy::Merge(cfg))
         }
         other => return Err(format!("invalid policy '{other}' for segment backend").into()),
@@ -1000,6 +1016,57 @@ warmup_records = 0
         let config = crate::config::Config::from_toml(toml).expect("parse");
         let builder = apply_reproducibility_seeds(segcache::SegCache::builder(), &config.cache);
         assert_eq!(builder.configured_eviction_seed(), Some(4242));
+    }
+
+    /// Every merge knob must reach the config, and an unset one must not.
+    ///
+    /// Written against `merge_config_from` because the failure this guards
+    /// is not a parse failure: `main_merge_segments` was once read on the
+    /// s3fifo path and ignored on the single-layer merge path, so a sweep
+    /// parsed the file, built a cache, produced numbers, and measured the
+    /// compiled default at every point. Nothing in the output said so.
+    #[test]
+    fn every_merge_knob_reaches_the_config_and_an_unset_one_does_not() {
+        let base = cache_core::MergeConfig::default();
+        let toml = |extra: &str| {
+            let text = format!(
+                "[general]\nduration = \"1s\"\nwarmup = \"0s\"\nthreads = 1\n\n\
+                 [cache]\nbackend = \"segment\"\npolicy = \"merge\"\n\
+                 heap_size = \"16MB\"\nsegment_size = \"256KB\"\n\
+                 hashtable_power = 16\n{extra}\n\n\
+                 [workload.trace]\npath = \"/tmp/t.bin\"\nformat = \"twitter\"\n\
+                 warmup_records = 0\n"
+            );
+            crate::config::Config::from_toml(&text).expect("parse")
+        };
+
+        // Unset: the compiled defaults survive untouched.
+        let untouched = merge_config_from(&toml("").cache, base);
+        assert_eq!(untouched, base, "an empty config must change nothing");
+
+        // Set: each knob lands, and lands on its own field.
+        let set = merge_config_from(
+            &toml(
+                "main_merge_segments = 7\n\
+                 main_target_ratio = 0.9\n\
+                 main_cost_exponent = 0.0",
+            )
+            .cache,
+            base,
+        );
+        assert_eq!(set.min_segments, 7, "chain length must reach the config");
+        assert_eq!(set.target_ratio, 0.9, "retention cap must reach it");
+        assert_eq!(
+            set.cost_exponent, 0.0,
+            "cost exponent must reach it -- and 0.0 is exactly the value a \
+             knob that was parsed and dropped would leave behind if the \
+             default were 0.0, which is why the default is 1.0 and this \
+             asserts the non-default"
+        );
+        assert_ne!(
+            set.cost_exponent, base.cost_exponent,
+            "the test is vacuous unless 0.0 differs from the default"
+        );
     }
 
     /// And an unset seed must leave the builder alone, so the layer default

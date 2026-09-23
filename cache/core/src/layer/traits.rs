@@ -206,7 +206,10 @@ pub trait Layer: Send + Sync {
     /// # Arguments
     /// * `location` - Item location
     /// * `hashtable` - Hashtable for updating item locations during compaction
-    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H);
+    /// Returns whether a compaction pass actually ran, so callers can count
+    /// it. Layers with no compaction path return `false`.
+    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H)
+    -> bool;
 
     /// Mark an item deleted and free its segment if that emptied it.
     ///

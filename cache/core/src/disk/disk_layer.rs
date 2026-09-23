@@ -595,9 +595,15 @@ impl Layer for DiskLayer {
         }
     }
 
-    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, _hashtable: &H) {
+    fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        _hashtable: &H,
+    ) -> bool {
         // Disk layer doesn't do compaction - just mark deleted
         self.mark_deleted(location);
+        // A disk layer reclaims by rewriting whole segments, not by pairing them.
+        false
     }
 
     fn mark_deleted_and_free_empty(&self, location: ItemLocation) {

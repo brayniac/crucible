@@ -133,6 +133,41 @@ struct ScannedItem {
     candidate: u32,
     offset: u32,
     freq: u8,
+    /// Bytes this item occupies, including header, key and alignment --
+    /// what `append_item` will consume in the spare. Kept from the scan so
+    /// the ranking pass need not re-parse the span.
+    stride: u32,
+}
+
+/// Rank an item for retention: `frequency * (mean_stride / stride)^e`.
+///
+/// At `e == 0.0` the rank is the raw frequency, so the size-aware path
+/// collapses to what crucible did before this existed -- bit-identical,
+/// which is what makes it usable as the control arm of an A/B rather than
+/// merely a similar setting. That holds either way: `powf(0.0)` is exactly
+/// 1.0 for any finite positive base, so the early return skips the float
+/// work rather than guarding the result.
+///
+/// Live items are floored at rank 1. Class 0 means "the hashtable no longer
+/// knows about this item", which the prune threshold and the straddle rule
+/// both rely on; letting a large cold item round down into it would put a
+/// live item in the dead class.
+fn retention_rank(freq: u8, stride: u32, mean_stride: f64, exponent: f64) -> u8 {
+    if freq == 0 {
+        return 0;
+    }
+    if exponent == 0.0 {
+        return freq;
+    }
+    if !(mean_stride > 0.0) || stride == 0 {
+        return freq;
+    }
+    let multiplier = (mean_stride / stride as f64).powf(exponent);
+    let ranked = (freq as f64 * multiplier).round();
+    if !ranked.is_finite() {
+        return freq;
+    }
+    ranked.clamp(1.0, u8::MAX as f64) as u8
 }
 
 /// The lowest prune threshold whose retained bytes still fit `budget`, and
@@ -1433,15 +1468,38 @@ impl TtlLayer {
 
                 let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
 
-                class_bytes[freq as usize] += span.stride as u64;
                 scanned.push(ScannedItem {
                     candidate: cand_idx as u32,
                     offset,
                     freq,
+                    stride: span.stride,
                 });
 
                 offset += span.stride;
             }
+        }
+
+        // ---- Phase A2: rank the scanned items, then bucket them by rank.
+        //
+        // The mean is taken over the items this pass actually scanned rather
+        // than from segment headers, so dead bytes do not drag it and the
+        // ranking is relative to the live population being merged. It needs
+        // the whole scan before any item can be ranked, which is why this is
+        // a second loop over the vector rather than part of phase A -- the
+        // vector is already materialised, so it costs no extra I/O.
+        let mean_stride = if scanned.is_empty() {
+            0.0
+        } else {
+            scanned.iter().map(|i| i.stride as f64).sum::<f64>() / scanned.len() as f64
+        };
+        for item in &mut scanned {
+            item.freq = retention_rank(
+                item.freq,
+                item.stride,
+                mean_stride,
+                merge_config.cost_exponent,
+            );
+            class_bytes[item.freq as usize] += item.stride as u64;
         }
 
         // ---- Phase B: choose the threshold before copying anything.
@@ -1541,12 +1599,27 @@ impl TtlLayer {
                         new_offset,
                     );
 
-                    // Update hashtable (preserve frequency)
+                    // Relocate, and reset the frequency to 1.
+                    //
+                    // Segcache 3.6.3: "To avoid extra parameters, Segcache
+                    // resets the frequency of retained objects during
+                    // evictions, which has a similar effect as
+                    // window-based frequency." It is the policy's only
+                    // defence against cache pollution. A frequency counter
+                    // only ever rises, so without the reset an item that
+                    // was hot once outranks an item that is hot now, for
+                    // as long as it keeps surviving -- and surviving is
+                    // exactly what a high frequency buys it.
+                    //
+                    // Only here, not in `try_compact_segment`. Compaction
+                    // relocates every live item and decides nothing, so
+                    // resetting there would charge items for a maintenance
+                    // pass that made no judgement about them.
                     if !hashtable.cas_location(
                         key,
                         old_loc.to_location(),
                         new_loc.to_location(),
-                        true,
+                        false,
                     ) {
                         // CAS failed (concurrent overwrite), mark spare copy as deleted
                         spare.mark_deleted_at_offset(new_offset);
@@ -1845,9 +1918,18 @@ impl Layer for TtlLayer {
         }
     }
 
-    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H) {
+    /// Returns whether a compaction pass actually ran, so the caller can
+    /// count it. `try_compact_segment` declines far more often than it
+    /// fires -- it needs a sealed predecessor and a combined live set that
+    /// fits one segment -- and discarding the answer made "is compaction
+    /// reachable on this workload" unanswerable from a running cache.
+    fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        hashtable: &H,
+    ) -> bool {
         if location.pool_id() != self.pool.pool_id() {
-            return;
+            return false;
         }
 
         let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
@@ -1864,14 +1946,15 @@ impl Layer for TtlLayer {
 
                     // Try to free segment if now empty
                     if self.try_free_empty_segment(segment_id) {
-                        return;
+                        return false;
                     }
 
                     // Try compaction with predecessor
-                    self.try_compact_segment(segment_id, hashtable);
+                    return self.try_compact_segment(segment_id, hashtable);
                 }
             }
         }
+        false
     }
 }
 
@@ -3359,6 +3442,95 @@ mod tests {
         );
     }
 
+    /// The cost exponent must change *which* items a merge keeps.
+    ///
+    /// The unit tests pin the ranking formula; this pins that the formula
+    /// reaches the retention decision. Every item is inserted at frequency
+    /// 1, so raw-frequency ranking has nothing to order by and falls back to
+    /// scan order -- while frequency-over-size ranks the small items far
+    /// above the large ones. Sizes are interleaved rather than written in
+    /// blocks, so a pass that simply kept the earliest items would retain
+    /// both classes equally and fail the contrast.
+    #[test]
+    fn the_cost_exponent_decides_which_sizes_a_merge_keeps() {
+        use crate::config::{EvictionStrategy, MergeConfig};
+        use crate::hashtable_impl::MultiChoiceHashtable;
+
+        const SMALL: usize = 16;
+        const LARGE: usize = 512;
+
+        // Returns (small survivors, large survivors) after one merge pass.
+        let survivors = |exponent: f64| -> (usize, usize) {
+            let layer = TtlLayerBuilder::new()
+                .layer_id(1)
+                .pool_id(1)
+                .segment_size(4096)
+                .heap_size(128 * 1024)
+                .config(
+                    LayerConfig::new().with_ghosts(true).with_eviction_strategy(
+                        EvictionStrategy::Merge(
+                            MergeConfig::new()
+                                .with_target_ratio(0.5)
+                                .with_min_segments(2)
+                                .with_cost_exponent(exponent),
+                        ),
+                    ),
+                )
+                .spare_capacity(2)
+                .build()
+                .expect("layer");
+
+            let hashtable = MultiChoiceHashtable::new(12);
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+            let ttl = Duration::from_secs(3600);
+
+            let mut small_keys = Vec::new();
+            let mut large_keys = Vec::new();
+            for i in 0..200 {
+                for (tag, len, bucket) in
+                    [("s", SMALL, &mut small_keys), ("l", LARGE, &mut large_keys)]
+                {
+                    let key = format!("{tag}-{i:05}");
+                    let value = vec![b'x'; len];
+                    if let Ok(loc) = layer.write_item(key.as_bytes(), &value, b"", ttl) {
+                        let _ = hashtable.insert(key.as_bytes(), loc.to_location(), &verifier);
+                        bucket.push(key);
+                    }
+                }
+            }
+            assert!(
+                !small_keys.is_empty() && !large_keys.is_empty(),
+                "the fixture must write both size classes"
+            );
+
+            assert!(layer.evict(&hashtable), "merge eviction should run");
+
+            let alive = |keys: &[String]| {
+                keys.iter()
+                    .filter(|k| hashtable.lookup(k.as_bytes(), &verifier).is_some())
+                    .count()
+            };
+            (alive(&small_keys), alive(&large_keys))
+        };
+
+        let (small_blind, large_blind) = survivors(0.0);
+        let (small_aware, large_aware) = survivors(1.0);
+
+        // Size-aware ranking must keep more of the cheap items and fewer of
+        // the costly ones than size-blind ranking does. Both directions are
+        // asserted: keeping more of everything would just mean the pass
+        // pruned less, which is not what the exponent is for.
+        assert!(
+            small_aware > small_blind,
+            "frequency-over-size must retain more small items: \
+             {small_aware} against {small_blind}"
+        );
+        assert!(
+            large_aware < large_blind,
+            "and fewer large ones: {large_aware} against {large_blind}"
+        );
+    }
+
     /// A pass must stay inside its retention target, not discover afterwards
     /// that it overshot.
     ///
@@ -4247,12 +4419,75 @@ mod merge_retention_budget {
     /// that counts items therefore mispredicts what the spare holds --
     /// admitting more than fits, which the copy can only resolve by dropping
     /// whatever it reaches last.
+    ///
+    /// A merge pass must reset the frequency of what it keeps.
+    ///
+    /// Segcache 3.6.3: "To avoid extra parameters, Segcache resets the
+    /// frequency of retained objects during evictions, which has a similar
+    /// effect as window-based frequency." It is the policy's whole defence
+    /// against cache pollution -- without it a frequency counter only ever
+    /// rises, so an item that was hot once outranks an item that is hot now,
+    /// for as long as it survives. Crucible preserved it until this test,
+    /// which was an oversight rather than a decision.
+    #[test]
+    fn a_merge_pass_resets_the_frequency_of_the_items_it_keeps() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(1.0)
+                .with_cost_exponent(0.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+
+        let written = fill_sized(&layer, &hashtable, 220, |_| 64);
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+
+        // Warm everything well clear of 1, so a survivor still sitting at
+        // its warmed frequency is unmistakable.
+        for w in &written {
+            warm(&layer, &hashtable, &w.key, 9);
+        }
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        // Read survival through `get_frequency`, not `survived`. The latter
+        // goes through `lookup`, which bumps the counter it is being used to
+        // inspect -- a correctly reset item reads back as 2, and the test
+        // measures its own probe. `get_frequency` does not match ghosts, so
+        // `Some` still means the item is live.
+        let mut checked = 0;
+        for w in written.iter().filter(|w| candidates.contains(&w.segment)) {
+            if let Some(freq) = hashtable.get_frequency(w.key.as_bytes(), &verifier) {
+                assert_eq!(
+                    freq, 1,
+                    "{} survived the merge and must re-enter at frequency 1, \
+                     not at the 9 it carried in",
+                    w.key
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "a ratio of 1.0 must retain something to check");
+    }
+
+    /// Pinned to `cost_exponent: 0.0` deliberately. The subject here is the
+    /// budget's *currency* -- bytes against items -- and the assertion that
+    /// exposes a miscounted budget is that the retained set stays a clean
+    /// frequency cut. Size-aware ranking breaks that property on purpose: at
+    /// the default exponent a small item at frequency 2 legitimately
+    /// outranks a large one at frequency 8, so the cut is by rank and not by
+    /// frequency. Holding the exponent at zero keeps this test measuring the
+    /// budget rather than the ranking. The frequency-cut property is
+    /// therefore *not* an invariant of merge at the default settings.
     #[test]
     fn a_budget_counted_in_items_cannot_hold_with_items_of_mixed_size() {
         let layer = layer_with(
             MergeConfig::new()
                 .with_min_segments(4)
-                .with_target_ratio(1.0),
+                .with_target_ratio(1.0)
+                .with_cost_exponent(0.0),
         );
         let hashtable = MultiChoiceHashtable::new(12);
 
@@ -4716,7 +4951,7 @@ mod merge_retention_budget {
 /// can only observe through a whole eviction pass.
 #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
 mod threshold_choice {
-    use super::threshold_for_budget;
+    use super::{retention_rank, threshold_for_budget};
 
     fn histogram(classes: &[(u8, u64)]) -> [u64; 256] {
         let mut out = [0u64; 256];
@@ -4732,6 +4967,86 @@ mod threshold_choice {
         // Frequency 0 is excluded by the `freq > threshold` rule itself, so
         // the budget only has to cover the 300 bytes that are still indexed.
         assert_eq!(threshold_for_budget(&hist, 300), (0, 300));
+    }
+
+    /// The control arm has to be exact, not merely similar.
+    ///
+    /// `cost_exponent: 0.0` is how the pre-GDSF behaviour is reproduced for
+    /// an A/B, so it must return the raw frequency for every input rather
+    /// than something that rounds to it -- asserted with `assert_eq`, not a
+    /// tolerance, because a rank is a class index and being one class out
+    /// moves an item across the prune threshold.
+    ///
+    /// Removing the `exponent == 0.0` early return does not break this, and
+    /// should not: `powf(0.0)` is exactly 1.0, so both routes agree. The
+    /// property is what is pinned here, not the branch that implements it.
+    #[test]
+    fn a_zero_cost_exponent_ranks_by_raw_frequency_exactly() {
+        for &freq in &[0u8, 1, 2, 17, 128, 255] {
+            for &stride in &[8u32, 64, 1024, 1 << 20] {
+                for &mean in &[8.0f64, 512.0, 1.0e6] {
+                    assert_eq!(
+                        retention_rank(freq, stride, mean, 0.0),
+                        freq,
+                        "freq {freq} stride {stride} mean {mean} must rank as itself"
+                    );
+                }
+            }
+        }
+    }
+
+    /// At exponent 1 the ranking must invert a raw-frequency comparison.
+    ///
+    /// This is the whole point of the knob, so the case is chosen to be one
+    /// where the two disagree: a small item that is *less* frequently used
+    /// than a large one still outranks it, because it costs a fraction as
+    /// much to keep. A version that weighted in the wrong direction, or that
+    /// weighted too weakly to cross the boundary, ranks them the other way.
+    #[test]
+    fn a_unit_cost_exponent_ranks_a_cheap_warm_item_above_a_costly_hot_one() {
+        let mean = 512.0;
+        // 8x smaller than the mean, referenced 4 times.
+        let small = retention_rank(4, 64, mean, 1.0);
+        // 8x larger than the mean, referenced 16 times -- four times as
+        // popular, sixty-four times as expensive to hold.
+        let large = retention_rank(16, 4096, mean, 1.0);
+        assert!(
+            small > large,
+            "frequency-over-size must prefer the small item: {small} against {large}"
+        );
+        // And the size-blind ranking disagrees, which is what makes this a
+        // test of the weighting rather than of the fixture.
+        assert!(
+            retention_rank(4, 64, mean, 0.0) < retention_rank(16, 4096, mean, 0.0),
+            "raw frequency must rank these the other way round"
+        );
+    }
+
+    /// A live item must never be ranked into class 0.
+    ///
+    /// Class 0 means "the hashtable no longer knows about this item". The
+    /// prune threshold and the straddle rule both depend on that, so a huge
+    /// cold item whose weighted rank rounds below 1 has to be floored rather
+    /// than filed with the dead.
+    #[test]
+    fn a_live_item_is_never_ranked_into_the_dead_class() {
+        // A megabyte item against an 8-byte mean: the multiplier is ~7.6e-6.
+        assert_eq!(retention_rank(1, 1 << 20, 8.0, 1.0), 1);
+        assert_eq!(retention_rank(255, 1 << 20, 8.0, 1.0), 1);
+        // Frequency 0 *is* the dead class and must stay there.
+        assert_eq!(retention_rank(0, 8, 4096.0, 1.0), 0);
+    }
+
+    /// Degenerate inputs fall back to the raw frequency rather than to zero.
+    ///
+    /// An empty scan gives a mean of 0.0, which would make the multiplier
+    /// infinite; a zero stride would divide by zero. Neither can be ranked
+    /// meaningfully, and returning 0 would file live items with the dead.
+    #[test]
+    fn a_degenerate_mean_or_stride_falls_back_to_frequency() {
+        assert_eq!(retention_rank(7, 64, 0.0, 1.0), 7);
+        assert_eq!(retention_rank(7, 0, 512.0, 1.0), 7);
+        assert_eq!(retention_rank(7, 64, f64::NAN, 1.0), 7);
     }
 
     #[test]
