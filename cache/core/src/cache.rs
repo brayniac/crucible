@@ -549,12 +549,33 @@ impl<H: Hashtable> TieredCache<H> {
         let mut total = 0u64;
         for layer in &self.layers {
             for segment_id in 0..layer.total_segment_count() as u32 {
-                if let Some(segment) = layer.get_segment(segment_id) {
+                if let Some(segment) = layer.get_segment(segment_id)
+                    && !Self::is_freed(segment)
+                {
                     total += segment.live_items() as u64;
                 }
             }
         }
         total
+    }
+
+    /// Whether a segment is sitting in the free queue.
+    ///
+    /// A freed segment keeps its `live_items` and `live_bytes` until it is
+    /// reserved again -- `try_reserve` zeroes them, `try_release` does not --
+    /// so a walk over every addressable segment counts contents that were
+    /// correctly evicted. About two segments' worth at any moment, which is
+    /// 1.6% of residency on a 128-segment cache and 25.6% on a 16-segment
+    /// one.
+    ///
+    /// Filtered here rather than zeroed at release, because zeroing after
+    /// the release CAS races a concurrent `try_reserve` that has already
+    /// reset the counters and begun appending, and zeroing before it would
+    /// clear a segment whose CAS then fails. A free segment holds nothing
+    /// by definition, so declining to count it is correct without any new
+    /// ordering requirement.
+    fn is_freed(segment: &SliceSegment<'_>) -> bool {
+        segment.state() == crate::state::State::Free
     }
 
     /// Live item bytes and the segment bytes they sit in, across RAM layers.
@@ -583,7 +604,9 @@ impl<H: Hashtable> TieredCache<H> {
         let mut capacity = 0u64;
         for layer in &self.layers {
             for segment_id in 0..layer.total_segment_count() as u32 {
-                if let Some(segment) = layer.get_segment(segment_id) {
+                if let Some(segment) = layer.get_segment(segment_id)
+                    && !Self::is_freed(segment)
+                {
                     live += segment.live_bytes() as u64;
                     written += segment.write_offset() as u64;
                     capacity += segment.capacity() as u64;
@@ -3109,7 +3132,6 @@ mod tests {
     /// and counted while reads for it miss, and the unpressured case above
     /// would never catch it because nothing moves there.
     #[test]
-    #[ignore = "known bug: merge strands ~2 segments of items outside the index"]
     fn resident_items_stay_reachable_after_eviction_and_demotion() {
         let cache = create_test_cache();
         let value = vec![0xABu8; 1024];
@@ -3173,7 +3195,6 @@ mod tests {
     ///
     /// See `report_unreachable_resident_items_by_heap_size` for the numbers.
     #[test]
-    #[ignore = "known bug: merge strands ~2 segments of items outside the index"]
     fn every_resident_item_should_be_reachable_after_merge() {
         let hashtable = Arc::new(MultiChoiceHashtable::new(16));
         let layer = TtlLayerBuilder::new()
@@ -3217,6 +3238,77 @@ mod tests {
             "{resident} resident but {found} reachable: {} items held outside the index",
             resident.saturating_sub(found)
         );
+    }
+
+    /// Where the unreachable items actually live, by segment state.
+    ///
+    /// `resident_items` walks every segment the pool addresses, so anything
+    /// holding live items counts regardless of whether the chain still
+    /// points at it. This says which state the strays are parked in, which
+    /// is the difference between "pending release" and "leaked".
+    #[test]
+    #[ignore = "diagnostic: run explicitly with --ignored"]
+    fn report_stranded_items_by_segment_state() {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(16));
+        let layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(8 * 1024 * 1024)
+            .spare_capacity(4)
+            .config(
+                LayerConfig::new()
+                    .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+            )
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(layer)
+            .eviction_threshold(1)
+            .build();
+
+        let value = vec![0xABu8; 1024];
+        for i in 0..24000u32 {
+            let key = format!("k-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        let mut found = 0u64;
+        for i in 0..24000u32 {
+            let key = format!("k-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+
+        let layer = cache.layer(0).expect("layer 0");
+        let mut by_state: std::collections::BTreeMap<String, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        for id in 0..layer.total_segment_count() as u32 {
+            if let Some(seg) = layer.get_segment(id) {
+                let items = seg.live_items();
+                if items == 0 {
+                    continue;
+                }
+                let e = by_state
+                    .entry(format!("{:?}", seg.state()))
+                    .or_insert((0, 0));
+                e.0 += 1;
+                e.1 += items;
+            }
+        }
+        eprintln!(
+            "  resident {} / reachable {found} -> {} unreachable",
+            cache.resident_items(),
+            cache.resident_items().saturating_sub(found)
+        );
+        for (state, (segs, items)) in by_state {
+            eprintln!("    {state:<16} {segs:>4} segments, {items:>7} live items");
+        }
     }
 
     /// How many resident items are unreachable, across heap sizes.
