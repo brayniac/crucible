@@ -470,6 +470,13 @@ fn print_replay_report(
         // not helping, and the two were indistinguishable before this was
         // counted.
         eprintln!("  compactions:    {}", stats.compactions);
+        // Beside evictions, not instead of them. Reclaiming a segment by
+        // expiry costs nothing and destroys nothing live, so an engine
+        // doing more of it needs fewer eviction passes for the same working
+        // set -- and reporting only evictions makes working expiry look
+        // like good luck. Zero on a TTL-bearing trace means proactive
+        // expiration is not running at all, which no other figure shows.
+        eprintln!("  expirations:    {}", stats.expirations);
         eprintln!("  resident items: {}", stats.resident_items);
         // Printed as a decomposition rather than a ratio, because the
         // question it answers -- why does this engine hold fewer items in

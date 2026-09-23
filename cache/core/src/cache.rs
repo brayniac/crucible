@@ -403,6 +403,15 @@ pub struct CacheStats {
     pub evictions: AtomicU64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: AtomicU64,
+    /// Segments reclaimed by expiry rather than eviction.
+    ///
+    /// The distinction the whole TTL-bucket design exists for: an expired
+    /// segment is reclaimed whole, costing nothing and destroying nothing
+    /// live, while an eviction pass copies survivors and discards the rest.
+    /// A cache doing the first needs less of the second, so reporting only
+    /// evictions makes a working expiry look like good luck.
+    pub expirations: AtomicU64,
+
     /// Compaction passes that actually ran.
     ///
     /// `try_compact_segment` declines far more often than it fires: it
@@ -424,6 +433,7 @@ impl CacheStats {
             evictions: AtomicU64::new(0),
             demotion_failures: AtomicU64::new(0),
             compactions: AtomicU64::new(0),
+            expirations: AtomicU64::new(0),
             eviction_latency: crate::latency::LatencyHistogram::new(),
         }
     }
@@ -441,6 +451,7 @@ impl CacheStats {
             evictions: self.evictions.load(Ordering::Relaxed),
             demotion_failures: self.demotion_failures.load(Ordering::Relaxed),
             compactions: self.compactions.load(Ordering::Relaxed),
+            expirations: self.expirations.load(Ordering::Relaxed),
             eviction_latency: self.eviction_latency.snapshot(),
             ..Default::default()
         }
@@ -1282,6 +1293,9 @@ impl<H: Hashtable> TieredCache<H> {
         for layer in &self.layers {
             total += layer.expire(self.hashtable.as_ref());
         }
+        self.stats
+            .expirations
+            .fetch_add(total as u64, Ordering::Relaxed);
         total
     }
 
@@ -1558,6 +1572,29 @@ impl<H: Hashtable> TieredCache<H> {
         // so a sub-millisecond pass would measure as 0 or as exactly one
         // second -- a plausible-looking number that is pure artifact.
         let started = std::time::Instant::now();
+
+        // Expiry first, because it is free and eviction is not.
+        //
+        // An expired segment is reclaimed whole: nothing is copied and
+        // nothing live is discarded. An eviction pass copies the survivors
+        // of a chain and throws the rest away. Reaching for the second
+        // while the first would have sufficed destroys live data to make
+        // room that dead data was already holding -- which is precisely the
+        // advantage TTL-bucketed segments exist to provide, and it was
+        // unreachable before this: `expire()` is a public method nothing
+        // called internally, so unless pressure triggers it, proactive
+        // expiration never runs at all. Both engines measured in this
+        // program had it switched off for that reason.
+        //
+        // Cheap to attempt: `try_expire_segments` walks bucket heads and
+        // stops at the first unexpired one, so on a cache with nothing
+        // expired it costs a comparison per bucket and no segment work.
+        if self.expire() > 0 && layer.free_segment_count() > self.eviction_threshold {
+            self.stats
+                .eviction_latency
+                .record(started.elapsed().as_nanos() as u64);
+            return Ok(());
+        }
 
         // Try to evict until we have enough space
         for _ in 0..self.max_eviction_attempts {
@@ -3300,6 +3337,91 @@ mod tests {
             "each compaction nets one released segment, so {many} passes \
              cannot be reconciled with {released} segments released across \
              {deletes} deletes -- the counter is reporting attempts, not passes"
+        );
+    }
+
+    /// Memory pressure must try expiry before it evicts.
+    ///
+    /// Reclaiming an expired segment costs nothing and destroys nothing
+    /// live; an eviction pass copies survivors and discards the rest. So a
+    /// cache whose contents have all expired should make room by expiring,
+    /// and evict not at all. Doing it the other way round throws away live
+    /// data to make space that dead data was already holding.
+    ///
+    /// This is also what makes proactive expiration reachable at all in a
+    /// benchmark. `expire()` is a public method neither engine calls
+    /// internally, so unless pressure triggers it, the TTL-bucket design's
+    /// whole advantage is switched off in every measurement.
+    #[test]
+    fn memory_pressure_expires_before_it_evicts() {
+        let clock = crate::clock::TestClock::start();
+        // A single TTL layer, matching `policy = "merge"`. The shared
+        // tiered fixture will not do: its layer 0 is a FIFO layer whose
+        // `expire` returns 0 by construction ("items are checked on read"),
+        // and items only reach the TTL layer by demotion, which needs a
+        // frequency above the threshold. Nothing here is ever read, so in
+        // the tiered shape every item stays where expiry cannot see it.
+        let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(16 * 1024)
+            .heap_size(256 * 1024)
+            .spare_capacity(2)
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(ttl_layer)
+            .eviction_threshold(1)
+            .overwrite_reclaim(OverwriteReclaim::Deferred)
+            .build();
+        let value = vec![0xEEu8; 512];
+
+        // Enough to fill the heap several times over. A fixture that merely
+        // fits never calls the space-making path at all, so expiry is never
+        // reached and the test reads as "expiry does not run" when what it
+        // showed was "there was nothing to reclaim".
+        let mut stored = 0u32;
+        for i in 0..2000u32 {
+            let key = format!("exp-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(60))
+                .is_ok()
+            {
+                stored += 1;
+            }
+        }
+        assert!(stored > 0, "the fixture must store something");
+
+        let evictions_before = cache.stats().snapshot().evictions;
+
+        // Everything is now dead. The next write needs space, and there is
+        // a segment's worth of expired bytes to take it from.
+        for _ in 0..600 {
+            clock.tick();
+        }
+        // A batch, not a single write: whether any one `set` meets pressure
+        // depends on where the fill happened to leave the free count, and a
+        // write that simply fits never reaches the space-making path at all.
+        for i in 0..200u32 {
+            let key = format!("after-{i:08}");
+            cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .expect("a write must succeed when every resident item has expired");
+        }
+
+        let after = cache.stats().snapshot();
+        assert!(
+            after.expirations > 0,
+            "pressure against a cache of expired items must reclaim by \
+             expiry: {} expirations",
+            after.expirations
+        );
+        assert_eq!(
+            after.evictions, evictions_before,
+            "and must not evict to do it: evictions went from \
+             {evictions_before} to {}",
+            after.evictions
         );
     }
 

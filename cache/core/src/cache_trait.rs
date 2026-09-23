@@ -730,6 +730,15 @@ pub struct CacheInternalStats {
     pub evictions: u64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: u64,
+    /// Segments reclaimed by expiry rather than eviction.
+    ///
+    /// Read beside [`evictions`](Self::evictions): reclaiming space by
+    /// expiry costs nothing and destroys nothing live, so an engine doing
+    /// more of it needs fewer eviction passes to hold the same working set.
+    /// Zero here with a TTL-bearing workload means proactive expiration is
+    /// not running at all, which is not visible from any other figure.
+    pub expirations: u64,
+
     /// Compaction passes that actually ran.
     ///
     /// Zero here with compaction configured means it never found an
