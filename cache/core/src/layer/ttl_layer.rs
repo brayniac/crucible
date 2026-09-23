@@ -2262,7 +2262,12 @@ mod tests {
 
             // The warming reads go through the verifier, which is fine here --
             // the segment is still `Live`, so `admits_verify_reader` allows it.
+            // once however many there are. Each read gets its own second.
+            // smoothed counter), so reads inside one second raise the frequency
+            // The counter is rate-limited to one increment per epoch (Segcache's
+            let _tick_clock = crate::clock::TestClock::start();
             for _ in 0..reads {
+                _tick_clock.tick();
                 assert!(
                     hashtable.lookup(KEY, &verifier).is_some(),
                     "the warming read must hit, or no frequency accrues"
@@ -3604,7 +3609,12 @@ mod tests {
 
         // Access some items to increase their frequency
         for key in keys.iter().take(30) {
+            // once however many there are. Each read gets its own second.
+            // smoothed counter), so reads inside one second raise the frequency
+            // The counter is rate-limited to one increment per epoch (Segcache's
+            let _tick_clock = crate::clock::TestClock::start();
             for _ in 0..5 {
+                _tick_clock.tick();
                 let _ = hashtable.lookup(key.as_bytes(), &verifier);
             }
         }
@@ -3814,7 +3824,12 @@ mod clock_eviction {
         // second cold. Both sit in the oldest segment, which is what CLOCK
         // reclaims first.
         let verifier = SinglePoolVerifier { pool: &layer.pool };
+        // once however many there are. Each read gets its own second.
+        // smoothed counter), so reads inside one second raise the frequency
+        // The counter is rate-limited to one increment per epoch (Segcache's
+        let _tick_clock = crate::clock::TestClock::start();
         for _ in 0..4 {
+            _tick_clock.tick();
             assert!(
                 hashtable.lookup(b"k000", &verifier).is_some(),
                 "the warming read must hit, or no frequency accrues"
@@ -4035,9 +4050,19 @@ mod merge_retention_budget {
 
     /// Raise `key` to `freq`. An insert already leaves it at 1, and the
     /// frequency counter increments deterministically below 16.
+    /// Raise `key` to `freq`, advancing the clock between reads.
+    ///
+    /// The counter is rate-limited to one increment per epoch (Segcache's
+    /// smoothed counter), so a loop of reads inside one second raises the
+    /// frequency by exactly one however many times it runs -- which is the
+    /// feature, and which silently made every warming helper here a no-op
+    /// when it landed. Each read gets its own second, which is what the
+    /// cache would see from accesses spread over real time.
     fn warm<H: Hashtable>(layer: &TtlLayer, hashtable: &H, key: &str, freq: u8) {
         let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let clock = crate::clock::TestClock::start();
         for _ in 1..freq {
+            clock.tick();
             assert!(
                 hashtable.lookup(key.as_bytes(), &verifier).is_some(),
                 "the warming read must hit, or no frequency accrues"
