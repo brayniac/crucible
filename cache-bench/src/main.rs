@@ -730,7 +730,10 @@ fn create_cachers(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         .eviction(policy)
         .build()?;
 
-    Ok(cachers::CacheRs::new(inner))
+    Ok(cachers::CacheRs::new(
+        inner,
+        config.cache.segment_size as u64,
+    ))
 }
 
 #[cfg(not(feature = "cache-rs"))]

@@ -59,12 +59,24 @@ mod adapter {
     /// cache-rs's `Segcache` behind crucible's `Cache` trait.
     pub struct CacheRs {
         pub(super) inner: cache_rs::Segcache,
+        /// Segment size in bytes, carried from the configuration that built
+        /// `inner`.
+        ///
+        /// cache-rs does not expose it on the public type, and the byte
+        /// accounting needs it to turn a segment count into a capacity.
+        /// Taken from the same config value that was handed to the builder,
+        /// so the two cannot disagree without the caller passing different
+        /// numbers to each.
+        pub(super) segment_size: u64,
     }
 
     impl CacheRs {
         /// Wrap a built cache-rs `Segcache` behind crucible's `Cache` trait.
-        pub fn new(inner: cache_rs::Segcache) -> Self {
-            Self { inner }
+        pub fn new(inner: cache_rs::Segcache, segment_size: u64) -> Self {
+            Self {
+                inner,
+                segment_size,
+            }
         }
     }
 
@@ -140,6 +152,9 @@ mod adapter {
         }
 
         fn internal_stats(&self) -> Option<CacheInternalStats> {
+            // Segment size is not exposed as a metric, so it comes from the
+            // instance that was built.
+            let segment_size = self.segment_size;
             find_counter("segment_evict").map(|evictions| CacheInternalStats {
                 evictions,
                 // `item_current`, `segment_free` and `segment_current` are
@@ -158,6 +173,19 @@ mod adapter {
                 // "current total number of segments" -- set once at
                 // construction, not a live per-write count.
                 total_segments: find_gauge("segment_current").unwrap_or(0),
+                // The same decomposition crucible reports, so the two are
+                // readable side by side: live bytes, bytes written (live
+                // plus the superseded copies still occupying segments), and
+                // the addressable total.
+                //
+                // cache-rs counts dead bytes explicitly rather than by
+                // subtraction, so `written` is a sum here where crucible
+                // reads each segment's write offset. Both mean "bytes
+                // appended and not yet reclaimed".
+                live_bytes: find_gauge("item_current_bytes").unwrap_or(0),
+                written_bytes: find_gauge("item_current_bytes").unwrap_or(0)
+                    + find_gauge("item_dead_bytes").unwrap_or(0),
+                capacity_bytes: find_gauge("segment_current").unwrap_or(0) * segment_size,
                 ..Default::default()
             })
         }
@@ -323,6 +351,7 @@ mod tests {
                 .hash_power(cachers_hash_power(12))
                 .build()
                 .expect("build cache-rs"),
+            segment_size: 1024 * 1024,
         }
     }
 
@@ -512,6 +541,7 @@ mod tests {
                 .hash_power(cachers_hash_power(16))
                 .build()
                 .expect("build"),
+            segment_size: 1024 * 1024,
         };
 
         let num_items = 20u32;
@@ -583,6 +613,7 @@ mod tests {
                 .hash_power(cachers_hash_power(16))
                 .build()
                 .expect("build"),
+            segment_size: 1024 * 1024,
         };
 
         let value = vec![0xABu8; 8 * 1024];
