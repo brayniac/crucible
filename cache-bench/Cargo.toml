@@ -41,7 +41,7 @@ zstd = "0.13"
 # wrong as driving neither: the engine honouring expiry loses the hits it
 # correctly discards while the other keeps serving them, so a comparison
 # needs the feature on both sides.
-cache_rs = { package = "segcache", git = "https://github.com/brayniac/cache-rs", rev = "88ba94081180117d51b0070879077bd0176db523", optional = true }
+cache_rs = { package = "segcache", git = "https://github.com/brayniac/cache-rs", rev = "7d09212cf47398263d4b76ad3bc8730017758bc1", optional = true }
 
 # Jemalloc
 tikv-jemallocator = { workspace = true }
@@ -55,6 +55,12 @@ cache-rs = ["dep:cache_rs"]
 # fires and every policy that consults expiry is measured as though the
 # mechanism were absent.
 virtual-clock = ["cache-core/virtual-clock", "cache_rs?/virtual-clock"]
+# Tally what each engine's merge passes keep, by item size and frequency
+# band, and print the retention rate per cell. Five hypotheses about the
+# retention *decision* have been falsified by measuring its effects; this
+# measures the decision. Both engines must have it, with identical
+# bucketing, or the comparison measures two instruments.
+retention-trace = ["cache-core/retention-trace", "cache_rs?/retention-trace"]
 
 [dev-dependencies]
 tempfile = "3"

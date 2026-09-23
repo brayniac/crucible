@@ -306,6 +306,8 @@ pub fn run_replay<C: Cache>(
 ) -> std::io::Result<ReplayOutcome> {
     let mut warmup = ReplayStats::default();
     let mut measured = ReplayStats::default();
+    #[cfg(feature = "retention-trace")]
+    let mut retention_trace_reset = false;
     let mut intervals = Vec::new();
     let mut interval = ReplayStats::default();
 
@@ -353,6 +355,18 @@ pub fn run_replay<C: Cache>(
         }
 
         let in_warmup = reader.records_read() <= opts.warmup_records;
+        // Clear the retention tally once, as the measured window opens, so
+        // the table describes the window the miss ratio describes. Warmup
+        // does most of the cache's filling and therefore most of its early
+        // merges, and folding those in would report decisions taken against
+        // a half-full cache alongside decisions taken against a full one.
+        #[cfg(feature = "retention-trace")]
+        if !in_warmup && !retention_trace_reset {
+            retention_trace_reset = true;
+            cache_core::retention_trace::reset();
+            #[cfg(feature = "cache-rs")]
+            cache_rs::retention_trace::reset();
+        }
         let stats = if in_warmup {
             &mut warmup
         } else {

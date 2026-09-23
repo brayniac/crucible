@@ -15,6 +15,12 @@ default = []
 # Trace replay needs it -- a replay consumes hours of recorded time in
 # seconds, so wall-clock expiry never fires.
 virtual-clock = []
+# Tally what a merge pass keeps, by item size and frequency band. Gated
+# because the record sits inside the merge loop; with it off the call
+# compiles away. Measurement only -- it answers whether two engines decide
+# retention differently or are shown different items, which no outcome
+# metric can separate.
+retention-trace = []
 loom = ["dep:loom"]
 # Randomized concurrency testing under sequential consistency. Deliberately
 # complementary to `loom`, not a replacement:
