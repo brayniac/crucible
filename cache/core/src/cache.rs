@@ -616,6 +616,47 @@ impl<H: Hashtable> TieredCache<H> {
         (live, written, capacity)
     }
 
+    /// Per-segment live occupancy, as counts in ten deciles.
+    ///
+    /// Bucket `i` counts non-free RAM segments whose `live_bytes` falls in
+    /// `[i*10%, (i+1)*10%)` of segment capacity; a completely full segment
+    /// lands in bucket 9.
+    ///
+    /// The cache-wide `live / capacity` ratio cannot answer whether
+    /// compaction is reachable, because compaction is a decision about
+    /// *pairs* of adjacent segments, not about the mean.
+    /// [`TtlLayer::try_compact_segment`] merges two sealed segments into one
+    /// spare only when their combined live bytes fit in 90% of a single
+    /// segment -- an average occupancy of 45% across the pair. A cache
+    /// sitting at 76% live overall can still hold a compactable tail, or
+    /// none at all, and the mean does not distinguish those.
+    ///
+    /// `live_bytes` is charged the full `item_stride`, so each count already
+    /// includes header and alignment overhead rather than just payload.
+    ///
+    /// A gauge, read without pinning exactly as [`resident_bytes`] is.
+    ///
+    /// [`resident_bytes`]: Self::resident_bytes
+    pub fn segment_occupancy(&self) -> [u64; 10] {
+        let mut deciles = [0u64; 10];
+        for layer in &self.layers {
+            for segment_id in 0..layer.total_segment_count() as u32 {
+                if let Some(segment) = layer.get_segment(segment_id)
+                    && !Self::is_freed(segment)
+                {
+                    let capacity = segment.capacity();
+                    if capacity == 0 {
+                        continue;
+                    }
+                    let live = segment.live_bytes() as usize;
+                    let decile = (live * 10 / capacity).min(9);
+                    deciles[decile] += 1;
+                }
+            }
+        }
+        deciles
+    }
+
     /// Sum of free segments across RAM layers only.
     ///
     /// Skips disk-backed layers the same way `resident_items` does (see its
@@ -3027,6 +3068,84 @@ mod tests {
     }
 
     /// The three byte figures must tell apart the two things that look
+    /// Occupancy must be reported per segment, not as a cache-wide mean.
+    ///
+    /// Compaction pairs two adjacent sealed segments, so what decides
+    /// whether it can fire is where individual segments sit, not the
+    /// average. A version of this that returned `live / capacity` over the
+    /// whole cache would report the same single number for a cache of
+    /// uniformly half-full segments and for one holding full segments
+    /// beside empty ones -- and only the second has pairs to compact.
+    ///
+    /// Not covered here: the `is_freed` filter. Nothing in this fixture
+    /// reaches the free queue, so a version counting freed segments passes.
+    /// That filter is exercised by the resident-byte tests instead.
+    #[test]
+    fn segment_occupancy_locates_segments_rather_than_averaging_them() {
+        let cache = create_test_cache_with_reclaim(OverwriteReclaim::Deferred);
+        let value = vec![0xCDu8; 1024];
+        let mut stored = Vec::new();
+        for i in 0..150u32 {
+            let key = format!("occ-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                stored.push(key);
+            }
+        }
+        assert!(!stored.is_empty(), "the fixture must store something");
+
+        let full = cache.segment_occupancy();
+        let occupied: u64 = full.iter().sum();
+        assert!(occupied > 0, "a filled cache has non-free segments");
+        assert_eq!(
+            occupied,
+            full.iter().sum::<u64>(),
+            "every counted segment lands in exactly one decile"
+        );
+        // Freshly written segments are densely packed, so the mass sits high.
+        let high: u64 = full[5..].iter().sum();
+        assert!(
+            high > 0,
+            "freshly filled segments should sit in the upper deciles: {full:?}"
+        );
+
+        // Items are appended in order, so deleting a prefix of the keys
+        // empties the earliest segments and leaves the later ones untouched.
+        // That is deliberately bimodal: drained segments at the bottom, full
+        // ones at the top, and nothing in between.
+        for key in stored.iter().take(stored.len() / 2) {
+            cache.delete(key.as_bytes());
+        }
+        let sparse = cache.segment_occupancy();
+
+        // The load-bearing assertion. Any cache-wide ratio -- however it is
+        // computed -- is a single number, so it can only ever populate a
+        // single bucket. Two modes several deciles apart cannot come from a
+        // mean, which is what makes this reject the averaged version rather
+        // than merely agreeing with it.
+        let occupied: Vec<usize> = (0..10).filter(|&i| sparse[i] > 0).collect();
+        let span = occupied.last().unwrap() - occupied.first().unwrap();
+        assert!(
+            span >= 5,
+            "draining a prefix leaves emptied segments far below untouched \
+             ones, and a mean could not show that spread: {full:?} became \
+             {sparse:?}"
+        );
+        // ...and the spread has to be caused by the deletions, not merely
+        // present beforehand. The partially-filled tail segment already sits
+        // well below the sealed ones, so a version reading `write_offset`
+        // instead of `live_bytes` would satisfy the span check while being
+        // blind to every delete.
+        assert!(
+            sparse[0] > full[0],
+            "emptied segments must fall into the bottom decile, which bytes \
+             written rather than bytes live would never show: {full:?} \
+             became {sparse:?}"
+        );
+    }
+
     /// identical in a resident-item count.
     ///
     /// Overwriting the same keys leaves superseded copies behind: the

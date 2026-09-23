@@ -872,6 +872,7 @@ impl Cache for SegCache {
             live_bytes,
             written_bytes,
             capacity_bytes,
+            occupancy_deciles: Some(self.inner.segment_occupancy()),
             ..self.inner.stats().snapshot()
         })
     }

@@ -139,6 +139,14 @@ pub struct TraceConfig {
         deserialize_with = "deserialize_size"
     )]
     pub max_value_bytes: usize,
+    /// Report which value sizes survived, by probing every key written.
+    ///
+    /// Off by default: it holds a key-to-size map for the whole run and
+    /// probes once per distinct key afterwards. Answers whether two engines
+    /// holding different item counts are keeping different size
+    /// distributions, which a total count cannot show.
+    #[serde(default)]
+    pub retained_sizes: bool,
 }
 
 /// On-disk trace layout.

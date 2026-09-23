@@ -778,6 +778,15 @@ pub struct CacheInternalStats {
     pub written_bytes: u64,
     /// Total addressable bytes in RAM segments.
     pub capacity_bytes: u64,
+    /// Non-free RAM segments counted into ten live-occupancy deciles, when
+    /// the engine can report them.
+    ///
+    /// `live_bytes / capacity_bytes` is a mean, and compaction is not a
+    /// decision about the mean: it pairs adjacent segments, so what decides
+    /// whether it can fire is how the segments are spread. `None` means the
+    /// engine does not expose per-segment occupancy, which is distinct from
+    /// a histogram that is genuinely all zeroes.
+    pub occupancy_deciles: Option<[u64; 10]>,
 }
 
 /// Result of a cache lookup that may require async I/O.

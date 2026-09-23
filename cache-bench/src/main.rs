@@ -337,6 +337,7 @@ fn run_trace_replay<C: Cache>(
         report_interval_records: trace_cfg.report_interval_records,
         max_value_bytes: trace_cfg.max_value_bytes,
         insert_on_miss: trace_cfg.format.insert_on_miss(),
+        retained_sizes: trace_cfg.retained_sizes,
     };
 
     eprintln!("replaying {}", trace_cfg.path.display());
@@ -421,6 +422,28 @@ fn print_replay_report(
     print_replay_latency("READ ", outcome.read_latency.as_ref());
     print_replay_latency("WRITE", outcome.write_latency.as_ref());
 
+    // Survival by value size, when asked for. Two engines holding
+    // different item counts in the same heap may be keeping the same size
+    // mix in different amounts, or different mixes entirely, and the totals
+    // read identically either way. Measured from the replay side so one
+    // code path covers both engines.
+    if let Some(hist) = &outcome.retained_sizes {
+        eprintln!("=== Retained by value size ===");
+        for &(bucket, written, retained) in &hist.buckets {
+            let pct = if written > 0 {
+                100.0 * retained as f64 / written as f64
+            } else {
+                0.0
+            };
+            let label = if bucket >= 1024 {
+                format!("{:>5} KiB", bucket / 1024)
+            } else {
+                format!("{bucket:>5} B  ")
+            };
+            eprintln!("  {label}  {retained:>9} of {written:>9} written  ({pct:5.1}%)");
+        }
+    }
+
     if let Some(stats) = internal {
         eprintln!();
         eprintln!("=== Cache internals ===");
@@ -456,6 +479,34 @@ fn print_replay_report(
                     "    per item:     {:.0} B live, {:.0} B of capacity",
                     stats.live_bytes as f64 / stats.resident_items as f64,
                     stats.capacity_bytes as f64 / stats.resident_items as f64
+                );
+            }
+        }
+        // The mean above cannot say whether compaction is reachable.
+        // `try_compact_segment` merges two adjacent sealed segments into one
+        // spare, and only when their combined live bytes fit in 90% of a
+        // single segment -- 45% average occupancy across the pair. So a
+        // cache can sit at any mean at all and still have no eligible pairs,
+        // and the decomposition above would look identical either way.
+        //
+        // The eligible count below is an upper bound, not a count of
+        // available compactions: the two segments also have to be adjacent
+        // in the same bucket's chain. If it is near zero, though, the bound
+        // is enough -- no pairs means no compaction, whatever the chain
+        // order.
+        if let Some(deciles) = stats.occupancy_deciles {
+            let counted: u64 = deciles.iter().sum();
+            if counted > 0 {
+                let bars: Vec<String> = (0..10)
+                    .map(|i| format!("{:>2}0%:{}", i, deciles[i]))
+                    .collect();
+                eprintln!("  occupancy:      {}", bars.join("  "));
+                // Deciles 0-3 are wholly under 45%; decile 4 straddles it,
+                // so it is excluded rather than half-counted.
+                let eligible: u64 = deciles[..4].iter().sum();
+                eprintln!(
+                    "    compactable:  {eligible} of {counted} segments under 40% live \
+                     (a pair needs <=45% each)"
                 );
             }
         }

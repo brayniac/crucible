@@ -196,6 +196,41 @@ pub struct ReplayOptions {
     pub max_value_bytes: usize,
     /// Synthesize an insert on every GET miss (`oracleGeneral` traces).
     pub insert_on_miss: bool,
+    /// Record which value sizes survived, by probing every key written.
+    ///
+    /// Off by default: it holds a key-to-size map for the whole run and
+    /// probes the cache once per distinct key afterwards, which is memory
+    /// and time a normal measurement should not pay.
+    ///
+    /// Measured from here rather than inside either engine on purpose. The
+    /// replay already knows every key's size, and `contains` is on the
+    /// `Cache` trait, so one piece of code measures both engines and the
+    /// results are comparable by construction rather than by reconciling
+    /// two engines' internal gauges -- which is how the last three
+    /// comparisons went wrong.
+    pub retained_sizes: bool,
+}
+
+/// Retention by value size: how many distinct keys of each size were
+/// written, and how many were still resident at the end.
+///
+/// Buckets are powers of two on the value length. The question it answers
+/// is whether two engines holding different item counts are keeping
+/// different size distributions, which a total count cannot show.
+#[derive(Debug, Default, Clone)]
+pub struct RetainedSizes {
+    /// `(bucket_low_bytes, written, retained)`, ascending.
+    pub buckets: Vec<(u32, u64, u64)>,
+}
+
+impl RetainedSizes {
+    fn bucket_of(value_len: u32) -> u32 {
+        if value_len == 0 {
+            0
+        } else {
+            1u32 << (31 - value_len.leading_zeros())
+        }
+    }
 }
 
 /// What a replay produced.
@@ -224,6 +259,9 @@ pub struct ReplayOutcome {
     /// trending at its end was too short, and its average is a value that
     /// occurs nowhere in the run.
     pub intervals: Vec<f64>,
+    /// Retention by value size, when `ReplayOptions::retained_sizes` asked
+    /// for it.
+    pub retained_sizes: Option<RetainedSizes>,
 }
 
 /// Replay a trace against a cache, splitting warmup from the measured window.
@@ -238,6 +276,13 @@ pub fn run_replay<C: Cache>(
     let mut interval = ReplayStats::default();
 
     let mut key_buf = Vec::with_capacity(64);
+    // key_id -> value length, for the retention probe. Only distinct keys,
+    // and only when asked.
+    let mut written_sizes: std::collections::HashMap<u64, (u16, u32)> = if opts.retained_sizes {
+        std::collections::HashMap::with_capacity(1 << 20)
+    } else {
+        std::collections::HashMap::new()
+    };
     let value_pool = vec![0xA5u8; opts.max_value_bytes];
     let mut measured_records = 0u64;
 
@@ -304,6 +349,12 @@ pub fn run_replay<C: Cache>(
             stats,
         );
 
+        // Record the size a key was stored at. Last write wins, which is
+        // what the cache holds too.
+        if opts.retained_sizes && !matches!(record.op, Op::Get | Op::Gets | Op::Delete) {
+            written_sizes.insert(record.key_id, (record.key_len, record.value_len));
+        }
+
         if let Some(started) = started {
             let elapsed = started.elapsed().as_nanos() as u64;
             // A GET that misses under `insert_on_miss` performs a write, so it
@@ -340,6 +391,29 @@ pub fn run_replay<C: Cache>(
         intervals.push(ratio);
     }
 
+    // Probe after the window closes, so the probing itself cannot change
+    // what is resident during measurement. `contains` is the non-bumping
+    // lookup, so it does not disturb frequencies either.
+    let retained_sizes = if opts.retained_sizes {
+        let mut tally: std::collections::BTreeMap<u32, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for (&key_id, &(key_len, value_len)) in &written_sizes {
+            write_key(&mut key_buf, key_id, key_len);
+            let entry = tally
+                .entry(RetainedSizes::bucket_of(value_len))
+                .or_insert((0, 0));
+            entry.0 += 1;
+            if cache.contains(&key_buf) {
+                entry.1 += 1;
+            }
+        }
+        Some(RetainedSizes {
+            buckets: tally.into_iter().map(|(b, (w, r))| (b, w, r)).collect(),
+        })
+    } else {
+        None
+    };
+
     Ok(ReplayOutcome {
         warmup,
         measured,
@@ -347,6 +421,7 @@ pub fn run_replay<C: Cache>(
         read_latency: read_hist.load(),
         write_latency: write_hist.load(),
         intervals,
+        retained_sizes,
     })
 }
 
@@ -742,12 +817,96 @@ mod tests {
         cache_rs::clock::clear_virtual_now();
     }
 
+    /// The histogram must separate size classes and measure survival
+    /// within each.
+    ///
+    /// Asserts the instrument, not a policy outcome. An earlier version
+    /// asserted that small values survive better than large ones; they do
+    /// not, at least not here -- eviction is by whole segment and a segment
+    /// holds a mix, so both classes survived at 6-7%. That is the kind of
+    /// claim this instrument exists to test, so encoding it as a test would
+    /// have been assuming the answer.
+    #[test]
+    fn retained_sizes_reports_survival_per_size_class() {
+        // Interleaved, not one class then the other. Writing all the small
+        // keys first and then 25 MiB of large ones into an 8 MiB cache
+        // evicts the small ones by recency, and the result measures write
+        // order rather than size -- which is what the first version of this
+        // test did, and it read as small keys surviving *worse*.
+        let mut bytes = Vec::new();
+        for i in 0..100u64 {
+            bytes.extend_from_slice(&twitter_bytes(i, 64, Op::Set));
+            bytes.extend_from_slice(&twitter_bytes(1000 + i, 256 * 1024, Op::Set));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sizes.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader =
+            crate::trace::TraceReader::open(&path, crate::trace::TraceFormat::Twitter).unwrap();
+        let mut o = opts(0, 1000);
+        o.retained_sizes = true;
+        o.max_value_bytes = 512 * 1024;
+        let outcome = run_replay(&small_cache(), &mut reader, &o).expect("replay");
+
+        let hist = outcome.retained_sizes.expect("asked for it");
+        let small: u64 = hist
+            .buckets
+            .iter()
+            .filter(|(b, _, _)| *b < 1024)
+            .map(|(_, _, r)| r)
+            .sum();
+        let small_w: u64 = hist
+            .buckets
+            .iter()
+            .filter(|(b, _, _)| *b < 1024)
+            .map(|(_, w, _)| w)
+            .sum();
+        let large: u64 = hist
+            .buckets
+            .iter()
+            .filter(|(b, _, _)| *b >= 1024)
+            .map(|(_, _, r)| r)
+            .sum();
+        let large_w: u64 = hist
+            .buckets
+            .iter()
+            .filter(|(b, _, _)| *b >= 1024)
+            .map(|(_, w, _)| w)
+            .sum();
+
+        assert_eq!(small_w, 100, "100 small keys written, bucketed under 1 KiB");
+        assert_eq!(
+            large_w, 100,
+            "100 large keys written, bucketed at or above 1 KiB"
+        );
+        assert!(
+            hist.buckets.len() >= 2,
+            "two size classes were written, so both must appear: {:?}",
+            hist.buckets
+        );
+        // Eviction happened, and the probe saw it rather than echoing the
+        // written counts back.
+        assert!(
+            small + large < small_w + large_w,
+            "25 MiB into an 8 MiB cache must evict something: \
+             {small}/{small_w} small, {large}/{large_w} large"
+        );
+        for &(bucket, written, retained) in &hist.buckets {
+            assert!(
+                retained <= written,
+                "bucket {bucket}: retained {retained} exceeds written {written}"
+            );
+        }
+    }
+
     fn opts(warmup: u64, interval: u64) -> ReplayOptions {
         ReplayOptions {
             warmup_records: warmup,
             max_records: None,
             report_interval_records: interval,
             max_value_bytes: 4096,
+            retained_sizes: false,
             insert_on_miss: true,
         }
     }
