@@ -910,7 +910,7 @@ checksum = "02477b4e4b5454c404fa7ef505c85cacb89fee3987793f9a3a2bd9ab556c4e3b"
 [[package]]
 name = "keyvalue"
 version = "0.4.0"
-source = "git+https://github.com/brayniac/cache-rs?branch=feat%2Fvirtual-clock#88ba94081180117d51b0070879077bd0176db523"
+source = "git+https://github.com/brayniac/cache-rs?rev=88ba94081180117d51b0070879077bd0176db523#88ba94081180117d51b0070879077bd0176db523"
 
 [[package]]
 name = "lazy_static"
@@ -1726,7 +1726,7 @@ dependencies = [
 [[package]]
 name = "segcache"
 version = "0.4.5"
-source = "git+https://github.com/brayniac/cache-rs?branch=feat%2Fvirtual-clock#88ba94081180117d51b0070879077bd0176db523"
+source = "git+https://github.com/brayniac/cache-rs?rev=88ba94081180117d51b0070879077bd0176db523#88ba94081180117d51b0070879077bd0176db523"
 dependencies = [
  "ahash",
  "clocksource 0.8.3",

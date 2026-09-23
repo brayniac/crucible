@@ -3240,6 +3240,63 @@ mod tests {
         );
     }
 
+    /// Does capacity drift away over many eviction cycles?
+    ///
+    /// The freed-segment counters were an accounting fault, not a leak --
+    /// those segments are in the free queue and get reused. This checks
+    /// that claim the only way that matters: run far more eviction cycles
+    /// than the cache has segments and see whether usable capacity, or the
+    /// items it holds, decays.
+    #[test]
+    #[ignore = "diagnostic: run explicitly with --ignored"]
+    fn report_capacity_drift_over_eviction_cycles() {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(16));
+        let layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(8 * 1024 * 1024)
+            .spare_capacity(4)
+            .config(
+                LayerConfig::new()
+                    .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+            )
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(layer)
+            .eviction_threshold(1)
+            .build();
+
+        let value = vec![0xABu8; 1024];
+        let mut written = 0u32;
+        eprintln!(
+            "  {:>9}{:>12}{:>11}{:>12}{:>10}",
+            "writes", "evictions", "resident", "live MiB", "free segs"
+        );
+        for round in 1..=6u32 {
+            for _ in 0..20000 {
+                let key = format!("k-{written:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    let _ = cache.get(key.as_bytes());
+                }
+                written += 1;
+            }
+            let (live, _w, _c) = cache.resident_bytes();
+            eprintln!(
+                "  {:>9}{:>12}{:>11}{:>12.2}{:>10}",
+                round * 20000,
+                cache.stats().snapshot().evictions,
+                cache.resident_items(),
+                live as f64 / (1024.0 * 1024.0),
+                cache.ram_free_segment_count()
+            );
+        }
+    }
+
     /// Where the unreachable items actually live, by segment state.
     ///
     /// `resident_items` walks every segment the pool addresses, so anything
