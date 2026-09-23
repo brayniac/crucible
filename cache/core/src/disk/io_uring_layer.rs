@@ -1350,12 +1350,7 @@ mod tests {
 
         // Reads go through the verifier, which is fine here -- the segment is
         // still `Live`, so `admits_verify_reader` allows it.
-        // once however many there are. Each read gets its own second.
-        // smoothed counter), so reads inside one second raise the frequency
-        // The counter is rate-limited to one increment per epoch (Segcache's
-        let _tick_clock = crate::clock::TestClock::start();
         for _ in 0..reads {
-            _tick_clock.tick();
             assert!(
                 hashtable.lookup(key, &verifier).is_some(),
                 "the warming read must hit, or no frequency accrues"

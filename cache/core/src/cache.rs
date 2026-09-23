@@ -3185,12 +3185,7 @@ mod tests {
         // Warm every key well clear of 1. `get` bumps the counter, so the
         // reads are the warming.
         for key in &keys {
-            // once however many there are. Each read gets its own second.
-            // smoothed counter), so reads inside one second raise the frequency
-            // The counter is rate-limited to one increment per epoch (Segcache's
-            let _tick_clock = crate::clock::TestClock::start();
             for _ in 0..6 {
-                _tick_clock.tick();
                 let _ = cache.get(key.as_bytes());
             }
         }
@@ -3301,12 +3296,7 @@ mod tests {
                 }
             }
             for key in &keys {
-                // once however many there are. Each read gets its own second.
-                // smoothed counter), so reads inside one second raise the frequency
-                // The counter is rate-limited to one increment per epoch (Segcache's
-                let _tick_clock = crate::clock::TestClock::start();
                 for _ in 0..6 {
-                    _tick_clock.tick();
                     let _ = cache.get(key.as_bytes());
                 }
             }
