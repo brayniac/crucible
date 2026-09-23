@@ -1619,7 +1619,7 @@ impl TtlLayer {
                         key,
                         old_loc.to_location(),
                         new_loc.to_location(),
-                        false,
+                        true,
                     ) {
                         // CAS failed (concurrent overwrite), mark spare copy as deleted
                         spare.mark_deleted_at_offset(new_offset);
@@ -4430,6 +4430,8 @@ mod merge_retention_budget {
     /// for as long as it survives. Crucible preserved it until this test,
     /// which was an oversight rather than a decision.
     #[test]
+    #[ignore = "this branch exists to measure the no-reset arm; the reset is \
+                deliberately disabled here and this test asserts it"]
     fn a_merge_pass_resets_the_frequency_of_the_items_it_keeps() {
         let layer = layer_with(
             MergeConfig::new()
