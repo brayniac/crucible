@@ -2053,7 +2053,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
-    use crate::config::OverwriteReclaim;
+    use crate::config::{EvictionStrategy, MergeConfig, OverwriteReclaim};
     use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::layer::{FifoLayerBuilder, TtlLayerBuilder};
 
@@ -3048,6 +3048,233 @@ mod tests {
             "overwriting should lower the live share of written bytes: \
              {after:.3} against {before:.3}"
         );
+    }
+
+    /// Every resident item must be reachable through the hashtable.
+    ///
+    /// A lookup that loses an item it still holds produces exactly the
+    /// signature that is otherwise hard to explain: residency unchanged,
+    /// miss ratio higher. The item stays live in its segment, counted by
+    /// `resident_items`, while reads for it miss -- so capacity looks fine
+    /// and hit ratio does not.
+    ///
+    /// Sized to fit without eviction, so any shortfall is the index losing
+    /// track rather than the policy discarding.
+    #[test]
+    fn every_resident_item_is_reachable_by_lookup() {
+        let cache = create_test_cache();
+        let value = vec![0xABu8; 256];
+
+        let mut stored = 0u64;
+        for i in 0..400u32 {
+            let key = format!("reach-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                stored += 1;
+            }
+        }
+
+        let mut found = 0u64;
+        for i in 0..400u32 {
+            let key = format!("reach-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+
+        let resident = cache.resident_items();
+        assert_eq!(
+            found,
+            resident,
+            "{resident} items are resident but only {found} read back; \
+             {} are held but unreachable",
+            resident.saturating_sub(found)
+        );
+        assert_eq!(found, stored, "{stored} stored, {found} read back");
+    }
+
+    /// The same invariant after items have been relocated.
+    ///
+    /// CURRENTLY FAILS for the same reason as
+    /// `every_resident_item_should_be_reachable_after_merge`, which
+    /// isolates it to merge rather than to demotion: the single-layer case
+    /// with zero demotions strands items too. Ignored so it does not break
+    /// the suite while the bug stands.
+    ///
+    /// Merge copies survivors into a new segment and demotion moves them
+    /// between layers; both must re-point the index. A relocation that
+    /// updated the segment but not the hashtable would leave the item live
+    /// and counted while reads for it miss, and the unpressured case above
+    /// would never catch it because nothing moves there.
+    #[test]
+    #[ignore = "known bug: merge strands ~2 segments of items outside the index"]
+    fn resident_items_stay_reachable_after_eviction_and_demotion() {
+        let cache = create_test_cache();
+        let value = vec![0xABu8; 1024];
+
+        // Well past capacity, reading each key so it carries a frequency
+        // and demotes rather than being discarded out of layer 0.
+        for i in 0..3000u32 {
+            let key = format!("moved-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+
+        let stats = cache.stats().snapshot();
+        assert!(
+            stats.evictions > 0,
+            "the fixture must actually evict for this to test anything"
+        );
+
+        let mut found = 0u64;
+        for i in 0..3000u32 {
+            let key = format!("moved-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+        let resident = cache.resident_items();
+
+        assert_eq!(
+            found,
+            resident,
+            "after {} evictions and {} demotions: {resident} resident but {found} \
+             reachable, so {} are held and unreachable",
+            stats.evictions,
+            stats.demotions,
+            resident.saturating_sub(found)
+        );
+    }
+
+    /// Every item the cache reports as resident should be reachable.
+    ///
+    /// CURRENTLY FAILS -- this is a bug report, not a guard. Ignored so it
+    /// does not break the suite while it stands.
+    ///
+    /// Single layer with merge eviction and no demotion, which is the shape
+    /// `policy = "merge"` builds. After eviction a fixed set of items stays
+    /// live in its segments and counted by `resident_items` while lookups
+    /// for it miss. About 126 items, roughly two segments' worth, largely
+    /// independent of heap size: 25.6% of residency on a 16-segment cache,
+    /// 1.6% on a 128-segment one. It persists -- further traffic leaves the
+    /// shortfall at exactly the same absolute number.
+    ///
+    /// Two consequences. Reads for those items miss even though the bytes
+    /// are held, which inflates miss ratio at unchanged capacity. And
+    /// `resident_items` overstates the useful contents, so any cross-engine
+    /// residency comparison using it is biased toward crucible by that
+    /// margin.
+    ///
+    /// See `report_unreachable_resident_items_by_heap_size` for the numbers.
+    #[test]
+    #[ignore = "known bug: merge strands ~2 segments of items outside the index"]
+    fn every_resident_item_should_be_reachable_after_merge() {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(16));
+        let layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(8 * 1024 * 1024)
+            .spare_capacity(4)
+            .config(
+                LayerConfig::new()
+                    .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+            )
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(layer)
+            .eviction_threshold(1)
+            .build();
+
+        let value = vec![0xABu8; 1024];
+        for i in 0..24000u32 {
+            let key = format!("k-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        let mut found = 0u64;
+        for i in 0..24000u32 {
+            let key = format!("k-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+        let resident = cache.resident_items();
+        assert_eq!(
+            found,
+            resident,
+            "{resident} resident but {found} reachable: {} items held outside the index",
+            resident.saturating_sub(found)
+        );
+    }
+
+    /// How many resident items are unreachable, across heap sizes.
+    ///
+    /// Single layer with merge eviction and no demotion -- the shape
+    /// `policy = "merge"` actually builds. Reports rather than asserts,
+    /// because the question being answered is whether the shortfall scales
+    /// with the segment count or is an artifact of a cramped fixture.
+    #[test]
+    #[ignore = "diagnostic: run explicitly with --ignored"]
+    fn report_unreachable_resident_items_by_heap_size() {
+        for (heap_mb, power) in [(1usize, 12u8), (4, 14), (8, 16)] {
+            let hashtable = Arc::new(MultiChoiceHashtable::new(power));
+            let layer = TtlLayerBuilder::new()
+                .layer_id(0)
+                .pool_id(0)
+                .segment_size(64 * 1024)
+                .heap_size(heap_mb * 1024 * 1024)
+                .spare_capacity(4)
+                .config(
+                    LayerConfig::new()
+                        .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+                )
+                .build()
+                .expect("ttl layer");
+            let cache = TieredCacheBuilder::new(hashtable)
+                .with_ttl_layer(layer)
+                .eviction_threshold(1)
+                .build();
+
+            let value = vec![0xABu8; 1024];
+            let n = heap_mb as u32 * 3000;
+            for i in 0..n {
+                let key = format!("k-{i:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    let _ = cache.get(key.as_bytes());
+                }
+            }
+            let mut found = 0u64;
+            for i in 0..n {
+                let key = format!("k-{i:08}");
+                if cache.get(key.as_bytes()).is_some() {
+                    found += 1;
+                }
+            }
+            let resident = cache.resident_items();
+            let evictions = cache.stats().snapshot().evictions;
+            let segments = heap_mb * 1024 / 64;
+            eprintln!(
+                "  {heap_mb} MiB ({segments} segments, {evictions} evictions): \
+                 {resident} resident, {found} reachable, {} unreachable ({:.1}%)",
+                resident.saturating_sub(found),
+                100.0 * resident.saturating_sub(found) as f64 / resident.max(1) as f64
+            );
+        }
     }
 
     #[test]
