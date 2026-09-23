@@ -1586,9 +1586,23 @@ impl<H: Hashtable> TieredCache<H> {
         // expiration never runs at all. Both engines measured in this
         // program had it switched off for that reason.
         //
-        // Cheap to attempt: `try_expire_segments` walks bucket heads and
-        // stops at the first unexpired one, so on a cache with nothing
-        // expired it costs a comparison per bucket and no segment work.
+        // Not free to attempt, and measured. `try_expire_segments` checks
+        // the head of every one of the 1024 TTL buckets on each call -- it
+        // does not stop early -- so a pass that expires nothing still pays
+        // that walk. Measured at cluster4/128MB the walk is small against
+        // the pass it sits in: space-making passes averaged 1572us with
+        // expiry and 1546us without, which is inside the difference between
+        // two pi4b boards.
+        //
+        // What it does *not* buy, on that trace: anything measurable. The
+        // eviction counter falls 428 -> 119, but the number of passes is
+        // identical at 402, and miss ratio, residency and the write tail
+        // (p99.99 2539us against 2523us) are unchanged. Expiry changes how
+        // a pass resolves, not how often one happens, and this workload's
+        // expired bytes were going to be reclaimed by the next merge
+        // anyway. It is kept because reclaiming dead data before live data
+        // is right regardless, and because a workload with real expiry
+        // pressure is exactly the one this trace is not.
         if self.expire() > 0 && layer.free_segment_count() > self.eviction_threshold {
             self.stats
                 .eviction_latency
