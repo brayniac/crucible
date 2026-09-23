@@ -3340,6 +3340,115 @@ mod tests {
         );
     }
 
+    /// Every allocating write must reach expiry, not just `set`.
+    ///
+    /// `ensure_space` is where expiry is attempted, and it is called by
+    /// `set`, `begin_segment_set`, `add`, `replace` and `cas` -- with
+    /// `append` and `prepend` reaching it through `set`. That list is easy
+    /// to read off the code and easy to be wrong about: a write path added
+    /// later that allocates without calling `ensure_space` would evict
+    /// live data while expired data sat there, and nothing would say so.
+    ///
+    /// So this exercises the paths rather than reading them.
+    #[test]
+    fn every_allocating_write_path_expires_before_it_evicts() {
+        type Cache = TieredCache<MultiChoiceHashtable>;
+        // (name, prepare, exercise). Anything the op needs in place runs in
+        // `prepare`, before the TTL lapses, so the only write happening
+        // against an all-expired cache is the one under test. Doing that
+        // setup afterwards consumes the expired supply itself, and the op is
+        // then measured evicting for space its own preamble used -- which is
+        // what the first version did, and it read as `append` bypassing
+        // expiry entirely.
+        type Op = (
+            &'static str,
+            fn(&Cache, &[u8], &[u8]),
+            fn(&Cache, &[u8], &[u8]) -> bool,
+        );
+        let ops: &[Op] = &[
+            (
+                "set",
+                |_, _, _| {},
+                |c, k, v| c.set(k, v, b"", Duration::from_secs(3600)).is_ok(),
+            ),
+            (
+                "add",
+                |_, _, _| {},
+                |c, k, v| c.add(k, v, b"", Duration::from_secs(3600)).is_ok(),
+            ),
+            (
+                "append",
+                |c, k, v| {
+                    let _ = c.set(k, v, b"", Duration::from_secs(3600));
+                },
+                |c, k, v| c.append(k, v).is_ok(),
+            ),
+            (
+                "replace",
+                |c, k, v| {
+                    let _ = c.set(k, v, b"", Duration::from_secs(3600));
+                },
+                |c, k, v| c.replace(k, v, b"", Duration::from_secs(3600)).is_ok(),
+            ),
+        ];
+
+        for (name, prepare, exercise) in ops {
+            let clock = crate::clock::TestClock::start();
+            let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+            let ttl_layer = TtlLayerBuilder::new()
+                .layer_id(0)
+                .pool_id(0)
+                .segment_size(16 * 1024)
+                .heap_size(256 * 1024)
+                .spare_capacity(2)
+                .build()
+                .expect("ttl layer");
+            let cache = TieredCacheBuilder::new(hashtable)
+                .with_ttl_layer(ttl_layer)
+                .eviction_threshold(1)
+                .overwrite_reclaim(OverwriteReclaim::Deferred)
+                .build();
+            let value = vec![0xEEu8; 512];
+
+            for i in 0..2000u32 {
+                let key = format!("{name}-{i:08}");
+                let _ = cache.set(key.as_bytes(), &value, b"", Duration::from_secs(60));
+            }
+            // Whatever the op needs present, written while nothing has
+            // expired yet.
+            for i in 0..200u32 {
+                let key = format!("{name}-after-{i:08}");
+                prepare(&cache, key.as_bytes(), &value);
+            }
+
+            let evictions_before = cache.stats().snapshot().evictions;
+            let expirations_before = cache.stats().snapshot().expirations;
+            for _ in 0..600 {
+                clock.tick();
+            }
+
+            let mut applied = 0;
+            for i in 0..200u32 {
+                let key = format!("{name}-after-{i:08}");
+                if exercise(&cache, key.as_bytes(), &value) {
+                    applied += 1;
+                }
+            }
+            assert!(applied > 0, "{name} never succeeded, so it proved nothing");
+
+            let after = cache.stats().snapshot();
+            assert!(
+                after.expirations > expirations_before,
+                "{name} made space without reaching expiry: expirations stayed \
+                 at {expirations_before}"
+            );
+            assert_eq!(
+                after.evictions, evictions_before,
+                "{name} evicted live data while expired data was available"
+            );
+        }
+    }
+
     /// Memory pressure must try expiry before it evicts.
     ///
     /// Reclaiming an expired segment costs nothing and destroys nothing
