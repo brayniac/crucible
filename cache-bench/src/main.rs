@@ -412,6 +412,21 @@ fn print_replay_report(
         ),
         None => eprintln!("  MISS RATIO:     n/a (no GETs)"),
     }
+    // Printed beside the request-weighted ratio rather than instead of it,
+    // because retention policies trade one against the other. Ranking by
+    // frequency alone keeps large hot items and favours this ratio; ranking
+    // by frequency-over-size keeps small ones and favours the ratio above.
+    // Reporting only one scores every policy on the axis that happens to
+    // suit it.
+    match m.byte_miss_ratio() {
+        Some(r) => eprintln!(
+            "  BYTE MISS:      {:.4}  (hit {:.2}%)  over {:.1} MiB of GETs",
+            r,
+            (1.0 - r) * 100.0,
+            m.get_bytes as f64 / (1024.0 * 1024.0)
+        ),
+        None => eprintln!("  BYTE MISS:      n/a (no GET carried bytes)"),
+    }
 
     // Merge eviction runs inline in `set`, so a reclamation pass is a stall on
     // whichever write triggered it. The tail is the whole signal here: at ~200

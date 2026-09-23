@@ -36,6 +36,16 @@ pub struct ReplayStats {
     pub deletes: u64,
     /// Records whose value exceeded the replay's value buffer.
     pub oversized: u64,
+    /// Value bytes behind the GETs counted in `hits`.
+    ///
+    /// Taken from the trace record, not from the cache, so a hit and a miss
+    /// on the same key contribute the same number and the figure is
+    /// identical across engines. That is what makes it comparable; reading
+    /// the length back from each cache would measure two implementations of
+    /// the measurement alongside the two caches.
+    pub hit_bytes: u64,
+    /// Value bytes behind every GET counted here, hit or miss.
+    pub get_bytes: u64,
 }
 
 /// Cause counts behind [`ReplayStats::set_errors`].
@@ -62,6 +72,28 @@ pub struct SetErrorCauses {
 }
 
 impl ReplayStats {
+    /// Miss ratio by value bytes, or `None` if no GET carried any.
+    ///
+    /// The companion to [`miss_ratio`](Self::miss_ratio), and the two answer
+    /// different questions. Ranking retention by frequency alone favours
+    /// large hot items; ranking by frequency-over-size favours small ones.
+    /// Both raise one of these ratios at the other's expense, so reporting
+    /// only the request-weighted figure scores a size-aware policy on the
+    /// axis it optimises and a size-blind one on the axis it does not.
+    ///
+    /// `None` rather than 0.0 for the same reason `miss_ratio` uses it: a
+    /// window with nothing in the denominator has no ratio, and rendering
+    /// that as a perfect hit rate is how an empty window reads as a good
+    /// result. Note that GETs for zero-length values count in
+    /// [`miss_ratio`] but contribute nothing here, so the two denominators
+    /// are deliberately not the same population.
+    pub fn byte_miss_ratio(&self) -> Option<f64> {
+        if self.get_bytes == 0 {
+            return None;
+        }
+        Some((self.get_bytes - self.hit_bytes) as f64 / self.get_bytes as f64)
+    }
+
     /// Miss ratio over the GETs counted here, or `None` if there were none.
     ///
     /// `None` rather than 0.0: a window with no GETs has no miss ratio, and
@@ -120,8 +152,10 @@ pub fn apply_record<C: Cache>(
 
     match record.op {
         Op::Get | Op::Gets => {
+            stats.get_bytes += record.value_len as u64;
             if cache.with_value(key_buf, |_| ()).is_some() {
                 stats.hits += 1;
+                stats.hit_bytes += record.value_len as u64;
             } else {
                 stats.misses += 1;
                 if insert_on_miss {
@@ -818,6 +852,66 @@ mod tests {
     }
 
     /// The histogram must separate size classes and measure survival
+    /// Byte miss ratio must weight by value size, not just count GETs.
+    ///
+    /// Built so the two ratios must disagree: the same number of GETs hit
+    /// and miss, so the request miss ratio is exactly 0.5 whatever the
+    /// sizes are, while every hit is a large value and every miss a small
+    /// one. An implementation that counted GETs, or that added a constant
+    /// per GET, would report 0.5 here too.
+    #[test]
+    fn byte_miss_ratio_weights_gets_by_value_size() {
+        const BIG: u32 = 8192;
+        const SMALL: u32 = 64;
+        let mut bytes = Vec::new();
+        // Only the large keys are ever stored, so every GET for a small key
+        // is a guaranteed miss and every GET for a large key a guaranteed
+        // hit -- no dependence on the cache's policy.
+        for i in 0..50u64 {
+            bytes.extend_from_slice(&twitter_bytes(i, BIG, Op::Set));
+        }
+        for i in 0..50u64 {
+            bytes.extend_from_slice(&twitter_bytes(i, BIG, Op::Get));
+            bytes.extend_from_slice(&twitter_bytes(5000 + i, SMALL, Op::Get));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bytes.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader =
+            crate::trace::TraceReader::open(&path, crate::trace::TraceFormat::Twitter).unwrap();
+        let mut o = opts(0, 1000);
+        o.insert_on_miss = false;
+        o.max_value_bytes = 64 * 1024;
+        let outcome = run_replay(&small_cache(), &mut reader, &o).expect("replay");
+        let m = &outcome.measured;
+
+        assert_eq!(m.hits, 50, "every large key was stored, so every GET hits");
+        assert_eq!(m.misses, 50, "no small key was ever stored");
+        assert_eq!(
+            m.miss_ratio(),
+            Some(0.5),
+            "by request count the window is exactly half misses"
+        );
+
+        let byte_miss = m.byte_miss_ratio().expect("GETs carried bytes");
+        let expected = (50.0 * SMALL as f64) / (50.0 * SMALL as f64 + 50.0 * BIG as f64);
+        assert!(
+            (byte_miss - expected).abs() < 1e-9,
+            "byte miss ratio must be miss bytes over GET bytes: {byte_miss} against {expected}"
+        );
+        assert!(
+            byte_miss < 0.5,
+            "the misses are the small values, so by bytes the window must \
+             look far better than by requests: {byte_miss} against 0.5"
+        );
+        assert_eq!(
+            m.get_bytes,
+            50 * (BIG as u64 + SMALL as u64),
+            "every GET contributes its trace value length"
+        );
+    }
+
     /// within each.
     ///
     /// Asserts the instrument, not a policy outcome. An earlier version
