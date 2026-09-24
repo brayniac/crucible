@@ -159,6 +159,14 @@ fn retention_rank(freq: u8, stride: u32, mean_stride: f64, exponent: f64) -> u8 
     if exponent == 0.0 {
         return freq;
     }
+    // `!(x > 0.0)` rather than `x <= 0.0`: the negated form is true for
+    // NaN and the comparison form is not. Not load-bearing on its own --
+    // `!ranked.is_finite()` below catches a NaN that reached `powf` -- but
+    // it also rejects a non-positive mean, which would otherwise produce a
+    // negative multiplier and clamp every item to rank 1 rather than
+    // falling back to the frequency. Kept as the earlier and more explicit
+    // of the two guards.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(mean_stride > 0.0) || stride == 0 {
         return freq;
     }
@@ -1545,11 +1553,11 @@ impl TtlLayer {
         // the chain claiming both.
         let mut consumed = 0usize;
         let mut consumed_bytes = 0u64;
-        for idx in 0..candidates.len() {
-            if consumed_bytes + retained[idx] > spare_budget {
+        for bytes in &retained {
+            if consumed_bytes + bytes > spare_budget {
                 break;
             }
-            consumed_bytes += retained[idx];
+            consumed_bytes += bytes;
             consumed += 1;
         }
 
@@ -4250,10 +4258,6 @@ mod merge_retention_budget {
 
         assert!(layer.evict(&hashtable), "merge eviction did not run");
 
-        let in_candidates: Vec<&Written> = written
-            .iter()
-            .filter(|w| candidates.contains(&w.segment))
-            .collect();
         // Per candidate, not across the chain: each is pruned against its
         // own budget, so comparing frequencies between segments tests the
         // budgeting rather than the ordering.
