@@ -202,7 +202,7 @@ dependencies = [
  "metrics",
  "metriken",
  "rand 0.9.2",
- "rand_xoshiro 0.7.0",
+ "rand_xoshiro",
  "segcache 0.4.2-alpha.0",
  "segcache 0.4.5",
  "serde",
@@ -910,7 +910,7 @@ checksum = "02477b4e4b5454c404fa7ef505c85cacb89fee3987793f9a3a2bd9ab556c4e3b"
 [[package]]
 name = "keyvalue"
 version = "0.4.0"
-source = "git+https://github.com/brayniac/cache-rs?rev=27ca521d860afc6af1e5223f8cfbcdefc0b716f9#27ca521d860afc6af1e5223f8cfbcdefc0b716f9"
+source = "git+https://github.com/brayniac/cache-rs?rev=445592930f3e503e7d693c9545e8026923f3a5bb#445592930f3e503e7d693c9545e8026923f3a5bb"
 
 [[package]]
 name = "lazy_static"
@@ -1493,15 +1493,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_xoshiro"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "662effc7698e08ea324d3acccf8d9d7f7bf79b9785e270a174ea36e56900c91d"
-dependencies = [
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "rayon"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1726,7 +1717,7 @@ dependencies = [
 [[package]]
 name = "segcache"
 version = "0.4.5"
-source = "git+https://github.com/brayniac/cache-rs?rev=27ca521d860afc6af1e5223f8cfbcdefc0b716f9#27ca521d860afc6af1e5223f8cfbcdefc0b716f9"
+source = "git+https://github.com/brayniac/cache-rs?rev=445592930f3e503e7d693c9545e8026923f3a5bb#445592930f3e503e7d693c9545e8026923f3a5bb"
 dependencies = [
  "ahash",
  "clocksource 0.8.3",
@@ -1737,7 +1728,6 @@ dependencies = [
  "memmap2",
  "metriken",
  "rand 0.10.2",
- "rand_xoshiro 0.8.1",
  "thiserror 2.0.18",
 ]
 
