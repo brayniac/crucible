@@ -1439,7 +1439,12 @@ impl TtlLayer {
         let mut scanned: Vec<ScannedItem> = Vec::with_capacity(estimated_items);
         // Bytes per frequency class. Frequency is a `u8`, so every class has
         // a slot and no bucketing is needed.
-        let mut class_bytes = [0u64; 256];
+        // One histogram per candidate, not one for the chain. A shared
+        // histogram lets a hot candidate spend the whole allowance and
+        // leaves the next with nothing, and it calibrates the threshold
+        // against bytes from candidates a pass that stops early will never
+        // reach. cache-rs budgets per segment for the same reason.
+        let mut class_bytes = vec![[0u64; 256]; candidates.len()];
 
         for (cand_idx, &cand_id) in candidates.iter().enumerate() {
             let segment = match self.pool.get(cand_id) {
@@ -1499,93 +1504,59 @@ impl TtlLayer {
                 mean_stride,
                 merge_config.cost_exponent,
             );
-            class_bytes[item.freq as usize] += item.stride as u64;
+            class_bytes[item.candidate as usize][item.freq as usize] += item.stride as u64;
         }
 
-        // ---- Phase B: choose the threshold before copying anything.
+        // ---- Phase B: a threshold per candidate, then how many fit.
         //
-        // The spare is freshly reserved, so its whole capacity is available;
-        // `free_space` says so without assuming the write offset is zero.
-        // Because the candidates and the spare come from the same pool they
-        // share an alignment, so the stride measured during the scan is
-        // exactly what `append_item` will consume.
+        // Each candidate is held to `target_ratio` of a segment's capacity,
+        // exactly as cache-rs holds each to `data.len() * target_ratio`.
+        // The spare's capacity is enforced separately, by consuming whole
+        // candidates only while they fit -- never by raising a threshold,
+        // which would answer a policy question with arithmetic.
         let spare_budget = spare.free_space() as u64;
-        let live_bytes: u64 = class_bytes.iter().sum();
+        let per_budget = (self.pool.segment_size() as f64 * merge_config.target_ratio) as u64;
 
-        // The threshold is policy alone, deliberately uncapped by the spare.
-        //
-        // It used to be `min(spare_budget, ratio_budget)`, which forces every
-        // candidate into one spare by pruning however hard that takes. That
-        // is the wrong side of the trade. How much to retain is a policy
-        // question; how many segments fit at that level is arithmetic, and
-        // capping the threshold answers the policy question with the
-        // arithmetic. On a four-candidate chain it meant pruning to ~25%
-        // whatever `target_ratio` asked for, and the items that die under
-        // hard pruning are the coldest -- which on this corpus are the small
-        // ones. Measured: cold-item retention 4.8% at four candidates
-        // against 14.8% at two, with both miss ratios better at two.
-        //
-        // The spare's capacity is still a hard bound. It is enforced below
-        // by consuming whole candidates only while they fit, which is what
-        // cache-rs does when it breaks out of its candidate loop.
-        let ratio_budget = (live_bytes as f64 * merge_config.target_ratio) as u64;
-        let budget = ratio_budget;
-
-        let (bound_threshold, bound_bytes) = threshold_for_budget(&class_bytes, budget);
-
-        // `initial_threshold` is a floor under both bounds.
-        //
-        // This is what keeps `MergeConfig::CLOCK` intact: one candidate into
-        // one spare always fits and a `target_ratio` of 1.0 caps nothing, so
-        // `bound_threshold` is 0 and the floor of 1 carries through.
-        let threshold = merge_config.initial_threshold.max(bound_threshold);
-
-        // The bound stops at a whole class, so it usually leaves a slice of
-        // the spare unfilled. That slice goes to the class that straddles the
-        // boundary -- and only to it. Those items all carry the same
-        // frequency, so taking them in scan order discards nothing the
-        // frequency ordering had anything to say about; that is the one place
-        // position is still allowed to decide (#154).
-        //
-        // Only when the *bound* is what binds: if the floor raised the
-        // threshold, the straddling class is below the floor and must go.
-        // And never at threshold 0, whose class is the items the hashtable
-        // no longer knows about.
-        // ---- Phase B2: how many candidates fit in the spare at that
-        // threshold.
-        //
-        // Whole candidates only. Stopping midway through one would leave
-        // half its survivors copied into the spare and half still in place,
-        // with the chain then claiming both -- so a candidate is either
-        // consumed entirely or not reached at all.
-        let mut per_candidate = vec![0u64; candidates.len()];
-        for item in &scanned {
-            if item.freq > threshold {
-                per_candidate[item.candidate as usize] += item.stride as u64;
-            }
+        let mut thresholds = vec![0u8; candidates.len()];
+        let mut straddles = vec![0u64; candidates.len()];
+        let mut retained = vec![0u64; candidates.len()];
+        for idx in 0..candidates.len() {
+            let (bound_threshold, bound_bytes) =
+                threshold_for_budget(&class_bytes[idx], per_budget);
+            // `initial_threshold` is a floor under the bound, which is what
+            // keeps `MergeConfig::CLOCK` a fixed rule rather than a budget.
+            let threshold = merge_config.initial_threshold.max(bound_threshold);
+            // The bound stops at a whole class, leaving a slice of the
+            // budget unspent; that slice goes to the straddling class and
+            // only to it. Those items share a frequency, so taking them in
+            // scan order discards nothing the ordering had to say (#154).
+            let straddle = if threshold == bound_threshold && threshold > 0 {
+                per_budget.saturating_sub(bound_bytes)
+            } else {
+                0
+            };
+            thresholds[idx] = threshold;
+            straddles[idx] = straddle;
+            retained[idx] = bound_bytes.min(per_budget) + straddle;
         }
+
+        // Whole candidates only: stopping midway would leave half a
+        // candidate's survivors in the spare and half still in place, with
+        // the chain claiming both.
         let mut consumed = 0usize;
         let mut consumed_bytes = 0u64;
-        for bytes in &per_candidate {
-            if consumed_bytes + bytes > spare_budget {
+        for idx in 0..candidates.len() {
+            if consumed_bytes + retained[idx] > spare_budget {
                 break;
             }
-            consumed_bytes += bytes;
+            consumed_bytes += retained[idx];
             consumed += 1;
         }
 
-        // How few is too few depends on what was asked for. A chain pass
-        // (`min_segments >= 2`) only reclaims when at least two candidates
-        // collapse into one spare, so one is no progress and the caller
-        // would loop. `MergeConfig::CLOCK` asks for exactly one on purpose
-        // -- it compacts a single segment rather than merging a chain --
-        // and requiring two there turns every CLOCK pass into the
-        // whole-segment fallback, which is not CLOCK at all.
-        //
-        // A candidate whose survivors do not fit even alone means the
-        // threshold is too generous for this chain; whole-segment eviction
-        // is the honest answer rather than pruning harder behind the
-        // policy's back.
+        // A chain pass only reclaims when two or more candidates collapse
+        // into one spare, so one is no progress and the caller would loop.
+        // `MergeConfig::CLOCK` asks for exactly one on purpose, and holding
+        // it to two turns every CLOCK pass into the whole-segment fallback.
         let min_consume = merge_config.min_segments.min(2);
         if consumed < min_consume {
             for &cand_id in &candidates {
@@ -1596,32 +1567,6 @@ impl TtlLayer {
             self.pool.release(spare_id);
             return self.evict_selected(hashtable);
         }
-
-        // Leftover within the *policy* budget, not within the spare.
-        //
-        // Briefly this read `spare_budget - consumed_bytes`, which is a
-        // whole segment's slack rather than the few bytes the class
-        // boundary left over -- so every item at the threshold was
-        // straddled back in and the pass retained its entire chain. The
-        // straddle exists to spend the remainder of what the policy
-        // allowed, and the spare's free space is a different quantity that
-        // happens to be much larger.
-        let mut straddle_budget = if threshold == bound_threshold && threshold > 0 {
-            // Bounded by both, because they bound different things. The
-            // policy leftover is what `target_ratio` still allows after the
-            // class boundary; the spare leftover is what physically fits
-            // after the consumed prefix. Taking only the first overfills
-            // the spare, `append_item` starts refusing, and the items it
-            // refuses are whichever were scanned last -- including
-            // top-class ones, which then read as retention ignoring
-            // frequency. That is what this looked like before the second
-            // bound was added.
-            budget
-                .saturating_sub(bound_bytes)
-                .min(spare_budget.saturating_sub(consumed_bytes))
-        } else {
-            0
-        };
 
         // ---- Phase C: copy the survivors, in the order they were scanned.
         for item in &scanned {
@@ -1653,11 +1598,15 @@ impl TtlLayer {
             );
 
             // The memoized frequency -- probing again here would double the
-            // hashtable work the pass does for no new information.
+            // hashtable work the pass does for no new information. The
+            // threshold is this candidate's own, so a hot segment and a
+            // cold one beside it are each judged against their own budget.
+            let idx = item.candidate as usize;
+            let threshold = thresholds[idx];
             let retain = if item.freq > threshold {
                 true
-            } else if item.freq == threshold && straddle_budget >= span.stride as u64 {
-                straddle_budget -= span.stride as u64;
+            } else if item.freq == threshold && straddles[idx] >= span.stride as u64 {
+                straddles[idx] -= span.stride as u64;
                 true
             } else {
                 false
@@ -4550,6 +4499,79 @@ mod merge_retention_budget {
     /// admitting more than fits, which the copy can only resolve by dropping
     /// whatever it reaches last.
     ///
+    /// The retention budget is per candidate, not spread across the chain.
+    ///
+    /// A chain-wide budget lets one candidate spend the whole allowance:
+    /// give the first segment hot items and the second cold ones, and a
+    /// single threshold over their combined histogram keeps the first
+    /// entirely and the second not at all. That is defensible by frequency
+    /// alone, and it is incoherent with a pass that stops when its spare
+    /// fills -- the threshold gets calibrated against bytes from candidates
+    /// the pass will never reach, so it retains too much from the ones it
+    /// does and consumes fewer of them.
+    ///
+    /// Measured: chain-wide calibration at four candidates gave miss 0.4859
+    /// against 0.4829 for the pre-early-break code, and needed 270 passes
+    /// against 119.
+    ///
+    /// Each candidate therefore gets its own budget, which is what cache-rs
+    /// does (`to_keep = data.len() * target_ratio`, per segment).
+    #[test]
+    fn each_candidate_is_pruned_against_its_own_budget() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(2)
+                .with_target_ratio(0.5)
+                .with_cost_exponent(0.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        let written = fill_sized(&layer, &hashtable, 400, |_| 64);
+        let ids = chain(&written);
+        assert!(ids.len() >= 3, "chain too short: {ids:?}");
+        let candidates = &ids[..2];
+
+        // Everything in the first candidate hotter than everything in the
+        // second. Under a chain-wide budget the first survives whole and
+        // the second is wiped; under per-candidate budgets both lose their
+        // own coldest half.
+        for w in &written {
+            let freq = if w.segment == candidates[0] { 8 } else { 2 };
+            warm(&layer, &hashtable, &w.key, freq);
+        }
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let judged = consumed_candidates(&layer, candidates);
+        assert_eq!(judged.len(), 2, "both candidates must have been judged");
+
+        let kept_in = |seg: u32| {
+            written
+                .iter()
+                .filter(|w| w.segment == seg)
+                .filter(|w| survived(&layer, &hashtable, &w.key))
+                .count()
+        };
+        let total_in = |seg: u32| written.iter().filter(|w| w.segment == seg).count();
+
+        let (hot_kept, hot_all) = (kept_in(candidates[0]), total_in(candidates[0]));
+        let (cold_kept, cold_all) = (kept_in(candidates[1]), total_in(candidates[1]));
+        assert!(
+            hot_all > 0 && cold_all > 0,
+            "both candidates must hold items"
+        );
+
+        assert!(
+            cold_kept > 0,
+            "the colder candidate lost everything ({cold_kept} of {cold_all}), \
+             so the hotter one spent the whole chain's budget"
+        );
+        assert!(
+            hot_kept < hot_all,
+            "the hotter candidate kept everything ({hot_kept} of {hot_all}), \
+             so it was never held to a budget of its own"
+        );
+    }
+
     /// A pass must stop consuming candidates once the spare is full.
     ///
     /// Crucible used to prune however hard was needed to force every
