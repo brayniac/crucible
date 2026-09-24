@@ -41,7 +41,7 @@ zstd = "0.13"
 # wrong as driving neither: the engine honouring expiry loses the hits it
 # correctly discards while the other keeps serving them, so a comparison
 # needs the feature on both sides.
-cache_rs = { package = "segcache", git = "https://github.com/brayniac/cache-rs", rev = "7d09212cf47398263d4b76ad3bc8730017758bc1", optional = true }
+cache_rs = { package = "segcache", git = "https://github.com/brayniac/cache-rs", rev = "27ca521d860afc6af1e5223f8cfbcdefc0b716f9", optional = true }
 
 # Jemalloc
 tikv-jemallocator = { workspace = true }

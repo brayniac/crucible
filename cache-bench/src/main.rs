@@ -945,13 +945,26 @@ fn create_cachers(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         )
     })?;
 
-    let inner = cache_rs::Segcache::builder()
+    let mut builder = cache_rs::Segcache::builder()
         .heap_size(config.cache.heap_size)
         .segment_size(segment_size_i32(config.cache.segment_size)?)
         // Converted, not copied. See `cachers_hash_power`.
         .hash_power(cachers::cachers_hash_power(config.cache.hashtable_power))
-        .eviction(policy)
-        .build()?;
+        .eviction(policy);
+
+    // The same `eviction_seed` the segment backend reads, for the same
+    // reason. cache-rs picks which TTL bucket to merge from by drawing a
+    // random segment index, seeded from system entropy unless told
+    // otherwise -- so an unseeded arm's miss ratio moves between runs of
+    // one build on one trace. Measured across five runs: 0.4482 to 0.4604,
+    // a spread of 0.0122, which was 46% of the gap being measured against
+    // the segment backend. Leaving it unset means every cache-rs point
+    // needs repetitions to mean anything.
+    if let Some(seed) = config.cache.eviction_seed {
+        builder = builder.eviction_seed(seed);
+    }
+
+    let inner = builder.build()?;
 
     Ok(cachers::CacheRs::new(
         inner,
@@ -1157,6 +1170,69 @@ warmup_records = 0
         let config = crate::config::Config::from_toml(toml).expect("parse");
         let builder = apply_reproducibility_seeds(segcache::SegCache::builder(), &config.cache);
         assert_eq!(builder.configured_eviction_seed(), Some(4242));
+    }
+
+    /// `eviction_seed` must reach the cache-rs builder too.
+    ///
+    /// It already reached the segment backend. cache-rs picks the TTL
+    /// bucket to merge from by drawing a random segment index, seeded from
+    /// system entropy unless told otherwise, so an unseeded arm's miss
+    /// ratio moves between runs of one build on one trace -- measured at
+    /// 0.4482 to 0.4604 across five runs, a spread that was 46% of the gap
+    /// under measurement. A config that sets the seed and an arm that
+    /// ignores it looks exactly like an engine that is simply noisy.
+    #[cfg(feature = "cache-rs")]
+    #[test]
+    fn an_eviction_seed_makes_the_cachers_arm_reproducible() {
+        let toml = |extra: &str| {
+            let text = format!(
+                "[general]\nduration = \"1s\"\nwarmup = \"0s\"\nthreads = 1\n\n\
+                 [cache]\nbackend = \"cachers\"\npolicy = \"merge\"\n\
+                 heap_size = \"32MB\"\nsegment_size = \"1MB\"\n\
+                 hashtable_power = 16\n{extra}\n\n\
+                 [workload.trace]\npath = \"/tmp/t.bin\"\nformat = \"twitter\"\n\
+                 warmup_records = 0\n"
+            );
+            crate::config::Config::from_toml(&text).expect("parse")
+        };
+
+        // Fill past capacity across several TTL buckets. A single TTL will
+        // not do: every draw then resolves to the same bucket and the
+        // generator changes nothing, so seeded and unseeded agree and the
+        // test passes without testing anything.
+        let survivors = |cfg: &Config| -> Vec<bool> {
+            let cache = create_cachers(cfg).expect("build cachers");
+            let value = vec![0xABu8; 512];
+            let ttls = [60u64, 3600, 21600];
+            let mut keys = Vec::new();
+            for i in 0..120_000u32 {
+                let key = format!("seed-{i:08}");
+                let ttl = std::time::Duration::from_secs(ttls[i as usize % ttls.len()]);
+                if cache.set(key.as_bytes(), &value, Some(ttl)).is_ok() {
+                    keys.push(key);
+                }
+            }
+            keys.iter()
+                .map(|k| cache.with_value(k.as_bytes(), |_| ()).is_some())
+                .collect()
+        };
+
+        let seeded = toml("eviction_seed = 7");
+        let a = survivors(&seeded);
+        let b = survivors(&seeded);
+        assert!(
+            a.iter().any(|&x| x) && a.iter().any(|&x| !x),
+            "the fixture must both keep and evict, or agreement proves nothing"
+        );
+        assert_eq!(a, b, "seed 7 gave two different survivor sets");
+
+        let other = toml("eviction_seed = 99");
+        assert_ne!(
+            a,
+            survivors(&other),
+            "seeds 7 and 99 gave identical survivors, so the seed is not \
+             reaching cache-rs's eviction"
+        );
     }
 
     /// Every merge knob must reach the config, and an unset one must not.
