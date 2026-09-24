@@ -250,7 +250,20 @@ pub struct MergeConfig {
 impl Default for MergeConfig {
     fn default() -> Self {
         Self {
-            min_segments: 4,
+            // Two, not the four the Segcache paper recommends.
+            //
+            // The paper's three-or-four assumes a pass that stops consuming
+            // candidates when its destination fills. Crucible now does stop
+            // -- so this is the number of candidates a pass will *consider*,
+            // not the number it must force into one spare.
+            //
+            // Measured at cluster4/128MB before the early break existed,
+            // when four candidates meant compressing four segments into one:
+            // miss 0.4829 / byte miss 0.1051 at four against 0.4811 / 0.1017
+            // at two, with cold-item retention 4.8% against 14.8%. Both miss
+            // ratios improved, which no other lever in that programme
+            // managed -- every other one traded an axis.
+            min_segments: 2,
             // Prune half the live set, even where capacity would allow
             // keeping it. This is a latency choice, not a correctness one,
             // and it is held here deliberately.
@@ -582,7 +595,12 @@ mod tests {
     #[test]
     fn test_merge_config_defaults() {
         let config = MergeConfig::default();
-        assert_eq!(config.min_segments, 4);
+        // Two, not the paper's three-or-four: with the early break a pass
+        // stops consuming candidates when its spare fills, so this is how
+        // many it considers rather than how many it must force into one.
+        // Measured better on both miss axes -- see the default's own
+        // comment for the numbers.
+        assert_eq!(config.min_segments, 2);
         // 1.0, not 0.5: capacity is enforced by the spare's byte budget
         // (#154), so the ratio is a pure "prune more than capacity forces"
         // Held at 0.5 while the occupancy-adaptive chain length (#155's

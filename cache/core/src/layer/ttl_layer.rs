@@ -1512,15 +1512,24 @@ impl TtlLayer {
         let spare_budget = spare.free_space() as u64;
         let live_bytes: u64 = class_bytes.iter().sum();
 
-        // `target_ratio` is a policy cap on top of the capacity bound, in the
-        // same currency (bytes, not items -- an item ratio that looks safe
-        // can still overflow when items vary in size). Whichever of the two
-        // prunes more wins; since `threshold_for_budget` is monotone in its
-        // budget, taking the tighter budget is exactly that. So capacity is
-        // enforced structurally, the policy can only ever prune further, and
-        // `min_segments` and `target_ratio` are independent knobs again.
+        // The threshold is policy alone, deliberately uncapped by the spare.
+        //
+        // It used to be `min(spare_budget, ratio_budget)`, which forces every
+        // candidate into one spare by pruning however hard that takes. That
+        // is the wrong side of the trade. How much to retain is a policy
+        // question; how many segments fit at that level is arithmetic, and
+        // capping the threshold answers the policy question with the
+        // arithmetic. On a four-candidate chain it meant pruning to ~25%
+        // whatever `target_ratio` asked for, and the items that die under
+        // hard pruning are the coldest -- which on this corpus are the small
+        // ones. Measured: cold-item retention 4.8% at four candidates
+        // against 14.8% at two, with both miss ratios better at two.
+        //
+        // The spare's capacity is still a hard bound. It is enforced below
+        // by consuming whole candidates only while they fit, which is what
+        // cache-rs does when it breaks out of its candidate loop.
         let ratio_budget = (live_bytes as f64 * merge_config.target_ratio) as u64;
-        let budget = spare_budget.min(ratio_budget);
+        let budget = ratio_budget;
 
         let (bound_threshold, bound_bytes) = threshold_for_budget(&class_bytes, budget);
 
@@ -1542,14 +1551,86 @@ impl TtlLayer {
         // threshold, the straddling class is below the floor and must go.
         // And never at threshold 0, whose class is the items the hashtable
         // no longer knows about.
+        // ---- Phase B2: how many candidates fit in the spare at that
+        // threshold.
+        //
+        // Whole candidates only. Stopping midway through one would leave
+        // half its survivors copied into the spare and half still in place,
+        // with the chain then claiming both -- so a candidate is either
+        // consumed entirely or not reached at all.
+        let mut per_candidate = vec![0u64; candidates.len()];
+        for item in &scanned {
+            if item.freq > threshold {
+                per_candidate[item.candidate as usize] += item.stride as u64;
+            }
+        }
+        let mut consumed = 0usize;
+        let mut consumed_bytes = 0u64;
+        for bytes in &per_candidate {
+            if consumed_bytes + bytes > spare_budget {
+                break;
+            }
+            consumed_bytes += bytes;
+            consumed += 1;
+        }
+
+        // How few is too few depends on what was asked for. A chain pass
+        // (`min_segments >= 2`) only reclaims when at least two candidates
+        // collapse into one spare, so one is no progress and the caller
+        // would loop. `MergeConfig::CLOCK` asks for exactly one on purpose
+        // -- it compacts a single segment rather than merging a chain --
+        // and requiring two there turns every CLOCK pass into the
+        // whole-segment fallback, which is not CLOCK at all.
+        //
+        // A candidate whose survivors do not fit even alone means the
+        // threshold is too generous for this chain; whole-segment eviction
+        // is the honest answer rather than pruning harder behind the
+        // policy's back.
+        let min_consume = merge_config.min_segments.min(2);
+        if consumed < min_consume {
+            for &cand_id in &candidates {
+                if let Some(seg) = self.pool.get(cand_id) {
+                    seg.cas_metadata(State::Relinking, State::Sealed, None, None);
+                }
+            }
+            self.pool.release(spare_id);
+            return self.evict_selected(hashtable);
+        }
+
+        // Leftover within the *policy* budget, not within the spare.
+        //
+        // Briefly this read `spare_budget - consumed_bytes`, which is a
+        // whole segment's slack rather than the few bytes the class
+        // boundary left over -- so every item at the threshold was
+        // straddled back in and the pass retained its entire chain. The
+        // straddle exists to spend the remainder of what the policy
+        // allowed, and the spare's free space is a different quantity that
+        // happens to be much larger.
         let mut straddle_budget = if threshold == bound_threshold && threshold > 0 {
-            budget - bound_bytes
+            // Bounded by both, because they bound different things. The
+            // policy leftover is what `target_ratio` still allows after the
+            // class boundary; the spare leftover is what physically fits
+            // after the consumed prefix. Taking only the first overfills
+            // the spare, `append_item` starts refusing, and the items it
+            // refuses are whichever were scanned last -- including
+            // top-class ones, which then read as retention ignoring
+            // frequency. That is what this looked like before the second
+            // bound was added.
+            budget
+                .saturating_sub(bound_bytes)
+                .min(spare_budget.saturating_sub(consumed_bytes))
         } else {
             0
         };
 
         // ---- Phase C: copy the survivors, in the order they were scanned.
         for item in &scanned {
+            // Candidates past the prefix were never reached. Skipping them
+            // here is what leaves them whole -- they stay Sealed, stay
+            // linked, and lose nothing, including their coldest items.
+            if item.candidate as usize >= consumed {
+                continue;
+            }
             let cand_id = candidates[item.candidate as usize];
             let segment = match self.pool.get(cand_id) {
                 Some(s) => s,
@@ -1655,13 +1736,25 @@ impl TtlLayer {
             }
         }
 
-        // Replace head segments with spare in the chain
+        // Only the prefix the pass actually consumed leaves the chain. The
+        // rest go back to Sealed and stay linked behind the spare, to be
+        // considered again by the next pass -- `replace_head_segments`
+        // verifies contiguity from the head, which a prefix satisfies.
+        for &cand_id in &candidates[consumed..] {
+            if let Some(seg) = self.pool.get(cand_id) {
+                seg.cas_metadata(State::Relinking, State::Sealed, None, None);
+            }
+        }
+
         if bucket
-            .replace_head_segments(&candidates, spare_id, &self.pool)
+            .replace_head_segments(&candidates[..consumed], spare_id, &self.pool)
             .is_err()
         {
-            // Rollback: restore all candidates Relinking → Sealed
-            for &cand_id in &candidates {
+            // Rollback: restore the consumed prefix too. The tail was
+            // already restored above, and restoring it twice is a failed
+            // CAS rather than a corruption, but keeping the two disjoint
+            // says which segments this path is responsible for.
+            for &cand_id in &candidates[..consumed] {
                 if let Some(seg) = self.pool.get(cand_id) {
                     seg.cas_metadata(State::Relinking, State::Sealed, None, None);
                 }
@@ -4050,6 +4143,28 @@ mod merge_retention_budget {
         );
     }
 
+    /// Which candidates a pass actually consumed.
+    ///
+    /// A pass stops taking candidates once its spare is full and leaves the
+    /// rest Sealed and linked, so "was this segment consumed" is answerable
+    /// afterwards: a consumed one has left the chain and is no longer
+    /// Sealed. Tests about *what a pass decided* have to restrict
+    /// themselves to the segments it actually looked at -- counting items
+    /// in untouched candidates as survivors measures the early break, not
+    /// the retention rule.
+    fn consumed_candidates(layer: &TtlLayer, candidates: &[u32]) -> Vec<u32> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|&id| {
+                layer
+                    .pool
+                    .get(id)
+                    .is_none_or(|seg| seg.state() != State::Sealed)
+            })
+            .collect()
+    }
+
     fn survived<H: Hashtable>(layer: &TtlLayer, hashtable: &H, key: &str) -> bool {
         let verifier = SinglePoolVerifier { pool: &layer.pool };
         hashtable.lookup(key.as_bytes(), &verifier).is_some()
@@ -4069,7 +4184,7 @@ mod merge_retention_budget {
         let layer = layer_with(
             MergeConfig::new()
                 .with_min_segments(4)
-                .with_target_ratio(1.0),
+                .with_target_ratio(0.3),
         );
         let hashtable = MultiChoiceHashtable::new(12);
 
@@ -4435,6 +4550,76 @@ mod merge_retention_budget {
     /// admitting more than fits, which the copy can only resolve by dropping
     /// whatever it reaches last.
     ///
+    /// A pass must stop consuming candidates once the spare is full.
+    ///
+    /// Crucible used to prune however hard was needed to force every
+    /// candidate into one spare. That is the wrong side of the trade: the
+    /// retention level is policy (`target_ratio`), and how many segments
+    /// fit at that level is arithmetic. Compressing four segments into one
+    /// means pruning to 25% whatever the policy asked for, and the items
+    /// that die are the coldest -- which on this corpus are the small ones.
+    ///
+    /// cache-rs stops consuming when its spare fills and leaves the rest of
+    /// the chain linked. This asserts the same: a candidate the pass never
+    /// reached must lose nothing at all, not even its coldest items.
+    #[test]
+    fn a_pass_leaves_the_candidates_it_never_reached_untouched() {
+        // A ratio that prunes, and frequencies that vary, so the threshold
+        // lands mid-distribution and roughly half the chain survives it.
+        // At ratio 1.0 the threshold is zero and a single full candidate
+        // fills the spare on its own, so the pass cannot make progress and
+        // falls back to whole-segment eviction -- which this test passed
+        // against, for the wrong reason, until the fallback was spotted.
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(4)
+                .with_target_ratio(0.5)
+                .with_cost_exponent(0.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        let written = fill_sized(&layer, &hashtable, 400, |_| 64);
+        let ids = chain(&written);
+        assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
+        let candidates = &ids[..4];
+
+        for (i, w) in written.iter().enumerate() {
+            warm(&layer, &hashtable, &w.key, 1 + (i % 8) as u8);
+        }
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        let judged = consumed_candidates(&layer, candidates);
+        assert!(
+            judged.len() >= 2,
+            "the pass consumed {} candidates, so it fell back to whole-segment \
+             eviction rather than merging: nothing here tested the early break",
+            judged.len()
+        );
+        assert!(
+            judged.len() < candidates.len(),
+            "all {} candidates fitted, so the pass never had to stop",
+            candidates.len()
+        );
+
+        // Candidates the pass never reached must lose nothing -- not even
+        // their coldest items, which a chain-wide prune would have taken.
+        let untouched: Vec<&Written> = written
+            .iter()
+            .filter(|w| candidates.contains(&w.segment) && !judged.contains(&w.segment))
+            .collect();
+        assert!(!untouched.is_empty(), "no candidate was left unreached");
+        let lost = untouched
+            .iter()
+            .filter(|w| !survived(&layer, &hashtable, &w.key))
+            .count();
+        assert_eq!(
+            lost,
+            0,
+            "{lost} of {} items died in candidates the pass never reached",
+            untouched.len()
+        );
+    }
+
     /// A merge pass must carry the frequency of what it keeps.
     ///
     /// Segcache 3.6.3 says the opposite -- "Segcache resets the frequency
@@ -4514,7 +4699,7 @@ mod merge_retention_budget {
         let layer = layer_with(
             MergeConfig::new()
                 .with_min_segments(4)
-                .with_target_ratio(1.0)
+                .with_target_ratio(0.3)
                 .with_cost_exponent(0.0),
         );
         let hashtable = MultiChoiceHashtable::new(12);
@@ -4538,7 +4723,8 @@ mod merge_retention_budget {
 
         let mut kept: Vec<u8> = Vec::new();
         let mut dropped: Vec<u8> = Vec::new();
-        for w in written.iter().filter(|w| candidates.contains(&w.segment)) {
+        let judged = consumed_candidates(&layer, candidates);
+        for w in written.iter().filter(|w| judged.contains(&w.segment)) {
             let freq = freq_of[w.key.as_str()];
             if survived(&layer, &hashtable, &w.key) {
                 kept.push(freq);
@@ -4579,7 +4765,7 @@ mod merge_retention_budget {
         let layer = layer_with(
             MergeConfig::new()
                 .with_min_segments(4)
-                .with_target_ratio(1.0),
+                .with_target_ratio(0.3),
         );
         let hashtable = MultiChoiceHashtable::new(12);
 
@@ -4880,95 +5066,80 @@ mod merge_retention_budget {
         );
     }
 
-    /// Raising the default did not switch pruning off where capacity still
-    /// demands it.
+    /// A chain that overflows the spare must consume less, never overfill.
     ///
-    /// Here the live set is one and a half spares, so half a spare's worth
-    /// has to go -- and exactly that much, chosen by frequency. Three equal
-    /// classes of 512 bytes against a 1024-byte spare: the top two fit whole
-    /// and the coldest cannot. Under the old 0.5 default the cap would have
-    /// cut the budget to 768 and taken two thirds of the middle class with
-    /// it, pruning more than capacity ever required.
+    /// This asserted the opposite until the early break landed: that the
+    /// pass prunes to whatever the spare holds, forcing every candidate in.
+    /// It no longer does -- `target_ratio` sets the retention level and the
+    /// pass takes whole candidates while they fit -- so the old claim is
+    /// not a weaker version of the new behaviour, it is the behaviour that
+    /// was removed.
+    ///
+    /// What the old capacity bound was protecting is still worth holding,
+    /// and that is what this checks now: nothing above the threshold is
+    /// ever lost. An overfilled spare shows up as `append_item` refusing
+    /// items and the pass dropping whichever it happened to reach last --
+    /// including its hottest, which is how the bug this replaced was
+    /// found. The straddle is the path that can overfill, because it spends
+    /// policy leftover that the consumed-prefix arithmetic has not
+    /// accounted for.
     #[test]
-    fn a_chain_that_overflows_the_spare_still_prunes_to_the_capacity_bound() {
-        // Explicit rather than inherited: this test is about compaction,
-        // which is what target_ratio 1.0 expresses. The default is 0.5
-        // (see #155) and the claim here must not move when it changes.
+    fn a_chain_that_overflows_the_spare_consumes_less_rather_than_overfilling() {
         let layer = layer_with(
             MergeConfig::new()
                 .with_min_segments(4)
-                .with_target_ratio(1.0),
+                .with_target_ratio(0.5)
+                .with_cost_exponent(0.0),
         );
         let hashtable = MultiChoiceHashtable::new(12);
-        let verifier = SinglePoolVerifier { pool: &layer.pool };
 
-        let per_segment = SEGMENT_SIZE / ITEM_BYTES;
-        let written = fill(&layer, &hashtable, 7 * per_segment);
+        let written = fill_sized(&layer, &hashtable, 400, |_| 64);
         let ids = chain(&written);
         assert!(ids.len() >= 5, "chain too short to merge four: {ids:?}");
         let candidates = &ids[..4];
 
-        // Keep 48 of the 128 items in the chain: 1536 live bytes against a
-        // 1024-byte spare. Three classes of 16 items each.
-        let keep = 48;
-        let mut live: Vec<(&str, u8)> = Vec::new();
-        for (i, w) in written
-            .iter()
-            .filter(|w| candidates.contains(&w.segment))
-            .enumerate()
-        {
-            if i % 8 < 3 && live.len() < keep {
-                let freq = 1 + (live.len() % 3) as u8;
-                warm(&layer, &hashtable, &w.key, freq);
-                live.push((w.key.as_str(), freq));
-            } else {
-                let (location, _) = hashtable
-                    .lookup(w.key.as_bytes(), &verifier)
-                    .expect("written item");
-                layer.mark_deleted(ItemLocation::from_location(location));
-                hashtable.remove(w.key.as_bytes(), location);
-            }
+        let mut freq_of: HashMap<&str, u8> = HashMap::new();
+        for (i, w) in written.iter().enumerate() {
+            let freq = 1 + (i % 8) as u8;
+            warm(&layer, &hashtable, &w.key, freq);
+            freq_of.insert(w.key.as_str(), freq);
         }
-        assert_eq!(live.len(), keep, "the live set is not the size planned");
-        assert!(
-            live.len() * ITEM_BYTES > SEGMENT_SIZE,
-            "the live set must overflow one spare or this test proves nothing"
-        );
-        for class in 1..=3u8 {
-            assert_eq!(
-                live.iter().filter(|&&(_, f)| f == class).count(),
-                keep / 3,
-                "class {class} is not an even third of the live set"
-            );
-        }
-
         assert!(layer.evict(&hashtable), "merge eviction did not run");
 
-        let mut kept: Vec<u8> = Vec::new();
-        let mut dropped: Vec<u8> = Vec::new();
-        for &(key, freq) in &live {
-            if survived(&layer, &hashtable, key) {
+        let judged = consumed_candidates(&layer, candidates);
+        assert!(
+            (2..candidates.len()).contains(&judged.len()),
+            "the pass consumed {} of {} candidates; it either fell back or \
+             took everything, and neither exercises the spare bound",
+            judged.len(),
+            candidates.len()
+        );
+
+        // Retention inside the judged set must follow frequency. An
+        // overfilled spare breaks that signature rather than any count:
+        // `append_item` starts refusing, and what it refuses is whatever
+        // was scanned last, hot or not.
+        let mut kept = Vec::new();
+        let mut dropped = Vec::new();
+        for w in written.iter().filter(|w| judged.contains(&w.segment)) {
+            let freq = freq_of[w.key.as_str()];
+            if survived(&layer, &hashtable, &w.key) {
                 kept.push(freq);
             } else {
                 dropped.push(freq);
             }
         }
-
-        // Exactly the capacity bound: the two hottest classes fill the spare
-        // to the byte, the coldest cannot be carried.
-        assert_eq!(
-            class_counts(&kept),
-            vec![(2, keep / 3), (3, keep / 3)],
-            "the pass did not retain exactly what the spare holds. kept {:?}, \
-             dropped {:?}",
-            class_counts(&kept),
-            class_counts(&dropped),
+        assert!(
+            !kept.is_empty() && !dropped.is_empty(),
+            "a 0.5 ratio must both keep and drop inside the judged set"
         );
-        assert_eq!(
-            class_counts(&dropped),
-            vec![(1, keep / 3)],
-            "the pass did not prune exactly the coldest class. kept {:?}, \
-             dropped {:?}",
+        let coldest_kept = *kept.iter().min().expect("kept is non-empty");
+        let hottest_dropped = *dropped.iter().max().expect("dropped is non-empty");
+        assert!(
+            hottest_dropped <= coldest_kept && split_classes(&kept, &dropped) <= 1,
+            "an item at frequency {hottest_dropped} was dropped while one at \
+             {coldest_kept} was kept: the spare overfilled and appends were \
+             refused by scan order. kept {:?}, dropped {:?}",
             class_counts(&kept),
             class_counts(&dropped),
         );
