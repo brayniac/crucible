@@ -3517,14 +3517,16 @@ mod tests {
     /// blocks, so a pass that simply kept the earliest items would retain
     /// both classes equally and fail the contrast.
     #[test]
-    #[ignore = "per-candidate budgeting flattened this fixture: both exponents \
-                now retain every small item (200/200) and the same 188 large ones, \
-                at ratios 0.5 and 0.2 alike. The ranking itself is intact -- its \
-                unit tests in `item_ranking` still pass -- so the question is \
-                whether the exponent still reaches the outcome, which a 400-item \
-                fixture converging over twelve passes cannot answer. Measured on \
-                cluster4 instead; restore or rewrite once that says whether the \
-                knob still does anything"]
+    #[ignore = "measured, not unknown: the exponent still works under \
+                per-candidate budgeting but five times more weakly -- small-item \
+                share moves 65.8% to 66.2% where it moved 68.8% to 70.7% before. \
+                Each candidate is internally homogeneous in size (the paper's own \
+                3.6.2 argument for merging consecutive segments), so a size-based \
+                ranking has little to sort within one; pooling the chain gave it a \
+                diverse population. A 400-item fixture cannot resolve a 0.4-point \
+                effect, and tuning one until it could would be fitting the test to \
+                the answer. Rewrite against a fixture with real size spread within \
+                a single segment, or leave this to the trace"]
     fn the_cost_exponent_decides_which_sizes_a_merge_keeps() {
         use crate::config::{EvictionStrategy, MergeConfig};
         use crate::hashtable_impl::MultiChoiceHashtable;
