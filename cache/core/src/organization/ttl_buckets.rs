@@ -80,6 +80,11 @@ pub enum TtlBucketError {
     ActiveReaders,
 }
 
+/// A [`TtlBucket::next_to_merge`] that means "no cursor -- start at the head".
+///
+/// Not zero: zero is a legitimate `(generation 0, segment 0)` pair.
+pub const NO_MERGE_CURSOR: u64 = u64::MAX;
+
 /// The step splitmix64 advances its state by. Any odd constant does; this one
 /// is the golden-ratio word the algorithm is usually written with.
 const RNG_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -275,26 +280,63 @@ impl TtlBuckets {
         P::Segment: Segment,
     {
         let bucket = &self.buckets[bucket_index.min(MAX_TTL_BUCKET_IDX)];
-        let mut candidates = Vec::with_capacity(count);
+        let index = bucket.index();
 
-        let mut current = match bucket.head() {
+        let head = match bucket.head() {
             Some(id) => id,
-            None => return candidates,
+            None => return Vec::new(),
         };
-
         let tail = bucket.tail().unwrap_or(INVALID_SEGMENT_ID);
 
-        while candidates.len() < count && current != INVALID_SEGMENT_ID && current != tail {
-            candidates.push(current);
+        // Walk `count` segments from `start`, stopping before the live tail.
+        let walk = |start: u32| {
+            let mut candidates = Vec::with_capacity(count);
+            let mut current = start;
+            while candidates.len() < count && current != INVALID_SEGMENT_ID && current != tail {
+                candidates.push(current);
+                match pool.get(current) {
+                    Some(segment) => current = segment.next().unwrap_or(INVALID_SEGMENT_ID),
+                    None => break,
+                }
+            }
+            candidates
+        };
 
-            if let Some(segment) = pool.get(current) {
-                current = segment.next().unwrap_or(INVALID_SEGMENT_ID);
+        // The cursor is a hint, never a promise: it is read without the chain
+        // mutex, and the segment it names can have been merged away, released
+        // or reserved into another bucket since it was written. Every way of
+        // being wrong ends the same -- start at the head instead.
+        if let Some((id, generation)) = bucket.merge_cursor() {
+            // No explicit "is it the tail" check: a walk starting on the tail
+            // stops before pushing anything, and the length guard below turns
+            // that into a wrap. Testing it here would be a branch no input can
+            // distinguish.
+            let usable = pool.get(id).is_some_and(|segment| {
+                segment.generation() == generation && segment.bucket_id() == Some(index)
+            });
+
+            if usable {
+                let candidates = walk(id);
+                // The cursor is only worth following if it can supply the
+                // whole pass. Near the tail it has run out of chain, and a
+                // short pass frees less than a full one from the head, so
+                // wrap instead of spending the pass there.
+                //
+                // `count`, not a literal 2: CLOCK merges one segment at a
+                // time, and a literal would make its cursor unusable -- every
+                // pass would fall back to the head and re-sweep the same
+                // segment, which is the opposite of a clock hand.
+                if candidates.len() >= count {
+                    return candidates;
+                }
             } else {
-                break;
+                // Stale. Clear it so the next pass does not pay the lookup
+                // again to reach the same conclusion.
+                bucket.clear_merge_cursor();
             }
         }
 
-        candidates
+        walk(head)
     }
 }
 
@@ -316,6 +358,47 @@ pub struct TtlBucket {
     tail: AtomicU32,
     /// Number of segments in this bucket.
     segment_count: AtomicU32,
+    /// Where the next merge pass should start, as `(generation << 32) | id`.
+    ///
+    /// [`NO_MERGE_CURSOR`] means "start at the head". A merge advances this
+    /// to the segment immediately tailward of the one it just wrote, so the
+    /// next pass does not re-judge what the last pass just kept.
+    ///
+    /// # Why this is not optional
+    ///
+    /// The merge spare is installed at the head, so without a cursor every
+    /// pass re-judges the same oldest region and the retention test -- a
+    /// frequency test -- never reaches the rest of the chain. That is
+    /// evicting oldest-first with extra copying: on a trace with no reuse
+    /// (zero judged items at frequency >= 16, and a miss ratio identical at
+    /// 4MB and 8MB) it measured the same as [`EvictionStrategy::Fifo`] to
+    /// four decimals on both miss ratios.
+    ///
+    /// With the cursor the same test sweeps the whole chain. On a trace
+    /// where 36% of judged items reach frequency 16, `Fifo`, head-always
+    /// merge and this measured 0.7666 / 0.7524 / 0.5899 miss: running the
+    /// test at all bought 0.0142, letting it sweep bought a further 0.1625.
+    ///
+    /// Across 18 evicting positions on 9 traces, heaps 4MB-215MB, the cursor
+    /// improved request miss on 14 and byte miss on 15, median -0.0196 and
+    /// -0.0227. Sorting those positions by the share of judged items at
+    /// frequency >= 16 separates the sign with no overlap: the three that
+    /// preferred head-always sit at 0.00%, 0.00% and 0.67%, and every
+    /// position at 3.09% or above preferred the cursor. A workload below
+    /// that line has no reuse for merge to find and wants
+    /// [`EvictionStrategy::Fifo`], not a merge policy.
+    ///
+    /// [`EvictionStrategy::Fifo`]: crate::config::EvictionStrategy::Fifo
+    ///
+    /// The generation is carried because a bare segment id is an ABA hazard:
+    /// the segment can be released and reserved into a different bucket
+    /// before the cursor is read again. [`Segment::generation`] is bumped on
+    /// every `Free -> Reserved` transition, so a mismatch means the id was
+    /// reused and the cursor is stale. It is 16 bits and does wrap, but a
+    /// false match also has to survive the bucket and state checks in
+    /// [`TtlBuckets::select_merge_candidates`], and the only cost of getting
+    /// it wrong is starting a merge in the wrong place.
+    next_to_merge: AtomicU64,
     /// Mutex for serializing chain modifications.
     chain_mutex: Mutex<()>,
 }
@@ -329,6 +412,7 @@ impl TtlBucket {
             head: AtomicU32::new(INVALID_SEGMENT_ID),
             tail: AtomicU32::new(INVALID_SEGMENT_ID),
             segment_count: AtomicU32::new(0),
+            next_to_merge: AtomicU64::new(NO_MERGE_CURSOR),
             chain_mutex: Mutex::new(()),
         }
     }
@@ -368,6 +452,34 @@ impl TtlBucket {
         self.segment_count.load(Ordering::Relaxed) as usize
     }
 
+    /// Where the next merge pass should start, if the cursor is set.
+    ///
+    /// Returns `(segment_id, generation)`. The caller must still check that
+    /// the segment is in this bucket and mergeable -- see
+    /// [`TtlBuckets::select_merge_candidates`].
+    pub fn merge_cursor(&self) -> Option<(u32, u16)> {
+        let packed = self.next_to_merge.load(Ordering::Acquire);
+        if packed == NO_MERGE_CURSOR {
+            return None;
+        }
+        Some((packed as u32, (packed >> 32) as u16))
+    }
+
+    /// Point the cursor at `segment_id`, stamped with `generation`.
+    pub fn set_merge_cursor(&self, segment_id: u32, generation: u16) {
+        if segment_id == INVALID_SEGMENT_ID {
+            self.clear_merge_cursor();
+            return;
+        }
+        let packed = ((generation as u64) << 32) | segment_id as u64;
+        self.next_to_merge.store(packed, Ordering::Release);
+    }
+
+    /// Send the next merge pass back to the head.
+    pub fn clear_merge_cursor(&self) {
+        self.next_to_merge.store(NO_MERGE_CURSOR, Ordering::Release);
+    }
+
     /// Check if the bucket is empty.
     pub fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire) == INVALID_SEGMENT_ID
@@ -383,6 +495,7 @@ impl TtlBucket {
         let _guard = self.chain_mutex.lock();
         self.head.store(INVALID_SEGMENT_ID, Ordering::Release);
         self.tail.store(INVALID_SEGMENT_ID, Ordering::Release);
+        self.next_to_merge.store(NO_MERGE_CURSOR, Ordering::Release);
         self.segment_count.store(0, Ordering::Relaxed);
     }
 
@@ -737,22 +850,25 @@ impl TtlBucket {
         Ok(())
     }
 
-    /// Replace N contiguous head segments with a single spare segment.
+    /// Replace N contiguous segments with a single spare segment.
     ///
-    /// This is used for merge eviction (SSD GC style). The source segments must be
-    /// contiguous from the head of the chain (source_ids\[0\] == head, each source's
-    /// next == the following source), and all must be in Relinking state.
+    /// This is used for merge eviction (SSD GC style). The source segments
+    /// must be contiguous (each source's next == the following source) and
+    /// all in Relinking state, but they need not start at the head: a merge
+    /// resuming from [`TtlBucket::merge_cursor`] splices mid-chain.
     ///
     /// After this operation:
     /// - All source segments are transitioned to AwaitingRelease
-    /// - The spare is inserted at the head position with state Sealed
+    /// - The spare takes their place in the chain with state Sealed
     /// - Chain pointers are updated under the chain mutex
+    /// - The bucket's merge cursor advances to the segment tailward of the
+    ///   spare, so the next pass does not re-judge what this one just kept
     ///
     /// # Arguments
-    /// * `source_ids` - Segment IDs to replace, contiguous from head
-    /// * `spare_id` - The spare segment to insert at head
+    /// * `source_ids` - Contiguous segment IDs to replace, oldest first
+    /// * `spare_id` - The spare segment to splice in
     /// * `pool` - The segment pool
-    pub fn replace_head_segments<P: RamPool>(
+    pub fn replace_segments<P: RamPool>(
         &self,
         source_ids: &[u32],
         spare_id: u32,
@@ -769,11 +885,6 @@ impl TtlBucket {
 
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-
-        // Verify source_ids[0] is the head
-        if source_ids[0] != head {
-            return Err(TtlBucketError::InvalidState);
-        }
 
         // Verify all sources are contiguous and in Relinking state
         for i in 0..source_ids.len() {
@@ -810,13 +921,19 @@ impl TtlBucket {
             .ok_or(TtlBucketError::InvalidSegmentId)?;
         let next_of_last = last_src.next().unwrap_or(INVALID_SEGMENT_ID);
 
-        // Set spare's chain pointers: prev=INVALID (new head), next=next_of_last
-        // Transition spare to Sealed
+        // The predecessor of the range, which is INVALID exactly when the
+        // range starts at the head.
+        let first_src = pool
+            .get(source_ids[0])
+            .ok_or(TtlBucketError::InvalidSegmentId)?;
+        let prev_of_first = first_src.prev().unwrap_or(INVALID_SEGMENT_ID);
+
+        // Set spare's chain pointers and transition it to Sealed.
         if !spare.cas_metadata(
             spare_state,
             State::Sealed,
             Some(next_of_last),
-            Some(INVALID_SEGMENT_ID),
+            Some(prev_of_first),
         ) {
             return Err(TtlBucketError::StateTransitionFailed);
         }
@@ -833,8 +950,20 @@ impl TtlBucket {
             );
         }
 
-        // Update bucket head to spare
-        self.head.store(spare_id, Ordering::Release);
+        // Splice the spare in: either it is the new head, or the segment
+        // before the range now points at it.
+        if source_ids[0] == head {
+            self.head.store(spare_id, Ordering::Release);
+        } else if prev_of_first != INVALID_SEGMENT_ID
+            && let Some(prev_segment) = pool.get(prev_of_first)
+        {
+            prev_segment.cas_metadata(
+                prev_segment.state(),
+                prev_segment.state(),
+                Some(spare_id),
+                None,
+            );
+        }
 
         // Transition all sources to AwaitingRelease with cleared chain pointers
         for &src_id in source_ids {
@@ -863,6 +992,20 @@ impl TtlBucket {
         let n = source_ids.len() as u32;
         if n > 1 {
             self.segment_count.fetch_sub(n - 1, Ordering::Relaxed);
+        }
+
+        // Point the next pass past the segment this one just wrote. Leaving
+        // the cursor at the spare would hand every item it just kept straight
+        // back to the retention test, which is what starting at the head
+        // always did: survivors get re-judged pass after pass and the hot ones
+        // eventually lose a roll they did not need to take.
+        match pool.get(next_of_last) {
+            Some(next_segment) if next_of_last != INVALID_SEGMENT_ID && next_of_last != tail => {
+                self.set_merge_cursor(next_of_last, next_segment.generation());
+            }
+            // The spare is the last mergeable segment in the chain. There is
+            // nothing tailward to advance to, so wrap.
+            _ => self.clear_merge_cursor(),
         }
 
         Ok(())
@@ -1171,6 +1314,281 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], seg1);
         assert_eq!(candidates[1], seg2);
+    }
+
+    /// An `n`-segment chain in one bucket, tail left Live.
+    ///
+    /// Returns `(pool, buckets, bucket_index, ids oldest-first)`.
+    fn chain_of(n: usize) -> (crate::memory_pool::MemoryPool, TtlBuckets, usize, Vec<u32>) {
+        let pool = create_test_pool();
+        let buckets = TtlBuckets::new();
+        let idx = buckets.get_bucket_index(Duration::from_secs(100));
+        let bucket = &buckets.buckets[idx];
+
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = pool.reserve().unwrap();
+            bucket.append_segment(id, &pool).unwrap();
+            // `append_segment` does not stamp the bucket; `TtlLayer` does, on
+            // every path that puts a segment into a chain. Without it here the
+            // fixture would not be the state the cursor is read against.
+            pool.get(id).unwrap().set_bucket_id(bucket.index());
+            ids.push(id);
+        }
+        (pool, buckets, idx, ids)
+    }
+
+    fn chain_of_four() -> (crate::memory_pool::MemoryPool, TtlBuckets, usize, Vec<u32>) {
+        chain_of(4)
+    }
+
+    /// Put `ids` into Relinking and hand back a Reserved spare, which is the
+    /// state `replace_segments` expects a merge to have produced.
+    fn stage_merge(pool: &crate::memory_pool::MemoryPool, bucket: &TtlBucket, ids: &[u32]) -> u32 {
+        for &id in ids {
+            let seg = pool.get(id).expect("segment");
+            assert!(
+                seg.cas_metadata(seg.state(), State::Relinking, None, None),
+                "could not stage segment {id} for relink"
+            );
+        }
+        let spare = pool.reserve().expect("spare");
+        pool.get(spare)
+            .expect("spare")
+            .set_bucket_id(bucket.index());
+        spare
+    }
+
+    /// The chain read forwards from the head, and the ids read backwards from
+    /// the tail. A splice that breaks either direction shows up as a mismatch.
+    fn walk_both_ways(
+        pool: &crate::memory_pool::MemoryPool,
+        bucket: &TtlBucket,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let mut forward = Vec::new();
+        let mut cur = bucket.head().unwrap_or(INVALID_SEGMENT_ID);
+        while cur != INVALID_SEGMENT_ID {
+            forward.push(cur);
+            assert!(forward.len() < 64, "chain does not terminate: {forward:?}");
+            cur = pool
+                .get(cur)
+                .and_then(|s| s.next())
+                .unwrap_or(INVALID_SEGMENT_ID);
+        }
+
+        let mut backward = Vec::new();
+        let mut cur = bucket.tail().unwrap_or(INVALID_SEGMENT_ID);
+        while cur != INVALID_SEGMENT_ID {
+            backward.push(cur);
+            assert!(
+                backward.len() < 64,
+                "chain does not terminate: {backward:?}"
+            );
+            cur = pool
+                .get(cur)
+                .and_then(|s| s.prev())
+                .unwrap_or(INVALID_SEGMENT_ID);
+        }
+        backward.reverse();
+        (forward, backward)
+    }
+
+    /// The generation the cursor has to be stamped with to be believed.
+    fn gen_of(pool: &crate::memory_pool::MemoryPool, id: u32) -> u16 {
+        pool.get(id).expect("segment").generation()
+    }
+
+    #[test]
+    fn test_merge_cursor_absent_starts_at_head() {
+        let (pool, buckets, idx, ids) = chain_of_four();
+        assert_eq!(buckets.buckets[idx].merge_cursor(), None);
+
+        let candidates = buckets.select_merge_candidates(idx, 2, &pool);
+        assert_eq!(candidates, vec![ids[0], ids[1]]);
+    }
+
+    #[test]
+    fn test_merge_cursor_starts_the_pass_where_it_points() {
+        let (pool, buckets, idx, ids) = chain_of_four();
+        let bucket = &buckets.buckets[idx];
+
+        // Point at the second segment, as a merge over [0] would leave it.
+        bucket.set_merge_cursor(ids[1], gen_of(&pool, ids[1]));
+
+        let candidates = buckets.select_merge_candidates(idx, 2, &pool);
+        assert_eq!(
+            candidates,
+            vec![ids[1], ids[2]],
+            "the pass must begin at the cursor, not the head"
+        );
+    }
+
+    #[test]
+    fn test_merge_cursor_with_stale_generation_falls_back_to_head() {
+        let (pool, buckets, idx, ids) = chain_of_four();
+        let bucket = &buckets.buckets[idx];
+
+        // The id is real and still in this bucket, but the stamp is from an
+        // incarnation that has ended. That is the ABA case.
+        bucket.set_merge_cursor(ids[2], gen_of(&pool, ids[2]).wrapping_add(1));
+
+        let candidates = buckets.select_merge_candidates(idx, 2, &pool);
+        assert_eq!(candidates, vec![ids[0], ids[1]]);
+        assert_eq!(
+            bucket.merge_cursor(),
+            None,
+            "a cursor found stale should be cleared, not re-read next pass"
+        );
+    }
+
+    #[test]
+    fn test_merge_cursor_into_another_bucket_falls_back_to_head() {
+        let (pool, buckets, idx, ids) = chain_of_four();
+        let bucket = &buckets.buckets[idx];
+
+        // A segment that exists, at its current generation, but belongs to a
+        // different chain: following it would walk out of this bucket.
+        // Three segments, so walking from its head yields two mergeable ones.
+        // With a shorter chain the walk would come up short and the length
+        // guard would wrap for us -- and this test would pass without the
+        // bucket check ever running.
+        let other_idx = buckets.get_bucket_index(Duration::from_secs(9000));
+        let other = &buckets.buckets[other_idx];
+        let mut strangers = Vec::new();
+        for _ in 0..3 {
+            let id = pool.reserve().unwrap();
+            other.append_segment(id, &pool).unwrap();
+            pool.get(id).unwrap().set_bucket_id(other.index());
+            strangers.push(id);
+        }
+        bucket.set_merge_cursor(strangers[0], gen_of(&pool, strangers[0]));
+
+        let candidates = buckets.select_merge_candidates(idx, 2, &pool);
+        assert_eq!(candidates, vec![ids[0], ids[1]]);
+    }
+
+    #[test]
+    fn test_merge_cursor_at_the_tail_falls_back_to_head() {
+        let (pool, buckets, idx, ids) = chain_of_four();
+        let bucket = &buckets.buckets[idx];
+
+        // The tail is Live and never mergeable, so a cursor there would yield
+        // nothing at all -- the pass has to wrap rather than do no work.
+        bucket.set_merge_cursor(ids[3], gen_of(&pool, ids[3]));
+
+        let candidates = buckets.select_merge_candidates(idx, 2, &pool);
+        assert_eq!(candidates, vec![ids[0], ids[1]]);
+    }
+
+    #[test]
+    fn test_merge_cursor_too_close_to_the_tail_falls_back_to_head() {
+        let (pool, buckets, idx, ids) = chain_of_four();
+        let bucket = &buckets.buckets[idx];
+
+        // From ids[2] only one segment is mergeable before the live tail,
+        // short of the two this pass asked for. Wrapping is what keeps the
+        // pass full.
+        bucket.set_merge_cursor(ids[2], gen_of(&pool, ids[2]));
+
+        let candidates = buckets.select_merge_candidates(idx, 2, &pool);
+        assert_eq!(candidates, vec![ids[0], ids[1]]);
+    }
+
+    #[test]
+    fn test_merge_cursor_is_followed_for_a_single_segment_pass() {
+        let (pool, buckets, idx, ids) = chain_of(4);
+        let bucket = &buckets.buckets[idx];
+
+        // CLOCK merges one segment per pass. A cursor that needed two
+        // candidates to be worth following would never fire for it, and the
+        // hand would sit on the head forever.
+        bucket.set_merge_cursor(ids[1], gen_of(&pool, ids[1]));
+
+        assert_eq!(buckets.select_merge_candidates(idx, 1, &pool), vec![ids[1]]);
+    }
+
+    #[test]
+    fn test_merge_advances_the_cursor_past_the_segment_it_wrote() {
+        let (pool, buckets, idx, ids) = chain_of(6);
+        let bucket = &buckets.buckets[idx];
+
+        let spare = stage_merge(&pool, bucket, &ids[..2]);
+        bucket
+            .replace_segments(&ids[..2], spare, &pool)
+            .expect("relink");
+
+        assert_eq!(
+            bucket.merge_cursor().map(|(id, _)| id),
+            Some(ids[2]),
+            "the cursor must point past the spare, not at it"
+        );
+        assert_eq!(bucket.head(), Some(spare), "spare took the head position");
+
+        // The end this change exists for: the next pass does not re-judge the
+        // items the last one just kept.
+        let next = buckets.select_merge_candidates(idx, 2, &pool);
+        assert_eq!(next, vec![ids[2], ids[3]]);
+        assert!(!next.contains(&spare));
+    }
+
+    #[test]
+    fn test_merge_clears_the_cursor_when_it_reaches_the_live_tail() {
+        let (pool, buckets, idx, ids) = chain_of(4);
+        let bucket = &buckets.buckets[idx];
+
+        // Merging ids[1..3] leaves ids[3], the live tail, immediately after
+        // the spare. There is nothing mergeable left to advance to.
+        bucket.set_merge_cursor(ids[1], gen_of(&pool, ids[1]));
+        let spare = stage_merge(&pool, bucket, &ids[1..3]);
+        bucket
+            .replace_segments(&ids[1..3], spare, &pool)
+            .expect("relink");
+
+        assert_eq!(
+            bucket.merge_cursor(),
+            None,
+            "a cursor left on the tail would stall every later pass"
+        );
+        assert_eq!(
+            buckets.select_merge_candidates(idx, 2, &pool),
+            vec![ids[0], spare]
+        );
+    }
+
+    #[test]
+    fn test_mid_chain_merge_keeps_the_chain_walkable_both_ways() {
+        let (pool, buckets, idx, ids) = chain_of(6);
+        let bucket = &buckets.buckets[idx];
+
+        let spare = stage_merge(&pool, bucket, &ids[2..4]);
+        bucket
+            .replace_segments(&ids[2..4], spare, &pool)
+            .expect("relink");
+
+        let expected = vec![ids[0], ids[1], spare, ids[4], ids[5]];
+        let (forward, backward) = walk_both_ways(&pool, bucket);
+        assert_eq!(forward, expected, "forward chain");
+        assert_eq!(backward, expected, "prev pointers disagree with next");
+        assert_eq!(bucket.head(), Some(ids[0]), "head must not move");
+        assert_eq!(bucket.segment_count(), 5);
+    }
+
+    #[test]
+    fn test_head_merge_keeps_the_chain_walkable_both_ways() {
+        let (pool, buckets, idx, ids) = chain_of(6);
+        let bucket = &buckets.buckets[idx];
+
+        let spare = stage_merge(&pool, bucket, &ids[..3]);
+        bucket
+            .replace_segments(&ids[..3], spare, &pool)
+            .expect("relink");
+
+        let expected = vec![spare, ids[3], ids[4], ids[5]];
+        let (forward, backward) = walk_both_ways(&pool, bucket);
+        assert_eq!(forward, expected, "forward chain");
+        assert_eq!(backward, expected, "prev pointers disagree with next");
+        assert_eq!(bucket.head(), Some(spare));
+        assert_eq!(bucket.segment_count(), 4);
     }
 
     #[test]

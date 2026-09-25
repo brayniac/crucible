@@ -376,6 +376,12 @@ pub enum EvictionStrategy {
     /// and takes its head, so it evicts the oldest segment of a randomly
     /// chosen TTL range rather than the oldest segment there is.
     ///
+    /// Reach for this, not merge, on a workload with no reuse. Merge's
+    /// retention test ranks by frequency, and a workload where nothing is
+    /// re-read gives it nothing to rank -- measured on cluster15, where
+    /// `Fifo` and a merge that never sweeps agree to four decimals on both
+    /// miss ratios. Merge then costs segment copying for no decision.
+    ///
     /// [`RandomFifo`]: EvictionStrategy::RandomFifo
     /// [`SliceSegment::create_seq`]: crate::slice_segment::SliceSegment::create_seq
     Fifo,
