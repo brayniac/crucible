@@ -1695,7 +1695,7 @@ impl TtlLayer {
 
         // Only the prefix the pass actually consumed leaves the chain. The
         // rest go back to Sealed and stay linked behind the spare, to be
-        // considered again by the next pass -- `replace_head_segments`
+        // considered again by the next pass -- `replace_segments`
         // verifies contiguity from the head, which a prefix satisfies.
         for &cand_id in &candidates[consumed..] {
             if let Some(seg) = self.pool.get(cand_id) {
@@ -1704,7 +1704,7 @@ impl TtlLayer {
         }
 
         if bucket
-            .replace_head_segments(&candidates[..consumed], spare_id, &self.pool)
+            .replace_segments(&candidates[..consumed], spare_id, &self.pool)
             .is_err()
         {
             // Rollback: restore the consumed prefix too. The tail was
@@ -1717,6 +1717,11 @@ impl TtlLayer {
                 }
             }
             self.pool.release(spare_id);
+            // Only a committed merge advances the cursor, so a pass that
+            // rolled back would leave it on the position that just failed and
+            // the next pass would start in the same place. Sending it back to
+            // the head costs one pass of locality and cannot livelock.
+            bucket.clear_merge_cursor();
             return false;
         }
 
@@ -4867,6 +4872,46 @@ mod merge_retention_budget {
                 );
             }
         }
+    }
+
+    /// After a pass commits, the next one must not be handed the segment it
+    /// just wrote.
+    ///
+    /// Asserted on the candidate list rather than on the cursor field,
+    /// because the cursor is a mechanism and the candidate list is the
+    /// behaviour: a future implementation that skips the fresh segment some
+    /// other way should still pass this.
+    ///
+    /// Without it the frequency test only ever runs on the oldest region of
+    /// a chain, which is evicting oldest-first with extra copying -- on a
+    /// trace with no reuse it measures identically to
+    /// [`EvictionStrategy::Fifo`], to four decimals on both miss ratios.
+    #[test]
+    fn a_merge_pass_does_not_re_offer_the_segment_the_last_one_wrote() {
+        const TTL: Duration = Duration::from_secs(3600);
+
+        let layer = layer_with(MergeConfig::default());
+        let hashtable = MultiChoiceHashtable::new(12);
+
+        let written = fill(&layer, &hashtable, 5 * (SEGMENT_SIZE / ITEM_BYTES));
+        assert!(
+            chain(&written).len() >= 4,
+            "chain too short for a second pass to have anywhere else to go: {:?}",
+            chain(&written)
+        );
+
+        assert!(layer.evict(&hashtable), "merge pass did not run");
+
+        let idx = layer.buckets.get_bucket_index(TTL);
+        let bucket = layer.buckets.get_bucket(TTL);
+        let head = bucket.head().expect("bucket emptied");
+        let next = layer.buckets.select_merge_candidates(idx, 2, &layer.pool);
+
+        assert!(!next.is_empty(), "no candidates for the second pass");
+        assert_ne!(
+            next[0], head,
+            "the freshly written head was offered straight back"
+        );
     }
 
     /// CLOCK is `{min_segments: 1, target_ratio: 1.0, initial_threshold: 1}`.

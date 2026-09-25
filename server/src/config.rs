@@ -340,8 +340,9 @@ pub enum EvictionPolicy {
     /// Closest to expiration (TTL-aware)
     /// Valid for: segment
     Cte,
-    /// Merge eviction (compaction)
-    /// Valid for: segment
+    /// Merge eviction (compaction). Each pass resumes tailward of the
+    /// segment the previous pass wrote, so the frequency test reaches the
+    /// whole chain rather than only the oldest region.
     Merge,
     /// Approximate LFU (least frequently used)
     /// Valid for: heap
@@ -1039,6 +1040,7 @@ pub fn format_size(bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
