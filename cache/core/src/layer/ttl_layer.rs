@@ -5386,6 +5386,16 @@ mod eviction_strategy_selection {
     const SHORT_TTL: u64 = 10;
 
     /// Four TTLs in four buckets, for the tests that want several chains.
+    ///
+    /// Every test here holds a [`TestClock`] for its whole body, because
+    /// every eviction entry point expires before it selects, and ten seconds
+    /// is short enough to lapse mid-test on the real clock: under Miri these
+    /// tests take a minute or two, and the TTL-10 segments were taken ahead
+    /// of FIFO order partway through, at a point that moved with wall time.
+    /// The helpers take no clock of their own -- the override is one
+    /// thread-local, and an inner clock dropping would unfreeze the outer.
+    ///
+    /// [`TestClock`]: crate::clock::TestClock
     const TTLS: [u64; 4] = [10, 100, 1000, 10_000];
 
     fn layer_with(strategy: EvictionStrategy) -> TtlLayer {
@@ -5556,6 +5566,7 @@ mod eviction_strategy_selection {
     /// identity is exactly what the leaderboard sweep measured.
     #[test]
     fn the_segment_policies_no_longer_evict_the_same_segments() {
+        let _clock = crate::clock::TestClock::start();
         let fifo = sequence(EvictionStrategy::Fifo, 12);
         let cte = sequence(EvictionStrategy::Cte, 12);
         let random = sequence(EvictionStrategy::Random, 12);
@@ -5582,6 +5593,7 @@ mod eviction_strategy_selection {
     /// can reach at all.
     #[test]
     fn fifo_cte_and_random_choose_different_victims_from_one_state() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::RandomFifo);
         let hashtable = MultiChoiceHashtable::new(12);
         let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
@@ -5632,6 +5644,7 @@ mod eviction_strategy_selection {
     /// `expire_at` -- wherever it sits in a chain.
     #[test]
     fn cte_evicts_the_soonest_expiring_segment_not_a_chain_head() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::Cte);
         let hashtable = MultiChoiceHashtable::new(12);
         let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
@@ -5655,6 +5668,7 @@ mod eviction_strategy_selection {
     /// epoch": a segment that never expires is never the closest to it.
     #[test]
     fn a_segment_with_no_expiry_is_never_the_closest_to_expiring() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::Cte);
         let hashtable = MultiChoiceHashtable::new(12);
         let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
@@ -5678,6 +5692,7 @@ mod eviction_strategy_selection {
     /// to the short bucket most of the time, FIFO never does.
     #[test]
     fn fifo_evicts_the_oldest_segment_in_the_layer_not_a_random_buckets_head() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::Fifo);
         let hashtable = MultiChoiceHashtable::new(12);
         let (long, short) = two_bucket_state(&layer, &hashtable, 17, 81);
@@ -5706,6 +5721,7 @@ mod eviction_strategy_selection {
     /// repeatedly walks the chain that was written first, oldest out.
     #[test]
     fn fifo_takes_the_next_oldest_segment_on_each_pass() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::Fifo);
         let hashtable = MultiChoiceHashtable::new(12);
         let (long, short) = two_bucket_state(&layer, &hashtable, 33, 17);
@@ -5728,6 +5744,7 @@ mod eviction_strategy_selection {
     /// scan reached first".
     #[test]
     fn a_segment_allocated_later_carries_a_newer_ticket() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::Fifo);
         let hashtable = MultiChoiceHashtable::new(12);
         write_n(&layer, &hashtable, 'L', LONG_TTL, 8 * 5);
@@ -5753,6 +5770,7 @@ mod eviction_strategy_selection {
     /// first eviction.
     #[test]
     fn fifo_ranks_by_age_not_by_segment_id() {
+        let _clock = crate::clock::TestClock::start();
         let (layer, hashtable, oldest, first_scanned) = recycled_id_state();
         assert_ne!(
             oldest, first_scanned,
@@ -5807,6 +5825,7 @@ mod eviction_strategy_selection {
     /// newest segments.
     #[test]
     fn cte_breaks_an_expiry_tie_by_age_not_by_scan_order() {
+        let _clock = crate::clock::TestClock::start();
         let (layer, hashtable, oldest, first_scanned) = recycled_id_state();
         assert_ne!(
             oldest, first_scanned,
@@ -5832,6 +5851,7 @@ mod eviction_strategy_selection {
     /// under its own: pick a bucket weighted by segment count, take its head.
     #[test]
     fn random_fifo_still_takes_a_bucket_head_weighted_by_segment_count() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::RandomFifo);
         let hashtable = MultiChoiceHashtable::new(12);
         let (long, short) = two_bucket_state(&layer, &hashtable, 17, 9);
@@ -5858,6 +5878,7 @@ mod eviction_strategy_selection {
     /// never takes a mid-chain segment.
     #[test]
     fn the_default_strategy_evicts_only_chain_heads() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::default());
         let hashtable = MultiChoiceHashtable::new(12);
         fill_four(&layer, &hashtable, 56);
@@ -5878,6 +5899,7 @@ mod eviction_strategy_selection {
     /// mirror image of the test above, so neither passes by accident.
     #[test]
     fn random_eventually_evicts_a_segment_that_was_not_a_chain_head() {
+        let _clock = crate::clock::TestClock::start();
         let layer = layer_with(EvictionStrategy::Random);
         let hashtable = MultiChoiceHashtable::new(12);
         fill_four(&layer, &hashtable, 56);
@@ -5904,6 +5926,7 @@ mod eviction_strategy_selection {
     /// in production. All four must agree.
     #[test]
     fn every_eviction_entry_point_honours_the_strategy() {
+        let _clock = crate::clock::TestClock::start();
         let seed = crate::config::DEFAULT_EVICTION_SEED;
         let reference = sequence_via(EvictionStrategy::Fifo, seed, 12, &|l, h| l.evict(h));
 
@@ -5943,6 +5966,7 @@ mod eviction_strategy_selection {
     /// actually reach the draws.
     #[test]
     fn a_different_eviction_seed_takes_different_victims() {
+        let _clock = crate::clock::TestClock::start();
         for strategy in [EvictionStrategy::Random, EvictionStrategy::RandomFifo] {
             let a = sequence_seeded(strategy, crate::config::DEFAULT_EVICTION_SEED, 12);
             let b = sequence_seeded(strategy, 0x5EED_5EED_5EED_5EED, 12);
@@ -5958,6 +5982,7 @@ mod eviction_strategy_selection {
     /// drawing.
     #[test]
     fn the_eviction_seed_does_not_move_a_deterministic_policy() {
+        let _clock = crate::clock::TestClock::start();
         for strategy in [EvictionStrategy::Fifo, EvictionStrategy::Cte] {
             assert_eq!(
                 sequence_seeded(strategy, crate::config::DEFAULT_EVICTION_SEED, 12),
@@ -5972,6 +5997,7 @@ mod eviction_strategy_selection {
     /// have it: the same trace replayed twice takes different victims.
     #[test]
     fn the_same_workload_evicts_the_same_segments_on_every_run() {
+        let _clock = crate::clock::TestClock::start();
         for strategy in [
             EvictionStrategy::Fifo,
             EvictionStrategy::Cte,
