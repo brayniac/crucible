@@ -3719,11 +3719,9 @@ mod tests {
 
     /// The same invariant after items have been relocated.
     ///
-    /// CURRENTLY FAILS for the same reason as
-    /// `every_resident_item_should_be_reachable_after_merge`, which
-    /// isolates it to merge rather than to demotion: the single-layer case
-    /// with zero demotions strands items too. Ignored so it does not break
-    /// the suite while the bug stands.
+    /// This failed alongside `every_resident_item_should_be_reachable_after_merge`
+    /// until `resident_items` stopped counting freed segments; that fix is
+    /// what either test now guards.
     ///
     /// Merge copies survivors into a new segment and demotion moves them
     /// between layers; both must re-point the index. A relocation that
@@ -3775,22 +3773,21 @@ mod tests {
 
     /// Every item the cache reports as resident should be reachable.
     ///
-    /// CURRENTLY FAILS -- this is a bug report, not a guard. Ignored so it
-    /// does not break the suite while it stands.
-    ///
     /// Single layer with merge eviction and no demotion, which is the shape
-    /// `policy = "merge"` builds. After eviction a fixed set of items stays
-    /// live in its segments and counted by `resident_items` while lookups
-    /// for it miss. About 126 items, roughly two segments' worth, largely
-    /// independent of heap size: 25.6% of residency on a 16-segment cache,
-    /// 1.6% on a 128-segment one. It persists -- further traffic leaves the
-    /// shortfall at exactly the same absolute number.
+    /// `policy = "merge"` builds. `resident_items` used to count segments
+    /// sitting in the free queue, whose counters survive until they are
+    /// reserved again, so it over-reported by about two segments' worth --
+    /// roughly 126 items regardless of heap size. The items were evicted
+    /// correctly; the count was wrong.
     ///
-    /// Two consequences. Reads for those items miss even though the bytes
-    /// are held, which inflates miss ratio at unchanged capacity. And
-    /// `resident_items` overstates the useful contents, so any cross-engine
-    /// residency comparison using it is biased toward crucible by that
-    /// margin.
+    /// Sixteen segments, because the gap is a near-constant absolute number
+    /// and so is largest, relatively, on the smallest cache: 25.6% of
+    /// residency here against 1.6% at 128 segments. Two thousand writes is
+    /// about twice what the heap holds, enough to keep eviction running.
+    /// Reinstating the bug (`is_freed` always false) fails this at 982
+    /// resident, 858 reachable. It is also a twelfth of the work of the
+    /// 128-segment version this replaced, which Miri could not finish
+    /// inside the CI job's timeout.
     ///
     /// See `report_unreachable_resident_items_by_heap_size` for the numbers.
     #[test]
@@ -3800,7 +3797,7 @@ mod tests {
             .layer_id(0)
             .pool_id(0)
             .segment_size(64 * 1024)
-            .heap_size(8 * 1024 * 1024)
+            .heap_size(1024 * 1024)
             .spare_capacity(4)
             .config(
                 LayerConfig::new()
@@ -3814,7 +3811,7 @@ mod tests {
             .build();
 
         let value = vec![0xABu8; 1024];
-        for i in 0..24000u32 {
+        for i in 0..2000u32 {
             let key = format!("k-{i:08}");
             if cache
                 .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
@@ -3824,7 +3821,7 @@ mod tests {
             }
         }
         let mut found = 0u64;
-        for i in 0..24000u32 {
+        for i in 0..2000u32 {
             let key = format!("k-{i:08}");
             if cache.get(key.as_bytes()).is_some() {
                 found += 1;
