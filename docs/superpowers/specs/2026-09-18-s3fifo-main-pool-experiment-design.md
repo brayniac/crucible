@@ -137,9 +137,9 @@ interchangeable for this question.
 > `promoted: 0` for the first 240M operations. Do not use them as a baseline or
 > as evidence that the rig works.
 
-Traces live on an NFS export mounted read-only on the measurement
-hosts. Mount instructions and the spec definitions live in the
-private `crucible-experiments` repository.
+Traces live on an NFS export, mounted read-only on the measurement
+hosts. Mount instructions and the spec definitions live in the private
+`crucible-experiments` repository.
 
 `twoday/` and `bin/` and `nsdi/` hold `.sbin.zst` — the native 20-byte layout
 with op codes and TTLs. `oracle/` holds the oracleGeneral form of the same
