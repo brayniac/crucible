@@ -35,8 +35,32 @@ ctrlc = { version = "3", features = ["termination"] }
 humantime = "2.1"
 zstd = "0.13"
 
+# Renamed: crucible already has a crate called `segcache`. Optional so the
+# default build does not pay for a second cache engine.
+# The fork, for the virtual clock. Driving only one engine's clock is as
+# wrong as driving neither: the engine honouring expiry loses the hits it
+# correctly discards while the other keeps serving them, so a comparison
+# needs the feature on both sides.
+cache_rs = { package = "segcache", git = "https://github.com/brayniac/cache-rs", rev = "445592930f3e503e7d693c9545e8026923f3a5bb", optional = true }
+
 # Jemalloc
 tikv-jemallocator = { workspace = true }
+
+[features]
+default = []
+cache-rs = ["dep:cache_rs"]
+# Drive the cache's expiry clock from the trace's own timestamps. Without
+# it the cache expires against the wall clock while the replay consumes
+# hours of recorded time in seconds, so no TTL shorter than the run ever
+# fires and every policy that consults expiry is measured as though the
+# mechanism were absent.
+virtual-clock = ["cache-core/virtual-clock", "cache_rs?/virtual-clock"]
+# Tally what each engine's merge passes keep, by item size and frequency
+# band, and print the retention rate per cell. Five hypotheses about the
+# retention *decision* have been falsified by measuring its effects; this
+# measures the decision. Both engines must have it, with identical
+# bucketing, or the comparison measures two instruments.
+retention-trace = ["cache-core/retention-trace", "cache_rs?/retention-trace"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -4,6 +4,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod cachers;
 mod config;
 mod metrics;
 mod ratelimit;
@@ -63,6 +64,10 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         CacheBackend::Heap => {
             let cache = create_heap(&config)?;
+            run_with_cache(config, Arc::new(cache))
+        }
+        CacheBackend::CacheRs => {
+            let cache = create_cachers(&config)?;
             run_with_cache(config, Arc::new(cache))
         }
     }
@@ -332,6 +337,7 @@ fn run_trace_replay<C: Cache>(
         report_interval_records: trace_cfg.report_interval_records,
         max_value_bytes: trace_cfg.max_value_bytes,
         insert_on_miss: trace_cfg.format.insert_on_miss(),
+        retained_sizes: trace_cfg.retained_sizes,
     };
 
     eprintln!("replaying {}", trace_cfg.path.display());
@@ -344,6 +350,18 @@ fn run_trace_replay<C: Cache>(
         }
     );
     eprintln!("  insert on miss: {}", opts.insert_on_miss);
+    // A result that does not say whether expiry was live is not comparable
+    // with one that does: with the clock on wall time, a TTL shorter than
+    // the run never fires, and every policy that consults expiry is
+    // measured against a mechanism that was effectively switched off.
+    eprintln!(
+        "  clock:      {}",
+        if cfg!(feature = "virtual-clock") {
+            "trace time (TTLs fire as recorded)"
+        } else {
+            "wall clock (TTLs shorter than the run never fire)"
+        }
+    );
     eprintln!();
 
     let mut reader = trace::TraceReader::open(&trace_cfg.path, trace_cfg.format.into())?;
@@ -394,6 +412,21 @@ fn print_replay_report(
         ),
         None => eprintln!("  MISS RATIO:     n/a (no GETs)"),
     }
+    // Printed beside the request-weighted ratio rather than instead of it,
+    // because retention policies trade one against the other. Ranking by
+    // frequency alone keeps large hot items and favours this ratio; ranking
+    // by frequency-over-size keeps small ones and favours the ratio above.
+    // Reporting only one scores every policy on the axis that happens to
+    // suit it.
+    match m.byte_miss_ratio() {
+        Some(r) => eprintln!(
+            "  BYTE MISS:      {:.4}  (hit {:.2}%)  over {:.1} MiB of GETs",
+            r,
+            (1.0 - r) * 100.0,
+            m.get_bytes as f64 / (1024.0 * 1024.0)
+        ),
+        None => eprintln!("  BYTE MISS:      n/a (no GET carried bytes)"),
+    }
 
     // Merge eviction runs inline in `set`, so a reclamation pass is a stall on
     // whichever write triggered it. The tail is the whole signal here: at ~200
@@ -404,12 +437,128 @@ fn print_replay_report(
     print_replay_latency("READ ", outcome.read_latency.as_ref());
     print_replay_latency("WRITE", outcome.write_latency.as_ref());
 
+    // Survival by value size, when asked for. Two engines holding
+    // different item counts in the same heap may be keeping the same size
+    // mix in different amounts, or different mixes entirely, and the totals
+    // read identically either way. Measured from the replay side so one
+    // code path covers both engines.
+    if let Some(hist) = &outcome.retained_sizes {
+        eprintln!("=== Retained by value size ===");
+        for &(bucket, written, retained) in &hist.buckets {
+            let pct = if written > 0 {
+                100.0 * retained as f64 / written as f64
+            } else {
+                0.0
+            };
+            let label = if bucket >= 1024 {
+                format!("{:>5} KiB", bucket / 1024)
+            } else {
+                format!("{bucket:>5} B  ")
+            };
+            eprintln!("  {label}  {retained:>9} of {written:>9} written  ({pct:5.1}%)");
+        }
+    }
+
+    // What the merge passes actually decided, when asked for.
+    //
+    // The retained-size table above says what survived the window; this
+    // says what each decision did. They answer different questions: an item
+    // can be absent at the end because a merge dropped it, because an
+    // overwrite superseded it, or because its segment expired.
+    #[cfg(feature = "retention-trace")]
+    print_retention_trace();
+
     if let Some(stats) = internal {
         eprintln!();
         eprintln!("=== Cache internals ===");
         eprintln!("  evictions:      {}", stats.evictions);
         eprintln!("  demotions:      {}", stats.demotions);
         eprintln!("  demotion fails: {}", stats.demotion_failures);
+        // Zero here with compaction configured means it never found an
+        // eligible pair -- a different problem from compaction running and
+        // not helping, and the two were indistinguishable before this was
+        // counted.
+        eprintln!("  compactions:    {}", stats.compactions);
+        // Beside evictions, not instead of them. Reclaiming a segment by
+        // expiry costs nothing and destroys nothing live, so an engine
+        // doing more of it needs fewer eviction passes for the same working
+        // set -- and reporting only evictions makes working expiry look
+        // like good luck. Zero on a TTL-bearing trace means proactive
+        // expiration is not running at all, which no other figure shows.
+        eprintln!("  expirations:    {}", stats.expirations);
+        eprintln!("  resident items: {}", stats.resident_items);
+        // Printed as a decomposition rather than a ratio, because the
+        // question it answers -- why does this engine hold fewer items in
+        // the same heap -- has three answers that one number cannot tell
+        // apart: segments packed loosely, segments full of superseded items
+        // nothing reclaimed, or a policy that retained fewer on purpose.
+        if stats.capacity_bytes > 0 {
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            let packed = 100.0 * stats.written_bytes as f64 / stats.capacity_bytes as f64;
+            let live_share = if stats.written_bytes > 0 {
+                100.0 * stats.live_bytes as f64 / stats.written_bytes as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  segment bytes:  {:.1} MiB live / {:.1} MiB written / {:.1} MiB capacity",
+                mib(stats.live_bytes),
+                mib(stats.written_bytes),
+                mib(stats.capacity_bytes)
+            );
+            eprintln!("    packed:       {packed:.1}% of capacity written  (low = loose packing)");
+            eprintln!(
+                "    live:         {live_share:.1}% of written still live  (low = unreclaimed)"
+            );
+            if stats.resident_items > 0 {
+                eprintln!(
+                    "    per item:     {:.0} B live, {:.0} B of capacity",
+                    stats.live_bytes as f64 / stats.resident_items as f64,
+                    stats.capacity_bytes as f64 / stats.resident_items as f64
+                );
+            }
+        }
+        // The mean above cannot say whether compaction is reachable.
+        // `try_compact_segment` merges two adjacent sealed segments into one
+        // spare, and only when their combined live bytes fit in 90% of a
+        // single segment -- 45% average occupancy across the pair. So a
+        // cache can sit at any mean at all and still have no eligible pairs,
+        // and the decomposition above would look identical either way.
+        //
+        // The eligible count below is an upper bound, not a count of
+        // available compactions: the two segments also have to be adjacent
+        // in the same bucket's chain. If it is near zero, though, the bound
+        // is enough -- no pairs means no compaction, whatever the chain
+        // order.
+        if let Some(deciles) = stats.occupancy_deciles {
+            let counted: u64 = deciles.iter().sum();
+            if counted > 0 {
+                let bars: Vec<String> = (0..10)
+                    .map(|i| format!("{:>2}0%:{}", i, deciles[i]))
+                    .collect();
+                eprintln!("  occupancy:      {}", bars.join("  "));
+                // Deciles 0-3 are wholly under 45%; decile 4 straddles it,
+                // so it is excluded rather than half-counted.
+                let eligible: u64 = deciles[..4].iter().sum();
+                eprintln!(
+                    "    compactable:  {eligible} of {counted} segments under 40% live \
+                     (a pair needs <=45% each)"
+                );
+            }
+        }
+        // Same figures `envelope_verdict`'s fill check reads, printed here so
+        // a thin cell (the cache never filled) is visible to the analysis
+        // step even on a run that passes the check.
+        if stats.total_segments > 0 {
+            eprintln!(
+                "  segments:       {} free / {} total ({:.1}% free)",
+                stats.free_segments,
+                stats.total_segments,
+                stats.free_segments as f64 / stats.total_segments as f64 * 100.0,
+            );
+        } else {
+            eprintln!("  segments:       (not reported)");
+        }
 
         // Independent of the write-latency histogram above: that one times
         // every record from the replay's side, this one times the eviction
@@ -419,7 +568,8 @@ fn print_replay_report(
         match (ev.count(), ev.max_ns()) {
             (0, _) | (_, None) => eprintln!("  evict pass us: (no passes timed)"),
             (n, Some(max)) => eprintln!(
-                "  evict pass us: n={n}  p50={:.1}  p99={:.1}  max={:.1}",
+                "  evict pass us: n={n}  mean={:.1}  p50={:.1}  p99={:.1}  max={:.1}",
+                ev.mean_ns().unwrap_or(0) as f64 / 1000.0,
                 ev.percentile_ns(50.0).unwrap_or(0) as f64 / 1000.0,
                 ev.percentile_ns(99.0).unwrap_or(0) as f64 / 1000.0,
                 max as f64 / 1000.0,
@@ -548,6 +698,173 @@ fn print_latency_summary(label: &str, hist: &AtomicHistogram) {
 
 // --- Cache constructors ---
 
+/// Apply the seeds a config pins to a segment-backend builder.
+///
+/// Split out from `create_segment` so the plumbing has a seam: a seed that
+/// parses and is then dropped on the way to the builder would make a sweep
+/// over seeds report a spread of zero, and every policy difference inside
+/// that spread look significant.
+fn apply_reproducibility_seeds(
+    mut builder: segcache::SegCacheBuilder,
+    cache: &crate::config::CacheConfig,
+) -> segcache::SegCacheBuilder {
+    if let Some(seed) = cache.hashtable_seed {
+        builder = builder.hashtable_seed(seed);
+    }
+    if let Some(seed) = cache.eviction_seed {
+        builder = builder.eviction_seed(seed);
+    }
+    builder
+}
+
+/// Print the retention rate per size and frequency band, for whichever
+/// engine ran.
+///
+/// Both engines keep their own thread-local tally with identical bucketing.
+/// Equal rates in every cell mean the two decide retention the same way and
+/// differ only in what reaches the decision, which is a question about
+/// chain selection; unequal rates say which cell differs.
+#[cfg(feature = "retention-trace")]
+fn print_retention_trace() {
+    use cache_core::retention_trace::{FREQ_BANDS, SIZE_BANDS};
+
+    // The two engines' `RetentionTrace` are distinct types from distinct
+    // crates, so the tallies are copied into a local pair of arrays rather
+    // than compared as values. The band counts are asserted equal below,
+    // which is the property that actually has to hold.
+    type Table = [[u64; FREQ_BANDS]; SIZE_BANDS];
+    let mut considered: Table = [[0; FREQ_BANDS]; SIZE_BANDS];
+    let mut kept: Table = [[0; FREQ_BANDS]; SIZE_BANDS];
+    let mut who = "segment";
+
+    let native = cache_core::retention_trace::snapshot();
+    let native_total: u64 = native.considered.iter().flatten().sum();
+    #[allow(unused_mut, unused_assignments)]
+    let mut chosen_total = native_total;
+    for b in 0..SIZE_BANDS {
+        for f in 0..FREQ_BANDS {
+            considered[b][f] = native.considered[b][f];
+            kept[b][f] = native.kept[b][f];
+        }
+    }
+
+    #[cfg(feature = "cache-rs")]
+    {
+        // Duplicated bucketing is the one thing that would silently void
+        // this comparison, so it is asserted rather than trusted.
+        assert_eq!(
+            (SIZE_BANDS, FREQ_BANDS),
+            (
+                cache_rs::retention_trace::SIZE_BANDS,
+                cache_rs::retention_trace::FREQ_BANDS
+            ),
+            "the two engines' retention tables have different shapes; the \
+             bucketing has drifted and the comparison means nothing"
+        );
+        let foreign = cache_rs::retention_trace::snapshot();
+        let foreign_total: u64 = foreign.considered.iter().flatten().sum();
+        // Exactly one engine ran, so exactly one tally is populated.
+        if foreign_total > native_total {
+            who = "cachers";
+            chosen_total = foreign_total;
+            for b in 0..SIZE_BANDS {
+                for f in 0..FREQ_BANDS {
+                    considered[b][f] = foreign.considered[b][f];
+                    kept[b][f] = foreign.kept[b][f];
+                }
+            }
+        }
+    }
+
+    if chosen_total == 0 {
+        eprintln!("=== Retention decisions ===");
+        eprintln!("  no merge pass judged an item in the measured window");
+        return;
+    }
+
+    let freq_label = ["1", "2-3", "4-7", "8-15", "16-63", "64+"];
+    eprintln!("=== Retention decisions ({who}) ===");
+    eprintln!("  kept % of items judged, by item size and frequency");
+    eprint!("  {:>9}", "size");
+    for label in freq_label.iter().take(FREQ_BANDS) {
+        eprint!("{label:>9}");
+    }
+    eprintln!("{:>11}", "judged");
+
+    for band in 0..SIZE_BANDS {
+        let judged: u64 = considered[band].iter().sum();
+        if judged == 0 {
+            continue;
+        }
+        let label = if band == 0 {
+            "<64B".to_string()
+        } else if band >= SIZE_BANDS - 1 {
+            format!(">={}KiB", (1u64 << (band + 5)) / 1024)
+        } else if (1u64 << (band + 5)) >= 1024 {
+            format!("{}KiB", (1u64 << (band + 5)) / 1024)
+        } else {
+            format!("{}B", 1u64 << (band + 5))
+        };
+        eprint!("  {label:>9}");
+        for f in 0..FREQ_BANDS {
+            let c = considered[band][f];
+            if c == 0 {
+                eprint!("{:>9}", "-");
+            } else {
+                eprint!("{:>8.1}%", 100.0 * kept[band][f] as f64 / c as f64);
+            }
+        }
+        eprintln!("{judged:>11}");
+    }
+
+    let judged: u64 = considered.iter().flatten().sum();
+    let total_kept: u64 = kept.iter().flatten().sum();
+    eprintln!(
+        "  overall:  {:.1}% kept ({total_kept} of {judged} decisions)",
+        100.0 * total_kept as f64 / judged as f64
+    );
+
+    // Raw counts as well as the rendered table. Reparsing percentages back
+    // into counts loses the denominator, and a cell at 100% over three
+    // decisions is not the same finding as one at 100% over thirty
+    // thousand -- which is exactly the distinction this table exists to
+    // support.
+    for band in 0..SIZE_BANDS {
+        for f in 0..FREQ_BANDS {
+            if considered[band][f] > 0 {
+                println!(
+                    "TRACECELL\t{who}\t{band}\t{f}\t{}\t{}",
+                    considered[band][f], kept[band][f]
+                );
+            }
+        }
+    }
+}
+
+/// The merge knobs from config, applied over a base.
+///
+/// One function rather than two call sites, because there were two: the
+/// s3fifo main layer read these and the single-layer merge arm did not, so
+/// a sweep over chain length silently measured the compiled default on
+/// every point. Duplicated plumbing is how that happens, and adding a third
+/// knob to two places is how it happens again.
+fn merge_config_from(
+    cache: &config::CacheConfig,
+    base: cache_core::MergeConfig,
+) -> cache_core::MergeConfig {
+    let mut cfg = base;
+    if let Some(n) = cache.main_merge_segments {
+        cfg.min_segments = n;
+    }
+    if let Some(r) = cache.main_target_ratio {
+        cfg.target_ratio = r;
+    }
+    if let Some(e) = cache.main_cost_exponent {
+        cfg.cost_exponent = e;
+    }
+    cfg
+}
+
 fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
     use segcache::{DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache};
 
@@ -556,8 +873,12 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
         .segment_size(config.cache.segment_size)
         .hashtable_power(config.cache.hashtable_power);
 
-    if let Some(seed) = config.cache.hashtable_seed {
-        builder = builder.hashtable_seed(seed);
+    builder = apply_reproducibility_seeds(builder, &config.cache);
+
+    // Applied before the policy selection below, so it holds whichever
+    // layer topology the policy chooses.
+    if let Some(policy) = config.cache.overwrite_reclaim {
+        builder = builder.overwrite_reclaim(policy.into());
     }
 
     builder = match config.cache.policy {
@@ -569,19 +890,24 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
             // Chain length is the lever the first results identified, so it
             // overrides the policy's default rather than the policy silently
             // winning. Rejected for clock in config validation.
-            if let Some(n) = config.cache.main_merge_segments
-                && let cache_core::EvictionStrategy::Merge(ref mut cfg) = strategy
-            {
-                cfg.min_segments = n;
+            if let cache_core::EvictionStrategy::Merge(ref mut cfg) = strategy {
+                *cfg = merge_config_from(&config.cache, *cfg);
             }
             b = b.main_eviction(strategy);
             b
         }
         EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),
         EvictionPolicy::Random => builder.eviction_policy(SegEvictionPolicy::Random),
+        EvictionPolicy::RandomFifo => builder.eviction_policy(SegEvictionPolicy::RandomFifo),
         EvictionPolicy::Cte => builder.eviction_policy(SegEvictionPolicy::Cte),
         EvictionPolicy::Merge => {
-            builder.eviction_policy(SegEvictionPolicy::Merge(MergeConfig::default()))
+            // The single-layer merge arm took `MergeConfig::default()` and
+            // ignored every knob, so a sweep over chain length or retention
+            // silently measured the compiled default on every point. Both
+            // knobs are read here for the same reason they are read for the
+            // s3fifo main layer.
+            let cfg = merge_config_from(&config.cache, MergeConfig::default());
+            builder.eviction_policy(SegEvictionPolicy::Merge(cfg))
         }
         other => return Err(format!("invalid policy '{other}' for segment backend").into()),
     };
@@ -609,6 +935,62 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
     Ok(cache)
 }
 
+#[cfg(feature = "cache-rs")]
+fn create_cachers(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
+    let policy = cachers::cachers_policy(config.cache.policy).ok_or_else(|| {
+        format!(
+            "policy '{}' has no cache-rs counterpart",
+            config.cache.policy
+        )
+    })?;
+
+    let mut builder = cache_rs::Segcache::builder()
+        .heap_size(config.cache.heap_size)
+        .segment_size(segment_size_i32(config.cache.segment_size)?)
+        // Converted, not copied. See `cachers_hash_power`.
+        .hash_power(cachers::cachers_hash_power(config.cache.hashtable_power))
+        .eviction(policy);
+
+    // The same `eviction_seed` the segment backend reads, for the same
+    // reason. cache-rs picks which TTL bucket to merge from by drawing a
+    // random segment index, seeded from system entropy unless told
+    // otherwise -- so an unseeded arm's miss ratio moves between runs of
+    // one build on one trace. Measured across five runs: 0.4482 to 0.4604,
+    // a spread of 0.0122, which was 46% of the gap being measured against
+    // the segment backend. Leaving it unset means every cache-rs point
+    // needs repetitions to mean anything.
+    if let Some(seed) = config.cache.eviction_seed {
+        builder = builder.eviction_seed(seed);
+    }
+
+    let inner = builder.build()?;
+
+    Ok(cachers::CacheRs::new(
+        inner,
+        config.cache.segment_size as u64,
+    ))
+}
+
+#[cfg(not(feature = "cache-rs"))]
+fn create_cachers(_config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
+    // Rejected rather than ignored: a config naming a backend the binary
+    // cannot provide must fail, not silently run a different engine.
+    Err::<crate::cachers::Unavailable, _>(
+        "this binary was built without the `cache-rs` feature; \
+         rebuild with --features cache-rs"
+            .into(),
+    )
+}
+
+/// crucible's `segment_size` is `usize`; cache-rs's builder takes `i32`. A
+/// bare `as` cast would silently wrap a segment size above 2 GiB to
+/// negative, so this rejects the config instead.
+#[cfg(feature = "cache-rs")]
+fn segment_size_i32(bytes: usize) -> Result<i32, Box<dyn std::error::Error>> {
+    i32::try_from(bytes)
+        .map_err(|_| format!("segment_size {bytes} exceeds cache-rs's i32 limit").into())
+}
+
 fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
     use slab_cache::{DiskTierConfig, EvictionStrategy, SlabCache};
 
@@ -617,6 +999,10 @@ fn create_slab(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
     // significant. Reject instead.
     if config.cache.hashtable_seed.is_some() {
         return Err("the slab backend does not support hashtable_seed yet".into());
+    }
+
+    if config.cache.eviction_seed.is_some() {
+        return Err("the slab backend does not support eviction_seed yet".into());
     }
 
     let eviction_strategy = match config.cache.policy {
@@ -654,6 +1040,10 @@ fn create_heap(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>
     // See `create_slab` on why this is rejected rather than ignored.
     if config.cache.hashtable_seed.is_some() {
         return Err("the heap backend does not support hashtable_seed yet".into());
+    }
+
+    if config.cache.eviction_seed.is_some() {
+        return Err("the heap backend does not support eviction_seed yet".into());
     }
 
     let heap_policy = match config.cache.policy {
@@ -745,4 +1135,180 @@ fn pin_to_cpu(cpu_id: usize) -> std::io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn pin_to_cpu(_cpu_id: usize) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod seed_plumbing_tests {
+    use super::*;
+
+    /// The seed has to survive the trip from the parsed config to the
+    /// builder. Accepting it and dropping it here would leave a sweep over
+    /// seeds reporting a spread of zero, which makes every policy difference
+    /// inside the real spread look significant.
+    #[test]
+    fn a_configured_eviction_seed_reaches_the_segment_builder() {
+        let toml = r#"
+[general]
+duration = "1s"
+warmup = "0s"
+threads = 1
+
+[cache]
+backend = "segment"
+policy = "randomfifo"
+heap_size = "16MB"
+segment_size = "256KB"
+hashtable_power = 16
+eviction_seed = 4242
+
+[workload.trace]
+path = "/tmp/t.bin"
+format = "twitter"
+warmup_records = 0
+"#;
+        let config = crate::config::Config::from_toml(toml).expect("parse");
+        let builder = apply_reproducibility_seeds(segcache::SegCache::builder(), &config.cache);
+        assert_eq!(builder.configured_eviction_seed(), Some(4242));
+    }
+
+    /// `eviction_seed` must reach the cache-rs builder too.
+    ///
+    /// It already reached the segment backend. cache-rs picks the TTL
+    /// bucket to merge from by drawing a random segment index, seeded from
+    /// system entropy unless told otherwise, so an unseeded arm's miss
+    /// ratio moves between runs of one build on one trace -- measured at
+    /// 0.4482 to 0.4604 across five runs, a spread that was 46% of the gap
+    /// under measurement. A config that sets the seed and an arm that
+    /// ignores it looks exactly like an engine that is simply noisy.
+    #[cfg(feature = "cache-rs")]
+    #[test]
+    fn an_eviction_seed_makes_the_cachers_arm_reproducible() {
+        let toml = |extra: &str| {
+            let text = format!(
+                "[general]\nduration = \"1s\"\nwarmup = \"0s\"\nthreads = 1\n\n\
+                 [cache]\nbackend = \"cachers\"\npolicy = \"merge\"\n\
+                 heap_size = \"32MB\"\nsegment_size = \"1MB\"\n\
+                 hashtable_power = 16\n{extra}\n\n\
+                 [workload.trace]\npath = \"/tmp/t.bin\"\nformat = \"twitter\"\n\
+                 warmup_records = 0\n"
+            );
+            crate::config::Config::from_toml(&text).expect("parse")
+        };
+
+        // Fill past capacity across several TTL buckets. A single TTL will
+        // not do: every draw then resolves to the same bucket and the
+        // generator changes nothing, so seeded and unseeded agree and the
+        // test passes without testing anything.
+        let survivors = |cfg: &Config| -> Vec<bool> {
+            let cache = create_cachers(cfg).expect("build cachers");
+            let value = vec![0xABu8; 512];
+            let ttls = [60u64, 3600, 21600];
+            let mut keys = Vec::new();
+            for i in 0..120_000u32 {
+                let key = format!("seed-{i:08}");
+                let ttl = std::time::Duration::from_secs(ttls[i as usize % ttls.len()]);
+                if cache.set(key.as_bytes(), &value, Some(ttl)).is_ok() {
+                    keys.push(key);
+                }
+            }
+            keys.iter()
+                .map(|k| cache.with_value(k.as_bytes(), |_| ()).is_some())
+                .collect()
+        };
+
+        let seeded = toml("eviction_seed = 7");
+        let a = survivors(&seeded);
+        let b = survivors(&seeded);
+        assert!(
+            a.iter().any(|&x| x) && a.iter().any(|&x| !x),
+            "the fixture must both keep and evict, or agreement proves nothing"
+        );
+        assert_eq!(a, b, "seed 7 gave two different survivor sets");
+
+        let other = toml("eviction_seed = 99");
+        assert_ne!(
+            a,
+            survivors(&other),
+            "seeds 7 and 99 gave identical survivors, so the seed is not \
+             reaching cache-rs's eviction"
+        );
+    }
+
+    /// Every merge knob must reach the config, and an unset one must not.
+    ///
+    /// Written against `merge_config_from` because the failure this guards
+    /// is not a parse failure: `main_merge_segments` was once read on the
+    /// s3fifo path and ignored on the single-layer merge path, so a sweep
+    /// parsed the file, built a cache, produced numbers, and measured the
+    /// compiled default at every point. Nothing in the output said so.
+    #[test]
+    fn every_merge_knob_reaches_the_config_and_an_unset_one_does_not() {
+        let base = cache_core::MergeConfig::default();
+        let toml = |extra: &str| {
+            let text = format!(
+                "[general]\nduration = \"1s\"\nwarmup = \"0s\"\nthreads = 1\n\n\
+                 [cache]\nbackend = \"segment\"\npolicy = \"merge\"\n\
+                 heap_size = \"16MB\"\nsegment_size = \"256KB\"\n\
+                 hashtable_power = 16\n{extra}\n\n\
+                 [workload.trace]\npath = \"/tmp/t.bin\"\nformat = \"twitter\"\n\
+                 warmup_records = 0\n"
+            );
+            crate::config::Config::from_toml(&text).expect("parse")
+        };
+
+        // Unset: the compiled defaults survive untouched.
+        let untouched = merge_config_from(&toml("").cache, base);
+        assert_eq!(untouched, base, "an empty config must change nothing");
+
+        // Set: each knob lands, and lands on its own field.
+        let set = merge_config_from(
+            &toml(
+                "main_merge_segments = 7\n\
+                 main_target_ratio = 0.9\n\
+                 main_cost_exponent = 0.0",
+            )
+            .cache,
+            base,
+        );
+        assert_eq!(set.min_segments, 7, "chain length must reach the config");
+        assert_eq!(set.target_ratio, 0.9, "retention cap must reach it");
+        assert_eq!(
+            set.cost_exponent, 0.0,
+            "cost exponent must reach it -- and 0.0 is exactly the value a \
+             knob that was parsed and dropped would leave behind if the \
+             default were 0.0, which is why the default is 1.0 and this \
+             asserts the non-default"
+        );
+        assert_ne!(
+            set.cost_exponent, base.cost_exponent,
+            "the test is vacuous unless 0.0 differs from the default"
+        );
+    }
+
+    /// And an unset seed must leave the builder alone, so the layer default
+    /// applies rather than some stand-in value chosen here.
+    #[test]
+    fn an_unset_eviction_seed_leaves_the_builder_untouched() {
+        let toml = r#"
+[general]
+duration = "1s"
+warmup = "0s"
+threads = 1
+
+[cache]
+backend = "segment"
+policy = "randomfifo"
+heap_size = "16MB"
+segment_size = "256KB"
+hashtable_power = 16
+
+[workload.trace]
+path = "/tmp/t.bin"
+format = "twitter"
+warmup_records = 0
+"#;
+        let config = crate::config::Config::from_toml(toml).expect("parse");
+        let builder = apply_reproducibility_seeds(segcache::SegCache::builder(), &config.cache);
+        assert_eq!(builder.configured_eviction_seed(), None);
+    }
 }

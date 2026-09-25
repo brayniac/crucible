@@ -63,10 +63,12 @@
 #![warn(clippy::all)]
 
 // Core types
+pub mod clock;
 mod config;
 mod error;
 mod location;
 mod location_layout;
+pub mod retention_trace;
 pub mod sync;
 
 // Segment-specific location interpretation
@@ -79,7 +81,10 @@ mod segment;
 mod state;
 
 // Re-exports
-pub use config::{EvictionStrategy, FrequencyDecay, LayerConfig, LayerId, MergeConfig};
+pub use config::{
+    DEFAULT_EVICTION_SEED, EvictionStrategy, FrequencyDecay, LayerConfig, LayerId, MergeConfig,
+    OverwriteReclaim,
+};
 pub use error::{CacheError, CacheResult};
 
 // Location re-exports

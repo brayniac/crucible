@@ -16,6 +16,20 @@ use ahash::RandomState;
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
 
+/// Step for the frequency generator: the golden-ratio odd constant, as
+/// `TtlBuckets` uses for eviction.
+const FREQ_RNG_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Default seed for the frequency generator.
+///
+/// Fixed rather than drawn from entropy, so a measurement is reproducible
+/// without asking for it. ASFC increments probabilistically above frequency
+/// 16, and an entropy-seeded generator makes the whole cache's miss ratio
+/// move between runs of one build on one workload -- measured on cache-rs,
+/// which has the same construction, at 0.0021 even after its eviction draw
+/// was seeded.
+pub const DEFAULT_FREQ_SEED: u64 = 0x2545_F491_4F6C_DD1D;
+
 /// Lock-free hashtable for caches.
 ///
 /// Each entry stores:
@@ -30,6 +44,13 @@ pub struct MultiChoiceHashtable {
     /// Number of bucket choices (1-8). Higher values increase max load factor
     /// but add probe overhead. Recommended: 2-3 for most workloads.
     num_choices: u8,
+    /// Generator for ASFC's probabilistic increment.
+    ///
+    /// SplitMix64 off an atomic counter, matching `TtlBuckets::next_random`:
+    /// lock-free, deterministic given the seed and the call order, and
+    /// cheaper than `rand::rng()` -- which is a thread-local ChaCha12 with
+    /// reseed accounting, and which this replaced.
+    freq_rng: AtomicU64,
 }
 
 impl MultiChoiceHashtable {
@@ -84,7 +105,30 @@ impl MultiChoiceHashtable {
             num_buckets,
             mask,
             num_choices,
+            freq_rng: AtomicU64::new(DEFAULT_FREQ_SEED),
         }
+    }
+
+    /// Next draw for ASFC's probabilistic increment.
+    ///
+    /// SplitMix64 over an atomically stepped counter, as
+    /// `TtlBuckets::next_random` does for eviction: lock-free, and
+    /// deterministic given the seed and the order of calls.
+    #[inline]
+    fn next_freq_random(&self) -> u64 {
+        let mut z = self.freq_rng.fetch_add(FREQ_RNG_STEP, Ordering::Relaxed);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Seed the frequency generator.
+    ///
+    /// Defaults to `DEFAULT_FREQ_SEED`. Set it to draw a different but
+    /// still reproducible stream -- several seeds sample the distribution
+    /// where one seed only pins a single arbitrary point of it.
+    pub fn set_freq_seed(&self, seed: u64) {
+        self.freq_rng.store(seed, Ordering::Relaxed);
     }
 
     /// Create a hashtable whose key placement is reproducible across processes.
@@ -623,7 +667,8 @@ impl MultiChoiceHashtable {
                 // Update frequency (best effort)
                 let freq = Hashbucket::freq(packed);
                 if freq < 127
-                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
+                    && let Some(new_packed) =
+                        Hashbucket::try_update_freq(packed, freq, self.next_freq_random())
                 {
                     let _ = bucket.items[slot_index].compare_exchange(
                         packed,
@@ -765,7 +810,8 @@ impl MultiChoiceHashtable {
             if packed != 0 && Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
                 let freq = Hashbucket::freq(packed);
                 if freq < 127
-                    && let Some(new_packed) = Hashbucket::try_update_freq(packed, freq)
+                    && let Some(new_packed) =
+                        Hashbucket::try_update_freq(packed, freq, self.next_freq_random())
                 {
                     let _ = bucket.items[slot_index].compare_exchange(
                         packed,
@@ -2032,24 +2078,25 @@ impl Hashbucket {
     ///
     /// Returns `Some(new_packed)` if frequency should increment.
     #[inline]
-    pub fn try_update_freq(packed: u64, freq: u8) -> Option<u64> {
+    /// `draw` supplies the randomness for the probabilistic branch.
+    ///
+    /// Passed in rather than drawn here, so it can come from a seeded
+    /// generator. It used to call `rand::rng()` -- a thread-local ChaCha12
+    /// reseeded from the OS -- which made the cache's miss ratio move
+    /// between runs of one build on one workload, with no way to pin it.
+    /// The caller now supplies `next_freq_random()`, which is both
+    /// reproducible and cheaper.
+    pub fn try_update_freq(packed: u64, freq: u8, draw: u64) -> Option<u64> {
         if freq >= 127 {
             return None;
         }
 
-        // ASFC: probabilistic increment
+        // ASFC: probabilistic increment. Below 17 every access counts, so
+        // the draw is not consulted and its value cannot matter.
         let should_increment = if freq <= 16 {
             true
         } else {
-            #[cfg(not(feature = "loom"))]
-            let rand = {
-                use rand::Rng;
-                rand::rng().random::<u64>()
-            };
-            #[cfg(feature = "loom")]
-            let rand = 0u64;
-
-            rand.is_multiple_of(freq as u64)
+            draw.is_multiple_of(freq as u64)
         };
 
         if should_increment {
@@ -3004,18 +3051,64 @@ mod tests {
         assert_eq!(Hashbucket::location(updated), Location::new(100));
     }
 
+    /// The frequency generator must be seeded, and reach the ASFC branch.
+    ///
+    /// Above frequency 16 ASFC increments with probability 1/freq. That
+    /// draw used to come from `rand::rng()`, so the cache's miss ratio
+    /// moved between runs of one build on one workload with no way to pin
+    /// it. Measured on cache-rs, which has the same construction: 0.0021 of
+    /// miss-ratio spread remained even after its eviction draw was seeded.
+    ///
+    /// Driven past 16 deliberately -- below that every access counts and
+    /// the draw is never consulted, so a fixture that stops short passes
+    /// whether or not the generator is wired to anything.
+    #[test]
+    fn a_seeded_frequency_generator_makes_asfc_reproducible() {
+        let climb = |seed: u64| -> u8 {
+            let ht = MultiChoiceHashtable::new(10);
+            ht.set_freq_seed(seed);
+            let mut verifier = MockVerifier::new();
+            let location = Location::new(4242);
+            verifier.add(b"climber", location, false);
+            ht.insert(b"climber", location, &verifier).expect("insert");
+            for _ in 0..4000 {
+                let _ = ht.lookup(b"climber", &verifier);
+            }
+            ht.get_frequency(b"climber", &verifier).expect("present")
+        };
+
+        let a = climb(1);
+        assert!(
+            a > 16,
+            "the fixture must drive frequency past 16 or the probabilistic \
+             branch is never reached: got {a}"
+        );
+        assert!(
+            a < 127,
+            "and must not saturate, or every seed agrees: got {a}"
+        );
+        assert_eq!(a, climb(1), "seed 1 gave two different frequencies");
+        assert_ne!(
+            a,
+            climb(0xDEAD_BEEF),
+            "two seeds gave the same frequency, so ASFC is not consulting \
+             the seeded generator"
+        );
+    }
+
     #[test]
     fn test_try_update_freq_max() {
         let packed = Hashbucket::pack(0x123, 127, Location::new(100));
         // At max frequency, should return None
-        assert!(Hashbucket::try_update_freq(packed, 127).is_none());
+        assert!(Hashbucket::try_update_freq(packed, 127, 0).is_none());
     }
 
     #[test]
     fn test_try_update_freq_low() {
         let packed = Hashbucket::pack(0x123, 5, Location::new(100));
         // Low frequency always increments
-        let result = Hashbucket::try_update_freq(packed, 5);
+        // Below 17 the draw is not consulted, so its value is arbitrary.
+        let result = Hashbucket::try_update_freq(packed, 5, 0);
         assert!(result.is_some());
         let new_packed = result.unwrap();
         assert_eq!(Hashbucket::freq(new_packed), 6);

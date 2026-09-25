@@ -159,6 +159,7 @@ fn create_segment(
         }),
         EvictionPolicy::Fifo => builder.eviction_policy(SegEvictionPolicy::Fifo),
         EvictionPolicy::Random => builder.eviction_policy(SegEvictionPolicy::Random),
+        EvictionPolicy::RandomFifo => builder.eviction_policy(SegEvictionPolicy::RandomFifo),
         EvictionPolicy::Cte => builder.eviction_policy(SegEvictionPolicy::Cte),
         EvictionPolicy::Merge => {
             builder.eviction_policy(SegEvictionPolicy::Merge(MergeConfig::default()))

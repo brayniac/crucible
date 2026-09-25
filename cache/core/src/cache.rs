@@ -171,8 +171,17 @@ impl CacheLayer {
     ///
     /// This is like `mark_deleted` but additionally attempts to compact the
     /// segment with its predecessor when the deletion creates enough free space.
-    pub fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, hashtable: &H) {
+    pub fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        hashtable: &H,
+    ) -> bool {
         dispatch!(self, mark_deleted_and_compact(location, hashtable))
+    }
+
+    /// Mark an item deleted and free its segment if that emptied it.
+    pub fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        dispatch!(self, mark_deleted_and_free_empty(location))
     }
 
     /// Get the remaining TTL for an item.
@@ -394,6 +403,24 @@ pub struct CacheStats {
     pub evictions: AtomicU64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: AtomicU64,
+    /// Segments reclaimed by expiry rather than eviction.
+    ///
+    /// The distinction the whole TTL-bucket design exists for: an expired
+    /// segment is reclaimed whole, costing nothing and destroying nothing
+    /// live, while an eviction pass copies survivors and discards the rest.
+    /// A cache doing the first needs less of the second, so reporting only
+    /// evictions makes a working expiry look like good luck.
+    pub expirations: AtomicU64,
+
+    /// Compaction passes that actually ran.
+    ///
+    /// `try_compact_segment` declines far more often than it fires: it
+    /// needs a sealed predecessor whose combined live set fits in 90% of
+    /// one segment. A cache can therefore be configured for compaction,
+    /// report nothing unusual, and never compact once -- which is
+    /// indistinguishable from compaction running and not helping unless
+    /// this is counted.
+    pub compactions: AtomicU64,
     /// Duration of eviction passes. See [`CacheInternalStats::eviction_latency`].
     pub eviction_latency: crate::latency::LatencyHistogram,
 }
@@ -405,17 +432,28 @@ impl CacheStats {
             demotions: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             demotion_failures: AtomicU64::new(0),
+            compactions: AtomicU64::new(0),
+            expirations: AtomicU64::new(0),
             eviction_latency: crate::latency::LatencyHistogram::new(),
         }
     }
 
     /// Snapshot the current values as a `CacheInternalStats`.
+    ///
+    /// `CacheStats` holds only atomic counters and has no access to the
+    /// layers, so it cannot report `resident_items` (a gauge over live
+    /// segments, not a counter) -- callers with layer access (e.g.
+    /// `SegCache::internal_stats`) must fill that field in themselves via
+    /// `TieredCache::resident_items()`.
     pub fn snapshot(&self) -> CacheInternalStats {
         CacheInternalStats {
             demotions: self.demotions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             demotion_failures: self.demotion_failures.load(Ordering::Relaxed),
+            compactions: self.compactions.load(Ordering::Relaxed),
+            expirations: self.expirations.load(Ordering::Relaxed),
             eviction_latency: self.eviction_latency.snapshot(),
+            ..Default::default()
         }
     }
 }
@@ -482,6 +520,9 @@ pub struct TieredCache<H: Hashtable> {
     /// Maximum eviction attempts per write.
     max_eviction_attempts: usize,
 
+    /// What an overwrite does with the superseded copy's bytes.
+    overwrite_reclaim: crate::config::OverwriteReclaim,
+
     /// Atomic counters for demotion and eviction events.
     stats: CacheStats,
 }
@@ -517,6 +558,158 @@ impl<H: Hashtable> TieredCache<H> {
         self.layers.get_mut(index)
     }
 
+    /// Sum live item counts across every segment of every layer.
+    ///
+    /// Segment IDs within a layer's pool are 0-based (see
+    /// `MemoryPool::get`, which indexes `segments` directly by `id as
+    /// usize`), so this iterates `0..total_segment_count()`. Disk layers
+    /// have no addressable `SliceSegment` (`CacheLayer::get_segment` always
+    /// returns `None` for them), so they contribute nothing here and this
+    /// counts RAM-resident items only.
+    ///
+    /// This is a gauge, not a counter: it is read without pinning against
+    /// concurrent writers/evictors, so a segment can be double- or
+    /// under-counted mid-transition. See [`CacheInternalStats::resident_items`]
+    /// for why an approximate figure is still worth reporting.
+    pub fn resident_items(&self) -> u64 {
+        let mut total = 0u64;
+        for layer in &self.layers {
+            for segment_id in 0..layer.total_segment_count() as u32 {
+                if let Some(segment) = layer.get_segment(segment_id)
+                    && !Self::is_freed(segment)
+                {
+                    total += segment.live_items() as u64;
+                }
+            }
+        }
+        total
+    }
+
+    /// Whether a segment is sitting in the free queue.
+    ///
+    /// A freed segment keeps its `live_items` and `live_bytes` until it is
+    /// reserved again -- `try_reserve` zeroes them, `try_release` does not --
+    /// so a walk over every addressable segment counts contents that were
+    /// correctly evicted. About two segments' worth at any moment, which is
+    /// 1.6% of residency on a 128-segment cache and 25.6% on a 16-segment
+    /// one.
+    ///
+    /// Filtered here rather than zeroed at release, because zeroing after
+    /// the release CAS races a concurrent `try_reserve` that has already
+    /// reset the counters and begun appending, and zeroing before it would
+    /// clear a segment whose CAS then fails. A free segment holds nothing
+    /// by definition, so declining to count it is correct without any new
+    /// ordering requirement.
+    fn is_freed(segment: &SliceSegment<'_>) -> bool {
+        segment.state() == crate::state::State::Free
+    }
+
+    /// Live item bytes and the segment bytes they sit in, across RAM layers.
+    ///
+    /// Returns `(live_bytes, written_bytes, capacity_bytes)` over RAM layers.
+    ///
+    /// Three numbers rather than one, because "why does this engine hold
+    /// fewer items in the same heap" has two different answers that a single
+    /// ratio cannot separate:
+    ///
+    /// - `written / capacity` is how full the segments are. Low means the
+    ///   bytes are sitting there unused -- a packing problem.
+    /// - `live / written` is how much of what was written is still live.
+    ///   Low means the segments are full of superseded or expired items that
+    ///   nothing has reclaimed -- a reclamation problem.
+    ///
+    /// Dividing heap size by resident items conflates those with a third
+    /// possibility, that the policy simply retained fewer items on purpose,
+    /// and the three have different fixes.
+    ///
+    /// A gauge, read without pinning exactly as `resident_items` is, so the
+    /// same caveat about mid-transition segments applies.
+    pub fn resident_bytes(&self) -> (u64, u64, u64) {
+        let mut live = 0u64;
+        let mut written = 0u64;
+        let mut capacity = 0u64;
+        for layer in &self.layers {
+            for segment_id in 0..layer.total_segment_count() as u32 {
+                if let Some(segment) = layer.get_segment(segment_id)
+                    && !Self::is_freed(segment)
+                {
+                    live += segment.live_bytes() as u64;
+                    written += segment.write_offset() as u64;
+                    capacity += segment.capacity() as u64;
+                }
+            }
+        }
+        (live, written, capacity)
+    }
+
+    /// Per-segment live occupancy, as counts in ten deciles.
+    ///
+    /// Bucket `i` counts non-free RAM segments whose `live_bytes` falls in
+    /// `[i*10%, (i+1)*10%)` of segment capacity; a completely full segment
+    /// lands in bucket 9.
+    ///
+    /// The cache-wide `live / capacity` ratio cannot answer whether
+    /// compaction is reachable, because compaction is a decision about
+    /// *pairs* of adjacent segments, not about the mean.
+    /// `TtlLayer::try_compact_segment` merges two sealed segments into one
+    /// spare only when their combined live bytes fit in 90% of a single
+    /// segment -- an average occupancy of 45% across the pair. A cache
+    /// sitting at 76% live overall can still hold a compactable tail, or
+    /// none at all, and the mean does not distinguish those.
+    ///
+    /// `live_bytes` is charged the full `item_stride`, so each count already
+    /// includes header and alignment overhead rather than just payload.
+    ///
+    /// A gauge, read without pinning exactly as [`resident_bytes`] is.
+    ///
+    /// [`resident_bytes`]: Self::resident_bytes
+    pub fn segment_occupancy(&self) -> [u64; 10] {
+        let mut deciles = [0u64; 10];
+        for layer in &self.layers {
+            for segment_id in 0..layer.total_segment_count() as u32 {
+                if let Some(segment) = layer.get_segment(segment_id)
+                    && !Self::is_freed(segment)
+                {
+                    let capacity = segment.capacity();
+                    if capacity == 0 {
+                        continue;
+                    }
+                    let live = segment.live_bytes() as usize;
+                    let decile = (live * 10 / capacity).min(9);
+                    deciles[decile] += 1;
+                }
+            }
+        }
+        deciles
+    }
+
+    /// Sum of free segments across RAM layers only.
+    ///
+    /// Skips disk-backed layers the same way `resident_items` does (see its
+    /// doc comment): a disk tier's fill dynamic is a different question from
+    /// "did the in-memory cache reach capacity", which is what
+    /// [`crate::cache_trait::CacheInternalStats::free_segments`] and
+    /// [`total_segments`](crate::cache_trait::CacheInternalStats::total_segments)
+    /// exist to answer.
+    pub fn ram_free_segment_count(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter(|layer| !layer.is_disk())
+            .map(|layer| layer.free_segment_count() as u64)
+            .sum()
+    }
+
+    /// Sum of total segments across RAM layers only. See
+    /// [`ram_free_segment_count`](Self::ram_free_segment_count) for why disk
+    /// layers are excluded.
+    pub fn ram_total_segment_count(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter(|layer| !layer.is_disk())
+            .map(|layer| layer.total_segment_count() as u64)
+            .sum()
+    }
+
     /// Store an item in the cache.
     ///
     /// The item is always written to Layer 0 (admission queue).
@@ -545,7 +738,7 @@ impl<H: Hashtable> TieredCache<H> {
         {
             Ok(Some(old_location)) => {
                 // Key existed, mark old location as deleted
-                self.mark_deleted_at(old_location);
+                self.supersede_at(old_location);
             }
             Ok(None) => {
                 // New key or ghost resurrection
@@ -636,7 +829,7 @@ impl<H: Hashtable> TieredCache<H> {
         {
             Ok(Some(old_location)) => {
                 // Key existed, mark old location as deleted
-                self.mark_deleted_at(old_location);
+                self.supersede_at(old_location);
             }
             Ok(None) => {
                 // New key or ghost resurrection
@@ -727,7 +920,7 @@ impl<H: Hashtable> TieredCache<H> {
             .update_if_present(key, location.to_location(), &verifier)
         {
             Ok(old_location) => {
-                self.mark_deleted_at(old_location);
+                self.supersede_at(old_location);
                 Ok(())
             }
             Err(e) => {
@@ -1030,7 +1223,7 @@ impl<H: Hashtable> TieredCache<H> {
             .hashtable
             .cas_location(key, current_location, new_location.to_location(), true)
         {
-            self.mark_deleted_at(current_location);
+            self.supersede_at(current_location);
             return Ok(true);
         }
 
@@ -1100,6 +1293,9 @@ impl<H: Hashtable> TieredCache<H> {
         for layer in &self.layers {
             total += layer.expire(self.hashtable.as_ref());
         }
+        self.stats
+            .expirations
+            .fetch_add(total as u64, Ordering::Relaxed);
         total
     }
 
@@ -1377,6 +1573,43 @@ impl<H: Hashtable> TieredCache<H> {
         // second -- a plausible-looking number that is pure artifact.
         let started = std::time::Instant::now();
 
+        // Expiry first, because it is free and eviction is not.
+        //
+        // An expired segment is reclaimed whole: nothing is copied and
+        // nothing live is discarded. An eviction pass copies the survivors
+        // of a chain and throws the rest away. Reaching for the second
+        // while the first would have sufficed destroys live data to make
+        // room that dead data was already holding -- which is precisely the
+        // advantage TTL-bucketed segments exist to provide, and it was
+        // unreachable before this: `expire()` is a public method nothing
+        // called internally, so unless pressure triggers it, proactive
+        // expiration never runs at all. Both engines measured in this
+        // program had it switched off for that reason.
+        //
+        // Not free to attempt, and measured. `try_expire_segments` checks
+        // the head of every one of the 1024 TTL buckets on each call -- it
+        // does not stop early -- so a pass that expires nothing still pays
+        // that walk. Measured at cluster4/128MB the walk is small against
+        // the pass it sits in: space-making passes averaged 1572us with
+        // expiry and 1546us without, which is inside the difference between
+        // two pi4b boards.
+        //
+        // What it does *not* buy, on that trace: anything measurable. The
+        // eviction counter falls 428 -> 119, but the number of passes is
+        // identical at 402, and miss ratio, residency and the write tail
+        // (p99.99 2539us against 2523us) are unchanged. Expiry changes how
+        // a pass resolves, not how often one happens, and this workload's
+        // expired bytes were going to be reclaimed by the next merge
+        // anyway. It is kept because reclaiming dead data before live data
+        // is right regardless, and because a workload with real expiry
+        // pressure is exactly the one this trace is not.
+        if self.expire() > 0 && layer.free_segment_count() > self.eviction_threshold {
+            self.stats
+                .eviction_latency
+                .record(started.elapsed().as_nanos() as u64);
+            return Ok(());
+        }
+
         // Try to evict until we have enough space
         for _ in 0..self.max_eviction_attempts {
             // Cascading: ensure downstream layers have space (bottom-up)
@@ -1502,6 +1735,32 @@ impl<H: Hashtable> TieredCache<H> {
     }
 
     /// Mark an item as deleted at the given location.
+    /// Supersede an item, reclaiming its space according to the configured
+    /// policy.
+    ///
+    /// The four overwrite paths -- `set`, `replace`, `cas` and a committed
+    /// streaming set -- all route through here so they cannot drift apart
+    /// from each other, which is how the deferred behaviour came to differ
+    /// from `delete` in the first place.
+    fn supersede_at(&self, location: Location) {
+        match self.overwrite_reclaim {
+            crate::config::OverwriteReclaim::Deferred => self.mark_deleted_at(location),
+            crate::config::OverwriteReclaim::FreeEmpty => self.mark_deleted_at_free_empty(location),
+            crate::config::OverwriteReclaim::Compact => self.mark_deleted_at_with_compact(location),
+        }
+    }
+
+    /// Mark deleted and free the segment if that emptied it, without
+    /// attempting predecessor compaction.
+    fn mark_deleted_at_free_empty(&self, location: Location) {
+        let item_loc = ItemLocation::from_location(location);
+        if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
+            && let Some(layer) = self.layers.get(layer_idx)
+        {
+            layer.mark_deleted_and_free_empty(item_loc);
+        }
+    }
+
     fn mark_deleted_at(&self, location: Location) {
         let item_loc = ItemLocation::from_location(location);
         if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
@@ -1518,8 +1777,9 @@ impl<H: Hashtable> TieredCache<H> {
         let item_loc = ItemLocation::from_location(location);
         if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
             && let Some(layer) = self.layers.get(layer_idx)
+            && layer.mark_deleted_and_compact(item_loc, self.hashtable.as_ref())
         {
-            layer.mark_deleted_and_compact(item_loc, self.hashtable.as_ref());
+            self.stats.compactions.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1794,6 +2054,7 @@ pub struct TieredCacheBuilder<H: Hashtable> {
     pool_map: [Option<usize>; 4],
     eviction_threshold: usize,
     max_eviction_attempts: usize,
+    overwrite_reclaim: crate::config::OverwriteReclaim,
 }
 
 impl<H: Hashtable> TieredCacheBuilder<H> {
@@ -1803,6 +2064,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
             hashtable,
             layers: Vec::new(),
             pool_map: [None; 4],
+            overwrite_reclaim: crate::config::OverwriteReclaim::default(),
             eviction_threshold: 1,
             max_eviction_attempts: 10,
         }
@@ -1875,6 +2137,16 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
         self
     }
 
+    /// What an overwrite does with the superseded copy's bytes.
+    ///
+    /// Defaults to `Deferred`, which is the behaviour every overwrite path
+    /// has always had: mark the old copy deleted and leave its bytes until a
+    /// merge pass sweeps the segment. `delete` alone reclaims eagerly.
+    pub fn overwrite_reclaim(mut self, policy: crate::config::OverwriteReclaim) -> Self {
+        self.overwrite_reclaim = policy;
+        self
+    }
+
     /// Build the tiered cache.
     pub fn build(mut self) -> TieredCache<H> {
         // Wire each layer to demote into the next one added, unless the caller
@@ -1903,6 +2175,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
             pool_map: self.pool_map,
             eviction_threshold: self.eviction_threshold,
             max_eviction_attempts: self.max_eviction_attempts,
+            overwrite_reclaim: self.overwrite_reclaim,
             stats: CacheStats::new(),
         }
     }
@@ -1911,6 +2184,7 @@ impl<H: Hashtable> TieredCacheBuilder<H> {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use crate::config::{EvictionStrategy, MergeConfig, OverwriteReclaim};
     use crate::hashtable_impl::MultiChoiceHashtable;
     use crate::layer::{FifoLayerBuilder, TtlLayerBuilder};
 
@@ -2344,6 +2618,38 @@ mod tests {
         );
     }
 
+    fn create_test_cache_with_reclaim(
+        policy: OverwriteReclaim,
+    ) -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(10));
+        let fifo_config = LayerConfig::new()
+            .with_next_layer(1)
+            .with_demotion_threshold(1);
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(256 * 1024)
+            .spare_capacity(0)
+            .config(fifo_config)
+            .build()
+            .expect("fifo layer");
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(512 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+        TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo_layer)
+            .with_ttl_layer(ttl_layer)
+            .eviction_threshold(1)
+            .overwrite_reclaim(policy)
+            .build()
+    }
+
     fn create_test_cache() -> TieredCache<MultiChoiceHashtable> {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10)); // 2^10 = 1024 buckets
 
@@ -2770,6 +3076,952 @@ mod tests {
         assert_eq!(expired, 0);
     }
 
+    /// Every reclamation policy must preserve the live set.
+    ///
+    /// This pins correctness, not benefit. The benefit is a capacity effect
+    /// that needs a realistic segment count to appear: at this fixture's
+    /// eight segments in layer 1, all three policies return identical
+    /// survivor and free-segment counts, because merge already reclaims
+    /// everything the workload frees. The measurement that motivated the
+    /// policy ran 128 segments on a real trace, and belongs on the rig
+    /// rather than here -- a unit test tuned until it showed a difference
+    /// would be measuring the tuning.
+    #[test]
+    fn every_reclamation_policy_preserves_the_live_set() {
+        fn survivors(policy: OverwriteReclaim) -> u64 {
+            let cache = create_test_cache_with_reclaim(policy);
+            let value = vec![0xABu8; 1024];
+            for i in 0..200u32 {
+                let key = format!("key-{i:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    let _ = cache.get(key.as_bytes());
+                }
+            }
+            // Rewrite repeatedly: every one of these supersedes a copy that
+            // is still resident, which is the path that never reclaimed.
+            let bigger = vec![0xCDu8; 1024];
+            for _round in 0..20 {
+                for i in 0..200u32 {
+                    let key = format!("key-{i:08}");
+                    let _ = cache.set(key.as_bytes(), &bigger, b"", Duration::from_secs(3600));
+                }
+            }
+            let mut alive = 0u64;
+            for i in 0..200u32 {
+                let key = format!("key-{i:08}");
+                if let Some(v) = cache.get(key.as_bytes()) {
+                    // The survivor must be the copy written last, or a
+                    // policy could "preserve" the live set by serving a
+                    // superseded copy.
+                    let bytes: &[u8] = &v;
+                    assert_eq!(bytes[0], 0xCD, "{policy:?} served a superseded copy");
+                    alive += 1;
+                }
+            }
+            alive
+        }
+
+        let deferred = survivors(OverwriteReclaim::Deferred);
+        for policy in [OverwriteReclaim::FreeEmpty, OverwriteReclaim::Compact] {
+            assert_eq!(
+                survivors(policy),
+                deferred,
+                "{policy:?} lost live items the deferred policy kept"
+            );
+        }
+    }
+
+    /// Compaction must relocate items without touching their frequency.
+    ///
+    /// The counterpart to `a_merge_pass_resets_the_frequency_of_the_items_it_keeps`.
+    /// A merge pass judges items and resets what it keeps, which is
+    /// Segcache's substitute for aging. Compaction judges nothing -- it
+    /// relocates every live item to reclaim dead bytes -- so resetting
+    /// there would charge items for a maintenance pass, repeatedly
+    /// flattening the frequencies the eviction policy depends on, and more
+    /// often the more fragmented the cache is.
+    ///
+    /// Added because mutating the compaction path to reset left all 607
+    /// other tests passing: the distinction was asserted only in a comment.
+    #[test]
+    fn compaction_relocates_items_without_resetting_their_frequency() {
+        // A purpose-built cache rather than the shared fixture. Compaction
+        // needs three segments in one TTL bucket, a sealed predecessor, a
+        // spare to copy into, and a combined live set under 90% of one
+        // segment -- and the shared fixture's eight spare-less segments
+        // never satisfy all four, so the first version of this test passed
+        // without compacting once.
+        let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(16 * 1024)
+            .heap_size(64 * 1024)
+            .spare_capacity(0)
+            .config(
+                LayerConfig::new()
+                    .with_next_layer(1)
+                    .with_demotion_threshold(1),
+            )
+            .build()
+            .expect("fifo layer");
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(16 * 1024)
+            .heap_size(1024 * 1024)
+            .spare_capacity(4)
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo_layer)
+            .with_ttl_layer(ttl_layer)
+            .eviction_threshold(1)
+            .overwrite_reclaim(OverwriteReclaim::Compact)
+            .build();
+        let value = vec![0xABu8; 512];
+        let mut keys = Vec::new();
+        for i in 0..400u32 {
+            let key = format!("comp-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                keys.push(key);
+            }
+        }
+        assert!(!keys.is_empty(), "the fixture must store something");
+
+        // Warm every key well clear of 1. `get` bumps the counter, so the
+        // reads are the warming.
+        for key in &keys {
+            for _ in 0..6 {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+
+        // Delete most of them. `delete` runs the compaction path directly,
+        // and draining segments this hard is what puts adjacent pairs under
+        // the combined-live bound so a pass can actually fire.
+        let survivors: Vec<&String> = keys.iter().step_by(8).collect();
+        for key in &keys {
+            if !survivors.contains(&key) {
+                cache.delete(key.as_bytes());
+            }
+        }
+
+        // The survivors are what compaction relocated. Their frequency must
+        // be whatever the warming reads left it at, never reset to 1. Read
+        // through `frequency`, not `get`, which would bump it.
+        let mut checked = 0;
+        let mut at_floor = 0;
+        for key in survivors {
+            if let Some(freq) = cache.frequency(key.as_bytes()) {
+                checked += 1;
+                if freq <= 1 {
+                    at_floor += 1;
+                }
+            }
+        }
+        // Without this the test is vacuous: if no compaction ran, nothing
+        // was relocated and every frequency is trivially intact. The
+        // mutation that resets frequency during compaction passed the first
+        // version of this test for exactly that reason.
+        assert!(
+            cache.stats().snapshot().compactions > 0,
+            "no compaction ran, so this fixture proves nothing about what \
+             compaction does to frequencies"
+        );
+        assert!(checked > 0, "some untouched keys must still be resident");
+        assert_eq!(
+            at_floor, 0,
+            "{at_floor} of {checked} untouched items came back at frequency \
+             1 or below: compaction reset what it merely relocated"
+        );
+    }
+
+    /// The compaction counter must count compactions, not delete calls.
+    ///
+    /// `delete` runs the compaction path on every call regardless of
+    /// `OverwriteReclaim`, so "a delete happened" and "a compaction ran" are
+    /// easy to conflate -- and a counter incremented once per delete passes
+    /// every test that only asks whether it is above zero. That matters
+    /// because this counter is what answers "is compaction reachable on
+    /// this workload at all", where a false yes is worse than no counter.
+    ///
+    /// The control is a working set too small to fill three segments.
+    /// `try_compact_segment` needs a segment with a sealed *predecessor*
+    /// that is not the bucket tail, so it returns early when
+    /// `bucket.segment_count() < 3` -- while the deletes still run exactly
+    /// as they do in the other arm.
+    ///
+    /// An earlier version used a layer with no spare capacity, on the
+    /// assumption that compaction could not reserve a destination. It can:
+    /// the pool hands out free segments, and that arm compacted nine times.
+    #[test]
+    fn the_compaction_counter_counts_passes_not_deletes() {
+        let build = || {
+            let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+            let fifo_layer = FifoLayerBuilder::new()
+                .layer_id(0)
+                .pool_id(0)
+                .segment_size(16 * 1024)
+                .heap_size(64 * 1024)
+                .spare_capacity(0)
+                .config(
+                    LayerConfig::new()
+                        .with_next_layer(1)
+                        .with_demotion_threshold(1),
+                )
+                .build()
+                .expect("fifo layer");
+            let ttl_layer = TtlLayerBuilder::new()
+                .layer_id(1)
+                .pool_id(1)
+                .segment_size(16 * 1024)
+                .heap_size(1024 * 1024)
+                .spare_capacity(4)
+                .build()
+                .expect("ttl layer");
+            TieredCacheBuilder::new(hashtable)
+                .with_fifo_layer(fifo_layer)
+                .with_ttl_layer(ttl_layer)
+                .eviction_threshold(1)
+                .overwrite_reclaim(OverwriteReclaim::Compact)
+                .build()
+        };
+
+        // (compactions, deletes issued, segments released)
+        let run = |n_items: u32| -> (u64, u64, u64) {
+            let cache = build();
+            let value = vec![0xABu8; 512];
+            let mut keys = Vec::new();
+            for i in 0..n_items {
+                let key = format!("cnt-{i:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    keys.push(key);
+                }
+            }
+            for key in &keys {
+                for _ in 0..6 {
+                    let _ = cache.get(key.as_bytes());
+                }
+            }
+            let survivors: Vec<&String> = keys.iter().step_by(8).collect();
+            let free_before = cache.ram_free_segment_count();
+            let mut deletes = 0u64;
+            for key in &keys {
+                if !survivors.contains(&key) {
+                    cache.delete(key.as_bytes());
+                    deletes += 1;
+                }
+            }
+            let released = cache.ram_free_segment_count().saturating_sub(free_before);
+            (cache.stats().snapshot().compactions, deletes, released)
+        };
+
+        let (many, deletes, released) = run(400);
+        let (few, deletes_control, _) = run(16);
+
+        assert!(deletes > 0 && deletes_control > 0, "both arms must delete");
+        assert!(
+            many > 0,
+            "the large arm must actually compact, or the control proves nothing"
+        );
+        assert_eq!(
+            few, 0,
+            "a working set under three segments cannot compact -- {few} were \
+             counted across {deletes_control} deletes, so the counter is \
+             tracking delete calls rather than compaction passes"
+        );
+        // A real pass retires two segments and takes one spare, so it nets
+        // one release. Deletes release segments too, by emptying them, which
+        // only makes this a looser bound -- and it still catches a count
+        // that reports a pass whenever it merely reaches the call site,
+        // which is what "compaction happened" degrades into otherwise.
+        assert!(
+            many <= released,
+            "each compaction nets one released segment, so {many} passes \
+             cannot be reconciled with {released} segments released across \
+             {deletes} deletes -- the counter is reporting attempts, not passes"
+        );
+    }
+
+    /// Every allocating write must reach expiry, not just `set`.
+    ///
+    /// `ensure_space` is where expiry is attempted, and it is called by
+    /// `set`, `begin_segment_set`, `add`, `replace` and `cas` -- with
+    /// `append` and `prepend` reaching it through `set`. That list is easy
+    /// to read off the code and easy to be wrong about: a write path added
+    /// later that allocates without calling `ensure_space` would evict
+    /// live data while expired data sat there, and nothing would say so.
+    ///
+    /// So this exercises the paths rather than reading them.
+    #[test]
+    fn every_allocating_write_path_expires_before_it_evicts() {
+        type Cache = TieredCache<MultiChoiceHashtable>;
+        // (name, prepare, exercise). Anything the op needs in place runs in
+        // `prepare`, before the TTL lapses, so the only write happening
+        // against an all-expired cache is the one under test. Doing that
+        // setup afterwards consumes the expired supply itself, and the op is
+        // then measured evicting for space its own preamble used -- which is
+        // what the first version did, and it read as `append` bypassing
+        // expiry entirely.
+        type Op = (
+            &'static str,
+            fn(&Cache, &[u8], &[u8]),
+            fn(&Cache, &[u8], &[u8]) -> bool,
+        );
+        let ops: &[Op] = &[
+            (
+                "set",
+                |_, _, _| {},
+                |c, k, v| c.set(k, v, b"", Duration::from_secs(3600)).is_ok(),
+            ),
+            (
+                "add",
+                |_, _, _| {},
+                |c, k, v| c.add(k, v, b"", Duration::from_secs(3600)).is_ok(),
+            ),
+            (
+                "append",
+                |c, k, v| {
+                    let _ = c.set(k, v, b"", Duration::from_secs(3600));
+                },
+                |c, k, v| c.append(k, v).is_ok(),
+            ),
+            (
+                "replace",
+                |c, k, v| {
+                    let _ = c.set(k, v, b"", Duration::from_secs(3600));
+                },
+                |c, k, v| c.replace(k, v, b"", Duration::from_secs(3600)).is_ok(),
+            ),
+        ];
+
+        for (name, prepare, exercise) in ops {
+            let clock = crate::clock::TestClock::start();
+            let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+            let ttl_layer = TtlLayerBuilder::new()
+                .layer_id(0)
+                .pool_id(0)
+                .segment_size(16 * 1024)
+                .heap_size(256 * 1024)
+                .spare_capacity(2)
+                .build()
+                .expect("ttl layer");
+            let cache = TieredCacheBuilder::new(hashtable)
+                .with_ttl_layer(ttl_layer)
+                .eviction_threshold(1)
+                .overwrite_reclaim(OverwriteReclaim::Deferred)
+                .build();
+            let value = vec![0xEEu8; 512];
+
+            for i in 0..2000u32 {
+                let key = format!("{name}-{i:08}");
+                let _ = cache.set(key.as_bytes(), &value, b"", Duration::from_secs(60));
+            }
+            // Whatever the op needs present, written while nothing has
+            // expired yet.
+            for i in 0..200u32 {
+                let key = format!("{name}-after-{i:08}");
+                prepare(&cache, key.as_bytes(), &value);
+            }
+
+            let evictions_before = cache.stats().snapshot().evictions;
+            let expirations_before = cache.stats().snapshot().expirations;
+            for _ in 0..600 {
+                clock.tick();
+            }
+
+            let mut applied = 0;
+            for i in 0..200u32 {
+                let key = format!("{name}-after-{i:08}");
+                if exercise(&cache, key.as_bytes(), &value) {
+                    applied += 1;
+                }
+            }
+            assert!(applied > 0, "{name} never succeeded, so it proved nothing");
+
+            let after = cache.stats().snapshot();
+            assert!(
+                after.expirations > expirations_before,
+                "{name} made space without reaching expiry: expirations stayed \
+                 at {expirations_before}"
+            );
+            assert_eq!(
+                after.evictions, evictions_before,
+                "{name} evicted live data while expired data was available"
+            );
+        }
+    }
+
+    /// Memory pressure must try expiry before it evicts.
+    ///
+    /// Reclaiming an expired segment costs nothing and destroys nothing
+    /// live; an eviction pass copies survivors and discards the rest. So a
+    /// cache whose contents have all expired should make room by expiring,
+    /// and evict not at all. Doing it the other way round throws away live
+    /// data to make space that dead data was already holding.
+    ///
+    /// This is also what makes proactive expiration reachable at all in a
+    /// benchmark. `expire()` is a public method neither engine calls
+    /// internally, so unless pressure triggers it, the TTL-bucket design's
+    /// whole advantage is switched off in every measurement.
+    #[test]
+    fn memory_pressure_expires_before_it_evicts() {
+        let clock = crate::clock::TestClock::start();
+        // A single TTL layer, matching `policy = "merge"`. The shared
+        // tiered fixture will not do: its layer 0 is a FIFO layer whose
+        // `expire` returns 0 by construction ("items are checked on read"),
+        // and items only reach the TTL layer by demotion, which needs a
+        // frequency above the threshold. Nothing here is ever read, so in
+        // the tiered shape every item stays where expiry cannot see it.
+        let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(16 * 1024)
+            .heap_size(256 * 1024)
+            .spare_capacity(2)
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(ttl_layer)
+            .eviction_threshold(1)
+            .overwrite_reclaim(OverwriteReclaim::Deferred)
+            .build();
+        let value = vec![0xEEu8; 512];
+
+        // Enough to fill the heap several times over. A fixture that merely
+        // fits never calls the space-making path at all, so expiry is never
+        // reached and the test reads as "expiry does not run" when what it
+        // showed was "there was nothing to reclaim".
+        let mut stored = 0u32;
+        for i in 0..2000u32 {
+            let key = format!("exp-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(60))
+                .is_ok()
+            {
+                stored += 1;
+            }
+        }
+        assert!(stored > 0, "the fixture must store something");
+
+        let evictions_before = cache.stats().snapshot().evictions;
+
+        // Everything is now dead. The next write needs space, and there is
+        // a segment's worth of expired bytes to take it from.
+        for _ in 0..600 {
+            clock.tick();
+        }
+        // A batch, not a single write: whether any one `set` meets pressure
+        // depends on where the fill happened to leave the free count, and a
+        // write that simply fits never reaches the space-making path at all.
+        for i in 0..200u32 {
+            let key = format!("after-{i:08}");
+            cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .expect("a write must succeed when every resident item has expired");
+        }
+
+        let after = cache.stats().snapshot();
+        assert!(
+            after.expirations > 0,
+            "pressure against a cache of expired items must reclaim by \
+             expiry: {} expirations",
+            after.expirations
+        );
+        assert_eq!(
+            after.evictions, evictions_before,
+            "and must not evict to do it: evictions went from \
+             {evictions_before} to {}",
+            after.evictions
+        );
+    }
+
+    /// Occupancy must be reported per segment, not as a cache-wide mean.
+    ///
+    /// Compaction pairs two adjacent sealed segments, so what decides
+    /// whether it can fire is where individual segments sit, not the
+    /// average. A version of this that returned `live / capacity` over the
+    /// whole cache would report the same single number for a cache of
+    /// uniformly half-full segments and for one holding full segments
+    /// beside empty ones -- and only the second has pairs to compact.
+    ///
+    /// Not covered here: the `is_freed` filter. Nothing in this fixture
+    /// reaches the free queue, so a version counting freed segments passes.
+    /// That filter is exercised by the resident-byte tests instead.
+    #[test]
+    fn segment_occupancy_locates_segments_rather_than_averaging_them() {
+        let cache = create_test_cache_with_reclaim(OverwriteReclaim::Deferred);
+        let value = vec![0xCDu8; 1024];
+        let mut stored = Vec::new();
+        for i in 0..150u32 {
+            let key = format!("occ-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                stored.push(key);
+            }
+        }
+        assert!(!stored.is_empty(), "the fixture must store something");
+
+        let full = cache.segment_occupancy();
+        let occupied: u64 = full.iter().sum();
+        assert!(occupied > 0, "a filled cache has non-free segments");
+        assert_eq!(
+            occupied,
+            full.iter().sum::<u64>(),
+            "every counted segment lands in exactly one decile"
+        );
+        // Freshly written segments are densely packed, so the mass sits high.
+        let high: u64 = full[5..].iter().sum();
+        assert!(
+            high > 0,
+            "freshly filled segments should sit in the upper deciles: {full:?}"
+        );
+
+        // Items are appended in order, so deleting a prefix of the keys
+        // empties the earliest segments and leaves the later ones untouched.
+        // That is deliberately bimodal: drained segments at the bottom, full
+        // ones at the top, and nothing in between.
+        for key in stored.iter().take(stored.len() / 2) {
+            cache.delete(key.as_bytes());
+        }
+        let sparse = cache.segment_occupancy();
+
+        // The load-bearing assertion. Any cache-wide ratio -- however it is
+        // computed -- is a single number, so it can only ever populate a
+        // single bucket. Two modes several deciles apart cannot come from a
+        // mean, which is what makes this reject the averaged version rather
+        // than merely agreeing with it.
+        let occupied: Vec<usize> = (0..10).filter(|&i| sparse[i] > 0).collect();
+        let span = occupied.last().unwrap() - occupied.first().unwrap();
+        assert!(
+            span >= 5,
+            "draining a prefix leaves emptied segments far below untouched \
+             ones, and a mean could not show that spread: {full:?} became \
+             {sparse:?}"
+        );
+        // ...and the spread has to be caused by the deletions, not merely
+        // present beforehand. The partially-filled tail segment already sits
+        // well below the sealed ones, so a version reading `write_offset`
+        // instead of `live_bytes` would satisfy the span check while being
+        // blind to every delete.
+        assert!(
+            sparse[0] > full[0],
+            "emptied segments must fall into the bottom decile, which bytes \
+             written rather than bytes live would never show: {full:?} \
+             became {sparse:?}"
+        );
+    }
+
+    /// The three byte figures must tell apart the two things that look
+    /// identical in a resident-item count.
+    ///
+    /// Overwriting the same keys leaves superseded copies behind: the
+    /// segments stay just as full of written bytes, but fewer of those bytes
+    /// are live. A resident-item count cannot see that -- the live set is
+    /// unchanged -- while `live / written` drops. That is the distinction
+    /// the metric exists to make.
+    #[test]
+    fn written_and_live_bytes_separate_packing_from_reclamation() {
+        let cache = create_test_cache_with_reclaim(OverwriteReclaim::Deferred);
+        let value = vec![0xABu8; 1024];
+        for i in 0..150u32 {
+            let key = format!("key-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        let (live_before, written_before, capacity) = cache.resident_bytes();
+        assert!(capacity > 0, "a built cache has segment capacity");
+        assert!(
+            live_before > 0 && written_before >= live_before,
+            "live {live_before} cannot exceed written {written_before}"
+        );
+
+        // Same keys, same sizes: the live set does not grow, but each write
+        // appends a new copy and strands the previous one.
+        for _round in 0..12 {
+            for i in 0..150u32 {
+                let key = format!("key-{i:08}");
+                let _ = cache.set(key.as_bytes(), &value, b"", Duration::from_secs(3600));
+            }
+        }
+        let (live_after, written_after, _) = cache.resident_bytes();
+
+        let before = live_before as f64 / written_before as f64;
+        let after = live_after as f64 / written_after as f64;
+        assert!(
+            after < before,
+            "overwriting should lower the live share of written bytes: \
+             {after:.3} against {before:.3}"
+        );
+    }
+
+    /// Every resident item must be reachable through the hashtable.
+    ///
+    /// A lookup that loses an item it still holds produces exactly the
+    /// signature that is otherwise hard to explain: residency unchanged,
+    /// miss ratio higher. The item stays live in its segment, counted by
+    /// `resident_items`, while reads for it miss -- so capacity looks fine
+    /// and hit ratio does not.
+    ///
+    /// Sized to fit without eviction, so any shortfall is the index losing
+    /// track rather than the policy discarding.
+    #[test]
+    fn every_resident_item_is_reachable_by_lookup() {
+        let cache = create_test_cache();
+        let value = vec![0xABu8; 256];
+
+        let mut stored = 0u64;
+        for i in 0..400u32 {
+            let key = format!("reach-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                stored += 1;
+            }
+        }
+
+        let mut found = 0u64;
+        for i in 0..400u32 {
+            let key = format!("reach-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+
+        let resident = cache.resident_items();
+        assert_eq!(
+            found,
+            resident,
+            "{resident} items are resident but only {found} read back; \
+             {} are held but unreachable",
+            resident.saturating_sub(found)
+        );
+        assert_eq!(found, stored, "{stored} stored, {found} read back");
+    }
+
+    /// The same invariant after items have been relocated.
+    ///
+    /// This failed alongside `every_resident_item_should_be_reachable_after_merge`
+    /// until `resident_items` stopped counting freed segments; that fix is
+    /// what either test now guards.
+    ///
+    /// Merge copies survivors into a new segment and demotion moves them
+    /// between layers; both must re-point the index. A relocation that
+    /// updated the segment but not the hashtable would leave the item live
+    /// and counted while reads for it miss, and the unpressured case above
+    /// would never catch it because nothing moves there.
+    #[test]
+    fn resident_items_stay_reachable_after_eviction_and_demotion() {
+        let cache = create_test_cache();
+        let value = vec![0xABu8; 1024];
+
+        // Well past capacity, reading each key so it carries a frequency
+        // and demotes rather than being discarded out of layer 0.
+        for i in 0..3000u32 {
+            let key = format!("moved-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+
+        let stats = cache.stats().snapshot();
+        assert!(
+            stats.evictions > 0,
+            "the fixture must actually evict for this to test anything"
+        );
+
+        let mut found = 0u64;
+        for i in 0..3000u32 {
+            let key = format!("moved-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+        let resident = cache.resident_items();
+
+        assert_eq!(
+            found,
+            resident,
+            "after {} evictions and {} demotions: {resident} resident but {found} \
+             reachable, so {} are held and unreachable",
+            stats.evictions,
+            stats.demotions,
+            resident.saturating_sub(found)
+        );
+    }
+
+    /// Every item the cache reports as resident should be reachable.
+    ///
+    /// Single layer with merge eviction and no demotion, which is the shape
+    /// `policy = "merge"` builds. `resident_items` used to count segments
+    /// sitting in the free queue, whose counters survive until they are
+    /// reserved again, so it over-reported by about two segments' worth --
+    /// roughly 126 items regardless of heap size. The items were evicted
+    /// correctly; the count was wrong.
+    ///
+    /// Sixteen segments, because the gap is a near-constant absolute number
+    /// and so is largest, relatively, on the smallest cache: 25.6% of
+    /// residency here against 1.6% at 128 segments. Two thousand writes is
+    /// about twice what the heap holds, enough to keep eviction running.
+    /// Reinstating the bug (`is_freed` always false) fails this at 982
+    /// resident, 858 reachable. It is also a twelfth of the work of the
+    /// 128-segment version this replaced, which Miri could not finish
+    /// inside the CI job's timeout.
+    ///
+    /// See `report_unreachable_resident_items_by_heap_size` for the numbers.
+    #[test]
+    fn every_resident_item_should_be_reachable_after_merge() {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(16));
+        let layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(1024 * 1024)
+            .spare_capacity(4)
+            .config(
+                LayerConfig::new()
+                    .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+            )
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(layer)
+            .eviction_threshold(1)
+            .build();
+
+        let value = vec![0xABu8; 1024];
+        for i in 0..2000u32 {
+            let key = format!("k-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        let mut found = 0u64;
+        for i in 0..2000u32 {
+            let key = format!("k-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+        let resident = cache.resident_items();
+        assert_eq!(
+            found,
+            resident,
+            "{resident} resident but {found} reachable: {} items held outside the index",
+            resident.saturating_sub(found)
+        );
+    }
+
+    /// Does capacity drift away over many eviction cycles?
+    ///
+    /// The freed-segment counters were an accounting fault, not a leak --
+    /// those segments are in the free queue and get reused. This checks
+    /// that claim the only way that matters: run far more eviction cycles
+    /// than the cache has segments and see whether usable capacity, or the
+    /// items it holds, decays.
+    #[test]
+    #[ignore = "diagnostic: run explicitly with --ignored"]
+    fn report_capacity_drift_over_eviction_cycles() {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(16));
+        let layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(8 * 1024 * 1024)
+            .spare_capacity(4)
+            .config(
+                LayerConfig::new()
+                    .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+            )
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(layer)
+            .eviction_threshold(1)
+            .build();
+
+        let value = vec![0xABu8; 1024];
+        let mut written = 0u32;
+        eprintln!(
+            "  {:>9}{:>12}{:>11}{:>12}{:>10}",
+            "writes", "evictions", "resident", "live MiB", "free segs"
+        );
+        for round in 1..=6u32 {
+            for _ in 0..20000 {
+                let key = format!("k-{written:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    let _ = cache.get(key.as_bytes());
+                }
+                written += 1;
+            }
+            let (live, _w, _c) = cache.resident_bytes();
+            eprintln!(
+                "  {:>9}{:>12}{:>11}{:>12.2}{:>10}",
+                round * 20000,
+                cache.stats().snapshot().evictions,
+                cache.resident_items(),
+                live as f64 / (1024.0 * 1024.0),
+                cache.ram_free_segment_count()
+            );
+        }
+    }
+
+    /// Where the unreachable items actually live, by segment state.
+    ///
+    /// `resident_items` walks every segment the pool addresses, so anything
+    /// holding live items counts regardless of whether the chain still
+    /// points at it. This says which state the strays are parked in, which
+    /// is the difference between "pending release" and "leaked".
+    #[test]
+    #[ignore = "diagnostic: run explicitly with --ignored"]
+    fn report_stranded_items_by_segment_state() {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(16));
+        let layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(8 * 1024 * 1024)
+            .spare_capacity(4)
+            .config(
+                LayerConfig::new()
+                    .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+            )
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(hashtable)
+            .with_ttl_layer(layer)
+            .eviction_threshold(1)
+            .build();
+
+        let value = vec![0xABu8; 1024];
+        for i in 0..24000u32 {
+            let key = format!("k-{i:08}");
+            if cache
+                .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                .is_ok()
+            {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        let mut found = 0u64;
+        for i in 0..24000u32 {
+            let key = format!("k-{i:08}");
+            if cache.get(key.as_bytes()).is_some() {
+                found += 1;
+            }
+        }
+
+        let layer = cache.layer(0).expect("layer 0");
+        let mut by_state: std::collections::BTreeMap<String, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        for id in 0..layer.total_segment_count() as u32 {
+            if let Some(seg) = layer.get_segment(id) {
+                let items = seg.live_items();
+                if items == 0 {
+                    continue;
+                }
+                let e = by_state
+                    .entry(format!("{:?}", seg.state()))
+                    .or_insert((0, 0));
+                e.0 += 1;
+                e.1 += items;
+            }
+        }
+        eprintln!(
+            "  resident {} / reachable {found} -> {} unreachable",
+            cache.resident_items(),
+            cache.resident_items().saturating_sub(found)
+        );
+        for (state, (segs, items)) in by_state {
+            eprintln!("    {state:<16} {segs:>4} segments, {items:>7} live items");
+        }
+    }
+
+    /// How many resident items are unreachable, across heap sizes.
+    ///
+    /// Single layer with merge eviction and no demotion -- the shape
+    /// `policy = "merge"` actually builds. Reports rather than asserts,
+    /// because the question being answered is whether the shortfall scales
+    /// with the segment count or is an artifact of a cramped fixture.
+    #[test]
+    #[ignore = "diagnostic: run explicitly with --ignored"]
+    fn report_unreachable_resident_items_by_heap_size() {
+        for (heap_mb, power) in [(1usize, 12u8), (4, 14), (8, 16)] {
+            let hashtable = Arc::new(MultiChoiceHashtable::new(power));
+            let layer = TtlLayerBuilder::new()
+                .layer_id(0)
+                .pool_id(0)
+                .segment_size(64 * 1024)
+                .heap_size(heap_mb * 1024 * 1024)
+                .spare_capacity(4)
+                .config(
+                    LayerConfig::new()
+                        .with_eviction_strategy(EvictionStrategy::Merge(MergeConfig::default())),
+                )
+                .build()
+                .expect("ttl layer");
+            let cache = TieredCacheBuilder::new(hashtable)
+                .with_ttl_layer(layer)
+                .eviction_threshold(1)
+                .build();
+
+            let value = vec![0xABu8; 1024];
+            let n = heap_mb as u32 * 3000;
+            for i in 0..n {
+                let key = format!("k-{i:08}");
+                if cache
+                    .set(key.as_bytes(), &value, b"", Duration::from_secs(3600))
+                    .is_ok()
+                {
+                    let _ = cache.get(key.as_bytes());
+                }
+            }
+            let mut found = 0u64;
+            for i in 0..n {
+                let key = format!("k-{i:08}");
+                if cache.get(key.as_bytes()).is_some() {
+                    found += 1;
+                }
+            }
+            let resident = cache.resident_items();
+            let evictions = cache.stats().snapshot().evictions;
+            let segments = heap_mb * 1024 / 64;
+            eprintln!(
+                "  {heap_mb} MiB ({segments} segments, {evictions} evictions): \
+                 {resident} resident, {found} reachable, {} unreachable ({:.1}%)",
+                resident.saturating_sub(found),
+                100.0 * resident.saturating_sub(found) as f64 / resident.max(1) as f64
+            );
+        }
+    }
+
     #[test]
     fn test_frequency() {
         let cache = create_test_cache();
@@ -3019,6 +4271,110 @@ mod tests {
         let layer = cache.layer(0).unwrap();
         // Segment 0 should exist after writing
         let _segment = layer.get_segment(0);
+    }
+
+    #[test]
+    fn resident_items_counts_inserted_small_items_without_overcounting() {
+        let cache = create_ttl_only_cache();
+
+        let num_items = 20;
+        for i in 0..num_items {
+            let key = format!("resident_{i}");
+            cache
+                .set(key.as_bytes(), b"v", b"", Duration::from_secs(3600))
+                .unwrap();
+        }
+
+        let resident = cache.resident_items();
+        assert!(
+            resident > 0,
+            "expected resident_items > 0 after inserting {num_items} items, got {resident}"
+        );
+        assert!(
+            resident <= num_items as u64,
+            "expected resident_items <= {num_items} inserted items, got {resident}"
+        );
+    }
+
+    #[test]
+    fn ram_segment_counts_report_free_and_total_across_ram_layers() {
+        let cache = create_test_cache();
+
+        let total = cache.ram_total_segment_count();
+        let free = cache.ram_free_segment_count();
+
+        assert!(total > 0);
+        assert!(free <= total);
+        assert_eq!(
+            total,
+            cache.layer(0).unwrap().total_segment_count() as u64
+                + cache.layer(1).unwrap().total_segment_count() as u64
+        );
+
+        // Write until layer 0 has a used segment, so free < total proves the
+        // method reads live state rather than a value cached at construction.
+        cache
+            .set(b"k", b"v", b"", Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            cache.ram_free_segment_count() < total,
+            "expected a write to reduce free segments below the total"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file-backed mmap is unsupported under Miri")]
+    fn ram_segment_counts_exclude_disk_layers() {
+        use crate::disk::DiskLayerBuilder;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let fifo_layer = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(256 * 1024) // 4 segments
+            .spare_capacity(0)
+            .build()
+            .expect("fifo layer");
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(512 * 1024) // 8 segments
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+        // Deliberately far larger than the RAM total (12 segments): if the
+        // disk layer leaked into the RAM-only sum, this test would fail by a
+        // large margin rather than an easily-missed small one.
+        let disk_layer = DiskLayerBuilder::new()
+            .layer_id(2)
+            .pool_id(2)
+            .segment_size(64 * 1024)
+            .path(dir.path().join("disk.dat"))
+            .size(64 * 64 * 1024) // 64 segments
+            .build()
+            .expect("disk layer");
+
+        let cache: TieredCache<MultiChoiceHashtable> =
+            TieredCacheBuilder::new(Arc::new(MultiChoiceHashtable::new(10)))
+                .with_fifo_layer(fifo_layer)
+                .with_ttl_layer(ttl_layer)
+                .with_disk_layer(disk_layer)
+                .build();
+
+        let ram_total = cache.ram_total_segment_count();
+        let expected_ram_total = cache.layer(0).unwrap().total_segment_count() as u64
+            + cache.layer(1).unwrap().total_segment_count() as u64;
+        let disk_total = cache.layer(2).unwrap().total_segment_count() as u64;
+
+        assert_eq!(ram_total, expected_ram_total);
+        assert!(
+            ram_total < disk_total,
+            "fixture must make the disk layer's segment count dwarf the RAM \
+             total for this test to be meaningful (ram={ram_total}, disk={disk_total})"
+        );
     }
 
     #[test]

@@ -132,9 +132,7 @@ impl FifoLayer {
 
     /// Get current time as coarse seconds.
     fn now_secs() -> u32 {
-        clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs()
+        crate::clock::now_unix_secs()
     }
 
     /// Remove all hashtable entries for items in a segment, without waiting for
@@ -886,8 +884,20 @@ impl Layer for FifoLayer {
         }
     }
 
-    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, _hashtable: &H) {
+    fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        _hashtable: &H,
+    ) -> bool {
         // FIFO layer doesn't do compaction - just mark deleted
+        self.mark_deleted(location);
+        // The admission queue has no compaction path: it is FIFO-organised, so pairing neighbours would reorder the queue it exists to preserve.
+        false
+    }
+
+    fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        // Same reason: this layer reclaims by evicting whole segments in
+        // order, so there is no partial reclamation to do here.
         self.mark_deleted(location);
     }
 }

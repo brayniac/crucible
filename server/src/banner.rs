@@ -59,6 +59,7 @@ pub fn print_banner(config: &BannerConfig) {
         EvictionPolicy::S3Fifo => "s3fifo",
         EvictionPolicy::Fifo => "fifo",
         EvictionPolicy::Random => "random",
+        EvictionPolicy::RandomFifo => "randomfifo",
         EvictionPolicy::Cte => "cte",
         EvictionPolicy::Merge => "merge",
         EvictionPolicy::Lfu => "lfu",

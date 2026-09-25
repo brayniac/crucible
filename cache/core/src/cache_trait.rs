@@ -730,12 +730,79 @@ pub struct CacheInternalStats {
     pub evictions: u64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: u64,
+    /// Segments reclaimed by expiry rather than eviction.
+    ///
+    /// Read beside [`evictions`](Self::evictions): reclaiming space by
+    /// expiry costs nothing and destroys nothing live, so an engine doing
+    /// more of it needs fewer eviction passes to hold the same working set.
+    /// Zero here with a TTL-bearing workload means proactive expiration is
+    /// not running at all, which is not visible from any other figure.
+    pub expirations: u64,
+
+    /// Compaction passes that actually ran.
+    ///
+    /// Zero here with compaction configured means it never found an
+    /// eligible pair, which is a different problem from compaction running
+    /// and not helping. Read it beside
+    /// [`occupancy_deciles`](Self::occupancy_deciles).
+    pub compactions: u64,
     /// How long eviction passes took.
     ///
     /// Merge eviction runs inline in the write path, so each sample is a stall
     /// some `set` absorbed (crucible#152). `evictions` says how many passes
     /// ran; this says what they cost.
     pub eviction_latency: crate::latency::LatencySnapshot,
+    /// Approximate count of items currently resident in the cache.
+    ///
+    /// This is a gauge (gauged at read time), not a counter, and is read
+    /// without pinning against concurrent writers, so it can be off by
+    /// roughly a segment's worth of items. It exists to separate eviction
+    /// algorithm effects from item-header-size effects when comparing
+    /// engines at a fixed memory budget: two engines can differ in hit ratio
+    /// either because one has a better eviction policy, or merely because a
+    /// smaller per-item header let it fit more items in the same bytes. This
+    /// field is what lets that question be asked instead of assumed.
+    pub resident_items: u64,
+    /// Free RAM segments at the time of the snapshot (disk tiers excluded).
+    ///
+    /// Exists to answer "did the cache fill up?" directly, rather than by
+    /// proxy through eviction-pass counts, which are not comparable across
+    /// engines or policies (a pass reclaims a variable number of segments --
+    /// crucible#158). Paired with [`total_segments`](Self::total_segments),
+    /// this distinguishes a cache that filled and exercised its eviction
+    /// policy from one that never reached capacity and so mostly measured
+    /// allocation instead.
+    pub free_segments: u64,
+    /// Total RAM segments at the time of the snapshot (disk tiers excluded).
+    ///
+    /// See [`free_segments`](Self::free_segments).
+    pub total_segments: u64,
+    /// Bytes held by live items across RAM layers.
+    ///
+    /// With [`written_bytes`](Self::written_bytes) and
+    /// [`capacity_bytes`](Self::capacity_bytes), this separates the two
+    /// reasons an engine holds fewer items in the same heap. Dividing heap
+    /// size by [`resident_items`](Self::resident_items) cannot: a low figure
+    /// there could mean segments are packed loosely, or full of superseded
+    /// items nothing reclaimed, or that the policy retained fewer items on
+    /// purpose. Those have different fixes.
+    pub live_bytes: u64,
+    /// Bytes appended into RAM segments, live or superseded.
+    ///
+    /// `written / capacity` is how full the segments are;
+    /// `live / written` is how much of that is still worth keeping.
+    pub written_bytes: u64,
+    /// Total addressable bytes in RAM segments.
+    pub capacity_bytes: u64,
+    /// Non-free RAM segments counted into ten live-occupancy deciles, when
+    /// the engine can report them.
+    ///
+    /// `live_bytes / capacity_bytes` is a mean, and compaction is not a
+    /// decision about the mean: it pairs adjacent segments, so what decides
+    /// whether it can fire is how the segments are spread. `None` means the
+    /// engine does not expose per-segment occupancy, which is distinct from
+    /// a histogram that is genuinely all zeroes.
+    pub occupancy_deciles: Option<[u64; 10]>,
 }
 
 /// Result of a cache lookup that may require async I/O.

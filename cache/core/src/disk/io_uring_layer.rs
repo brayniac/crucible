@@ -1048,8 +1048,21 @@ impl Layer for IoUringDiskLayer {
     fn finalize_write_item(&self, _location: ItemLocation, _item_size: u32) {}
     fn cancel_write_item(&self, _location: ItemLocation) {}
 
-    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, _hashtable: &H) {
+    fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        _hashtable: &H,
+    ) -> bool {
         // Disk layer doesn't compact
+        self.mark_deleted(location);
+        // A disk layer reclaims by rewriting whole segments, not by pairing them.
+        false
+    }
+
+    fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        // Nor does it reclaim a file region early: space here is recovered
+        // when the whole region is rewritten, so there is nothing an
+        // overwrite can free on its own.
         self.mark_deleted(location);
     }
 }
@@ -1135,7 +1148,7 @@ impl IoUringDiskLayerBuilder {
         );
 
         let num_buckets = crate::organization::MAX_TTL_BUCKETS;
-        let buckets = TtlBuckets::new();
+        let buckets = TtlBuckets::with_seed(self.config.eviction_seed);
 
         let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 

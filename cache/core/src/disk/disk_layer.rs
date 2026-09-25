@@ -595,8 +595,21 @@ impl Layer for DiskLayer {
         }
     }
 
-    fn mark_deleted_and_compact<H: Hashtable>(&self, location: ItemLocation, _hashtable: &H) {
+    fn mark_deleted_and_compact<H: Hashtable>(
+        &self,
+        location: ItemLocation,
+        _hashtable: &H,
+    ) -> bool {
         // Disk layer doesn't do compaction - just mark deleted
+        self.mark_deleted(location);
+        // A disk layer reclaims by rewriting whole segments, not by pairing them.
+        false
+    }
+
+    fn mark_deleted_and_free_empty(&self, location: ItemLocation) {
+        // Nor does it reclaim a file region early: space here is recovered
+        // when the whole region is rewritten, so there is nothing an
+        // overwrite can free on its own.
         self.mark_deleted(location);
     }
 }
@@ -712,11 +725,13 @@ impl DiskLayerBuilder {
             .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
             .collect();
 
+        let buckets = TtlBuckets::with_seed(self.config.eviction_seed);
+
         Ok(DiskLayer {
             layer_id: self.layer_id,
             config: self.config,
             pool,
-            buckets: TtlBuckets::new(),
+            buckets,
             current_write_segments,
         })
     }

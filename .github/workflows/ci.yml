@@ -30,6 +30,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The run above only ever sees cache-rs alongside every other
+      # feature. These cover the two configurations people actually
+      # build: the default one, and the feature on its own. A symbol
+      # used solely by feature-gated code goes dead in the default
+      # binary, which --all-features can never reveal.
+      - run: cargo clippy -p cache-bench --all-targets -- -D warnings
+      - run: cargo clippy -p cache-bench --features cache-rs --all-targets -- -D warnings
 
   doc:
     name: Doc
@@ -205,9 +212,23 @@ jobs:
             --test io_uring_disk_tier_tests
 
   miri:
-    name: Test (miri)
+    name: Test (miri, ${{ matrix.shard.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Sharded because one job no longer fits: about 77 minutes serially,
+    # of which `cache::tests` is ~48 and the rest ~31. The two filters are
+    # exact complements -- the same substring selected in one shard and
+    # skipped in the other -- so every test runs exactly once whatever it
+    # is named; a name that happens to contain `cache::tests::` elsewhere
+    # only moves it between shards. Rebalance if either approaches the
+    # timeout, which has headroom over the larger shard, not slack for
+    # doubling it.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { name: cache, filter: "cache::tests::" }
+          - { name: rest, filter: "--skip cache::tests::" }
     # Miri under Stacked Borrows, over nearly all of cache-core.
     #
     # This checks two things TSan structurally cannot. First, the ALIASING
@@ -264,6 +285,7 @@ jobs:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
           cargo +nightly miri test -p cache-core --lib -- \
+            ${{ matrix.shard.filter }} \
             --skip disk::file_pool \
             --skip disk::disk_layer \
             --skip disk::io_uring \

@@ -48,6 +48,15 @@ pub struct CacheConfig {
     /// floor that any policy difference has to clear.
     #[serde(default)]
     pub hashtable_seed: Option<[u64; 4]>,
+    /// Pin the eviction PRNG seed for the segment backend.
+    ///
+    /// Which bucket `randomfifo` picks, and which segment `random` picks.
+    /// Unset, the layers use a fixed built-in default, so a run is
+    /// reproducible either way -- this is the knob for sweeping seeds, which
+    /// is how a policy difference is told apart from the luck of one random
+    /// sequence.
+    #[serde(default)]
+    pub eviction_seed: Option<u64>,
     /// How the S3-FIFO main cache (layer 1) reclaims segments.
     ///
     /// Only meaningful for `backend = "segment"` with `policy = "s3fifo"`.
@@ -61,6 +70,41 @@ pub struct CacheConfig {
     /// `MergeConfig::default()`, which is 4.
     #[serde(default)]
     pub main_merge_segments: Option<usize>,
+    /// Retention cap for merge, as a fraction of the chain's live bytes.
+    ///
+    /// Since #154 the spare's free space bounds a pass structurally, so this
+    /// is a policy cap layered on top: `budget = min(spare, live * ratio)`.
+    /// At 1.0 a pass keeps everything that fits, which is compaction; below
+    /// that it discards live items there was room for. Unset leaves
+    /// `MergeConfig::default()`, currently 0.5 -- see the reasoning on that
+    /// default, which is a latency choice rather than a correctness one.
+    #[serde(default)]
+    pub main_target_ratio: Option<f64>,
+    /// How strongly an item's size counts against it when merge ranks items
+    /// for retention: `frequency * (mean_size / size)^e`.
+    ///
+    /// Two assumptions about what a miss costs, not a tuning range. `1.0`
+    /// is cost-per-request, which is what Segcache specifies (NSDI '21
+    /// 3.6.3, frequency-over-size, after greedy dual size frequency); it
+    /// keeps small items and minimises the request miss ratio. `0.0` is
+    /// cost-proportional-to-size, which cancels to raw frequency; it keeps
+    /// large hot items and minimises something closer to the byte miss
+    /// ratio. Unset leaves `MergeConfig::default()`, which is 1.0.
+    ///
+    /// Read `MISS RATIO` and `BYTE MISS` together across a sweep of this:
+    /// raising it improves one at the other's expense, so a comparison on
+    /// the request ratio alone will always flatter `1.0`.
+    #[serde(default)]
+    pub main_cost_exponent: Option<f64>,
+    /// What an overwrite does with the superseded copy's bytes.
+    ///
+    /// `set`, `replace`, `cas` and a committed streaming set all supersede
+    /// an existing item; all four leave its bytes for the next merge, while
+    /// `delete` reclaims eagerly. On an 80%-SET trace that asymmetry showed
+    /// as 1673 bytes per resident item against a comparable engine's 909,
+    /// widening with heap size. Unset leaves the historical behaviour.
+    #[serde(default)]
+    pub overwrite_reclaim: Option<OverwriteReclaimConfig>,
     /// Optional disk tier configuration.
     #[serde(default)]
     pub disk: Option<DiskConfig>,
@@ -111,6 +155,14 @@ pub struct TraceConfig {
         deserialize_with = "deserialize_size"
     )]
     pub max_value_bytes: usize,
+    /// Report which value sizes survived, by probing every key written.
+    ///
+    /// Off by default: it holds a key-to-size map for the whole run and
+    /// probes once per distinct key afterwards. Answers whether two engines
+    /// holding different item counts are keeping different size
+    /// distributions, which a total count cannot show.
+    #[serde(default)]
+    pub retained_sizes: bool,
 }
 
 /// On-disk trace layout.
@@ -179,12 +231,15 @@ pub struct ValuesConfig {
 }
 
 /// Cache backend type.
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheBackend {
     Segment,
     Slab,
     Heap,
+    /// pelikan-io/cache-rs, for engine-vs-engine ranking.
+    #[serde(rename = "cachers")]
+    CacheRs,
 }
 
 impl std::fmt::Display for CacheBackend {
@@ -193,6 +248,32 @@ impl std::fmt::Display for CacheBackend {
             CacheBackend::Segment => write!(f, "segment"),
             CacheBackend::Slab => write!(f, "slab"),
             CacheBackend::Heap => write!(f, "heap"),
+            CacheBackend::CacheRs => write!(f, "cachers"),
+        }
+    }
+}
+
+/// What an overwrite does with the superseded copy's bytes.
+///
+/// `delete` has always reclaimed eagerly; the four overwrite paths never
+/// did. See the field on `CacheConfig` for what that costs.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverwriteReclaimConfig {
+    /// Leave the superseded bytes for the next merge pass.
+    Deferred,
+    /// Free the segment if the overwrite emptied it.
+    FreeEmpty,
+    /// Also attempt compaction with the predecessor, as `delete` does.
+    Compact,
+}
+
+impl From<OverwriteReclaimConfig> for cache_core::OverwriteReclaim {
+    fn from(value: OverwriteReclaimConfig) -> Self {
+        match value {
+            OverwriteReclaimConfig::Deferred => cache_core::OverwriteReclaim::Deferred,
+            OverwriteReclaimConfig::FreeEmpty => cache_core::OverwriteReclaim::FreeEmpty,
+            OverwriteReclaimConfig::Compact => cache_core::OverwriteReclaim::Compact,
         }
     }
 }
@@ -237,6 +318,7 @@ pub enum EvictionPolicy {
     S3Fifo,
     Fifo,
     Random,
+    RandomFifo,
     Cte,
     Merge,
     Lra,
@@ -289,6 +371,7 @@ impl std::fmt::Display for EvictionPolicy {
             EvictionPolicy::S3Fifo => write!(f, "s3fifo"),
             EvictionPolicy::Fifo => write!(f, "fifo"),
             EvictionPolicy::Random => write!(f, "random"),
+            EvictionPolicy::RandomFifo => write!(f, "randomfifo"),
             EvictionPolicy::Cte => write!(f, "cte"),
             EvictionPolicy::Merge => write!(f, "merge"),
             EvictionPolicy::Lra => write!(f, "lra"),
@@ -334,6 +417,26 @@ impl Config {
                             one segment by definition"
                     .into());
             }
+        }
+        if let Some(r) = config.cache.main_target_ratio
+            && !(r > 0.0 && r <= 1.0)
+        {
+            // Zero would retain nothing and make every merge pass a
+            // whole-segment eviction wearing merge's name; above one is not
+            // a fraction of anything. `MergeConfig` clamps silently, which
+            // is the wrong behaviour for a measurement rig.
+            return Err(format!("main_target_ratio must be in (0.0, 1.0], got {r}").into());
+        }
+        if let Some(e) = config.cache.main_cost_exponent
+            && !(0.0..=1.0).contains(&e)
+        {
+            // Outside the range the ranking either inverts -- a negative
+            // exponent prefers large cold items over small hot ones -- or
+            // amplifies size past what any cost model motivates.
+            // `MergeConfig` clamps silently, which is the wrong behaviour
+            // for a measurement rig: a sweep would report several points
+            // that all secretly ran at 1.0.
+            return Err(format!("main_cost_exponent must be in [0.0, 1.0], got {e}").into());
         }
         Ok(())
     }
@@ -472,6 +575,43 @@ warmup_records = 1000
     }
 
     #[test]
+    fn an_overwrite_reclaim_policy_parses() {
+        for (text, expected) in [
+            ("deferred", OverwriteReclaimConfig::Deferred),
+            ("free-empty", OverwriteReclaimConfig::FreeEmpty),
+            ("compact", OverwriteReclaimConfig::Compact),
+        ] {
+            let toml = TRACE_TOML.replace(
+                "hashtable_power = 20",
+                &format!("hashtable_power = 20\noverwrite_reclaim = \"{text}\""),
+            );
+            let cfg =
+                Config::from_toml(&toml).unwrap_or_else(|e| panic!("{text} should parse: {e}"));
+            assert_eq!(cfg.cache.overwrite_reclaim, Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_overwrite_reclaim_policy_is_rejected() {
+        // A typo must not fall back to the historical behaviour while the
+        // run reports itself as having used the policy that was asked for.
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\noverwrite_reclaim = \"eager\"",
+        );
+        assert!(
+            Config::from_toml(&toml).is_err(),
+            "an unknown reclaim policy should be rejected, not defaulted"
+        );
+    }
+
+    #[test]
+    fn overwrite_reclaim_defaults_to_the_historical_behaviour() {
+        let cfg = Config::from_toml(TRACE_TOML).expect("parse");
+        assert_eq!(cfg.cache.overwrite_reclaim, None);
+    }
+
+    #[test]
     fn a_merge_chain_length_is_rejected_for_the_clock_policy() {
         let toml = TRACE_TOML.replace(
             "hashtable_power = 20",
@@ -511,6 +651,41 @@ warmup_records = 1000
         assert_eq!(config.cache.hashtable_seed, Some([1, 2, 3, 4]));
     }
 
+    /// A seed that parsed but never reached the cache would make a sweep
+    /// over seeds report a spread of zero.
+    #[test]
+    fn an_eviction_seed_is_read_from_the_config() {
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\neviction_seed = 12345",
+        );
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(config.cache.eviction_seed, Some(12345));
+    }
+
+    /// Unset means "use the built-in fixed default", not "seed from the OS".
+    #[test]
+    fn an_absent_eviction_seed_stays_absent() {
+        let config = Config::from_toml(TRACE_TOML).expect("parse");
+        assert_eq!(config.cache.eviction_seed, None);
+    }
+
+    /// `randomfifo` is the honest name for what `fifo`, `random` and `cte`
+    /// all used to do (#156), so the config surface has to accept it.
+    #[test]
+    fn randomfifo_is_a_policy_the_config_accepts() {
+        let toml = TRACE_TOML.replace("policy = \"s3fifo\"", "policy = \"randomfifo\"");
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert!(config.cache.policy == EvictionPolicy::RandomFifo);
+        assert_eq!(config.cache.policy.to_string(), "randomfifo");
+    }
+
     #[test]
     fn a_synthetic_config_still_rejects_a_command_mix_that_does_not_sum_to_a_hundred() {
         let toml = TRACE_TOML.replace(
@@ -531,5 +706,51 @@ warmup_records = 1000
         assert!(!TraceFormatConfig::Twitter.insert_on_miss());
         assert!(TraceFormatConfig::OracleGeneral.insert_on_miss());
         assert!(TraceFormatConfig::OracleGeneralCsv.insert_on_miss());
+    }
+
+    #[test]
+    fn a_cache_rs_backend_parses() {
+        let toml = TRACE_TOML.replace("backend = \"segment\"", "backend = \"cachers\"");
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(config.cache.backend, CacheBackend::CacheRs);
+    }
+
+    #[test]
+    fn a_merge_retention_ratio_parses() {
+        let toml = TRACE_TOML.replace(
+            "hashtable_power = 20",
+            "hashtable_power = 20\nmain_target_ratio = 1.0",
+        );
+        let config = match Config::from_toml(&toml) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(config.cache.main_target_ratio, Some(1.0));
+    }
+
+    #[test]
+    fn a_retention_ratio_outside_the_unit_interval_is_rejected() {
+        // `MergeConfig::with_target_ratio` clamps silently. For a
+        // measurement rig that is the wrong behaviour: an arm asking for 1.5
+        // would quietly run at 1.0 and be reported under the label it asked
+        // for, so the sweep would contain two identical points wearing
+        // different names.
+        for bad in ["0.0", "1.5", "-0.2"] {
+            let toml = TRACE_TOML.replace(
+                "hashtable_power = 20",
+                &format!("hashtable_power = 20\nmain_target_ratio = {bad}"),
+            );
+            let err = match Config::from_toml(&toml) {
+                Ok(_) => panic!("main_target_ratio = {bad} was accepted"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("main_target_ratio"),
+                "the rejection must name the knob: {err}"
+            );
+        }
     }
 }

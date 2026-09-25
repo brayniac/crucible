@@ -8,6 +8,12 @@
 //! kept because its next-access field is what yields a Belady reference curve,
 //! not because it can compare eviction policies.
 //!
+//! The Twitter layout is the one released with the cluster traces at
+//! <https://github.com/twitter/cache-trace>, whose own documentation
+//! specifies the 20-byte record. Note the public release identifies clusters
+//! by number; any internal service naming is not part of that dataset and is
+//! deliberately absent here.
+//!
 //! See `docs/superpowers/specs/2026-09-18-s3fifo-main-pool-experiment-design.md`.
 
 /// Which on-disk layout a trace file carries.
@@ -42,6 +48,8 @@ pub enum Op {
     Append = 7,
     Prepend = 8,
     Delete = 9,
+    Incr = 10,
+    Decr = 11,
 }
 
 impl Op {
@@ -50,6 +58,14 @@ impl Op {
     /// Returns the offending byte rather than defaulting to `Get`: a trace
     /// whose op codes we cannot read is a trace we are misinterpreting, and a
     /// silent default would turn that into a plausible-looking hit ratio.
+    ///
+    /// The format defines eleven operations. Codes 1-9 are cross-checked
+    /// against twitter/rpc-perf's replay decoder, which maps 6 to `Replace`
+    /// and so fixes the numbering that the dataset's prose listing leaves
+    /// ambiguous; 10 and 11 are `incr` and `decr`. Note rpc-perf *skips*
+    /// codes it does not implement, which is why its own table is shorter
+    /// than this one -- a shorter table there is not evidence of a shorter
+    /// format.
     pub fn from_u8(v: u8) -> Result<Self, u8> {
         match v {
             1 => Ok(Op::Get),
@@ -61,6 +77,8 @@ impl Op {
             7 => Ok(Op::Append),
             8 => Ok(Op::Prepend),
             9 => Ok(Op::Delete),
+            10 => Ok(Op::Incr),
+            11 => Ok(Op::Decr),
             other => Err(other),
         }
     }
@@ -79,6 +97,14 @@ pub struct TraceRecord {
     pub op: Op,
     /// TTL in seconds; 0 means no expiry.
     pub ttl_secs: u32,
+    /// Record timestamp in the trace's own seconds, or `None` for a format
+    /// that carries none.
+    ///
+    /// Carried so a replay can drive the cache's clock from the trace rather
+    /// than the wall clock. Without it a run consumes hours of recorded time
+    /// in seconds and no TTL shorter than the run ever fires, which measures
+    /// expiry -- and every policy that depends on it -- as absent.
+    pub timestamp_secs: Option<u32>,
 }
 
 impl TraceRecord {
@@ -98,6 +124,7 @@ impl TraceRecord {
             value_len: kv_packed & 0x003F_FFFF,
             op: Op::from_u8((op_ttl_packed >> 24) as u8)?,
             ttl_secs: op_ttl_packed & 0x00FF_FFFF,
+            timestamp_secs: Some(u32::from_le_bytes(data[0..4].try_into().expect("4 bytes"))),
         })
     }
 
@@ -114,6 +141,10 @@ impl TraceRecord {
             value_len: u32::from_le_bytes(data[12..16].try_into().expect("4 bytes")),
             op: Op::Get,
             ttl_secs: 0,
+            // This layout's leading field is a virtual time rather than a
+            // seconds count, and every record here carries ttl_secs 0, so
+            // there is nothing for a clock to decide.
+            timestamp_secs: None,
         }
     }
 }
@@ -277,6 +308,8 @@ fn parse_oracle_general_csv_line(line: &str) -> Option<TraceRecord> {
         value_len,
         op: Op::Get,
         ttl_secs: 0,
+        // Virtual time again, and no TTLs; see `from_oracle_general_bytes`.
+        timestamp_secs: None,
     })
 }
 
@@ -295,6 +328,25 @@ mod tests {
         let op_ttl_packed = ((op as u32) << 24) | (ttl & 0x00FF_FFFF);
         out[16..20].copy_from_slice(&op_ttl_packed.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn incr_and_decr_are_decoded_rather_than_rejected() {
+        // The format defines eleven operations; op 10 and 11 are incr and
+        // decr, confirmed against twitter/rpc-perf's replay decoder and the
+        // dataset's own documentation. Rejecting them failed the whole run
+        // on any trace that used a counter, which is two of the corpus.
+        assert_eq!(Op::from_u8(10), Ok(Op::Incr));
+        assert_eq!(Op::from_u8(11), Ok(Op::Decr));
+    }
+
+    #[test]
+    fn an_undefined_op_code_is_still_rejected() {
+        // The point of decoding strictly is unchanged: a code the format does
+        // not define means we are misreading the trace, and a silent default
+        // would turn that into a plausible-looking hit ratio.
+        assert_eq!(Op::from_u8(12), Err(12));
+        assert_eq!(Op::from_u8(0), Err(0));
     }
 
     #[test]
