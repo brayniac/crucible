@@ -85,7 +85,7 @@ impl ReplayStats {
     /// window with nothing in the denominator has no ratio, and rendering
     /// that as a perfect hit rate is how an empty window reads as a good
     /// result. Note that GETs for zero-length values count in
-    /// [`miss_ratio`] but contribute nothing here, so the two denominators
+    /// [`Self::miss_ratio`] but contribute nothing here, so the two denominators
     /// are deliberately not the same population.
     pub fn byte_miss_ratio(&self) -> Option<f64> {
         if self.get_bytes == 0 {

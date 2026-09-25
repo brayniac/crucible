@@ -651,7 +651,7 @@ impl<H: Hashtable> TieredCache<H> {
     /// The cache-wide `live / capacity` ratio cannot answer whether
     /// compaction is reachable, because compaction is a decision about
     /// *pairs* of adjacent segments, not about the mean.
-    /// [`TtlLayer::try_compact_segment`] merges two sealed segments into one
+    /// `TtlLayer::try_compact_segment` merges two sealed segments into one
     /// spare only when their combined live bytes fit in 90% of a single
     /// segment -- an average occupancy of 45% across the pair. A cache
     /// sitting at 76% live overall can still hold a compactable tail, or
@@ -1777,10 +1777,9 @@ impl<H: Hashtable> TieredCache<H> {
         let item_loc = ItemLocation::from_location(location);
         if let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id())
             && let Some(layer) = self.layers.get(layer_idx)
+            && layer.mark_deleted_and_compact(item_loc, self.hashtable.as_ref())
         {
-            if layer.mark_deleted_and_compact(item_loc, self.hashtable.as_ref()) {
-                self.stats.compactions.fetch_add(1, Ordering::Relaxed);
-            }
+            self.stats.compactions.fetch_add(1, Ordering::Relaxed);
         }
     }
 

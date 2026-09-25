@@ -633,6 +633,11 @@ impl SegCacheBuilder {
         self
     }
 
+    /// Build the cache, allocating the hashtable and the segment pool.
+    ///
+    /// Fails if the pool cannot reserve its heap -- most often because the
+    /// requested heap does not divide into at least two segments, or because
+    /// hugepages were asked for and are unavailable.
     pub fn build(self) -> Result<SegCache, std::io::Error> {
         // Create hashtable
         let hashtable = Arc::new(match self.hashtable_seed {

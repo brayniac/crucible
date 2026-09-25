@@ -717,14 +717,6 @@ fn apply_reproducibility_seeds(
     builder
 }
 
-/// The merge knobs from config, applied over a base.
-///
-/// One function rather than two call sites, because there were two: the
-/// s3fifo main layer read these and the single-layer merge arm did not, so
-/// a sweep over chain length silently measured the compiled default on
-/// every point. Duplicated plumbing is how that happens, and adding a third
-/// knob to two places is how it happens again.
-
 /// Print the retention rate per size and frequency band, for whichever
 /// engine ran.
 ///
@@ -849,6 +841,13 @@ fn print_retention_trace() {
     }
 }
 
+/// The merge knobs from config, applied over a base.
+///
+/// One function rather than two call sites, because there were two: the
+/// s3fifo main layer read these and the single-layer merge arm did not, so
+/// a sweep over chain length silently measured the compiled default on
+/// every point. Duplicated plumbing is how that happens, and adding a third
+/// knob to two places is how it happens again.
 fn merge_config_from(
     cache: &config::CacheConfig,
     base: cache_core::MergeConfig,

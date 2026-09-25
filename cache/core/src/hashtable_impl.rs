@@ -16,12 +16,6 @@ use ahash::RandomState;
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
 
-/// Lock-free hashtable for caches.
-///
-/// Each entry stores:
-/// - 12-bit tag (hash suffix for fast filtering)
-/// - 8-bit frequency counter (ASFC algorithm)
-/// - 44-bit location (opaque, meaning defined by storage backend)
 /// Step for the frequency generator: the golden-ratio odd constant, as
 /// `TtlBuckets` uses for eviction.
 const FREQ_RNG_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -36,6 +30,12 @@ const FREQ_RNG_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 /// was seeded.
 pub const DEFAULT_FREQ_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 
+/// Lock-free hashtable for caches.
+///
+/// Each entry stores:
+/// - 12-bit tag (hash suffix for fast filtering)
+/// - 8-bit frequency counter (ASFC algorithm)
+/// - 44-bit location (opaque, meaning defined by storage backend)
 pub struct MultiChoiceHashtable {
     hash_builder: Box<RandomState>,
     buckets: Box<[Hashbucket]>,
@@ -124,7 +124,7 @@ impl MultiChoiceHashtable {
 
     /// Seed the frequency generator.
     ///
-    /// Defaults to [`DEFAULT_FREQ_SEED`]. Set it to draw a different but
+    /// Defaults to `DEFAULT_FREQ_SEED`. Set it to draw a different but
     /// still reproducible stream -- several seeds sample the distribution
     /// where one seed only pins a single arbitrary point of it.
     pub fn set_freq_seed(&self, seed: u64) {

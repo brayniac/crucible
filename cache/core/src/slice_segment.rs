@@ -229,7 +229,7 @@ impl<'a> SliceSegment<'a> {
     }
 
     /// When this segment entered service, as a monotonically increasing
-    /// ticket. Lower is older; compare with [`is_older`], not `<`.
+    /// ticket. Lower is older; compare with `is_older`, not `<`.
     ///
     /// This is a proxy for cache-rs's "the later of its creation and
     /// last-merge timestamps", and a deliberately better one than a clock
