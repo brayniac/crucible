@@ -68,7 +68,6 @@ mod config;
 mod error;
 mod location;
 mod location_layout;
-pub mod retention_trace;
 pub mod sync;
 
 // Segment-specific location interpretation
