@@ -3462,6 +3462,49 @@ mod tests {
         }
     }
 
+    /// A TTL is a ceiling: an item may expire early, never be served late.
+    ///
+    /// A TTL layer judges expiry per segment, so a segment's deadline is
+    /// what every item in it gets. A bucket covers a range of TTLs and
+    /// stamps its segments with one of them; if that is above the range's
+    /// minimum, an item whose TTL sits at the bottom of its bucket is served
+    /// past it. The first item into a fresh segment is written in the
+    /// second the segment is stamped, so it exposes any excess exactly.
+    #[test]
+    fn a_ttl_bucket_never_rounds_a_ttl_up() {
+        let _clock = crate::clock::TestClock::start();
+        const T0: u32 = 1_000_000;
+        // Exact multiples of each tier's width: the bottom of their bucket.
+        for ttl in [8u32, 64, 128, 2048, 32768] {
+            crate::clock::set_virtual_now(T0);
+            let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+            let ttl_layer = TtlLayerBuilder::new()
+                .layer_id(0)
+                .pool_id(0)
+                .segment_size(64 * 1024)
+                .heap_size(1024 * 1024)
+                .build()
+                .expect("ttl layer");
+            let cache = TieredCacheBuilder::new(hashtable)
+                .with_ttl_layer(ttl_layer)
+                .build();
+
+            cache
+                .set(b"exact", b"v", b"", Duration::from_secs(ttl.into()))
+                .expect("set");
+            crate::clock::set_virtual_now(T0 + ttl - 1);
+            assert!(
+                cache.get(b"exact").is_some(),
+                "a {ttl}s item expired before its TTL, so this is not testing the ceiling"
+            );
+            crate::clock::set_virtual_now(T0 + ttl);
+            assert!(
+                cache.get(b"exact").is_none(),
+                "an item with a {ttl}s TTL was served {ttl}s after it was written"
+            );
+        }
+    }
+
     /// Memory pressure must try expiry before it evicts.
     ///
     /// Reclaiming an expired segment costs nothing and destroys nothing

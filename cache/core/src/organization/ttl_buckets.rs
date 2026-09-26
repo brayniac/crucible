@@ -129,7 +129,13 @@ impl TtlBuckets {
 
         for (i, interval) in intervals.iter().enumerate() {
             for j in 0..N_BUCKET_PER_STEP {
-                let ttl_secs = (interval * j + 1) as u64;
+                // The bottom of the range this bucket holds, which is the
+                // shortest TTL any of its items carries: a TTL layer judges
+                // expiry per segment, so stamping a segment with anything
+                // longer serves those items past their TTL. Bucket 0 holds
+                // 0..interval, and 1 keeps its segments' deadline in the
+                // future rather than at the moment they are created.
+                let ttl_secs = (interval * j).max(1) as u64;
                 let ttl = Duration::from_secs(ttl_secs);
                 let index = (i * N_BUCKET_PER_STEP + j) as u16;
                 let bucket = TtlBucket::new(ttl, index);
