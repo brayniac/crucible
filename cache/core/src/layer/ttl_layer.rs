@@ -1620,15 +1620,6 @@ impl TtlLayer {
                 false
             };
 
-            // Recorded here, at the decision, rather than inferred from what
-            // survives the run. An item can be absent at the end because a
-            // merge dropped it, because a later overwrite superseded it, or
-            // because its segment expired -- and a survival count cannot
-            // tell those apart. `item.freq` is the rank the threshold was
-            // compared against, which at `cost_exponent > 0` is not the raw
-            // frequency; that is deliberate, since the rank is what decided.
-            crate::retention_trace::record(span.stride, item.freq, retain);
-
             if retain {
                 let optional = segment
                     .data_slice(span.optional_start, span.optional_len)

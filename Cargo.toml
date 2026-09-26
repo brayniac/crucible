@@ -89,13 +89,4 @@ codegen-units = 1
 panic = "abort"
 debug = true
 
-# The comparison is crucible main against cache-rs upstream. crates.io is at
-# 0.4.4; upstream main carries work that is not released yet.
-#
-# Pinned to an exact rev rather than `branch = "main"`: a branch ref drifts if
-# anyone pushes mid-sweep, and a result that cannot name the code it measured
-# is not reproducible. Bump this deliberately, and re-run rather than mixing
-# arms across revs.
-[patch.crates-io]
-segcache = { git = "https://github.com/pelikan-io/cache-rs", rev = "2af1aff1020ba94cb3e58a2722e41b1403e390d1" }
 

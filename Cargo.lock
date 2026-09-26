@@ -910,7 +910,7 @@ checksum = "02477b4e4b5454c404fa7ef505c85cacb89fee3987793f9a3a2bd9ab556c4e3b"
 [[package]]
 name = "keyvalue"
 version = "0.4.0"
-source = "git+https://github.com/brayniac/cache-rs?rev=445592930f3e503e7d693c9545e8026923f3a5bb#445592930f3e503e7d693c9545e8026923f3a5bb"
+source = "git+https://github.com/pelikan-io/cache-rs?rev=53d2e9a0fae421a67c3522088dc8dfd1ad05d1ba#53d2e9a0fae421a67c3522088dc8dfd1ad05d1ba"
 
 [[package]]
 name = "lazy_static"
@@ -1717,7 +1717,7 @@ dependencies = [
 [[package]]
 name = "segcache"
 version = "0.4.5"
-source = "git+https://github.com/brayniac/cache-rs?rev=445592930f3e503e7d693c9545e8026923f3a5bb#445592930f3e503e7d693c9545e8026923f3a5bb"
+source = "git+https://github.com/pelikan-io/cache-rs?rev=53d2e9a0fae421a67c3522088dc8dfd1ad05d1ba#53d2e9a0fae421a67c3522088dc8dfd1ad05d1ba"
 dependencies = [
  "ahash",
  "clocksource 0.8.3",
@@ -2786,8 +2786,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "segcache"
-version = "0.4.5"
-source = "git+https://github.com/pelikan-io/cache-rs?rev=2af1aff1020ba94cb3e58a2722e41b1403e390d1#2af1aff1020ba94cb3e58a2722e41b1403e390d1"
