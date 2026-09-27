@@ -105,6 +105,23 @@ pub struct CacheConfig {
     /// widening with heap size. Unset leaves the historical behaviour.
     #[serde(default)]
     pub overwrite_reclaim: Option<OverwriteReclaimConfig>,
+    /// Share of the heap given to S3-FIFO's admission queue, in percent.
+    ///
+    /// Both engines use 10 when unset. Only meaningful for `policy =
+    /// "s3fifo"`. Accepted 1-50: crucible clamps to that range silently,
+    /// which is the wrong behaviour for a sweep -- a point asking for 60
+    /// would run at 50 and be reported as 60.
+    #[serde(default)]
+    pub s3fifo_admission_percent: Option<u8>,
+    /// Accesses beyond the first an item needs while in S3-FIFO's admission
+    /// queue to be promoted rather than discarded.
+    ///
+    /// crucible's `demotion_threshold`; unset is 1. At 0 every item is
+    /// promoted and the queue stops filtering, which isolates how much of
+    /// s3fifo's behaviour is the filter. cache-rs has no counterpart, so it
+    /// is refused for that backend rather than ignored.
+    #[serde(default)]
+    pub s3fifo_promotion_threshold: Option<u8>,
     /// Optional disk tier configuration.
     #[serde(default)]
     pub disk: Option<DiskConfig>,
@@ -399,6 +416,7 @@ impl Config {
             Self::validate_command_mix(&config)?;
         }
         Self::validate_main_cache(&config)?;
+        Self::validate_s3fifo(&config)?;
         Ok(config)
     }
 
@@ -437,6 +455,46 @@ impl Config {
             // for a measurement rig: a sweep would report several points
             // that all secretly ran at 1.0.
             return Err(format!("main_cost_exponent must be in [0.0, 1.0], got {e}").into());
+        }
+        Ok(())
+    }
+
+    fn validate_s3fifo(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        let set = config.cache.s3fifo_admission_percent.is_some()
+            || config.cache.s3fifo_promotion_threshold.is_some();
+        if set && config.cache.policy != EvictionPolicy::S3Fifo {
+            // Accepting it would run the arm with no admission queue at all
+            // and report it under the setting that was asked for.
+            return Err("s3fifo_admission_percent and s3fifo_promotion_threshold \
+                        apply only to policy = \"s3fifo\""
+                .into());
+        }
+        if let Some(p) = config.cache.s3fifo_admission_percent
+            && !(1..=50).contains(&p)
+        {
+            return Err(format!("s3fifo_admission_percent must be in 1..=50, got {p}").into());
+        }
+        if set
+            && !matches!(
+                config.cache.backend,
+                CacheBackend::Segment | CacheBackend::CacheRs
+            )
+        {
+            // The heap backend has an S3-FIFO too, sized its own way; it
+            // would ignore both settings.
+            return Err(format!(
+                "s3fifo_admission_percent and s3fifo_promotion_threshold are not \
+                 supported by backend = \"{}\"",
+                config.cache.backend
+            )
+            .into());
+        }
+        if config.cache.s3fifo_promotion_threshold.is_some()
+            && config.cache.backend == CacheBackend::CacheRs
+        {
+            return Err("s3fifo_promotion_threshold has no cache-rs counterpart; \
+                        a cachers arm would ignore it and report it anyway"
+                .into());
         }
         Ok(())
     }
@@ -559,6 +617,86 @@ path = "/tmp/t.bin"
 format = "twitter"
 warmup_records = 1000
 "#;
+
+    fn with(extra: &str) -> Result<Config, String> {
+        Config::from_toml(&TRACE_TOML.replace(
+            "hashtable_power = 20",
+            &format!("hashtable_power = 20\n{extra}"),
+        ))
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn s3fifo_admission_settings_are_read_from_the_config() {
+        let c =
+            with("s3fifo_admission_percent = 25\ns3fifo_promotion_threshold = 0").expect("parse");
+        assert_eq!(c.cache.s3fifo_admission_percent, Some(25));
+        assert_eq!(c.cache.s3fifo_promotion_threshold, Some(0));
+    }
+
+    /// crucible clamps to 1..=50; a sweep point outside that would run at the
+    /// clamp and be reported at the value asked for.
+    #[test]
+    fn an_admission_percent_outside_crucibles_range_is_rejected_not_clamped() {
+        for bad in [0, 51, 100] {
+            let err = with(&format!("s3fifo_admission_percent = {bad}"))
+                .map(|_| ())
+                .expect_err("out of range");
+            assert!(err.contains("1..=50"), "{err}");
+        }
+        assert!(with("s3fifo_admission_percent = 1").is_ok());
+        assert!(with("s3fifo_admission_percent = 50").is_ok());
+    }
+
+    #[test]
+    fn admission_settings_are_refused_for_a_policy_without_an_admission_queue() {
+        let toml = TRACE_TOML
+            .replace("policy = \"s3fifo\"", "policy = \"merge\"")
+            .replace(
+                "hashtable_power = 20",
+                "hashtable_power = 20\ns3fifo_admission_percent = 25",
+            );
+        let err = Config::from_toml(&toml)
+            .map(|_| ())
+            .expect_err("merge has no admission queue");
+        assert!(err.to_string().contains("policy = \"s3fifo\""), "{err}");
+    }
+
+    #[test]
+    fn a_promotion_threshold_is_refused_for_cache_rs() {
+        let toml = TRACE_TOML
+            .replace("backend = \"segment\"", "backend = \"cachers\"")
+            .replace(
+                "hashtable_power = 20",
+                "hashtable_power = 20\ns3fifo_promotion_threshold = 0",
+            );
+        let err = Config::from_toml(&toml)
+            .map(|_| ())
+            .expect_err("no cache-rs counterpart");
+        assert!(err.to_string().contains("cache-rs"), "{err}");
+        // The admission size does map across.
+        let toml = TRACE_TOML
+            .replace("backend = \"segment\"", "backend = \"cachers\"")
+            .replace(
+                "hashtable_power = 20",
+                "hashtable_power = 20\ns3fifo_admission_percent = 25",
+            );
+        assert!(Config::from_toml(&toml).is_ok());
+    }
+
+    #[test]
+    fn admission_settings_are_refused_for_the_heap_backend() {
+        let toml = TRACE_TOML
+            .replace("backend = \"segment\"", "backend = \"heap\"")
+            .replace(
+                "hashtable_power = 20",
+                "hashtable_power = 20\ns3fifo_admission_percent = 25",
+            );
+        let err = Config::from_toml(&toml)
+            .map(|_| ())
+            .expect_err("heap sizes its own");
+        assert!(err.to_string().contains("heap"), "{err}");
+    }
 
     #[test]
     fn a_zero_length_merge_chain_is_rejected() {

@@ -735,6 +735,17 @@ fn merge_config_from(
     cfg
 }
 
+/// crucible's S3-FIFO, sized by the config's admission settings.
+///
+/// `SegCacheBuilder::s3fifo()` is these defaults hard-coded -- 10% admission,
+/// threshold 1 -- so going through it made both settings unreachable.
+fn s3fifo_policy(cache: &crate::config::CacheConfig) -> segcache::EvictionPolicy {
+    segcache::EvictionPolicy::S3Fifo {
+        small_queue_percent: cache.s3fifo_admission_percent.unwrap_or(10),
+        demotion_threshold: cache.s3fifo_promotion_threshold.unwrap_or(1),
+    }
+}
+
 fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Error>> {
     use segcache::{DiskTierConfig, EvictionPolicy as SegEvictionPolicy, MergeConfig, SegCache};
 
@@ -753,7 +764,7 @@ fn create_segment(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
 
     builder = match config.cache.policy {
         EvictionPolicy::S3Fifo => {
-            let mut b = builder.s3fifo();
+            let mut b = builder.eviction_policy(s3fifo_policy(&config.cache));
             let mut strategy = config.cache.main_policy.map(Into::into).unwrap_or(
                 cache_core::EvictionStrategy::Merge(cache_core::MergeConfig::default()),
             );
@@ -813,6 +824,14 @@ fn create_cachers(config: &Config) -> Result<impl Cache, Box<dyn std::error::Err
             config.cache.policy
         )
     })?;
+    // cache-rs's admission queue, sized like crucible's. The mapping's own
+    // 0.10 is the default either way.
+    let policy = match (policy, config.cache.s3fifo_admission_percent) {
+        (cache_rs::Policy::S3Fifo { .. }, Some(pct)) => cache_rs::Policy::S3Fifo {
+            admission_ratio: f64::from(pct) / 100.0,
+        },
+        (p, _) => p,
+    };
 
     let mut builder = cache_rs::Segcache::builder()
         .heap_size(config.cache.heap_size)
@@ -1005,6 +1024,85 @@ fn pin_to_cpu(cpu_id: usize) -> std::io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn pin_to_cpu(_cpu_id: usize) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod s3fifo_admission_tests {
+    use super::*;
+
+    fn config(extra: &str) -> crate::config::Config {
+        let toml = format!(
+            r#"
+[general]
+duration = "1s"
+warmup = "0s"
+threads = 1
+
+[cache]
+backend = "segment"
+policy = "s3fifo"
+heap_size = "16MB"
+segment_size = "256KB"
+hashtable_power = 16
+{extra}
+
+[workload.trace]
+path = "/tmp/t.bin"
+format = "twitter"
+warmup_records = 0
+"#
+        );
+        crate::config::Config::from_toml(&toml).expect("parse")
+    }
+
+    fn admission_segments(extra: &str) -> usize {
+        let cache = segcache::SegCache::builder()
+            .heap_size(16 * 1024 * 1024)
+            .segment_size(256 * 1024)
+            .hashtable_power(16)
+            .eviction_policy(s3fifo_policy(&config(extra).cache))
+            .build()
+            .expect("build");
+        cache
+            .layer(0)
+            .expect("admission layer")
+            .total_segment_count()
+    }
+
+    /// The setting has to change what the engine allocates, not only what
+    /// the config says: `SegCacheBuilder::s3fifo()` hard-coded 10%, and a
+    /// sweep through it would have measured 10% at every point.
+    #[test]
+    fn the_admission_percent_sizes_the_admission_layer() {
+        // 64 segments of 256KB.
+        assert_eq!(
+            admission_segments(""),
+            6,
+            "unset must stay at the 10% default"
+        );
+        assert_eq!(admission_segments("s3fifo_admission_percent = 25"), 16);
+        assert_eq!(admission_segments("s3fifo_admission_percent = 50"), 32);
+    }
+
+    #[test]
+    fn unset_settings_are_the_builders_old_defaults() {
+        let c = config("");
+        assert!(matches!(
+            s3fifo_policy(&c.cache),
+            segcache::EvictionPolicy::S3Fifo {
+                small_queue_percent: 10,
+                demotion_threshold: 1
+            }
+        ));
+        let c = config("s3fifo_promotion_threshold = 0");
+        assert!(matches!(
+            s3fifo_policy(&c.cache),
+            segcache::EvictionPolicy::S3Fifo {
+                demotion_threshold: 0,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
