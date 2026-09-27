@@ -338,6 +338,7 @@ fn run_trace_replay<C: Cache>(
         max_value_bytes: trace_cfg.max_value_bytes,
         insert_on_miss: trace_cfg.format.insert_on_miss(),
         retained_sizes: trace_cfg.retained_sizes,
+        oracle: trace_cfg.oracle,
     };
 
     eprintln!("replaying {}", trace_cfg.path.display());
@@ -414,6 +415,14 @@ fn print_replay_report(
             (1.0 - r) * 100.0
         ),
         None => eprintln!("  MISS RATIO:     n/a (no GETs)"),
+    }
+    let o = m.oracle;
+    if o != replay::OracleCounts::default() {
+        // One line, fixed field order: the lab collector reads it back.
+        eprintln!(
+            "  ORACLE:         misses compulsory {} expired {} early {}  hits past_ttl {} unknown {}",
+            o.miss_compulsory, o.miss_expired, o.miss_early, o.hit_past_ttl, o.hit_unknown
+        );
     }
     // Printed beside the request-weighted ratio rather than instead of it,
     // because retention policies trade one against the other. Ranking by

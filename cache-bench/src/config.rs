@@ -180,6 +180,14 @@ pub struct TraceConfig {
     /// distributions, which a total count cannot show.
     #[serde(default)]
     pub retained_sizes: bool,
+    /// Classify each miss as compulsory, expired or early, and check every
+    /// hit is within its TTL, against an ideal cache replayed alongside.
+    ///
+    /// Off by default: it holds a key-to-deadline map for the whole run.
+    /// Needs the trace clock -- on wall time "within its TTL" means nothing
+    /// the replay can check -- so it is refused without `virtual-clock`.
+    #[serde(default)]
+    pub oracle: bool,
 }
 
 /// On-disk trace layout.
@@ -417,6 +425,14 @@ impl Config {
         }
         Self::validate_main_cache(&config)?;
         Self::validate_s3fifo(&config)?;
+        if config.workload.trace.as_ref().is_some_and(|t| t.oracle)
+            && !cfg!(feature = "virtual-clock")
+        {
+            // On wall time the replay cannot say what was within its TTL.
+            return Err("oracle = true needs the trace clock: build with \
+                        --features virtual-clock"
+                .into());
+        }
         Ok(config)
     }
 

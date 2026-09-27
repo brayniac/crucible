@@ -46,6 +46,73 @@ pub struct ReplayStats {
     pub hit_bytes: u64,
     /// Value bytes behind every GET counted here, hit or miss.
     pub get_bytes: u64,
+    /// What the oracle says each miss and hit was, when it is running.
+    pub oracle: OracleCounts,
+}
+
+/// Misses and hits classified against an ideal cache: one with unlimited
+/// room that holds every write until its TTL, exactly, and nothing after.
+///
+/// A miss the ideal cache would also have taken is **compulsory** (never
+/// written, or deleted) or **expired** (its TTL had passed). One it would
+/// have served is **early**: the item was still within its TTL and the real
+/// cache no longer had it -- evicted, or expired early because it sat in a
+/// segment whose deadline came before its own. Early misses are what an
+/// eviction policy and a segment layout cost; the other two no cache avoids.
+///
+/// The reverse is checked too. A hit the ideal cache would have missed
+/// because the TTL had passed is an item served late, which no cache may
+/// do. Zero is the only correct count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OracleCounts {
+    pub miss_compulsory: u64,
+    pub miss_expired: u64,
+    pub miss_early: u64,
+    /// Served after its TTL.
+    pub hit_past_ttl: u64,
+    /// Served though the oracle never saw it written. Only possible if the
+    /// oracle and the replay disagree about what was written, so nonzero is
+    /// a fault in this instrument, not in a cache.
+    pub hit_unknown: u64,
+}
+
+/// The ideal cache: `key_id -> deadline` in trace seconds, `u32::MAX` for
+/// no expiry. Mirrors the replay's writes and deletes exactly -- every write
+/// op is replayed as a set, and so is a fill after a miss -- including
+/// writes the real cache refused, since the ideal one would not have.
+///
+/// Its clock is the record's timestamp, which is also what the replay sets
+/// both engines' clocks to before applying the record, and an item expires
+/// at `now >= written + ttl`, the same boundary the engines use.
+#[derive(Default)]
+pub struct Oracle {
+    deadlines: std::collections::HashMap<u64, u32>,
+}
+
+impl Oracle {
+    fn write(&mut self, record: &TraceRecord, now: u32) {
+        let deadline = match record.ttl_secs {
+            0 => u32::MAX,
+            ttl => now.saturating_add(ttl),
+        };
+        self.deadlines.insert(record.key_id, deadline);
+    }
+
+    fn delete(&mut self, key_id: u64) {
+        self.deadlines.remove(&key_id);
+    }
+
+    fn classify(&self, key_id: u64, now: u32, hit: bool, counts: &mut OracleCounts) {
+        let live = self.deadlines.get(&key_id).map(|&d| now < d);
+        match (hit, live) {
+            (false, None) => counts.miss_compulsory += 1,
+            (false, Some(false)) => counts.miss_expired += 1,
+            (false, Some(true)) => counts.miss_early += 1,
+            (true, Some(false)) => counts.hit_past_ttl += 1,
+            (true, None) => counts.hit_unknown += 1,
+            (true, Some(true)) => {}
+        }
+    }
 }
 
 /// Cause counts behind [`ReplayStats::set_errors`].
@@ -134,7 +201,11 @@ pub fn apply_record<C: Cache>(
     value_pool: &[u8],
     insert_on_miss: bool,
     stats: &mut ReplayStats,
+    oracle: Option<&mut Oracle>,
 ) {
+    // The oracle needs the trace's clock; a record without one cannot be
+    // judged, and is replayed without it.
+    let mut oracle = oracle.zip(record.timestamp_secs);
     write_key(key_buf, record.key_id, record.key_len);
 
     let value_len = record.value_len as usize;
@@ -153,19 +224,29 @@ pub fn apply_record<C: Cache>(
     match record.op {
         Op::Get | Op::Gets => {
             stats.get_bytes += record.value_len as u64;
-            if cache.with_value(key_buf, |_| ()).is_some() {
+            let hit = cache.with_value(key_buf, |_| ()).is_some();
+            if let Some((o, now)) = oracle.as_mut() {
+                o.classify(record.key_id, *now, hit, &mut stats.oracle);
+            }
+            if hit {
                 stats.hits += 1;
                 stats.hit_bytes += record.value_len as u64;
             } else {
                 stats.misses += 1;
                 if insert_on_miss {
                     store(cache, key_buf, &value_pool[..value_len], record, stats);
+                    if let Some((o, now)) = oracle.as_mut() {
+                        o.write(record, *now);
+                    }
                 }
             }
         }
         Op::Delete => {
             cache.delete(key_buf);
             stats.deletes += 1;
+            if let Some((o, _)) = oracle.as_mut() {
+                o.delete(record.key_id);
+            }
         }
         Op::Incr | Op::Decr => {
             // A counter operation reads, modifies and writes back in place.
@@ -179,7 +260,11 @@ pub fn apply_record<C: Cache>(
             // It goes through the same read path as `Get` rather than
             // `contains` so that it bumps the frequency counter -- an access
             // is an access, and eviction policy depends on that.
-            if cache.with_value(key_buf, |_| ()).is_some() {
+            let hit = cache.with_value(key_buf, |_| ()).is_some();
+            if let Some((o, now)) = oracle.as_mut() {
+                o.classify(record.key_id, *now, hit, &mut stats.oracle);
+            }
+            if hit {
                 stats.hits += 1;
             } else {
                 stats.misses += 1;
@@ -187,6 +272,9 @@ pub fn apply_record<C: Cache>(
         }
         Op::Set | Op::Add | Op::Cas | Op::Replace | Op::Append | Op::Prepend => {
             store(cache, key_buf, &value_pool[..value_len], record, stats);
+            if let Some((o, now)) = oracle.as_mut() {
+                o.write(record, *now);
+            }
         }
     }
 }
@@ -243,6 +331,8 @@ pub struct ReplayOptions {
     /// two engines' internal gauges -- which is how the last three
     /// comparisons went wrong.
     pub retained_sizes: bool,
+    /// Classify every miss and hit against an ideal cache ([`Oracle`]).
+    pub oracle: bool,
 }
 
 /// Retention by value size: how many distinct keys of each size were
@@ -318,6 +408,7 @@ pub fn run_replay<C: Cache>(
         std::collections::HashMap::new()
     };
     let value_pool = vec![0xA5u8; opts.max_value_bytes];
+    let mut oracle = opts.oracle.then(Oracle::default);
     let mut measured_records = 0u64;
 
     // 7/64 matches the histograms in `metrics`: ~1% relative error, and a
@@ -381,6 +472,7 @@ pub fn run_replay<C: Cache>(
             &value_pool,
             opts.insert_on_miss,
             stats,
+            oracle.as_mut(),
         );
 
         // Record the size a key was stored at. Last write wins, which is
@@ -684,6 +776,144 @@ mod tests {
             .expect("failed to build test cache")
     }
 
+    fn stamped(key_id: u64, op: Op, ttl_secs: u32, at: u32) -> TraceRecord {
+        TraceRecord {
+            timestamp_secs: Some(at),
+            ..record(key_id, op, 64, ttl_secs)
+        }
+    }
+
+    /// Drive one record the way `run_replay` does: engine clock first.
+    #[cfg(feature = "virtual-clock")]
+    fn step(
+        cache: &segcache::SegCache,
+        rec: &TraceRecord,
+        stats: &mut ReplayStats,
+        oracle: Option<&mut Oracle>,
+    ) {
+        cache_core::clock::set_virtual_now(rec.timestamp_secs.expect("stamped"));
+        let mut key_buf = Vec::new();
+        let pool = vec![0u8; 1024];
+        apply_record(cache, rec, &mut key_buf, &pool, false, stats, oracle);
+    }
+
+    /// Each miss class, produced for a known reason, lands in its own count.
+    #[cfg(feature = "virtual-clock")]
+    #[test]
+    fn the_oracle_classifies_each_miss_by_what_an_ideal_cache_would_have_done() {
+        let cache = small_cache();
+        let mut oracle = Oracle::default();
+        let mut stats = ReplayStats::default();
+
+        // Never written.
+        step(
+            &cache,
+            &stamped(1, Op::Get, 0, 100),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        // Written, then deleted by the workload itself.
+        step(
+            &cache,
+            &stamped(4, Op::Set, 600, 100),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        step(
+            &cache,
+            &stamped(4, Op::Delete, 0, 100),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        step(
+            &cache,
+            &stamped(4, Op::Get, 0, 101),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        assert_eq!(stats.oracle.miss_compulsory, 2, "{:?}", stats.oracle);
+
+        // Written with a 60s TTL: a hit inside it, a miss after it.
+        step(
+            &cache,
+            &stamped(2, Op::Set, 60, 100),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        step(
+            &cache,
+            &stamped(2, Op::Get, 0, 120),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        step(
+            &cache,
+            &stamped(2, Op::Get, 0, 170),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.oracle.miss_expired, 1, "{:?}", stats.oracle);
+
+        // Written with a long TTL, then removed behind the replay's back --
+        // standing in for an eviction or an early expiry.
+        step(
+            &cache,
+            &stamped(3, Op::Set, 600, 100),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        let mut key = Vec::new();
+        write_key(&mut key, 3, ORACLE_GENERAL_KEY_LEN);
+        assert!(cache.delete(&key));
+        step(
+            &cache,
+            &stamped(3, Op::Get, 0, 110),
+            &mut stats,
+            Some(&mut oracle),
+        );
+        assert_eq!(stats.oracle.miss_early, 1, "{:?}", stats.oracle);
+
+        assert_eq!(stats.oracle.hit_past_ttl + stats.oracle.hit_unknown, 0);
+        cache_core::clock::clear_virtual_now();
+    }
+
+    /// The two hit checks, which a correct engine never trips, so they are
+    /// exercised on the classifier directly.
+    #[test]
+    fn a_hit_after_its_ttl_or_for_an_unwritten_key_is_flagged() {
+        let mut oracle = Oracle::default();
+        oracle.write(&stamped(1, Op::Set, 60, 100), 100);
+        let mut counts = OracleCounts::default();
+        oracle.classify(1, 159, true, &mut counts);
+        assert_eq!(
+            counts,
+            OracleCounts::default(),
+            "a hit inside the TTL is correct"
+        );
+        oracle.classify(1, 160, true, &mut counts);
+        assert_eq!(
+            counts.hit_past_ttl, 1,
+            "expiry is at written + ttl, like the engines"
+        );
+        oracle.classify(9, 160, true, &mut counts);
+        assert_eq!(counts.hit_unknown, 1);
+        // No expiry at all.
+        oracle.write(&stamped(2, Op::Set, 0, 100), 100);
+        oracle.classify(2, u32::MAX - 1, true, &mut counts);
+        assert_eq!(counts.hit_past_ttl, 1, "a zero TTL never expires");
+    }
+
+    #[cfg(feature = "virtual-clock")]
+    #[test]
+    fn without_the_oracle_nothing_is_classified() {
+        let cache = small_cache();
+        let mut stats = ReplayStats::default();
+        step(&cache, &stamped(1, Op::Get, 0, 100), &mut stats, None);
+        assert_eq!(stats.oracle, OracleCounts::default());
+        cache_core::clock::clear_virtual_now();
+    }
+
     #[test]
     fn a_counter_operation_is_a_lookup_not_an_insert() {
         // incr/decr read-modify-write an existing counter. On a miss the
@@ -701,6 +931,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
         assert_eq!(stats.misses, 1, "a counter op on an absent key is a miss");
         assert_eq!(stats.sets, 0, "it must not insert on miss");
@@ -712,6 +943,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
         apply_record(
             &cache,
@@ -720,6 +952,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
         assert_eq!(stats.hits, 1, "a counter op on a present key is a hit");
         assert_eq!(stats.sets, 1, "the counter op must not have written again");
@@ -1023,6 +1256,7 @@ mod tests {
             report_interval_records: interval,
             max_value_bytes: 4096,
             retained_sizes: false,
+            oracle: false,
             insert_on_miss: true,
         }
     }
@@ -1517,8 +1751,8 @@ mod tests {
         let mut stats = ReplayStats::default();
 
         let rec = record(42, Op::Get, 100, 0);
-        apply_record(&cache, &rec, &mut key_buf, &pool, true, &mut stats);
-        apply_record(&cache, &rec, &mut key_buf, &pool, true, &mut stats);
+        apply_record(&cache, &rec, &mut key_buf, &pool, true, &mut stats, None);
+        apply_record(&cache, &rec, &mut key_buf, &pool, true, &mut stats, None);
 
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);
@@ -1533,8 +1767,8 @@ mod tests {
         let mut stats = ReplayStats::default();
 
         let rec = record(42, Op::Get, 100, 0);
-        apply_record(&cache, &rec, &mut key_buf, &pool, false, &mut stats);
-        apply_record(&cache, &rec, &mut key_buf, &pool, false, &mut stats);
+        apply_record(&cache, &rec, &mut key_buf, &pool, false, &mut stats, None);
+        apply_record(&cache, &rec, &mut key_buf, &pool, false, &mut stats, None);
 
         assert_eq!(stats.misses, 2, "a twitter GET must not populate the cache");
         assert_eq!(stats.sets, 0);
@@ -1554,6 +1788,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
 
         let stored_len = cache.get(&key_buf).map(|v| v.len());
@@ -1575,6 +1810,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
         apply_record(
             &cache,
@@ -1583,6 +1819,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
         apply_record(
             &cache,
@@ -1591,6 +1828,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
 
         assert_eq!(stats.deletes, 1);
@@ -1645,6 +1883,7 @@ mod tests {
             &pool,
             false,
             &mut stats,
+            None,
         );
 
         assert_eq!(stats.oversized, 1);
