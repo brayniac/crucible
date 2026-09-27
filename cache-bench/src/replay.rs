@@ -461,10 +461,9 @@ pub fn run_replay<C: Cache>(
 
 /// Whether a completed replay measured what it claims to.
 ///
-/// A sweep point above the trace's working set never evicts, so every policy
-/// scores identically there and the point carries no information about
-/// eviction. Reporting it anyway is how a flat region of a sweep reads as
-/// "the policies are equivalent". Rejected loudly rather than averaged in.
+/// A run that refused writes, read nothing, or never filled its cache is
+/// rejected: each is wrong on its own, whatever any other run did. A run
+/// that filled but never evicted is not -- see [`no_eviction_note`].
 pub fn envelope_verdict(
     measured: &ReplayStats,
     internal: Option<cache_core::CacheInternalStats>,
@@ -598,19 +597,36 @@ pub fn envelope_verdict(
         ));
     }
 
-    // Kept alongside the fill check above rather than replaced by it: a
-    // full-and-never-evicted cache is still suspect (something other than
-    // normal capacity pressure kept the eviction path from ever running),
-    // and the two checks answer different questions.
+    Ok(())
+}
+
+/// A note when the main layer never evicted in the measured window.
+///
+/// Not a rejection. It used to be one, judged per run, and that is the wrong
+/// level: whether a point measures eviction depends on *both* engines at
+/// that point. One engine holding the working set without evicting while
+/// the other has to evict is a result -- the first fits more in the same
+/// memory -- and rejecting that run hid it: cluster1 at 8MB compared a
+/// rejected, eviction-free crucible arm against an evicting cache-rs arm,
+/// and the verdict column was the only sign. Only when no arm at a point
+/// evicted does the point measure allocation rather than eviction, and only
+/// the analysis, which sees every arm of the point, can tell. The eviction
+/// count is in the result row for it to read.
+///
+/// A cache that never *filled* is still rejected by [`envelope_verdict`]:
+/// that one is about the run alone.
+pub fn no_eviction_note(
+    measured: &ReplayStats,
+    internal: Option<&cache_core::CacheInternalStats>,
+) -> Option<String> {
     match internal {
-        Some(stats) if stats.evictions == 0 => Err(format!(
+        Some(stats) if stats.evictions == 0 => Some(format!(
             "the main layer never evicted in the measured window \
-             ({} demotions, {} sets, {} set errors): this cache size is at or \
-             above the trace's working set, so the point measures allocation \
-             rather than eviction",
+             ({} demotions, {} sets, {} set errors): this run held the working \
+             set; the point measures eviction only if another arm at it evicted",
             stats.demotions, measured.sets, measured.set_errors
         )),
-        _ => Ok(()),
+        _ => None,
     }
 }
 
@@ -1194,15 +1210,19 @@ mod tests {
     }
 
     #[test]
-    fn a_saturated_cache_with_zero_evictions_is_still_rejected() {
-        // Full-and-never-evicted is still suspect: the two checks (did it
-        // fill? did it ever evict?) answer different questions, and this
-        // case fails the second one even though it passes the first.
+    fn a_full_cache_that_never_evicted_is_accepted_and_flagged() {
+        // It held the working set. Whether that makes the point
+        // uninformative depends on the other arms at the point, which only
+        // the analysis sees -- so it is data here, with a note saying so.
         let internal = internal_with_fill(0, 2, 64);
 
-        let msg = envelope_verdict(&stats_with_gets(), Some(internal))
-            .expect_err("a full cache that never evicted is still suspect");
-        assert!(msg.contains("evict"), "{msg}");
+        assert_eq!(
+            envelope_verdict(&stats_with_gets(), Some(internal.clone())),
+            Ok(())
+        );
+        let note = no_eviction_note(&stats_with_gets(), Some(&internal))
+            .expect("a run with no evictions must be flagged");
+        assert!(note.contains("never evicted"), "{note}");
     }
 
     #[test]
@@ -1230,20 +1250,22 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_never_evicted_is_rejected_rather_than_reported() {
-        let verdict = envelope_verdict(&stats_with_gets(), Some(internal(0)));
-
-        let msg = verdict.expect_err("a run with no evictions measured allocation, not eviction");
-        assert!(msg.contains("evict"), "{msg}");
+    fn a_run_that_evicted_carries_no_note() {
+        assert_eq!(
+            no_eviction_note(&stats_with_gets(), Some(&internal(1))),
+            None
+        );
+        assert_eq!(no_eviction_note(&stats_with_gets(), None), None);
     }
 
     #[test]
-    fn a_run_whose_main_layer_never_reclaimed_is_rejected_even_when_layer_zero_promoted() {
+    fn a_main_layer_that_never_reclaimed_is_flagged_even_when_layer_zero_promoted() {
         // Above the working set, layer 0 still demotes into layer 1 while
-        // layer 1 never evicts. The cache "works", but no main-pool eviction
-        // decision was ever made -- which is the entire quantity a
-        // merge-vs-CLOCK comparison is trying to read. Accepting the point is
-        // how a saturated region of a sweep reads as "the policies agree".
+        // layer 1 never evicts, so no main-pool eviction decision was made.
+        // If every arm at a point looks like this, a sweep's saturated region
+        // reads as "the policies agree" -- the analysis must drop such a
+        // point, and this note, with the zero in the eviction column, is how
+        // it knows. Promotions must not mask it.
         let internal = cache_core::CacheInternalStats {
             demotions: 376_122,
             evictions: 0,
@@ -1251,9 +1273,9 @@ mod tests {
             ..Default::default()
         };
 
-        let msg = envelope_verdict(&stats_with_gets(), Some(internal))
-            .expect_err("no main-layer eviction means no policy decision");
-        assert!(msg.contains("evict"), "{msg}");
+        let note = no_eviction_note(&stats_with_gets(), Some(&internal))
+            .expect("no main-layer eviction must be flagged despite promotions");
+        assert!(note.contains("376122 demotions"), "{note}");
     }
 
     #[test]

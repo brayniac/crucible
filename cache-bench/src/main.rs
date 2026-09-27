@@ -372,6 +372,9 @@ fn run_trace_replay<C: Cache>(
 
     let internal = cache.internal_stats();
     print_replay_report(&outcome, internal.clone(), elapsed);
+    if let Some(note) = replay::no_eviction_note(&outcome.measured, internal.as_ref()) {
+        println!("note: {note}");
+    }
 
     // The envelope check is a hard gate, not a warning: a point that measured
     // no eviction is not a weaker result, it is a different measurement.
