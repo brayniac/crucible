@@ -60,7 +60,7 @@ pub struct CacheConfig {
     pub backend: CacheBackend,
 
     /// Eviction policy. Valid options depend on backend:
-    /// - segment: "s3fifo" (default), "fifo", "random", "cte", "merge"
+    /// - segment: "merge" (default), "s3fifo", "fifo", "random", "cte"
     /// - heap: "s3fifo" (default), "lfu"
     /// - slab: "lra" (default), "lrc", "random", "none"
     #[serde(default)]
@@ -279,7 +279,15 @@ impl CacheBackend {
     /// Get the default eviction policy for this backend.
     pub fn default_policy(self) -> EvictionPolicy {
         match self {
-            CacheBackend::Segment => EvictionPolicy::S3Fifo,
+            // Merge, not S3-FIFO: on the scoped trace points merge had the
+            // lowest miss ratio of every segment policy, and S3-FIFO the
+            // highest -- 1.01-1.84x merge, 3.2x on one expiry-driven point
+            // (crucible-experiments results/policy-ranking.md). S3-FIFO's
+            // per-item admission and promotion sit awkwardly on segment-level
+            // storage: promotion is a copy, and it re-files items into write
+            // segments whose deadlines precede their own. The heap backend's
+            // S3-FIFO is item-level and was not part of that comparison.
+            CacheBackend::Segment => EvictionPolicy::Merge,
             CacheBackend::Heap => EvictionPolicy::S3Fifo,
             CacheBackend::Slab => EvictionPolicy::Lra,
         }
@@ -1040,6 +1048,19 @@ pub fn format_size(bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pins the backend defaults. Segment moved to merge on measured miss
+    /// ratio; heap and slab were not part of that comparison and are not
+    /// meant to move with it.
+    #[test]
+    fn each_backend_defaults_to_its_measured_best_policy() {
+        assert_eq!(
+            CacheBackend::Segment.default_policy(),
+            EvictionPolicy::Merge
+        );
+        assert_eq!(CacheBackend::Heap.default_policy(), EvictionPolicy::S3Fifo);
+        assert_eq!(CacheBackend::Slab.default_policy(), EvictionPolicy::Lra);
+    }
 
     use super::*;
 
