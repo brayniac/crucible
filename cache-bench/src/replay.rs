@@ -602,6 +602,11 @@ pub fn envelope_verdict(
 
 /// A note when the main layer never evicted in the measured window.
 ///
+/// "The main layer" is exact: the eviction count does not include items an
+/// admission queue discarded without promoting. crucible's S3-FIFO on
+/// cluster1 at 8MB never evicted and still missed 3.2x as often as merge.
+/// So this does not mean the run held everything.
+///
 /// Not a rejection. It used to be one, judged per run, and that is the wrong
 /// level: whether a point measures eviction depends on *both* engines at
 /// that point. One engine holding the working set without evicting while
@@ -622,8 +627,9 @@ pub fn no_eviction_note(
     match internal {
         Some(stats) if stats.evictions == 0 => Some(format!(
             "the main layer never evicted in the measured window \
-             ({} demotions, {} sets, {} set errors): this run held the working \
-             set; the point measures eviction only if another arm at it evicted",
+             ({} demotions, {} sets, {} set errors): whether the point is \
+             informative depends on the other arms at it, which the analysis \
+             sees -- an admission queue can still have discarded items",
             stats.demotions, measured.sets, measured.set_errors
         )),
         _ => None,
