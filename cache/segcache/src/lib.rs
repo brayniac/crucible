@@ -1102,6 +1102,53 @@ mod tests {
         assert!(!cache.contains(b"key"));
     }
 
+    /// A disk tier reports what it cost to fill (`demoted_bytes`) and what
+    /// it served (`disk_hits`), and a read served from RAM counts as neither.
+    #[test]
+    fn internal_stats_count_disk_tier_bytes_and_hits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = SegCacheBuilder::new()
+            .heap_size(4 * 1024 * 1024)
+            .segment_size(1024 * 1024)
+            .hashtable_power(14)
+            .disk_tier(
+                DiskTierConfig::new(dir.path().join("disk.dat"), 32 * 1024 * 1024)
+                    .recover_on_startup(false),
+            )
+            .build()
+            .expect("cache with disk tier");
+        let ttl = Duration::from_secs(3600);
+        let value = [b'v'; 512];
+        let n = 8000;
+        for i in 0..n {
+            cache.set(format!("k:{i}").as_bytes(), &value, ttl).unwrap();
+        }
+
+        let stats = cache.internal_stats().unwrap();
+        assert!(stats.demotions > 0, "precondition: something was demoted");
+        // Keys are "k:0".."k:7999", 3 to 6 bytes, with no optional data.
+        let (lo, hi) = (stats.demotions * (512 + 3), stats.demotions * (512 + 6));
+        assert!(
+            (lo..=hi).contains(&stats.demoted_bytes),
+            "{} demotions wrote {} bytes, outside {lo}..={hi}",
+            stats.demotions,
+            stats.demoted_bytes
+        );
+        assert_eq!(stats.disk_hits, 0, "nothing has been read yet");
+
+        // The newest item is in RAM.
+        assert!(cache.get(format!("k:{}", n - 1).as_bytes()).is_some());
+        assert_eq!(cache.internal_stats().unwrap().disk_hits, 0);
+
+        // The oldest were demoted.
+        let found = (0..100)
+            .filter(|i| cache.get(format!("k:{i}").as_bytes()).is_some())
+            .count() as u64;
+        let hits = cache.internal_stats().unwrap().disk_hits;
+        assert!(found > 0, "precondition: early items survive on disk");
+        assert_eq!(hits, found, "every early item found was served from disk");
+    }
+
     #[test]
     fn internal_stats_reports_ram_segment_fill() {
         let cache = create_test_cache();

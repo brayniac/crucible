@@ -477,6 +477,10 @@ fn print_replay_report(
         eprintln!("  evictions:      {}", stats.evictions);
         eprintln!("  demotions:      {}", stats.demotions);
         eprintln!("  demotion fails: {}", stats.demotion_failures);
+        // A disk tier's cost and return: bytes written to fill it, and reads
+        // it served. A demotion threshold trades one for the other.
+        eprintln!("  demoted bytes:  {}", stats.demoted_bytes);
+        eprintln!("  disk hits:      {}", stats.disk_hits);
         // Zero here with compaction configured means it never found an
         // eligible pair -- a different problem from compaction running and
         // not helping, and the two were indistinguishable before this was

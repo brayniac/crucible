@@ -730,6 +730,15 @@ pub struct CacheInternalStats {
     pub evictions: u64,
     /// Items that failed to demote (staging pool exhausted, discarded instead).
     pub demotion_failures: u64,
+    /// Reads the hashtable resolved to a disk layer.
+    ///
+    /// Beside `demotions`, the two halves of a disk tier's trade: what it
+    /// cost to fill and what it served. Counted when the read reaches the
+    /// layer, so it includes the rare read that then finds the item gone.
+    pub disk_hits: u64,
+    /// Key, value and optional bytes written by demotions -- the tier's
+    /// write volume, which `demotions` alone hides when item sizes vary.
+    pub demoted_bytes: u64,
     /// Segments reclaimed by expiry rather than eviction.
     ///
     /// Read beside [`evictions`](Self::evictions): reclaiming space by
