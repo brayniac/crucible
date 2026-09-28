@@ -1149,6 +1149,47 @@ mod tests {
         assert_eq!(hits, found, "every early item found was served from disk");
     }
 
+    /// Merge with a disk tier demotes what it prunes, and the demoted items
+    /// are readable. The layer-level tests pin *which* items go down; this
+    /// pins that the builder connects merge's layer to the disk at all.
+    #[test]
+    fn merge_with_a_disk_tier_demotes_and_the_items_are_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = SegCacheBuilder::new()
+            .heap_size(4 * 1024 * 1024)
+            .segment_size(256 * 1024)
+            .hashtable_power(14)
+            .eviction_policy(EvictionPolicy::Merge(MergeConfig::default()))
+            .disk_tier(
+                DiskTierConfig::new(dir.path().join("disk.dat"), 32 * 1024 * 1024)
+                    .recover_on_startup(false),
+            )
+            .build()
+            .expect("cache with disk tier");
+        let ttl = Duration::from_secs(3600);
+        let value = [b'v'; 512];
+        let n = 16000;
+        for i in 0..n {
+            cache.set(format!("k:{i}").as_bytes(), &value, ttl).unwrap();
+        }
+
+        let stats = cache.internal_stats().unwrap();
+        assert!(
+            stats.demotions > 0,
+            "merge with a disk tier demoted nothing"
+        );
+        // 16000 items of ~530 bytes need twice the 4 MiB of RAM, so most of
+        // the first half can only have survived on disk.
+        let found = (0..n / 2)
+            .filter(|i| cache.get(format!("k:{i}").as_bytes()) == Some(value.to_vec()))
+            .count();
+        assert!(
+            found > n / 4,
+            "only {found} of the first {} items readable",
+            n / 2
+        );
+    }
+
     #[test]
     fn internal_stats_reports_ram_segment_fill() {
         let cache = create_test_cache();
