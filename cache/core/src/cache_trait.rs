@@ -829,8 +829,13 @@ pub enum LookupResult {
     /// The caller should:
     /// 1. Allocate a read buffer
     /// 2. Submit an io_uring read using the provided parameters
-    /// 3. Parse the item from the read buffer on completion
+    /// 3. Parse the item from the read buffer on completion, and **compare
+    ///    its key with the requested one**, answering a miss if they differ
     /// 4. Call `release_read()` on the disk layer when done
+    ///
+    /// Step 3's key check is required, not defensive. A committed segment
+    /// has no bytes in memory, so the hashtable matched this item on its tag
+    /// alone, and the item may belong to a different key.
     DiskRead(crate::disk::DiskReadParams),
     /// Item not found in any layer.
     Miss,
