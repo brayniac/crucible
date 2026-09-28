@@ -133,11 +133,18 @@ struct ScannedItem {
     candidate: u32,
     offset: u32,
     freq: u8,
+    /// The hashtable's read count, or `None` when it no longer indexes the
+    /// item. `freq` is a retention rank and cannot answer the demotion
+    /// question, which is asked in reads and never of a lost item.
+    reads: Option<u8>,
     /// Bytes this item occupies, including header, key and alignment --
     /// what `append_item` will consume in the spare. Kept from the scan so
     /// the ranking pass need not re-parse the span.
     stride: u32,
 }
+
+/// The demoter type of a merge pass that has nowhere to demote to.
+type NoDemoter = fn(&[u8], &[u8], &[u8], Duration, Location);
 
 /// Rank an item for retention: `frequency * (mean_stride / stride)^e`.
 ///
@@ -1332,6 +1339,18 @@ impl TtlLayer {
         }
     }
 
+    /// Merge's whole-segment fallback, demoting when the pass has a demoter.
+    fn evict_selected_or_demote<H, F>(&self, hashtable: &H, demoter: Option<F>) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
+        match demoter {
+            Some(demoter) => self.evict_selected_with_demoter(hashtable, demoter),
+            None => self.evict_selected(hashtable),
+        }
+    }
+
     /// Merge eviction: SSD garbage-collection style.
     ///
     /// Selects N candidate segments from the head of a bucket, reserves a spare,
@@ -1354,11 +1373,21 @@ impl TtlLayer {
     /// by frequency (#154). Choosing up front, in bytes, makes the capacity
     /// bound structural: position can now only decide *within* the single
     /// class that straddles the boundary, where order is arbitrary anyway.
-    fn try_merge_eviction<H: Hashtable>(
+    ///
+    /// With a `demoter`, a pruned item goes to it rather than being dropped,
+    /// if its reads meet the layer's `demotion_threshold`: the layer below
+    /// gets what merge ranked cold, and the fallbacks demote too. Without
+    /// one, pruned items are discarded.
+    fn try_merge_eviction<H, F>(
         &self,
         merge_config: &crate::config::MergeConfig,
         hashtable: &H,
-    ) -> bool {
+        mut demoter: Option<F>,
+    ) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
         // Select a bucket for eviction (weighted by segment count)
         let (bucket_idx, bucket) = match self.buckets.select_bucket_for_eviction() {
             Some(b) => b,
@@ -1373,13 +1402,13 @@ impl TtlLayer {
         // Need at least min_segments candidates
         if candidates.len() < merge_config.min_segments {
             // Fall back to random eviction
-            return self.evict_selected(hashtable);
+            return self.evict_selected_or_demote(hashtable, demoter);
         }
 
         // Reserve a spare segment for compaction
         let spare_id = match self.pool.reserve_spare() {
             Some(id) => id,
-            None => return self.evict_selected(hashtable),
+            None => return self.evict_selected_or_demote(hashtable, demoter),
         };
 
         let spare = match self.pool.get(spare_id) {
@@ -1490,14 +1519,14 @@ impl TtlLayer {
                 // here, every budget, threshold and straddle decision is
                 // what it was when inserts started at 1, and CLOCK's floor
                 // of 1 still means "untouched since admission is pruned".
-                let freq = hashtable
-                    .get_frequency(key, &verifier)
-                    .map_or(0, |f| f.saturating_add(1));
+                let reads = hashtable.get_frequency(key, &verifier);
+                let freq = reads.map_or(0, |f| f.saturating_add(1));
 
                 scanned.push(ScannedItem {
                     candidate: cand_idx as u32,
                     offset,
                     freq,
+                    reads,
                     stride: span.stride,
                 });
 
@@ -1586,10 +1615,11 @@ impl TtlLayer {
                 }
             }
             self.pool.release(spare_id);
-            return self.evict_selected(hashtable);
+            return self.evict_selected_or_demote(hashtable, demoter);
         }
 
         // ---- Phase C: copy the survivors, in the order they were scanned.
+        let now = Self::now_secs();
         for item in &scanned {
             // Candidates past the prefix were never reached. Skipping them
             // here is what leaves them whole -- they stay Sealed, stay
@@ -1690,6 +1720,25 @@ impl TtlLayer {
             }
 
             // Pruned: below the threshold, or the defensive overflow above.
+            //
+            // Demoted if there is a layer below and the item has the reads
+            // to earn it, exactly as whole-segment eviction decides. The TTL
+            // handed down is what remains of *this candidate's* deadline --
+            // not the spare's, which is the chain's earliest, and never the
+            // item's original TTL, which would extend it.
+            if let (Some(demote), Some(reads)) = (demoter.as_mut(), item.reads)
+                && matches!(determine_item_fate(reads, &self.config), ItemFate::Demote)
+            {
+                let optional = segment
+                    .data_slice(span.optional_start, span.optional_len)
+                    .unwrap_or(&[]);
+                let value = segment
+                    .data_slice(span.value_start, span.value_len)
+                    .unwrap_or(&[]);
+                let remaining = Duration::from_secs(segment.expire_at().saturating_sub(now) as u64);
+                demote(key, value, optional, remaining, old_loc.to_location());
+                continue;
+            }
             if self.config.create_ghosts {
                 hashtable.convert_to_ghost(key, old_loc.to_location());
             } else {
@@ -1867,7 +1916,7 @@ impl Layer for TtlLayer {
         // parameters `merge_params` hands over -- see `EvictionStrategy::Clock`
         // on why CLOCK is not a second implementation.
         if let Some(merge_config) = self.config.eviction_strategy.merge_params() {
-            return self.try_merge_eviction(&merge_config, hashtable);
+            return self.try_merge_eviction(&merge_config, hashtable, None::<NoDemoter>);
         }
 
         self.evict_selected(hashtable)
@@ -1883,8 +1932,10 @@ impl Layer for TtlLayer {
             return true;
         }
 
-        // Whole-segment eviction only: merge would have to run the demoter
-        // over the items it prunes, which it does not yet do.
+        if let Some(merge_config) = self.config.eviction_strategy.merge_params() {
+            return self.try_merge_eviction(&merge_config, hashtable, Some(demoter));
+        }
+
         self.evict_selected_with_demoter(hashtable, demoter)
     }
 
@@ -2046,7 +2097,7 @@ impl TtlLayer {
         if let Some(merge_config) = self.config.eviction_strategy.merge_params() {
             // Merge eviction prunes items in-place without reclaiming whole segments,
             // so it is inherently non-blocking (no ref_count wait needed).
-            return if self.try_merge_eviction(&merge_config, hashtable) {
+            return if self.try_merge_eviction(&merge_config, hashtable, None::<NoDemoter>) {
                 EvictResult::Freed
             } else {
                 EvictResult::NoCandidate
@@ -2076,6 +2127,17 @@ impl TtlLayer {
         // First try to expire any segments
         if self.try_expire_segments(hashtable) > 0 {
             return EvictResult::Freed;
+        }
+
+        // The path `TieredCache` drives when a layer has one below it. Before
+        // merge took a demoter, this went straight to whole-segment eviction,
+        // so configuring a disk tier silently swapped merge for random-FIFO.
+        if let Some(merge_config) = self.config.eviction_strategy.merge_params() {
+            return if self.try_merge_eviction(&merge_config, hashtable, Some(demoter)) {
+                EvictResult::Freed
+            } else {
+                EvictResult::NoCandidate
+            };
         }
 
         match self.pick_victim().and_then(|id| self.detach(id)) {
@@ -6015,6 +6077,192 @@ mod eviction_strategy_selection {
                  eviction is drawing its randomness from something that is \
                  not the cache's own state"
             );
+        }
+    }
+}
+
+/// Merge with a layer below: what it prunes goes down, what it keeps stays.
+///
+/// Before merge took a demoter, a layer with a next layer skipped merge
+/// entirely and evicted whole segments, so a disk tier silently turned merge
+/// into random-FIFO.
+#[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+mod merge_demotion {
+    use super::*;
+    use crate::config::{EvictionStrategy, MergeConfig};
+    use crate::hashtable_impl::MultiChoiceHashtable;
+
+    const SEGMENT_SIZE: usize = 1024;
+    /// Header (9) + 7-byte key + 16-byte value: 32 items to a segment.
+    const ITEM_BYTES: usize = 32;
+    const TTL: Duration = Duration::from_secs(3600);
+
+    /// Merge keeping a quarter of each candidate: 8 of its 32 items.
+    fn layer(demotion_threshold: u8) -> TtlLayer {
+        TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(SEGMENT_SIZE)
+            .heap_size(64 * SEGMENT_SIZE)
+            .config(
+                LayerConfig::new()
+                    .with_ghosts(true)
+                    .with_next_layer(2)
+                    .with_demotion_threshold(demotion_threshold)
+                    .with_eviction_strategy(EvictionStrategy::Merge(
+                        MergeConfig::new()
+                            .with_min_segments(2)
+                            .with_target_ratio(0.25)
+                            .with_cost_exponent(0.0),
+                    )),
+            )
+            .spare_capacity(2)
+            .build()
+            .expect("failed to build merge layer")
+    }
+
+    /// Reads given to item `i`: every fourth is hot (3) and fills its
+    /// candidate's budget exactly, every fourth is read once, the rest never.
+    fn reads(i: usize) -> u8 {
+        match i % 4 {
+            0 => 3,
+            1 => 1,
+            _ => 0,
+        }
+    }
+
+    /// Fill four segments, warm them, move the clock 100s on and run one
+    /// pass through `evict`. Returns each demoted key with the TTL it was
+    /// handed.
+    fn run(
+        demotion_threshold: u8,
+        orphans: usize,
+        evict: impl Fn(&TtlLayer, &MultiChoiceHashtable, &mut dyn FnMut(&[u8], Duration)),
+    ) -> (Vec<(String, Duration)>, MultiChoiceHashtable, TtlLayer) {
+        let clock = crate::clock::TestClock::start();
+        let layer = layer(demotion_threshold);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let value = vec![b'v'; ITEM_BYTES - 9 - 7];
+
+        // Items the hashtable never learns about, at the head of the chain.
+        for i in 0..orphans {
+            layer
+                .write_item(format!("o{i:06}").as_bytes(), &value, b"", TTL)
+                .expect("write");
+        }
+        for i in 0..4 * (SEGMENT_SIZE / ITEM_BYTES) - orphans {
+            let key = format!("k{i:06}");
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", TTL)
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+            for _ in 0..reads(i) {
+                assert!(hashtable.lookup(key.as_bytes(), &verifier).is_some());
+            }
+        }
+
+        crate::clock::set_virtual_now(clock.now() + 100);
+        let mut demoted = Vec::new();
+        evict(&layer, &hashtable, &mut |key, ttl| {
+            demoted.push((String::from_utf8(key.to_vec()).unwrap(), ttl));
+        });
+        drop(clock);
+        (demoted, hashtable, layer)
+    }
+
+    fn nonblocking(l: &TtlLayer, h: &MultiChoiceHashtable, d: &mut dyn FnMut(&[u8], Duration)) {
+        let result = l.evict_nonblocking_with_demoter(h, |k, _, _, ttl, _| d(k, ttl));
+        assert!(matches!(result, EvictResult::Freed), "{result:?}");
+    }
+
+    fn blocking(l: &TtlLayer, h: &MultiChoiceHashtable, d: &mut dyn FnMut(&[u8], Duration)) {
+        assert!(l.evict_with_demoter(h, |k, _, _, ttl, _| d(k, ttl)));
+    }
+
+    fn index(key: &str) -> usize {
+        key[1..].parse().unwrap()
+    }
+
+    /// At threshold 0 everything merge prunes goes down, and nothing it
+    /// keeps does. Both entry points, since `TieredCache` drives one and the
+    /// `Layer` trait exposes the other.
+    #[test]
+    fn merge_demotes_what_it_prunes_and_nothing_it_keeps() {
+        for (name, evict) in [
+            (
+                "nonblocking",
+                nonblocking as fn(&_, &_, &mut dyn FnMut(&[u8], Duration)),
+            ),
+            ("blocking", blocking),
+        ] {
+            let (demoted, hashtable, layer) = run(0, 0, evict);
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+
+            // Merge consumed at least the two head candidates: 64 items, of
+            // which the 16 hot ones were kept.
+            assert!(
+                demoted.len() >= 48,
+                "{name}: only {} demoted",
+                demoted.len()
+            );
+            assert_eq!(demoted.len() % 24, 0, "{name}: part of a candidate demoted");
+            for (key, _) in &demoted {
+                assert_ne!(reads(index(key)), 3, "{name}: kept item {key} was demoted");
+            }
+            // And a whole-segment eviction would have demoted the hot items
+            // too: they are still indexed in RAM.
+            for i in (0..demoted.len() / 24 * 32).step_by(4) {
+                assert!(
+                    hashtable
+                        .lookup(format!("k{i:06}").as_bytes(), &verifier)
+                        .is_some(),
+                    "{name}: hot item {i} is not in RAM"
+                );
+            }
+        }
+    }
+
+    /// At threshold 1 an item nobody read is pruned but not demoted.
+    #[test]
+    fn a_demotion_threshold_filters_what_merge_prunes() {
+        let (demoted, _, _) = run(1, 0, nonblocking);
+        assert!(!demoted.is_empty(), "nothing demoted");
+        for (key, _) in &demoted {
+            assert_eq!(
+                reads(index(key)),
+                1,
+                "{key} demoted with {} reads",
+                reads(index(key))
+            );
+        }
+    }
+
+    /// A demoted item keeps what is left of its segment's deadline. Handing
+    /// down the original TTL would extend it by the 100s already spent.
+    #[test]
+    fn a_demoted_item_is_handed_its_remaining_ttl() {
+        let (demoted, _, _) = run(0, 0, nonblocking);
+        assert!(!demoted.is_empty(), "nothing demoted");
+        for (key, ttl) in &demoted {
+            assert!(
+                *ttl <= TTL - Duration::from_secs(100),
+                "{key} was handed {ttl:?}, past its deadline"
+            );
+            assert!(!ttl.is_zero(), "{key} was handed an expired TTL");
+        }
+    }
+
+    /// An item the hashtable has lost has nothing to point at the copy, so
+    /// demoting it would only spend the lower layer's space.
+    #[test]
+    fn an_item_the_hashtable_has_lost_is_never_demoted() {
+        let (demoted, _, _) = run(0, 8, nonblocking);
+        assert!(!demoted.is_empty(), "nothing demoted");
+        for (key, _) in &demoted {
+            assert!(key.starts_with('k'), "lost item {key} was demoted");
         }
     }
 }
