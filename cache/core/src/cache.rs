@@ -423,6 +423,10 @@ pub struct CacheStats {
     pub compactions: AtomicU64,
     /// Duration of eviction passes. See [`CacheInternalStats::eviction_latency`].
     pub eviction_latency: crate::latency::LatencyHistogram,
+    /// See [`CacheInternalStats::disk_hits`].
+    pub disk_hits: AtomicU64,
+    /// See [`CacheInternalStats::demoted_bytes`].
+    pub demoted_bytes: AtomicU64,
 }
 
 impl CacheStats {
@@ -435,6 +439,8 @@ impl CacheStats {
             compactions: AtomicU64::new(0),
             expirations: AtomicU64::new(0),
             eviction_latency: crate::latency::LatencyHistogram::new(),
+            disk_hits: AtomicU64::new(0),
+            demoted_bytes: AtomicU64::new(0),
         }
     }
 
@@ -453,6 +459,8 @@ impl CacheStats {
             compactions: self.compactions.load(Ordering::Relaxed),
             expirations: self.expirations.load(Ordering::Relaxed),
             eviction_latency: self.eviction_latency.snapshot(),
+            disk_hits: self.disk_hits.load(Ordering::Relaxed),
+            demoted_bytes: self.demoted_bytes.load(Ordering::Relaxed),
             ..Default::default()
         }
     }
@@ -943,7 +951,7 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Find the layer containing this item
         let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
-        let layer = self.layers.get(layer_idx)?;
+        let layer = self.read_layer(layer_idx)?;
 
         // Get value from layer
         layer.get_value(item_loc, key)
@@ -965,7 +973,7 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Find the layer containing this item
         let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
-        let layer = self.layers.get(layer_idx)?;
+        let layer = self.read_layer(layer_idx)?;
 
         // Call function with item
         layer.with_item(item_loc, key, f)
@@ -987,7 +995,7 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Find the layer containing this item
         let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
-        let layer = self.layers.get(layer_idx)?;
+        let layer = self.read_layer(layer_idx)?;
 
         // Get raw pointers from layer
         let (ref_count_ptr, value_ptr, value_len, metadata_ptr, free_queue_ptr, segment_id) =
@@ -1030,7 +1038,7 @@ impl<H: Hashtable> TieredCache<H> {
         let Some(layer_idx) = self.layer_for_pool(item_loc.pool_id()) else {
             return LookupResult::Miss;
         };
-        let Some(layer) = self.layers.get(layer_idx) else {
+        let Some(layer) = self.read_layer(layer_idx) else {
             return LookupResult::Miss;
         };
 
@@ -1109,7 +1117,7 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Find the layer containing this item
         let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
-        let layer = self.layers.get(layer_idx)?;
+        let layer = self.read_layer(layer_idx)?;
 
         // Get the segment to retrieve its generation
         let segment = layer.get_segment(item_loc.segment_id(layer.layout()))?;
@@ -1143,7 +1151,7 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Find the layer containing this item
         let layer_idx = self.layer_for_pool(item_loc.pool_id())?;
-        let layer = self.layers.get(layer_idx)?;
+        let layer = self.read_layer(layer_idx)?;
 
         // Get the segment to retrieve its generation
         let segment = layer.get_segment(item_loc.segment_id(layer.layout()))?;
@@ -1702,6 +1710,10 @@ impl<H: Hashtable> TieredCache<H> {
                     // preserve_freq=true to keep the frequency counter
                     hashtable.cas_location(key, old_location, new_location.to_location(), true);
                     stats.demotions.fetch_add(1, Ordering::Relaxed);
+                    stats.demoted_bytes.fetch_add(
+                        (key.len() + value.len() + optional.len()) as u64,
+                        Ordering::Relaxed,
+                    );
                 } else {
                     // Target write failed (staging pool exhausted), discard item
                     stats.demotion_failures.fetch_add(1, Ordering::Relaxed);
@@ -1781,6 +1793,17 @@ impl<H: Hashtable> TieredCache<H> {
         {
             self.stats.compactions.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The layer a read resolved to, counting it in `disk_hits` when that
+    /// layer is on disk.
+    #[inline]
+    fn read_layer(&self, layer_idx: usize) -> Option<&CacheLayer> {
+        let layer = self.layers.get(layer_idx)?;
+        if layer.is_disk() {
+            self.stats.disk_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(layer)
     }
 
     /// Find the layer index for a given pool_id.
