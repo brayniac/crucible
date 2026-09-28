@@ -100,9 +100,9 @@ impl DiskLayer {
 
     /// Get current time as coarse seconds.
     fn now_secs() -> u32 {
-        clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs()
+        // The cache's clock, as every RAM layer reads it -- not the system
+        // clock, which a trace replay does not drive.
+        crate::clock::now_unix_secs()
     }
 
     /// Reset the layer to its freshly built state: empty TTL buckets, no
@@ -1149,6 +1149,39 @@ mod tests {
 
         layer.process_evicted_segment(segment_id, &hashtable);
         assert_all_removed(&layer, &hashtable, &keys);
+    }
+
+    /// Expiry runs on the cache's clock, the one every RAM layer uses. On the
+    /// system clock instead, a trace replay (which drives the cache's clock
+    /// from record timestamps) stamped disk deadlines in wall time and
+    /// served demoted items long past their TTL.
+    #[test]
+    fn a_disk_item_expires_on_the_cache_clock() {
+        let clock = crate::clock::TestClock::start();
+        let (_dir, layer) = create_test_layer();
+        let ttl = Duration::from_secs(60);
+        let loc = layer.write_item(b"key", b"value", b"", ttl).expect("write");
+
+        let segment = layer
+            .pool
+            .get(loc.segment_id(layer.pool.layout()))
+            .expect("segment");
+        assert!(
+            segment.expire_at() <= clock.now() + 60,
+            "deadline {} is past now + ttl ({})",
+            segment.expire_at(),
+            clock.now() + 60
+        );
+        assert!(
+            layer.get_item(loc, b"key").is_some(),
+            "unexpired item missing"
+        );
+
+        crate::clock::set_virtual_now(clock.now() + 61);
+        assert!(
+            layer.get_item(loc, b"key").is_none(),
+            "served 61s into a 60s TTL"
+        );
     }
 
     /// A location from a previous incarnation must not resolve, even though

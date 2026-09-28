@@ -138,9 +138,9 @@ impl IoUringDiskLayer {
 
     /// Get current time as coarse seconds.
     fn now_secs() -> u32 {
-        clocksource::coarse::UnixInstant::now()
-            .duration_since(clocksource::coarse::UnixInstant::EPOCH)
-            .as_secs()
+        // The cache's clock, as every RAM layer reads it -- not the system
+        // clock, which a trace replay does not drive.
+        crate::clock::now_unix_secs()
     }
 
     /// Write an item to the disk layer.
@@ -1292,6 +1292,27 @@ mod tests {
             .segment_size(64 * 1024)
             .segment_count(4)
             .build()
+    }
+
+    /// Deadlines are stamped on the cache's clock, as on every RAM layer.
+    /// See `DiskLayer`'s `a_disk_item_expires_on_the_cache_clock`.
+    #[test]
+    fn a_disk_segment_deadline_is_on_the_cache_clock() {
+        let clock = crate::clock::TestClock::start();
+        let layer = test_layer();
+        let loc = layer
+            .write_item(b"key", b"value", b"", Duration::from_secs(60))
+            .expect("write");
+        let segment = layer
+            .pool
+            .get(loc.segment_id(layer.pool.layout()))
+            .expect("segment");
+        assert!(
+            segment.expire_at() <= clock.now() + 60,
+            "deadline {} is past now + ttl ({})",
+            segment.expire_at(),
+            clock.now() + 60
+        );
     }
 
     /// The demotion threshold the frequency tests configure their layer with.
