@@ -203,8 +203,12 @@ None yet. A design spec under `docs/superpowers/specs/` if this reaches GO.
   reclaimed. It is now treated as absent. The error for the disk case is a
   stopgap; the design above promotes the counter back into RAM (the async
   path GET already takes), which would let incr succeed.
-- **ADD on an expired key returns `KeyExists`** for the same reason: the
-  hashtable's `contains` does not check expiry. Not yet fixed.
+- **Every operation that decides on presence now checks expiry.** The
+  hashtable indexes an expired item until its segment is reclaimed. ADD,
+  REPLACE and CAS used to trust that, and now retire the expired entry
+  first, as incr and decr do: ADD stores, REPLACE and CAS answer not found.
+  Keep this in mind for any new operation that asks the hashtable whether
+  a key exists.
 - **Slab and heap** expire on the system clock (`cache/slab/src/item.rs`,
   `cache/heap/src/entry.rs`). Slab also subtracts a 2024 base epoch that
   replayed timestamps saturate. Their TTL results under trace replay are
