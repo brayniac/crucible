@@ -163,11 +163,18 @@ pub struct DiskConfig {
     #[serde(default = "default_disk_size", deserialize_with = "deserialize_size")]
     pub size: usize,
 
-    /// Frequency threshold for promoting items from disk to RAM.
-    /// Items with frequency > threshold are promoted on read.
-    /// Default: 2
+    /// Read on which a disk item is promoted back to RAM: 2 (the default)
+    /// promotes it on its second read. Slab backend only; the segment
+    /// backend accepts it but does not yet use it.
     #[serde(default = "default_promotion_threshold")]
     pub promotion_threshold: u8,
+
+    /// Reads an item evicted from RAM needs to be demoted to disk rather
+    /// than discarded. 0 (the default) demotes every evicted item, as the
+    /// tier always has; 1 demotes only items read at least once. Segment
+    /// backend only.
+    #[serde(default)]
+    pub demotion_threshold: u8,
 
     /// Synchronization mode for disk writes: "sync", "async", or "none".
     /// - sync: fsync after each write (safest, slowest)
@@ -1175,6 +1182,7 @@ mod tests {
             path: default_disk_path(),
             size: default_disk_size(),
             promotion_threshold: default_promotion_threshold(),
+            demotion_threshold: 0,
             sync_mode: DiskSyncMode::default(),
             recover_on_startup: true,
         });
@@ -1193,6 +1201,7 @@ mod tests {
             path: default_disk_path(),
             size: default_disk_size(),
             promotion_threshold: default_promotion_threshold(),
+            demotion_threshold: 0,
             sync_mode: DiskSyncMode::default(),
             recover_on_startup: true,
         });
@@ -1211,6 +1220,7 @@ mod tests {
             path: default_disk_path(),
             size: default_disk_size(),
             promotion_threshold: default_promotion_threshold(),
+            demotion_threshold: 0,
             sync_mode: DiskSyncMode::default(),
             recover_on_startup: true,
         });
@@ -1228,6 +1238,7 @@ mod tests {
             path: default_disk_path(),
             size: default_disk_size(),
             promotion_threshold: default_promotion_threshold(),
+            demotion_threshold: 0,
             sync_mode: DiskSyncMode::default(),
             recover_on_startup: true,
         });

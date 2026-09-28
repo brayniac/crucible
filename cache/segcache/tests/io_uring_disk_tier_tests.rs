@@ -27,6 +27,7 @@ fn create_small_disk_cache() -> SegCache {
             block_size: 4096,
             promotion_threshold: 2,
             write_buffer_count: 4,
+            demotion_threshold: 0,
         })
         .build()
         .expect("Failed to create cache with io_uring disk tier")
@@ -69,6 +70,55 @@ fn test_demotion_happens() {
         stats.demotions > 0,
         "Expected demotions > 0, got {}. Items are not being demoted to disk.",
         stats.demotions
+    );
+}
+
+/// `demotion_threshold` gates which RAM evictions reach disk. A write is
+/// not a read, so at 1 an item nobody read is discarded, not demoted.
+#[test]
+fn demotion_threshold_one_demotes_only_items_that_were_read() {
+    let build = |demotion_threshold| {
+        SegCacheBuilder::new()
+            .heap_size(8 * 1024 * 1024)
+            .segment_size(1024 * 1024)
+            .hashtable_power(14)
+            .io_uring_disk_tier(IoUringDiskTierConfig {
+                segment_count: 8,
+                block_size: 4096,
+                promotion_threshold: 2,
+                write_buffer_count: 4,
+                demotion_threshold,
+            })
+            .build()
+            .expect("Failed to create cache with io_uring disk tier")
+    };
+    let fill = |cache: &SegCache, read: usize| {
+        for i in 0..8000 {
+            let key = format!("k:{}", i);
+            cache
+                .set(key.as_bytes(), &make_value(i), Duration::from_secs(3600))
+                .unwrap_or_else(|e| panic!("SET failed for key {}: {:?}", i, e));
+            // Read the first `read` items once while they are still in RAM.
+            if i < read {
+                assert!(cache.get(key.as_bytes()).is_some());
+            }
+        }
+        cache.internal_stats().unwrap().demotions
+    };
+
+    let unread = fill(&build(1), 0);
+    assert_eq!(unread, 0, "threshold 1 demoted {unread} items nobody read");
+
+    let read = fill(&build(1), 1000);
+    assert!(
+        read > 0 && read <= 1000,
+        "threshold 1 should demote only the 1000 read items, demoted {read}"
+    );
+
+    let all = fill(&build(0), 0);
+    assert!(
+        all > 1000,
+        "threshold 0 should demote unread items, demoted {all}"
     );
 }
 
