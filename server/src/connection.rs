@@ -176,6 +176,10 @@ enum StreamingState {
 pub struct PendingDiskReadInfo {
     /// Disk read parameters from the cache layer.
     pub params: cache_core::DiskReadParams,
+    /// The key the read is for. The index matched it on a tag alone -- a
+    /// committed disk segment has no bytes in memory to compare against --
+    /// so the item the read returns must be checked against it.
+    pub key: Vec<u8>,
     /// Protocol context for building the response on completion.
     pub response_ctx: crate::disk_io::DiskReadResponseCtx,
 }
@@ -484,9 +488,12 @@ impl Connection {
                                 continue;
                             }
                             LookupResult::DiskRead(params) => {
+                                // Copied before `consume` releases the bytes it borrows.
+                                let key = key.to_vec();
                                 buf.consume(consumed);
                                 // Stall pipeline: save params for handler to submit io_uring read
                                 self.pending_disk_read = Some(PendingDiskReadInfo {
+                                    key,
                                     params,
                                     response_ctx: crate::disk_io::DiskReadResponseCtx::Resp,
                                 });
@@ -851,6 +858,7 @@ impl Connection {
                             }
                             LookupResult::DiskRead(params) => {
                                 self.pending_disk_read = Some(PendingDiskReadInfo {
+                                    key: key.to_vec(),
                                     params,
                                     response_ctx:
                                         crate::disk_io::DiskReadResponseCtx::MemcacheAscii {
@@ -1233,6 +1241,7 @@ impl Connection {
                                         _ => unreachable!(),
                                     };
                                     self.pending_disk_read = Some(PendingDiskReadInfo {
+                                        key: key.to_vec(),
                                         params,
                                         response_ctx:
                                             crate::disk_io::DiskReadResponseCtx::MemcacheBinary {

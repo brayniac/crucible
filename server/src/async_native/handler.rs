@@ -576,47 +576,15 @@ async fn submit_and_await_disk_read<C: Cache>(
 
     let item_offset = pending_info.params.item_offset as usize;
     let buf_slice = unsafe { buffer.as_slice(pending_info.params.read_len as usize) };
-    let header_size = cache_core::BasicHeader::SIZE;
-
-    if item_offset + header_size > buf_slice.len() {
+    let Some(value_bytes) =
+        crate::disk_io::value_from_disk_read(buf_slice, item_offset, &pending_info.key)
+    else {
         DISK_READ_MISSES.increment();
         MISSES.increment();
         connection.write_miss_response();
         release_read!(buffer);
         return Ok(());
-    }
-
-    // Decoded from a private copy. `BasicHeader::from_ptr` reads the flags byte
-    // through an atomic view, which needs provenance permitting writes, and a
-    // `&[u8]` cannot give that. Unlike segment memory this buffer is a
-    // completed io_uring read that no other thread touches, so copying the
-    // header out is sound and keeps the atomic view off a read-only reference.
-    let mut header_bytes = [0u8; cache_core::BasicHeader::SIZE];
-    header_bytes.copy_from_slice(&buf_slice[item_offset..item_offset + header_size]);
-    let header = unsafe { cache_core::BasicHeader::from_ptr(header_bytes.as_mut_ptr()) };
-
-    if header.is_deleted() {
-        DISK_READ_MISSES.increment();
-        MISSES.increment();
-        connection.write_miss_response();
-        release_read!(buffer);
-        return Ok(());
-    }
-
-    let key_start = item_offset + header_size + header.optional_len() as usize;
-    let value_start = key_start + header.key_len() as usize;
-    let value_len = header.value_len() as usize;
-    let value_end = value_start + value_len;
-
-    if value_end > buf_slice.len() {
-        DISK_READ_MISSES.increment();
-        MISSES.increment();
-        connection.write_miss_response();
-        release_read!(buffer);
-        return Ok(());
-    }
-
-    let value_bytes = &buf_slice[value_start..value_end];
+    };
     DISK_READ_HITS.increment();
     HITS.increment();
     connection.write_disk_read_response(&pending_info.response_ctx, value_bytes);

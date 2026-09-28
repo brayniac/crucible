@@ -51,6 +51,48 @@ pub struct PendingDiskRead {
     pub response_ctx: DiskReadResponseCtx,
 }
 
+/// The value a completed disk read holds for `key`, or `None` to answer a
+/// miss.
+///
+/// `item_offset` is where the item starts within `buf`, the bytes the read
+/// returned. A deleted item, one that does not fit in `buf`, or one stored
+/// under a different key is a miss.
+///
+/// The key check is the one the index could not make. A committed disk
+/// segment has no bytes in memory, so the hashtable matched this item on its
+/// 12-bit tag alone; about one lookup in 4,096 per occupied slot names some
+/// other key's item. Serving it would answer with another key's value.
+pub(crate) fn value_from_disk_read<'a>(
+    buf: &'a [u8],
+    item_offset: usize,
+    key: &[u8],
+) -> Option<&'a [u8]> {
+    let header_size = cache_core::BasicHeader::SIZE;
+    if item_offset + header_size > buf.len() {
+        return None;
+    }
+
+    // Decoded from a private copy. `BasicHeader::from_ptr` reads the flags
+    // byte through an atomic view, which needs provenance permitting writes,
+    // and a `&[u8]` cannot give that. `buf` is a completed read no other
+    // thread touches, so copying the header out is sound and keeps the atomic
+    // view off a read-only reference.
+    let mut header_bytes = [0u8; cache_core::BasicHeader::SIZE];
+    header_bytes.copy_from_slice(&buf[item_offset..item_offset + header_size]);
+    let header = unsafe { cache_core::BasicHeader::from_ptr(header_bytes.as_mut_ptr()) };
+    if header.is_deleted() {
+        return None;
+    }
+
+    let key_start = item_offset + header_size + header.optional_len() as usize;
+    let value_start = key_start + header.key_len() as usize;
+    let value_end = value_start + header.value_len() as usize;
+    if buf.get(key_start..value_start)? != key {
+        return None;
+    }
+    buf.get(value_start..value_end)
+}
+
 /// Protocol-specific context saved when a disk read is initiated.
 ///
 /// Contains enough information to build the correct protocol response
@@ -161,5 +203,50 @@ impl DiskIoState {
             DiskBackend::Nvme { block_size, .. } => *block_size,
             DiskBackend::DirectIo { block_size, .. } => *block_size,
         }
+    }
+}
+
+#[cfg(test)]
+mod value_from_disk_read_tests {
+    use super::value_from_disk_read;
+    use cache_core::BasicHeader;
+
+    /// An item as a disk segment holds it: header, key, value.
+    fn item(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; BasicHeader::SIZE];
+        BasicHeader::new(key.len() as u8, 0, value.len() as u32).to_bytes(&mut buf);
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    #[test]
+    fn the_requested_key_reads_its_value() {
+        let buf = item(b"key-a", b"value-a");
+        assert_eq!(
+            value_from_disk_read(&buf, 0, b"key-a"),
+            Some(&b"value-a"[..])
+        );
+
+        let mut padded = vec![0u8; 512];
+        padded.extend_from_slice(&buf);
+        assert_eq!(
+            value_from_disk_read(&padded, 512, b"key-a"),
+            Some(&b"value-a"[..])
+        );
+    }
+
+    /// The index matches a committed disk item on a 12-bit tag alone, so a
+    /// read can return a different key's item. Serving its value answers the
+    /// request with another key's data.
+    #[test]
+    fn another_keys_item_is_a_miss() {
+        let buf = item(b"key-a", b"value-a");
+        assert_eq!(value_from_disk_read(&buf, 0, b"key-b"), None, "same length");
+        assert_eq!(
+            value_from_disk_read(&buf, 0, b"other-key"),
+            None,
+            "different length"
+        );
     }
 }
