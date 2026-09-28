@@ -25,11 +25,13 @@ part of this entry.
 
 GO on building the shadow region needs all of:
 
-- **Write tail.** The segment-size latency run shows merge's inline eviction
-  stalls in the `set` tail are worth removing at the segment sizes that fix
-  early expiry (256KB-64KB). If per-pass stalls at 64KB are small, the case
-  rests on disk writes and warm restart alone. That is weaker, and this
-  entry should say so before going further.
+- **The case, without the write tail.** This criterion originally asked
+  whether merge's inline stalls were worth removing. They are (see
+  Evidence), but the shadow region does not remove them: a clean eviction
+  skips the *demotion write*, and merge still copies retained items within
+  RAM. The case for this design therefore rests on disk writes,
+  useful promotion and warm restart. The tail is a separate lever
+  (Deferred).
 - **The prototype against today's merge demotion (#11)**, on the same
   A/B grid:
   - bytes written to disk no higher;
@@ -78,6 +80,14 @@ replay and its miss oracle:
   Tail latency is being measured now.
 - **`demotion_threshold` stays 0 under merge.** Merge has already filtered
   what it prunes, and a second filter only costs hits.
+- **Small segments move merge's stall into p99.** Merge, no disk, three
+  reps on one pinned host. A pass costs in proportion to segment size, and
+  total stall time barely changes. From 1MB to 64KB:
+  - write p99.99 falls about 10x, from 3-5ms to 0.3-0.6ms;
+  - write p99.9 rises 7x, and 256KB is its worst size (514-840us);
+  - write p99 rises 7-41x at 64KB, to 42-172us;
+  - reads do not move.
+  cluster14 (no TTLs) gains nothing in miss ratio and pays the worst p99.
 - **Frequency counts reads (#9).** Inserts start at 0, so a threshold means
   reads.
 - **Disk-tier counters (#10):** `disk_hits` and `demoted_bytes`.
@@ -161,22 +171,32 @@ ever holds a reference into counter storage.
 
 ## Outcome
 
-Open. Waiting on two measurements:
+Open, paused by choice.
 
-1. **The segment-size latency run:** merge, no disk, 1MB/256KB/64KB,
-   interleaved on one pinned host, three reps. Prediction, stated before
-   the results: per-pass stalls and max write latency fall with segment
-   size, write p99.9 rises at 64KB, p99 does not move.
+1. **The segment-size latency run: done** (Evidence). Predicted: per-pass
+   stalls and the max fall with segment size, p99.9 rises at 64KB, p99 does
+   not move. The first two held; p99 rose 7-41x at 64KB, which refutes the
+   third. The run did not gate this design as written: merge copies within
+   RAM whatever the tier layout (Decision Criteria).
 2. **The incr/decr census** across the trace corpus: share of ops and
    concentration on few keys, per cluster. Not started.
 
-Restart condition: both results in hand.
+Restart condition: the census, and a decision to prototype.
 
 ## Derived Documents
 
 None yet. A design spec under `docs/superpowers/specs/` if this reaches GO.
 
 ## Deferred or Reopen Items
+
+- **Take eviction off the write path.** Keeping free segments ahead of
+  demand in the background would remove merge's stall from `set` at any
+  segment size. At 64KB that stall now sits in p99. This is orthogonal to
+  the tier layout and may matter more than it.
+- **No single segment size fits every workload.** It trades early
+  expiry against the write tail, and a trace without TTLs gets only the
+  cost. A per-deployment setting, or buckets sized by TTL, rather than one
+  new default.
 
 - **Likely hang, found by reading and not reproduced:**
   `IoUringDiskLayer::get_item` returns `None` for an item on a committed
