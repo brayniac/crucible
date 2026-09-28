@@ -145,7 +145,7 @@ All storage backends share a **lock-free hashtable** with optional tiering:
 
 | Backend | Available Policies |
 |---------|-------------------|
-| `segment` | `s3fifo` (default), `fifo`, `random`, `cte`, `merge` |
+| `segment` | `merge` (default), `s3fifo`, `fifo`, `random`, `cte` |
 | `slab` | `lra` (default), `lrc`, `random`, `none` |
 | `heap` | `s3fifo` (default), `lfu` |
 

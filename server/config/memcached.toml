@@ -34,7 +34,7 @@ threads = 4
 [cache]
 # Slab backend with LRA eviction - most similar to Memcached's slab allocator
 # Alternatives:
-#   backend = "segment", policy = "s3fifo" - better hit rates
+#   backend = "segment", policy = "merge" - better hit rates
 #   backend = "heap", policy = "lfu" - no internal fragmentation
 backend = "slab"
 policy = "lra"
