@@ -1364,12 +1364,10 @@ impl<H: Hashtable> TieredCache<H> {
                 }
                 Some((None, _)) => return Err(CacheError::NotNumeric),
                 None => {
-                    // with_value_cas returns None both when the key is absent
-                    // and when the item is transiently unreadable (e.g. its
-                    // segment is mid-migration). Only treat the key as absent
-                    // if the hashtable agrees; otherwise retry.
-                    let verifier = self.create_key_verifier();
-                    if self.hashtable.contains(key, &verifier) {
+                    // with_value_cas returns None when the key is absent, and
+                    // also for three states of a key the hashtable still
+                    // indexes. Only a transient one is worth a retry.
+                    if self.retry_unreadable(key)? {
                         continue;
                     }
                     match initial {
@@ -1387,6 +1385,56 @@ impl<H: Hashtable> TieredCache<H> {
                 }
             }
         }
+    }
+
+    /// Decide what a read-modify-write loop does about a key it could not
+    /// read: `Ok(true)` to retry, `Ok(false)` to treat the key as absent, or
+    /// an error.
+    ///
+    /// Retrying blindly whenever the hashtable still indexes the key spun
+    /// forever in two states nothing between retries would change:
+    ///
+    /// - **Expired, not yet reclaimed.** The read path refuses it and the
+    ///   hashtable, which does not check expiry, still indexes it. Absent is
+    ///   the right answer, so the stale entry is removed -- matched on its
+    ///   exact location, so a concurrent overwrite is never lost -- and the
+    ///   caller retries into its absent path.
+    /// - **Only on a committed io_uring disk segment.** That read has to go
+    ///   through the ring, which a synchronous caller cannot drive. Reported
+    ///   as `SegmentNotAccessible` rather than guessed at.
+    ///
+    /// Anything else indexed is mid-move (a merge relink, a drain) and a
+    /// retry will find it.
+    fn retry_unreadable(&self, key: &[u8]) -> CacheResult<bool> {
+        let verifier = self.create_key_verifier();
+        let Some((location, _)) = self.hashtable.lookup(key, &verifier) else {
+            return Ok(false);
+        };
+        let item_loc = ItemLocation::from_location(location);
+        let Some(layer) = self
+            .layer_for_pool(item_loc.pool_id())
+            .and_then(|idx| self.layers.get(idx))
+        else {
+            return Ok(true);
+        };
+
+        // `item_ttl` is `None` for an item that is expired or not found, and
+        // the hashtable has just located it.
+        if layer.item_ttl(item_loc).is_none() {
+            self.hashtable.remove(key, location);
+            return Ok(true);
+        }
+
+        if let CacheLayer::IoUringDisk(disk) = layer
+            && disk
+                .pool()
+                .get_meta(item_loc.segment_id(disk.pool().layout()))
+                .is_some_and(|meta| !meta.has_write_buffer())
+        {
+            return Err(CacheError::SegmentNotAccessible);
+        }
+
+        Ok(true)
     }
 
     /// Atomically decrement a numeric value stored as ASCII decimal.
@@ -1437,12 +1485,10 @@ impl<H: Hashtable> TieredCache<H> {
                 }
                 Some((None, _)) => return Err(CacheError::NotNumeric),
                 None => {
-                    // with_value_cas returns None both when the key is absent
-                    // and when the item is transiently unreadable (e.g. its
-                    // segment is mid-migration). Only treat the key as absent
-                    // if the hashtable agrees; otherwise retry.
-                    let verifier = self.create_key_verifier();
-                    if self.hashtable.contains(key, &verifier) {
+                    // with_value_cas returns None when the key is absent, and
+                    // also for three states of a key the hashtable still
+                    // indexes. Only a transient one is worth a retry.
+                    if self.retry_unreadable(key)? {
                         continue;
                     }
                     match initial {
@@ -2684,6 +2730,99 @@ mod tests {
     /// since admission". Inserts used to start at 1, so an item nobody ever
     /// read already passed a threshold of 1: S3-FIFO's admission queue
     /// promoted every write and filtered nothing.
+    /// An expired counter is absent to incr and decr, not a key to wait on.
+    ///
+    /// The hashtable does not check expiry, so it indexes an expired item
+    /// until its segment is reclaimed, while every read refuses it. The
+    /// read-modify-write loops retried on "indexed but unreadable", and
+    /// nothing between retries reclaims the segment: they never returned.
+    #[test]
+    fn incr_and_decr_treat_an_expired_counter_as_absent() {
+        // (op, initial, expected). Without `initial` an absent key is
+        // KeyNotFound (memcache); with it, a fresh counter (Redis).
+        type Op = fn(&TieredCache<MultiChoiceHashtable>, Option<u64>) -> CacheResult<u64>;
+        let incr: Op = |c, init| c.increment(b"c", 1, init, Duration::from_secs(60));
+        let decr: Op = |c, init| c.decrement(b"c", 1, init, Duration::from_secs(60));
+        let cases: [(&str, Op, Option<u64>, CacheResult<u64>); 4] = [
+            ("increment", incr, None, Err(CacheError::KeyNotFound)),
+            ("increment", incr, Some(0), Ok(1)),
+            ("decrement", decr, None, Err(CacheError::KeyNotFound)),
+            ("decrement", decr, Some(5), Ok(4)),
+        ];
+        for (name, op, initial, want) in cases {
+            let cache = Arc::new(create_test_cache());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = cache.clone();
+            std::thread::spawn(move || {
+                // The virtual clock is per thread, so it is set here.
+                crate::clock::set_virtual_now(1_000_000);
+                worker
+                    .set(b"c", b"10", b"", Duration::from_secs(60))
+                    .unwrap();
+                crate::clock::set_virtual_now(1_000_061);
+                assert!(worker.get(b"c").is_none(), "precondition: expired");
+                let got = op(&worker, initial);
+                let after = worker.get(b"c");
+                let _ = tx.send((got, after));
+            });
+            // Generous under Miri, which runs this orders of magnitude slower
+            // against the real clock; a hang is still a hang at ten minutes.
+            let deadline = Duration::from_secs(if cfg!(miri) { 600 } else { 5 });
+            let (got, after) = rx.recv_timeout(deadline).unwrap_or_else(|_| {
+                panic!("{name} {initial:?} on an expired counter did not return")
+            });
+            assert_eq!(got, want, "{name} with initial {initial:?}");
+            let want_after = want.ok().map(|v| v.to_string().into_bytes());
+            assert_eq!(
+                after, want_after,
+                "{name} with initial {initial:?} left the wrong value"
+            );
+        }
+    }
+
+    /// A live key that a read could not reach is retried and left alone.
+    ///
+    /// Asked directly, because incr only asks after a failed read, and a live
+    /// key reads fine: a rule that dropped live keys as if expired would pass
+    /// every incr test and delete items caught mid-move.
+    #[test]
+    fn an_unreadable_live_key_is_retried_not_removed() {
+        let _clock = crate::clock::TestClock::start();
+        let cache = create_test_cache();
+        cache
+            .set(b"c", b"10", b"", Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(cache.retry_unreadable(b"c"), Ok(true));
+        assert_eq!(
+            cache.get(b"c").as_deref(),
+            Some(&b"10"[..]),
+            "a live key was dropped"
+        );
+        assert_eq!(
+            cache.retry_unreadable(b"missing"),
+            Ok(false),
+            "absent is not a retry"
+        );
+    }
+
+    /// The control: a live counter is not mistaken for an expired one.
+    #[test]
+    fn incr_on_a_live_counter_is_unchanged() {
+        let _clock = crate::clock::TestClock::start();
+        let cache = create_test_cache();
+        cache
+            .set(b"c", b"10", b"", Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            cache.increment(b"c", 1, Some(0), Duration::from_secs(60)),
+            Ok(11)
+        );
+        assert_eq!(
+            cache.decrement(b"c", 2, None, Duration::from_secs(60)),
+            Ok(9)
+        );
+    }
+
     #[test]
     fn a_write_is_not_an_access() {
         let clock = crate::clock::TestClock::start();
