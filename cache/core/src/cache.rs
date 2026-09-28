@@ -871,9 +871,10 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// Returns error if key already exists.
     pub fn add(&self, key: &[u8], value: &[u8], optional: &[u8], ttl: Duration) -> CacheResult<()> {
-        // Check if key exists first
+        // Check if key exists first. An expired entry is still indexed, so it
+        // is retired here rather than counted as the key existing.
         let verifier = self.create_key_verifier();
-        if self.hashtable.contains(key, &verifier) {
+        if self.hashtable.contains(key, &verifier) && !self.remove_if_expired(key) {
             return Err(CacheError::KeyExists);
         }
 
@@ -910,8 +911,9 @@ impl<H: Hashtable> TieredCache<H> {
     ) -> CacheResult<()> {
         let verifier = self.create_key_verifier();
 
-        // Check if key exists
-        if !self.hashtable.contains(key, &verifier) {
+        // Check if key exists. An expired entry is still indexed, and storing
+        // over it would bring the key back.
+        if !self.hashtable.contains(key, &verifier) || self.remove_if_expired(key) {
             return Err(CacheError::KeyNotFound);
         }
 
@@ -1187,6 +1189,12 @@ impl<H: Hashtable> TieredCache<H> {
         ttl: Duration,
         cas_token: CasToken,
     ) -> CacheResult<bool> {
+        // A token taken while the item was live still matches after it
+        // expires, and CAS never reads the item; storing would bring it back.
+        if self.remove_if_expired(key) {
+            return Err(CacheError::KeyNotFound);
+        }
+
         let verifier = self.create_key_verifier();
 
         // Lookup current item
@@ -1387,6 +1395,39 @@ impl<H: Hashtable> TieredCache<H> {
         }
     }
 
+    /// Retire `key`'s hashtable entry if the item it points at has expired,
+    /// returning whether it did.
+    ///
+    /// The hashtable does not check expiry: it indexes an expired item until
+    /// its segment is reclaimed, so "is the key present" answers yes for a
+    /// key every read treats as gone. Anything that decides on presence --
+    /// ADD, REPLACE, incr and decr -- asks this first.
+    ///
+    /// The entry is removed only if it still points at the expired item, so
+    /// a concurrent write is never lost; the item is then marked deleted, as
+    /// `delete` does. Looking the key up here does not count as a read.
+    fn remove_if_expired(&self, key: &[u8]) -> bool {
+        let verifier = self.create_key_verifier();
+        let Some((_, packed)) = self.hashtable.lookup_for_tracking(key, &verifier) else {
+            return false;
+        };
+        let location = crate::hashtable_impl::Hashbucket::location(packed);
+        let item_loc = ItemLocation::from_location(location);
+        let Some(layer) = self
+            .layer_for_pool(item_loc.pool_id())
+            .and_then(|idx| self.layers.get(idx))
+        else {
+            return false;
+        };
+        // `item_ttl` is `None` for an item that is expired or not found, and
+        // the hashtable has just located it.
+        if layer.item_ttl(item_loc).is_some() || !self.hashtable.remove(key, location) {
+            return false;
+        }
+        self.mark_deleted_at(location);
+        true
+    }
+
     /// Decide what a read-modify-write loop does about a key it could not
     /// read: `Ok(true)` to retry, `Ok(false)` to treat the key as absent, or
     /// an error.
@@ -1406,6 +1447,9 @@ impl<H: Hashtable> TieredCache<H> {
     /// Anything else indexed is mid-move (a merge relink, a drain) and a
     /// retry will find it.
     fn retry_unreadable(&self, key: &[u8]) -> CacheResult<bool> {
+        if self.remove_if_expired(key) {
+            return Ok(true);
+        }
         let verifier = self.create_key_verifier();
         let Some((location, _)) = self.hashtable.lookup(key, &verifier) else {
             return Ok(false);
@@ -1417,13 +1461,6 @@ impl<H: Hashtable> TieredCache<H> {
         else {
             return Ok(true);
         };
-
-        // `item_ttl` is `None` for an item that is expired or not found, and
-        // the hashtable has just located it.
-        if layer.item_ttl(item_loc).is_none() {
-            self.hashtable.remove(key, location);
-            return Ok(true);
-        }
 
         if let CacheLayer::IoUringDisk(disk) = layer
             && disk
@@ -2778,6 +2815,87 @@ mod tests {
                 "{name} with initial {initial:?} left the wrong value"
             );
         }
+    }
+
+    /// ADD stores over an expired key, and REPLACE refuses one.
+    ///
+    /// The hashtable does not check expiry: it indexes an expired item until
+    /// its segment is reclaimed. Both used its "is the key present" answer
+    /// as-is, so ADD refused a key that is gone and REPLACE brought one back.
+    #[test]
+    fn add_and_replace_treat_an_expired_key_as_absent() {
+        let clock = crate::clock::TestClock::start();
+        let ttl = Duration::from_secs(60);
+
+        let cache = create_test_cache();
+        cache.set(b"k", b"old", b"", ttl).unwrap();
+        crate::clock::set_virtual_now(clock.now() + 61);
+        assert_eq!(
+            cache.add(b"k", b"new", b"", ttl),
+            Ok(()),
+            "ADD refused an expired key"
+        );
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"new"[..]));
+
+        let cache = create_test_cache();
+        crate::clock::set_virtual_now(clock.now());
+        cache.set(b"k", b"old", b"", ttl).unwrap();
+        crate::clock::set_virtual_now(clock.now() + 61);
+        assert_eq!(
+            cache.replace(b"k", b"new", b"", ttl),
+            Err(CacheError::KeyNotFound),
+            "REPLACE stored over an expired key"
+        );
+        assert_eq!(cache.get(b"k"), None, "REPLACE brought an expired key back");
+    }
+
+    /// CAS on a key that expired after its GETS is NOT_FOUND, not a store.
+    ///
+    /// CAS checks that the token's location and generation still match and
+    /// never reads the item, so the expired item's still-matching token let
+    /// it store over the key and bring it back.
+    #[test]
+    fn cas_on_a_key_that_expired_since_its_gets_is_not_found() {
+        let clock = crate::clock::TestClock::start();
+        let ttl = Duration::from_secs(60);
+        let cache = create_test_cache();
+        cache.set(b"k", b"old", b"", ttl).unwrap();
+        let (_, token) = cache.get_with_cas(b"k").expect("live at GETS");
+        crate::clock::set_virtual_now(clock.now() + 61);
+        assert_eq!(
+            cache.cas(b"k", b"new", b"", ttl, token),
+            Err(CacheError::KeyNotFound)
+        );
+        assert_eq!(cache.get(b"k"), None, "CAS brought an expired key back");
+
+        // The control: the same CAS before expiry stores.
+        crate::clock::set_virtual_now(clock.now());
+        let cache = create_test_cache();
+        cache.set(b"k", b"old", b"", ttl).unwrap();
+        let (_, token) = cache.get_with_cas(b"k").expect("live at GETS");
+        assert_eq!(cache.cas(b"k", b"new", b"", ttl, token), Ok(true));
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"new"[..]));
+    }
+
+    /// The control: on a live key ADD still refuses and REPLACE still stores.
+    #[test]
+    fn add_and_replace_on_a_live_key_are_unchanged() {
+        let _clock = crate::clock::TestClock::start();
+        let ttl = Duration::from_secs(60);
+        let cache = create_test_cache();
+        cache.set(b"k", b"old", b"", ttl).unwrap();
+        assert_eq!(
+            cache.add(b"k", b"new", b"", ttl),
+            Err(CacheError::KeyExists)
+        );
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"old"[..]));
+        assert_eq!(cache.replace(b"k", b"new", b"", ttl), Ok(()));
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"new"[..]));
+        assert_eq!(cache.add(b"absent", b"v", b"", ttl), Ok(()));
+        assert_eq!(
+            cache.replace(b"missing", b"v", b"", ttl),
+            Err(CacheError::KeyNotFound)
+        );
     }
 
     /// A live key that a read could not reach is retried and left alone.
