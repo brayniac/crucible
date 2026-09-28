@@ -19,7 +19,28 @@ env:
   DEFAULT_MAX_PREEMPTIONS: 3
 
 jobs:
+  # Gated like ci.yml's slow jobs: loom exercises cache-core alone. A manual
+  # dispatch always runs, since choosing it is the point.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      cache-core: ${{ steps.filter.outputs.cache-core }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            cache-core:
+              - 'cache/core/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/loom.yml'
+
   loom:
+    needs: changes
+    if: needs.changes.outputs.cache-core == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120  # 2 hours max
 
