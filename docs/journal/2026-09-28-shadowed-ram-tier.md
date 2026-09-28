@@ -197,13 +197,14 @@ None yet. A design spec under `docs/superpowers/specs/` if this reaches GO.
   expiry against the write tail, and a trace without TTLs gets only the
   cost. A per-deployment setting, or buckets sized by TTL, rather than one
   new default.
-
-- **Likely hang, found by reading and not reproduced:**
-  `IoUringDiskLayer::get_item` returns `None` for an item on a committed
-  segment. `increment`/`decrement` treat `None` with the key still indexed
-  as transient and retry forever. An incr on a counter demoted to disk and
-  committed would spin a worker. Needs a reproducing test and a fix,
-  independent of this design.
+- **incr/decr on a counter only on disk returns `SegmentNotAccessible`.**
+  It used to spin forever. That was reproduced, with a second trigger: an
+  expired counter, which the hashtable still indexes until its segment is
+  reclaimed. It is now treated as absent. The error for the disk case is a
+  stopgap; the design above promotes the counter back into RAM (the async
+  path GET already takes), which would let incr succeed.
+- **ADD on an expired key returns `KeyExists`** for the same reason: the
+  hashtable's `contains` does not check expiry. Not yet fixed.
 - **Slab and heap** expire on the system clock (`cache/slab/src/item.rs`,
   `cache/heap/src/entry.rs`). Slab also subtracts a 2024 base epoch that
   replayed timestamps saturate. Their TTL results under trace replay are

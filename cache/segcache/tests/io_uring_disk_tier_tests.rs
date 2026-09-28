@@ -506,7 +506,7 @@ fn a_counter_on_committed_disk() -> (std::sync::Arc<SegCache>, String) {
 }
 
 /// `increment` and `decrement` must return for an item on a committed disk
-/// segment, and must not answer as though the counter were absent.
+/// segment, with an error rather than an answer from the wrong value.
 ///
 /// They read through the synchronous item path, which returns `None` for a
 /// committed io_uring segment -- that read has to go through the ring. Both
@@ -514,8 +514,8 @@ fn a_counter_on_committed_disk() -> (std::sync::Arc<SegCache>, String) {
 /// retry, and nothing changes between retries, so they spin forever. On a
 /// server that is a worker thread lost to one incr of a cold counter.
 ///
-/// `initial` is set so that a fix which reads the item as absent is caught
-/// too: that would return 1 (a fresh counter) instead of 11.
+/// `initial` is set, so a fix that read the item as absent would return 1 (a
+/// fresh counter) and fail too.
 #[test]
 fn a_counter_on_committed_disk_does_not_hang() {
     for (name, op, want) in [("increment", true, 11u64), ("decrement", false, 9u64)] {
@@ -544,15 +544,15 @@ fn a_counter_on_committed_disk_does_not_hang() {
             });
         }
 
+        // An error, not a guess: the read has to go through the ring, which a
+        // synchronous incr cannot drive. Promoting the counter back into RAM
+        // (the async path GET already takes) would make this `Ok(want)`.
         match rx.recv_timeout(Duration::from_secs(5)) {
             Err(_) => panic!("{name} on {key} did not return within 5s"),
-            Ok(Ok(v)) => assert_eq!(v, want, "{name} on {key} answered from the wrong value"),
-            Ok(Err(e)) => assert!(
-                !matches!(
-                    e,
-                    cache_core::CacheError::KeyNotFound | cache_core::CacheError::NotNumeric
-                ),
-                "{name} on {key} failed as though the counter were absent or corrupt: {e:?}"
+            Ok(got) => assert_eq!(
+                got,
+                Err(cache_core::CacheError::SegmentNotAccessible),
+                "{name} on {key} (the value is 10, so success would be {want})"
             ),
         }
     }
