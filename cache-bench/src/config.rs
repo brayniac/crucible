@@ -380,6 +380,10 @@ pub struct DiskConfig {
     pub size: usize,
     #[serde(default = "default_promotion_threshold")]
     pub promotion_threshold: u8,
+    /// Reads an evicted item needs to be demoted to disk; 0 demotes every
+    /// evicted item (the default, and the tier's historical behaviour).
+    #[serde(default)]
+    pub demotion_threshold: u8,
     #[serde(default)]
     pub sync_mode: DiskSyncMode,
     #[serde(default)]

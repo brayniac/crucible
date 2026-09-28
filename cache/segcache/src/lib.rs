@@ -279,6 +279,13 @@ pub struct DiskTierConfig {
     pub sync_mode: SyncMode,
     /// Whether to recover from existing disk cache on startup.
     pub recover_on_startup: bool,
+    /// Reads an item evicted from RAM needs to be demoted here rather than
+    /// discarded. 0 (the default) demotes every evicted item, which is how
+    /// the tier has always behaved: until writes stopped counting as
+    /// reads, the builder's 1 -- documented as "accessed at least once" --
+    /// passed every item. 1 demotes only items read at least once. A
+    /// setting, not a constant, so the two can be measured.
+    pub demotion_threshold: u8,
 }
 
 /// Configuration for the io_uring-based disk tier (Direct I/O).
@@ -297,6 +304,13 @@ pub struct IoUringDiskTierConfig {
     /// Number of write buffers for staging segment data before disk flush.
     /// Under pressure, demotion degrades to discard. Default: 16.
     pub write_buffer_count: usize,
+    /// Reads an item evicted from RAM needs to be demoted here rather than
+    /// discarded. 0 (the default) demotes every evicted item, which is how
+    /// the tier has always behaved: until writes stopped counting as
+    /// reads, the builder's 1 -- documented as "accessed at least once" --
+    /// passed every item. 1 demotes only items read at least once. A
+    /// setting, not a constant, so the two can be measured.
+    pub demotion_threshold: u8,
 }
 
 impl Default for IoUringDiskTierConfig {
@@ -306,6 +320,7 @@ impl Default for IoUringDiskTierConfig {
             block_size: 4096,
             promotion_threshold: 2,
             write_buffer_count: 16,
+            demotion_threshold: 0,
         }
     }
 }
@@ -317,6 +332,7 @@ impl DiskTierConfig {
             path: path.into(),
             size,
             promotion_threshold: 2,
+            demotion_threshold: 0,
             sync_mode: SyncMode::default(),
             recover_on_startup: true,
         }
@@ -325,6 +341,12 @@ impl DiskTierConfig {
     /// Set the promotion threshold.
     pub fn promotion_threshold(mut self, threshold: u8) -> Self {
         self.promotion_threshold = threshold;
+        self
+    }
+
+    /// Reads an evicted item needs to be demoted to disk; see the field.
+    pub fn demotion_threshold(mut self, threshold: u8) -> Self {
+        self.demotion_threshold = threshold;
         self
     }
 
@@ -574,6 +596,19 @@ impl SegCacheBuilder {
         self
     }
 
+    /// The configured disk tier's demotion threshold, or `None` with no
+    /// disk tier.
+    fn disk_demotion_threshold(&self) -> Option<u8> {
+        self.disk_tier
+            .as_ref()
+            .map(|d| d.demotion_threshold)
+            .or_else(|| {
+                self.io_uring_disk_tier
+                    .as_ref()
+                    .map(|d| d.demotion_threshold)
+            })
+    }
+
     /// Use S3-FIFO eviction policy with default settings.
     ///
     /// S3-FIFO uses a small FIFO queue (10% of capacity) as an admission filter
@@ -671,11 +706,10 @@ impl SegCacheBuilder {
             .with_ghosts(self.enable_ghosts)
             .with_eviction_strategy(eviction_strategy);
 
-        let has_disk = self.disk_tier.is_some() || self.io_uring_disk_tier.is_some();
-        if has_disk {
-            // Demote to disk layer (layer 1) with demotion threshold of 1
-            // (demote items that have been accessed at least once)
-            layer_config = layer_config.with_next_layer(1).with_demotion_threshold(1);
+        if let Some(threshold) = self.disk_demotion_threshold() {
+            layer_config = layer_config
+                .with_next_layer(1)
+                .with_demotion_threshold(threshold);
         }
 
         let mut layer_builder = TtlLayerBuilder::new()
@@ -785,10 +819,10 @@ impl SegCacheBuilder {
             .with_ghosts(true)
             .with_eviction_strategy(self.main_eviction);
 
-        let has_disk = self.disk_tier.is_some() || self.io_uring_disk_tier.is_some();
-        if has_disk {
-            // Demote to disk layer (layer 2) with demotion threshold of 1
-            layer1_config = layer1_config.with_next_layer(2).with_demotion_threshold(1);
+        if let Some(threshold) = self.disk_demotion_threshold() {
+            layer1_config = layer1_config
+                .with_next_layer(2)
+                .with_demotion_threshold(threshold);
         }
 
         let mut layer1_builder = TtlLayerBuilder::new()
@@ -1147,14 +1181,14 @@ mod tests {
 
         cache.set(b"key", b"value", ttl).unwrap();
 
-        // Initial frequency is 1
+        // A write is not a read.
         let freq = cache.frequency(b"key");
-        assert_eq!(freq, Some(1));
+        assert_eq!(freq, Some(0));
 
         // Access increments frequency
         let _ = cache.get(b"key");
         let freq = cache.frequency(b"key");
-        assert_eq!(freq, Some(2));
+        assert_eq!(freq, Some(1));
     }
 
     #[test]

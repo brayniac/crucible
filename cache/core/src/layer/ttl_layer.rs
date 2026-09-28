@@ -1479,7 +1479,20 @@ impl TtlLayer {
                     None => break,
                 };
 
-                let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
+                // 0 means the hashtable no longer indexes this item, and a
+                // lost item is never carried forward. An indexed one is
+                // counted as its reads + 1: the counter now starts at 0 on
+                // insert (a write is not an access), and rank 0 is "never
+                // retained" throughout this pass -- `threshold_for_budget`
+                // counts classes 1..=255 and `retention_rank` maps 0 to 0.
+                // Ranking an unread item at 0 would discard it even with
+                // budget to spare, and conflate it with a lost one. Shifted
+                // here, every budget, threshold and straddle decision is
+                // what it was when inserts started at 1, and CLOCK's floor
+                // of 1 still means "untouched since admission is pruned".
+                let freq = hashtable
+                    .get_frequency(key, &verifier)
+                    .map_or(0, |f| f.saturating_add(1));
 
                 scanned.push(ScannedItem {
                     candidate: cand_idx as u32,
@@ -3448,7 +3461,7 @@ mod tests {
         let verifier = SinglePoolVerifier { pool: &layer.pool };
         let ttl = Duration::from_secs(3600);
 
-        // Write items and register them in the hashtable (they get freq=1)
+        // Write items and register them in the hashtable (unread: freq 0)
         let mut keys = Vec::new();
         for i in 0..200 {
             let key = format!("merge_key_{:04}", i);
@@ -3463,10 +3476,10 @@ mod tests {
 
         let free_before = layer.free_segment_count();
 
-        // Verify items have freq=1 after insertion
+        // Verify items are unread after insertion
         for key in &keys {
             let freq = hashtable.get_frequency(key.as_bytes(), &verifier);
-            assert_eq!(freq, Some(1), "Items should have freq=1 after insert");
+            assert_eq!(freq, Some(0), "an insert is not a read");
         }
 
         // Trigger merge eviction - items with freq=1 (> threshold 0) should
@@ -4126,11 +4139,11 @@ mod merge_retention_budget {
         ids
     }
 
-    /// Raise `key` to `freq`. An insert already leaves it at 1, and the
-    /// frequency counter increments deterministically below 16.
+    /// Raise `key` to `freq`: one read per step, since an insert leaves it
+    /// at 0 and the counter increments deterministically below 16.
     fn warm<H: Hashtable>(layer: &TtlLayer, hashtable: &H, key: &str, freq: u8) {
         let verifier = SinglePoolVerifier { pool: &layer.pool };
-        for _ in 1..freq {
+        for _ in 0..freq {
             assert!(
                 hashtable.lookup(key.as_bytes(), &verifier).is_some(),
                 "the warming read must hit, or no frequency accrues"

@@ -2624,7 +2624,10 @@ mod tests {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10));
         let fifo_config = LayerConfig::new()
             .with_next_layer(1)
-            .with_demotion_threshold(1);
+            // 0: promote every item. These fixtures test the main layer, not
+            // admission, and a write no longer counts as a read (it did when
+            // this was 1).
+            .with_demotion_threshold(0);
         let fifo_layer = FifoLayerBuilder::new()
             .layer_id(0)
             .pool_id(0)
@@ -2650,6 +2653,35 @@ mod tests {
             .build()
     }
 
+    /// Frequency counts reads. A write stores the item; it is not evidence
+    /// that anyone wants it back.
+    ///
+    /// Every threshold in the cache is `freq >= n` or `freq > n` against
+    /// this counter -- S3-FIFO promotion, disk demotion, CLOCK's "touched
+    /// since admission". Inserts used to start at 1, so an item nobody ever
+    /// read already passed a threshold of 1: S3-FIFO's admission queue
+    /// promoted every write and filtered nothing.
+    #[test]
+    fn a_write_is_not_an_access() {
+        let clock = crate::clock::TestClock::start();
+        let cache = create_test_cache();
+        cache
+            .set(b"k", b"v", b"", Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(
+            cache.frequency(b"k"),
+            Some(0),
+            "a fresh write has not been read"
+        );
+        cache
+            .set(b"k", b"v2", b"", Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(cache.frequency(b"k"), Some(0), "nor has an overwrite");
+        clock.tick();
+        let _ = cache.get(b"k");
+        assert_eq!(cache.frequency(b"k"), Some(1), "one read is one access");
+    }
+
     fn create_test_cache() -> TieredCache<MultiChoiceHashtable> {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10)); // 2^10 = 1024 buckets
 
@@ -2661,7 +2693,10 @@ mod tests {
         // only looks like S3-FIFO.
         let fifo_config = LayerConfig::new()
             .with_next_layer(1)
-            .with_demotion_threshold(1);
+            // 0: promote every item. These fixtures test the main layer, not
+            // admission, and a write no longer counts as a read (it did when
+            // this was 1).
+            .with_demotion_threshold(0);
 
         let fifo_layer = FifoLayerBuilder::new()
             .layer_id(0)
@@ -3164,7 +3199,10 @@ mod tests {
             .config(
                 LayerConfig::new()
                     .with_next_layer(1)
-                    .with_demotion_threshold(1),
+                    // 0: promote every item. These fixtures test the main layer, not
+                    // admission, and a write no longer counts as a read (it did when
+                    // this was 1).
+                    .with_demotion_threshold(0),
             )
             .build()
             .expect("fifo layer");
@@ -3274,7 +3312,10 @@ mod tests {
                 .config(
                     LayerConfig::new()
                         .with_next_layer(1)
-                        .with_demotion_threshold(1),
+                        // 0: promote every item. These fixtures test the main layer, not
+                        // admission, and a write no longer counts as a read (it did when
+                        // this was 1).
+                        .with_demotion_threshold(0),
                 )
                 .build()
                 .expect("fifo layer");

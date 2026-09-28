@@ -546,8 +546,10 @@ impl SlabCache {
                 // Item is on disk
                 let value = self.get_from_disk(key, location)?;
 
-                // Optionally promote to RAM if accessed frequently
-                if freq >= self.promotion_threshold {
+                // Promote on the item's `promotion_threshold`-th read.
+                // `freq` counts the reads before this one (a write is not
+                // a read), so this read makes `freq + 1`.
+                if freq.saturating_add(1) >= self.promotion_threshold {
                     // Get TTL from disk item
                     let ttl = self
                         .disk_layer
@@ -1275,6 +1277,51 @@ mod tests {
             .expect("Failed to create test cache")
     }
 
+    /// A disk item is promoted on its `promotion_threshold`-th read. A write
+    /// is not a read, so at the default of 2 the first read leaves an item
+    /// on disk and the second brings it back to RAM.
+    #[test]
+    fn a_disk_item_is_promoted_on_its_second_read() {
+        use cache_core::{Hashbucket, Hashtable};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = SlabCacheBuilder::new()
+            .heap_size(512 * 1024)
+            .slab_size(64 * 1024)
+            .hashtable_power(10)
+            .disk_tier(DiskTierConfig::new(
+                dir.path().join("slab.disk"),
+                8 * 1024 * 1024,
+            ))
+            .build()
+            .expect("cache with disk tier");
+        // Where the key lives, without counting a read.
+        let on_disk = |key: &[u8]| {
+            let (_, packed) = cache
+                .hashtable
+                .lookup_for_tracking(key, &cache.tiered_verifier())
+                .expect("key is indexed");
+            SlabLocation::pool_id_from_location(Hashbucket::location(packed)) == cache.disk_pool_id
+        };
+
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+        for i in 0..400 {
+            cache
+                .set_item(format!("k{i}").as_bytes(), &value, ttl)
+                .unwrap_or_else(|e| panic!("set {i}: {e:?}"));
+        }
+        let key = (0..400)
+            .map(|i| format!("k{i}").into_bytes())
+            .find(|k| on_disk(k))
+            .expect("some early item was demoted to disk");
+
+        assert_eq!(cache.get_item(&key), Some(value.clone()));
+        assert!(on_disk(&key), "promoted on its first read");
+        assert_eq!(cache.get_item(&key), Some(value));
+        assert!(!on_disk(&key), "still on disk after its second read");
+    }
+
     /// Items evicted from RAM must reach the disk tier, and be readable there.
     ///
     /// Before this the plumbing existed but nothing connected it:
@@ -1483,14 +1530,14 @@ mod tests {
 
         cache.set_item(b"key", b"value", ttl).unwrap();
 
-        // Initial frequency is 1
+        // A write is not a read
         let freq = cache.frequency(b"key");
-        assert_eq!(freq, Some(1));
+        assert_eq!(freq, Some(0));
 
         // Access increments frequency
         let _ = cache.get_item(b"key");
         let freq = cache.frequency(b"key");
-        assert_eq!(freq, Some(2));
+        assert_eq!(freq, Some(1));
     }
 
     #[test]

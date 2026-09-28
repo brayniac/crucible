@@ -952,7 +952,7 @@ mod tests {
         for (key, location) in &published {
             assert_eq!(
                 hashtable.get_item_frequency(key, *location),
-                Some(1),
+                Some(0),
                 "precondition: the entry must be published before eviction"
             );
         }

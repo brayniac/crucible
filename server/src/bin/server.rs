@@ -181,6 +181,7 @@ fn create_segment(
                     segment_count,
                     block_size: 4096,
                     promotion_threshold: disk_config.promotion_threshold,
+                    demotion_threshold: disk_config.demotion_threshold,
                     ..Default::default()
                 };
                 let backend_name = match disk_config.io_backend {
@@ -204,6 +205,7 @@ fn create_segment(
             DiskIoBackendConfig::Mmap => {
                 let disk_tier = DiskTierConfig::new(&disk_config.path, disk_config.size)
                     .promotion_threshold(disk_config.promotion_threshold)
+                    .demotion_threshold(disk_config.demotion_threshold)
                     .sync_mode(disk_config.sync_mode.into())
                     .recover_on_startup(disk_config.recover_on_startup);
 

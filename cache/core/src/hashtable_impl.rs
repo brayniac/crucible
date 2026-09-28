@@ -1613,7 +1613,11 @@ impl Hashtable for MultiChoiceHashtable {
         let buckets = self.bucket_indices(hash);
         let choices = &buckets[..self.num_choices as usize];
 
-        let new_packed = Hashbucket::pack(tag, 1, location);
+        // Frequency 0: a write is not an access. Every threshold compares
+        // against reads, and starting at 1 made an item nobody read pass a
+        // threshold of 1 -- S3-FIFO promoted every write. `packed` stays
+        // nonzero regardless: the tag is never 0 (see `tag_from_hash`).
+        let new_packed = Hashbucket::pack(tag, 0, location);
 
         // A key has at most ONE live entry across its choice buckets, so every
         // pass runs over all of them before the next pass begins. Doing all of
@@ -1688,7 +1692,11 @@ impl Hashtable for MultiChoiceHashtable {
         }
 
         // Phase 3: Insert into empty slot, preferring least-full bucket
-        let new_packed = Hashbucket::pack(tag, 1, location);
+        // Frequency 0: a write is not an access. Every threshold compares
+        // against reads, and starting at 1 made an item nobody read pass a
+        // threshold of 1 -- S3-FIFO promoted every write. `packed` stays
+        // nonzero regardless: the tag is never 0 (see `tag_from_hash`).
+        let new_packed = Hashbucket::pack(tag, 0, location);
 
         // Sort buckets by occupancy (least-full first)
         let mut sorted: Vec<_> = choices.to_vec();
@@ -2783,7 +2791,8 @@ mod tests {
         assert!(lookup.is_some());
         let (loc, freq) = lookup.unwrap();
         assert_eq!(loc, location);
-        assert!(freq >= 1);
+        // An insert is not a read; this lookup reports the count before it.
+        assert_eq!(freq, 0);
     }
 
     #[test]
@@ -2904,8 +2913,7 @@ mod tests {
         ht.insert(b"test", location, &verifier).unwrap();
 
         let freq = ht.get_frequency(b"test", &verifier);
-        assert!(freq.is_some());
-        assert!(freq.unwrap() >= 1);
+        assert_eq!(freq, Some(0), "an insert is not a read");
     }
 
     #[test]
@@ -3181,8 +3189,7 @@ mod tests {
         ht.insert(b"test", location, &verifier).unwrap();
 
         let freq = ht.get_item_frequency(b"test", location);
-        assert!(freq.is_some());
-        assert!(freq.unwrap() >= 1);
+        assert_eq!(freq, Some(0), "an insert is not a read");
 
         // Wrong location returns None
         let wrong_location = Location::new(99999);
