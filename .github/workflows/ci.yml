@@ -10,6 +10,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # What changed, for jobs too expensive to run on every push. Gating is by
+  # job-level `if:` rather than a workflow `paths:` filter: a job skipped by
+  # its `if:` reports success, so it cannot leave a required check pending.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      miri: ${{ steps.filter.outputs.miri }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # Miri runs cache-core's lib tests only. It needs to run when that
+          # code, its dependencies (workspace manifest, lockfile), or this
+          # job's own definition changes -- not on docs or other crates.
+          filters: |
+            miri:
+              - 'cache/core/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -213,6 +236,8 @@ jobs:
 
   miri:
     name: Test (miri, ${{ matrix.shard.name }})
+    needs: changes
+    if: needs.changes.outputs.miri == 'true'
     runs-on: ubuntu-latest
     # Sharded because one job no longer fits: about 77 minutes serially,
     # of which `cache::tests` is ~48 and the rest ~31. The two filters are
