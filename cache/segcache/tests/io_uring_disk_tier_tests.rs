@@ -469,3 +469,91 @@ fn test_disk_read_params_point_to_correct_data() {
         "All disk reads should either verify or be tag collisions"
     );
 }
+
+/// Fill the cache with numeric values, then complete every pending flush so
+/// demoted items sit on committed disk segments. Returns a key whose value
+/// is now only on disk (its lookup is `DiskRead`).
+fn a_counter_on_committed_disk() -> (std::sync::Arc<SegCache>, String) {
+    use segcache::CacheLayer;
+
+    let cache = std::sync::Arc::new(create_small_disk_cache());
+    // "10", zero-padded so items are large enough to force demotion. The
+    // padding parses: `increment` trims and reads the value as a u64.
+    let value = format!("{:0>512}", 10);
+    for i in 0..8000 {
+        let _ = cache.set(
+            format!("k:{i}").as_bytes(),
+            value.as_bytes(),
+            Duration::from_secs(3600),
+        );
+    }
+
+    let disk_idx = (0..cache.layer_count())
+        .find(|&i| matches!(cache.layer(i), Some(CacheLayer::IoUringDisk(_))))
+        .expect("no io_uring disk layer");
+    let Some(CacheLayer::IoUringDisk(disk)) = cache.layer(disk_idx) else {
+        unreachable!()
+    };
+    for req in disk.take_flush_queue() {
+        disk.complete_flush(req.segment_id);
+    }
+
+    let key = (0..8000)
+        .map(|i| format!("k:{i}"))
+        .find(|k| matches!(cache.lookup(k.as_bytes()), LookupResult::DiskRead(_)))
+        .expect("precondition: some item is on a committed disk segment");
+    (cache, key)
+}
+
+/// `increment` and `decrement` must return for an item on a committed disk
+/// segment, and must not answer as though the counter were absent.
+///
+/// They read through the synchronous item path, which returns `None` for a
+/// committed io_uring segment -- that read has to go through the ring. Both
+/// treat `None` with the key still indexed as "transiently unreadable" and
+/// retry, and nothing changes between retries, so they spin forever. On a
+/// server that is a worker thread lost to one incr of a cold counter.
+///
+/// `initial` is set so that a fix which reads the item as absent is caught
+/// too: that would return 1 (a fresh counter) instead of 11.
+#[test]
+fn a_counter_on_committed_disk_does_not_hang() {
+    for (name, op, want) in [("increment", true, 11u64), ("decrement", false, 9u64)] {
+        let (cache, key) = a_counter_on_committed_disk();
+
+        // The state the retry loop cannot leave: the synchronous read finds
+        // nothing, and the hashtable still indexes the key. Checked directly,
+        // so a timeout below is this and not some other stall.
+        assert!(
+            cache.get(key.as_bytes()).is_none(),
+            "{key} is readable synchronously"
+        );
+        assert!(cache.contains(key.as_bytes()), "{key} is no longer indexed");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (cache, key) = (cache.clone(), key.clone());
+            std::thread::spawn(move || {
+                let ttl = Some(Duration::from_secs(3600));
+                let r = if op {
+                    cache.increment(key.as_bytes(), 1, Some(0), ttl)
+                } else {
+                    cache.decrement(key.as_bytes(), 1, Some(0), ttl)
+                };
+                let _ = tx.send(r);
+            });
+        }
+
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Err(_) => panic!("{name} on {key} did not return within 5s"),
+            Ok(Ok(v)) => assert_eq!(v, want, "{name} on {key} answered from the wrong value"),
+            Ok(Err(e)) => assert!(
+                !matches!(
+                    e,
+                    cache_core::CacheError::KeyNotFound | cache_core::CacheError::NotNumeric
+                ),
+                "{name} on {key} failed as though the counter were absent or corrupt: {e:?}"
+            ),
+        }
+    }
+}
