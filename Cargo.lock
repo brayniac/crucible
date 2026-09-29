@@ -1579,9 +1579,9 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.6.5"
+version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f75d585c8ebfc094ecc7297efc39aad3e14a43d6ddf1729c140b478597566796"
+checksum = "4dda343a06a25d96cd4c3e4cba44af236a08920e4fc16003d6275a2edb58d840"
 dependencies = [
  "bytes",
  "crossbeam-channel",
