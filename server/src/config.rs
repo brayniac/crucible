@@ -122,6 +122,55 @@ pub struct CacheConfig {
     /// When enabled, items evicted from RAM are demoted to disk storage.
     #[serde(default)]
     pub disk: Option<DiskConfig>,
+
+    /// Background maintenance: expiry and eviction on a thread of their own.
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
+}
+
+/// Background maintenance (`[cache.maintenance]`). Off by default.
+///
+/// A `set` evicts inline when free space runs out, and merge eviction runs
+/// in that `set`: at small segment sizes the stall reaches write p99. Enabled,
+/// a thread wakes every `interval_us`, reclaims expired segments, and evicts
+/// until more than `free_segments` segments are free, so writes find space
+/// already made. Writes still evict inline if they outpace it.
+///
+/// Segment backend only; the other backends accept it and do nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    /// Run the maintenance thread.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Microseconds between maintenance passes. Default: 1000.
+    #[serde(default = "default_maintenance_interval_us")]
+    pub interval_us: u64,
+
+    /// Free segments to keep ahead of writes. Must exceed the inline
+    /// threshold (1), or the thread never runs before a `set` does.
+    /// Default: 4.
+    #[serde(default = "default_maintenance_free_segments")]
+    pub free_segments: usize,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_us: default_maintenance_interval_us(),
+            free_segments: default_maintenance_free_segments(),
+        }
+    }
+}
+
+fn default_maintenance_interval_us() -> u64 {
+    1000
+}
+
+fn default_maintenance_free_segments() -> usize {
+    4
 }
 
 /// Disk I/O backend selection.
@@ -256,6 +305,7 @@ impl Default for CacheConfig {
             hugepage: HugepageConfig::default(),
             numa_node: None,
             disk: None,
+            maintenance: MaintenanceConfig::default(),
         }
     }
 }
@@ -843,6 +893,28 @@ impl Config {
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let m = &self.cache.maintenance;
+        if m.enabled && m.interval_us == 0 {
+            return Err("cache.maintenance.interval_us must be > 0".into());
+        }
+        if m.enabled && m.free_segments < 2 {
+            return Err(format!(
+                "cache.maintenance.free_segments ({}) must be at least 2: a set \
+                 evicts inline at 1 free segment, so a target of 1 or less \
+                 leaves the thread nothing to do ahead of it",
+                m.free_segments
+            )
+            .into());
+        }
+        let segments = self.cache.heap_size / self.cache.segment_size.max(1);
+        if m.enabled && m.free_segments >= segments {
+            return Err(format!(
+                "cache.maintenance.free_segments ({}) must be below the heap's {} segments",
+                m.free_segments, segments
+            )
+            .into());
+        }
+
         // Validate backend + policy combination
         if let Some(policy) = self.cache.policy
             && !self.cache.backend.is_valid_policy(policy)
@@ -1108,6 +1180,65 @@ mod tests {
     #[test]
     fn test_validate_single_listener_ok() {
         let config = minimal_config();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_is_off_by_default() {
+        let config = minimal_config();
+        assert!(!config.cache.maintenance.enabled);
+        let parsed: MaintenanceConfig = toml::from_str("").unwrap();
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.interval_us, 1000);
+        assert_eq!(parsed.free_segments, 4);
+    }
+
+    #[test]
+    fn maintenance_parses_from_its_section() {
+        let parsed: CacheConfig =
+            toml::from_str("[maintenance]\nenabled = true\ninterval_us = 250\nfree_segments = 8\n")
+                .unwrap();
+        assert!(parsed.maintenance.enabled);
+        assert_eq!(parsed.maintenance.interval_us, 250);
+        assert_eq!(parsed.maintenance.free_segments, 8);
+    }
+
+    #[test]
+    fn maintenance_settings_that_cannot_work_are_rejected() {
+        let enabled = |interval_us, free_segments| {
+            let mut config = minimal_config();
+            config.cache.maintenance = MaintenanceConfig {
+                enabled: true,
+                interval_us,
+                free_segments,
+            };
+            config.validate()
+        };
+        assert!(enabled(1000, 4).is_ok());
+        assert!(
+            enabled(0, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("interval_us")
+        );
+        assert!(
+            enabled(1000, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("at least 2")
+        );
+        let segments = minimal_config().cache.heap_size / minimal_config().cache.segment_size;
+        assert!(
+            enabled(1000, segments)
+                .unwrap_err()
+                .to_string()
+                .contains("below the heap")
+        );
+
+        // Disabled, the same values are not an error: nothing reads them.
+        let mut config = minimal_config();
+        config.cache.maintenance.interval_us = 0;
+        config.cache.maintenance.free_segments = 0;
         assert!(config.validate().is_ok());
     }
 

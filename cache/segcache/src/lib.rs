@@ -902,6 +902,10 @@ impl Cache for SegCache {
         self.inner.lookup(key)
     }
 
+    fn maintain(&self, free_segments: usize) {
+        self.inner.maintain(free_segments);
+    }
+
     fn internal_stats(&self) -> Option<CacheInternalStats> {
         let (live_bytes, written_bytes, capacity_bytes) = self.inner.resident_bytes();
         Some(CacheInternalStats {

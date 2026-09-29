@@ -86,6 +86,30 @@ numa_node = 0
 | `cte` | Closest to expiration | TTL-heavy workloads |
 | `lru`/`lra` | Least recently used/accessed | Classic LRU behavior |
 
+#### Background maintenance
+
+```toml
+[cache.maintenance]
+# Off by default
+enabled = true
+# Microseconds between passes (default 1000)
+interval_us = 1000
+# Free segments to keep ahead of writes (default 4, minimum 2)
+free_segments = 4
+```
+
+Segment backend only; the others accept the section and do nothing.
+
+When a `set` finds no free segment it evicts inline, and merge eviction runs
+in that `set`. With small segments the pause reaches write p99. The
+maintenance thread wakes every `interval_us`, reclaims segments whose items
+have all expired, then evicts until more than `free_segments` are free, so
+writes find space already made. If writes outpace it, they still evict
+inline, so it can only take work off the write path, never add a failure.
+
+Expiry also only runs under write pressure without it: a cache that stops
+receiving writes keeps its expired segments until something needs space.
+
 ### Listeners
 
 ```toml

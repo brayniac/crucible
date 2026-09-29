@@ -654,6 +654,14 @@ pub trait Cache: Send + Sync + 'static {
         Err(CacheError::Unsupported)
     }
 
+    /// Background upkeep, for a maintenance thread: expire what has
+    /// expired, then evict until more than `free_segments` segments are free,
+    /// so writes find space rather than making it inline.
+    ///
+    /// Does nothing by default; a backend without segment pools has nothing
+    /// to keep ahead of.
+    fn maintain(&self, _free_segments: usize) {}
+
     /// Get internal cache statistics (demotions, evictions).
     ///
     /// Returns `None` if the implementation does not track internal stats.
@@ -739,6 +747,11 @@ pub struct CacheInternalStats {
     /// Key, value and optional bytes written by demotions -- the tier's
     /// write volume, which `demotions` alone hides when item sizes vary.
     pub demoted_bytes: u64,
+    /// Eviction passes run by background maintenance rather than by a `set`.
+    ///
+    /// Read beside `eviction_latency`, which samples only the inline passes:
+    /// maintenance is keeping ahead when this grows and that count does not.
+    pub background_eviction_passes: u64,
     /// Segments reclaimed by expiry rather than eviction.
     ///
     /// Read beside [`evictions`](Self::evictions): reclaiming space by

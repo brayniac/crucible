@@ -161,3 +161,110 @@ fn test_shutdown_timeout() {
 
     drop(handle);
 }
+
+/// Send one RESP command and read one reply.
+fn resp(stream: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
+    let mut cmd = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        cmd.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        cmd.extend_from_slice(a);
+        cmd.extend_from_slice(b"\r\n");
+    }
+    stream.write_all(&cmd).unwrap();
+    let mut reply = vec![0u8; 16 * 1024];
+    let n = stream.read(&mut reply).unwrap();
+    reply.truncate(n);
+    reply
+}
+
+/// With `[cache.maintenance]` enabled the server evicts in the background,
+/// serves reads, and still shuts down promptly: the maintenance thread
+/// watches the same flag and is joined on the way out.
+#[test]
+#[serial]
+fn test_shutdown_with_background_maintenance() {
+    let cache_port = get_available_port();
+    let admin_port = get_available_port();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let shutdown = shutdown.clone();
+        thread::spawn(move || {
+            let config_str = format!(
+                r#"
+                [workers]
+                threads = 1
+
+                [shutdown]
+                drain_timeout_secs = 1
+
+                [cache]
+                backend = "segment"
+                heap_size = "8MB"
+                segment_size = "256KB"
+                max_value_size = "64KB"
+                hashtable_power = 16
+
+                [cache.maintenance]
+                enabled = true
+                interval_us = 200
+                free_segments = 4
+
+                [[listener]]
+                protocol = "resp"
+                address = "127.0.0.1:{cache_port}"
+
+                [metrics]
+                address = "127.0.0.1:{admin_port}"
+                "#
+            );
+            let config: server::Config = toml::from_str(&config_str).unwrap();
+            config.validate().unwrap();
+            let cache = segcache::SegCache::builder()
+                .heap_size(config.cache.heap_size)
+                .segment_size(config.cache.segment_size)
+                .hashtable_power(config.cache.hashtable_power)
+                .build()
+                .unwrap();
+            let drain = Duration::from_secs(config.shutdown.drain_timeout_secs);
+            let _ = server::async_native::run(&config, cache, shutdown, drain);
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+
+    let addr: SocketAddr = format!("127.0.0.1:{cache_port}").parse().unwrap();
+    let mut conn = TcpStream::connect(addr).expect("connect");
+    conn.set_nodelay(true).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+
+    // 12MB of values into an 8MB heap: eviction has to run.
+    let value = vec![b'v'; 4096];
+    let n = 3000;
+    for i in 0..n {
+        let reply = resp(&mut conn, &[b"SET", format!("k{i}").as_bytes(), &value]);
+        assert!(
+            reply.starts_with(b"+OK"),
+            "SET k{i}: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    for i in n - 10..n {
+        let reply = resp(&mut conn, &[b"GET", format!("k{i}").as_bytes()]);
+        assert!(
+            reply.starts_with(b"$4096\r\n"),
+            "GET k{i}: {} bytes",
+            reply.len()
+        );
+    }
+    drop(conn);
+
+    shutdown.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    while !handle.is_finished() && start.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        handle.is_finished(),
+        "server with maintenance did not shut down within 3s"
+    );
+    handle.join().expect("server thread panicked");
+}

@@ -66,6 +66,32 @@ mod server {
             None
         };
 
+        // Background maintenance (`[cache.maintenance]`): expiry and eviction
+        // ahead of writes, so a `set` finds space instead of making it.
+        let maintenance_handle = if config.cache.maintenance.enabled {
+            let cache = cache.clone();
+            let shutdown_flag = shutdown.clone();
+            let interval = Duration::from_micros(config.cache.maintenance.interval_us);
+            let free_segments = config.cache.maintenance.free_segments;
+            info!(
+                interval_us = config.cache.maintenance.interval_us,
+                free_segments, "Background maintenance enabled"
+            );
+            Some(
+                std::thread::Builder::new()
+                    .name("maintenance".to_string())
+                    .spawn(move || {
+                        while !shutdown_flag.load(Ordering::Relaxed) {
+                            cache.maintain(free_segments);
+                            std::thread::sleep(interval);
+                        }
+                    })
+                    .expect("failed to spawn maintenance thread"),
+            )
+        } else {
+            None
+        };
+
         let send_copy_slot_size = 16384u32;
         let send_copy_count = 8192u16;
 
@@ -274,6 +300,9 @@ mod server {
         }
 
         if let Some(handle) = diagnostics_handle {
+            let _ = handle.join();
+        }
+        if let Some(handle) = maintenance_handle {
             let _ = handle.join();
         }
 

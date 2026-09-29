@@ -395,6 +395,15 @@ impl CacheLayer {
     }
 }
 
+/// What one [`TieredCache::maintain`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceOutcome {
+    /// Segments reclaimed by expiry.
+    pub expired_segments: usize,
+    /// Whether free space was short, so an eviction pass ran.
+    pub evicted: bool,
+}
+
 /// Atomic counters for cache-internal events (demotions, evictions).
 pub struct CacheStats {
     /// Items demoted from one layer to another.
@@ -427,6 +436,8 @@ pub struct CacheStats {
     pub disk_hits: AtomicU64,
     /// See [`CacheInternalStats::demoted_bytes`].
     pub demoted_bytes: AtomicU64,
+    /// See [`CacheInternalStats::background_eviction_passes`].
+    pub background_eviction_passes: AtomicU64,
 }
 
 impl CacheStats {
@@ -441,6 +452,7 @@ impl CacheStats {
             eviction_latency: crate::latency::LatencyHistogram::new(),
             disk_hits: AtomicU64::new(0),
             demoted_bytes: AtomicU64::new(0),
+            background_eviction_passes: AtomicU64::new(0),
         }
     }
 
@@ -461,6 +473,7 @@ impl CacheStats {
             eviction_latency: self.eviction_latency.snapshot(),
             disk_hits: self.disk_hits.load(Ordering::Relaxed),
             demoted_bytes: self.demoted_bytes.load(Ordering::Relaxed),
+            background_eviction_passes: self.background_eviction_passes.load(Ordering::Relaxed),
             ..Default::default()
         }
     }
@@ -1637,6 +1650,43 @@ impl<H: Hashtable> TieredCache<H> {
         Ok(new_len)
     }
 
+    /// Background upkeep: expire what has expired, then evict until layer 0
+    /// has more than `free_segments` free segments.
+    ///
+    /// For a maintenance thread that runs this on an interval, so writes
+    /// find space already made rather than making it inline. A `set` evicts
+    /// only when layer 0 is at `eviction_threshold` free segments; keeping
+    /// `free_segments` above that means the inline pass -- merge's stall in
+    /// the write tail -- runs only when writes outpace the thread.
+    ///
+    /// Expiry runs on every call, whether or not space is short: it is the
+    /// proactive expiration that otherwise runs only under write pressure,
+    /// and it costs one walk of the TTL bucket heads.
+    ///
+    /// Safe to call concurrently with writes: every worker already evicts
+    /// from its own `set`, and this is one more caller of the same paths.
+    pub fn maintain(&self, free_segments: usize) -> MaintenanceOutcome {
+        let expired_segments = self.expire();
+        let short = self
+            .layers
+            .first()
+            .is_some_and(|layer| layer.free_segment_count() <= free_segments);
+        if !short {
+            return MaintenanceOutcome {
+                expired_segments,
+                evicted: false,
+            };
+        }
+        self.evict_until(free_segments);
+        self.stats
+            .background_eviction_passes
+            .fetch_add(1, Ordering::Relaxed);
+        MaintenanceOutcome {
+            expired_segments,
+            evicted: true,
+        }
+    }
+
     /// Ensure Layer 0 has space for a new item.
     ///
     /// Uses cascading eviction: before evicting from a layer that demotes to a
@@ -1649,9 +1699,6 @@ impl<H: Hashtable> TieredCache<H> {
         if layer.free_segment_count() > self.eviction_threshold {
             return Ok(());
         }
-
-        // Find disk layer index
-        let disk_layer_idx = self.layers.iter().position(|l| l.is_disk());
 
         // Timed from here, after the free-segment early return above, so the
         // histogram holds eviction passes rather than every `set`. Timing the
@@ -1701,7 +1748,34 @@ impl<H: Hashtable> TieredCache<H> {
             return Ok(());
         }
 
-        // Try to evict until we have enough space
+        // Try to evict until we have enough space.
+        let made_space = self.evict_until(self.eviction_threshold);
+
+        // Timed whether or not it succeeded: a pass that ran the full attempt
+        // budget and failed is the longest stall a `set` can absorb, and
+        // excluding it would understate the tail precisely where it is worst.
+        self.stats
+            .eviction_latency
+            .record(started.elapsed().as_nanos() as u64);
+        if made_space {
+            Ok(())
+        } else {
+            Err(CacheError::OutOfMemory)
+        }
+    }
+
+    /// Run the eviction cascade until layer 0 has more than `target` free
+    /// segments, for at most `max_eviction_attempts` rounds. Returns whether
+    /// it got there.
+    ///
+    /// Shared by the inline path (`ensure_space`, on behalf of a `set`) and
+    /// the background one (`maintain`); the two differ only in the target.
+    fn evict_until(&self, target: usize) -> bool {
+        let Some(layer) = self.layers.first() else {
+            return false;
+        };
+        let disk_layer_idx = self.layers.iter().position(|l| l.is_disk());
+
         for _ in 0..self.max_eviction_attempts {
             // Cascading: ensure downstream layers have space (bottom-up)
             // 1. Evict from disk if full (frees disk segments)
@@ -1745,22 +1819,11 @@ impl<H: Hashtable> TieredCache<H> {
                 }
             }
 
-            if layer.free_segment_count() > self.eviction_threshold {
-                self.stats
-                    .eviction_latency
-                    .record(started.elapsed().as_nanos() as u64);
-                return Ok(());
+            if layer.free_segment_count() > target {
+                return true;
             }
         }
-
-        // Still no space after max attempts. Timed too: a pass that ran the
-        // full attempt budget and failed is the longest stall a `set` can
-        // absorb, and excluding it would understate the tail precisely where
-        // it is worst.
-        self.stats
-            .eviction_latency
-            .record(started.elapsed().as_nanos() as u64);
-        Err(CacheError::OutOfMemory)
+        false
     }
 
     /// Evict from a specific layer, demoting items to the layer's configured `next_layer`.
@@ -2813,6 +2876,186 @@ mod tests {
             assert_eq!(
                 after, want_after,
                 "{name} with initial {initial:?} left the wrong value"
+            );
+        }
+    }
+
+    /// A two-layer cache with room for maintenance to work: 16 admission
+    /// segments over a larger main layer.
+    fn create_maintenance_test_cache() -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(14));
+        let fifo = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .config(
+                LayerConfig::new()
+                    .with_next_layer(1)
+                    .with_demotion_threshold(0),
+            )
+            .segment_size(64 * 1024)
+            .heap_size(1024 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("fifo layer");
+        let ttl = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(2 * 1024 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+        TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo)
+            .with_ttl_layer(ttl)
+            .eviction_threshold(1)
+            .build()
+    }
+
+    fn layer0_free(cache: &TieredCache<MultiChoiceHashtable>) -> usize {
+        cache.layer(0).expect("layer 0").free_segment_count()
+    }
+
+    /// Maintenance makes space ahead of writes, so the writes that follow do
+    /// not evict inline -- which is the point of running it.
+    #[test]
+    fn maintain_makes_space_that_writes_then_use_without_evicting() {
+        let _clock = crate::clock::TestClock::start();
+        let cache = create_maintenance_test_cache();
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 1024];
+        let mut i = 0;
+        while layer0_free(&cache) > 1 {
+            cache
+                .set(format!("k{i}").as_bytes(), &value, b"", ttl)
+                .unwrap();
+            i += 1;
+        }
+
+        let outcome = cache.maintain(6);
+        assert!(
+            outcome.evicted,
+            "space was short, so maintenance must evict"
+        );
+        assert!(layer0_free(&cache) > 6, "only {} free", layer0_free(&cache));
+        assert_eq!(cache.stats().snapshot().background_eviction_passes, 1);
+
+        // Two segments' worth of writes fit in the space it made.
+        let inline_before = cache.stats().eviction_latency.snapshot().count();
+        for j in 0..100 {
+            cache
+                .set(format!("after{j}").as_bytes(), &value, b"", ttl)
+                .unwrap();
+        }
+        assert_eq!(
+            cache.stats().eviction_latency.snapshot().count(),
+            inline_before,
+            "a write evicted inline despite maintenance having made space"
+        );
+    }
+
+    /// With space to spare, maintenance expires but does not evict.
+    #[test]
+    fn maintain_with_space_to_spare_does_not_evict() {
+        let _clock = crate::clock::TestClock::start();
+        let cache = create_maintenance_test_cache();
+        cache
+            .set(b"k", b"v", b"", Duration::from_secs(3600))
+            .unwrap();
+        let outcome = cache.maintain(4);
+        assert_eq!(
+            outcome,
+            MaintenanceOutcome {
+                expired_segments: 0,
+                evicted: false
+            }
+        );
+        assert_eq!(cache.stats().snapshot().background_eviction_passes, 0);
+        assert_eq!(cache.get(b"k").as_deref(), Some(&b"v"[..]));
+    }
+
+    /// Expired segments are reclaimed by maintenance alone, with no write to
+    /// trigger it -- expiry otherwise runs only under write pressure.
+    ///
+    /// A single TTL layer, as the segment backend's default (merge) builds:
+    /// TTL-layer segments expire whole. The S3-FIFO admission layer does not
+    /// expire segments at all; its items carry their own TTLs, checked on read.
+    #[test]
+    fn maintain_expires_without_any_write() {
+        let clock = crate::clock::TestClock::start();
+        let ttl_layer = TtlLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(1024 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("ttl layer");
+        let cache = TieredCacheBuilder::new(Arc::new(MultiChoiceHashtable::new(14)))
+            .with_ttl_layer(ttl_layer)
+            .build();
+        let value = vec![b'v'; 1024];
+        for i in 0..200 {
+            cache
+                .set(
+                    format!("k{i}").as_bytes(),
+                    &value,
+                    b"",
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+        }
+        let free_before = layer0_free(&cache);
+        assert_eq!(
+            cache.maintain(0).expired_segments,
+            0,
+            "nothing has expired yet"
+        );
+
+        crate::clock::set_virtual_now(clock.now() + 61);
+        let outcome = cache.maintain(0);
+        assert!(outcome.expired_segments > 0, "{outcome:?}");
+        assert!(layer0_free(&cache) > free_before, "expiry freed nothing");
+        assert!(cache.get(b"k0").is_none());
+    }
+
+    /// Maintenance on its own thread, concurrent with writes and reads. The
+    /// point is that nothing breaks: eviction is already concurrent (every
+    /// worker evicts from its own `set`), and this adds one more caller.
+    #[test]
+    fn maintain_runs_concurrently_with_writes() {
+        use std::sync::atomic::AtomicBool;
+
+        let cache = Arc::new(create_maintenance_test_cache());
+        let stop = Arc::new(AtomicBool::new(false));
+        let background = {
+            let (cache, stop) = (cache.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    cache.maintain(4);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let ttl = Duration::from_secs(3600);
+        let n = if cfg!(miri) { 300 } else { 20_000 };
+        for i in 0..n {
+            let value = format!("value{i}").into_bytes();
+            cache
+                .set(format!("k{i}").as_bytes(), &value, b"", ttl)
+                .unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        background.join().expect("maintenance thread panicked");
+
+        // The newest writes cannot have been evicted yet, and must read back
+        // as written.
+        for i in n - 20..n {
+            assert_eq!(
+                cache.get(format!("k{i}").as_bytes()),
+                Some(format!("value{i}").into_bytes()),
+                "k{i}"
             );
         }
     }

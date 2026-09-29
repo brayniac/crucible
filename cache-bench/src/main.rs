@@ -486,6 +486,9 @@ fn print_replay_report(
         // not helping, and the two were indistinguishable before this was
         // counted.
         eprintln!("  compactions:    {}", stats.compactions);
+        // Eviction passes a maintenance thread ran, which no `set` waited on.
+        // Zero unless something called `maintain`.
+        eprintln!("  bg evict passes: {}", stats.background_eviction_passes);
         // Beside evictions, not instead of them. Reclaiming a segment by
         // expiry costs nothing and destroys nothing live, so an engine
         // doing more of it needs fewer eviction passes for the same working
