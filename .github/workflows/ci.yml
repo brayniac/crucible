@@ -367,7 +367,15 @@ jobs:
       - name: Build debug server with validation
         run: cargo build -p server --features server/validation
       - name: Install cachecannon
-        run: curl -fsSL https://cachecannon.cc/install.sh | bash
+        # Download, then run. Piping curl into bash hid a failed download:
+        # bash ran an empty script and exited 0, so this step passed and the
+        # smoketest failed later with "cachecannon: command not found".
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors \
+            -o "$RUNNER_TEMP/cachecannon-install.sh" https://cachecannon.cc/install.sh
+          bash "$RUNNER_TEMP/cachecannon-install.sh"
+          command -v cachecannon
       - name: Run smoketest
         env:
           # Enable debug assertions in dependencies
