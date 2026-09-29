@@ -150,7 +150,7 @@ pub use layer::{FifoLayer, FifoLayerBuilder, Layer, TtlLayer, TtlLayerBuilder};
 mod cache;
 
 // Phase 8 re-exports
-pub use cache::{CacheLayer, CacheStats, TieredCache, TieredCacheBuilder};
+pub use cache::{CacheLayer, CacheStats, MaintenanceOutcome, TieredCache, TieredCacheBuilder};
 
 // Phase 9 - Metrics
 mod metrics;

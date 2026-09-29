@@ -86,6 +86,15 @@ hashtable_power = 16
 # # nvme_device = "/dev/ng0n1"
 # # nvme_nsid = 1
 
+# Background maintenance (segment backend, optional)
+# A thread that reclaims expired segments and evicts ahead of writes, so a
+# SET finds space instead of making it inline -- merge eviction's pause
+# moves out of the write path. Writes still evict inline if they outpace it.
+# [cache.maintenance]
+# enabled = true
+# interval_us = 1000                # Wake every 1ms (default)
+# free_segments = 4                 # Keep this many segments free (min 2)
+
 # Protocol listener (only one listener is supported)
 [[listener]]
 protocol = "resp"
