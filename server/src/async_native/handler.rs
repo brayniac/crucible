@@ -508,49 +508,6 @@ async fn submit_and_await_disk_read<C: Cache>(
         }
     };
 
-    // 2. Submit io_uring read and await completion.
-    // Extract what we need from disk_io under the lock, then drop the lock
-    // before awaiting (the future spans a suspend point).
-    let future = {
-        let dio = disk_io.lock();
-        let dio = dio
-            .as_ref()
-            .expect("disk_io must be Some when submit_and_await_disk_read is called");
-        match &dio.backend {
-            DiskBackend::DirectIo { file, .. } => unsafe {
-                ringline::direct_io_read(
-                    *file,
-                    pending_info.params.disk_offset,
-                    buffer.as_mut_ptr(),
-                    pending_info.params.read_len,
-                )
-            },
-            DiskBackend::Nvme { device, block_size } => {
-                let lba = pending_info.params.disk_offset / *block_size as u64;
-                let num_blocks = (pending_info.params.read_len / *block_size) as u16;
-                // SAFETY: `buffer` comes from the read buffer pool, is aligned
-                // for O_DIRECT/NVMe, and is only returned to the pool by
-                // `release_read!` after the future below resolves.
-                unsafe {
-                    ringline::nvme_read(
-                        *device,
-                        lba,
-                        num_blocks,
-                        buffer.addr(),
-                        pending_info.params.read_len,
-                    )
-                }
-            }
-        }
-    };
-
-    DISK_READS.increment();
-
-    let result = match future {
-        Ok(fut) => fut.await,
-        Err(e) => Err(e),
-    };
-
     // Macro to release read buffer + segment ref_count on every exit path.
     macro_rules! release_read {
         ($buf:expr) => {
@@ -564,6 +521,70 @@ async fn submit_and_await_disk_read<C: Cache>(
         };
     }
 
+    // A read longer than the buffer would have the kernel write past it.
+    // `read_buffer_size` covers every read `lookup` asks for while the disk
+    // tier's `block_size` is no larger than `DiskIoWorkerConfig`'s; both are
+    // `DISK_BLOCK_SIZE`.
+    if pending_info.params.read_len as usize > buffer.capacity() {
+        DISK_READ_ERRORS.increment();
+        MISSES.increment();
+        tracing::warn!(
+            read_len = pending_info.params.read_len,
+            capacity = buffer.capacity(),
+            "disk read longer than its buffer"
+        );
+        connection.write_miss_response();
+        release_read!(buffer);
+        return Ok(());
+    }
+
+    // 2. Submit io_uring read and await completion.
+    // Extract what we need from disk_io under the lock, then drop the lock
+    // before awaiting (the future spans a suspend point).
+    let (future, is_direct_io) = {
+        let dio = disk_io.lock();
+        let dio = dio
+            .as_ref()
+            .expect("disk_io must be Some when submit_and_await_disk_read is called");
+        match &dio.backend {
+            DiskBackend::DirectIo { file, .. } => (
+                unsafe {
+                    ringline::direct_io_read(
+                        *file,
+                        pending_info.params.disk_offset,
+                        buffer.as_mut_ptr(),
+                        pending_info.params.read_len,
+                    )
+                },
+                true,
+            ),
+            DiskBackend::Nvme { device, block_size } => {
+                let lba = pending_info.params.disk_offset / *block_size as u64;
+                let num_blocks = (pending_info.params.read_len / *block_size) as u16;
+                // SAFETY: `buffer` comes from the read buffer pool, is aligned
+                // for O_DIRECT/NVMe, and is only returned to the pool by
+                // `release_read!` after the future below resolves.
+                let future = unsafe {
+                    ringline::nvme_read(
+                        *device,
+                        lba,
+                        num_blocks,
+                        buffer.addr(),
+                        pending_info.params.read_len,
+                    )
+                };
+                (future, false)
+            }
+        }
+    };
+
+    DISK_READS.increment();
+
+    let result = match future {
+        Ok(fut) => fut.await,
+        Err(e) => Err(e),
+    };
+
     // 3. Parse result and write response (same logic as native/handler.rs).
     if let Err(e) = &result {
         DISK_READ_ERRORS.increment();
@@ -574,8 +595,17 @@ async fn submit_and_await_disk_read<C: Cache>(
         return Ok(());
     }
 
+    // Only the bytes the read returned are this item's; the rest of the
+    // buffer holds whatever the previous read left. A Direct I/O read reports
+    // its byte count; NVMe passthrough reports a status, and success means
+    // the full transfer.
+    let read_len = pending_info.params.read_len as usize;
+    let valid_len = match (&result, is_direct_io) {
+        (Ok(n), true) => (*n as usize).min(read_len),
+        _ => read_len,
+    };
     let item_offset = pending_info.params.item_offset as usize;
-    let buf_slice = unsafe { buffer.as_slice(pending_info.params.read_len as usize) };
+    let buf_slice = unsafe { buffer.as_slice(valid_len) };
     let Some(value_bytes) =
         crate::disk_io::value_from_disk_read(buf_slice, item_offset, &pending_info.key)
     else {

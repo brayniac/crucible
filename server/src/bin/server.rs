@@ -179,7 +179,7 @@ fn create_segment(
                 let segment_count = disk_config.size / config.cache.segment_size;
                 let io_uring_tier = IoUringDiskTierConfig {
                     segment_count,
-                    block_size: 4096,
+                    block_size: server::disk_io::DISK_BLOCK_SIZE,
                     promotion_threshold: disk_config.promotion_threshold,
                     demotion_threshold: disk_config.demotion_threshold,
                     ..Default::default()

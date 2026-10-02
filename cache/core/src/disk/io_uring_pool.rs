@@ -82,7 +82,9 @@ impl IoUringPool {
     /// Panics if any argument is out of range, or if `segment_size` and the
     /// pool's alignment factor (512 bytes) do not yield a usable
     /// [`LocationLayout`] -- for instance a segment so small that more segment
-    /// id bits remain than a `u32` id can hold.
+    /// id bits remain than a `u32` id can hold -- or if `segment_size` is not a
+    /// multiple of `block_size`, which would leave every segment after the
+    /// first unaligned for O_DIRECT.
     pub fn new(pool_id: u8, segment_count: usize, segment_size: usize, block_size: u32) -> Self {
         assert!(pool_id <= 3, "pool_id must be 0-3");
         assert!(segment_count > 0, "segment_count must be > 0");
@@ -90,6 +92,10 @@ impl IoUringPool {
         assert!(
             block_size > 0 && block_size.is_power_of_two(),
             "block_size must be a power of two"
+        );
+        assert!(
+            segment_size.is_multiple_of(block_size as usize),
+            "segment_size ({segment_size}) must be a multiple of block_size ({block_size})"
         );
 
         // Consistent with the surrounding constructor, which asserts rather
@@ -173,7 +179,9 @@ impl IoUringPool {
     /// # Returns
     /// `(disk_offset, aligned_len, offset_within_block)` where:
     /// - `disk_offset`: Block-aligned byte offset to start reading from
-    /// - `aligned_len`: Block-aligned number of bytes to read
+    /// - `aligned_len`: Block-aligned number of bytes to read, at most
+    ///   `read_size` rounded up to a block plus one block (the item can start
+    ///   anywhere in its first block), and never past the end of the segment
     /// - `offset_within_block`: Item's offset within the read buffer
     pub fn item_disk_range(
         &self,
@@ -188,9 +196,13 @@ impl IoUringPool {
         let aligned_start = abs_offset & !block_mask;
         let offset_within_block = (abs_offset - aligned_start) as u32;
 
-        // Compute aligned read length covering the requested range
+        // Compute aligned read length covering the requested range, stopping
+        // at the segment's end. A read past the last segment can run past the
+        // end of the file or device, and Direct I/O then returns fewer bytes
+        // than asked.
         let end = abs_offset + read_size as u64;
-        let aligned_end = (end + block_mask) & !block_mask;
+        let segment_end = segment_offset + self.segment_size as u64;
+        let aligned_end = ((end + block_mask) & !block_mask).min(segment_end);
         let aligned_len = (aligned_end - aligned_start) as u32;
 
         (aligned_start, aligned_len, offset_within_block)
@@ -407,6 +419,21 @@ mod tests {
         assert_eq!(offset, 0); // Aligned down
         assert_eq!(within, 100); // 100 bytes into the block
         assert_eq!(len, 8192); // Need 2 blocks to cover 100..4196
+    }
+
+    /// A read starting at the last block of a segment stops at the segment's
+    /// end, so a read of the last segment does not run past the end of the
+    /// file or device.
+    #[test]
+    fn test_item_disk_range_stops_at_the_segment_end() {
+        let segment_size = 64 * 1024;
+        let pool = IoUringPool::new(0, 2, segment_size, 4096);
+        let last_item = segment_size as u32 - 512;
+
+        let (offset, len, within) = pool.item_disk_range(1, last_item, 4096);
+        assert_eq!(offset, (2 * segment_size - 4096) as u64);
+        assert_eq!(within, 4096 - 512);
+        assert_eq!(len, 4096, "the read ran past the segment");
     }
 
     #[test]
