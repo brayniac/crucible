@@ -172,7 +172,9 @@ pub use disk::{DiskConfig, DiskLayer, DiskLayerBuilder, FilePool, FilePoolBuilde
 
 // Cache trait for server compatibility
 mod cache_trait;
-pub use cache_trait::{Cache, CacheInternalStats, DEFAULT_TTL, LookupResult, OwnedGuard, ValueRef};
+pub use cache_trait::{
+    Cache, CacheInternalStats, DEFAULT_TTL, LookupResult, OwnedGuard, ReleaseHook, ValueRef,
+};
 
 // Redis-like data structure traits
 mod hash_cache;

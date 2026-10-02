@@ -89,7 +89,7 @@ impl SlabState {
 
 /// Packed state + ref_count operations.
 /// Format: [state: 8 bits][ref_count: 24 bits]
-mod packed_state {
+pub(crate) mod packed_state {
     use super::SlabState;
     use crate::sync::{AtomicU32, Ordering};
 
@@ -356,6 +356,37 @@ impl Slab {
 unsafe impl Send for Slab {}
 unsafe impl Sync for Slab {}
 
+/// Per-slot pin word.
+///
+/// A reader pins the slot it reads as well as holding a slab reference. A
+/// freed slot goes back on the free list only once no pins remain, so a
+/// pinned slot is not rewritten. The low 29 bits count pins; the high three
+/// bits are the state.
+///
+/// ```text
+/// on free list:  FREED | ON_FREE_LIST   allocate claims it
+/// writing:       WRITING                written, then published
+/// live:          0                      readers pin and unpin
+/// retired:       FREED                  pushed by whoever drops count to 0
+/// ```
+///
+/// The left column is the state bits. Outside `live`, a nonzero count comes
+/// from a `pin_slot` that saw the state and is about to unpin.
+///
+/// A reader that pins a slot in `WRITING` or `FREED` state unpins at once.
+/// Exactly one thread moves a retired slot to `ON_FREE_LIST` and pushes it:
+/// the freer if no reader holds it, otherwise the last reader to unpin.
+pub(crate) mod slot_pin {
+    /// Readers holding the slot.
+    pub const COUNT_MASK: u32 = (1 << 29) - 1;
+    /// Claimed by a writer and not yet published.
+    pub const WRITING: u32 = 1 << 29;
+    /// Retired: `pin_slot` fails; pushed when the count reaches zero.
+    pub const FREED: u32 = 1 << 30;
+    /// Pushed to the class free list.
+    pub const ON_FREE_LIST: u32 = 1 << 31;
+}
+
 /// A slab class manages all slabs of a particular slot size.
 pub struct SlabClass {
     /// Class ID (index in the SLAB_CLASSES array).
@@ -374,6 +405,9 @@ pub struct SlabClass {
     /// Format: [state: 8 bits][ref_count: 24 bits]
     /// Used for safe concurrent access and eviction coordination.
     slab_states: Box<[AtomicU32]>,
+    /// Per-slab array of `slots_per_slab` slot pin words (see `slot_pin`),
+    /// from `Box::into_raw`. Null when the slab is not in this class.
+    slot_pins: Box<[AtomicPtr<AtomicU32>]>,
     /// Free slot stack: packed as (slab_id << 32 | slot_index).
     free_slots: Injector<u64>,
     /// Number of allocated slabs (atomic for lock-free reads).
@@ -423,6 +457,10 @@ impl SlabClass {
             .map(|_| AtomicU32::new(0))
             .collect();
 
+        let slot_pins: Box<[AtomicPtr<AtomicU32>]> = (0..MAX_SLABS_PER_CLASS)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect();
+
         Self {
             class_id,
             slot_size,
@@ -430,6 +468,7 @@ impl SlabClass {
             slabs: RwLock::new(Vec::new()),
             slab_ptrs,
             slab_states,
+            slot_pins,
             free_slots: Injector::new(),
             slab_count: AtomicU32::new(0),
             item_count: AtomicU64::new(0),
@@ -553,6 +592,14 @@ impl SlabClass {
             // This ensures the pointer is visible to readers before the slab_id is used.
             self.slab_ptrs[slab_id as usize].store(data, Ordering::Release);
 
+            // Every slot starts on the free list.
+            let pins: Box<[AtomicU32]> = (0..self.slots_per_slab)
+                .map(|_| AtomicU32::new(slot_pin::FREED | slot_pin::ON_FREE_LIST))
+                .collect();
+            let old = self.slot_pins[slab_id as usize]
+                .swap(Box::into_raw(pins) as *mut AtomicU32, Ordering::Release);
+            self.drop_pins_ptr(old);
+
             // Set state to Live so readers can acquire references
             packed_state::set_live(&self.slab_states[slab_id as usize]);
 
@@ -576,8 +623,9 @@ impl SlabClass {
     /// Try to allocate a slot from the free list for writing.
     ///
     /// Returns `Some((slab_id, slot_index))` if successful, `None` if no free slots.
-    /// **The slab's ref_count is incremented** to prevent eviction during the write.
-    /// Caller MUST call `release_slab(slab_id)` when the write is complete.
+    /// Increments the slab's ref_count and claims the slot (`WRITING`). The
+    /// caller publishes it with `publish_slot` or frees it with `free_slot`,
+    /// then calls `release_slab`.
     ///
     /// This method filters out slots from evicted slabs. When a slab is evicted,
     /// its state becomes Unallocated, but the free_slots queue may still contain
@@ -592,10 +640,15 @@ impl SlabClass {
                     // This both checks that the slab is Live AND increments ref_count,
                     // preventing eviction from proceeding while we write to the slot.
                     // If the slab is not Live (evicted or draining), try_acquire fails.
-                    if packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
+                    if !packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
+                        // Slab is not Live (evicted or draining), discard and try again
+                        continue;
+                    }
+                    if self.claim_slot(slab_id, slot_index) {
                         return Some((slab_id, slot_index));
                     }
-                    // Slab is not Live (evicted or draining), discard and try again
+                    // Not a free slot: discard it.
+                    self.release_slab(slab_id);
                     continue;
                 }
                 crossbeam_deque::Steal::Empty => return None,
@@ -604,10 +657,177 @@ impl SlabClass {
         }
     }
 
-    /// Return a slot to the free list.
-    pub fn deallocate(&self, slab_id: u32, slot_index: u32) {
-        let packed = pack_slot_ref(slab_id, slot_index);
-        self.free_slots.push(packed);
+    /// The pin word for a slot, or `None` if the slab is not in this class.
+    ///
+    /// The caller must hold a reference on the slab, which keeps the pin
+    /// array from being freed.
+    #[inline]
+    fn pin_word(&self, slab_id: u32, slot_index: u32) -> Option<&AtomicU32> {
+        let pins = self
+            .slot_pins
+            .get(slab_id as usize)?
+            .load(Ordering::Acquire);
+        if pins.is_null() || slot_index as usize >= self.slots_per_slab {
+            return None;
+        }
+        // SAFETY: `pins` points to `slots_per_slab` words, kept alive by the
+        // caller's slab reference.
+        Some(unsafe { &*pins.add(slot_index as usize) })
+    }
+
+    /// Take a slot popped from the free list for writing. Returns `false`
+    /// if the slot is not on the free list.
+    fn claim_slot(&self, slab_id: u32, slot_index: u32) -> bool {
+        let Some(pin) = self.pin_word(slab_id, slot_index) else {
+            return false;
+        };
+        let free = slot_pin::FREED | slot_pin::ON_FREE_LIST;
+        let mut cur = pin.load(Ordering::Acquire);
+        loop {
+            if cur & !slot_pin::COUNT_MASK != free {
+                debug_assert!(
+                    false,
+                    "slot {slab_id}/{slot_index} on free list in state {cur:#x}"
+                );
+                return false;
+            }
+            // A nonzero count is a `pin_slot` that saw `FREED` and will
+            // unpin without reading. Keeping it in the word lets that unpin
+            // see `WRITING` and do nothing.
+            let new = slot_pin::WRITING | (cur & slot_pin::COUNT_MASK);
+            match pin.compare_exchange_weak(cur, new, Ordering::Acquire, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Make a written slot readable. Called after the item is fully written
+    /// and before its location is published in the hashtable.
+    pub fn publish_slot(&self, slab_id: u32, slot_index: u32) {
+        if let Some(pin) = self.pin_word(slab_id, slot_index) {
+            let prev = pin.fetch_and(!slot_pin::WRITING, Ordering::Release);
+            debug_assert!(
+                prev & slot_pin::WRITING != 0,
+                "publishing an unclaimed slot"
+            );
+        }
+    }
+
+    /// Hold a live slot for reading. Returns `false` if the slot is being
+    /// written or has been freed.
+    ///
+    /// The caller must hold a reference on the slab, and must call
+    /// `unpin_slot` before releasing it. A pinned slot is not reused, but it
+    /// may hold a different key than the one the caller looked up.
+    pub fn pin_slot(&self, slab_id: u32, slot_index: u32) -> bool {
+        let Some(pin) = self.pin_word(slab_id, slot_index) else {
+            return false;
+        };
+        let prev = pin.fetch_add(1, Ordering::Acquire);
+        debug_assert!(prev & slot_pin::COUNT_MASK < slot_pin::COUNT_MASK);
+        if prev & (slot_pin::WRITING | slot_pin::FREED) != 0 {
+            self.unpin_slot(slab_id, slot_index);
+            return false;
+        }
+        true
+    }
+
+    /// Release a hold taken by `pin_slot`. If the slot was freed while held
+    /// and this was the last hold, pushes it to the free list.
+    pub fn unpin_slot(&self, slab_id: u32, slot_index: u32) {
+        let Some(pin) = self.pin_word(slab_id, slot_index) else {
+            return;
+        };
+        let prev = pin.fetch_sub(1, Ordering::Release);
+        if prev & slot_pin::COUNT_MASK == 1
+            && prev & (slot_pin::FREED | slot_pin::ON_FREE_LIST) == slot_pin::FREED
+        {
+            self.push_freed_slot(pin, slab_id, slot_index);
+        }
+    }
+
+    /// Retire a slot whose item is no longer reachable from the hashtable.
+    /// It goes on the free list once no reader holds it.
+    ///
+    /// The caller must hold a reference on the slab, and calls this at most
+    /// once per `allocate` of the slot.
+    pub fn free_slot(&self, slab_id: u32, slot_index: u32) {
+        let Some(pin) = self.pin_word(slab_id, slot_index) else {
+            return;
+        };
+        let mut cur = pin.load(Ordering::Relaxed);
+        loop {
+            debug_assert!(cur & slot_pin::FREED == 0, "slot freed twice");
+            let new = (cur & !slot_pin::WRITING) | slot_pin::FREED;
+            match pin.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => {
+                    if new & slot_pin::COUNT_MASK == 0 {
+                        self.push_freed_slot(pin, slab_id, slot_index);
+                    }
+                    return;
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Push a retired slot with no readers, unless another thread already
+    /// has or a reader has since pinned it (that reader's unpin pushes it).
+    fn push_freed_slot(&self, pin: &AtomicU32, slab_id: u32, slot_index: u32) {
+        if pin
+            .compare_exchange(
+                slot_pin::FREED,
+                slot_pin::FREED | slot_pin::ON_FREE_LIST,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.free_slots.push(pack_slot_ref(slab_id, slot_index));
+        }
+    }
+
+    /// Free a pin array taken from `slot_pins`.
+    fn drop_pins_ptr(&self, pins: *mut AtomicU32) {
+        if !pins.is_null() {
+            // SAFETY: `pins` came from `Box::into_raw` of a slice of
+            // `slots_per_slab` words in `add_slab`. Callers swap it out of
+            // `slot_pins` once the slab is `Locked` with no references
+            // (`evict_slab`) or the class is being dropped. `reset` also
+            // frees it, and requires that no read or write is in flight.
+            drop(unsafe {
+                Box::from_raw(ptr::slice_from_raw_parts_mut(pins, self.slots_per_slab))
+            });
+        }
+    }
+
+    /// Like `acquire_slab`, but if the slab is draining, waits until the
+    /// drain finishes or is aborted. Returns `false` once the slab is
+    /// `Locked` or has left the class.
+    ///
+    /// The caller must not hold a reference on this slab, or the drain
+    /// cannot finish and the wait lasts until it times out.
+    pub fn acquire_slab_after_drain(&self, slab_id: u32) -> bool {
+        let Some(atom) = self.slab_states.get(slab_id as usize) else {
+            return false;
+        };
+        let mut spins = 0u32;
+        loop {
+            if packed_state::try_acquire(atom) {
+                return true;
+            }
+            // `Live` here means the drain aborted after `try_acquire` failed.
+            let (state, _) = packed_state::unpack(atom.load(Ordering::Acquire));
+            if matches!(state, SlabState::Locked | SlabState::Unallocated) {
+                return false;
+            }
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(1000) {
+                std::thread::yield_now();
+            }
+            crate::sync::spin_loop();
+        }
     }
 
     /// Try to acquire a reference to a slab for reading.
@@ -633,44 +853,10 @@ impl SlabClass {
         packed_state::release(&self.slab_states[slab_id as usize]);
     }
 
-    /// Get raw value reference pointers for zero-copy reads.
-    ///
-    /// Returns `(ref_count_ptr, value_ptr, value_len)` if successful.
-    /// The ref_count has already been incremented; caller must decrement on drop
-    /// (typically by constructing a `ValueRef`).
-    ///
-    /// Returns `None` if the slab is not readable (draining or unallocated).
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure the slot contains a valid item.
+    /// The packed state + ref_count word of a slab.
     #[inline]
-    pub unsafe fn get_value_ref_raw(
-        &self,
-        slab_id: u32,
-        slot_index: u32,
-    ) -> Option<(*const AtomicU32, *const u8, usize)> {
-        unsafe {
-            if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
-                return None;
-            }
-
-            // Acquire slab reference (increments ref_count if Live)
-            if !packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
-                return None;
-            }
-
-            // Get value pointer and length
-            let header = self.header(slab_id, slot_index);
-            let value_ptr = header.value_ptr();
-            let value_len = header.value_len();
-
-            // Return pointer to the packed state (ref_count is in low 24 bits)
-            // ValueRef::drop will call fetch_sub(1), which decrements only the ref_count
-            let ref_count_ptr = &self.slab_states[slab_id as usize] as *const AtomicU32;
-
-            Some((ref_count_ptr, value_ptr, value_len))
-        }
+    pub fn state_word(&self, slab_id: u32) -> &AtomicU32 {
+        &self.slab_states[slab_id as usize]
     }
 
     /// Get a slab by ID.
@@ -857,6 +1043,8 @@ impl SlabClass {
         // leaving this class entirely. The slot refs would point to memory
         // that may be reused by a different class.
         self.slab_ptrs[slab_id as usize].store(std::ptr::null_mut(), Ordering::Release);
+        let pins = self.slot_pins[slab_id as usize].swap(ptr::null_mut(), Ordering::AcqRel);
+        self.drop_pins_ptr(pins);
         packed_state::set_unallocated(state_atom);
 
         // Decrement slab count since this slab is leaving the class
@@ -903,7 +1091,8 @@ impl SlabClass {
     /// 4. Returns the location and a pointer to the value area
     ///
     /// After this call, the caller writes the value directly to the returned
-    /// pointer, then calls `finalize_write_item` to update statistics.
+    /// pointer, then calls `finalize_write_item` to update statistics and make
+    /// the slot readable.
     ///
     /// Returns `None` if no free slots are available.
     ///
@@ -947,38 +1136,34 @@ impl SlabClass {
     ///
     /// Called after the value has been written to the pointer returned by
     /// `begin_write_item`. Updates statistics (bytes_used, item_count) and
-    /// releases the write ref acquired during allocation.
-    pub fn finalize_write_item(&self, slab_id: u32, item_size: usize) {
+    /// makes the slot readable. The write ref taken by `allocate` is still
+    /// held; the caller releases it after publishing the location.
+    pub fn finalize_write_item(&self, slab_id: u32, slot_index: u32, item_size: usize) {
         self.add_bytes(item_size);
         self.add_item();
-        // Release the write ref acquired during begin_write_item -> allocate()
-        self.release_slab(slab_id);
+        self.publish_slot(slab_id, slot_index);
     }
 
-    /// Cancel a two-phase write operation.
+    /// Cancel a two-phase write operation before `finalize_write_item`.
     ///
     /// Called if the write cannot be completed (e.g., connection closed).
-    /// Marks the item as deleted, returns the slot to the free list, and
-    /// releases the write ref acquired during allocation.
+    /// Marks the item as deleted, frees the slot, and releases the write
+    /// ref acquired during allocation.
     pub fn cancel_write_item(&self, slab_id: u32, slot_index: u32) {
-        // Release the write ref acquired during begin_write_item -> allocate()
-        self.release_slab(slab_id);
-
-        // Mark as deleted
         unsafe {
             let slot_ptr = self.slot_ptr(slab_id, slot_index);
             let header = SlabItemHeader::from_ptr(slot_ptr);
             header.mark_deleted();
         }
-
-        // Return slot to free list
-        self.deallocate(slab_id, slot_index);
+        self.free_slot(slab_id, slot_index);
+        self.release_slab(slab_id);
     }
 
     /// Reset this slab class, returning all slab data pointers.
     ///
     /// This clears all slabs and returns their data pointers so they can
-    /// be returned to the global free pool.
+    /// be returned to the global free pool. No read, write or `ValueRef`
+    /// may be outstanding: the slot pin arrays are freed here.
     pub fn reset(&self) -> Vec<*mut u8> {
         // Clear the free slots queue
         loop {
@@ -992,6 +1177,10 @@ impl SlabClass {
         // Get all slab data pointers and clear the slabs list
         let mut slabs = self.slabs.write();
         let data_ptrs: Vec<*mut u8> = slabs.iter().map(|s| s.data()).collect();
+        for slab_id in 0..slabs.len() {
+            let pins = self.slot_pins[slab_id].swap(ptr::null_mut(), Ordering::AcqRel);
+            self.drop_pins_ptr(pins);
+        }
         slabs.clear();
 
         // Reset counters
@@ -1000,6 +1189,15 @@ impl SlabClass {
         self.bytes_used.store(0, Ordering::Release);
 
         data_ptrs
+    }
+}
+
+impl Drop for SlabClass {
+    fn drop(&mut self) {
+        for i in 0..self.slot_pins.len() {
+            let pins = self.slot_pins[i].swap(ptr::null_mut(), Ordering::Relaxed);
+            self.drop_pins_ptr(pins);
+        }
     }
 }
 
@@ -1079,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_slab_class_allocate_deallocate() {
+    fn test_slab_class_allocate_free() {
         let class = SlabClass::new(0, 64, 1024);
 
         let mut buffer = vec![0u8; 1024];
@@ -1099,9 +1297,9 @@ mod tests {
         // No more slots
         assert!(class.allocate().is_none());
 
-        // Deallocate one
+        // Free one; the write ref from `allocate` is still held.
         let (slab_id, slot_index) = allocated.pop().unwrap();
-        class.deallocate(slab_id, slot_index);
+        class.free_slot(slab_id, slot_index);
 
         // Can allocate again
         let slot = class.allocate();

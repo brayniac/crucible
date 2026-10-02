@@ -13,9 +13,71 @@ use crossbeam_deque::Injector;
 
 use crate::class::SlabClass;
 use crate::config::{EvictionStrategy, HEADER_SIZE, SlabCacheConfig, SlabClasses};
-use crate::item::SlabItemHeader;
+use crate::item::{SlabItemHeader, pack_slot_ref, unpack_slot_ref};
 use crate::location::{MAX_SLOT_INDEX, SlabLocation};
 use crate::verifier::SlabVerifier;
+
+/// A slab reference and slot pin on one item, released on drop.
+pub struct ItemPin<'a> {
+    class: &'a SlabClass,
+    slab_id: u32,
+    slot_index: u32,
+}
+
+impl ItemPin<'_> {
+    /// The pinned item's header.
+    #[inline]
+    pub fn header(&self) -> &SlabItemHeader {
+        // SAFETY: the slab reference and slot pin keep the slot's memory in
+        // this class and keep it from being rewritten.
+        unsafe { self.class.header(self.slab_id, self.slot_index) }
+    }
+
+    /// Convert into a `ValueRef` over the item's value that keeps the slab
+    /// reference and slot pin until it is dropped.
+    pub fn into_value_ref(self) -> cache_core::ValueRef {
+        let header = self.header();
+        // SAFETY: a pinned slot holds a published item.
+        let (value_ptr, value_len) = (unsafe { header.value_ptr() }, header.value_len());
+        let ref_count = self.class.state_word(self.slab_id) as *const AtomicU32;
+        let ctx = self.class as *const SlabClass as *const ();
+        let arg = pack_slot_ref(self.slab_id, self.slot_index);
+        std::mem::forget(self);
+        // SAFETY: `ref_count` is the slab's state word, on which this pin
+        // holds a reference; `ValueRef::drop` releases it after the hook
+        // unpins the slot. `ctx` is the `SlabClass`, in the same `SlabCache`
+        // as `ref_count`; both are valid while the `ValueRef` does not
+        // outlive the cache.
+        unsafe {
+            cache_core::ValueRef::new(
+                ref_count,
+                value_ptr,
+                value_len,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+            .with_release_hook(unpin_slot_hook, ctx, arg)
+        }
+    }
+}
+
+impl Drop for ItemPin<'_> {
+    fn drop(&mut self) {
+        self.class.unpin_slot(self.slab_id, self.slot_index);
+        self.class.release_slab(self.slab_id);
+    }
+}
+
+/// `ValueRef` release hook for a slab item: `ctx` is the `SlabClass` and
+/// `arg` the packed slot.
+unsafe fn unpin_slot_hook(ctx: *const (), arg: u64) {
+    // SAFETY: `into_value_ref` passes a `SlabClass` pointer that outlives
+    // the `ValueRef`.
+    let class = unsafe { &*(ctx as *const SlabClass) };
+    let (slab_id, slot_index) = unpack_slot_ref(arg);
+    class.unpin_slot(slab_id, slot_index);
+}
 
 /// The main slab allocator.
 pub struct SlabAllocator {
@@ -132,8 +194,7 @@ impl SlabAllocator {
     /// Check if a slab is in Live state (readable).
     ///
     /// This is a quick check for the verifier to avoid reading from evicted
-    /// slabs. Note that this check is racy - use `acquire_slab()` for safe
-    /// access that prevents eviction during the read.
+    /// slabs. Note that this check is racy - use `pin_item` to read an item.
     #[allow(dead_code)]
     #[inline]
     pub fn is_slab_live(&self, class_id: u8, slab_id: u32) -> bool {
@@ -187,11 +248,80 @@ impl SlabAllocator {
         class.allocate()
     }
 
-    /// Deallocate a slot, returning it to the free list.
-    pub fn deallocate(&self, class_id: u8, slab_id: u32, slot_index: u32) {
-        if let Some(class) = self.classes.get(class_id as usize) {
-            class.deallocate(slab_id, slot_index);
+    /// Retire an item that has been removed from the hashtable: drop it
+    /// from the class statistics, mark it deleted, and free its slot once no
+    /// reader holds it.
+    ///
+    /// If the slab is draining, waits for the drain to finish or abort.
+    /// Returns `false` and does nothing if the slab is then `Locked` or has
+    /// left the class: eviction counts the item out when it processes the
+    /// slab, and its hashtable remove finds no entry.
+    ///
+    /// The caller must not hold a reference on the item's slab; a caller
+    /// that holds the write ref uses `retire_held_item`.
+    pub fn retire_item(&self, location: SlabLocation) -> bool {
+        let (class_id, slab_id, slot_index) = location.unpack();
+        let Some(class) = self.classes.get(class_id as usize) else {
+            return false;
+        };
+        if !class.acquire_slab_after_drain(slab_id) {
+            return false;
         }
+        Self::retire_in_class(class, slab_id, slot_index);
+        class.release_slab(slab_id);
+        true
+    }
+
+    /// `retire_item` for a slot whose write ref the caller still holds.
+    pub fn retire_held_item(&self, location: SlabLocation) {
+        let (class_id, slab_id, slot_index) = location.unpack();
+        if let Some(class) = self.classes.get(class_id as usize) {
+            Self::retire_in_class(class, slab_id, slot_index);
+        }
+    }
+
+    fn retire_in_class(class: &SlabClass, slab_id: u32, slot_index: u32) {
+        // SAFETY: the caller's slab reference keeps the slab in this class,
+        // and the caller owns this slot's retirement: it removed the slot's
+        // hashtable entry or never inserted one.
+        unsafe {
+            let header = class.header(slab_id, slot_index);
+            class.sub_bytes(header.item_size());
+            class.remove_item();
+            header.mark_deleted();
+        }
+        class.free_slot(slab_id, slot_index);
+    }
+
+    /// Hold the item at `location` for reading if it is live and its key is
+    /// `key`. The slab cannot be evicted and the slot cannot be reused until
+    /// the returned pin is dropped.
+    ///
+    /// Returns `None` if the slab is draining or gone, or the slot has been
+    /// freed or now holds a different key; the caller can look the key up
+    /// again.
+    pub fn pin_item(&self, location: SlabLocation, key: &[u8]) -> Option<ItemPin<'_>> {
+        let (class_id, slab_id, slot_index) = location.unpack();
+        let class = self.classes.get(class_id as usize)?;
+        if !class.acquire_slab(slab_id) {
+            return None;
+        }
+        if !class.pin_slot(slab_id, slot_index) {
+            class.release_slab(slab_id);
+            return None;
+        }
+        let pin = ItemPin {
+            class,
+            slab_id,
+            slot_index,
+        };
+        let header = pin.header();
+        // SAFETY: a pinned slot is published, so its header and key are
+        // fully written and not being rewritten.
+        if header.is_deleted() || unsafe { header.key() } != key {
+            return None;
+        }
+        Some(pin)
     }
 
     /// Release a slab reference acquired during allocation.
@@ -486,7 +616,8 @@ impl SlabAllocator {
     ///
     /// # Safety
     ///
-    /// The slot must have been allocated and not contain a live item.
+    /// The slot must be one `allocate` claimed for this write and has not
+    /// been published. Publishes the slot.
     pub unsafe fn write_item(
         &self,
         class_id: u8,
@@ -517,6 +648,8 @@ impl SlabAllocator {
             // Update stats
             class.add_bytes(HEADER_SIZE + key.len() + value.len());
             class.add_item();
+
+            class.publish_slot(slab_id, slot_index);
         }
     }
 
@@ -525,6 +658,7 @@ impl SlabAllocator {
     /// # Safety
     ///
     /// The location must point to a valid item.
+    #[cfg(test)]
     #[inline]
     pub unsafe fn header(&self, location: SlabLocation) -> &SlabItemHeader {
         // SAFETY: Caller ensures location points to valid item
@@ -554,55 +688,6 @@ impl SlabAllocator {
         let (class_id, slab_id, _slot_index) = location.unpack();
         if let Some(class) = self.classes.get(class_id as usize) {
             class.touch_slab(slab_id);
-        }
-    }
-
-    /// Try to acquire a reference to a slab for reading.
-    ///
-    /// Returns `true` if the slab is readable and ref_count was incremented.
-    /// Returns `false` if the slab is not readable (unallocated or draining).
-    ///
-    /// Caller must call `release_slab()` when done reading.
-    #[inline]
-    pub fn acquire_slab(&self, location: SlabLocation) -> bool {
-        let (class_id, slab_id, _) = location.unpack();
-        if let Some(class) = self.classes.get(class_id as usize) {
-            class.acquire_slab(slab_id)
-        } else {
-            false
-        }
-    }
-
-    /// Release a reference to a slab after reading.
-    ///
-    /// Must be called after a successful `acquire_slab()`.
-    #[inline]
-    pub fn release_slab(&self, location: SlabLocation) {
-        let (class_id, slab_id, _) = location.unpack();
-        if let Some(class) = self.classes.get(class_id as usize) {
-            class.release_slab(slab_id);
-        }
-    }
-
-    /// Get raw value reference pointers for zero-copy reads.
-    ///
-    /// Returns `(ref_count_ptr, value_ptr, value_len)` if successful.
-    /// The ref_count has already been incremented; caller must decrement on drop
-    /// (typically by constructing a `ValueRef`).
-    ///
-    /// # Safety
-    ///
-    /// The location must point to a valid item.
-    #[inline]
-    pub unsafe fn get_value_ref_raw(
-        &self,
-        location: SlabLocation,
-    ) -> Option<(*const AtomicU32, *const u8, usize)> {
-        unsafe {
-            let (class_id, slab_id, slot_index) = location.unpack();
-            self.classes
-                .get(class_id as usize)?
-                .get_value_ref_raw(slab_id, slot_index)
         }
     }
 
@@ -690,22 +775,25 @@ impl SlabAllocator {
     ///
     /// Called after the value has been written to the pointer returned by
     /// `begin_write_item`. Updates statistics (bytes_used, item_count) and
-    /// releases the write ref acquired during allocation.
+    /// makes the slot readable. The write ref taken by `allocate` is still
+    /// held; the caller releases it after inserting the location into the
+    /// hashtable.
     ///
     /// # Arguments
     /// * `location` - The location returned by `begin_write_item`
     /// * `item_size` - The item_size returned by `begin_write_item`
     pub fn finalize_write_item(&self, location: SlabLocation, item_size: usize) {
-        let (class_id, slab_id, _slot_index) = location.unpack();
+        let (class_id, slab_id, slot_index) = location.unpack();
         if let Some(class) = self.classes.get(class_id as usize) {
-            class.finalize_write_item(slab_id, item_size);
+            class.finalize_write_item(slab_id, slot_index, item_size);
         }
     }
 
     /// Cancel a two-phase write operation.
     ///
-    /// Called if the write cannot be completed (e.g., connection closed).
-    /// Marks the item as deleted and returns the slot to the free list.
+    /// Called if the write cannot be completed (e.g., connection closed),
+    /// before `finalize_write_item`. Marks the item deleted, frees the
+    /// slot, and releases the write ref.
     ///
     /// # Arguments
     /// * `location` - The location returned by `begin_write_item`
@@ -841,6 +929,42 @@ mod tests {
             hugepage_size: HugepageSize::None,
             ..Default::default()
         }
+    }
+
+    /// An item retired while its slab is draining is retired once the drain
+    /// aborts, not left counted with its slot unused.
+    #[test]
+    fn retire_during_an_aborted_drain_retires_the_item() {
+        use crate::class::packed_state;
+
+        let config = test_config();
+        let allocator = SlabAllocator::new(&config).unwrap();
+        let class_id = allocator.select_class(HEADER_SIZE + 8).unwrap();
+        let (slab_id, slot_index) = allocator.allocate(class_id).unwrap();
+        unsafe {
+            allocator.write_item(
+                class_id,
+                slab_id,
+                slot_index,
+                b"k",
+                b"v",
+                Duration::from_secs(3600),
+            );
+        }
+        allocator.release_write_ref(class_id, slab_id);
+        let class = allocator.class(class_id).unwrap();
+        assert_eq!(class.item_count(), 1);
+
+        let state = class.state_word(slab_id);
+        assert!(packed_state::try_start_drain(state));
+        let location = SlabLocation::new(class_id, slab_id, slot_index);
+        std::thread::scope(|s| {
+            let retire = s.spawn(|| allocator.retire_item(location));
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(packed_state::abort_drain(state));
+            assert!(retire.join().unwrap(), "retire gave up on a live slab");
+        });
+        assert_eq!(class.item_count(), 0);
     }
 
     #[test]

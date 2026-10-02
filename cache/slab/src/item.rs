@@ -69,9 +69,10 @@ const EXPIRE_MASK: u32 = (1 << 28) - 1;
 ///
 /// # Concurrency
 ///
-/// Items are protected by slab-level reference counting, not per-item locks.
-/// All mutations use copy-modify-write semantics (allocate new slot, update
-/// hashtable atomically). The `expire_and_flags` field uses atomic operations
+/// A reader holds a reference on the slab, which blocks eviction, and a pin
+/// on the slot (`class::slot_pin`), which keeps a freed slot off the free
+/// list until the reader is done. All mutations use copy-modify-write
+/// semantics (allocate new slot, update hashtable atomically). The `expire_and_flags` field uses atomic operations
 /// for flag updates (mark_deleted, set_numeric, etc.).
 #[repr(C)]
 pub struct SlabItemHeader {

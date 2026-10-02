@@ -86,7 +86,13 @@ pub struct ValueRef {
     free_queue: *const crossbeam_deque::Injector<u32>,
     /// Segment ID for returning to free queue.
     segment_id: u32,
+    /// Called by `drop` before `ref_count` is released, as `hook(ctx, arg)`.
+    release_hook: Option<(ReleaseHook, *const (), u64)>,
 }
+
+/// A function `ValueRef::drop` calls as `hook(ctx, arg)`; see
+/// [`ValueRef::with_release_hook`].
+pub type ReleaseHook = unsafe fn(ctx: *const (), arg: u64);
 
 impl ValueRef {
     /// Create a new ValueRef.
@@ -115,7 +121,26 @@ impl ValueRef {
             metadata,
             free_queue,
             segment_id,
+            release_hook: None,
         }
+    }
+
+    /// Run `hook(ctx, arg)` when this reference is dropped, before
+    /// `ref_count` is released.
+    ///
+    /// A backend whose `ref_count` covers more memory than the value uses
+    /// this to release a finer-grained hold on the value itself.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must stay valid until the hook runs, and the hook must be safe
+    /// to call from any thread. The hook runs once, in `drop`, while
+    /// `ref_count` is still held; it must not panic or release `ref_count`.
+    /// A second call replaces the first hook.
+    #[inline]
+    pub unsafe fn with_release_hook(mut self, hook: ReleaseHook, ctx: *const (), arg: u64) -> Self {
+        self.release_hook = Some((hook, ctx, arg));
+        self
     }
 
     /// Get the value as a byte slice.
@@ -174,7 +199,8 @@ impl std::ops::Deref for ValueRef {
 }
 
 impl Drop for ValueRef {
-    /// Release the segment reference and handle AwaitingRelease state.
+    /// Run the release hook, if any, then release the reference and handle
+    /// AwaitingRelease state.
     ///
     /// # AwaitingRelease Release Pattern
     ///
@@ -216,6 +242,12 @@ impl Drop for ValueRef {
     /// preventing double-free. The successful thread pushes the segment to
     /// the free queue.
     fn drop(&mut self) {
+        if let Some((hook, ctx, arg)) = self.release_hook {
+            // SAFETY: `with_release_hook`'s caller guarantees `ctx` is valid
+            // until now; `ref_count` is still held.
+            unsafe { hook(ctx, arg) };
+        }
+
         // SAFETY: ref_count is a valid AtomicU32 pointer from the segment.
         //
         // SeqCst: the release half of the drain/condemn Dekker pair -- this
@@ -254,6 +286,8 @@ impl Drop for ValueRef {
 // 1. The ref_count points to an AtomicU32 in a 'static MemoryPool
 // 2. The value memory is in the same pool
 // 3. The pool's lifetime exceeds all ValueRefs
+// 4. A release hook is set under `with_release_hook`'s contract that it can
+//    run on any thread
 unsafe impl Send for ValueRef {}
 
 // SAFETY: ValueRef can be shared between threads because:
