@@ -159,8 +159,10 @@ mod server {
                     backend: cache_core::DiskIoBackend::DirectIo,
                     path: disk_config.path.to_string_lossy().into_owned(),
                     read_buffer_count: 64,
-                    read_buffer_size: 4096,
-                    block_size: 4096,
+                    read_buffer_size: crate::disk_io::read_buffer_size(
+                        crate::disk_io::DISK_BLOCK_SIZE,
+                    ),
+                    block_size: crate::disk_io::DISK_BLOCK_SIZE,
                 })
             }
             Some(DiskIoBackendConfig::Nvme) => {
@@ -180,8 +182,10 @@ mod server {
                     backend: cache_core::DiskIoBackend::Nvme { device_path, nsid },
                     path: String::new(),
                     read_buffer_count: 64,
-                    read_buffer_size: 4096,
-                    block_size: 4096,
+                    read_buffer_size: crate::disk_io::read_buffer_size(
+                        crate::disk_io::DISK_BLOCK_SIZE,
+                    ),
+                    block_size: crate::disk_io::DISK_BLOCK_SIZE,
                 })
             }
             _ => None,

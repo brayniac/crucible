@@ -8,6 +8,20 @@
 use cache_core::disk::{AlignedBuffer, AlignedBufferPool, DiskReadParams};
 use ringline::{ConnToken, DirectIoFile, NvmeDevice};
 
+/// Block size of the io_uring disk tier, shared by the cache's
+/// `IoUringDiskTierConfig` and the server's `DiskIoWorkerConfig`. Read buffers
+/// are sized from it, so the two must agree.
+pub const DISK_BLOCK_SIZE: u32 = 4096;
+
+/// Read buffer size for a disk read of one block at an item's offset.
+///
+/// Items are 512-byte aligned, not block aligned, so a block-sized read
+/// starting at an item spans two blocks unless the item starts on a block
+/// boundary. See `IoUringPool::item_disk_range`.
+pub(crate) const fn read_buffer_size(block_size: u32) -> usize {
+    2 * block_size as usize
+}
+
 /// Configuration for per-worker disk I/O initialization.
 pub(crate) struct DiskIoWorkerConfig {
     /// Backend type.
@@ -16,7 +30,7 @@ pub(crate) struct DiskIoWorkerConfig {
     pub path: String,
     /// Number of read buffers per worker.
     pub read_buffer_count: usize,
-    /// Size of each read buffer (typically one block = 4096).
+    /// Size of each read buffer; see [`read_buffer_size`].
     pub read_buffer_size: usize,
     /// Block size for alignment.
     pub block_size: u32,
@@ -202,6 +216,33 @@ impl DiskIoState {
         match &self.backend {
             DiskBackend::Nvme { block_size, .. } => *block_size,
             DiskBackend::DirectIo { block_size, .. } => *block_size,
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_buffer_size_tests {
+    use super::read_buffer_size;
+    use cache_core::disk::IoUringPool;
+
+    /// Every read `TieredCache::lookup` asks for -- one block from an item's
+    /// offset -- fits a read buffer, wherever the item sits in its segment.
+    /// A one-block buffer is too small for 7 of every 8 item offsets.
+    #[test]
+    fn every_block_read_fits_a_read_buffer() {
+        let block = 4096;
+        let segment_size = 1024 * 1024;
+        let pool = IoUringPool::new(0, 2, segment_size, block);
+        for segment_id in 0..2 {
+            for offset in (0..segment_size as u32).step_by(512) {
+                let (_, read_len, within) = pool.item_disk_range(segment_id, offset, block);
+                assert!(
+                    read_len as usize <= read_buffer_size(block),
+                    "offset {offset}: read of {read_len} bytes into a {}-byte buffer",
+                    read_buffer_size(block)
+                );
+                assert!(within < read_len, "offset {offset}: item outside the read");
+            }
         }
     }
 }
