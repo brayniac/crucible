@@ -301,6 +301,20 @@ impl SlabAllocator {
     /// freed or now holds a different key; the caller can look the key up
     /// again.
     pub fn pin_item(&self, location: SlabLocation, key: &[u8]) -> Option<ItemPin<'_>> {
+        let pin = self.pin_slot(location)?;
+        let header = pin.header();
+        // SAFETY: a pinned slot is published, so its header and key are
+        // fully written and not being rewritten.
+        if header.is_deleted() || unsafe { header.key() } != key {
+            return None;
+        }
+        Some(pin)
+    }
+
+    /// Hold the slot at `location` for reading if it holds a published item,
+    /// whatever its key and deleted flag. Returns `None` if the slab is
+    /// draining or gone, or the slot is free or being written.
+    pub fn pin_slot(&self, location: SlabLocation) -> Option<ItemPin<'_>> {
         let (class_id, slab_id, slot_index) = location.unpack();
         let class = self.classes.get(class_id as usize)?;
         if !class.acquire_slab(slab_id) {
@@ -310,18 +324,11 @@ impl SlabAllocator {
             class.release_slab(slab_id);
             return None;
         }
-        let pin = ItemPin {
+        Some(ItemPin {
             class,
             slab_id,
             slot_index,
-        };
-        let header = pin.header();
-        // SAFETY: a pinned slot is published, so its header and key are
-        // fully written and not being rewritten.
-        if header.is_deleted() || unsafe { header.key() } != key {
-            return None;
-        }
-        Some(pin)
+        })
     }
 
     /// Release a slab reference acquired during allocation.

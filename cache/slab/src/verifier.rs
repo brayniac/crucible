@@ -52,40 +52,22 @@ impl KeyVerifier for SlabVerifier<'_> {
         }
 
         let slab_loc = SlabLocation::from_location(location);
-        let (class_id, slab_id, slot_index) = slab_loc.unpack();
 
-        // Get the class
-        let class = match self.allocator.class(class_id) {
-            Some(c) => c,
-            None => return false,
+        // The pin keeps the slab in this class and the slot from being
+        // rewritten while the header and key are read. A slot that is free
+        // or mid-write holds no item to match.
+        let Some(pin) = self.allocator.pin_slot(slab_loc) else {
+            return false;
         };
-
-        // Check if slab is live (not evicted).
-        // This is crucial: slab_count() returns the total slabs ever added,
-        // not the currently live slabs. An evicted slab would pass the
-        // slab_count() check but have a null pointer, causing a segfault.
-        if !class.is_slab_live(slab_id) {
+        let header = pin.header();
+        if !allow_deleted && header.is_deleted() {
             return false;
         }
-
-        // Get the header and verify
-        unsafe {
-            let header = class.header(slab_id, slot_index);
-
-            // Check deleted flag
-            if !allow_deleted && header.is_deleted() {
-                return false;
-            }
-
-            // Check expiration
-            if !self.allow_expired && header.is_expired() {
-                return false;
-            }
-
-            // Compare key
-            let stored_key = header.key();
-            stored_key == key
+        if !self.allow_expired && header.is_expired() {
+            return false;
         }
+        // SAFETY: a pinned slot is published, so its key is fully written.
+        unsafe { header.key() == key }
     }
 
     fn prefetch(&self, location: Location) {
@@ -173,40 +155,22 @@ impl<'a> SlabTieredVerifier<'a> {
     /// Verify a key in RAM storage.
     fn verify_ram(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let slab_loc = SlabLocation::from_location(location);
-        let (class_id, slab_id, slot_index) = slab_loc.unpack();
 
-        // Get the class
-        let class = match self.allocator.class(class_id) {
-            Some(c) => c,
-            None => return false,
+        // The pin keeps the slab in this class and the slot from being
+        // rewritten while the header and key are read. A slot that is free
+        // or mid-write holds no item to match.
+        let Some(pin) = self.allocator.pin_slot(slab_loc) else {
+            return false;
         };
-
-        // Check if slab is live (not evicted).
-        // This is crucial: slab_count() returns the total slabs ever added,
-        // not the currently live slabs. An evicted slab would pass the
-        // slab_count() check but have a null pointer, causing a segfault.
-        if !class.is_slab_live(slab_id) {
+        let header = pin.header();
+        if !allow_deleted && header.is_deleted() {
             return false;
         }
-
-        // Get the header and verify
-        unsafe {
-            let header = class.header(slab_id, slot_index);
-
-            // Check deleted flag
-            if !allow_deleted && header.is_deleted() {
-                return false;
-            }
-
-            // Check expiration
-            if !self.allow_expired && header.is_expired() {
-                return false;
-            }
-
-            // Compare key
-            let stored_key = header.key();
-            stored_key == key
+        if !self.allow_expired && header.is_expired() {
+            return false;
         }
+        // SAFETY: a pinned slot is published, so its key is fully written.
+        unsafe { header.key() == key }
     }
 
     /// Verify a key in disk storage.
