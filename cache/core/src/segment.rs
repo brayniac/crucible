@@ -253,11 +253,6 @@ pub(crate) mod interpose {
     /// is one that arrives while the segment is still admitting -- the arrival
     /// a `ref_count` read taken *before* the claim would miss (#133).
     pub(crate) const CLAIM_BEFORE_CAS: u8 = 2;
-    /// `layer::wait_for_readers`: before the first `ref_count` poll. Fired
-    /// from inside the wait, so it moves with it: a test that reads the
-    /// segment's state here sees whether the blocking paths claim before they
-    /// wait or after (#133).
-    pub(crate) const WAIT_BEFORE_POLL: u8 = 3;
     /// [`try_free_condemned`]: immediately after the freed segment is pushed
     /// to the free queue, and only on the path that actually freed it.
     ///
@@ -756,9 +751,9 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
     /// 1. Write exactly `value_len` bytes to the returned pointer
     /// 2. Call `finalize_append` to complete the operation
     ///
-    /// If the caller doesn't complete the operation (e.g., connection closes),
-    /// the item will have garbage in the value but the segment remains valid.
-    /// Use `mark_deleted_at_offset` to clean up incomplete items.
+    /// The item is written with its deleted flag set, so readers and eviction
+    /// scans skip it until `finalize_append` clears the flag. An item that is
+    /// never finalized stays deleted.
     ///
     /// # Parameters
     /// - `key`: The item's key
@@ -808,12 +803,14 @@ pub trait Segment: SegmentKeyVerify + Send + Sync {
 
     /// Finalize a two-phase append operation.
     ///
-    /// Called after writing the value data to complete the append.
-    /// Updates live_items and live_bytes statistics.
+    /// Called after writing the value data. Clears the deleted flag the
+    /// begin call set, with release ordering so a reader that sees the item
+    /// sees its value, then updates live_items and live_bytes.
     ///
     /// # Parameters
-    /// - `item_size`: Total padded item size (from begin_append_with_ttl)
-    fn finalize_append(&self, item_size: u32);
+    /// - `offset`: Item offset (from the begin call)
+    /// - `item_size`: Total padded item size (from the begin call)
+    fn finalize_append(&self, offset: u32, item_size: u32);
 
     /// Mark an item as deleted at a given offset (without key verification).
     ///

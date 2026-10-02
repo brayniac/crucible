@@ -724,6 +724,9 @@ impl Segment for DiskSegmentMeta {
             // Write header
             let header_buf = std::slice::from_raw_parts_mut(ptr, header_size);
             header.to_bytes(header_buf);
+            // Written deleted until `finalize_append`; see
+            // `Segment::begin_append_with_ttl`.
+            header_buf[1] |= 0x40;
             ptr = ptr.add(header_size);
 
             // Write optional
@@ -741,8 +744,27 @@ impl Segment for DiskSegmentMeta {
         }
     }
 
-    fn finalize_append(&self, item_size: u32) {
-        fence(Ordering::Release);
+    fn finalize_append(&self, offset: u32, item_size: u32) {
+        if let Some(data_ptr) = self.write_buffer_mut_ptr()
+            && offset as usize + BasicHeader::SIZE <= self.capacity as usize
+        {
+            let flags_ptr = unsafe { data_ptr.add(offset as usize + 1) };
+            #[cfg(not(feature = "loom"))]
+            {
+                // SAFETY: in bounds (checked above); every writer of this
+                // byte uses the same atomic view.
+                let flags_atomic = unsafe { &*(flags_ptr as *const AtomicU8) };
+                flags_atomic.fetch_and(!0x40, Ordering::Release);
+            }
+            #[cfg(feature = "loom")]
+            {
+                fence(Ordering::Release);
+                unsafe {
+                    let old = std::ptr::read_volatile(flags_ptr);
+                    std::ptr::write_volatile(flags_ptr, old & !0x40);
+                }
+            }
+        }
         self.live_items.fetch_add(1, Ordering::Relaxed);
         self.live_bytes.fetch_add(item_size, Ordering::Relaxed);
     }

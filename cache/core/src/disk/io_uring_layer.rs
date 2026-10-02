@@ -1040,7 +1040,7 @@ impl Layer for IoUringDiskLayer {
         _value_len: usize,
         _optional: &[u8],
         _ttl: Duration,
-    ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
+    ) -> CacheResult<(ItemLocation, *mut u8, u32, crate::cache_trait::ValueRef)> {
         // Streaming writes not supported for disk layer
         Err(CacheError::Unsupported)
     }

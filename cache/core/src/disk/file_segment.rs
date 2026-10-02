@@ -353,8 +353,8 @@ impl Segment for FileSegment<'_> {
         result
     }
 
-    fn finalize_append(&self, item_size: u32) {
-        self.inner.finalize_append(item_size);
+    fn finalize_append(&self, offset: u32, item_size: u32) {
+        self.inner.finalize_append(offset, item_size);
     }
 
     fn mark_deleted_at_offset(&self, offset: u32) {

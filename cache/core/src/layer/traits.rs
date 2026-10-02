@@ -161,22 +161,27 @@ pub trait Layer: Send + Sync {
     /// * `ttl` - Time to live
     ///
     /// # Returns
-    /// * `Ok((location, value_ptr, item_size))` - Space reserved successfully
+    /// * `Ok((location, value_ptr, item_size, pin))` - Space reserved successfully
     /// * `Err(CacheError)` - Reservation failed
+    ///
+    /// `pin` is a `ValueRef` over the reserved value bytes that holds a
+    /// reference on the segment, so the segment is not freed and reused
+    /// while the caller writes the value. The item is written deleted and is
+    /// skipped by readers and eviction until `finalize_write_item`.
     ///
     /// # Safety
     ///
     /// The returned `value_ptr` points into segment memory. The caller must:
     /// - Write exactly `value_len` bytes to the pointer
     /// - Call `finalize_write_item` with the same `item_size`
-    /// - Not hold the pointer beyond the `finalize_write_item` call
+    /// - Not hold the pointer after dropping `pin`
     fn begin_write_item(
         &self,
         key: &[u8],
         value_len: usize,
         optional: &[u8],
         ttl: Duration,
-    ) -> CacheResult<(ItemLocation, *mut u8, u32)>;
+    ) -> CacheResult<(ItemLocation, *mut u8, u32, crate::cache_trait::ValueRef)>;
 
     /// Complete a two-phase write operation.
     ///
