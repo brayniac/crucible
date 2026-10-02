@@ -241,7 +241,8 @@ impl State {
 
     /// Whether a *fresh* key-verify acquire (`try_acquire_read`) is admitted
     /// in this state. Wider than [`Self::admits_guard_reader`] by `Draining`,
-    /// which is what lets the demoter verify keys on a segment it is draining.
+    /// so a lookup or insert that resolves an entry still pointing into a
+    /// segment being swept can verify its key.
     ///
     /// That width is the whole reason `Draining` is *not* an exclusive claim.
     /// An evictor that wants to rewrite the segment's bytes has to take
@@ -269,8 +270,8 @@ impl State {
 /// key-verify readers `Draining` still admitted), and
 /// `Relinking -> AwaitingRelease` (the merge paths).
 ///
-/// False for everything else: `Live -> Sealed` and `Sealed -> Relinking` do
-/// not change admission, the eleven chain-pointer identity CASes in
+/// False for everything else except leaving `Live` (see the last section):
+/// `Sealed -> Relinking` does not change admission, the eleven chain-pointer identity CASes in
 /// `organization/` do not change state at all, `Locked -> Reserved` and
 /// `Reserved -> Free` are already exclusive, and `Draining -> Sealed` (the
 /// chain's revert) *widens*. Marking those `SeqCst` would be noise.
@@ -290,11 +291,21 @@ impl State {
 /// `ref_count`, so when readers turn out to still be present it condemns from
 /// `Locked` rather than from `Draining`. Every other condemn transition is
 /// already covered by the narrowing clause.
+///
+/// # Leaving `Live`
+///
+/// Leaving `Live` ends admission for append pins
+/// (`SliceSegment::try_pin_for_append`). `TtlLayer::try_free_empty_segment`
+/// reads the state and then `ref_count`, both `SeqCst`, to skip a segment a
+/// writer pinned while it was `Live`. Making the seal `SeqCst` puts it in the
+/// same total order as those loads and the pin's re-check; it costs one CAS
+/// per segment roll.
 #[inline]
 pub(crate) fn transition_excludes_readers(from: State, to: State) -> bool {
     (from.admits_guard_reader() && !to.admits_guard_reader())
         || (from.admits_verify_reader() && !to.admits_verify_reader())
         || to.is_condemned()
+        || (from == State::Live && to != State::Live)
 }
 
 /// Packed representation of segment metadata in a single AtomicU64.
@@ -788,7 +799,7 @@ mod tests {
     fn transitions_that_shut_readers_out_are_recognized() {
         use State::*;
 
-        // The four that end some class of fresh reader admission, and so must
+        // The transitions that end some class of fresh admission, and so must
         // be ordered against the `ref_count` load that follows them.
         for (from, to) in [
             (Sealed, Draining),           // shuts out guard readers
@@ -804,6 +815,9 @@ mod tests {
             (Live, Locked),
             (Sealed, Locked),
             (Sealed, AwaitingRelease),
+            // Ends append-pin admission (`try_pin_for_append` admits `Live`
+            // only).
+            (Live, Sealed),
         ] {
             assert!(
                 transition_excludes_readers(from, to),
@@ -814,7 +828,6 @@ mod tests {
         // Everything else. Marking these SeqCst would be pure cost: they
         // either leave admission unchanged, are already exclusive, or widen.
         for (from, to) in [
-            (Live, Sealed),
             (Sealed, Relinking),
             (Live, Live),
             (Sealed, Sealed),

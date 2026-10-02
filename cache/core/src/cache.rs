@@ -20,7 +20,8 @@ use crate::memory_pool::MemoryPool;
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentKeyVerify};
 use crate::slice_segment::SliceSegment;
-use crate::sync::{AtomicU64, Ordering};
+use crate::state::State;
+use crate::sync::{AtomicU64, Ordering, fence};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -354,8 +355,28 @@ impl CacheLayer {
         value_len: usize,
         optional: &[u8],
         ttl: Duration,
-    ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
+    ) -> CacheResult<(ItemLocation, *mut u8, u32, crate::cache_trait::ValueRef)> {
         dispatch!(self, begin_write_item(key, value_len, optional, ttl))
+    }
+
+    /// The state of the segment holding `location`, or `None` if the
+    /// location is not in this layer's pool.
+    pub fn segment_state(&self, location: ItemLocation) -> Option<State> {
+        macro_rules! state_in_pool {
+            ($layer:expr) => {{
+                let pool = $layer.pool();
+                if location.pool_id() != pool.pool_id() {
+                    return None;
+                }
+                Some(pool.get(location.segment_id(pool.layout()))?.state())
+            }};
+        }
+        match self {
+            CacheLayer::Fifo(layer) => state_in_pool!(layer),
+            CacheLayer::Ttl(layer) => state_in_pool!(layer),
+            CacheLayer::Disk(layer) => state_in_pool!(layer),
+            CacheLayer::IoUringDisk(layer) => state_in_pool!(layer),
+        }
     }
 
     /// Finalize a two-phase write operation.
@@ -795,8 +816,10 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// # Cancellation
     ///
-    /// If the reservation is dropped without committing (e.g., connection
-    /// closed during receive), the reserved space is marked as deleted.
+    /// The reserved item is written deleted and stays deleted unless the
+    /// reservation is committed, so dropping it (e.g., connection closed
+    /// during receive) leaves nothing to clean up. The reservation holds a
+    /// reference on its segment until it is dropped.
     pub fn begin_segment_set(
         &self,
         key: &[u8],
@@ -808,11 +831,12 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Reserve space in Layer 0
         let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
-        let (location, value_ptr, item_size) = layer.begin_write_item(key, value_len, &[], ttl)?;
+        let (location, value_ptr, item_size, pin) =
+            layer.begin_write_item(key, value_len, &[], ttl)?;
 
-        // Create the reservation
-        // SAFETY: value_ptr points to valid segment memory that will remain
-        // valid until the reservation is committed or cancelled
+        // SAFETY: `pin` holds a reference on the segment, which keeps
+        // `value_ptr..value_ptr + value_len` in it until the reservation is
+        // dropped.
         Ok(unsafe {
             crate::SegmentReservation::new(
                 location,
@@ -821,6 +845,7 @@ impl<H: Hashtable> TieredCache<H> {
                 key.to_vec(),
                 ttl,
                 item_size,
+                pin,
             )
         })
     }
@@ -836,7 +861,8 @@ impl<H: Hashtable> TieredCache<H> {
         let location = reservation.location();
         let item_size = reservation.item_size();
 
-        // Finalize the segment write
+        // Publish the item (clear the deleted flag it was written with) and
+        // count it.
         let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
         layer.finalize_write_item(location, item_size);
 
@@ -857,18 +883,42 @@ impl<H: Hashtable> TieredCache<H> {
             }
             Err(e) => {
                 // Hashtable full - mark item as deleted
-                layer.cancel_write_item(location);
+                layer.mark_deleted(location);
                 return Err(e);
             }
         }
-
         reservation.mark_committed();
+
+        // The receive can outlast the segment's time in the layer. If an
+        // evictor took the segment, its sweep may have run before the
+        // insert above and left this entry behind, in a segment that will be
+        // freed. The evictor publishes its state change, fences, then reads
+        // item flags and the hashtable; this side publishes the item and the
+        // entry, fences, then reads the state. So either the sweep saw the
+        // entry, or this load sees the state change.
+        fence(Ordering::SeqCst);
+        let state = layer.segment_state(location);
+        if !matches!(state, Some(State::Live | State::Sealed))
+            && self
+                .hashtable
+                .remove(reservation.key(), location.to_location())
+        {
+            // The sweep did not take the entry. Write the item again from
+            // the reserved bytes, which the reservation's pin keeps valid.
+            // `cancel_write_item` sets the deleted flag in any state;
+            // `mark_deleted` refuses the states that lead here.
+            layer.cancel_write_item(location);
+            let value = reservation.value().to_vec();
+            return self.set(reservation.key(), &value, &[], reservation.ttl());
+        }
+
         Ok(())
     }
 
     /// Cancel a two-phase SET operation.
     ///
-    /// Marks the reserved space as deleted. Called when a receive operation
+    /// Sets the deleted flag on the reserved item, which it was written with
+    /// already, and drops the reservation. Called when a receive operation
     /// fails (e.g., connection closed during value receive).
     pub fn cancel_segment_set(&self, reservation: crate::SegmentReservation) {
         if reservation.is_committed() {
@@ -2419,6 +2469,103 @@ mod tests {
         );
     }
 
+    /// A two-layer cache whose layer 0 turns over every few dozen SETs: four
+    /// 64KB segments, demoting anything read to a large layer 1.
+    fn create_small_layer0_cache() -> TieredCache<MultiChoiceHashtable> {
+        let hashtable = Arc::new(MultiChoiceHashtable::new(12));
+        let fifo = FifoLayerBuilder::new()
+            .layer_id(0)
+            .pool_id(0)
+            .segment_size(64 * 1024)
+            .heap_size(4 * 64 * 1024)
+            .spare_capacity(0)
+            .config(
+                LayerConfig::new()
+                    .with_ghosts(true)
+                    .with_next_layer(1)
+                    .with_demotion_threshold(1),
+            )
+            .build()
+            .expect("fifo layer");
+        let ttl = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(64 * 1024)
+            .heap_size(64 * 64 * 1024)
+            .spare_capacity(0)
+            .config(LayerConfig::new().with_ghosts(true))
+            .build()
+            .expect("ttl layer");
+        TieredCacheBuilder::new(hashtable)
+            .with_fifo_layer(fifo)
+            .with_ttl_layer(ttl)
+            .eviction_threshold(1)
+            .build()
+    }
+
+    /// A streamed SET survives its segment being evicted while the value is
+    /// still arriving.
+    ///
+    /// Filler SETs cycle layer 0 between `begin_segment_set` and the write of
+    /// the value, so for some filler counts the reservation's segment is
+    /// evicted mid-receive. Without the pin the segment is freed and reused,
+    /// the value bytes land in another item, and the committed key reads back
+    /// as a miss.
+    #[test]
+    fn a_streamed_set_survives_its_segment_being_evicted() {
+        let ttl = Duration::from_secs(3600);
+        let filler = vec![0x11u8; 1000];
+        for fillers in (0..400).step_by(10) {
+            let cache = create_small_layer0_cache();
+            let mut reservation = cache.begin_segment_set(b"big", 1000, ttl).expect("reserve");
+            for i in 0..fillers {
+                let _ = cache.set(format!("f{i}").as_bytes(), &filler, b"", ttl);
+            }
+            reservation.value_mut().fill(0xEE);
+            cache.commit_segment_set(reservation).expect("commit");
+
+            assert_eq!(
+                cache.get(b"big"),
+                Some(vec![0xEE; 1000]),
+                "{fillers} fillers: the streamed value is not readable"
+            );
+            let damaged = (0..fillers)
+                .filter(|i| {
+                    cache
+                        .get(format!("f{i}").as_bytes())
+                        .is_some_and(|v| v != filler)
+                })
+                .count();
+            assert_eq!(
+                damaged, 0,
+                "{fillers} fillers: {damaged} filler values were overwritten"
+            );
+        }
+    }
+
+    /// A reservation dropped without commit or cancel leaves nothing readable
+    /// and releases its pin on the segment.
+    #[test]
+    fn a_dropped_reservation_leaves_no_item_and_releases_its_segment() {
+        let ttl = Duration::from_secs(3600);
+        let cache = create_small_layer0_cache();
+        let mut reservation = cache.begin_segment_set(b"big", 1000, ttl).expect("reserve");
+        let location = reservation.location();
+        let layer = &cache.layers[0];
+        let segment_id = location.segment_id(layer.layout());
+        let segment = layer.get_segment(segment_id).expect("segment");
+        assert_eq!(segment.ref_count(), 1, "the reservation pins its segment");
+
+        reservation.value_mut().fill(0xEE);
+        drop(reservation);
+        assert_eq!(
+            segment.ref_count(),
+            0,
+            "dropping the reservation releases the pin"
+        );
+        assert_eq!(cache.get(b"big"), None);
+    }
+
     /// A two-layer cache built without touching `LayerConfig`.
     fn create_test_cache_without_explicit_demotion() -> TieredCache<MultiChoiceHashtable> {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10));
@@ -2588,7 +2735,6 @@ mod tests {
         use crate::disk::{DiskLayerBuilder, IoUringDiskLayerBuilder};
         use crate::pool::RamPool;
         use crate::segment::Segment;
-        use crate::state::State;
 
         let dir = tempfile::tempdir().expect("temp dir");
 

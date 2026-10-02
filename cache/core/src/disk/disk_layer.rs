@@ -243,6 +243,11 @@ impl DiskLayer {
             None => return,
         };
 
+        // Pairs with the fence in `TieredCache::commit_segment_set`: either
+        // the sweeps below see a streamed item that commit published, or
+        // commit sees the segment out of `Sealed` and writes the item again.
+        crate::sync::fence(std::sync::atomic::Ordering::SeqCst);
+
         // Claim before counting (#133). `Draining` still admits key-verify
         // readers, so reading `ref_count` first and CASing to `Locked` only if
         // it was zero leaves a window for a pin to land in between -- and the
@@ -536,7 +541,7 @@ impl Layer for DiskLayer {
         value_len: usize,
         optional: &[u8],
         ttl: Duration,
-    ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
+    ) -> CacheResult<(ItemLocation, *mut u8, u32, crate::cache_trait::ValueRef)> {
         if key.len() > BasicHeader::MAX_KEY_LEN {
             return Err(CacheError::KeyTooLong);
         }
@@ -548,6 +553,14 @@ impl Layer for DiskLayer {
             let segment_id = self.get_or_allocate_write_segment(ttl)?;
 
             if let Some(segment) = self.pool.get(segment_id) {
+                // Pin before reserving: the writer holds the space across
+                // several receives, and the pin keeps the segment from being
+                // freed and reused underneath it.
+                if !segment.inner().try_pin_for_append() {
+                    // Sealed since `get_or_allocate_write_segment` saw it.
+                    continue;
+                }
+
                 if let Some((offset, item_size, value_ptr)) =
                     segment.begin_append(key, value_len, optional)
                 {
@@ -558,8 +571,12 @@ impl Layer for DiskLayer {
                         segment.incarnation(),
                         offset,
                     );
-                    return Ok((location, value_ptr, item_size));
+                    // SAFETY: hands over the pin taken above; the value bytes
+                    // were just reserved in this segment.
+                    let pin = unsafe { segment.inner().value_ref_for_append(value_ptr, value_len) };
+                    return Ok((location, value_ptr, item_size, pin));
                 }
+                segment.inner().unpin_for_append();
 
                 let bucket_index = self.buckets.get_bucket_index(ttl);
                 if bucket_index < self.current_write_segments.len() {
@@ -579,8 +596,9 @@ impl Layer for DiskLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id(self.pool.layout())) {
-            segment.finalize_append(item_size);
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            segment.finalize_append(offset, item_size);
         }
     }
 

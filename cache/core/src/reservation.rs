@@ -133,9 +133,10 @@ impl SetReservation {
 ///
 /// # Cancellation
 ///
-/// If the reservation is dropped without calling `commit()` (e.g., connection
-/// closed during receive), the reserved space is marked as deleted.
-#[derive(Debug)]
+/// The reserved item is written deleted and stays deleted unless the
+/// reservation is committed, so dropping it (e.g., connection closed during
+/// receive) leaves nothing to clean up. Dropping it also releases its
+/// reference on the segment.
 pub struct SegmentReservation {
     /// Item location in the segment (pool_id, segment_id, offset).
     location: crate::ItemLocation,
@@ -151,11 +152,28 @@ pub struct SegmentReservation {
     item_size: u32,
     /// Whether this reservation has been committed.
     committed: bool,
+    /// Holds a reference on the segment until the reservation is dropped,
+    /// so the segment is not freed and reused while the value is received.
+    _pin: crate::cache_trait::ValueRef,
+}
+
+impl std::fmt::Debug for SegmentReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentReservation")
+            .field("location", &self.location)
+            .field("value_len", &self.value_len)
+            .field("key", &self.key)
+            .field("ttl", &self.ttl)
+            .field("item_size", &self.item_size)
+            .field("committed", &self.committed)
+            .finish_non_exhaustive()
+    }
 }
 
 // SAFETY: SegmentReservation can be sent between threads because:
 // 1. The segment memory is thread-safe (atomic operations)
 // 2. The caller is responsible for ensuring no concurrent writes
+// 3. The pin is a `ValueRef`, which is `Send`
 unsafe impl Send for SegmentReservation {}
 
 impl SegmentReservation {
@@ -164,8 +182,7 @@ impl SegmentReservation {
     /// # Safety
     ///
     /// The caller must ensure that `value_ptr` points to valid, writable
-    /// memory of at least `value_len` bytes that will remain valid until
-    /// the reservation is committed or dropped.
+    /// memory of at least `value_len` bytes that `pin` keeps valid.
     pub unsafe fn new(
         location: crate::ItemLocation,
         value_ptr: *mut u8,
@@ -173,6 +190,7 @@ impl SegmentReservation {
         key: Vec<u8>,
         ttl: Duration,
         item_size: u32,
+        pin: crate::cache_trait::ValueRef,
     ) -> Self {
         Self {
             location,
@@ -182,6 +200,7 @@ impl SegmentReservation {
             ttl,
             item_size,
             committed: false,
+            _pin: pin,
         }
     }
 

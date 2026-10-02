@@ -339,104 +339,115 @@ impl TtlLayer {
         self.allocate_segment_for_bucket(bucket_index, bucket.ttl())
     }
 
-    /// Remove all hashtable entries for items in a segment, without waiting for
-    /// readers or releasing the segment. Used by non-blocking eviction.
-    fn drain_segment_from_hashtable<H: Hashtable>(&self, segment_id: u32, hashtable: &H) {
-        let segment = match self.pool.get(segment_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let mut offset = 0u32;
-        let write_offset = segment.write_offset();
-
-        while offset < write_offset {
-            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
-                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    // The segment's stride, not the 8-byte padded body size: a scan
-                    // that advances by anything but what the append advanced by
-                    // desyncs after the first item on a coarser-aligned pool.
-                    let item_size = segment.item_stride(header.padded_size());
-
-                    let key_start =
-                        offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
-                    let key_len = header.key_len() as usize;
-
-                    if let Some(key) = segment.data_slice(key_start as u32, key_len)
-                        && !header.is_deleted()
-                    {
-                        let location = ItemLocation::new(
-                            self.pool.layout(),
-                            self.pool.pool_id(),
-                            segment_id,
-                            segment.incarnation(),
-                            offset,
-                        );
-
-                        let verifier = SinglePoolVerifier { pool: &self.pool };
-                        let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
-                        let fate = determine_item_fate(freq, &self.config);
-
-                        match fate {
-                            ItemFate::Ghost => {
-                                hashtable.convert_to_ghost(key, location.to_location());
-                            }
-                            ItemFate::Demote | ItemFate::Discard => {
-                                hashtable.remove(key, location.to_location());
-                            }
-                        }
-                    }
-
-                    offset += item_size;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Non-blocking eviction: process an evicted segment without spinning on
-    /// `ref_count`.
+    /// Evict a detached segment: sweep its items out of the hashtable, then
+    /// return it to the pool, or condemn it for the last reference to free.
+    /// Never waits for readers.
     ///
-    /// Returns `true` if the segment was fully processed and returned to the
-    /// pool, `false` if it was deferred (condemned, for the last reader to
-    /// free).
+    /// Items whose fate is `Demote` go to `demoter`, with the segment's
+    /// remaining TTL, when one is given and are unlinked otherwise.
+    ///
+    /// Returns `true` if the segment went back to the pool, `false` if it
+    /// was condemned or another thread owns the claim.
     ///
     /// # Order of operations
     ///
-    /// 1. sweep this segment's items out of the hashtable, while the segment
-    ///    is still `Draining` -- the sweep resolves each item's own location
-    ///    through a key-verify acquire, which `Draining` admits and `Locked`
-    ///    does not;
-    /// 2. claim `Draining -> Locked`, which refuses every fresh reader;
-    /// 3. *then* read `ref_count`.
+    /// 1. fence, pairing with `TieredCache::commit_segment_set`: the caller
+    ///    has already moved the segment to `Draining`, so either the sweep
+    ///    sees a streamed item that commit published, or commit sees
+    ///    `Draining` and writes the item again;
+    /// 2. sweep under `Draining`;
+    /// 3. claim `Draining -> Locked`, which refuses every fresh reader;
+    /// 4. *then* read `ref_count` (#133: counting first lets a key-verify
+    ///    reader pin between the zero and the claim).
     ///
-    /// Steps 2 and 3 used to be the other way round, which is #133: with the
-    /// count read first, a key-verify reader can pin between the observation
-    /// of zero and the claim, and then be mid-`verify_key_at_offset` while
-    /// this thread recycles the segment. Reachable under a full SC total
-    /// order, so no memory ordering fixes it. See `layer::try_claim_for_clear`.
+    /// A segment with references is condemned rather than waited on: the
+    /// references can be held across a zero-copy send or a streamed
+    /// receive, which only the holder's event loop can finish.
     ///
-    /// The sweep is unconditional, where it used to be duplicated verbatim
-    /// into both arms -- the deferred arm ran it under `Draining` and the
-    /// exclusive arm ran the identical loop under `Locked`, where every
-    /// `get_frequency` silently came back `None`. Hoisting it above the claim
-    /// gives one copy and one state. In production that changes no outcome:
-    /// this path is reached only for a layer with no `next_layer`, and
-    /// `determine_item_fate` is frequency-independent there.
-    fn process_evicted_segment_nonblocking<H: Hashtable>(
-        &self,
-        segment_id: u32,
-        hashtable: &H,
-    ) -> bool {
+    /// Frequencies are read with `get_item_frequency`, which matches the
+    /// entry by location and needs no verifier (#140).
+    fn evict_segment<H, F>(&self, segment_id: u32, hashtable: &H, mut demoter: Option<F>) -> bool
+    where
+        H: Hashtable,
+        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
+    {
         let segment = match self.pool.get(segment_id) {
             Some(s) => s,
             None => return true,
         };
 
-        self.drain_segment_from_hashtable(segment_id, hashtable);
+        // Every caller detached the segment with its `Sealed -> Draining`
+        // CAS. In any other state it belongs to another thread (#142):
+        // sweeping it would demote its items a second time.
+        if segment.state() != State::Draining {
+            return false;
+        }
+
+        crate::sync::fence(std::sync::atomic::Ordering::SeqCst);
+
+        let remaining_secs = segment.expire_at().saturating_sub(Self::now_secs());
+        let segment_ttl = Duration::from_secs(remaining_secs as u64);
+        let mut offset = 0u32;
+        let write_offset = segment.write_offset();
+
+        while offset < write_offset {
+            let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) else {
+                break;
+            };
+            let Some(header) = (unsafe { BasicHeader::try_from_ptr(data) }) else {
+                break;
+            };
+            // The segment's stride, not the 8-byte padded body size: a scan
+            // that advances by anything but what the append advanced by
+            // desyncs after the first item on a coarser-aligned pool.
+            let item_size = segment.item_stride(header.padded_size());
+
+            let optional_start = offset as usize + BasicHeader::SIZE;
+            let optional_len = header.optional_len() as usize;
+            let key_start = optional_start + optional_len;
+            let key_len = header.key_len() as usize;
+            let value_start = key_start + key_len;
+            let value_len = header.value_len() as usize;
+
+            if let Some(key) = segment.data_slice(key_start as u32, key_len)
+                && !header.is_deleted()
+            {
+                let location = ItemLocation::new(
+                    self.pool.layout(),
+                    self.pool.pool_id(),
+                    segment_id,
+                    segment.incarnation(),
+                    offset,
+                )
+                .to_location();
+
+                let freq = hashtable.get_item_frequency(key, location).unwrap_or(0);
+                match determine_item_fate(freq, &self.config) {
+                    ItemFate::Ghost => {
+                        hashtable.convert_to_ghost(key, location);
+                    }
+                    ItemFate::Demote => match demoter.as_mut() {
+                        Some(demoter) => {
+                            let optional = segment
+                                .data_slice(optional_start as u32, optional_len)
+                                .unwrap_or(&[]);
+                            let value = segment
+                                .data_slice(value_start as u32, value_len)
+                                .unwrap_or(&[]);
+                            demoter(key, value, optional, segment_ttl, location);
+                        }
+                        None => {
+                            hashtable.remove(key, location);
+                        }
+                    },
+                    ItemFate::Discard => {
+                        hashtable.remove(key, location);
+                    }
+                }
+            }
+
+            offset += item_size;
+        }
 
         // Claim before counting (#133).
         let claimed = super::try_claim_for_clear(segment);
@@ -449,119 +460,6 @@ impl TtlLayer {
         // Either the claim was lost (someone else owns the segment) or readers
         // are still holding it. Nothing was cleared either way; hand the
         // segment to whoever drops the last reference.
-        let held = if claimed {
-            State::Locked
-        } else {
-            State::Draining
-        };
-        super::condemn_and_reclaim(segment, held)
-    }
-
-    /// Non-blocking variant of process_evicted_segment_with_demoter.
-    ///
-    /// Demotes items regardless of active readers. Segment data is immutable
-    /// once sealed, so it is safe to read while readers hold refs. After
-    /// demotion, if readers remain the segment transitions to AwaitingRelease
-    /// for the last reader to free.
-    fn process_evicted_segment_with_demoter_nonblocking<H, F>(
-        &self,
-        segment_id: u32,
-        hashtable: &H,
-        mut demoter: F,
-    ) -> bool
-    where
-        H: Hashtable,
-        F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
-    {
-        let segment = match self.pool.get(segment_id) {
-            Some(s) => s,
-            None => return true,
-        };
-
-        // Iterate items and run demoter while still in Draining state.
-        // Segment data is immutable (sealed) — safe to read with active readers.
-        // No new readers will be admitted (is_readable() returns false for Draining).
-        let now = Self::now_secs();
-        let expire_at = segment.expire_at();
-        let remaining_secs = expire_at.saturating_sub(now);
-        let segment_ttl = Duration::from_secs(remaining_secs as u64);
-
-        let mut offset = 0u32;
-        let write_offset = segment.write_offset();
-
-        while offset < write_offset {
-            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
-                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    // The segment's stride, not the 8-byte padded body size: a scan
-                    // that advances by anything but what the append advanced by
-                    // desyncs after the first item on a coarser-aligned pool.
-                    let item_size = segment.item_stride(header.padded_size());
-
-                    let optional_start = offset as usize + BasicHeader::SIZE;
-                    let optional_len = header.optional_len() as usize;
-                    let key_start = optional_start + optional_len;
-                    let key_len = header.key_len() as usize;
-                    let value_start = key_start + key_len;
-                    let value_len = header.value_len() as usize;
-
-                    if let Some(key) = segment.data_slice(key_start as u32, key_len)
-                        && !header.is_deleted()
-                    {
-                        let location = ItemLocation::new(
-                            self.pool.layout(),
-                            self.pool.pool_id(),
-                            segment_id,
-                            segment.incarnation(),
-                            offset,
-                        );
-
-                        let verifier = SinglePoolVerifier { pool: &self.pool };
-                        let freq = hashtable.get_frequency(key, &verifier).unwrap_or(0);
-                        let fate = determine_item_fate(freq, &self.config);
-
-                        match fate {
-                            ItemFate::Ghost => {
-                                hashtable.convert_to_ghost(key, location.to_location());
-                            }
-                            ItemFate::Demote => {
-                                let optional = segment
-                                    .data_slice(optional_start as u32, optional_len)
-                                    .unwrap_or(&[]);
-                                let value = segment
-                                    .data_slice(value_start as u32, value_len)
-                                    .unwrap_or(&[]);
-
-                                demoter(key, value, optional, segment_ttl, location.to_location());
-                            }
-                            ItemFate::Discard => {
-                                hashtable.remove(key, location.to_location());
-                            }
-                        }
-                    }
-
-                    offset += item_size;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // All items processed. Claim before counting (#133): the count this
-        // recycle turns on must be read *after* the transition that refuses
-        // fresh readers, not before it. Reading it first leaves a window in
-        // which a key-verify reader pins the still-`Draining` segment and is
-        // then recycled out from under mid-`verify_key_at_offset`.
-        let claimed = super::try_claim_for_clear(segment);
-        if claimed && segment.ref_count_seqcst() == 0 {
-            segment.cas_metadata(State::Locked, State::Reserved, None, None);
-            self.pool.release(segment_id);
-            return true;
-        }
-
-        // Readers still active (or the claim was lost) -- let the last
-        // reference out free it.
         let held = if claimed {
             State::Locked
         } else {
@@ -606,111 +504,10 @@ impl TtlLayer {
         false
     }
 
-    /// Process items in an evicted segment.
-    fn process_evicted_segment<H: Hashtable>(&self, segment_id: u32, hashtable: &H) {
-        let segment = match self.pool.get(segment_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Claim first, then wait (#133). `Draining` still admits key-verify
-        // readers, so waiting for zero under it and only then taking `Locked`
-        // leaves a window for a fresh pin between the two; `Locked` refuses
-        // every reader, so the count this returns on is final. See
-        // `layer::claim_and_wait_for_readers`.
-        // A lost claim means another thread owns this segment. Everything
-        // below -- rewriting the items, `Locked -> Reserved`, returning it to
-        // the pool -- would be acting on the winner's segment, and the
-        // `Locked -> Reserved` CAS would *succeed*, because the winner is what
-        // put it in `Locked` (#142).
-        if !super::claim_and_wait_for_readers(segment) {
-            return;
-        }
-
-        // Process each item in the segment
-        let mut offset = 0u32;
-        let write_offset = segment.write_offset();
-
-        while offset < write_offset {
-            // Get header at offset
-            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
-                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    // The segment's stride, not the 8-byte padded body size: a scan
-                    // that advances by anything but what the append advanced by
-                    // desyncs after the first item on a coarser-aligned pool.
-                    let item_size = segment.item_stride(header.padded_size());
-
-                    // Get key for this item
-                    let key_start =
-                        offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
-                    let key_len = header.key_len() as usize;
-
-                    if let Some(key) = segment.data_slice(key_start as u32, key_len)
-                        && !header.is_deleted()
-                    {
-                        let location = ItemLocation::new(
-                            self.pool.layout(),
-                            self.pool.pool_id(),
-                            segment_id,
-                            segment.incarnation(),
-                            offset,
-                        );
-
-                        // Location-matched, not verifier-backed (#140). This loop runs
-                        // under the `Locked` claim `claim_and_wait_for_readers` took
-                        // above, and `State::admits_verify_reader` refuses `Locked` --
-                        // so `get_frequency`, which resolves the key through
-                        // `SinglePoolVerifier`, could only ever come back `None` here
-                        // and the `unwrap_or(0)` turned that refusal into a
-                        // plausible-looking zero. Nothing failed and nothing logged;
-                        // every item's fate was decided against a frequency of 0.
-                        //
-                        // `get_item_frequency` matches on the location alone, needs no
-                        // verifier and is honest under any segment state. The
-                        // `unwrap_or(0)` stays and is now correct rather than papering
-                        // over a refusal: `search_bucket_for_item_freq` and the fate
-                        // arms below use the identical predicate (non-ghost, tag match,
-                        // location match) against this same location, so a `None` here
-                        // and both arms no-opping coincide exactly. The segment is
-                        // `Locked`, so nothing can append into it and make an entry
-                        // start matching mid-scan.
-                        let freq = hashtable
-                            .get_item_frequency(key, location.to_location())
-                            .unwrap_or(0);
-
-                        // Determine item fate
-                        let fate = determine_item_fate(freq, &self.config);
-
-                        match fate {
-                            ItemFate::Ghost => {
-                                // Convert to ghost in hashtable
-                                hashtable.convert_to_ghost(key, location.to_location());
-                            }
-                            ItemFate::Demote => {
-                                // Demotion to next layer is handled by caller (TieredCache)
-                                // For now, just unlink from hashtable
-                                hashtable.remove(key, location.to_location());
-                            }
-                            ItemFate::Discard => {
-                                // Simply remove from hashtable
-                                hashtable.remove(key, location.to_location());
-                            }
-                        }
-                    }
-
-                    offset += item_size;
-                } else {
-                    // Invalid header, stop processing
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Clear segment state and release to pool
-        segment.cas_metadata(State::Locked, State::Reserved, None, None);
-        self.pool.release(segment_id);
+    /// Evict a detached segment, unlinking items whose fate is `Demote`.
+    /// See [`Self::evict_segment`].
+    fn process_evicted_segment<H: Hashtable>(&self, segment_id: u32, hashtable: &H) -> bool {
+        self.evict_segment(segment_id, hashtable, None::<super::NoDemoter>)
     }
 
     /// Try to compact a segment with its predecessor using a spare segment.
@@ -824,6 +621,10 @@ impl TtlLayer {
             self.pool.release(spare_id);
             return false;
         }
+        // Pairs with the fence in `TieredCache::commit_segment_set`: either
+        // the item reads below see a streamed item that commit published, or
+        // commit sees this state change and writes the item again.
+        crate::sync::fence(std::sync::atomic::Ordering::SeqCst);
 
         // Helper to copy items from a source segment to the spare
         let copy_items = |src: &SliceSegment<'static>, src_id: u32| {
@@ -929,13 +730,25 @@ impl TtlLayer {
             None => return false,
         };
 
-        // Only proceed if segment is truly empty
-        if segment.live_items() > 0 {
+        // Segment must be Sealed to be removed (Live segments are still being written to)
+        if segment.state_seqcst() != State::Sealed {
             return false;
         }
 
-        // Segment must be Sealed to be removed (Live segments are still being written to)
-        if segment.state() != State::Sealed {
+        // This function frees without sweeping, so it must not take a
+        // segment holding a streamed SET. The SET pins the segment while it is
+        // `Live` and publishes its item before releasing the pin, so the
+        // order of these checks matters: state, then `ref_count`, then
+        // `live_items`. A pin taken while `Live` is seen by the `ref_count`
+        // load; a pin already released published its item first, and the
+        // pin's `SeqCst` release orders that increment before the
+        // `live_items` load.
+        if segment.ref_count_seqcst() > 0 {
+            return false;
+        }
+
+        // Only proceed if segment is truly empty
+        if segment.live_items() > 0 {
             return false;
         }
 
@@ -990,138 +803,19 @@ impl TtlLayer {
         false
     }
 
-    /// Process items in an evicted segment with a demotion callback.
-    ///
-    /// For items that should be demoted, the callback is called with the item data
-    /// instead of removing from hashtable. This allows TieredCache to write to disk.
+    /// Evict a detached segment, passing items whose fate is `Demote` to
+    /// `demoter`. See [`Self::evict_segment`].
     fn process_evicted_segment_with_demoter<H, F>(
         &self,
         segment_id: u32,
         hashtable: &H,
-        mut demoter: F,
-    ) where
+        demoter: F,
+    ) -> bool
+    where
         H: Hashtable,
         F: FnMut(&[u8], &[u8], &[u8], Duration, Location),
     {
-        let segment = match self.pool.get(segment_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Claim first, then wait (#133). `Draining` still admits key-verify
-        // readers, so waiting for zero under it and only then taking `Locked`
-        // leaves a window for a fresh pin between the two; `Locked` refuses
-        // every reader, so the count this returns on is final. See
-        // `layer::claim_and_wait_for_readers`.
-        // A lost claim means another thread owns this segment. Everything
-        // below -- rewriting the items, `Locked -> Reserved`, returning it to
-        // the pool -- would be acting on the winner's segment, and the
-        // `Locked -> Reserved` CAS would *succeed*, because the winner is what
-        // put it in `Locked` (#142).
-        if !super::claim_and_wait_for_readers(segment) {
-            return;
-        }
-
-        // Get segment TTL for demotion
-        let now = Self::now_secs();
-        let expire_at = segment.expire_at();
-        let remaining_secs = expire_at.saturating_sub(now);
-        let segment_ttl = Duration::from_secs(remaining_secs as u64);
-
-        // Process each item in the segment
-        let mut offset = 0u32;
-        let write_offset = segment.write_offset();
-
-        while offset < write_offset {
-            // Get header at offset
-            if let Some(data) = segment.header_ptr(offset, BasicHeader::SIZE) {
-                if let Some(header) = unsafe { BasicHeader::try_from_ptr(data) } {
-                    // The segment's stride, not the 8-byte padded body size: a scan
-                    // that advances by anything but what the append advanced by
-                    // desyncs after the first item on a coarser-aligned pool.
-                    let item_size = segment.item_stride(header.padded_size());
-
-                    // Calculate offsets for key, value, optional
-                    let optional_start = offset as usize + BasicHeader::SIZE;
-                    let optional_len = header.optional_len() as usize;
-                    let key_start = optional_start + optional_len;
-                    let key_len = header.key_len() as usize;
-                    let value_start = key_start + key_len;
-                    let value_len = header.value_len() as usize;
-
-                    if let Some(key) = segment.data_slice(key_start as u32, key_len)
-                        && !header.is_deleted()
-                    {
-                        let location = ItemLocation::new(
-                            self.pool.layout(),
-                            self.pool.pool_id(),
-                            segment_id,
-                            segment.incarnation(),
-                            offset,
-                        );
-
-                        // Location-matched, not verifier-backed (#140). This loop runs
-                        // under the `Locked` claim `claim_and_wait_for_readers` took
-                        // above, and `State::admits_verify_reader` refuses `Locked` --
-                        // so `get_frequency`, which resolves the key through
-                        // `SinglePoolVerifier`, could only ever come back `None` here
-                        // and the `unwrap_or(0)` turned that refusal into a
-                        // plausible-looking zero. Nothing failed and nothing logged;
-                        // every item's fate was decided against a frequency of 0.
-                        //
-                        // `get_item_frequency` matches on the location alone, needs no
-                        // verifier and is honest under any segment state. The
-                        // `unwrap_or(0)` stays and is now correct rather than papering
-                        // over a refusal: `search_bucket_for_item_freq` and the fate
-                        // arms below use the identical predicate (non-ghost, tag match,
-                        // location match) against this same location, so a `None` here
-                        // and both arms no-opping coincide exactly. The segment is
-                        // `Locked`, so nothing can append into it and make an entry
-                        // start matching mid-scan.
-                        let freq = hashtable
-                            .get_item_frequency(key, location.to_location())
-                            .unwrap_or(0);
-
-                        // Determine item fate
-                        let fate = determine_item_fate(freq, &self.config);
-
-                        match fate {
-                            ItemFate::Ghost => {
-                                // Convert to ghost in hashtable
-                                hashtable.convert_to_ghost(key, location.to_location());
-                            }
-                            ItemFate::Demote => {
-                                // Extract item data for demotion
-                                let optional = segment
-                                    .data_slice(optional_start as u32, optional_len)
-                                    .unwrap_or(&[]);
-                                let value = segment
-                                    .data_slice(value_start as u32, value_len)
-                                    .unwrap_or(&[]);
-
-                                // Call demoter callback (which will write to disk and update hashtable)
-                                demoter(key, value, optional, segment_ttl, location.to_location());
-                            }
-                            ItemFate::Discard => {
-                                // Simply remove from hashtable
-                                hashtable.remove(key, location.to_location());
-                            }
-                        }
-                    }
-
-                    offset += item_size;
-                } else {
-                    // Invalid header, stop processing
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Clear segment state and release to pool
-        segment.cas_metadata(State::Locked, State::Reserved, None, None);
-        self.pool.release(segment_id);
+        self.evict_segment(segment_id, hashtable, Some(demoter))
     }
 
     /// Try to evict expired segments.
@@ -1459,6 +1153,11 @@ impl TtlLayer {
                 return false;
             }
         }
+
+        // Pairs with the fence in `TieredCache::commit_segment_set`: either
+        // the item reads below see a streamed item that commit published, or
+        // commit sees this state change and writes the item again.
+        crate::sync::fence(std::sync::atomic::Ordering::SeqCst);
 
         let verifier = SinglePoolVerifier { pool: &self.pool };
 
@@ -1957,7 +1656,7 @@ impl Layer for TtlLayer {
         value_len: usize,
         optional: &[u8],
         ttl: Duration,
-    ) -> CacheResult<(ItemLocation, *mut u8, u32)> {
+    ) -> CacheResult<(ItemLocation, *mut u8, u32, crate::cache_trait::ValueRef)> {
         // Validate inputs
         if key.len() > BasicHeader::MAX_KEY_LEN {
             return Err(CacheError::KeyTooLong);
@@ -1971,6 +1670,14 @@ impl Layer for TtlLayer {
             let segment_id = self.get_or_allocate_write_segment(ttl)?;
 
             if let Some(segment) = self.pool.get(segment_id) {
+                // Pin before reserving: the writer holds the space across
+                // several receives, and the pin keeps the segment from being
+                // freed and reused underneath it.
+                if !segment.try_pin_for_append() {
+                    // Sealed since `get_or_allocate_write_segment` saw it.
+                    continue;
+                }
+
                 // Try to reserve space for the item (no per-item TTL)
                 if let Some((offset, item_size, value_ptr)) =
                     segment.begin_append(key, value_len, optional)
@@ -1982,8 +1689,12 @@ impl Layer for TtlLayer {
                         segment.incarnation(),
                         offset,
                     );
-                    return Ok((location, value_ptr, item_size));
+                    // SAFETY: hands over the pin taken above; the value bytes
+                    // were just reserved in this segment.
+                    let pin = unsafe { segment.value_ref_for_append(value_ptr, value_len) };
+                    return Ok((location, value_ptr, item_size, pin));
                 }
+                segment.unpin_for_append();
 
                 // Segment is full, clear cached write segment
                 let bucket_index = self.buckets.get_bucket_index(ttl);
@@ -2005,8 +1716,9 @@ impl Layer for TtlLayer {
             return;
         }
 
-        if let Some(segment) = self.pool.get(location.segment_id(self.pool.layout())) {
-            segment.finalize_append(item_size);
+        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        if let Some(segment) = self.pool.get(segment_id) {
+            segment.finalize_append(offset, item_size);
         }
     }
 
@@ -2104,11 +1816,11 @@ impl TtlLayer {
             };
         }
 
-        // Whole-segment eviction, non-blocking path. The strategy chooses
-        // the victim exactly as it does for the blocking `evict` (#156).
+        // Whole-segment eviction. The strategy chooses the victim exactly as
+        // it does for `evict` (#156).
         match self.pick_victim().and_then(|id| self.detach(id)) {
             Some(segment_id) => {
-                if self.process_evicted_segment_nonblocking(segment_id, hashtable) {
+                if self.process_evicted_segment(segment_id, hashtable) {
                     EvictResult::Freed
                 } else {
                     EvictResult::Deferred
@@ -2142,9 +1854,7 @@ impl TtlLayer {
 
         match self.pick_victim().and_then(|id| self.detach(id)) {
             Some(segment_id) => {
-                if self.process_evicted_segment_with_demoter_nonblocking(
-                    segment_id, hashtable, demoter,
-                ) {
+                if self.process_evicted_segment_with_demoter(segment_id, hashtable, demoter) {
                     EvictResult::Freed
                 } else {
                     EvictResult::Deferred
@@ -2294,38 +2004,30 @@ mod tests {
             .expect("Failed to create test layer")
     }
 
-    /// The frequency the *blocking* eviction paths read (#140).
+    /// The frequency the eviction sweep reads, and the fate it picks from it.
     ///
-    /// `process_evicted_segment` and `process_evicted_segment_with_demoter`
-    /// both take the exclusive `Locked` claim up front, via
-    /// `layer::claim_and_wait_for_readers`, and then decided every item's fate
-    /// from `hashtable.get_frequency(key, &verifier)` -- a lookup that resolves
-    /// the key through `SinglePoolVerifier`, which goes through
-    /// `try_acquire_read`, which `State::admits_verify_reader` refuses under
-    /// `Locked`. So the lookup returned `None` on every item, every time, and
-    /// the `unwrap_or(0)` turned that refusal into a plausible-looking zero.
-    ///
-    /// Unlike #138's disk sites this is not latent: a RAM layer does get a
-    /// `next_layer`, and `TieredCache::evict_from_layer` reaches
-    /// `emergency_evict` -- and so the blocking path -- inside the branch that
-    /// established `next_layer.is_some()`.
+    /// The sweep reads each item's frequency with `get_item_frequency`, which
+    /// matches the hashtable entry by location (#140). A lookup by key finds
+    /// the key's current entry, which after an overwrite is a newer copy, so
+    /// the sweep would decide the old copy's fate from the new copy's
+    /// frequency.
     ///
     /// These tests do not use `segment::interpose`, but they are gated the
     /// same way as the module that does: they run a whole eviction pass over a
     /// real pool, which is not a model the checkers should be asked to
     /// explore.
     #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
-    mod blocking_eviction_frequency {
+    mod eviction_frequency {
         use super::*;
         use crate::hashtable_impl::MultiChoiceHashtable;
 
         /// The demotion threshold these tests configure their layer with.
-        const DEMOTION_THRESHOLD: u8 = 4;
+        pub(super) const DEMOTION_THRESHOLD: u8 = 4;
 
         /// The single key each test stages. One item per hashtable is
         /// deliberate: `get_ghost_frequency` matches on the 12-bit tag alone,
         /// so a second key in the table could answer for the first.
-        const KEY: &[u8] = b"solo";
+        pub(super) const KEY: &[u8] = b"solo";
 
         /// A layer wired to a tier *below* it.
         ///
@@ -2359,8 +2061,8 @@ mod tests {
         }
 
         /// One item, warmed with `reads` hits, in a segment already unlinked
-        /// into `Draining` -- which is the state the evictor hands the
-        /// blocking paths.
+        /// into `Draining` -- which is the state the evictor hands
+        /// `evict_segment`.
         pub(super) struct Staged {
             pub(super) hashtable: MultiChoiceHashtable,
             /// The frequency the hashtable holds for the item going in.
@@ -2409,16 +2111,9 @@ mod tests {
             }
         }
 
-        /// A hot item must be *removed* by the blocking non-demoting path, not
-        /// ghosted.
-        ///
-        /// Red proof: restore
-        /// `hashtable.get_frequency(key, &SinglePoolVerifier { pool: &self.pool })`
-        /// at the frequency read in `process_evicted_segment` and this fails
-        /// with a ghost, because the `Locked` claim taken a few lines above
-        /// refuses the verifier and `unwrap_or(0)` reports a zero.
+        /// A hot item must be *removed* by the non-demoting path, not ghosted.
         #[test]
-        fn blocking_eviction_demotes_an_item_over_the_threshold() {
+        fn eviction_demotes_an_item_over_the_threshold() {
             let layer = create_demoting_test_layer();
             let staged = stage_one_item(&layer, DEMOTION_THRESHOLD as usize + 2);
             assert!(
@@ -2441,10 +2136,7 @@ mod tests {
             assert_eq!(
                 staged.hashtable.get_ghost_frequency(KEY),
                 None,
-                "a hot item was ghosted instead of demoted -- the blocking \
-                 path read its frequency through the key verifier, which its \
-                 own `Locked` claim refuses, and `unwrap_or(0)` turned that \
-                 into a zero (#140)"
+                "a hot item was ghosted instead of demoted"
             );
         }
 
@@ -2453,7 +2145,7 @@ mod tests {
         /// Without this the test above passes for any "fix" that reports every
         /// item as hot -- including replacing the lookup with a constant 255.
         #[test]
-        fn blocking_eviction_ghosts_an_item_under_the_threshold() {
+        fn eviction_ghosts_an_item_under_the_threshold() {
             let layer = create_demoting_test_layer();
             let staged = stage_one_item(&layer, 0);
             assert!(
@@ -2480,15 +2172,10 @@ mod tests {
             );
         }
 
-        /// The demoting twin, where the silent zero is worse in kind:
-        /// `ItemFate::Demote` is the only arm that invokes the callback, so a
-        /// frequency stuck at 0 means the demoter never fires at all.
-        ///
-        /// Red proof: restore the verifier-backed lookup at the frequency read
-        /// in `process_evicted_segment_with_demoter` and the callback is never
-        /// called.
+        /// The demoting twin: `ItemFate::Demote` is the only arm that invokes
+        /// the callback.
         #[test]
-        fn blocking_demoting_eviction_hands_a_hot_item_to_the_demoter() {
+        fn demoting_eviction_hands_a_hot_item_to_the_demoter() {
             let layer = create_demoting_test_layer();
             let staged = stage_one_item(&layer, DEMOTION_THRESHOLD as usize + 2);
             assert!(
@@ -2508,16 +2195,14 @@ mod tests {
             assert_eq!(
                 demoted,
                 vec![KEY.to_vec()],
-                "a hot item was not handed to the demoter -- the blocking \
-                 demoting path read its frequency through the key verifier, \
-                 which its own `Locked` claim refuses (#140)"
+                "a hot item was not handed to the demoter"
             );
         }
 
         /// The control for the demoting twin: a cold item must be ghosted and
         /// the callback must not fire for it.
         #[test]
-        fn blocking_demoting_eviction_ghosts_a_cold_item() {
+        fn demoting_eviction_ghosts_a_cold_item() {
             let layer = create_demoting_test_layer();
             let staged = stage_one_item(&layer, 0);
             assert!(
@@ -2544,25 +2229,70 @@ mod tests {
                 "a cold item must become a ghost, carrying its frequency with it"
             );
         }
+
+        /// An old copy of a key that has since been overwritten is not
+        /// demoted, however hot the key is.
+        ///
+        /// Red proof: read the frequency by key,
+        /// `hashtable.get_frequency(key, &verifier)`, in `evict_segment`. The
+        /// key's current entry is the overwrite, which carries the key's
+        /// frequency, so the old copy is handed to the demoter.
+        #[test]
+        fn demoting_eviction_skips_an_overwritten_copy() {
+            let layer = create_demoting_test_layer();
+            let staged = stage_one_item(&layer, DEMOTION_THRESHOLD as usize + 2);
+            assert!(staged.freq >= DEMOTION_THRESHOLD);
+
+            // The staged segment is `Draining`, so this lands in another one.
+            let newer = layer
+                .write_item(KEY, b"newer", b"", Duration::from_secs(3600))
+                .expect("write");
+            let verifier = SinglePoolVerifier { pool: &layer.pool };
+            staged
+                .hashtable
+                .insert(KEY, newer.to_location(), &verifier)
+                .expect("overwrite");
+
+            let mut demoted: Vec<Vec<u8>> = Vec::new();
+            layer.process_evicted_segment_with_demoter(
+                staged.segment_id,
+                &staged.hashtable,
+                |_key, value, _optional, _ttl, _location| demoted.push(value.to_vec()),
+            );
+
+            assert!(
+                demoted.is_empty(),
+                "the overwritten copy was demoted: {demoted:?}"
+            );
+            assert!(
+                staged
+                    .hashtable
+                    .get_item_frequency(KEY, newer.to_location())
+                    .is_some(),
+                "the current entry must be untouched"
+            );
+        }
     }
 
-    /// A blocking eviction that *loses* the claim must leave the segment alone.
+    /// An eviction handed a segment another thread has claimed must leave it
+    /// alone.
     ///
     /// Unreachable in production today -- every caller is gated on a
     /// `Sealed -> Draining` CAS that admits exactly one thread -- so this
-    /// drives the path directly. The hazard it pins is #142: the tail's
-    /// `Locked -> Reserved` CAS *succeeds* for a loser, because the winner is
-    /// what put the segment in `Locked`, and the loser then returns the
-    /// winner's segment to the pool mid-clear.
+    /// drives the path directly. The hazards it pins: sweeping the other
+    /// thread's segment demotes or unlinks its items a second time, and
+    /// (#142) the tail's `Locked -> Reserved` CAS *succeeds* for a loser,
+    /// because the winner is what put the segment in `Locked`, so a loser
+    /// that carries on returns the winner's segment to the pool mid-clear.
     #[cfg(all(not(feature = "loom"), not(feature = "shuttle")))]
     mod lost_claim {
-        use super::blocking_eviction_frequency::*;
+        use super::eviction_frequency::*;
         use super::*;
 
-        /// Red proof: drop the `if !claim { return }` guard in
-        /// `process_evicted_segment` and this fails.
+        /// Red proof: drop the `Draining` check at the top of
+        /// `evict_segment` and this fails: the sweep unlinks the item.
         #[test]
-        fn a_blocking_eviction_that_loses_the_claim_touches_nothing() {
+        fn an_eviction_handed_a_claimed_segment_touches_nothing() {
             let layer = create_demoting_test_layer();
             let staged = stage_one_item(&layer, 0);
 
@@ -2581,17 +2311,25 @@ mod tests {
                 "the loser must not advance the winner's segment out of `Locked`"
             );
             assert_eq!(
+                staged
+                    .hashtable
+                    .get_item_frequency(KEY, staged.location.to_location()),
+                Some(staged.freq),
+                "the loser must not sweep the winner's items"
+            );
+            assert_eq!(
                 layer.pool().free_count(),
                 free_before,
                 "the loser must not return the winner's segment to the pool"
             );
         }
 
-        /// The demoting twin. Separate body, so it needs its own proof.
+        /// The demoting twin: with the `Draining` check gone, the sweep
+        /// hands the item to the demoter.
         #[test]
-        fn a_blocking_demoting_eviction_that_loses_the_claim_touches_nothing() {
+        fn a_demoting_eviction_handed_a_claimed_segment_touches_nothing() {
             let layer = create_demoting_test_layer();
-            let staged = stage_one_item(&layer, 0);
+            let staged = stage_one_item(&layer, DEMOTION_THRESHOLD as usize + 2);
 
             let segment = layer.pool().get(staged.segment_id).expect("segment");
             assert!(
@@ -2688,7 +2426,7 @@ mod tests {
         /// A segment pinned during the claim window must not be recycled.
         ///
         /// Red proof: swap the two lines in
-        /// `TtlLayer::process_evicted_segment_nonblocking` so the count is
+        /// `TtlLayer::evict_segment` so the count is
         /// read before the claim.
         #[test]
         fn eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
@@ -2725,7 +2463,7 @@ mod tests {
         /// own copy of the count gate.
         ///
         /// Red proof: swap the two lines in
-        /// `TtlLayer::process_evicted_segment_with_demoter_nonblocking`.
+        /// `TtlLayer::evict_segment`.
         #[test]
         fn demoting_eviction_does_not_recycle_a_segment_pinned_while_it_was_claiming() {
             let (layer, hashtable) = filled_layer(24, 4096);
@@ -3414,6 +3152,48 @@ mod tests {
         let invalid_location = ItemLocation::new(layer.pool().layout(), 1, 9999, 0, 0);
         // Should not panic
         layer.mark_deleted(invalid_location);
+    }
+
+    /// The eager empty-segment reclaim skips a segment pinned by an open
+    /// two-phase write. The reserved item does not count in `live_items`
+    /// until it is finalized, so without the pin check the segment is
+    /// detached and condemned with no sweep: a commit that read `Sealed`
+    /// before the detach leaves its entry in a segment that is freed when the
+    /// reservation drops.
+    #[test]
+    fn freeing_an_empty_segment_skips_one_with_an_open_reservation() {
+        let layer = TtlLayerBuilder::new()
+            .layer_id(1)
+            .pool_id(1)
+            .segment_size(1024)
+            .heap_size(5 * 1024)
+            .spare_capacity(0)
+            .build()
+            .expect("layer");
+        let ttl = Duration::from_secs(3600);
+
+        let (location, _value_ptr, _item_size, pin) = layer
+            .begin_write_item(b"big", 900, b"", ttl)
+            .expect("reserve");
+        let reserved = location.segment_id(layer.pool().layout());
+        // Does not fit behind the reservation, so the bucket moves on to a new
+        // segment and seals the reserved one.
+        let next = layer
+            .write_item(b"next", &[0u8; 200], b"", ttl)
+            .expect("write");
+        assert_ne!(next.segment_id(layer.pool().layout()), reserved);
+
+        let seg = layer.pool.get(reserved).expect("segment");
+        assert_eq!(seg.state(), State::Sealed);
+        assert_eq!(seg.live_items(), 0, "a reserved item is not counted yet");
+        assert!(
+            !layer.try_free_empty_segment(reserved),
+            "freed a segment with an open reservation"
+        );
+        assert_eq!(seg.state(), State::Sealed);
+
+        drop(pin);
+        assert!(layer.try_free_empty_segment(reserved));
     }
 
     #[test]

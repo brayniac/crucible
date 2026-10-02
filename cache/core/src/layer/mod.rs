@@ -34,50 +34,16 @@ pub use ttl_layer::{TtlLayer, TtlLayerBuilder};
 use crate::segment::Segment;
 use crate::state::State;
 
-/// Wait for all readers to release a segment.
-///
-/// Spins briefly using `spin_loop` hints for low-latency cases, then
-/// falls back to `thread::yield_now()` to avoid starving other work
-/// on the core.
-///
-/// **Call this only on a segment already claimed `Locked`** -- via
-/// [`claim_and_wait_for_readers`], which is the only caller. `Draining` is not
-/// an exclusive claim (it still admits key-verify readers, see
-/// [`State::admits_verify_reader`]), so a spin that converges to zero under
-/// `Draining` says nothing about the instant after it: a fresh pin can land
-/// between the observation and the `Draining -> Locked` CAS, and the caller
-/// then rewrites the segment's bytes under it. That was #133 on the blocking
-/// path. Under `Locked` no fresh pin is admitted, so the count is monotonically
-/// non-increasing and the zero this returns on is final.
-///
-/// `ref_count_seqcst`, not `ref_count`: the claim CAS above is the store and
-/// this is the load of the Dekker pair with each reader's (store `ref_count`,
-/// load state). Repeating the load does not rescue an `Acquire` one -- the
-/// guarantee needed is that the *observation of zero* cannot coexist with a
-/// reader whose re-check saw an admitting state, and only the SC total order
-/// gives that. See [`crate::segment::Segment::ref_count_seqcst`] (#129).
-pub(crate) fn wait_for_readers<S: Segment>(segment: &S) {
-    #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
-    crate::segment::interpose::fire(crate::segment::interpose::WAIT_BEFORE_POLL);
-
-    let mut spins = 0u32;
-    while segment.ref_count_seqcst() > 0 {
-        if spins < 64 {
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
-        }
-        spins = spins.saturating_add(1);
-    }
-}
+/// The demoter type for an eviction that demotes nothing.
+pub(crate) type NoDemoter = fn(&[u8], &[u8], &[u8], std::time::Duration, crate::location::Location);
 
 /// Claim a drained segment for exclusive access: `Draining -> Locked`.
 ///
 /// Returns `true` iff this caller won the claim. `Locked` is the only state
 /// that refuses *every* class of fresh reader -- `Draining` deliberately still
-/// admits key-verify readers so the demoter can verify keys on a segment it is
-/// draining -- so it is the transition past which the segment's bytes may be
-/// rewritten.
+/// admits key-verify readers, so a lookup or insert resolving an entry that
+/// still points into a segment being swept can verify its key -- so it is the
+/// transition past which the segment's bytes may be rewritten.
 ///
 /// # Claim, then count. Never count, then claim (#133)
 ///
@@ -110,31 +76,6 @@ pub(crate) fn try_claim_for_clear<S: Segment>(segment: &S) -> bool {
     crate::segment::interpose::fire(crate::segment::interpose::CLAIM_BEFORE_CAS);
 
     segment.cas_metadata(State::Draining, State::Locked, None, None)
-}
-
-/// Claim a drained segment and then wait out its readers, for the blocking
-/// eviction paths.
-///
-/// Returns `true` iff this caller holds the `Locked` claim on return, with
-/// `ref_count` observed at zero. The order is the point: see
-/// [`try_claim_for_clear`] for why the claim has to precede the count, and
-/// [`wait_for_readers`] for why waiting under `Draining` would not have been
-/// exclusive.
-///
-/// `#[must_use]`: a `false` here means this thread never owned the segment, so
-/// everything the caller would do next -- rewriting the items, CASing
-/// `Locked -> Reserved`, returning it to the pool -- belongs to whoever won the
-/// claim. All four blocking callers used to drop this value (#142). The
-/// `Locked -> Reserved` CAS is the trap, because it *succeeds*: the winner is
-/// what put the segment in `Locked`, so a loser that carries on releases a
-/// segment the winner is still clearing.
-#[must_use]
-pub(crate) fn claim_and_wait_for_readers<S: Segment>(segment: &S) -> bool {
-    if !try_claim_for_clear(segment) {
-        return false;
-    }
-    wait_for_readers(segment);
-    true
 }
 
 /// Condemn a segment whose readers have not all left, and reclaim it if they

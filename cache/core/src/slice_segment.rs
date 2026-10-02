@@ -262,6 +262,89 @@ impl<'a> SliceSegment<'a> {
         self.data.as_ptr()
     }
 
+    /// The segment state, loaded `SeqCst` for callers that pair it with a
+    /// `ref_count_seqcst` load.
+    pub fn state_seqcst(&self) -> State {
+        Metadata::unpack(self.metadata.load(Ordering::SeqCst)).state
+    }
+
+    /// Take a reference for a two-phase append, admitted only while the
+    /// segment is `Live`. Eviction can condemn a pinned segment but does not
+    /// free it until the reference is released, so bytes the writer is still
+    /// receiving are not handed to another segment's items. Returns `false`,
+    /// holding nothing, if the segment is not `Live`.
+    pub(crate) fn try_pin_for_append(&self) -> bool {
+        crate::segment::try_acquire_pin(
+            &self.ref_count,
+            &self.metadata,
+            |state| state == State::Live,
+            || self.release_ref(),
+        )
+    }
+
+    /// Release a reference taken by `try_pin_for_append` when no item was
+    /// reserved under it.
+    pub(crate) fn unpin_for_append(&self) {
+        self.release_ref();
+    }
+
+    /// A `ValueRef` over `len` bytes at `ptr` that owns a reference taken by
+    /// `try_pin_for_append`; dropping it releases the reference, freeing the
+    /// segment if it was condemned meanwhile.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds a reference from `try_pin_for_append` and hands it
+    /// over, and `ptr..ptr + len` lies in this segment.
+    pub(crate) unsafe fn value_ref_for_append(
+        &self,
+        ptr: *const u8,
+        len: usize,
+    ) -> crate::cache_trait::ValueRef {
+        // SAFETY: per this function's contract.
+        unsafe {
+            crate::cache_trait::ValueRef::new(
+                &self.ref_count as *const AtomicU32,
+                ptr,
+                len,
+                &self.metadata as *const AtomicU64,
+                self.free_queue,
+                self.id,
+            )
+        }
+    }
+
+    /// Clear the deleted flag of the item at `offset` (byte 1, bit 6), with
+    /// release ordering. Publishes an item written by a two-phase append.
+    fn clear_deleted_at_offset(&self, offset: u32) {
+        let header_size = if self.is_per_item_ttl() {
+            TtlHeader::SIZE
+        } else {
+            BasicHeader::SIZE
+        };
+        if offset as usize + header_size > self.capacity as usize {
+            return;
+        }
+        let flags_ptr = unsafe { self.data.as_ptr().add(offset as usize + 1) };
+
+        #[cfg(not(feature = "loom"))]
+        {
+            // SAFETY: in bounds (checked above); every writer of this byte
+            // uses the same atomic view.
+            let flags_atomic = unsafe { &*(flags_ptr as *const AtomicU8) };
+            flags_atomic.fetch_and(!0x40, Ordering::Release);
+        }
+
+        #[cfg(feature = "loom")]
+        {
+            fence(Ordering::Release);
+            unsafe {
+                let old = std::ptr::read_volatile(flags_ptr);
+                std::ptr::write_volatile(flags_ptr, old & !0x40);
+            }
+        }
+    }
+
     /// Reserve space atomically and return the start offset.
     fn reserve_space(&self, size: u32) -> Option<u32> {
         let config = CasRetryConfig::default();
@@ -1276,6 +1359,9 @@ impl Segment for SliceSegment<'_> {
 
         let mut header_bytes = [0u8; TtlHeader::SIZE];
         header.to_bytes(&mut header_bytes);
+        // Written deleted, so a scan skips the item until `finalize_append`
+        // clears the flag with its value in place.
+        header_bytes[1] |= 0x40;
 
         let item_size = TtlHeader::SIZE + optional.len() + key.len() + value_len;
         let padded_size = self.item_stride(item_size) as usize;
@@ -1323,6 +1409,9 @@ impl Segment for SliceSegment<'_> {
 
         let mut header_bytes = [0u8; BasicHeader::SIZE];
         header.to_bytes(&mut header_bytes);
+        // Written deleted, so a scan skips the item until `finalize_append`
+        // clears the flag with its value in place.
+        header_bytes[1] |= 0x40;
 
         let item_size = BasicHeader::SIZE + optional.len() + key.len() + value_len;
         let padded_size = self.item_stride(item_size) as usize;
@@ -1352,8 +1441,8 @@ impl Segment for SliceSegment<'_> {
         }
     }
 
-    fn finalize_append(&self, item_size: u32) {
-        fence(Ordering::Release);
+    fn finalize_append(&self, offset: u32, item_size: u32) {
+        self.clear_deleted_at_offset(offset);
 
         // Update statistics
         self.live_items.fetch_add(1, Ordering::Relaxed);
@@ -4624,7 +4713,7 @@ mod shuttle_tests {
     /// loads come back stale (with `SeqCst` throughout, too)". Under shuttle's
     /// SC execution it is assertable, and it holds.
     ///
-    /// The evictor is `FifoLayer::process_evicted_segment_nonblocking` in
+    /// The evictor is `FifoLayer::evict_segment` in
     /// full, in #133's order: claim `Sealed -> Draining`, sweep, claim
     /// `Draining -> Locked`, and only *then* load `ref_count` -- rewriting the
     /// segment's bytes if it is zero and condemning from `Locked` if it is
@@ -4749,7 +4838,7 @@ mod shuttle_tests {
     /// loads can be stale, so at least one side sees the other and acts. That
     /// is the direction loom reports false violations for.
     ///
-    /// Starts where `process_evicted_segment_nonblocking`'s deferred branch
+    /// Starts where `evict_segment`'s deferred branch
     /// starts: `Draining` with one outstanding pin.
     #[test]
     fn shuttle_awaiting_release_exactly_one_free() {
@@ -4802,82 +4891,6 @@ mod shuttle_tests {
         );
     }
 
-    /// **A pinned reader never coexists with a committed drain, in the
-    /// blocking claimer's shape.**
-    ///
-    /// The other production drain path: `process_evicted_segment` claims
-    /// `Sealed -> Draining`, then takes `Draining -> Locked`, and only then
-    /// *waits* -- `layer::claim_and_wait_for_readers`, which spins on
-    /// `ref_count_seqcst()` with the claim already published -- before
-    /// rewriting the segment's bytes. `committed` stands for that rewrite.
-    ///
-    /// The claim has to come first here too (#133). `Draining` still admits
-    /// key-verify readers, so a spin that converges to zero under it says
-    /// nothing about the instant after: a fresh pin can land between the
-    /// observation and the `Locked` CAS. Under `Locked` the count is
-    /// monotonically non-increasing, so the spin terminates on a zero that
-    /// stays true.
-    ///
-    /// Repeating the load does not rescue a weaker ordering here: the property
-    /// needed is that an *observation of zero* cannot coexist with a reader
-    /// whose re-check saw an admitting state, and only the SC total order
-    /// gives that. Shuttle is the tool that can assert it; loom cannot.
-    #[test]
-    fn shuttle_readers_vs_waiting_drain_claimer() {
-        shuttle::check_random(
-            || {
-                let ref_count = Arc::new(AtomicU32::new(0));
-                let metadata = Arc::new(AtomicU64::new(Metadata::new(State::Sealed).pack()));
-                let committed = Arc::new(AtomicU32::new(0));
-
-                let readers: Vec<_> = (0..2)
-                    .map(|_| {
-                        let rc = Arc::clone(&ref_count);
-                        let m = Arc::clone(&metadata);
-                        let c = Arc::clone(&committed);
-                        thread::spawn(move || {
-                            if !model_try_acquire_guard(&rc, &m) {
-                                return;
-                            }
-                            assert_eq!(
-                                c.load(Ordering::SeqCst),
-                                0,
-                                "a pinned reader coexisted with a COMMITTED drain -- \
-                                 wait_for_readers returned while a reference was live"
-                            );
-                            model_release_ref(&rc, &m);
-                        })
-                    })
-                    .collect();
-
-                let claimer = {
-                    let rc = Arc::clone(&ref_count);
-                    let m = Arc::clone(&metadata);
-                    let c = Arc::clone(&committed);
-                    thread::spawn(move || {
-                        if !model_cas_state(&m, State::Sealed, State::Draining) {
-                            return;
-                        }
-                        // layer::claim_and_wait_for_readers: claim, then wait.
-                        assert!(model_cas_state(&m, State::Draining, State::Locked));
-                        while rc.load(Ordering::SeqCst) > 0 {
-                            thread::yield_now();
-                        }
-                        c.store(1, Ordering::SeqCst);
-                    })
-                };
-
-                for r in readers {
-                    r.join().unwrap();
-                }
-                claimer.join().unwrap();
-
-                assert_eq!(ref_count.load(Ordering::SeqCst), 0);
-            },
-            shuttle_iters(20_000),
-        );
-    }
-
     /// **A key-verify reader never coexists with a committed clear (#133).**
     ///
     /// The other three models here use `model_try_acquire_guard`, whose
@@ -4888,7 +4901,7 @@ mod shuttle_tests {
     /// exclusive claim, so an evictor that reads `ref_count` while holding
     /// only `Draining` is reading a number that can still go up.
     ///
-    /// The evictor is `process_evicted_segment_nonblocking`'s tail in the
+    /// The evictor is `evict_segment`'s tail in the
     /// order this branch introduced: claim `Draining -> Locked`, *then* load
     /// `ref_count`, and either clear (`committed`) or condemn from `Locked`.
     ///
