@@ -14,7 +14,7 @@ use crossbeam_deque::Injector;
 use crate::class::SlabClass;
 use crate::config::{EvictionStrategy, HEADER_SIZE, SlabCacheConfig, SlabClasses};
 use crate::item::SlabItemHeader;
-use crate::location::SlabLocation;
+use crate::location::{MAX_SLOT_INDEX, SlabLocation};
 use crate::verifier::SlabVerifier;
 
 /// The main slab allocator.
@@ -45,11 +45,45 @@ unsafe impl Sync for SlabAllocator {}
 impl SlabAllocator {
     /// Create a new slab allocator.
     pub fn new(config: &SlabCacheConfig) -> Result<Self, std::io::Error> {
+        // A class_id has 6 bits. Checked here so `build` returns an error
+        // instead of reaching the assert in `SlabClasses::from_config`.
+        let class_count = config.generate_classes().len();
+        if class_count > SlabClasses::MAX_CLASSES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "slab_size {} with growth_factor {} gives {} slab classes, more than {}; \
+                     raise growth_factor or reduce slab_size",
+                    config.slab_size,
+                    config.growth_factor,
+                    class_count,
+                    SlabClasses::MAX_CLASSES
+                ),
+            ));
+        }
+        let slab_classes = SlabClasses::from_config(config);
+
+        // The smallest class has the most slots per slab, and every slot
+        // index has to fit in a location word.
+        if let Some(&min_slot) = slab_classes.sizes().first() {
+            let slots = config.slab_size / min_slot;
+            if slots > MAX_SLOT_INDEX as usize + 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "slab_size {} with a smallest slot of {} bytes gives {} slots per slab; \
+                         a slab can hold at most {} slots. Reduce slab_size or raise min_slot_size",
+                        config.slab_size,
+                        min_slot,
+                        slots,
+                        MAX_SLOT_INDEX as usize + 1
+                    ),
+                ));
+            }
+        }
+
         // Allocate the heap
         let heap = allocate_on_node(config.heap_size, config.hugepage_size, config.numa_node)?;
-
-        // Generate slab classes from config
-        let slab_classes = SlabClasses::from_config(config);
 
         // Create slab class instances
         let classes: Vec<SlabClass> = slab_classes
@@ -113,7 +147,7 @@ impl SlabAllocator {
     ///
     /// Returns `Some((slab_id, slot_index))` if successful.
     /// May allocate a new slab if needed.
-    pub fn allocate(&self, class_id: u8) -> Option<(u32, u16)> {
+    pub fn allocate(&self, class_id: u8) -> Option<(u32, u32)> {
         let class = self.classes.get(class_id as usize)?;
 
         // Try to allocate from the class's free list
@@ -131,7 +165,7 @@ impl SlabAllocator {
     /// for different (or even the same) classes. If two threads allocate
     /// slabs for the same class simultaneously, both slabs are added and
     /// used - this is intentional to avoid lock contention.
-    fn allocate_slab_for_class(&self, class_id: u8) -> Option<(u32, u16)> {
+    fn allocate_slab_for_class(&self, class_id: u8) -> Option<(u32, u32)> {
         let class = self.classes.get(class_id as usize)?;
 
         // Try to get a free slab from the pool (lock-free steal)
@@ -154,7 +188,7 @@ impl SlabAllocator {
     }
 
     /// Deallocate a slot, returning it to the free list.
-    pub fn deallocate(&self, class_id: u8, slab_id: u32, slot_index: u16) {
+    pub fn deallocate(&self, class_id: u8, slab_id: u32, slot_index: u32) {
         if let Some(class) = self.classes.get(class_id as usize) {
             class.deallocate(slab_id, slot_index);
         }
@@ -199,7 +233,7 @@ impl SlabAllocator {
         class_id: u8,
         hashtable: &H,
         mut demote: D,
-    ) -> Option<(u32, u16)>
+    ) -> Option<(u32, u32)>
     where
         H: Hashtable,
         D: FnMut(&crate::class::EvictedItem<'_>) -> bool,
@@ -457,7 +491,7 @@ impl SlabAllocator {
         &self,
         class_id: u8,
         slab_id: u32,
-        slot_index: u16,
+        slot_index: u32,
         key: &[u8],
         value: &[u8],
         ttl: Duration,

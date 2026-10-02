@@ -14,12 +14,13 @@ use parking_lot::RwLock;
 use crate::config::HEADER_SIZE;
 use crate::item::{SlabItemHeader, now_secs, pack_slot_ref, unpack_slot_ref};
 
-/// Maximum number of slabs per class for lock-free pointer array.
-/// With 1MB slabs and 64GB heap, total slabs = 65536. Since slabs can
-/// concentrate in popular size classes, we need to support the full count.
-/// Memory overhead: 12 bytes per slot (8 byte pointer + 4 byte state).
-/// At 65536 slots = 768KB per class, acceptable for large caches.
+/// Maximum number of slabs per class. Sizes the lock-free `slab_ptrs` and
+/// `slab_states` arrays and must equal `MAX_SLAB_ID + 1`, the 16-bit slab_id
+/// field of a location. A 64GB heap of 1MB slabs is 65,536 slabs, all of
+/// which can land in one class. Each class pre-allocates 12 bytes per entry
+/// (8-byte pointer + 4-byte state): 768KB per class, 48MB for 64 classes.
 const MAX_SLABS_PER_CLASS: usize = 65536;
+const _: () = assert!(MAX_SLABS_PER_CLASS == crate::location::MAX_SLAB_ID as usize + 1);
 
 /// Slab state for the state machine.
 ///
@@ -304,7 +305,7 @@ impl Slab {
     ///
     /// The caller must ensure `slot_index * slot_size < self.size`.
     #[inline]
-    pub unsafe fn slot_ptr(&self, slot_index: u16, slot_size: usize) -> *mut u8 {
+    pub unsafe fn slot_ptr(&self, slot_index: u32, slot_size: usize) -> *mut u8 {
         // SAFETY: Caller ensures slot_index * slot_size < self.size
         unsafe { self.data.add(slot_index as usize * slot_size) }
     }
@@ -315,7 +316,7 @@ impl Slab {
     ///
     /// The caller must ensure the slot contains a valid item.
     #[inline]
-    pub unsafe fn header(&self, slot_index: u16, slot_size: usize) -> &SlabItemHeader {
+    pub unsafe fn header(&self, slot_index: u32, slot_size: usize) -> &SlabItemHeader {
         // SAFETY: Caller ensures slot contains valid item
         unsafe { SlabItemHeader::from_ptr(self.slot_ptr(slot_index, slot_size)) }
     }
@@ -373,8 +374,8 @@ pub struct SlabClass {
     /// Format: [state: 8 bits][ref_count: 24 bits]
     /// Used for safe concurrent access and eviction coordination.
     slab_states: Box<[AtomicU32]>,
-    /// Free slot stack: packed as (slab_id << 16 | slot_index).
-    free_slots: Injector<u32>,
+    /// Free slot stack: packed as (slab_id << 32 | slot_index).
+    free_slots: Injector<u64>,
     /// Number of allocated slabs (atomic for lock-free reads).
     slab_count: AtomicU32,
     /// Number of items in this class.
@@ -399,12 +400,19 @@ pub struct EvictedItem<'a> {
     /// Slab within the class.
     pub slab_id: u32,
     /// Slot within the slab.
-    pub slot_index: u16,
+    pub slot_index: u32,
 }
 
 impl SlabClass {
     /// Create a new slab class.
     pub fn new(class_id: u8, slot_size: usize, slab_size: usize) -> Self {
+        assert!(
+            slab_size / slot_size <= crate::location::MAX_SLOT_INDEX as usize + 1,
+            "{} slots per slab exceeds the {} a location can address",
+            slab_size / slot_size,
+            crate::location::MAX_SLOT_INDEX as usize + 1
+        );
+
         // Pre-allocate lock-free arrays
         let slab_ptrs: Box<[AtomicPtr<u8>]> = (0..MAX_SLABS_PER_CLASS)
             .map(|_| AtomicPtr::new(ptr::null_mut()))
@@ -557,7 +565,7 @@ impl SlabClass {
 
             // Add all slots to the free list
             for slot_index in 0..self.slots_per_slab {
-                let packed = pack_slot_ref(slab_id, slot_index as u16);
+                let packed = pack_slot_ref(slab_id, slot_index as u32);
                 self.free_slots.push(packed);
             }
 
@@ -574,7 +582,7 @@ impl SlabClass {
     /// This method filters out slots from evicted slabs. When a slab is evicted,
     /// its state becomes Unallocated, but the free_slots queue may still contain
     /// entries for that slab. We discard those entries and keep trying.
-    pub fn allocate(&self) -> Option<(u32, u16)> {
+    pub fn allocate(&self) -> Option<(u32, u32)> {
         loop {
             match self.free_slots.steal() {
                 crossbeam_deque::Steal::Success(packed) => {
@@ -597,7 +605,7 @@ impl SlabClass {
     }
 
     /// Return a slot to the free list.
-    pub fn deallocate(&self, slab_id: u32, slot_index: u16) {
+    pub fn deallocate(&self, slab_id: u32, slot_index: u32) {
         let packed = pack_slot_ref(slab_id, slot_index);
         self.free_slots.push(packed);
     }
@@ -640,7 +648,7 @@ impl SlabClass {
     pub unsafe fn get_value_ref_raw(
         &self,
         slab_id: u32,
-        slot_index: u16,
+        slot_index: u32,
     ) -> Option<(*const AtomicU32, *const u8, usize)> {
         unsafe {
             if (slab_id as usize) >= MAX_SLABS_PER_CLASS {
@@ -689,7 +697,7 @@ impl SlabClass {
     ///
     /// Caller must ensure proper synchronization and that the slab exists.
     #[inline]
-    pub unsafe fn slot_ptr(&self, slab_id: u32, slot_index: u16) -> *mut u8 {
+    pub unsafe fn slot_ptr(&self, slab_id: u32, slot_index: u32) -> *mut u8 {
         unsafe {
             // Lock-free read from the atomic pointer array
             let slab_ptr = self.slab_ptrs[slab_id as usize].load(Ordering::Acquire);
@@ -706,7 +714,7 @@ impl SlabClass {
     ///
     /// Caller must ensure the slot contains a valid item.
     #[inline]
-    pub unsafe fn header(&self, slab_id: u32, slot_index: u16) -> &SlabItemHeader {
+    pub unsafe fn header(&self, slab_id: u32, slot_index: u32) -> &SlabItemHeader {
         unsafe {
             // SAFETY: Caller ensures slot contains valid item
             let ptr = self.slot_ptr(slab_id, slot_index);
@@ -807,7 +815,7 @@ impl SlabClass {
         // Phase 5: Process each slot without holding the slabs lock.
         // Safe because we're in Locked state with exclusive access.
         for slot_index in 0..self.slots_per_slab {
-            let slot_index = slot_index as u16;
+            let slot_index = slot_index as u32;
 
             // SAFETY: slot_index is valid, slab memory is stable, no concurrent readers
             unsafe {
@@ -909,7 +917,7 @@ impl SlabClass {
         key: &[u8],
         value_len: usize,
         ttl: std::time::Duration,
-    ) -> Option<(u32, u16, *mut u8, usize)> {
+    ) -> Option<(u32, u32, *mut u8, usize)> {
         // Allocate a slot
         let (slab_id, slot_index) = self.allocate()?;
 
@@ -952,7 +960,7 @@ impl SlabClass {
     /// Called if the write cannot be completed (e.g., connection closed).
     /// Marks the item as deleted, returns the slot to the free list, and
     /// releases the write ref acquired during allocation.
-    pub fn cancel_write_item(&self, slab_id: u32, slot_index: u16) {
+    pub fn cancel_write_item(&self, slab_id: u32, slot_index: u32) {
         // Release the write ref acquired during begin_write_item -> allocate()
         self.release_slab(slab_id);
 
@@ -1015,7 +1023,7 @@ impl<'a> SlabRef<'a> {
     ///
     /// Caller must ensure the slot index is valid.
     #[inline]
-    pub unsafe fn slot_ptr(&self, slot_index: u16) -> *mut u8 {
+    pub unsafe fn slot_ptr(&self, slot_index: u32) -> *mut u8 {
         // SAFETY: Caller ensures slot index is valid
         unsafe { self.class.slot_ptr(self.slab_id, slot_index) }
     }
@@ -1026,7 +1034,7 @@ impl<'a> SlabRef<'a> {
     ///
     /// Caller must ensure the slot contains a valid item.
     #[inline]
-    pub unsafe fn header(&self, slot_index: u16) -> &SlabItemHeader {
+    pub unsafe fn header(&self, slot_index: u32) -> &SlabItemHeader {
         // SAFETY: Caller ensures slot contains valid item
         unsafe { self.class.header(self.slab_id, slot_index) }
     }

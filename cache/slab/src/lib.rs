@@ -1378,6 +1378,73 @@ mod tests {
         let _cache = create_test_cache();
     }
 
+    /// An 8MB slab of 64-byte slots has 131,072 slots. With a 16-bit slot
+    /// index, slots 65,536 and up wrapped onto 0..65,535, so two keys were
+    /// given the same slot and the first one read back as a miss.
+    #[test]
+    fn every_slot_in_a_large_slab_is_distinct() {
+        let cache = SlabCacheBuilder::new()
+            .heap_size(8 * 1024 * 1024)
+            .slab_size(8 * 1024 * 1024)
+            .min_slot_size(64)
+            .hashtable_power(18)
+            .build()
+            .expect("cache");
+        let ttl = Duration::from_secs(3600);
+
+        // 7-byte keys and values land in the 64-byte class; 100,000 of them
+        // fit in one slab and need slot indices past 65,535.
+        let n = 100_000;
+        for i in 0..n {
+            cache
+                .set_item(
+                    format!("k{i:06}").as_bytes(),
+                    format!("v{i:06}").as_bytes(),
+                    ttl,
+                )
+                .unwrap_or_else(|e| panic!("set {i}: {e:?}"));
+        }
+        let wrong = (0..n)
+            .filter(|i| {
+                cache.get_item(format!("k{i:06}").as_bytes())
+                    != Some(format!("v{i:06}").into_bytes())
+            })
+            .count();
+        assert_eq!(wrong, 0, "{wrong} of {n} keys missing or wrong");
+    }
+
+    /// A slab with more slots than a location can address is refused at
+    /// build time: 128MB of 64-byte slots is 2,097,152 slots. growth_factor
+    /// is 2.0 because the default 1.25 gives 65 classes at this size, which
+    /// is rejected by the class-count check first.
+    #[test]
+    fn build_rejects_more_slots_than_a_location_can_address() {
+        let err = SlabCacheBuilder::new()
+            .heap_size(128 * 1024 * 1024)
+            .slab_size(128 * 1024 * 1024)
+            .min_slot_size(64)
+            .growth_factor(2.0)
+            .build()
+            .err()
+            .expect("build should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// More than 64 slab classes is refused at build time rather than
+    /// panicking: 128MB slabs at the default growth factor give 65 classes.
+    #[test]
+    fn build_rejects_more_classes_than_a_location_can_address() {
+        let err = SlabCacheBuilder::new()
+            .heap_size(128 * 1024 * 1024)
+            .slab_size(128 * 1024 * 1024)
+            .min_slot_size(64)
+            .build()
+            .err()
+            .expect("build should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("slab classes"), "{err}");
+    }
+
     /// A flushed cache must still accept writes.
     ///
     /// The segment backends had this wrong (crucible#107): flush reset the

@@ -517,20 +517,16 @@ impl SlabItemHeader {
     }
 }
 
-/// Pack slab_id and slot_index into a u32.
-///
-/// Note: This only works for up to 65536 slabs and 65536 slots per slab.
-/// For larger slab counts, we'd need a different encoding or larger links.
+/// Pack slab_id and slot_index into a u64 free-list entry.
 #[inline]
-pub fn pack_slot_ref(slab_id: u32, slot_index: u16) -> u32 {
-    debug_assert!(slab_id <= 0xFFFF, "slab_id too large for slot ref");
-    (slab_id << 16) | (slot_index as u32)
+pub fn pack_slot_ref(slab_id: u32, slot_index: u32) -> u64 {
+    ((slab_id as u64) << 32) | (slot_index as u64)
 }
 
-/// Unpack a u32 slot reference into (slab_id, slot_index).
+/// Unpack a free-list entry into (slab_id, slot_index).
 #[inline]
-pub fn unpack_slot_ref(packed: u32) -> (u32, u16) {
-    ((packed >> 16), (packed & 0xFFFF) as u16)
+pub fn unpack_slot_ref(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
 }
 
 #[cfg(kani)]
@@ -541,8 +537,7 @@ mod verification {
     #[kani::proof]
     fn slot_ref_roundtrip() {
         let slab_id: u32 = kani::any();
-        kani::assume(slab_id <= 0xFFFF);
-        let slot_index: u16 = kani::any();
+        let slot_index: u32 = kani::any();
         let (id, idx) = unpack_slot_ref(pack_slot_ref(slab_id, slot_index));
         assert_eq!(id, slab_id);
         assert_eq!(idx, slot_index);
@@ -562,7 +557,7 @@ mod tests {
     #[test]
     fn test_pack_unpack_slot_ref() {
         let slab_id = 1234u32;
-        let slot_index = 5678u16;
+        let slot_index = 567_890u32;
         let packed = pack_slot_ref(slab_id, slot_index);
         let (unpacked_slab, unpacked_slot) = unpack_slot_ref(packed);
         assert_eq!(unpacked_slab, slab_id);
