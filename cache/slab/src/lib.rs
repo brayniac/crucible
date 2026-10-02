@@ -96,6 +96,11 @@ use allocator::SlabAllocator;
 use location::SlabLocation;
 use verifier::SlabTieredVerifier;
 
+/// How many times a read looks a key up when `pin_item` fails because the
+/// slot was freed or rewritten or its slab is draining. After that the read
+/// misses, even if the key is present.
+const PIN_ATTEMPTS: usize = 4;
+
 /// Memcached-style slab allocator cache.
 ///
 /// Uses a traditional slab allocator with slab-level eviction.
@@ -207,20 +212,14 @@ impl SlabCache {
             }
             true
         } else {
-            // Release write ref before cleanup
+            // The write ref keeps the slab in this class while the slot is freed.
+            self.allocator.retire_held_item(SlabLocation::with_pool(
+                self.ram_pool_id,
+                class_id,
+                slab_id,
+                slot_index,
+            ));
             self.allocator.release_write_ref(class_id, slab_id);
-
-            // CAS failed, clean up allocated slot
-            unsafe {
-                let loc = SlabLocation::with_pool(self.ram_pool_id, class_id, slab_id, slot_index);
-                let header = self.allocator.header(loc);
-                if let Some(class) = self.allocator.class(class_id) {
-                    class.sub_bytes(header.item_size());
-                    class.remove_item();
-                }
-                header.mark_deleted();
-            }
-            self.allocator.deallocate(class_id, slab_id, slot_index);
             false
         }
     }
@@ -335,20 +334,10 @@ impl SlabCache {
                 Ok(())
             }
             Err(e) => {
-                // Release write ref before cleanup
+                // The write ref keeps the slab in this class while the slot is freed.
+                self.allocator
+                    .retire_held_item(SlabLocation::new(class_id, slab_id, slot_index));
                 self.allocator.release_write_ref(class_id, slab_id);
-
-                // Failed to insert, clean up the allocated slot
-                let loc = SlabLocation::new(class_id, slab_id, slot_index);
-                unsafe {
-                    let header = self.allocator.header(loc);
-                    if let Some(class) = self.allocator.class(class_id) {
-                        class.sub_bytes(header.item_size());
-                        class.remove_item();
-                    }
-                    header.mark_deleted();
-                }
-                self.allocator.deallocate(class_id, slab_id, slot_index);
                 Err(e)
             }
         }
@@ -397,37 +386,15 @@ impl SlabCache {
                 // Release write ref - write is complete and item is visible in hashtable
                 self.allocator.release_write_ref(class_id, slab_id);
 
-                // Deallocate old slot
-                let old = SlabLocation::from_location(old_loc);
-                let (old_class, old_slab, old_slot) = old.unpack();
-
-                // Mark deleted and update stats
-                unsafe {
-                    let header = self.allocator.header(old);
-                    if let Some(class) = self.allocator.class(old_class) {
-                        class.sub_bytes(header.item_size());
-                        class.remove_item();
-                    }
-                    header.mark_deleted();
-                }
-                self.allocator.deallocate(old_class, old_slab, old_slot);
+                self.allocator
+                    .retire_item(SlabLocation::from_location(old_loc));
                 Ok(())
             }
             Err(e) => {
-                // Release write ref before cleanup
+                // The write ref keeps the slab in this class while the slot is freed.
+                self.allocator
+                    .retire_held_item(SlabLocation::new(class_id, slab_id, slot_index));
                 self.allocator.release_write_ref(class_id, slab_id);
-
-                // Failed to update, clean up the allocated slot
-                let loc = SlabLocation::new(class_id, slab_id, slot_index);
-                unsafe {
-                    let header = self.allocator.header(loc);
-                    if let Some(class) = self.allocator.class(class_id) {
-                        class.sub_bytes(header.item_size());
-                        class.remove_item();
-                    }
-                    header.mark_deleted();
-                }
-                self.allocator.deallocate(class_id, slab_id, slot_index);
                 Err(e)
             }
         }
@@ -470,40 +437,18 @@ impl SlabCache {
                 // Release write ref - write is complete and item is visible in hashtable
                 self.allocator.release_write_ref(class_id, slab_id);
 
-                // Deallocate old slot
-                let old = SlabLocation::from_location(old_loc);
-                let (old_class, old_slab, old_slot) = old.unpack();
-
-                // Mark deleted and update stats
-                unsafe {
-                    let header = self.allocator.header(old);
-                    if let Some(class) = self.allocator.class(old_class) {
-                        class.sub_bytes(header.item_size());
-                        class.remove_item();
-                    }
-                    header.mark_deleted();
-                }
-                self.allocator.deallocate(old_class, old_slab, old_slot);
+                self.allocator
+                    .retire_item(SlabLocation::from_location(old_loc));
             }
             Ok(None) => {
                 // Release write ref - write is complete and item is visible in hashtable
                 self.allocator.release_write_ref(class_id, slab_id);
             }
             Err(e) => {
-                // Release write ref before cleanup
+                // The write ref keeps the slab in this class while the slot is freed.
+                self.allocator
+                    .retire_held_item(SlabLocation::new(class_id, slab_id, slot_index));
                 self.allocator.release_write_ref(class_id, slab_id);
-
-                // Hashtable insert failed, clean up the allocated slot
-                let loc = SlabLocation::new(class_id, slab_id, slot_index);
-                unsafe {
-                    let header = self.allocator.header(loc);
-                    if let Some(class) = self.allocator.class(class_id) {
-                        class.sub_bytes(header.item_size());
-                        class.remove_item();
-                    }
-                    header.mark_deleted();
-                }
-                self.allocator.deallocate(class_id, slab_id, slot_index);
                 return Err(e);
             }
         }
@@ -515,33 +460,21 @@ impl SlabCache {
     pub fn get_item(&self, key: &[u8]) -> Option<Vec<u8>> {
         let verifier = self.tiered_verifier();
 
-        if let Some((location, freq)) = self.hashtable.lookup(key, &verifier) {
+        for _ in 0..PIN_ATTEMPTS {
+            let Some((location, freq)) = self.hashtable.lookup(key, &verifier) else {
+                break;
+            };
             // Check which pool the item is in
             let pool_id = SlabLocation::pool_id_from_location(location);
 
             if pool_id == self.ram_pool_id {
-                // Item is in RAM
                 let slab_loc = SlabLocation::from_location(location);
-
-                // Acquire slab reference to prevent eviction during read
-                if !self.allocator.acquire_slab(slab_loc) {
-                    // Slab is being evicted, treat as miss
-                    return None;
-                }
-
-                // Touch slab for LRA tracking
-                self.allocator.touch_slab(slab_loc);
-
-                // Copy value while holding slab reference
-                let value = unsafe {
-                    let header = self.allocator.header(slab_loc);
-                    header.value().to_vec()
+                let Some(pin) = self.allocator.pin_item(slab_loc, key) else {
+                    continue;
                 };
-
-                // Release slab reference
-                self.allocator.release_slab(slab_loc);
-
-                return Some(value);
+                self.allocator.touch_slab(slab_loc);
+                // SAFETY: the pin holds a live item.
+                return Some(unsafe { pin.header().value() }.to_vec());
             } else if pool_id == self.disk_pool_id {
                 // Item is on disk
                 let value = self.get_from_disk(key, location)?;
@@ -565,6 +498,7 @@ impl SlabCache {
 
                 return Some(value);
             }
+            break;
         }
 
         // Lookup failed - try to clean up expired item if present
@@ -586,15 +520,18 @@ impl SlabCache {
             None => return, // Key truly doesn't exist
         };
 
+        if SlabLocation::pool_id_from_location(location) != self.ram_pool_id {
+            return;
+        }
         let slab_loc = SlabLocation::from_location(location);
 
-        // Check if it's actually expired (not just deleted or wrong key)
-        let is_expired = unsafe {
-            let header = self.allocator.header(slab_loc);
-            header.is_expired()
+        // The pin is held until the slot is retired, so the slot cannot be
+        // freed and reused for this key between the expiry check and the
+        // remove.
+        let Some(pin) = self.allocator.pin_item(slab_loc, key) else {
+            return;
         };
-
-        if !is_expired {
+        if !pin.header().is_expired() {
             return; // Not expired, some other reason for the failed lookup
         }
 
@@ -603,20 +540,10 @@ impl SlabCache {
             return; // Someone else already removed it
         }
 
-        let (class_id, slab_id, slot_index) = slab_loc.unpack();
-
-        // Update stats and mark deleted
-        unsafe {
-            let header = self.allocator.header(slab_loc);
-            if let Some(class) = self.allocator.class(class_id) {
-                class.sub_bytes(header.item_size());
-                class.remove_item();
-            }
-            header.mark_deleted();
-        }
-
-        // Return to free list
-        self.allocator.deallocate(class_id, slab_id, slot_index);
+        // The pin's slab reference keeps the slab in this class; its slot
+        // pin defers the free-list push until `pin` drops.
+        self.allocator.retire_held_item(slab_loc);
+        drop(pin);
     }
 
     /// Access an item without copying.
@@ -624,29 +551,10 @@ impl SlabCache {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let verifier = self.allocator.verifier();
-
-        if let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) {
-            let slab_loc = SlabLocation::from_location(location);
-
-            // Acquire slab reference to prevent eviction during read
-            if !self.allocator.acquire_slab(slab_loc) {
-                return None;
-            }
-
-            // Touch slab for LRA tracking
+        if let Some((slab_loc, pin)) = self.pin_ram_item(key) {
             self.allocator.touch_slab(slab_loc);
-
-            // Access value while holding slab reference
-            let result = unsafe {
-                let header = self.allocator.header(slab_loc);
-                f(header.value())
-            };
-
-            // Release slab reference
-            self.allocator.release_slab(slab_loc);
-
-            return Some(result);
+            // SAFETY: the pin holds a live item.
+            return Some(f(unsafe { pin.header().value() }));
         }
 
         // Lookup failed - try to clean up expired item if present
@@ -670,21 +578,8 @@ impl SlabCache {
             return false;
         }
 
-        let slab_loc = SlabLocation::from_location(location);
-        let (class_id, slab_id, slot_index) = slab_loc.unpack();
-
-        // Update stats and mark deleted
-        unsafe {
-            let header = self.allocator.header(slab_loc);
-            if let Some(class) = self.allocator.class(class_id) {
-                class.sub_bytes(header.item_size());
-                class.remove_item();
-            }
-            header.mark_deleted();
-        }
-
-        // Return to free list
-        self.allocator.deallocate(class_id, slab_id, slot_index);
+        self.allocator
+            .retire_item(SlabLocation::from_location(location));
 
         true
     }
@@ -704,23 +599,22 @@ impl SlabCache {
 
     /// Get the remaining TTL for an item.
     pub fn ttl(&self, key: &[u8]) -> Option<Duration> {
+        let (_, pin) = self.pin_ram_item(key)?;
+        pin.header().remaining_ttl()
+    }
+
+    /// Look up `key` and pin its item in RAM, looking it up again if the
+    /// slot is reused before it can be pinned.
+    fn pin_ram_item(&self, key: &[u8]) -> Option<(SlabLocation, allocator::ItemPin<'_>)> {
         let verifier = self.allocator.verifier();
-        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
-
-        let slab_loc = SlabLocation::from_location(location);
-
-        // Acquire slab reference
-        if !self.allocator.acquire_slab(slab_loc) {
-            return None;
+        for _ in 0..PIN_ATTEMPTS {
+            let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+            let slab_loc = SlabLocation::from_location(location);
+            if let Some(pin) = self.allocator.pin_item(slab_loc, key) {
+                return Some((slab_loc, pin));
+            }
         }
-
-        let result = unsafe {
-            let header = self.allocator.header(slab_loc);
-            header.remaining_ttl()
-        };
-
-        self.allocator.release_slab(slab_loc);
-        result
+        None
     }
 
     /// Get the frequency counter for an item.
@@ -786,7 +680,10 @@ impl SlabCache {
         let location = reservation.location();
         let item_size = reservation.item_size();
 
-        // Finalize the slab write (update stats)
+        let (class_id, slab_id, _) = location.unpack();
+
+        // Update stats and make the slot readable. The write ref taken by
+        // `begin_slab_set` is held until the insert below has finished.
         self.allocator.finalize_write_item(location, item_size);
 
         // Insert into hashtable
@@ -795,27 +692,17 @@ impl SlabCache {
 
         match self.hashtable.insert(reservation.key(), loc, &verifier) {
             Ok(Some(old_loc)) => {
-                // Deallocate old slot
-                let old = SlabLocation::from_location(old_loc);
-                let (old_class, old_slab, old_slot) = old.unpack();
-
-                // Mark deleted and update stats
-                unsafe {
-                    let header = self.allocator.header(old);
-                    if let Some(class) = self.allocator.class(old_class) {
-                        class.sub_bytes(header.item_size());
-                        class.remove_item();
-                    }
-                    header.mark_deleted();
-                }
-                self.allocator.deallocate(old_class, old_slab, old_slot);
+                self.allocator.release_write_ref(class_id, slab_id);
+                self.allocator
+                    .retire_item(SlabLocation::from_location(old_loc));
             }
             Ok(None) => {
-                // New entry, nothing to deallocate
+                self.allocator.release_write_ref(class_id, slab_id);
             }
             Err(e) => {
-                // Hashtable insert failed, cancel the reservation
-                self.allocator.cancel_write_item(location);
+                // The item is counted and published but not indexed.
+                self.allocator.retire_held_item(location);
+                self.allocator.release_write_ref(class_id, slab_id);
                 return Err(e);
             }
         }
@@ -865,30 +752,9 @@ impl Cache for SlabCache {
     }
 
     fn get_value_ref(&self, key: &[u8]) -> Option<ValueRef> {
-        let verifier = self.allocator.verifier();
-        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
-
-        let slab_loc = SlabLocation::from_location(location);
-
-        // Touch slab for LRA tracking
+        let (slab_loc, pin) = self.pin_ram_item(key)?;
         self.allocator.touch_slab(slab_loc);
-
-        // Get zero-copy value reference (acquires slab ref internally)
-        let (ref_count_ptr, value_ptr, value_len) =
-            unsafe { self.allocator.get_value_ref_raw(slab_loc)? };
-
-        // Construct ValueRef - it will decrement ref_count on drop
-        // Slab cache doesn't use segment-based eviction, so no auto-release metadata
-        Some(unsafe {
-            ValueRef::new(
-                ref_count_ptr,
-                value_ptr,
-                value_len,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-            )
-        })
+        Some(pin.into_value_ref())
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
@@ -1411,6 +1277,106 @@ mod tests {
             })
             .count();
         assert_eq!(wrong, 0, "{wrong} of {n} keys missing or wrong");
+    }
+
+    /// A `ValueRef` holds its slot: overwriting the key while the reference
+    /// is held must not let another item be written into the bytes it
+    /// covers. The slot is freed when the reference is dropped.
+    #[test]
+    fn value_ref_holds_its_slot_across_an_overwrite() {
+        // One 1KB slab of two 512-byte slots.
+        let cache = SlabCacheBuilder::new()
+            .heap_size(1024)
+            .slab_size(1024)
+            .min_slot_size(64)
+            .growth_factor(2.0)
+            .hashtable_power(10)
+            .build()
+            .expect("cache");
+        let ttl = Duration::from_secs(3600);
+
+        cache.set_item(b"k1", &[b'a'; 400], ttl).unwrap();
+        let value_ref = Cache::get_value_ref(&cache, b"k1").expect("k1");
+
+        // The overwrite takes the second slot. With the first slot held, the
+        // next SET has no slot to take.
+        cache.set_item(b"k1", &[b'b'; 400], ttl).unwrap();
+        let _ = cache.set_item(b"other", &[b'z'; 400], ttl);
+        assert!(
+            value_ref.iter().all(|&b| b == b'a'),
+            "held value was overwritten: starts {:?}",
+            &value_ref[..8]
+        );
+        assert_eq!(cache.get_item(b"k1"), Some(vec![b'b'; 400]));
+
+        drop(value_ref);
+        cache.set_item(b"other", &[b'z'; 400], ttl).unwrap();
+        assert_eq!(cache.get_item(b"other"), Some(vec![b'z'; 400]));
+    }
+
+    /// A copying read must not see bytes of an item written into the slot
+    /// after the one it looked up. Writers overwrite a few keys with uniform
+    /// values in a small cache, so freed slots are reused within a few
+    /// writes; a reader that copies across a reuse sees two byte values.
+    #[test]
+    fn concurrent_reads_never_see_a_reused_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cache = Arc::new(
+            SlabCacheBuilder::new()
+                .heap_size(64 * 1024)
+                .slab_size(64 * 1024)
+                .min_slot_size(64)
+                .growth_factor(2.0)
+                .hashtable_power(10)
+                .build()
+                .expect("cache"),
+        );
+        let ttl = Duration::from_secs(3600);
+        let keys: Vec<Vec<u8>> = (0..4).map(|i| format!("key{i}").into_bytes()).collect();
+        for key in &keys {
+            cache.set_item(key, &[0u8; 3000], ttl).unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for w in 0..4u8 {
+            let (cache, stop, keys) = (cache.clone(), stop.clone(), keys.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut n = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    for key in &keys {
+                        n = n.wrapping_add(1);
+                        let _ = cache.set_item(key, &[n ^ (w << 6); 3000], ttl);
+                    }
+                }
+                (0, 0)
+            }));
+        }
+        for _ in 0..4 {
+            let (cache, stop, keys) = (cache.clone(), stop.clone(), keys.clone());
+            threads.push(std::thread::spawn(move || {
+                let (mut torn, mut hits) = (0usize, 0usize);
+                while !stop.load(Ordering::Relaxed) {
+                    for key in &keys {
+                        let uniform = cache.with_item(key, |v| v.iter().all(|&b| b == v[0]));
+                        torn += usize::from(uniform == Some(false));
+                        hits += usize::from(uniform == Some(true));
+                    }
+                }
+                (torn, hits)
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        let (mut torn, mut hits) = (0, 0);
+        for thread in threads {
+            let (t, h) = thread.join().unwrap();
+            torn += t;
+            hits += h;
+        }
+        assert!(hits > 0, "no read found a key");
+        assert_eq!(torn, 0, "{torn} reads saw bytes from two different writes");
     }
 
     /// A slab with more slots than a location can address is refused at
