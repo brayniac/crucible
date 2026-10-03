@@ -303,7 +303,8 @@ pub trait Hashtable: Send + Sync {
 
     /// Clear all entries from the hashtable.
     ///
-    /// This resets all entries to empty (zero). Used by flush operations.
+    /// This resets all entries to empty (zero). Used by the segment
+    /// backend's flush and by the cache resets.
     /// After calling this, all lookups will return None until new items
     /// are inserted.
     fn clear(&self);

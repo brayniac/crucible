@@ -178,7 +178,7 @@ Supported commands:
 - **Lists** (heap backend): `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LPUSHX`, `RPUSHX`
 - **Sets** (heap backend): `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SPOP`, `SRANDMEMBER`
 - **Admin**: `PING`, `HELLO`, `CONFIG GET/SET`
-- **No-op**: `FLUSHDB`, `FLUSHALL` (accepted, does nothing)
+- **Flush**: `FLUSHDB`, `FLUSHALL` remove every item when `allow_flush` is enabled, and return an error otherwise
 
 Not supported: persistence, pub/sub, Lua scripting, streams, sorted sets.
 
@@ -189,7 +189,7 @@ ASCII protocol:
 - **Storage**: `set`, `add`, `replace`, `cas`, `append`, `prepend`
 - **Deletion**: `delete`
 - **Counters**: `incr`, `decr`
-- **Admin**: `version`, `quit`, `flush_all` (no-op)
+- **Admin**: `version`, `quit`, `flush_all` (removes every item when `allow_flush` is enabled, and returns an error otherwise)
 
 Binary protocol:
 - **Retrieval**: `Get`, `GetK`, `GetQ`, `GetKQ`

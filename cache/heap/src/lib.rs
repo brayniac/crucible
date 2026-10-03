@@ -189,6 +189,27 @@ pub struct HeapCache {
 }
 
 impl HeapCache {
+    /// Reset the cache to its freshly built state: an empty hashtable, every
+    /// storage slot free, and empty eviction queues.
+    ///
+    /// # Preconditions
+    ///
+    /// Only valid when no other operation is in flight on this cache: the
+    /// storage resets free entries and rebuild the free lists without
+    /// coordinating with concurrent allocations. Under traffic, use
+    /// `Cache::flush`.
+    pub fn reset(&self) {
+        self.hashtable.clear();
+        self.storage.reset_all();
+        self.hash_storage.reset_all();
+        self.list_storage.reset_all();
+        self.set_storage.reset_all();
+        if let EvictionState::S3Fifo(policy) = &self.eviction_state {
+            policy.reset();
+        }
+        self.bytes_used.store(0, Ordering::Release);
+    }
+
     /// Create a new builder for HeapCache.
     pub fn builder() -> HeapCacheBuilder {
         HeapCacheBuilder::new()
@@ -324,19 +345,21 @@ impl HeapCache {
         // Insert into hashtable using insert_if_absent
         let verifier = HeapCacheVerifier::new(&self.storage);
 
+        // Counted before the entry is published: once it is, a DELETE or a
+        // flush can unlink and free it and subtract its size at once.
+        self.bytes_used.fetch_add(item_size, Ordering::Relaxed);
         match self
             .hashtable
             .insert_if_absent(key, slot_loc.to_location(), &verifier)
         {
             Ok(()) => {
-                // Track new bytes
-                self.bytes_used.fetch_add(item_size, Ordering::Relaxed);
                 // Record for S3-FIFO tracking
                 self.maybe_record_insert(key);
                 Ok(())
             }
             Err(e) => {
                 // Insert failed (key already exists or hashtable full)
+                self.bytes_used.fetch_sub(item_size, Ordering::Relaxed);
                 self.storage.deallocate(slot_loc);
                 Err(e)
             }
@@ -401,14 +424,14 @@ impl HeapCache {
         // Update in hashtable using update_if_present
         let verifier = HeapCacheVerifier::new(&self.storage);
 
+        // Counted before the entry is published: once it is, a DELETE or a
+        // flush can unlink and free it and subtract its size at once.
+        self.bytes_used.fetch_add(item_size, Ordering::Relaxed);
         match self
             .hashtable
             .update_if_present(key, slot_loc.to_location(), &verifier)
         {
             Ok(old_location) => {
-                // Track new bytes
-                self.bytes_used.fetch_add(item_size, Ordering::Relaxed);
-
                 // Deallocate old slot
                 let old_slot_loc = SlotLocation::from_location(old_location);
                 self.deallocate_and_track(old_slot_loc);
@@ -418,6 +441,7 @@ impl HeapCache {
             }
             Err(e) => {
                 // Update failed (key doesn't exist anymore)
+                self.bytes_used.fetch_sub(item_size, Ordering::Relaxed);
                 self.storage.deallocate(slot_loc);
                 Err(e)
             }
@@ -476,14 +500,14 @@ impl HeapCache {
         // Insert into hashtable
         let verifier = HeapCacheVerifier::new(&self.storage);
 
+        // Counted before the entry is published: once it is, a DELETE or a
+        // flush can unlink and free it and subtract its size at once.
+        self.bytes_used.fetch_add(item_size, Ordering::Relaxed);
         match self
             .hashtable
             .insert(key, slot_loc.to_location(), &verifier)
         {
             Ok(old_location) => {
-                // Track new bytes
-                self.bytes_used.fetch_add(item_size, Ordering::Relaxed);
-
                 // If there was a previous entry, deallocate its slot
                 if let Some(old_loc) = old_location {
                     let old_slot_loc = SlotLocation::from_location(old_loc);
@@ -495,6 +519,7 @@ impl HeapCache {
             }
             Err(e) => {
                 // Insert failed, return the slot we just allocated
+                self.bytes_used.fetch_sub(item_size, Ordering::Relaxed);
                 self.storage.deallocate(slot_loc);
                 Err(e)
             }
@@ -1201,32 +1226,24 @@ impl Cache for HeapCache {
         self.contains_key(key)
     }
 
+    /// Unlinks every hashtable entry and frees each unlinked item's storage
+    /// through the path DELETE uses. A string item is freed only by the
+    /// thread that unlinked it. Hash, list and set operations re-check the
+    /// slot generation, so one racing the flush either fails or, if the slot
+    /// was reused in between, can write to the new occupant, as with a racing
+    /// DELETE. A write that runs concurrently with the flush may survive it.
     fn flush(&self) {
-        // Clear the hashtable first - makes all items "invisible"
-        self.hashtable.clear();
-
-        // Reset all storage slots (frees entries and rebuilds free list).
-        //
-        // All four, not just strings: the hashtable clear above makes every
-        // entry unreachable, but a slot left occupied is never handed out
-        // again, so flushing a cache with data structures used to leak every
-        // hash, list and set for the life of the process.
-        self.storage.reset_all();
-        self.hash_storage.reset_all();
-        self.list_storage.reset_all();
-        self.set_storage.reset_all();
-
-        // Drop the eviction policy's queues. Their entries name buckets the
-        // hashtable clear above just emptied, and a stale entry aborts an
-        // eviction rather than being skipped, so leaving them costs a burst of
-        // spurious OutOfMemory until the backlog drains. Lfu and Random hold no
-        // state.
+        // Drop the eviction policy's queued entries first, while every item
+        // they track is still indexed: the drain below frees each of those
+        // items, and a stale entry would abort an eviction rather than be
+        // skipped. An item inserted after this point is queued again by its
+        // writer, so emptying the queues after the drain would leave such an
+        // item in no queue and never evictable. Lfu and Random hold no state.
         if let EvictionState::S3Fifo(policy) = &self.eviction_state {
             policy.reset();
         }
-
-        // Reset memory tracking
-        self.bytes_used.store(0, Ordering::Release);
+        self.hashtable
+            .drain(|location| self.deallocate_typed_slot(TypedLocation::from_location(location)));
     }
 
     fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
@@ -2328,14 +2345,10 @@ mod tests {
             .expect("Failed to create test cache")
     }
 
-    /// A flushed heap cache must still accept writes.
-    ///
-    /// `flush()` clears the hashtable and resets slot storage but historically
-    /// left `eviction_state` alone, so the S3-FIFO queues kept entries naming
-    /// buckets that had just been cleared. `evict_from_small` uses `?` on the
-    /// stale lookup, which abandons the whole eviction instead of skipping the
-    /// entry, so each attempt burned one stale entry and reported "nothing to
-    /// evict" until the backlog drained. `flush()` backs FLUSHALL.
+    /// After a flush no earlier item is readable, every slot and byte is
+    /// accounted free, and a full cache refills. The S3-FIFO queues are
+    /// emptied too: `evict_from_small` uses `?` on a stale lookup, which
+    /// abandons the eviction instead of skipping the entry.
     #[test]
     fn test_cache_accepts_writes_after_flush() {
         let cache = create_test_cache();
@@ -2352,6 +2365,17 @@ mod tests {
         Cache::flush(&cache);
 
         for i in 0..300 {
+            let key = format!("pre{i}");
+            assert!(!cache.contains(key.as_bytes()), "{key} survived the flush");
+        }
+        assert_eq!(
+            cache.storage.occupied(),
+            0,
+            "flush left string slots occupied"
+        );
+        assert_eq!(cache.bytes_used.load(Ordering::Relaxed), 0);
+
+        for i in 0..300 {
             let key = format!("post{i}");
             cache
                 .set(key.as_bytes(), &value, ttl)
@@ -2361,12 +2385,91 @@ mod tests {
         assert!(cache.contains(b"post299"));
     }
 
-    /// `flush()` must reclaim complex-type storage, not just string slots.
-    ///
-    /// The hashtable clear makes hash/list/set entries unreachable, but their
-    /// slots stay occupied: `SlotStorage::reset_all` only covers strings.
-    /// FLUSHALL then leaks every data structure, and the slots are gone for
-    /// the life of the process.
+    /// Flushes concurrent with SET, DELETE and GET free each item once: after
+    /// the traffic stops, a final flush leaves no slot occupied and no byte
+    /// counted. A slot freed twice, or never, leaves the counts off.
+    #[test]
+    fn concurrent_flushes_free_every_item_once() {
+        let cache = create_test_cache();
+        let ttl = Some(Duration::from_secs(3600));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for t in 0..4u32 {
+                let cache = &cache;
+                let stop = &stop;
+                s.spawn(move || {
+                    let value = vec![b'v'; 512];
+                    let mut i = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        let key = format!("t{t}k{}", i % 200);
+                        match i % 3 {
+                            0 | 1 => {
+                                let _ = cache.set(key.as_bytes(), &value, ttl);
+                            }
+                            _ => {
+                                cache.delete(key.as_bytes());
+                            }
+                        }
+                        let _ = cache.get(key.as_bytes());
+                        i = i.wrapping_add(1);
+                    }
+                });
+            }
+            for _ in 0..200 {
+                Cache::flush(&cache);
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        Cache::flush(&cache);
+        assert_eq!(cache.storage.occupied(), 0, "a slot was never freed");
+        assert_eq!(
+            cache.bytes_used.load(Ordering::Relaxed),
+            0,
+            "the byte count drifted"
+        );
+    }
+
+    /// Flushes under concurrent SETs leave every live item in an S3-FIFO
+    /// queue: evicting until both queues are empty empties the cache.
+    #[test]
+    fn flushes_under_traffic_leave_no_item_untracked() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(256 << 20)
+            .hashtable_power(14)
+            .initial_fragmentation_ratio(100)
+            .build()
+            .unwrap();
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for t in 0..4u32 {
+                let cache = &cache;
+                let done = &done;
+                s.spawn(move || {
+                    for i in 0..2500u32 {
+                        let _ = cache.set(format!("t{t}k{i}").as_bytes(), &[b'v'; 32], None);
+                    }
+                    done.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            while done.load(Ordering::Relaxed) < 4 {
+                Cache::flush(&cache);
+            }
+        });
+        let EvictionState::S3Fifo(policy) = &cache.eviction_state else {
+            unreachable!("the default policy is S3-FIFO")
+        };
+        let mut calls = 0;
+        while policy.total_tracked() > 0 && calls < 1_000_000 {
+            cache.evict_one();
+            calls += 1;
+        }
+        assert_eq!(cache.len(), 0, "live items are tracked by no S3-FIFO queue");
+    }
+
+    /// `flush()` frees hash, list and set storage as well as strings: an
+    /// entry the flush unlinks is freed through the storage of its type.
     #[test]
     fn test_flush_reclaims_complex_type_storage() {
         let cache = create_test_cache();
