@@ -880,9 +880,11 @@ pub enum LookupResult {
     ///    its key with the requested one**, answering a miss if they differ
     /// 4. Call `release_read()` on the disk layer when done
     ///
-    /// Step 3's key check is required, not defensive. A committed segment
-    /// has no bytes in memory, so the hashtable matched this item on its tag
-    /// alone, and the item may belong to a different key.
+    /// Step 3's key check is required. A committed segment's keys are only
+    /// on disk, so the hashtable matched this item by its tag and a 64-bit
+    /// key hash recorded at flush. The item can still belong to a different
+    /// key on a hash collision, or if the disk bytes differ from the buffer
+    /// that was hashed (a flush that failed after its retries).
     DiskRead(crate::disk::DiskReadParams),
     /// Item not found in any layer.
     Miss,

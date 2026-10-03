@@ -445,11 +445,14 @@ impl IoUringDiskLayer {
     /// Complete a flush operation.
     ///
     /// Called once per [`FlushRequest`], when its io_uring write completes.
-    /// Detaches the write buffer, so reads go to disk from now on; the buffer
-    /// returns to the pool when the last reader still holding it unpins.
-    /// Then drops the buffer pin and segment reference the request held.
+    /// Records the hash of every item's key, which key checks use once the
+    /// keys are only on disk. Then detaches the write buffer, so reads go to
+    /// disk from now on; the buffer returns to the pool when the last reader
+    /// still holding it unpins. Then drops the buffer pin and segment
+    /// reference the request held.
     pub fn complete_flush(&self, segment_id: u32) {
         if let Some(segment) = self.pool.get(segment_id) {
+            segment.record_key_hashes();
             segment.detach_write_buffer();
             segment.unpin_write_buffer();
             self.release_segment_ref(segment);
@@ -642,6 +645,7 @@ impl IoUringDiskLayer {
             // Align the write length up to block boundary
             let aligned_len = ((write_offset as u64 + block_size - 1) & !(block_size - 1)) as u32;
 
+            segment.set_flushed_len(write_offset);
             let request = FlushRequest {
                 segment_id,
                 disk_offset: segment.disk_offset(),
@@ -1389,6 +1393,90 @@ mod tests {
                 "{key} survived the walk -- it stopped short of that item"
             );
         }
+    }
+
+    /// Two keys that share a hashtable tag and bucket. Hashed with the
+    /// hashtable's seeds: `MultiChoiceHashtable` takes its tag from bits
+    /// 32..44 of the key hash and, with one choice, its bucket from the low
+    /// bits.
+    fn colliding_keys(seeds: [u64; 4], power: u8) -> (Vec<u8>, Vec<u8>) {
+        let state = ahash::RandomState::with_seeds(seeds[0], seeds[1], seeds[2], seeds[3]);
+        let mask = (1u64 << power) - 1;
+        let slot = |key: &[u8]| {
+            let hash = state.hash_one(key);
+            (((hash >> 32) & 0xFFF).max(1), hash & mask)
+        };
+        let first = b"collide:0".to_vec();
+        let target = slot(&first);
+        let second = (1u64..)
+            .map(|i| format!("collide:{i}").into_bytes())
+            .find(|key| slot(key) == target)
+            .expect("a colliding key");
+        (first, second)
+    }
+
+    /// Once a segment is flushed, another key with the same tag in the same
+    /// bucket does not resolve to its entry: a lookup misses, and an insert
+    /// adds a second entry instead of replacing the first.
+    #[test]
+    fn a_flushed_entry_does_not_match_a_key_that_shares_its_tag() {
+        let seeds = [1, 2, 3, 4];
+        let hashtable = MultiChoiceHashtable::with_seeds(4, 1, seeds);
+        let (stored, other) = colliding_keys(seeds, 4);
+        let layer = test_layer();
+        let verifier = IoUringPoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+
+        // Accepts every tag match, so a hit here shows the two keys share a
+        // tag and bucket in this hashtable; otherwise the test is vacuous.
+        struct AnyKey;
+        impl KeyVerifier for AnyKey {
+            fn verify(&self, _: &[u8], _: Location, _: bool) -> bool {
+                true
+            }
+        }
+
+        let location = layer
+            .write_item_with_buffers(&stored, b"value", b"", ttl)
+            .expect("write");
+        hashtable
+            .insert(&stored, location.to_location(), &verifier)
+            .expect("insert");
+        let segment_id = location.segment_id(layer.pool.layout());
+        assert_eq!(
+            hashtable.lookup(&other, &AnyKey).map(|(l, _)| l),
+            Some(location.to_location()),
+            "the keys do not collide in this hashtable; the test is vacuous"
+        );
+        layer.seal_and_queue_flush(segment_id);
+        assert_eq!(layer.take_flush_queue().len(), 1);
+        layer.complete_flush(segment_id);
+        assert!(!layer.pool.get(segment_id).unwrap().has_write_buffer());
+
+        assert_eq!(
+            hashtable.lookup(&stored, &verifier).map(|(l, _)| l),
+            Some(location.to_location())
+        );
+        assert!(
+            hashtable.lookup(&other, &verifier).is_none(),
+            "a key resolved to another key's flushed entry"
+        );
+
+        let other_location = layer
+            .write_item_with_buffers(&other, b"other", b"", ttl)
+            .expect("write");
+        assert_eq!(
+            hashtable
+                .insert(&other, other_location.to_location(), &verifier)
+                .expect("insert"),
+            None,
+            "the insert replaced another key's flushed entry"
+        );
+        assert_eq!(
+            hashtable.lookup(&stored, &verifier).map(|(l, _)| l),
+            Some(location.to_location()),
+            "the flushed key lost its entry"
+        );
     }
 
     fn test_layer() -> IoUringDiskLayer {
