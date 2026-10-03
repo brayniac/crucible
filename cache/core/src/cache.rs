@@ -3404,6 +3404,10 @@ mod tests {
     /// An item with a TTL past `u32::MAX` seconds is still readable after it
     /// is demoted to layer 1, which buckets it by its remaining TTL.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "hundreds of writes to force a demotion; checks TTL arithmetic, not unsafe code"
+    )]
     fn a_ttl_past_u32_max_survives_demotion() {
         let clock = crate::clock::TestClock::start();
         let cache = create_test_cache();
