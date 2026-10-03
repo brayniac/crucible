@@ -125,27 +125,12 @@ pub(crate) fn condemn_and_reclaim<S: Segment>(segment: &S, from: State) -> bool 
 /// segment that owns something the segment type itself does not know about.
 ///
 /// The one caller is `IoUringDiskLayer`, whose segments hold a staging buffer
-/// borrowed from a layer-owned pool. `DiskSegmentMeta::release_condemned`
-/// cannot return it -- the segment has no handle on the pool -- so the buffer
-/// return has to ride along with the free.
-///
-/// # Why a hook and not a line before the condemn
-///
-/// The obvious spelling is to detach the buffer just before condemning. That
-/// is wrong in both directions. If the condemn or the reclaim then declines,
-/// the buffer has been pulled out from under a reader still resolving
-/// `write_buffer_ptr()` into it. And if the release is instead moved to after
-/// the reclaim, it lands *after* the segment is on the free queue, where
-/// another thread may already have reserved it and attached a fresh buffer --
-/// which the late detach then returns to the pool while its new owner is
-/// still writing into it.
-///
-/// The only safe instant is inside `segment::try_free_condemned`'s `on_freed`
-/// hook: after the winning CAS, so it runs exactly once and only for a
-/// segment that really was condemned with no references left, and before the
-/// push, so no one can have taken the segment yet. `reclaim` is how a caller
-/// reaches that hook; `IoUringDiskLayer::free_condemned_returning_buffer` is
-/// the body that uses it.
+/// borrowed from a layer-owned pool. It detaches the buffer before
+/// condemning; buffer pins keep it out of the pool until the last reader
+/// unpins. Its reclaim detaches again in `segment::try_free_condemned`'s
+/// `on_freed` hook, for a segment condemned with its buffer attached. That
+/// hook runs after the winning CAS and before the push to the free queue, so
+/// it cannot detach a buffer attached by the segment's next owner.
 pub(crate) fn condemn_and_reclaim_with<S: Segment, R: FnOnce(&S) -> bool>(
     segment: &S,
     from: State,

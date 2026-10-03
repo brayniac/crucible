@@ -751,6 +751,8 @@ pub struct BasicItemGuard<'a> {
     free_queue: *const crossbeam_deque::Injector<u32>,
     /// Segment ID for pushing to free queue.
     segment_id: u32,
+    /// Called by `drop` before `ref_count` is released, as `hook(ctx, arg)`.
+    release_hook: Option<(crate::cache_trait::ReleaseHook, *const (), u64)>,
 }
 
 impl<'a> BasicItemGuard<'a> {
@@ -778,7 +780,27 @@ impl<'a> BasicItemGuard<'a> {
             metadata,
             free_queue,
             segment_id,
+            release_hook: None,
         }
+    }
+
+    /// Run `hook(ctx, arg)` when this guard is dropped, before `ref_count` is
+    /// released. See [`crate::cache_trait::ValueRef::with_release_hook`].
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must stay valid until the hook runs, and the hook must be safe
+    /// to call from any thread. It runs once, in `drop`, while `ref_count` is
+    /// still held, and must not panic or release `ref_count`.
+    #[inline]
+    pub unsafe fn with_release_hook(
+        mut self,
+        hook: crate::cache_trait::ReleaseHook,
+        ctx: *const (),
+        arg: u64,
+    ) -> Self {
+        self.release_hook = Some((hook, ctx, arg));
+        self
     }
 }
 
@@ -798,6 +820,12 @@ impl<'a> ItemGuard<'a> for BasicItemGuard<'a> {
 
 impl Drop for BasicItemGuard<'_> {
     fn drop(&mut self) {
+        if let Some((hook, ctx, arg)) = self.release_hook {
+            // SAFETY: `with_release_hook`'s caller guarantees `ctx` is valid
+            // until now; `ref_count` is still held.
+            unsafe { hook(ctx, arg) };
+        }
+
         // SeqCst: the release half of the drain/condemn Dekker pair. This
         // thread stores `ref_count` then loads the state; the condemner stores
         // `AwaitingRelease` then loads `ref_count`. Under acquire/release both

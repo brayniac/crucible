@@ -31,7 +31,6 @@ use crate::location::Location;
 use crate::organization::TtlBuckets;
 use crate::pool::RamPool;
 use crate::segment::{Segment, SegmentKeyVerify};
-use crate::slice_segment::ValueRefRaw;
 use crate::state::State;
 use crate::sync::*;
 use std::sync::Mutex;
@@ -75,9 +74,10 @@ pub struct FlushRequest {
     pub buffer_len: u32,
 }
 
-// SAFETY: FlushRequest contains a raw pointer that points to a stable
-// AlignedBuffer allocation. The buffer remains valid until complete_flush()
-// is called, which detaches and returns it to the pool.
+// SAFETY: `buffer_ptr` points into a write buffer on which the request holds
+// a pin and a segment reference, taken in `seal_and_queue_flush`. The buffer
+// cannot return to the pool before `complete_flush` or `cancel_flush` drops
+// that pin.
 unsafe impl Send for FlushRequest {}
 
 /// io_uring-based disk layer for the cache hierarchy.
@@ -106,8 +106,10 @@ pub struct IoUringDiskLayer {
     /// Queue of sealed segments pending flush to disk.
     flush_queue: Mutex<Vec<FlushRequest>>,
 
-    /// Pool of page-aligned write buffers for staging segment data.
-    buffer_pool: Mutex<AlignedBufferPool>,
+    /// Pool of page-aligned write buffers for staging segment data. Shared
+    /// with every segment, which returns its buffer here when the last pin on
+    /// a detached buffer is released.
+    buffer_pool: std::sync::Arc<Mutex<AlignedBufferPool>>,
 }
 
 impl IoUringDiskLayer {
@@ -166,18 +168,31 @@ impl IoUringDiskLayer {
             let segment_id = self.get_or_allocate_write_segment(ttl)?;
 
             if let Some(segment) = self.pool.get(segment_id) {
-                if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(
-                        self.pool.layout(),
-                        self.pool.pool_id(),
-                        segment_id,
-                        segment.incarnation(),
-                        offset,
-                    ));
+                // The append pins the write buffer, and every buffer pin is
+                // held under a segment reference, so the segment cannot be
+                // freed and re-attached while the copy runs.
+                let appended = if self.pin_for_read(segment) {
+                    let appended = segment.append_item(key, value, optional).map(|offset| {
+                        ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        )
+                    });
+                    self.release_segment_ref(segment);
+                    Some(appended)
+                } else {
+                    None
+                };
+                match appended {
+                    Some(Some(location)) => return Ok(location),
+                    // Segment is full — seal it and queue for flush
+                    Some(None) => self.seal_and_queue_flush(segment_id),
+                    // No longer readable: being evicted
+                    None => {}
                 }
-
-                // Segment is full — seal it and queue for flush
-                self.seal_and_queue_flush(segment_id);
 
                 // Reset cached write segment for this bucket
                 let bucket_index = self.buckets.get_bucket_index(ttl);
@@ -195,15 +210,20 @@ impl IoUringDiskLayer {
 
     /// Try to read an item synchronously from a segment's write buffer.
     ///
-    /// Returns the raw value reference components if the segment has a
-    /// write buffer attached (i.e., it hasn't been flushed to disk yet).
-    /// Returns `None` if the segment has no write buffer (data is on disk).
-    pub fn read_from_buffer(&self, location: ItemLocation, key: &[u8]) -> Option<ValueRefRaw> {
+    /// Returns a `ValueRef` into the write buffer, holding a segment
+    /// reference and a buffer pin until it drops. Returns `None` if the
+    /// buffer is detached (the data is on disk), the location is from an
+    /// earlier incarnation, or the key does not match.
+    pub fn read_from_buffer(
+        &self,
+        location: ItemLocation,
+        key: &[u8],
+    ) -> Option<crate::cache_trait::ValueRef> {
         if location.pool_id() != self.pool.pool_id() {
             return None;
         }
 
-        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let (_, segment_id, incarnation, offset) = location.unpack(self.pool.layout());
         let segment = self.pool.get(segment_id)?;
 
         let state = segment.state();
@@ -229,17 +249,23 @@ impl IoUringDiskLayer {
         // here return the reference; see `pin_for_buffer_read`.
         let ref_count_ptr = segment.ref_count_ptr();
         let data_ptr = self.pin_for_buffer_read(segment)?;
+        // A location from an earlier incarnation can still match the key in
+        // bytes the segment's next owner is about to overwrite.
+        if segment.incarnation() != incarnation {
+            self.release_buffer_read(segment);
+            return None;
+        }
 
         // Parse header
         if offset as usize + BasicHeader::SIZE > segment.capacity() {
-            self.release_segment_ref(segment);
+            self.release_buffer_read(segment);
             return None;
         }
 
         let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
 
         if header.is_deleted() {
-            self.release_segment_ref(segment);
+            self.release_buffer_read(segment);
             return None;
         }
 
@@ -248,7 +274,7 @@ impl IoUringDiskLayer {
         // not own, so checking the stride here would reject a valid read.
         let item_size = header.padded_size();
         if offset as usize + item_size > segment.capacity() {
-            self.release_segment_ref(segment);
+            self.release_buffer_read(segment);
             return None;
         }
 
@@ -256,7 +282,7 @@ impl IoUringDiskLayer {
         let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
         let key_end = key_start + header.key_len() as usize;
         if key_end > segment.capacity() {
-            self.release_segment_ref(segment);
+            self.release_buffer_read(segment);
             return None;
         }
 
@@ -264,7 +290,7 @@ impl IoUringDiskLayer {
             std::slice::from_raw_parts(data_ptr.add(key_start), header.key_len() as usize)
         };
         if stored_key != key {
-            self.release_segment_ref(segment);
+            self.release_buffer_read(segment);
             return None;
         }
 
@@ -273,14 +299,25 @@ impl IoUringDiskLayer {
         let value_len = header.value_len() as usize;
         let value_ptr = unsafe { data_ptr.add(value_start) };
 
-        Some((
-            ref_count_ptr,
-            value_ptr,
-            value_len,
-            segment.metadata_ptr(),
-            segment.free_queue_ptr(),
-            segment.id(),
-        ))
+        // SAFETY: the segment reference and buffer pin taken above are handed
+        // to the `ValueRef`: its release hook drops the buffer pin, then its
+        // drop releases the reference. `segment` lives in the pool's segment
+        // array, which outlives every `ValueRef` the cache issues.
+        Some(unsafe {
+            crate::cache_trait::ValueRef::new(
+                ref_count_ptr,
+                value_ptr,
+                value_len,
+                segment.metadata_ptr(),
+                segment.free_queue_ptr(),
+                segment.id(),
+            )
+            .with_release_hook(
+                unpin_write_buffer_hook,
+                segment as *const DiskSegmentMeta as *const (),
+                0,
+            )
+        })
     }
 
     /// Prepare parameters for an io_uring disk read.
@@ -367,9 +404,12 @@ impl IoUringDiskLayer {
     /// in-flight io_uring write still references a write buffer, and only after
     /// the hashtable has been cleared.
     pub fn reset(&self) {
-        // Drop pending flushes before anything can renumber the segments they
-        // name. Their buffers are released with the rest below.
-        self.flush_queue.lock().unwrap().clear();
+        // Cancel pending flushes, dropping their segment references and
+        // buffer pins, before anything can renumber the segments they name.
+        let queued = std::mem::take(&mut *self.flush_queue.lock().unwrap());
+        for request in &queued {
+            self.cancel_flush(request);
+        }
 
         self.buckets.reset();
         for slot in &self.current_write_segments {
@@ -380,7 +420,7 @@ impl IoUringDiskLayer {
         // reclaim them here or the buffer pool drains one flush at a time.
         for id in 0..self.pool.segment_count() as u32 {
             if let Some(segment) = self.pool.get(id)
-                && let Some(buf) = segment.detach_write_buffer()
+                && let Some(buf) = segment.take_write_buffer_for_reset()
             {
                 self.buffer_pool.lock().unwrap().release(buf);
             }
@@ -399,13 +439,24 @@ impl IoUringDiskLayer {
 
     /// Complete a flush operation.
     ///
-    /// Called when an io_uring write completes. Detaches the write buffer
-    /// from the segment and returns it to the buffer pool.
+    /// Called once per [`FlushRequest`], when its io_uring write completes.
+    /// Detaches the write buffer, so reads go to disk from now on; the buffer
+    /// returns to the pool when the last reader still holding it unpins.
+    /// Then drops the buffer pin and segment reference the request held.
     pub fn complete_flush(&self, segment_id: u32) {
-        if let Some(segment) = self.pool.get(segment_id)
-            && let Some(buf) = segment.detach_write_buffer()
-        {
-            self.buffer_pool.lock().unwrap().release(buf);
+        if let Some(segment) = self.pool.get(segment_id) {
+            segment.detach_write_buffer();
+            segment.unpin_write_buffer();
+            self.release_segment_ref(segment);
+        }
+    }
+
+    /// Drop the buffer pin and segment reference held by a flush request
+    /// that will not be submitted.
+    fn cancel_flush(&self, request: &FlushRequest) {
+        if let Some(segment) = self.pool.get(request.segment_id) {
+            segment.unpin_write_buffer();
+            self.release_segment_ref(segment);
         }
     }
 
@@ -466,20 +517,29 @@ impl IoUringDiskLayer {
     /// `release_segment_ref` rather than a bare `fetch_sub` is the other half:
     /// a back-out that drops the last reference on an already-condemned
     /// segment owes it the free handoff (#131).
+    ///
+    /// On success the caller holds a segment reference and a write-buffer
+    /// pin, and releases both with [`Self::release_buffer_read`] (or hands the
+    /// pin to a `ValueRef` or item guard release hook).
     fn pin_for_buffer_read(&self, segment: &DiskSegmentMeta) -> Option<*const u8> {
         if !self.pin_for_read(segment) {
             return None;
         }
 
-        fence(Ordering::Acquire);
-
-        match segment.write_buffer_ptr() {
-            Some(data_ptr) => Some(data_ptr),
+        match segment.pin_write_buffer() {
+            Some(pin) => Some(pin.into_raw() as *const u8),
             None => {
                 self.release_segment_ref(segment);
                 None
             }
         }
+    }
+
+    /// Release the buffer pin and segment reference taken by
+    /// [`Self::pin_for_buffer_read`], in that order.
+    fn release_buffer_read(&self, segment: &DiskSegmentMeta) {
+        segment.unpin_write_buffer();
+        self.release_segment_ref(segment);
     }
 
     /// Drop one reference taken by a synchronous read path, completing the
@@ -496,22 +556,19 @@ impl IoUringDiskLayer {
         }
     }
 
-    /// The condemned handoff for a disk segment, returning its staging buffer
-    /// to the pool on the way out.
+    /// The condemned handoff for a disk segment, detaching its staging buffer
+    /// on the way out.
     ///
-    /// The buffer return rides in `try_free_condemned`'s `on_freed` hook
-    /// rather than in a pre-check of its own, and that placement is the whole
-    /// point. The hook runs only for the caller whose CAS won -- so the buffer
-    /// is returned exactly once, only for a segment that really was condemned
-    /// and really had no references left, and only after the same
-    /// `prev == 1` re-validation the free itself rests on. A back-out from a
-    /// live segment must not detach the buffer it is still writing into, and a
-    /// reader that pinned the segment again since the caller's decrement must
-    /// not have its `write_buffer_ptr()` pulled out from under it.
+    /// `process_evicted_segment` detaches the buffer before it condemns the
+    /// segment, and readers unpin the buffer before they drop their segment
+    /// reference, so by the time the last reference leaves the buffer is
+    /// back in the pool. The detach in `try_free_condemned`'s `on_freed` hook
+    /// is a no-op on every production path; it covers a segment condemned
+    /// with its buffer attached, which only tests construct.
     ///
-    /// The hook also runs *before* the push to the free queue, so no thread
-    /// can reserve the segment and attach a fresh buffer in between and have
-    /// that one returned instead.
+    /// The hook runs only for the caller whose CAS won, and *before* the push
+    /// to the free queue, so no thread can reserve the segment and attach a
+    /// fresh buffer in between and have that one detached instead.
     ///
     /// Returns `true` iff this call performed the `AwaitingRelease -> Free`
     /// transition, which is what lets it stand in for
@@ -526,11 +583,7 @@ impl IoUringDiskLayer {
                 &*segment.metadata_ptr(),
                 segment.free_queue_ptr(),
                 segment.id(),
-                || {
-                    if let Some(buf) = segment.detach_write_buffer() {
-                        self.buffer_pool.lock().unwrap().release(buf);
-                    }
-                },
+                || segment.detach_write_buffer(),
             )
         }
     }
@@ -546,10 +599,8 @@ impl IoUringDiskLayer {
             let prev = unsafe { (*ref_count_ptr).fetch_sub(1, Ordering::SeqCst) };
 
             // Check if this was the last reader and segment is condemned.
-            // The state check, the `prev == 1` re-validation and the buffer
-            // return all live in `free_condemned_returning_buffer`; this used
-            // to detach the buffer on `prev == 1` alone, without even checking
-            // the state.
+            // The state check and the `prev == 1` re-validation live in
+            // `free_condemned_returning_buffer`.
             if prev == 1 {
                 self.free_condemned_returning_buffer(segment);
             }
@@ -568,8 +619,18 @@ impl IoUringDiskLayer {
             return; // Already sealed or in wrong state
         }
 
-        // Create flush request
-        if let Some(buf_ptr) = segment.write_buffer_ptr() {
+        // The request holds a segment reference and a buffer pin until
+        // `complete_flush`: eviction cannot free the segment, nor return the
+        // buffer to the pool, while the kernel reads from it.
+        if !self.pin_for_read(segment) {
+            return;
+        }
+        let Some(pin) = segment.pin_write_buffer() else {
+            self.release_segment_ref(segment);
+            return;
+        };
+        {
+            let buf_ptr = pin.into_raw() as *const u8;
             let write_offset = segment.write_offset();
             let block_size = self.pool.block_size() as u64;
 
@@ -626,9 +687,7 @@ impl IoUringDiskLayer {
             }
             Err(_) => {
                 // Return write buffer and release segment
-                if let Some(buf) = segment.detach_write_buffer() {
-                    self.buffer_pool.lock().unwrap().release(buf);
-                }
+                segment.detach_write_buffer();
                 self.pool.release(segment_id);
                 Err(CacheError::OutOfMemory)
             }
@@ -676,9 +735,10 @@ impl IoUringDiskLayer {
         };
 
         // Can only drain if write buffer is present (need data access)
-        if !segment.has_write_buffer() {
+        // Held across the walk, which reads the buffer.
+        let Some(_pin) = segment.pin_write_buffer() else {
             return;
-        }
+        };
 
         let mut offset = 0u32;
         let write_offset = segment.write_offset();
@@ -741,12 +801,19 @@ impl IoUringDiskLayer {
             None => return,
         };
 
-        // Remove any pending flush request for this segment. Since the
-        // staging buffer will be released below, the FlushRequest's pointer
-        // would become stale if left in the queue.
-        {
+        // Cancel any queued flush for this segment. Its segment reference
+        // would force the deferral arm, and the segment is being discarded,
+        // so the write would be wasted.
+        let cancelled: Vec<FlushRequest> = {
             let mut queue = self.flush_queue.lock().unwrap();
-            queue.retain(|req| req.segment_id != segment_id);
+            let (cancelled, kept) = std::mem::take(&mut *queue)
+                .into_iter()
+                .partition(|req| req.segment_id == segment_id);
+            *queue = kept;
+            cancelled
+        };
+        for request in &cancelled {
+            self.cancel_flush(request);
         }
 
         // Claim before counting (#133). `try_claim_for_clear` publishes
@@ -757,13 +824,14 @@ impl IoUringDiskLayer {
         let claimed = crate::layer::try_claim_for_clear(segment);
         if !claimed || segment.ref_count_seqcst() > 0 {
             self.drain_segment_from_hashtable(segment_id, hashtable);
+            // Returned to the pool once the readers still holding it unpin,
+            // which they do before their last segment reference drops.
+            segment.detach_write_buffer();
 
             // Nothing was cleared on this arm, so the segment's bytes are
-            // intact and the readers still in it stay valid. The condemn, its
-            // race fix and the staging-buffer return all live in
-            // `condemn_and_reclaim_with`; see its note for why the buffer
-            // release has to ride inside `try_free_condemned`'s `on_freed`
-            // hook rather than sit on either side of the condemn.
+            // intact and the readers still in it stay valid. The condemn and
+            // its race fix live in `condemn_and_reclaim_with`. The buffer was
+            // detached above and returns to the pool on its last unpin.
             let held = if claimed {
                 State::Locked
             } else {
@@ -776,7 +844,7 @@ impl IoUringDiskLayer {
         }
 
         // Process each item
-        if segment.has_write_buffer() {
+        if let Some(_pin) = segment.pin_write_buffer() {
             let mut offset = 0u32;
             let write_offset = segment.write_offset();
 
@@ -847,9 +915,7 @@ impl IoUringDiskLayer {
         }
 
         // Return write buffer before releasing segment
-        if let Some(buf) = segment.detach_write_buffer() {
-            self.buffer_pool.lock().unwrap().release(buf);
-        }
+        segment.detach_write_buffer();
 
         segment.cas_metadata(State::Locked, State::Reserved, None, None);
         self.pool.release(segment_id);
@@ -927,7 +993,7 @@ impl Layer for IoUringDiskLayer {
             return None;
         }
 
-        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let (_, segment_id, incarnation, offset) = location.unpack(self.pool.layout());
         let segment = self.pool.get(segment_id)?;
         let state = segment.state();
         // Condemned: hashtable entries are gone, so this location is stale and
@@ -948,6 +1014,12 @@ impl Layer for IoUringDiskLayer {
         // in here return the reference; see `pin_for_buffer_read`.
         let ref_count_ptr = segment.ref_count_ptr();
         let data_ptr = self.pin_for_buffer_read(segment)?;
+        // A location from an earlier incarnation can still match the key in
+        // bytes the segment's next owner is about to overwrite.
+        if segment.incarnation() != incarnation {
+            self.release_buffer_read(segment);
+            return None;
+        }
 
         let (key_len, optional_len, value_len) = header_info;
 
@@ -959,7 +1031,7 @@ impl Layer for IoUringDiskLayer {
         let value_end = value_start + value_len as usize;
 
         if value_end > segment.capacity() {
-            self.release_segment_ref(segment);
+            self.release_buffer_read(segment);
             return None;
         }
 
@@ -970,15 +1042,22 @@ impl Layer for IoUringDiskLayer {
             let optional_slice =
                 std::slice::from_raw_parts(data_ptr.add(optional_start), optional_len as usize);
 
-            Some(crate::item::BasicItemGuard::new(
-                &*ref_count_ptr,
-                key_slice,
-                value_slice,
-                optional_slice,
-                &*segment.metadata_ptr(),
-                segment.free_queue_ptr(),
-                segment.id(),
-            ))
+            Some(
+                crate::item::BasicItemGuard::new(
+                    &*ref_count_ptr,
+                    key_slice,
+                    value_slice,
+                    optional_slice,
+                    &*segment.metadata_ptr(),
+                    segment.free_queue_ptr(),
+                    segment.id(),
+                )
+                .with_release_hook(
+                    unpin_write_buffer_hook,
+                    segment as *const DiskSegmentMeta as *const (),
+                    0,
+                ),
+            )
         }
     }
 
@@ -988,11 +1067,15 @@ impl Layer for IoUringDiskLayer {
         }
 
         let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
-        if let Some(segment) = self.pool.get(segment_id) {
-            // Can only mark deleted if write buffer is present
-            if segment.has_write_buffer() {
-                segment.mark_deleted_at_offset(offset);
-            }
+        // Can only mark deleted if write buffer is present. The flag write
+        // pins the buffer, which needs a segment reference held around it;
+        // see the `buffer_pin` module.
+        if let Some(segment) = self.pool.get(segment_id)
+            && segment.has_write_buffer()
+            && self.pin_for_read(segment)
+        {
+            segment.mark_deleted_at_offset(offset);
+            self.release_segment_ref(segment);
         }
     }
 
@@ -1152,7 +1235,16 @@ impl IoUringDiskLayerBuilder {
 
         let current_write_segments = (0..num_buckets).map(|_| AtomicU32::new(u32::MAX)).collect();
 
-        let buffer_pool = AlignedBufferPool::new(self.write_buffer_count, self.segment_size, 4096);
+        let buffer_pool = std::sync::Arc::new(Mutex::new(AlignedBufferPool::new(
+            self.write_buffer_count,
+            self.segment_size,
+            4096,
+        )));
+        for id in 0..pool.segment_count() as u32 {
+            if let Some(segment) = pool.get_meta(id) {
+                segment.set_buffer_pool(buffer_pool.clone());
+            }
+        }
 
         IoUringDiskLayer {
             layer_id: self.layer_id,
@@ -1161,7 +1253,7 @@ impl IoUringDiskLayerBuilder {
             buckets,
             current_write_segments,
             flush_queue: Mutex::new(Vec::new()),
-            buffer_pool: Mutex::new(buffer_pool),
+            buffer_pool,
         }
     }
 }
@@ -1170,6 +1262,14 @@ impl Default for IoUringDiskLayerBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Release hook for a value served from a disk segment's write buffer:
+/// `ctx` is the `DiskSegmentMeta`.
+unsafe fn unpin_write_buffer_hook(ctx: *const (), _arg: u64) {
+    // SAFETY: `read_from_buffer` and `get_item` pass a segment that outlives
+    // the reference they issue.
+    unsafe { (*(ctx as *const DiskSegmentMeta)).unpin_write_buffer() };
 }
 
 #[cfg(all(test, not(feature = "loom")))]
@@ -1292,6 +1392,154 @@ mod tests {
             .segment_size(64 * 1024)
             .segment_count(4)
             .build()
+    }
+
+    /// A value served zero-copy from the write buffer stays intact across the
+    /// flush completing. `complete_flush` detaches the buffer, but it returns
+    /// to the pool, where the next segment writes over it, only when the
+    /// `ValueRef` drops.
+    #[test]
+    fn a_buffer_read_outlives_the_flush_of_its_segment() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, locations, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let free_before = layer.buffer_pool.lock().unwrap().available();
+
+        layer.seal_and_queue_flush(segment_id);
+        let requests = layer.take_flush_queue();
+        assert_eq!(requests.len(), 1);
+
+        let value = layer
+            .read_from_buffer(locations[0], keys[0].as_bytes())
+            .expect("served from the write buffer");
+        layer.complete_flush(segment_id);
+
+        assert!(!segment.has_write_buffer(), "reads go to disk from now on");
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            free_before,
+            "the buffer went back to the pool under a live ValueRef"
+        );
+        assert_eq!(&value[..], b"value");
+
+        drop(value);
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            free_before + 1
+        );
+        assert_eq!(segment.ref_count(), 0);
+    }
+
+    /// A condemned segment freed by the last plain reader returns its write
+    /// buffer to the pool.
+    #[test]
+    fn the_last_reader_of_a_condemned_segment_returns_its_buffer() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, locations, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let free_before = layer.buffer_pool.lock().unwrap().available();
+
+        let value = layer
+            .read_from_buffer(locations[0], keys[0].as_bytes())
+            .expect("served from the write buffer");
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Draining, None, None));
+        layer.process_evicted_segment(segment_id, &hashtable);
+        assert_eq!(segment.state(), State::AwaitingRelease);
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            free_before,
+            "the buffer went back to the pool under a live ValueRef"
+        );
+
+        drop(value);
+        assert_eq!(segment.state(), State::Free);
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            free_before + 1,
+            "the buffer leaked when a reader freed the segment"
+        );
+    }
+
+    /// A reset cancels queued flushes, dropping the segment reference each
+    /// holds. A reference left behind keeps the segment from ever reaching
+    /// `ref_count == 0`, so its next eviction condemns it and nothing frees it.
+    #[test]
+    fn reset_drops_the_references_of_queued_flushes() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+
+        layer.seal_and_queue_flush(segment_id);
+        assert_eq!(segment.ref_count(), 1, "the queued flush holds the segment");
+
+        layer.reset();
+        assert_eq!(segment.ref_count(), 0);
+        let pool = layer.buffer_pool.lock().unwrap();
+        assert_eq!(pool.available(), pool.total(), "every buffer is back");
+    }
+
+    /// A buffer read through a location from an earlier incarnation misses
+    /// and hands back its pin and reference: the bytes at that offset belong
+    /// to the segment's next owner.
+    #[test]
+    fn a_buffer_read_rejects_a_stale_incarnation() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (keys, locations, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+
+        let (pool_id, _, incarnation, offset) = locations[0].unpack(layer.pool.layout());
+        let stale = ItemLocation::new(
+            layer.pool.layout(),
+            pool_id,
+            segment_id,
+            incarnation.wrapping_add(1) & 0x3F,
+            offset,
+        );
+        assert!(layer.read_from_buffer(stale, keys[0].as_bytes()).is_none());
+        assert_eq!(segment.ref_count(), 0);
+        assert!(
+            layer
+                .read_from_buffer(locations[0], keys[0].as_bytes())
+                .is_some(),
+            "the current location still reads"
+        );
+    }
+
+    /// A flush in flight holds its segment: eviction condemns rather than
+    /// frees it, and the flush's completion frees it.
+    #[test]
+    fn eviction_waits_out_an_in_flight_flush() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let (_keys, _locations, segment_id) = fill_one_segment(&layer, &hashtable);
+        let segment = layer.pool.get(segment_id).expect("segment");
+        let free_before = layer.buffer_pool.lock().unwrap().available();
+
+        layer.seal_and_queue_flush(segment_id);
+        let requests = layer.take_flush_queue();
+        assert_eq!(requests.len(), 1, "the flush is in flight");
+
+        let state = segment.state();
+        assert!(segment.cas_metadata(state, State::Draining, None, None));
+        layer.process_evicted_segment(segment_id, &hashtable);
+        assert_eq!(segment.state(), State::AwaitingRelease);
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            free_before,
+            "the buffer went back to the pool while the kernel reads from it"
+        );
+
+        layer.complete_flush(segment_id);
+        assert_eq!(segment.state(), State::Free);
+        assert_eq!(
+            layer.buffer_pool.lock().unwrap().available(),
+            free_before + 1
+        );
     }
 
     /// Deadlines are stamped on the cache's clock, as on every RAM layer.
@@ -1540,7 +1788,7 @@ mod tests {
     /// - the evictor's `release_condemned` race fix declines while a
     ///   reference is live, so the segment is not recycled under a reader;
     /// - the buffer is *not* returned on that declining path -- a live reader
-    ///   is still resolving `write_buffer_ptr()` into it;
+    ///   may still pin it;
     /// - the last reference out frees the segment and returns the buffer.
     ///
     /// Before this, `release_read` detached the buffer on `prev == 1` alone,
@@ -1620,9 +1868,8 @@ mod tests {
 
         // What the flush does when it lands in the window: the buffer goes
         // away while the segment is still live and perfectly readable.
-        let buf = segment
-            .detach_write_buffer()
-            .expect("the item is staged in RAM");
+        assert!(segment.has_write_buffer(), "the item is staged in RAM");
+        segment.detach_write_buffer();
         assert!(segment.state().is_readable());
         assert_eq!(segment.ref_count(), 0, "nothing holds this segment yet");
 
@@ -1636,8 +1883,6 @@ mod tests {
             "the backed-out read kept its reference -- this segment can never \
              satisfy the evictor's ref_count == 0 gate again"
         );
-
-        layer.buffer_pool.lock().unwrap().release(buf);
     }
 
     /// A location from a previous incarnation must not resolve, even though
@@ -1960,6 +2205,9 @@ mod tests {
                             "Draining admits a key-verify reader -- that is the whole \
                              reason it is not an exclusive claim"
                         );
+                        // A reader that goes on to read the staged bytes pins
+                        // the buffer too.
+                        assert!(seg.pin_write_buffer().map(|pin| pin.into_raw()).is_some());
                         flag.set(true);
                     }
                 }));
@@ -1992,17 +2240,24 @@ mod tests {
                 "the evictor must defer to the last reference out instead"
             );
             assert!(
-                segment.has_write_buffer(),
-                "the staging buffer must not be returned while a reader may still \
-                 resolve write_buffer_ptr() into it"
+                !segment.has_write_buffer(),
+                "the evictor detaches the buffer, so no new read resolves it"
             );
             assert_eq!(
                 layer.buffer_pool.lock().unwrap().available(),
                 buffers_free_before,
-                "nothing was freed, so nothing may go back to the buffer pool"
+                "the staging buffer must not go back to the pool while a reader \
+                 holds a pin on it"
             );
 
-            // And the deferral completes when the reader leaves, buffer and all.
+            // The buffer returns when the reader unpins it, and the segment
+            // when the reader releases its reference.
+            segment.unpin_write_buffer();
+            assert_eq!(
+                layer.buffer_pool.lock().unwrap().available(),
+                buffers_free_before + 1,
+                "the last unpin returns the detached buffer"
+            );
             layer.release_read(segment_id);
             assert_eq!(
                 segment.state(),
@@ -2038,8 +2293,8 @@ mod tests {
         ///
         /// ```ignore
         /// let freed = unsafe { crate::segment::try_free_condemned(.., || {}) };
-        /// if freed && let Some(buf) = segment.detach_write_buffer() {
-        ///     self.buffer_pool.lock().unwrap().release(buf);
+        /// if freed {
+        ///     segment.detach_write_buffer();
         /// }
         /// freed
         /// ```
