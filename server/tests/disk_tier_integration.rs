@@ -66,7 +66,7 @@ fn send_get(stream: &mut TcpStream, key: &str) -> Option<String> {
         return None;
     }
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 256 * 1024];
     let mut total_read = 0;
     let start = Instant::now();
 
@@ -354,4 +354,68 @@ fn test_disk_tier_async_basic() {
     );
 
     run_disk_tier_test(port, addr);
+}
+
+/// SET `num_keys` values of `value_size` bytes, 6MB in all, through a 4MB
+/// RAM tier so the earliest are demoted to the 8MB disk tier, then read every
+/// one back. Every value comes back intact and some are served from disk.
+fn serves_values_from_disk(name: &str, value_size: usize, num_keys: usize) {
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let disk_file = TempDiskFile::new(name);
+    let _server_handle = start_disk_test_server_async(port, &disk_file.path);
+    assert!(
+        wait_for_server(addr, Duration::from_secs(10)),
+        "Async server with disk tier failed to start"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    for i in 0..num_keys {
+        let key = format!("{name}:{i}");
+        assert!(
+            send_set(&mut stream, &key, &make_value(i, value_size)),
+            "SET failed for key {i}"
+        );
+    }
+    // Let the disk tier's flushes complete, so demoted items are read from
+    // disk rather than from their staging buffers.
+    thread::sleep(Duration::from_millis(500));
+
+    let disk_hits_before = server::metrics::DISK_READ_HITS.value();
+    let mut hits = 0;
+    for i in 0..num_keys {
+        if let Some(got) = send_get(&mut stream, &format!("{name}:{i}")) {
+            hits += 1;
+            assert_eq!(got, make_value(i, value_size), "key {i} came back wrong");
+        }
+    }
+    let disk_hits = server::metrics::DISK_READ_HITS.value() - disk_hits_before;
+    eprintln!("{name}: {hits} hits, {disk_hits} served from disk");
+    assert_eq!(hits, num_keys, "a stored value was not served");
+    assert!(disk_hits > 0, "no value was served from disk");
+}
+
+/// A value that extends past the first disk read is read again in full and
+/// served from disk.
+#[test]
+#[serial]
+fn test_disk_tier_serves_values_larger_than_a_block() {
+    serves_values_from_disk("large", 20 * 1024, 300);
+}
+
+/// A value that fits the first disk read, but is large enough to be sent
+/// without a copy into the write buffer, is served from disk.
+#[test]
+#[serial]
+fn test_disk_tier_serves_values_within_a_block() {
+    serves_values_from_disk("block", 2 * 1024, 3000);
 }

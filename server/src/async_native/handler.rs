@@ -474,11 +474,26 @@ async fn handle_connection<C: Cache>(
     CONNECTIONS_ACTIVE.decrement();
 }
 
-/// Submit a disk read via io_uring and await its completion inline.
+/// Releases a disk segment's read reference when dropped, including when
+/// the disk read future is dropped before its reads complete.
+struct DiskReadRef<'a, C: Cache> {
+    cache: &'a C,
+    segment_id: u32,
+    pool_id: u8,
+}
+
+impl<C: Cache> Drop for DiskReadRef<'_, C> {
+    fn drop(&mut self) {
+        self.cache.release_disk_read(self.segment_id, self.pool_id);
+    }
+}
+
+/// Read a disk-tier item and write the protocol response: the value, or a
+/// miss if the read fails or finds another key's or a deleted item.
 ///
-/// On success, parses the item from the read buffer and writes the protocol
-/// response. On failure, writes a miss response. Always releases the disk
-/// segment ref_count on completion.
+/// The first read fills a pooled buffer; an item that runs past it is read
+/// again in full into a buffer of its own, whose value is sent without a
+/// copy. The segment's read reference is released once the reads complete.
 async fn submit_and_await_disk_read<C: Cache>(
     disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
     cache: &C,
@@ -489,6 +504,23 @@ async fn submit_and_await_disk_read<C: Cache>(
 ) -> Result<(), ()> {
     let segment_id = pending_info.params.segment_id;
     let pool_id = pending_info.params.pool_id;
+    let segment_ref = DiskReadRef {
+        cache,
+        segment_id,
+        pool_id,
+    };
+
+    let release_buffer = |buffer| {
+        if let Some(dio) = disk_io.lock().as_mut() {
+            dio.read_buffer_pool.release(buffer);
+        }
+    };
+    let miss_on_error = |connection: &mut Connection, e: &dyn std::fmt::Display| {
+        DISK_READ_ERRORS.increment();
+        MISSES.increment();
+        tracing::warn!(segment_id, pool_id, "Disk read failed: {e}");
+        connection.write_miss_response();
+    };
 
     // 1. Allocate aligned read buffer.
     let mut buffer: cache_core::disk::AlignedBuffer = {
@@ -502,24 +534,10 @@ async fn submit_and_await_disk_read<C: Cache>(
                 DISK_READ_ERRORS.increment();
                 MISSES.increment();
                 connection.write_miss_response();
-                cache.release_disk_read(segment_id, pool_id);
                 return Ok(());
             }
         }
     };
-
-    // Macro to release read buffer + segment ref_count on every exit path.
-    macro_rules! release_read {
-        ($buf:expr) => {
-            disk_io
-                .lock()
-                .as_mut()
-                .expect("disk_io must be Some during read cleanup")
-                .read_buffer_pool
-                .release($buf);
-            cache.release_disk_read(segment_id, pool_id);
-        };
-    }
 
     // A read longer than the buffer would have the kernel write past it.
     // `read_buffer_size` covers every read `lookup` asks for while the disk
@@ -534,90 +552,76 @@ async fn submit_and_await_disk_read<C: Cache>(
             "disk read longer than its buffer"
         );
         connection.write_miss_response();
-        release_read!(buffer);
+        release_buffer(buffer);
         return Ok(());
     }
 
-    // 2. Submit io_uring read and await completion.
-    // Extract what we need from disk_io under the lock, then drop the lock
-    // before awaiting (the future spans a suspend point).
-    let (future, is_direct_io) = {
-        let dio = disk_io.lock();
-        let dio = dio
-            .as_ref()
-            .expect("disk_io must be Some when submit_and_await_disk_read is called");
-        match &dio.backend {
-            DiskBackend::DirectIo { file, .. } => (
-                unsafe {
-                    ringline::direct_io_read(
-                        *file,
-                        pending_info.params.disk_offset,
-                        buffer.as_mut_ptr(),
-                        pending_info.params.read_len,
-                    )
-                },
-                true,
-            ),
-            DiskBackend::Nvme { device, block_size } => {
-                let lba = pending_info.params.disk_offset / *block_size as u64;
-                let num_blocks = (pending_info.params.read_len / *block_size) as u16;
-                // SAFETY: `buffer` comes from the read buffer pool, is aligned
-                // for O_DIRECT/NVMe, and is only returned to the pool by
-                // `release_read!` after the future below resolves.
-                let future = unsafe {
-                    ringline::nvme_read(
-                        *device,
-                        lba,
-                        num_blocks,
-                        buffer.addr(),
-                        pending_info.params.read_len,
-                    )
-                };
-                (future, false)
+    // 2. Read one block from the item's start (two blocks on disk unless the
+    // item starts on a block boundary).
+    let item_offset = pending_info.params.item_offset as usize;
+    let read_len = pending_info.params.read_len as usize;
+    let disk_offset = pending_info.params.disk_offset;
+    DISK_READS.increment();
+    // SAFETY: `buffer` is a pooled read buffer of at least `read_len` bytes
+    // (checked above). If this future is dropped mid-read, `buffer` is never
+    // returned to the pool, so the kernel's write lands in memory nothing
+    // else uses.
+    let valid_len =
+        match unsafe { read_disk(disk_io, disk_offset, buffer.as_mut_ptr(), read_len) }.await {
+            Ok(n) => n,
+            Err(e) => {
+                miss_on_error(connection, &e);
+                release_buffer(buffer);
+                return Ok(());
             }
+        };
+
+    // 3. Locate the value. Only the first `valid_len` bytes of `buffer` come
+    // from this read; the rest hold an earlier read's data. A value that fits
+    // is copied out and the buffer returned to the pool at once. An item
+    // longer than the first read is read again in full into a
+    // `LargeReadBuffer`.
+    // SAFETY: the read returned `valid_len` bytes into `buffer`.
+    let first = unsafe { buffer.as_slice(valid_len) };
+    let key = &pending_info.key;
+    let value = match crate::disk_io::item_len_from_disk_read(first, item_offset) {
+        Some(item_len) if item_offset + item_len <= valid_len => {
+            let value = crate::disk_io::value_range_from_disk_read(first, item_offset, key)
+                .map(|range| Bytes::copy_from_slice(&first[range]));
+            release_buffer(buffer);
+            Ok(value)
+        }
+        Some(_) if !crate::disk_io::key_matches(first, item_offset, key) => {
+            release_buffer(buffer);
+            Ok(None)
+        }
+        Some(item_len) => {
+            release_buffer(buffer);
+            DISK_READS.increment();
+            read_large_item(disk_io, &pending_info.params, item_len, key).await
+        }
+        None => {
+            release_buffer(buffer);
+            Ok(None)
         }
     };
+    // Both reads have completed and the value, if any, is in a buffer of
+    // this request's, not in the segment.
+    drop(segment_ref);
 
-    DISK_READS.increment();
-
-    let result = match future {
-        Ok(fut) => fut.await,
-        Err(e) => Err(e),
-    };
-
-    // 3. Parse result and write response (same logic as native/handler.rs).
-    if let Err(e) = &result {
-        DISK_READ_ERRORS.increment();
-        MISSES.increment();
-        tracing::warn!(segment_id, pool_id, "Disk read failed: {e}");
-        connection.write_miss_response();
-        release_read!(buffer);
-        return Ok(());
+    match value {
+        Ok(Some(value)) => {
+            DISK_READ_HITS.increment();
+            HITS.increment();
+            connection.write_disk_read_response(&pending_info.response_ctx, value);
+        }
+        Ok(None) => {
+            DISK_READ_MISSES.increment();
+            MISSES.increment();
+            connection.write_miss_response();
+        }
+        Err(e) => miss_on_error(connection, &e),
     }
-
-    // Only the bytes the read returned are this item's; the rest of the
-    // buffer holds whatever the previous read left. A Direct I/O read reports
-    // its byte count; NVMe passthrough reports a status, and success means
-    // the full transfer.
-    let read_len = pending_info.params.read_len as usize;
-    let valid_len = match (&result, is_direct_io) {
-        (Ok(n), true) => (*n as usize).min(read_len),
-        _ => read_len,
-    };
-    let item_offset = pending_info.params.item_offset as usize;
-    let buf_slice = unsafe { buffer.as_slice(valid_len) };
-    let Some(value_bytes) =
-        crate::disk_io::value_from_disk_read(buf_slice, item_offset, &pending_info.key)
-    else {
-        DISK_READ_MISSES.increment();
-        MISSES.increment();
-        connection.write_miss_response();
-        release_read!(buffer);
-        return Ok(());
-    };
-    DISK_READ_HITS.increment();
-    HITS.increment();
-    connection.write_disk_read_response(&pending_info.response_ctx, value_bytes);
 
     // 4. Drain the response.
     if connection.has_pending_write()
@@ -625,13 +629,117 @@ async fn submit_and_await_disk_read<C: Cache>(
             .await
             .is_err()
     {
-        release_read!(buffer);
         return Err(());
     }
-
-    // 5. Release read buffer and segment ref_count.
-    release_read!(buffer);
     Ok(())
+}
+
+/// Largest single NVMe passthrough read issued by `read_disk`. 128 KiB is an
+/// assumed lower bound on the device's maximum data transfer size; the
+/// device's actual limit is not queried. Longer reads are split into several
+/// commands.
+const NVME_MAX_READ: usize = 128 * 1024;
+
+/// Read `len` bytes at `offset` into `buf`, returning how many bytes the read
+/// produced. A Direct I/O read can return fewer bytes than asked; an NVMe
+/// read either transfers everything or fails.
+///
+/// # Safety
+///
+/// `buf` is valid, writable and aligned to the block size for `len` bytes
+/// until the kernel completes the read. Dropping the returned future does
+/// not cancel the read, so if it is dropped early the memory must be neither
+/// freed nor reused.
+async unsafe fn read_disk(
+    disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
+    offset: u64,
+    buf: *mut u8,
+    len: usize,
+) -> std::io::Result<usize> {
+    let backend = disk_io
+        .lock()
+        .as_ref()
+        .map(|dio| dio.backend)
+        .ok_or_else(|| std::io::Error::other("disk I/O is not initialized"))?;
+    match backend {
+        DiskBackend::DirectIo { file, .. } => {
+            // SAFETY: the caller upholds this function's contract.
+            let read = unsafe { ringline::direct_io_read(file, offset, buf, len as u32) }?;
+            let n = read.await?;
+            Ok((n.max(0) as usize).min(len))
+        }
+        DiskBackend::Nvme { device, block_size } => {
+            let mut done = 0;
+            while done < len {
+                let chunk = (len - done).min(NVME_MAX_READ);
+                let lba = (offset + done as u64) / block_size as u64;
+                let num_blocks = (chunk / block_size as usize) as u16;
+                // SAFETY: the caller upholds this function's contract, and
+                // `done + chunk <= len`.
+                let read = unsafe {
+                    ringline::nvme_read(device, lba, num_blocks, buf.add(done) as u64, chunk as u32)
+                }?;
+                // Passthrough completes with the NVMe status: 0 is success,
+                // anything else is a device error.
+                let status = read.await?;
+                if status != 0 {
+                    return Err(std::io::Error::other(format!(
+                        "NVMe read status {status:#x}"
+                    )));
+                }
+                done += chunk;
+            }
+            Ok(len)
+        }
+    }
+}
+
+/// Read an item that runs past the first read: its whole block-aligned
+/// range from the first read's `disk_offset`, into a buffer of its own.
+/// `item_len` is the length the item's header gave.
+///
+/// An item that would extend past its segment's end is an error: its header
+/// is corrupt.
+async fn read_large_item(
+    disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
+    params: &cache_core::DiskReadParams,
+    item_len: usize,
+    key: &[u8],
+) -> std::io::Result<Option<Bytes>> {
+    let block = disk_io
+        .lock()
+        .as_ref()
+        .map(|dio| match dio.backend {
+            DiskBackend::DirectIo { block_size, .. } | DiskBackend::Nvme { block_size, .. } => {
+                block_size as usize
+            }
+        })
+        .ok_or_else(|| std::io::Error::other("disk I/O is not initialized"))?;
+    let item_offset = params.item_offset as usize;
+    let item_end = item_offset + item_len;
+    let len = item_end.div_ceil(block) * block;
+    if params.disk_offset + len as u64 > params.segment_end {
+        return Err(std::io::Error::other(format!(
+            "item of {item_len} bytes at offset {} extends past its segment",
+            params.disk_offset + item_offset as u64
+        )));
+    }
+    let buffer = crate::disk_io::LargeReadBuffer::new(len, block)
+        .ok_or_else(|| std::io::Error::other("disk read buffer allocation failed"))?;
+    let mut buffer = std::mem::ManuallyDrop::new(buffer);
+    // SAFETY: `buffer` holds `len` bytes aligned to the block size. It stays
+    // in a `ManuallyDrop` until the read completes, so if this future is
+    // dropped mid-read the buffer is leaked rather than freed while the
+    // kernel writes into it.
+    let read = unsafe { read_disk(disk_io, params.disk_offset, buffer.as_mut_ptr(), len) }.await;
+    let buffer = std::mem::ManuallyDrop::into_inner(buffer);
+    let read = read?;
+    if read < item_end {
+        return Ok(None);
+    }
+    let range =
+        crate::disk_io::value_range_from_disk_read(&buffer.as_slice()[..read], item_offset, key);
+    Ok(range.map(|range| Bytes::from_owner(crate::disk_io::DiskReadValue::new(buffer, range))))
 }
 
 // ── Send helpers ────────────────────────────────────────────────────────
