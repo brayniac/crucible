@@ -101,6 +101,28 @@ use verifier::SlabTieredVerifier;
 /// misses, even if the key is present.
 const PIN_ATTEMPTS: usize = 4;
 
+/// The item a hashtable entry named when the entry was replaced or removed.
+///
+/// A RAM item is pinned before its entry changes. Once the entry is gone,
+/// nothing else holds the item's location, so without the pin its slab
+/// could be evicted and its id given to a new slab before the item is
+/// retired, and the retire would free a slot in the new slab.
+enum Superseded<'a> {
+    /// A RAM item, retired with `retire_held_item` while the pin is held.
+    Ram(SlabLocation, allocator::ItemPin<'a>),
+    /// An item in the disk tier.
+    Disk(cache_core::Location),
+    /// An item that is not retired here, because it could not be pinned
+    /// without waiting:
+    /// - Its slab is draining or locked for eviction. Eviction counts it out
+    ///   when its hashtable remove finds the entry gone; if the drain is
+    ///   aborted, that happens when the slab is next evicted.
+    /// - The slot no longer holds this key's live item. Whoever freed or
+    ///   rewrote the slot retired the item, and the entry has changed, so
+    ///   the hashtable's exchange fails and the entry is read again.
+    Unpinned,
+}
+
 /// Memcached-style slab allocator cache.
 ///
 /// Uses a traditional slab allocator with slab-level eviction.
@@ -132,6 +154,42 @@ impl SlabCache {
     /// Create a new builder for SlabCache.
     pub fn builder() -> SlabCacheBuilder {
         SlabCacheBuilder::new()
+    }
+
+    /// Pin the item at `location`, which a hashtable entry for `key` names,
+    /// before the entry is replaced or removed. Never waits.
+    fn pin_superseded(&self, key: &[u8], location: cache_core::Location) -> Superseded<'_> {
+        let pool_id = SlabLocation::pool_id_from_location(location);
+        if pool_id == self.ram_pool_id {
+            let slab_loc = SlabLocation::from_location(location);
+            match self.allocator.pin_item(slab_loc, key) {
+                Some(pin) => Superseded::Ram(slab_loc, pin),
+                None => Superseded::Unpinned,
+            }
+        } else if pool_id == self.disk_pool_id {
+            Superseded::Disk(location)
+        } else {
+            debug_assert!(false, "location in unknown pool {pool_id}");
+            Superseded::Unpinned
+        }
+    }
+
+    /// Retire an item whose hashtable entry has been replaced or removed.
+    fn retire_superseded(&self, superseded: Superseded<'_>) {
+        match superseded {
+            Superseded::Ram(slab_loc, pin) => {
+                // The pin's slab reference keeps the slab in this class; its
+                // slot pin defers the free-list push until `pin` drops.
+                self.allocator.retire_held_item(slab_loc);
+                drop(pin);
+            }
+            Superseded::Disk(location) => {
+                if let Some(ref disk_layer) = self.disk_layer {
+                    disk_layer.mark_deleted(cache_core::ItemLocation::from_location(location));
+                }
+            }
+            Superseded::Unpinned => {}
+        }
     }
 
     /// Create a tiered verifier that can verify keys in both RAM and disk.
@@ -297,7 +355,7 @@ impl SlabCache {
         }
 
         // Check if key already exists
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
         if self.hashtable.contains(key, &verifier) {
             return Err(CacheError::KeyExists);
         }
@@ -325,7 +383,7 @@ impl SlabCache {
 
         // Insert into hashtable using insert_if_absent
         let location = SlabLocation::new(class_id, slab_id, slot_index).to_location();
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
 
         match self.hashtable.insert_if_absent(key, location, &verifier) {
             Ok(()) => {
@@ -351,7 +409,7 @@ impl SlabCache {
         }
 
         // Check if key exists
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
         if !self.hashtable.contains(key, &verifier) {
             return Err(CacheError::KeyNotFound);
         }
@@ -379,15 +437,18 @@ impl SlabCache {
 
         // Update in hashtable using update_if_present
         let location = SlabLocation::new(class_id, slab_id, slot_index).to_location();
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
 
-        match self.hashtable.update_if_present(key, location, &verifier) {
-            Ok(old_loc) => {
+        match self
+            .hashtable
+            .update_if_present_pinned(key, location, &verifier, |old| {
+                self.pin_superseded(key, old)
+            }) {
+            Ok((_, superseded)) => {
                 // Release write ref - write is complete and item is visible in hashtable
                 self.allocator.release_write_ref(class_id, slab_id);
 
-                self.allocator
-                    .retire_item(SlabLocation::from_location(old_loc));
+                self.retire_superseded(superseded);
                 Ok(())
             }
             Err(e) => {
@@ -430,15 +491,18 @@ impl SlabCache {
 
         // Insert into hashtable
         let location = SlabLocation::new(class_id, slab_id, slot_index).to_location();
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
 
-        match self.hashtable.insert(key, location, &verifier) {
-            Ok(Some(old_loc)) => {
+        match self
+            .hashtable
+            .insert_pinned(key, location, &verifier, |old| {
+                self.pin_superseded(key, old)
+            }) {
+            Ok(Some((_, superseded))) => {
                 // Release write ref - write is complete and item is visible in hashtable
                 self.allocator.release_write_ref(class_id, slab_id);
 
-                self.allocator
-                    .retire_item(SlabLocation::from_location(old_loc));
+                self.retire_superseded(superseded);
             }
             Ok(None) => {
                 // Release write ref - write is complete and item is visible in hashtable
@@ -565,7 +629,7 @@ impl SlabCache {
 
     /// Delete an item from the cache.
     pub fn delete_item(&self, key: &[u8]) -> bool {
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
 
         // Lookup to get location
         let (location, _freq) = match self.hashtable.lookup(key, &verifier) {
@@ -573,13 +637,11 @@ impl SlabCache {
             None => return false,
         };
 
-        // Remove from hashtable
+        let superseded = self.pin_superseded(key, location);
         if !self.hashtable.remove(key, location) {
             return false;
         }
-
-        self.allocator
-            .retire_item(SlabLocation::from_location(location));
+        self.retire_superseded(superseded);
 
         true
     }
@@ -688,13 +750,16 @@ impl SlabCache {
 
         // Insert into hashtable
         let loc = location.to_location();
-        let verifier = self.allocator.verifier();
+        let verifier = self.tiered_verifier();
 
-        match self.hashtable.insert(reservation.key(), loc, &verifier) {
-            Ok(Some(old_loc)) => {
+        let key = reservation.key();
+        match self
+            .hashtable
+            .insert_pinned(key, loc, &verifier, |old| self.pin_superseded(key, old))
+        {
+            Ok(Some((_, superseded))) => {
                 self.allocator.release_write_ref(class_id, slab_id);
-                self.allocator
-                    .retire_item(SlabLocation::from_location(old_loc));
+                self.retire_superseded(superseded);
             }
             Ok(None) => {
                 self.allocator.release_write_ref(class_id, slab_id);
@@ -1188,6 +1253,60 @@ mod tests {
         assert!(!on_disk(&key), "still on disk after its second read");
     }
 
+    /// SET and DELETE of a key whose item is in the disk tier act on that
+    /// item: SET replaces it and deletes the disk copy, DELETE removes it.
+    #[test]
+    fn set_and_delete_reach_an_item_in_the_disk_tier() {
+        use cache_core::{Hashbucket, Hashtable, KeyVerifier};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = SlabCacheBuilder::new()
+            .heap_size(512 * 1024)
+            .slab_size(64 * 1024)
+            .hashtable_power(10)
+            .disk_tier(DiskTierConfig::new(
+                dir.path().join("slab.disk"),
+                8 * 1024 * 1024,
+            ))
+            .build()
+            .expect("cache with disk tier");
+        let disk_location = |key: &[u8]| {
+            let (_, packed) = cache
+                .hashtable
+                .lookup_for_tracking(key, &cache.tiered_verifier())?;
+            let location = Hashbucket::location(packed);
+            (SlabLocation::pool_id_from_location(location) == cache.disk_pool_id)
+                .then_some(location)
+        };
+
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+        for i in 0..400 {
+            cache
+                .set_item(format!("k{i}").as_bytes(), &value, ttl)
+                .unwrap_or_else(|e| panic!("set {i}: {e:?}"));
+        }
+        let mut on_disk = (0..400)
+            .map(|i| format!("k{i}").into_bytes())
+            .filter_map(|k| disk_location(&k).map(|loc| (k, loc)));
+        let (overwritten, old_location) = on_disk.next().expect("an item on disk");
+        let (deleted, _) = on_disk.next().expect("a second item on disk");
+        drop(on_disk);
+
+        let new_value = vec![b'w'; 4096];
+        cache.set_item(&overwritten, &new_value, ttl).unwrap();
+        assert_eq!(cache.get_item(&overwritten), Some(new_value));
+        assert!(
+            !cache
+                .tiered_verifier()
+                .verify(&overwritten, old_location, false),
+            "the overwritten disk copy is still live"
+        );
+
+        assert!(cache.delete_item(&deleted), "DELETE missed a disk item");
+        assert_eq!(cache.get_item(&deleted), None);
+    }
+
     /// Items evicted from RAM must reach the disk tier, and be readable there.
     ///
     /// Before this the plumbing existed but nothing connected it:
@@ -1379,15 +1498,13 @@ mod tests {
         assert_eq!(torn, 0, "{torn} reads saw bytes from two different writes");
     }
 
-    /// Slab turnover reuses slab ids. Ids used to come from the length of
-    /// the class's slab list, which eviction never shortened, so a class
-    /// panicked after 65,536 slab additions over the process lifetime.
-    /// Both slot counts run: with two slots per slab, an evicted slab can
-    /// leave a free-slot entry queued when its id is reused, and that entry
-    /// must not be taken for the new slab's slot.
+    /// 70,000 slab additions to one class stay within the 65,536 ids a
+    /// location can address. With one slot per slab each SET adds a slab;
+    /// with two, every other SET does, and an evicted slab can leave a
+    /// free-slot entry queued when its id is reused.
     #[test]
     fn slab_turnover_reuses_slab_ids() {
-        for value_len in [900, 400] {
+        for (value_len, sets) in [(900, 70_000u32), (400, 140_000)] {
             let cache = SlabCacheBuilder::new()
                 .heap_size(2048)
                 .slab_size(1024)
@@ -1398,18 +1515,18 @@ mod tests {
                 .expect("cache");
             let ttl = Duration::from_secs(3600);
             let value = vec![b'v'; value_len];
-            for i in 0..70_000u32 {
+            for i in 0..sets {
                 cache
                     .set_item(format!("k{i}").as_bytes(), &value, ttl)
                     .unwrap_or_else(|e| panic!("value {value_len}, set {i}: {e:?}"));
             }
-            assert_eq!(cache.get_item(b"k69999"), Some(value));
+            let last = format!("k{}", sets - 1);
+            assert_eq!(cache.get_item(last.as_bytes()), Some(value));
         }
     }
 
-    /// LRC evicts the oldest slab even when every slab was created in the
-    /// same second. Ties on the one-second timestamp used to go to the lowest
-    /// class id, so the class-0 slab created last was evicted first.
+    /// LRC evicts the slab added first, across classes, when every slab was
+    /// created in the same second.
     #[test]
     fn lrc_evicts_the_oldest_slab_within_one_second() {
         let cache = SlabCacheBuilder::new()
@@ -1922,5 +2039,125 @@ mod tests {
         let result = cache.get_item(b"large");
         assert!(result.is_some());
         assert_eq!(result.unwrap(), expected);
+    }
+
+    /// One-slot slabs, two of them, so a slab can be evicted and its id
+    /// given to the next slab added to the class.
+    fn two_slab_cache() -> SlabCache {
+        SlabCacheBuilder::new()
+            .heap_size(2048)
+            .slab_size(1024)
+            .min_slot_size(64)
+            .growth_factor(2.0)
+            .hashtable_power(12)
+            .build()
+            .expect("cache")
+    }
+
+    /// Between a SET or DELETE replacing an item's hashtable entry and
+    /// retiring the item, the item's slab cannot be evicted, so its id cannot
+    /// be given to a new slab whose slot the retire would then free.
+    #[test]
+    fn a_superseded_item_keeps_its_slab_until_it_is_retired() {
+        let cache = two_slab_cache();
+        let ttl = Duration::from_secs(3600);
+        cache.set_item(b"a", &[b'a'; 900], ttl).unwrap();
+        let verifier = cache.allocator.verifier();
+        let (location, _) = cache.hashtable.lookup(b"a", &verifier).unwrap();
+        let (class_id, slab_id, _) = SlabLocation::from_location(location).unpack();
+
+        let superseded = cache.pin_superseded(b"a", location);
+        assert!(matches!(superseded, Superseded::Ram(..)));
+        assert!(cache.hashtable.remove(b"a", location));
+        assert!(
+            !cache.allocator.evict_slab_with_demoter(
+                class_id,
+                slab_id,
+                None,
+                &*cache.hashtable,
+                |_| false
+            ),
+            "evicted the slab of an item not yet retired"
+        );
+        cache.retire_superseded(superseded);
+
+        let class = cache.allocator.class(class_id).unwrap();
+        assert_eq!(class.item_count(), 0);
+        let b = vec![b'b'; 900];
+        cache.set_item(b"b", &b, ttl).unwrap();
+        assert_eq!(cache.get_item(b"b"), Some(b));
+        assert_eq!(class.item_count(), 1);
+    }
+
+    /// An eviction victim chosen before its slab was evicted by another
+    /// thread does not evict the newer slab that took its id.
+    #[test]
+    fn a_stale_victim_does_not_evict_the_slab_that_reused_its_id() {
+        let cache = two_slab_cache();
+        let ttl = Duration::from_secs(3600);
+        cache.set_item(b"a", &[b'a'; 900], ttl).unwrap();
+        let (class_id, slab_id, sequence) = cache.allocator.find_lrc_slab().unwrap();
+
+        // Another thread evicts the victim, and the next SET in the class
+        // adds a slab under the same id.
+        assert!(cache.allocator.evict_slab_with_demoter(
+            class_id,
+            slab_id,
+            None,
+            &*cache.hashtable,
+            |_| false
+        ));
+        let b = vec![b'b'; 900];
+        cache.set_item(b"b", &b, ttl).unwrap();
+        let verifier = cache.allocator.verifier();
+        let (location, _) = cache.hashtable.lookup(b"b", &verifier).unwrap();
+        assert_eq!(
+            SlabLocation::from_location(location).unpack().1,
+            slab_id,
+            "the new slab did not take the evicted id"
+        );
+
+        assert!(!cache.allocator.evict_slab_with_demoter(
+            class_id,
+            slab_id,
+            Some(sequence),
+            &*cache.hashtable,
+            |_| false
+        ));
+        assert_eq!(cache.get_item(b"b"), Some(b));
+    }
+
+    /// An item whose slab was draining when its entry was replaced is not
+    /// retired by the writer; eviction counts it out, here after the first
+    /// drain was aborted.
+    #[test]
+    fn an_item_superseded_during_a_drain_is_counted_out_by_eviction() {
+        use crate::class::packed_state;
+
+        let cache = two_slab_cache();
+        let ttl = Duration::from_secs(3600);
+        cache.set_item(b"a", &[b'a'; 900], ttl).unwrap();
+        let verifier = cache.allocator.verifier();
+        let (location, _) = cache.hashtable.lookup(b"a", &verifier).unwrap();
+        let (class_id, slab_id, _) = SlabLocation::from_location(location).unpack();
+        let class = cache.allocator.class(class_id).unwrap();
+        let state = class.state_word(slab_id);
+
+        assert!(packed_state::try_start_drain(state));
+        let superseded = cache.pin_superseded(b"a", location);
+        assert!(matches!(superseded, Superseded::Unpinned));
+        assert!(packed_state::abort_drain(state));
+        assert!(cache.hashtable.remove(b"a", location));
+        cache.retire_superseded(superseded);
+        assert_eq!(class.item_count(), 1, "the writer retired an unpinned item");
+
+        assert!(cache.allocator.evict_slab_with_demoter(
+            class_id,
+            slab_id,
+            None,
+            &*cache.hashtable,
+            |_| false
+        ));
+        assert_eq!(class.item_count(), 0);
     }
 }

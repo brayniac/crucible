@@ -112,7 +112,33 @@ pub trait Hashtable: Send + Sync {
         key: &[u8],
         location: Location,
         verifier: &impl KeyVerifier,
-    ) -> CacheResult<Option<Location>>;
+    ) -> CacheResult<Option<Location>> {
+        self.insert_pinned(key, location, verifier, |_| ())
+            .map(|replaced| replaced.map(|(old, ())| old))
+    }
+
+    /// As [`Hashtable::insert`], calling `pin` with the location of the
+    /// entry about to be replaced before replacing it.
+    ///
+    /// `pin` returns a guard, typically one that keeps the old location's
+    /// storage from being reused. It runs inside the loop that replaces the
+    /// entry, so it can be called several times and must not wait: if the
+    /// entry changes before it is replaced, the guard is dropped, and `pin`
+    /// is called again if the entry still belongs to `key`. The guard for the
+    /// replaced entry is returned with its location, so the caller can retire
+    /// the old item while the guard is held.
+    ///
+    /// # Returns
+    /// - `Ok(Some((old_location, guard)))` if an existing entry was replaced
+    /// - `Ok(None)` if this was a new entry or ghost resurrection
+    /// - `Err(CacheError::HashTableFull)` if no space available
+    fn insert_pinned<G>(
+        &self,
+        key: &[u8],
+        location: Location,
+        verifier: &impl KeyVerifier,
+        pin: impl FnMut(Location) -> G,
+    ) -> CacheResult<Option<(Location, G)>>;
 
     /// Insert a key only if it does NOT already exist (ADD semantics).
     ///
@@ -141,7 +167,25 @@ pub trait Hashtable: Send + Sync {
         key: &[u8],
         location: Location,
         verifier: &impl KeyVerifier,
-    ) -> CacheResult<Location>;
+    ) -> CacheResult<Location> {
+        self.update_if_present_pinned(key, location, verifier, |_| ())
+            .map(|(old, ())| old)
+    }
+
+    /// As [`Hashtable::update_if_present`], calling `pin` with the location
+    /// of the entry about to be replaced before replacing it, as
+    /// [`Hashtable::insert_pinned`] does.
+    ///
+    /// # Returns
+    /// - `Ok((old_location, guard))` if the key was found and updated
+    /// - `Err(CacheError::KeyNotFound)` if key doesn't exist
+    fn update_if_present_pinned<G>(
+        &self,
+        key: &[u8],
+        location: Location,
+        verifier: &impl KeyVerifier,
+        pin: impl FnMut(Location) -> G,
+    ) -> CacheResult<(Location, G)>;
 
     /// Remove a key from the hashtable.
     ///
