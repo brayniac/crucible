@@ -1379,6 +1379,67 @@ mod tests {
         assert_eq!(torn, 0, "{torn} reads saw bytes from two different writes");
     }
 
+    /// Slab turnover reuses slab ids. Ids used to come from the length of
+    /// the class's slab list, which eviction never shortened, so a class
+    /// panicked after 65,536 slab additions over the process lifetime.
+    /// Both slot counts run: with two slots per slab, an evicted slab can
+    /// leave a free-slot entry queued when its id is reused, and that entry
+    /// must not be taken for the new slab's slot.
+    #[test]
+    fn slab_turnover_reuses_slab_ids() {
+        for value_len in [900, 400] {
+            let cache = SlabCacheBuilder::new()
+                .heap_size(2048)
+                .slab_size(1024)
+                .min_slot_size(64)
+                .growth_factor(2.0)
+                .hashtable_power(12)
+                .build()
+                .expect("cache");
+            let ttl = Duration::from_secs(3600);
+            let value = vec![b'v'; value_len];
+            for i in 0..70_000u32 {
+                cache
+                    .set_item(format!("k{i}").as_bytes(), &value, ttl)
+                    .unwrap_or_else(|e| panic!("value {value_len}, set {i}: {e:?}"));
+            }
+            assert_eq!(cache.get_item(b"k69999"), Some(value));
+        }
+    }
+
+    /// LRC evicts the oldest slab even when every slab was created in the
+    /// same second. Ties on the one-second timestamp used to go to the lowest
+    /// class id, so the class-0 slab created last was evicted first.
+    #[test]
+    fn lrc_evicts_the_oldest_slab_within_one_second() {
+        let cache = SlabCacheBuilder::new()
+            .heap_size(4096)
+            .slab_size(1024)
+            .min_slot_size(64)
+            .growth_factor(2.0)
+            .hashtable_power(12)
+            .eviction_strategy(EvictionStrategy::SLAB_LRC)
+            .build()
+            .expect("cache");
+        let ttl = Duration::from_secs(3600);
+        let big = vec![b'x'; 900];
+        cache.set_item(b"big0", &big, ttl).unwrap(); // the oldest slab
+        cache.set_item(b"big1", &big, ttl).unwrap();
+        for i in 0..16 {
+            cache
+                .set_item(format!("s{i}").as_bytes(), b"v", ttl)
+                .unwrap(); // class 0
+        }
+        cache.set_item(b"big2", &big, ttl).unwrap();
+        cache.set_item(b"big3", &big, ttl).unwrap(); // evicts one slab
+
+        assert!(!cache.contains_key(b"big0"), "the oldest slab survived");
+        assert!(
+            cache.contains_key(b"s0"),
+            "a newer class-0 slab was evicted"
+        );
+    }
+
     /// A slab with more slots than a location can address is refused at
     /// build time: 128MB of 64-byte slots is 2,097,152 slots. growth_factor
     /// is 2.0 because the default 1.25 gives 65 classes at this size, which

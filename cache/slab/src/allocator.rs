@@ -412,42 +412,39 @@ impl SlabAllocator {
     ///
     /// Returns `(class_id, slab_id)` of the LRA slab, or `None` if no slabs exist.
     pub fn find_lra_slab(&self) -> Option<(u8, u32)> {
-        let mut oldest: Option<(u8, u32, u32)> = None; // (class_id, slab_id, last_accessed)
-
-        for (class_id, class) in self.classes.iter().enumerate() {
-            for (slab_id, _created_at, last_accessed) in class.slab_timestamps() {
-                match oldest {
-                    None => oldest = Some((class_id as u8, slab_id, last_accessed)),
-                    Some((_, _, old_ts)) if last_accessed < old_ts => {
-                        oldest = Some((class_id as u8, slab_id, last_accessed));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        oldest.map(|(class_id, slab_id, _)| (class_id, slab_id))
+        // Ordered by last access, then by age: access times have one-second
+        // resolution, so ties are common and the older slab goes first.
+        self.classes
+            .iter()
+            .enumerate()
+            .flat_map(|(class_id, class)| {
+                class.slab_timestamps().into_iter().map(
+                    move |(slab_id, last_accessed, sequence)| {
+                        ((last_accessed, sequence), (class_id as u8, slab_id))
+                    },
+                )
+            })
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, slab)| slab)
     }
 
     /// Find the least recently created slab across all classes.
     ///
     /// Returns `(class_id, slab_id)` of the LRC slab, or `None` if no slabs exist.
     pub fn find_lrc_slab(&self) -> Option<(u8, u32)> {
-        let mut oldest: Option<(u8, u32, u32)> = None; // (class_id, slab_id, created_at)
-
-        for (class_id, class) in self.classes.iter().enumerate() {
-            for (slab_id, created_at, _last_accessed) in class.slab_timestamps() {
-                match oldest {
-                    None => oldest = Some((class_id as u8, slab_id, created_at)),
-                    Some((_, _, old_ts)) if created_at < old_ts => {
-                        oldest = Some((class_id as u8, slab_id, created_at));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        oldest.map(|(class_id, slab_id, _)| (class_id, slab_id))
+        // Ordered by the sequence slabs were added in, which is exact where
+        // the one-second creation timestamp ties.
+        self.classes
+            .iter()
+            .enumerate()
+            .flat_map(|(class_id, class)| {
+                class
+                    .slab_timestamps()
+                    .into_iter()
+                    .map(move |(slab_id, _, sequence)| (sequence, (class_id as u8, slab_id)))
+            })
+            .min_by_key(|(sequence, _)| *sequence)
+            .map(|(_, slab)| slab)
     }
 
     /// Find a random slab across all classes.
@@ -459,7 +456,7 @@ impl SlabAllocator {
         let mut slabs = Vec::new();
         for (class_id, class) in self.classes.iter().enumerate() {
             // slab_timestamps() only returns Live slabs (filters by state)
-            for (slab_id, _created_at, _last_accessed) in class.slab_timestamps() {
+            for (slab_id, _, _) in class.slab_timestamps() {
                 slabs.push((class_id as u8, slab_id));
             }
         }
