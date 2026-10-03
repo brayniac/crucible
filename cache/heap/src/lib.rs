@@ -2325,6 +2325,16 @@ mod tests {
         );
     }
 
+    /// An item with a TTL past `u32::MAX` seconds is readable.
+    #[test]
+    fn a_ttl_past_u32_max_does_not_expire_the_item() {
+        let cache = create_test_cache();
+        cache
+            .set(b"k", b"v", Some(Duration::from_secs(1 << 33)))
+            .unwrap();
+        assert!(cache.get(b"k").is_some(), "the item expired at once");
+    }
+
     fn create_test_cache() -> HeapCache {
         HeapCacheBuilder::new()
             .memory_limit(1024 * 1024) // 1MB

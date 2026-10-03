@@ -693,7 +693,7 @@ impl IoUringDiskLayer {
         segment.attach_write_buffer(buf);
 
         // Set segment expiration time
-        let expire_at = Self::now_secs().saturating_add(ttl.as_secs() as u32);
+        let expire_at = crate::clock::deadline(Self::now_secs(), ttl);
         segment.set_expire_at(expire_at);
         // The bucket a cached write segment must still belong to, checked
         // by `get_or_allocate_write_segment` and the append.

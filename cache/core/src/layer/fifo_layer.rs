@@ -376,7 +376,7 @@ impl Layer for FifoLayer {
 
             if let Some(segment) = self.pool.get(segment_id) {
                 // Calculate expiration
-                let expire_at = Self::now_secs().saturating_add(ttl.as_secs() as u32);
+                let expire_at = crate::clock::deadline(Self::now_secs(), ttl);
 
                 // Try to append with per-item TTL
                 if let Some(offset) = segment.append_item_with_ttl(key, value, optional, expire_at)
@@ -528,7 +528,7 @@ impl Layer for FifoLayer {
                 }
 
                 // Calculate expiration
-                let expire_at = Self::now_secs().saturating_add(ttl.as_secs() as u32);
+                let expire_at = crate::clock::deadline(Self::now_secs(), ttl);
 
                 // Try to reserve space for the item
                 if let Some((offset, item_size, value_ptr)) =

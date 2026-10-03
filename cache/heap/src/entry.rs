@@ -116,7 +116,7 @@ impl HeapEntry {
         let expire_at = if ttl.is_zero() {
             0
         } else {
-            current_time_secs() + ttl.as_secs() as u32
+            cache_core::clock::deadline(current_time_secs(), ttl)
         };
 
         // Initialize the entry

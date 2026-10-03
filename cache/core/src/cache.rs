@@ -3386,6 +3386,59 @@ mod tests {
         assert_eq!(cache.frequency(b"k"), Some(1), "one read is one access");
     }
 
+    /// An item set with a TTL of 2^32 + 5 seconds is still readable later:
+    /// layer 0 stamps its deadline per item.
+    #[test]
+    fn a_ttl_past_u32_max_does_not_expire_a_layer_0_item() {
+        let clock = crate::clock::TestClock::start();
+        let cache = create_test_cache();
+        cache
+            .set(b"long", b"v", b"", Duration::from_secs((1 << 32) + 5))
+            .unwrap();
+        for _ in 0..10 {
+            clock.tick();
+        }
+        assert!(cache.get(b"long").is_some());
+    }
+
+    /// An item with a TTL past `u32::MAX` seconds is still readable after it
+    /// is demoted to layer 1, which buckets it by its remaining TTL.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "hundreds of writes to force a demotion; checks TTL arithmetic, not unsafe code"
+    )]
+    fn a_ttl_past_u32_max_survives_demotion() {
+        let clock = crate::clock::TestClock::start();
+        let cache = create_test_cache();
+        cache
+            .set(b"long", b"v", b"", Duration::from_secs(1 << 33))
+            .unwrap();
+        let pool_of = |cache: &TieredCache<MultiChoiceHashtable>| {
+            let verifier = cache.create_key_verifier();
+            cache
+                .hashtable
+                .lookup(b"long", &verifier)
+                .map(|(location, _)| ItemLocation::from_location(location).pool_id())
+        };
+        let value = vec![0u8; 1024];
+        let mut fillers = 0u32;
+        while pool_of(&cache) == Some(0) && fillers < 2000 {
+            let _ = cache.set(
+                format!("f{fillers}").as_bytes(),
+                &value,
+                b"",
+                Duration::from_secs(3600),
+            );
+            fillers += 1;
+        }
+        assert_eq!(pool_of(&cache), Some(1), "the item was not demoted");
+        for _ in 0..10 {
+            clock.tick();
+        }
+        assert!(cache.get(b"long").is_some());
+    }
+
     fn create_test_cache() -> TieredCache<MultiChoiceHashtable> {
         let hashtable = Arc::new(MultiChoiceHashtable::new(10)); // 2^10 = 1024 buckets
 

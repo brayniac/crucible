@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cache_core::clock::deadline(now, ttl)`: a TTL converted to a deadline in
+  seconds, saturating at `u32::MAX`
+
 ### Changed
 - **`Hashtable` gains `insert_pinned` and `update_if_present_pinned`**,
   which call a closure with the location of the entry being replaced before
