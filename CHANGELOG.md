@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`Hashtable` gains `insert_pinned` and `update_if_present_pinned`**,
+  which call a closure with the location of the entry being replaced before
+  replacing it. They are required methods; `insert` and `update_if_present`
+  are now provided methods built on them, so an implementor writes the
+  pinned form instead. The slab cache uses them to pin a replaced item until
+  it is retired, because evicted slab ids are now reused
 - **Restored completion-paced backpressure on the response drain path**: the
   scatter-gather branch of `drain_pending` awaits its first SQE again via
   `AsyncSendBuilder::submit_batch_await`, which the ringline 0.6 upgrade had

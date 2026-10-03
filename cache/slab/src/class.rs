@@ -12,13 +12,14 @@ use crossbeam_deque::Injector;
 use parking_lot::RwLock;
 
 use crate::config::HEADER_SIZE;
-use crate::item::{SlabItemHeader, now_secs, pack_slot_ref, unpack_slot_ref};
+use crate::item::{SlabItemHeader, now_secs};
 
 /// Maximum number of slabs per class. Sizes the lock-free `slab_ptrs` and
 /// `slab_states` arrays and must equal `MAX_SLAB_ID + 1`, the 16-bit slab_id
 /// field of a location. A 64GB heap of 1MB slabs is 65,536 slabs, all of
-/// which can land in one class. Each class pre-allocates 12 bytes per entry
-/// (8-byte pointer + 4-byte state): 768KB per class, 48MB for 64 classes.
+/// which can land in one class. Each class pre-allocates 24 bytes per entry
+/// (8-byte slab pointer, 4-byte state, 8-byte slot-pin array pointer, 4-byte
+/// generation): 1.5MB per class, 96MB for 64 classes.
 const MAX_SLABS_PER_CLASS: usize = 65536;
 const _: () = assert!(MAX_SLABS_PER_CLASS == crate::location::MAX_SLAB_ID as usize + 1);
 
@@ -243,11 +244,19 @@ pub struct Slab {
     created_at: u32,
     /// Last access timestamp (seconds since epoch, updated on item access).
     last_accessed: AtomicU32,
+    /// Position in the order slabs were added, process-wide. LRC orders by
+    /// it, LRA breaks last-access ties with it, and `evict_slab` compares it
+    /// to reject a victim whose id has been reused. The slab id cannot serve,
+    /// because evicted ids are reused.
+    sequence: u64,
     /// Class ID this slab belongs to.
     class_id: u8,
     /// Slab ID within the class.
     slab_id: u32,
 }
+
+/// Source of `Slab::sequence`.
+static SLAB_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[allow(dead_code)]
 impl Slab {
@@ -264,6 +273,7 @@ impl Slab {
             ref_count: AtomicU32::new(0),
             created_at: now,
             last_accessed: AtomicU32::new(now),
+            sequence: SLAB_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             class_id,
             slab_id,
         }
@@ -387,6 +397,28 @@ pub(crate) mod slot_pin {
     pub const ON_FREE_LIST: u32 = 1 << 31;
 }
 
+/// Pack a free-slot entry: slab id (16 bits), the slab's generation when the
+/// entry was pushed (low 28 bits), slot index (20 bits).
+#[inline]
+fn pack_free_slot(slab_id: u32, generation: u32, slot_index: u32) -> u64 {
+    ((slab_id as u64) << 48)
+        | (((generation & FREE_SLOT_GENERATION_MASK) as u64) << 20)
+        | slot_index as u64
+}
+
+/// Unpack a free-slot entry into (slab id, generation, slot index).
+#[inline]
+fn unpack_free_slot(packed: u64) -> (u32, u32, u32) {
+    (
+        (packed >> 48) as u32,
+        ((packed >> 20) as u32) & FREE_SLOT_GENERATION_MASK,
+        (packed as u32) & crate::location::MAX_SLOT_INDEX,
+    )
+}
+
+const FREE_SLOT_GENERATION_MASK: u32 = (1 << 28) - 1;
+const _: () = assert!(crate::location::SLOT_INDEX_BITS == 20);
+
 /// A slab class manages all slabs of a particular slot size.
 pub struct SlabClass {
     /// Class ID (index in the SLAB_CLASSES array).
@@ -408,8 +440,17 @@ pub struct SlabClass {
     /// Per-slab array of `slots_per_slab` slot pin words (see `slot_pin`),
     /// from `Box::into_raw`. Null when the slab is not in this class.
     slot_pins: Box<[AtomicPtr<AtomicU32>]>,
-    /// Free slot stack: packed as (slab_id << 32 | slot_index).
+    /// Free slot queue; entries are packed by `pack_free_slot`.
     free_slots: Injector<u64>,
+    /// Ids of slabs evicted from this class, for `add_slab` to reuse.
+    free_slab_ids: parking_lot::Mutex<Vec<u32>>,
+    /// Bumped each time a slab id is (re)used by `add_slab`. A free-slot
+    /// entry carries the generation it was pushed under, and `allocate`
+    /// discards an entry left over from an evicted slab whose id was reused.
+    /// The slot pin already stops such an entry handing a slot out twice;
+    /// discarding it keeps every popped entry naming a free slot, which
+    /// `claim_slot` asserts.
+    slab_generations: Box<[AtomicU32]>,
     /// Number of allocated slabs (atomic for lock-free reads).
     slab_count: AtomicU32,
     /// Number of items in this class.
@@ -461,6 +502,10 @@ impl SlabClass {
             .map(|_| AtomicPtr::new(ptr::null_mut()))
             .collect();
 
+        let slab_generations: Box<[AtomicU32]> = (0..MAX_SLABS_PER_CLASS)
+            .map(|_| AtomicU32::new(0))
+            .collect();
+
         Self {
             class_id,
             slot_size,
@@ -470,6 +515,8 @@ impl SlabClass {
             slab_states,
             slot_pins,
             free_slots: Injector::new(),
+            free_slab_ids: parking_lot::Mutex::new(Vec::new()),
+            slab_generations,
             slab_count: AtomicU32::new(0),
             item_count: AtomicU64::new(0),
             bytes_used: AtomicU64::new(0),
@@ -533,9 +580,10 @@ impl SlabClass {
 
     /// Get slab timestamps for LRA/LRC selection.
     ///
-    /// Returns (slab_id, created_at, last_accessed) for each Live slab.
+    /// Returns (slab_id, last_accessed, sequence) for each Live slab, where
+    /// `sequence` is the slab's place in the order slabs were added.
     /// Evicted slabs (state != Live) are filtered out.
-    pub fn slab_timestamps(&self) -> Vec<(u32, u32, u32)> {
+    pub fn slab_timestamps(&self) -> Vec<(u32, u32, u64)> {
         let slabs = self.slabs.read();
         slabs
             .iter()
@@ -546,7 +594,7 @@ impl SlabClass {
                 let (state, _) = packed_state::unpack(state_packed);
                 state == SlabState::Live
             })
-            .map(|(id, slab)| (id as u32, slab.created_at(), slab.last_accessed()))
+            .map(|(id, slab)| (id as u32, slab.last_accessed(), slab.sequence))
             .collect()
     }
 
@@ -571,7 +619,10 @@ impl SlabClass {
         // SAFETY: Caller ensures data points to valid memory
         unsafe {
             let mut slabs = self.slabs.write();
-            let slab_id = slabs.len() as u32;
+            // Reuse the id of an evicted slab before taking a new one, so ids
+            // stay below MAX_SLABS_PER_CLASS however often slabs turn over.
+            let reused = self.free_slab_ids.lock().pop();
+            let slab_id = reused.unwrap_or(slabs.len() as u32);
 
             // Check we haven't exceeded the lock-free array capacity
             assert!(
@@ -579,6 +630,9 @@ impl SlabClass {
                 "exceeded maximum slabs per class ({})",
                 MAX_SLABS_PER_CLASS
             );
+            let generation = self.slab_generations[slab_id as usize]
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
 
             // Initialize all slot headers as deleted BEFORE making the slab visible.
             // This ensures evict_slab() won't read uninitialized memory if it runs
@@ -605,14 +659,18 @@ impl SlabClass {
 
             // Create the slab with class_id and slab_id for tracking
             let slab = Slab::new(data, slab_size, self.class_id, slab_id);
-            slabs.push(slab);
+            if reused.is_some() {
+                slabs[slab_id as usize] = slab;
+            } else {
+                slabs.push(slab);
+            }
 
             // Update the atomic slab count
             self.slab_count.fetch_add(1, Ordering::Release);
 
             // Add all slots to the free list
             for slot_index in 0..self.slots_per_slab {
-                let packed = pack_slot_ref(slab_id, slot_index as u32);
+                let packed = pack_free_slot(slab_id, generation, slot_index as u32);
                 self.free_slots.push(packed);
             }
 
@@ -627,14 +685,15 @@ impl SlabClass {
     /// caller publishes it with `publish_slot` or frees it with `free_slot`,
     /// then calls `release_slab`.
     ///
-    /// This method filters out slots from evicted slabs. When a slab is evicted,
-    /// its state becomes Unallocated, but the free_slots queue may still contain
-    /// entries for that slab. We discard those entries and keep trying.
+    /// The free_slots queue can hold entries for slabs that have since been
+    /// evicted: entries for an `Unallocated` slab, or entries carrying the
+    /// generation of an evicted slab whose id has been reused. Those are
+    /// discarded.
     pub fn allocate(&self) -> Option<(u32, u32)> {
         loop {
             match self.free_slots.steal() {
                 crossbeam_deque::Steal::Success(packed) => {
-                    let (slab_id, slot_index) = unpack_slot_ref(packed);
+                    let (slab_id, generation, slot_index) = unpack_free_slot(packed);
 
                     // Try to acquire a reference to the slab atomically.
                     // This both checks that the slab is Live AND increments ref_count,
@@ -642,6 +701,11 @@ impl SlabClass {
                     // If the slab is not Live (evicted or draining), try_acquire fails.
                     if !packed_state::try_acquire(&self.slab_states[slab_id as usize]) {
                         // Slab is not Live (evicted or draining), discard and try again
+                        continue;
+                    }
+                    // An entry from an evicted slab whose id has been reused.
+                    if generation != self.slab_generation(slab_id) {
+                        self.release_slab(slab_id);
                         continue;
                     }
                     if self.claim_slot(slab_id, slot_index) {
@@ -655,6 +719,13 @@ impl SlabClass {
                 crossbeam_deque::Steal::Retry => continue,
             }
         }
+    }
+
+    /// The generation of the slab currently using `slab_id`, as packed into
+    /// free-slot entries.
+    #[inline]
+    fn slab_generation(&self, slab_id: u32) -> u32 {
+        self.slab_generations[slab_id as usize].load(Ordering::Acquire) & FREE_SLOT_GENERATION_MASK
     }
 
     /// The pin word for a slot, or `None` if the slab is not in this class.
@@ -784,7 +855,11 @@ impl SlabClass {
             )
             .is_ok()
         {
-            self.free_slots.push(pack_slot_ref(slab_id, slot_index));
+            self.free_slots.push(pack_free_slot(
+                slab_id,
+                self.slab_generation(slab_id),
+                slot_index,
+            ));
         }
     }
 
@@ -799,34 +874,6 @@ impl SlabClass {
             drop(unsafe {
                 Box::from_raw(ptr::slice_from_raw_parts_mut(pins, self.slots_per_slab))
             });
-        }
-    }
-
-    /// Like `acquire_slab`, but if the slab is draining, waits until the
-    /// drain finishes or is aborted. Returns `false` once the slab is
-    /// `Locked` or has left the class.
-    ///
-    /// The caller must not hold a reference on this slab, or the drain
-    /// cannot finish and the wait lasts until it times out.
-    pub fn acquire_slab_after_drain(&self, slab_id: u32) -> bool {
-        let Some(atom) = self.slab_states.get(slab_id as usize) else {
-            return false;
-        };
-        let mut spins = 0u32;
-        loop {
-            if packed_state::try_acquire(atom) {
-                return true;
-            }
-            // `Live` here means the drain aborted after `try_acquire` failed.
-            let (state, _) = packed_state::unpack(atom.load(Ordering::Acquire));
-            if matches!(state, SlabState::Locked | SlabState::Unallocated) {
-                return false;
-            }
-            spins = spins.wrapping_add(1);
-            if spins.is_multiple_of(1000) {
-                std::thread::yield_now();
-            }
-            crate::sync::spin_loop();
         }
     }
 
@@ -931,6 +978,8 @@ impl SlabClass {
     /// or `None` if:
     /// - The slab doesn't exist
     /// - The slab is already being drained
+    /// - `sequence` is given and the slab now using `slab_id` has a different
+    ///   `Slab::sequence`
     /// - The drain timed out waiting for readers (eviction aborted)
     ///
     /// # Safety
@@ -947,7 +996,16 @@ impl SlabClass {
     /// The callback runs in `Locked` state, after phase 2 has waited for
     /// `ref_count` to reach zero, so there are no concurrent readers and the
     /// borrowed `key`/`value` slices are stable for its duration.
-    pub unsafe fn evict_slab<F>(&self, slab_id: u32, mut on_evict: F) -> Option<*mut u8>
+    ///
+    /// With `sequence`, evicts only if the slab now using `slab_id` has that
+    /// `Slab::sequence`: a victim chosen earlier whose id has since been
+    /// given to a new slab is left alone, without starting a drain on it.
+    pub unsafe fn evict_slab<F>(
+        &self,
+        slab_id: u32,
+        sequence: Option<u64>,
+        mut on_evict: F,
+    ) -> Option<*mut u8>
     where
         F: FnMut(EvictedItem<'_>),
     {
@@ -957,9 +1015,23 @@ impl SlabClass {
 
         // Phase 1: Transition Live → Draining (blocks new readers)
         let state_atom = &self.slab_states[slab_id as usize];
-        if !packed_state::try_start_drain(state_atom) {
-            // Slab is not Live (already draining, locked, or unallocated)
-            return None;
+        {
+            // `add_slab` sets a reused id Live and replaces `slabs[slab_id]`
+            // under the write lock, so while this read lock is held a Live
+            // state belongs to the slab whose sequence is compared here. The
+            // check comes before the drain: a drain started on the wrong slab
+            // and then aborted would make `allocate` discard that slab's
+            // queued free slots.
+            let slabs = self.slabs.read();
+            if let Some(sequence) = sequence
+                && slabs.get(slab_id as usize).map(|slab| slab.sequence) != Some(sequence)
+            {
+                return None;
+            }
+            if !packed_state::try_start_drain(state_atom) {
+                // Slab is not Live (already draining, locked, or unallocated)
+                return None;
+            }
         }
 
         // Phase 2: Wait for all readers to finish (bounded wait)
@@ -1036,8 +1108,12 @@ impl SlabClass {
 
         // Phase 6: Mark slab as removed from this class (Locked → Unallocated).
         // The slab will be returned to the global pool and may be assigned
-        // to a different class. Old slot refs for this slab will fail at
-        // acquire_slab() because the state is no longer Live.
+        // to a different class, and its id given to the next slab this
+        // class adds. Locations in this slab can reach the slab that reuses
+        // the id by three routes: an `ItemPin` or write ref, which this
+        // eviction waited out; a queued free-slot entry, which `allocate`
+        // discards by generation; and an eviction victim, which `evict_slab`
+        // rejects by `sequence`.
         //
         // NOTE: We do NOT return slots to free_slots because the slab is
         // leaving this class entirely. The slot refs would point to memory
@@ -1046,6 +1122,7 @@ impl SlabClass {
         let pins = self.slot_pins[slab_id as usize].swap(ptr::null_mut(), Ordering::AcqRel);
         self.drop_pins_ptr(pins);
         packed_state::set_unallocated(state_atom);
+        self.free_slab_ids.lock().push(slab_id);
 
         // Decrement slab count since this slab is leaving the class
         self.slab_count.fetch_sub(1, Ordering::Release);
@@ -1177,6 +1254,7 @@ impl SlabClass {
         // Get all slab data pointers and clear the slabs list
         let mut slabs = self.slabs.write();
         let data_ptrs: Vec<*mut u8> = slabs.iter().map(|s| s.data()).collect();
+        self.free_slab_ids.lock().clear();
         for slab_id in 0..slabs.len() {
             let pins = self.slot_pins[slab_id].swap(ptr::null_mut(), Ordering::AcqRel);
             self.drop_pins_ptr(pins);
@@ -1306,6 +1384,78 @@ mod tests {
         assert!(slot.is_some());
     }
 
+    /// A free-slot entry left queued by an evicted slab is not taken for a
+    /// slot of the slab that reuses its id, and every slot is handed out
+    /// once. Without the generation check the stale entry claims the slot,
+    /// the new slab's own entry for it then finds it taken, and the debug
+    /// assertion in `claim_slot` (every popped slot is free) fires.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_stale_free_slot_entry_is_discarded_after_id_reuse() {
+        let class = SlabClass::new(0, 64, 1024);
+        let slots_per_slab = 1024 / 64;
+        let mut first = vec![0u8; 1024];
+        let mut second = vec![0u8; 1024];
+
+        let slab_id = unsafe { class.add_slab(first.as_mut_ptr(), 1024) };
+        let taken: Vec<_> = (0..slots_per_slab)
+            .map(|_| class.allocate().expect("slot"))
+            .collect();
+        // Free one slot, queueing its entry, and release every write ref.
+        class.free_slot(taken[0].0, taken[0].1);
+        for _ in &taken {
+            class.release_slab(slab_id);
+        }
+
+        assert!(unsafe { class.evict_slab(slab_id, None, |_| {}) }.is_some());
+        let reused = unsafe { class.add_slab(second.as_mut_ptr(), 1024) };
+        assert_eq!(reused, slab_id, "the evicted id is reused");
+
+        let mut seen = std::collections::HashSet::new();
+        while let Some((id, slot)) = class.allocate() {
+            assert_eq!(id, reused);
+            assert!(seen.insert(slot), "slot {slot} handed out twice");
+        }
+        assert_eq!(seen.len(), slots_per_slab);
+    }
+
+    /// An eviction of a victim whose id has been reused leaves the new slab
+    /// `Live` throughout. A drain started and then aborted on it would let a
+    /// concurrent `allocate` discard its queued free slots.
+    #[test]
+    fn a_stale_victim_never_drains_the_slab_that_reused_its_id() {
+        let class = SlabClass::new(0, 64, 1024);
+        let mut first = vec![0u8; 1024];
+        let mut second = vec![0u8; 1024];
+        let slab_id = unsafe { class.add_slab(first.as_mut_ptr(), 1024) };
+        let (_, _, sequence) = class.slab_timestamps()[0];
+        assert!(unsafe { class.evict_slab(slab_id, None, |_| {}) }.is_some());
+        assert_eq!(
+            unsafe { class.add_slab(second.as_mut_ptr(), 1024) },
+            slab_id
+        );
+
+        // Holding the write lock stops the stale eviction at its sequence
+        // check; the state seen meanwhile shows whether it began a drain.
+        let state = class.state_word(slab_id);
+        let slabs = class.slabs.write();
+        let (seen, evicted) = std::thread::scope(|s| {
+            let evict =
+                s.spawn(|| unsafe { class.evict_slab(slab_id, Some(sequence), |_| {}) }.is_some());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let (seen, _) = packed_state::unpack(state.load(Ordering::Acquire));
+            drop(slabs);
+            (seen, evict.join().unwrap())
+        });
+        assert_eq!(seen, SlabState::Live, "the stale eviction began a drain");
+        assert!(!evicted);
+        let mut slots = 0;
+        while class.allocate().is_some() {
+            slots += 1;
+        }
+        assert_eq!(slots, 1024 / 64);
+    }
+
     #[test]
     fn test_slab_timestamps() {
         let class = SlabClass::new(0, 64, 1024);
@@ -1318,19 +1468,17 @@ mod tests {
         let timestamps = class.slab_timestamps();
         assert_eq!(timestamps.len(), 1);
 
-        let (slab_id, created_at, last_accessed) = timestamps[0];
+        let (slab_id, last_accessed, _sequence) = timestamps[0];
         assert_eq!(slab_id, 0);
-        assert!(created_at > 0);
-        assert_eq!(created_at, last_accessed); // Initially equal
+        assert!(last_accessed > 0);
 
         // Touch the slab
         std::thread::sleep(std::time::Duration::from_millis(10));
         class.touch_slab(0);
 
         let timestamps = class.slab_timestamps();
-        let (_, _, new_last_accessed) = timestamps[0];
-        // last_accessed should be >= created_at
-        assert!(new_last_accessed >= created_at);
+        let (_, new_last_accessed, _) = timestamps[0];
+        assert!(new_last_accessed >= last_accessed);
     }
 
     #[test]

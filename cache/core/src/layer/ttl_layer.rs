@@ -4346,13 +4346,14 @@ mod merge_retention_budget {
             self.inner.contains(key, verifier)
         }
 
-        fn insert(
+        fn insert_pinned<G>(
             &self,
             key: &[u8],
             location: Location,
             verifier: &impl KeyVerifier,
-        ) -> CacheResult<Option<Location>> {
-            self.inner.insert(key, location, verifier)
+            pin: impl FnMut(Location) -> G,
+        ) -> CacheResult<Option<(Location, G)>> {
+            self.inner.insert_pinned(key, location, verifier, pin)
         }
 
         fn insert_if_absent(
@@ -4364,13 +4365,15 @@ mod merge_retention_budget {
             self.inner.insert_if_absent(key, location, verifier)
         }
 
-        fn update_if_present(
+        fn update_if_present_pinned<G>(
             &self,
             key: &[u8],
             location: Location,
             verifier: &impl KeyVerifier,
-        ) -> CacheResult<Location> {
-            self.inner.update_if_present(key, location, verifier)
+            pin: impl FnMut(Location) -> G,
+        ) -> CacheResult<(Location, G)> {
+            self.inner
+                .update_if_present_pinned(key, location, verifier, pin)
         }
 
         fn remove(&self, key: &[u8], expected: Location) -> bool {

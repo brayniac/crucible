@@ -921,14 +921,15 @@ impl MultiChoiceHashtable {
     /// entries: a freed slot in the first-choice bucket was taken while the
     /// key's entry sat in the second-choice bucket, and the caller was told it
     /// had made a fresh entry so the superseded item was never delete-marked.
-    fn try_replace_existing_in_bucket(
+    fn try_replace_existing_in_bucket<G>(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
         new_packed: u64,
         verifier: &impl KeyVerifier,
-    ) -> Option<CacheResult<Option<Location>>> {
+        pin: &mut impl FnMut(Location) -> G,
+    ) -> Option<CacheResult<Option<(Location, G)>>> {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
@@ -968,13 +969,14 @@ impl MultiChoiceHashtable {
                 else {
                     break;
                 };
+                let guard = pin(location);
 
                 let new_with_freq = Hashbucket::with_freq(new_packed, Hashbucket::freq(packed));
                 if slot
                     .compare_exchange(packed, new_with_freq, Ordering::Release, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return Some(Ok(Some(location)));
+                    return Some(Ok(Some((location, guard))));
                 }
                 spin_loop();
             }
@@ -995,7 +997,7 @@ impl MultiChoiceHashtable {
         bucket_index: usize,
         tag: u16,
         new_packed: u64,
-    ) -> Option<CacheResult<Option<Location>>> {
+    ) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
@@ -1017,7 +1019,7 @@ impl MultiChoiceHashtable {
                 .compare_exchange(packed, new_with_freq, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                return Some(Ok(None));
+                return Some(Ok(()));
             }
             // Losing this race is harmless: pass 1 already established that the
             // key has no live entry, so no duplicate can result from moving on.
@@ -1031,7 +1033,7 @@ impl MultiChoiceHashtable {
         &self,
         bucket_index: usize,
         new_packed: u64,
-    ) -> Option<CacheResult<Option<Location>>> {
+    ) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
@@ -1046,7 +1048,7 @@ impl MultiChoiceHashtable {
                 .compare_exchange(0, new_packed, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                return Some(Ok(None));
+                return Some(Ok(()));
             }
             // Somebody else took this slot; a slot never returns to empty
             // while we look at it, so move on rather than retrying here.
@@ -1060,7 +1062,7 @@ impl MultiChoiceHashtable {
         &self,
         bucket_index: usize,
         new_packed: u64,
-    ) -> Option<CacheResult<Option<Location>>> {
+    ) -> Option<CacheResult<()>> {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
@@ -1078,7 +1080,7 @@ impl MultiChoiceHashtable {
                 .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                return Some(Ok(None));
+                return Some(Ok(()));
             }
         }
 
@@ -1537,14 +1539,15 @@ impl MultiChoiceHashtable {
     }
 
     /// Try to replace existing entry for REPLACE semantics.
-    fn try_replace_existing_for_replace(
+    fn try_replace_existing_for_replace<G>(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
         new_location: Location,
         verifier: &impl KeyVerifier,
-    ) -> Option<CacheResult<Location>> {
+        pin: &mut impl FnMut(Location) -> G,
+    ) -> Option<CacheResult<(Location, G)>> {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
@@ -1584,6 +1587,7 @@ impl MultiChoiceHashtable {
                 else {
                     break;
                 };
+                let guard = pin(old_location);
 
                 let freq = Hashbucket::freq(packed);
                 let new_packed = Hashbucket::pack(tag, freq, new_location);
@@ -1592,7 +1596,7 @@ impl MultiChoiceHashtable {
                     .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return Some(Ok(old_location));
+                    return Some(Ok((old_location, guard)));
                 }
                 spin_loop();
             }
@@ -1649,12 +1653,13 @@ impl Hashtable for MultiChoiceHashtable {
         false
     }
 
-    fn insert(
+    fn insert_pinned<G>(
         &self,
         key: &[u8],
         location: Location,
         verifier: &impl KeyVerifier,
-    ) -> CacheResult<Option<Location>> {
+        mut pin: impl FnMut(Location) -> G,
+    ) -> CacheResult<Option<(Location, G)>> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
@@ -1674,9 +1679,14 @@ impl Hashtable for MultiChoiceHashtable {
 
         // Pass 1: replace the key's live entry, wherever it lives.
         for &bucket_index in choices {
-            if let Some(result) =
-                self.try_replace_existing_in_bucket(bucket_index, tag, key, new_packed, verifier)
-            {
+            if let Some(result) = self.try_replace_existing_in_bucket(
+                bucket_index,
+                tag,
+                key,
+                new_packed,
+                verifier,
+                &mut pin,
+            ) {
                 return result;
             }
         }
@@ -1686,7 +1696,7 @@ impl Hashtable for MultiChoiceHashtable {
             if let Some(result) =
                 self.try_replace_matching_ghost_in_bucket(bucket_index, tag, new_packed)
             {
-                return result;
+                return result.map(|_| None);
             }
         }
 
@@ -1699,14 +1709,14 @@ impl Hashtable for MultiChoiceHashtable {
         // Pass 3: claim an empty slot.
         for &bucket_index in ordered.iter() {
             if let Some(result) = self.try_claim_empty_in_bucket(bucket_index, new_packed) {
-                return result;
+                return result.map(|_| None);
             }
         }
 
         // Pass 4: evict any ghost to make room.
         for &bucket_index in ordered.iter() {
             if let Some(result) = self.try_evict_any_ghost_in_bucket(bucket_index, new_packed) {
-                return result;
+                return result.map(|_| None);
             }
         }
 
@@ -1787,20 +1797,26 @@ impl Hashtable for MultiChoiceHashtable {
         Err(CacheError::HashTableFull)
     }
 
-    fn update_if_present(
+    fn update_if_present_pinned<G>(
         &self,
         key: &[u8],
         location: Location,
         verifier: &impl KeyVerifier,
-    ) -> CacheResult<Location> {
+        mut pin: impl FnMut(Location) -> G,
+    ) -> CacheResult<(Location, G)> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
-            if let Some(result) =
-                self.try_replace_existing_for_replace(bucket_index, tag, key, location, verifier)
-            {
+            if let Some(result) = self.try_replace_existing_for_replace(
+                bucket_index,
+                tag,
+                key,
+                location,
+                verifier,
+                &mut pin,
+            ) {
                 return result;
             }
         }
@@ -2788,6 +2804,39 @@ mod tests {
         assert_eq!(loc, location);
         // An insert is not a read; this lookup reports the count before it.
         assert_eq!(freq, 0);
+    }
+
+    /// `insert_pinned` and `update_if_present_pinned` call `pin` while the
+    /// entry still names the location being replaced.
+    #[test]
+    fn pin_runs_while_the_replaced_entry_is_still_published() {
+        let ht = MultiChoiceHashtable::new(10);
+        let mut verifier = MockVerifier::new();
+        let (a, b, c) = (Location::new(1), Location::new(2), Location::new(3));
+        for location in [a, b, c] {
+            verifier.add(b"k", location, false);
+        }
+        ht.insert(b"k", a, &verifier).unwrap();
+
+        let (old, published) = ht
+            .insert_pinned(b"k", b, &verifier, |old| {
+                ht.get_item_frequency(b"k", old).is_some()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(old, a);
+        assert!(published, "insert_pinned pinned after replacing the entry");
+
+        let (old, published) = ht
+            .update_if_present_pinned(b"k", c, &verifier, |old| {
+                ht.get_item_frequency(b"k", old).is_some()
+            })
+            .unwrap();
+        assert_eq!(old, b);
+        assert!(
+            published,
+            "update_if_present_pinned pinned after replacing the entry"
+        );
     }
 
     #[test]

@@ -248,31 +248,12 @@ impl SlabAllocator {
         class.allocate()
     }
 
-    /// Retire an item that has been removed from the hashtable: drop it
-    /// from the class statistics, mark it deleted, and free its slot once no
-    /// reader holds it.
+    /// Retire an item that has been removed from the hashtable, or never
+    /// inserted: drop it from the class statistics, mark it deleted, and free
+    /// its slot once no reader holds it.
     ///
-    /// If the slab is draining, waits for the drain to finish or abort.
-    /// Returns `false` and does nothing if the slab is then `Locked` or has
-    /// left the class: eviction counts the item out when it processes the
-    /// slab, and its hashtable remove finds no entry.
-    ///
-    /// The caller must not hold a reference on the item's slab; a caller
-    /// that holds the write ref uses `retire_held_item`.
-    pub fn retire_item(&self, location: SlabLocation) -> bool {
-        let (class_id, slab_id, slot_index) = location.unpack();
-        let Some(class) = self.classes.get(class_id as usize) else {
-            return false;
-        };
-        if !class.acquire_slab_after_drain(slab_id) {
-            return false;
-        }
-        Self::retire_in_class(class, slab_id, slot_index);
-        class.release_slab(slab_id);
-        true
-    }
-
-    /// `retire_item` for a slot whose write ref the caller still holds.
+    /// The caller must hold a reference on the item's slab: the write ref
+    /// from allocation, or an `ItemPin` on the item.
     pub fn retire_held_item(&self, location: SlabLocation) {
         let (class_id, slab_id, slot_index) = location.unpack();
         if let Some(class) = self.classes.get(class_id as usize) {
@@ -410,57 +391,59 @@ impl SlabAllocator {
 
     /// Find the least recently accessed slab across all classes.
     ///
-    /// Returns `(class_id, slab_id)` of the LRA slab, or `None` if no slabs exist.
-    pub fn find_lra_slab(&self) -> Option<(u8, u32)> {
-        let mut oldest: Option<(u8, u32, u32)> = None; // (class_id, slab_id, last_accessed)
-
-        for (class_id, class) in self.classes.iter().enumerate() {
-            for (slab_id, _created_at, last_accessed) in class.slab_timestamps() {
-                match oldest {
-                    None => oldest = Some((class_id as u8, slab_id, last_accessed)),
-                    Some((_, _, old_ts)) if last_accessed < old_ts => {
-                        oldest = Some((class_id as u8, slab_id, last_accessed));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        oldest.map(|(class_id, slab_id, _)| (class_id, slab_id))
+    /// Returns `(class_id, slab_id, sequence)` of the LRA slab, or `None` if
+    /// no slabs exist.
+    pub fn find_lra_slab(&self) -> Option<(u8, u32, u64)> {
+        // Ordered by last access, then by age: access times have one-second
+        // resolution, so ties are common and the older slab goes first.
+        self.classes
+            .iter()
+            .enumerate()
+            .flat_map(|(class_id, class)| {
+                class.slab_timestamps().into_iter().map(
+                    move |(slab_id, last_accessed, sequence)| {
+                        (
+                            (last_accessed, sequence),
+                            (class_id as u8, slab_id, sequence),
+                        )
+                    },
+                )
+            })
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, slab)| slab)
     }
 
     /// Find the least recently created slab across all classes.
     ///
-    /// Returns `(class_id, slab_id)` of the LRC slab, or `None` if no slabs exist.
-    pub fn find_lrc_slab(&self) -> Option<(u8, u32)> {
-        let mut oldest: Option<(u8, u32, u32)> = None; // (class_id, slab_id, created_at)
-
-        for (class_id, class) in self.classes.iter().enumerate() {
-            for (slab_id, created_at, _last_accessed) in class.slab_timestamps() {
-                match oldest {
-                    None => oldest = Some((class_id as u8, slab_id, created_at)),
-                    Some((_, _, old_ts)) if created_at < old_ts => {
-                        oldest = Some((class_id as u8, slab_id, created_at));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        oldest.map(|(class_id, slab_id, _)| (class_id, slab_id))
+    /// Returns `(class_id, slab_id, sequence)` of the slab added first, by
+    /// `Slab::sequence`, or `None` if no slabs exist.
+    pub fn find_lrc_slab(&self) -> Option<(u8, u32, u64)> {
+        self.classes
+            .iter()
+            .enumerate()
+            .flat_map(|(class_id, class)| {
+                class
+                    .slab_timestamps()
+                    .into_iter()
+                    .map(move |(slab_id, _, sequence)| {
+                        (sequence, (class_id as u8, slab_id, sequence))
+                    })
+            })
+            .min_by_key(|(sequence, _)| *sequence)
+            .map(|(_, slab)| slab)
     }
 
     /// Find a random slab across all classes.
     ///
-    /// Returns `(class_id, slab_id)` of a random Live slab, or `None` if no slabs exist.
-    /// Only considers slabs in Live state (filters out evicted/zombie slabs).
-    pub fn find_random_slab(&self) -> Option<(u8, u32)> {
-        // Collect all (class_id, slab_id) pairs for Live slabs only
+    /// Returns `(class_id, slab_id, sequence)` of a random Live slab, or
+    /// `None` if no slabs exist.
+    pub fn find_random_slab(&self) -> Option<(u8, u32, u64)> {
+        // Collect (class_id, slab_id, sequence) for Live slabs only
         let mut slabs = Vec::new();
         for (class_id, class) in self.classes.iter().enumerate() {
             // slab_timestamps() only returns Live slabs (filters by state)
-            for (slab_id, _created_at, _last_accessed) in class.slab_timestamps() {
-                slabs.push((class_id as u8, slab_id));
+            for (slab_id, _, sequence) in class.slab_timestamps() {
+                slabs.push((class_id as u8, slab_id, sequence));
             }
         }
 
@@ -477,13 +460,15 @@ impl SlabAllocator {
         Some(slabs[idx])
     }
 
-    /// Evict all items from a specific slab.
+    /// Evict a slab: offer each item to `demote`, remove the hashtable
+    /// entries of the items it does not take, and return the slab's memory to
+    /// the global free pool. Returns `true` if the slab was evicted.
     ///
-    /// Removes all items from the slab, removes them from the hashtable,
-    /// and returns the slab memory to the global free pool.
-    ///
-    /// Returns `true` if successful, `false` if the slab doesn't exist.
-    /// As [`Self::evict_slab`], but offering each item to `demote` first.
+    /// With `sequence`, the slab is evicted only if the slab now using
+    /// `slab_id` has that `Slab::sequence`. A victim chosen by a
+    /// `find_*_slab` call passes its sequence, so if that slab has been
+    /// evicted and its id given to a newer slab in the meantime, the newer
+    /// slab is left alone.
     ///
     /// `demote` returns `true` if it took ownership of the item -- it has
     /// written the value elsewhere and repointed the hashtable entry, so this
@@ -499,6 +484,7 @@ impl SlabAllocator {
         &self,
         class_id: u8,
         slab_id: u32,
+        sequence: Option<u64>,
         hashtable: &H,
         mut demote: D,
     ) -> bool
@@ -513,7 +499,7 @@ impl SlabAllocator {
 
         // Evict all items from the slab
         let slab_ptr = unsafe {
-            class.evict_slab(slab_id, |item| {
+            class.evict_slab(slab_id, sequence, |item| {
                 let location =
                     SlabLocation::new(item.class_id, item.slab_id, item.slot_index).to_location();
 
@@ -535,8 +521,8 @@ impl SlabAllocator {
                     // the item we are about to free is right in both cases, so
                     // there is nothing to do here.
                     //
-                    // That retry is load-bearing and NOT local to this file.
-                    // `SlabClass::evict_slab` delete-marks unconditionally
+                    // This code depends on that retry, which lives in
+                    // cache-core. `SlabClass::evict_slab` delete-marks unconditionally
                     // immediately after this callback returns, so if `remove`
                     // could fail while the slot still published `location` — as
                     // it could before the retry was added — the table would be
@@ -588,24 +574,42 @@ impl SlabAllocator {
         // Try strategies in order from highest to lowest bit
         // SLAB_LRC (8)
         if strategy.contains(EvictionStrategy::SLAB_LRC)
-            && let Some((class_id, slab_id)) = self.find_lrc_slab()
-            && self.evict_slab_with_demoter(class_id, slab_id, hashtable, &mut demote)
+            && let Some((class_id, slab_id, sequence)) = self.find_lrc_slab()
+            && self.evict_slab_with_demoter(
+                class_id,
+                slab_id,
+                Some(sequence),
+                hashtable,
+                &mut demote,
+            )
         {
             return true;
         }
 
         // SLAB_LRA (4)
         if strategy.contains(EvictionStrategy::SLAB_LRA)
-            && let Some((class_id, slab_id)) = self.find_lra_slab()
-            && self.evict_slab_with_demoter(class_id, slab_id, hashtable, &mut demote)
+            && let Some((class_id, slab_id, sequence)) = self.find_lra_slab()
+            && self.evict_slab_with_demoter(
+                class_id,
+                slab_id,
+                Some(sequence),
+                hashtable,
+                &mut demote,
+            )
         {
             return true;
         }
 
         // RANDOM (2)
         if strategy.contains(EvictionStrategy::RANDOM)
-            && let Some((class_id, slab_id)) = self.find_random_slab()
-            && self.evict_slab_with_demoter(class_id, slab_id, hashtable, &mut demote)
+            && let Some((class_id, slab_id, sequence)) = self.find_random_slab()
+            && self.evict_slab_with_demoter(
+                class_id,
+                slab_id,
+                Some(sequence),
+                hashtable,
+                &mut demote,
+            )
         {
             return true;
         }
@@ -938,42 +942,6 @@ mod tests {
         }
     }
 
-    /// An item retired while its slab is draining is retired once the drain
-    /// aborts, not left counted with its slot unused.
-    #[test]
-    fn retire_during_an_aborted_drain_retires_the_item() {
-        use crate::class::packed_state;
-
-        let config = test_config();
-        let allocator = SlabAllocator::new(&config).unwrap();
-        let class_id = allocator.select_class(HEADER_SIZE + 8).unwrap();
-        let (slab_id, slot_index) = allocator.allocate(class_id).unwrap();
-        unsafe {
-            allocator.write_item(
-                class_id,
-                slab_id,
-                slot_index,
-                b"k",
-                b"v",
-                Duration::from_secs(3600),
-            );
-        }
-        allocator.release_write_ref(class_id, slab_id);
-        let class = allocator.class(class_id).unwrap();
-        assert_eq!(class.item_count(), 1);
-
-        let state = class.state_word(slab_id);
-        assert!(packed_state::try_start_drain(state));
-        let location = SlabLocation::new(class_id, slab_id, slot_index);
-        std::thread::scope(|s| {
-            let retire = s.spawn(|| allocator.retire_item(location));
-            std::thread::sleep(Duration::from_millis(20));
-            assert!(packed_state::abort_drain(state));
-            assert!(retire.join().unwrap(), "retire gave up on a live slab");
-        });
-        assert_eq!(class.item_count(), 0);
-    }
-
     #[test]
     fn test_allocator_creation() {
         let config = test_config();
@@ -1048,8 +1016,8 @@ mod tests {
     /// `SlabClass::evict_slab` delete-marks each item unconditionally right
     /// after the eviction callback runs, so any entry the callback fails to
     /// unlink is left pointing at a tombstone in memory that is handed back to
-    /// the global pool. Slab ids are not reused within a class, so such an
-    /// entry can never turn into a false positive — it just never goes away.
+    /// the global pool. Slab ids are reused, so such an entry would name a
+    /// slot of whichever slab later takes the id.
     ///
     /// Single-threaded, so it pins the end-to-end invariant rather than the
     /// race that used to break it; that race is covered by cache-core's
@@ -1122,7 +1090,7 @@ mod tests {
             );
         }
 
-        assert!(allocator.evict_slab_with_demoter(class_id, slab_id, &hashtable, |_| false));
+        assert!(allocator.evict_slab_with_demoter(class_id, slab_id, None, &hashtable, |_| false));
 
         for (key, location) in &published {
             assert_eq!(
