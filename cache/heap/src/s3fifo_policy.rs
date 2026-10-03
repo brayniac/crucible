@@ -132,17 +132,30 @@ impl S3FifoPolicy {
                 continue;
             }
 
-            // Evict this item
-            if create_ghosts {
-                hashtable.convert_to_ghost_at_bucket(entry.bucket_index, location);
-            } else {
-                hashtable.remove_at_bucket(entry.bucket_index, location);
+            // Evict this item, if it is still ours to evict
+            if Self::unlink(hashtable, entry.bucket_index, location, create_ghosts) {
+                return Some(Location::new(location));
             }
-
-            return Some(Location::new(location));
         }
 
         None
+    }
+
+    /// Unlink an evicted item's entry. Returns `true` iff this call unlinked
+    /// it; only then may the caller free the item. `false` means a concurrent
+    /// overwrite, delete or eviction took the entry, and that thread frees
+    /// the item.
+    fn unlink<H: Hashtable>(
+        hashtable: &H,
+        bucket_index: u64,
+        location: u64,
+        create_ghosts: bool,
+    ) -> bool {
+        if create_ghosts {
+            hashtable.convert_to_ghost_at_bucket(bucket_index, location)
+        } else {
+            hashtable.remove_at_bucket(bucket_index, location)
+        }
     }
 
     /// Evict from the main queue.
@@ -175,26 +188,19 @@ impl S3FifoPolicy {
                 let new_info = (current_info & !((0xFF_u64) << 44)) | ((decayed_freq as u64) << 44);
                 let reinsert_entry = QueueEntry::new(entry.bucket_index, new_info);
 
-                if !self.main.push(reinsert_entry) {
+                if !self.main.push(reinsert_entry)
+                    && Self::unlink(hashtable, entry.bucket_index, location, create_ghosts)
+                {
                     // Queue full, evict this item
-                    if create_ghosts {
-                        hashtable.convert_to_ghost_at_bucket(entry.bucket_index, location);
-                    } else {
-                        hashtable.remove_at_bucket(entry.bucket_index, location);
-                    }
                     return Some(Location::new(location));
                 }
                 continue;
             }
 
-            // Evict this item (freq == 0)
-            if create_ghosts {
-                hashtable.convert_to_ghost_at_bucket(entry.bucket_index, location);
-            } else {
-                hashtable.remove_at_bucket(entry.bucket_index, location);
+            // Evict this item (freq == 0), if it is still ours to evict
+            if Self::unlink(hashtable, entry.bucket_index, location, create_ghosts) {
+                return Some(Location::new(location));
             }
-
-            return Some(Location::new(location));
         }
 
         None

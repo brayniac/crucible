@@ -2232,6 +2232,82 @@ impl HeapCacheBuilder {
 mod tests {
     use super::*;
 
+    /// Concurrent SETs, DELETEs and GETs under S3-FIFO eviction leave the
+    /// slot storage consistent: no thread hangs, and once every key is
+    /// deleted no slot and no byte is left accounted.
+    ///
+    /// Eviction used to free a slot whose hashtable entry it had failed to
+    /// unlink. An overwrite or delete of the same key freed it too, so the
+    /// slot went onto the free list twice; SETs then spun forever in
+    /// `SlotStorage::allocate`, or a debug build panicked storing into an
+    /// occupied slot.
+    #[test]
+    fn s3fifo_eviction_under_concurrent_writes_frees_each_slot_once() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let cache = std::sync::Arc::new(
+            HeapCache::builder()
+                .eviction_policy(EvictionPolicy::S3Fifo)
+                .hashtable_power(10)
+                .memory_limit(48_000)
+                .build()
+                .expect("cache"),
+        );
+        let key = |i: u64| format!("T{i:08}").into_bytes();
+
+        let threads = 8;
+        let (done_tx, done_rx) = mpsc::channel();
+        for t in 0..threads {
+            let (cache, done_tx) = (cache.clone(), done_tx.clone());
+            std::thread::spawn(move || {
+                let value = [b'x'; 100];
+                let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ t;
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                while Instant::now() < deadline {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let k = key(x % 2000);
+                    match x % 10 {
+                        0..=5 => {
+                            let _ = cache.set(&k, &value, Some(Duration::from_secs(3600)));
+                        }
+                        6..=7 => {
+                            cache.delete(&k);
+                        }
+                        _ => {
+                            cache.get(&k);
+                        }
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        for _ in 0..threads {
+            done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("a worker hung: the slot free list is corrupt");
+        }
+
+        // Delete until absent: a key can be left with a second live entry
+        // under this workload, which is a separate bug from the one this test
+        // covers.
+        for i in 0..2000 {
+            while cache.delete(&key(i)) {}
+        }
+        assert_eq!(
+            cache.len(),
+            0,
+            "slots still occupied after deleting every key"
+        );
+        assert_eq!(
+            cache.bytes_used(),
+            0,
+            "bytes still accounted after deleting every key"
+        );
+    }
+
     fn create_test_cache() -> HeapCache {
         HeapCacheBuilder::new()
             .memory_limit(1024 * 1024) // 1MB

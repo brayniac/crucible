@@ -241,15 +241,20 @@ pub trait Hashtable: Send + Sync {
     /// Convert an item to a ghost at a specific bucket and location.
     ///
     /// Used by S3-FIFO during eviction when ghost tracking is enabled.
-    fn convert_to_ghost_at_bucket(&self, _bucket_index: u64, _location: u64) {
-        // Default: no-op
+    /// Returns `true` iff this call converted the entry; `false` if no entry
+    /// at that location remains (it was overwritten, deleted or evicted).
+    fn convert_to_ghost_at_bucket(&self, _bucket_index: u64, _location: u64) -> bool {
+        false
     }
 
     /// Remove an item at a specific bucket and location.
     ///
     /// Used by S3-FIFO during eviction when ghost tracking is disabled.
-    fn remove_at_bucket(&self, _bucket_index: u64, _location: u64) {
-        // Default: no-op
+    /// Returns `true` iff this call removed the entry; `false` if no entry at
+    /// that location remains (it was overwritten, deleted or evicted). Only
+    /// the caller that removed the entry may free the item it names.
+    fn remove_at_bucket(&self, _bucket_index: u64, _location: u64) -> bool {
+        false
     }
 
     /// Clear all entries from the hashtable.

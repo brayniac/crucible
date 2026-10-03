@@ -1086,6 +1086,53 @@ impl MultiChoiceHashtable {
     }
 
     /// Try to unlink an item from a bucket.
+    /// Replace the live entry at `location` in bucket `bucket_index` with
+    /// `replace(entry)`. Returns `true` iff this call made the replacement.
+    ///
+    /// Re-reads and retries while the slot still holds `location`: a reader
+    /// bumping the frequency bits fails the exchange without changing the
+    /// entry, and giving up there would leave the entry in place while the
+    /// caller believed it gone.
+    fn replace_at_bucket(
+        &self,
+        bucket_index: u64,
+        location: u64,
+        replace: impl Fn(u64) -> u64,
+    ) -> bool {
+        let bucket_index = bucket_index as usize;
+        if bucket_index >= self.num_buckets {
+            return false;
+        }
+
+        let bucket = self.bucket(bucket_index);
+        let target_location = Location::from_raw(location);
+
+        for slot in bucket.items.iter().take(Hashbucket::NUM_ITEM_SLOTS) {
+            loop {
+                let packed = slot.load(Ordering::Acquire);
+                if packed == 0
+                    || Hashbucket::is_ghost(packed)
+                    || Hashbucket::location(packed) != target_location
+                {
+                    break;
+                }
+                if slot
+                    .compare_exchange(
+                        packed,
+                        replace(packed),
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+                spin_loop();
+            }
+        }
+        false
+    }
+
     fn try_unlink_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
 
@@ -1931,64 +1978,12 @@ impl Hashtable for MultiChoiceHashtable {
         }
     }
 
-    fn convert_to_ghost_at_bucket(&self, bucket_index: u64, location: u64) {
-        let bucket_index = bucket_index as usize;
-        if bucket_index >= self.num_buckets {
-            return;
-        }
-
-        let bucket = self.bucket(bucket_index);
-        let target_location = Location::from_raw(location);
-
-        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
-            let slot = &bucket.items[slot_index];
-            let packed = slot.load(Ordering::Acquire);
-
-            // Skip empty and ghost entries
-            if packed == 0 || Hashbucket::is_ghost(packed) {
-                continue;
-            }
-
-            // Check if location matches
-            if Hashbucket::location(packed) == target_location {
-                let ghost_packed = Hashbucket::to_ghost(packed);
-                // Best-effort CAS
-                let _ = slot.compare_exchange(
-                    packed,
-                    ghost_packed,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                );
-                return;
-            }
-        }
+    fn convert_to_ghost_at_bucket(&self, bucket_index: u64, location: u64) -> bool {
+        self.replace_at_bucket(bucket_index, location, Hashbucket::to_ghost)
     }
 
-    fn remove_at_bucket(&self, bucket_index: u64, location: u64) {
-        let bucket_index = bucket_index as usize;
-        if bucket_index >= self.num_buckets {
-            return;
-        }
-
-        let bucket = self.bucket(bucket_index);
-        let target_location = Location::from_raw(location);
-
-        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
-            let slot = &bucket.items[slot_index];
-            let packed = slot.load(Ordering::Acquire);
-
-            // Skip empty and ghost entries
-            if packed == 0 || Hashbucket::is_ghost(packed) {
-                continue;
-            }
-
-            // Check if location matches
-            if Hashbucket::location(packed) == target_location {
-                // Best-effort CAS to remove
-                let _ = slot.compare_exchange(packed, 0, Ordering::Release, Ordering::Relaxed);
-                return;
-            }
-        }
+    fn remove_at_bucket(&self, bucket_index: u64, location: u64) -> bool {
+        self.replace_at_bucket(bucket_index, location, |_| 0)
     }
 
     fn clear(&self) {
