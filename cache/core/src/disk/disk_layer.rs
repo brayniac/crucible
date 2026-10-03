@@ -140,6 +140,9 @@ impl DiskLayer {
         // Set segment expiration time
         let expire_at = Self::now_secs().saturating_add(ttl.as_secs() as u32);
         segment.set_expire_at(expire_at);
+        // The bucket a cached write segment must still belong to, checked
+        // by `get_or_allocate_write_segment` and the append.
+        segment.set_bucket_id(bucket_index as u16);
 
         // Add to bucket
         let bucket = self.buckets.get_bucket_by_index(bucket_index);
@@ -159,9 +162,20 @@ impl DiskLayer {
     }
 
     /// Get or allocate the write segment for a TTL.
+    ///
+    /// An expired tail is not written to: an item written to it is a miss on
+    /// its first read. A new segment is appended instead, which seals the
+    /// expired one so expiry can reclaim it. A cached segment must still
+    /// belong to the bucket, since it can have been evicted and given to
+    /// another bucket since it was cached.
     fn get_or_allocate_write_segment(&self, ttl: Duration) -> CacheResult<u32> {
         let bucket_index = self.buckets.get_bucket_index(ttl);
         let bucket = self.buckets.get_bucket_by_index(bucket_index);
+        let now = Self::now_secs();
+        let unexpired = |segment: &_| {
+            let expire_at = crate::segment::Segment::expire_at(segment);
+            expire_at == 0 || now < expire_at
+        };
 
         // Check cached write segment first
         if bucket_index < self.current_write_segments.len() {
@@ -169,6 +183,8 @@ impl DiskLayer {
                 .load(std::sync::atomic::Ordering::Acquire);
             if cached_id != u32::MAX
                 && let Some(segment) = self.pool.get(cached_id)
+                && segment.bucket_id() == Some(bucket_index as u16)
+                && unexpired(segment)
                 && segment.state() == State::Live
             {
                 return Ok(cached_id);
@@ -178,6 +194,7 @@ impl DiskLayer {
         // Check bucket tail
         if let Some(tail_id) = bucket.tail()
             && let Some(segment) = self.pool.get(tail_id)
+            && unexpired(segment)
             && segment.state() == State::Live
         {
             if bucket_index < self.current_write_segments.len() {
@@ -351,17 +368,17 @@ impl DiskLayer {
         let mut expired_count = 0;
 
         for bucket in self.buckets.iter() {
-            if bucket.segment_count() < 2 {
-                continue;
-            }
-
             if let Some(head_id) = bucket.head()
                 && let Some(segment) = self.pool.get(head_id)
             {
                 let expire_at = segment.expire_at();
+                // Checked again under the bucket's chain mutex, which also
+                // seals the head if it is the bucket's only segment: writers
+                // stop choosing a segment once it has expired, so a bucket
+                // that receives no further writes would otherwise keep it.
                 if expire_at > 0
                     && now >= expire_at
-                    && let Ok(evicted_id) = bucket.evict_head_segment(&self.pool)
+                    && let Ok(evicted_id) = bucket.evict_expired_head(&self.pool, now)
                 {
                     self.process_evicted_segment(evicted_id, hashtable);
                     expired_count += 1;
@@ -416,20 +433,38 @@ impl Layer for DiskLayer {
 
         loop {
             let segment_id = self.get_or_allocate_write_segment(ttl)?;
+            #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+            crate::segment::interpose::fire(crate::segment::interpose::WRITE_BEFORE_APPEND);
 
             if let Some(segment) = self.pool.get(segment_id) {
-                if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(
-                        self.pool.layout(),
-                        self.pool.pool_id(),
-                        segment_id,
-                        segment.incarnation(),
-                        offset,
-                    ));
+                let bucket_index = self.buckets.get_bucket_index(ttl);
+                // Pinned, then re-checked: expiry can free the segment chosen
+                // above and give it to another bucket before this append
+                // runs, and a pinned segment is not freed until the pin is
+                // released.
+                if segment.inner().try_pin_for_append() {
+                    let expire_at = segment.expire_at();
+                    let unexpired = expire_at == 0 || Self::now_secs() < expire_at;
+                    let appended = (segment.bucket_id() == Some(bucket_index as u16) && unexpired)
+                        .then(|| segment.append_item(key, value, optional))
+                        .flatten()
+                        .map(|offset| {
+                            ItemLocation::new(
+                                self.pool.layout(),
+                                self.pool.pool_id(),
+                                segment_id,
+                                segment.incarnation(),
+                                offset,
+                            )
+                        });
+                    segment.inner().unpin_for_append();
+                    if let Some(location) = appended {
+                        return Ok(location);
+                    }
                 }
 
-                // Segment is full
-                let bucket_index = self.buckets.get_bucket_index(ttl);
+                // Full, or no longer this bucket's writable segment: clear
+                // the cached write segment and allocate a new one.
                 if bucket_index < self.current_write_segments.len() {
                     self.current_write_segments[bucket_index]
                         .store(u32::MAX, std::sync::atomic::Ordering::Release);
@@ -1167,6 +1202,117 @@ mod tests {
 
         layer.process_evicted_segment(segment_id, &hashtable);
         assert_all_removed(&layer, &hashtable, &keys);
+    }
+
+    /// A write whose chosen segment expires, is freed and is given to another
+    /// bucket before the append does not append into it.
+    #[test]
+    #[cfg(not(feature = "shuttle"))]
+    fn a_write_does_not_append_into_a_segment_reused_after_it_was_chosen() {
+        use crate::segment::interpose;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let clock = crate::clock::TestClock::start();
+        let (_dir, layer) = create_test_layer();
+        let hashtable = crate::hashtable_impl::MultiChoiceHashtable::new(10);
+        let segments = layer.free_segment_count();
+        // Long-lived buckets of one segment each, and one short-lived
+        // segment, fill the layer.
+        for i in 0..segments as u64 - 1 {
+            layer
+                .write_item(b"long", b"v", b"", Duration::from_secs(500 + 8 * i))
+                .expect("write");
+        }
+        let short = Duration::from_secs(4);
+        let first = layer.write_item(b"short", b"v", b"", short).expect("write");
+        let chosen = first.segment_id(layer.pool.layout());
+        assert_eq!(layer.free_segment_count(), 0);
+
+        // The write below chooses `chosen`, still unexpired, and stalls here.
+        let other = Rc::new(Cell::new(None));
+        {
+            let other = Rc::clone(&other);
+            let layer_ptr: *const DiskLayer = &layer;
+            let ht: *const crate::hashtable_impl::MultiChoiceHashtable = &hashtable;
+            let now = clock.now();
+            let _hook = interpose::install(Box::new(move |phase| {
+                if phase == interpose::WRITE_BEFORE_APPEND && other.get().is_none() {
+                    // SAFETY: both outlive the hook guard.
+                    let (layer, ht) = unsafe { (&*layer_ptr, &*ht) };
+                    crate::clock::set_virtual_now(now + 100);
+                    assert_eq!(layer.expire(ht), 1);
+                    let location = layer
+                        .write_item(b"other", b"v", b"", Duration::from_secs(3600))
+                        .expect("write");
+                    other.set(Some(location));
+                }
+            }));
+            let _ = layer.write_item(b"stalled", b"v", b"", short);
+        }
+
+        let other = other.get().expect("the hook ran");
+        assert_eq!(
+            other.segment_id(layer.pool.layout()),
+            chosen,
+            "the other bucket did not reuse the freed segment; the test is vacuous"
+        );
+        assert_eq!(
+            layer.pool.get(chosen).expect("segment").live_items(),
+            1,
+            "the stalled write appended into a segment another bucket owns"
+        );
+    }
+
+    /// A write to a bucket whose tail has expired goes to a new segment and
+    /// is readable.
+    #[test]
+    fn a_write_after_the_tail_expires_is_readable() {
+        let clock = crate::clock::TestClock::start();
+        let (_dir, layer) = create_test_layer();
+        let ttl = Duration::from_secs(10);
+        let first = layer.write_item(b"a", b"v", b"", ttl).expect("write");
+        for _ in 0..120 {
+            clock.tick();
+        }
+        let second = layer.write_item(b"b", b"v", b"", ttl).expect("write");
+        assert!(
+            layer.get_item(second, b"b").is_some(),
+            "a fresh write is unreadable"
+        );
+        assert_ne!(
+            first.segment_id(layer.pool.layout()),
+            second.segment_id(layer.pool.layout()),
+            "the write went to the expired segment"
+        );
+    }
+
+    /// Expiry reclaims a bucket's only segment once it has expired, so
+    /// segments that are each the expired sole segment of a bucket do not
+    /// hold the layer full.
+    #[test]
+    fn expiry_reclaims_a_bucket_whose_only_segment_has_expired() {
+        let clock = crate::clock::TestClock::start();
+        let (_dir, layer) = create_test_layer();
+        let hashtable = MultiChoiceHashtable::new(10);
+        let segments = layer.free_segment_count();
+        // TTLs eight seconds apart, one bucket each.
+        for i in 0..segments as u64 {
+            layer
+                .write_item(
+                    format!("k{i}").as_bytes(),
+                    b"v",
+                    b"",
+                    Duration::from_secs(8 * i + 4),
+                )
+                .expect("write");
+        }
+        assert_eq!(layer.free_segment_count(), 0);
+        for _ in 0..1000 {
+            clock.tick();
+        }
+        assert_eq!(layer.expire(&hashtable), segments);
+        assert_eq!(layer.free_segment_count(), segments);
     }
 
     /// Expiry runs on the cache's clock, the one every RAM layer uses. On the

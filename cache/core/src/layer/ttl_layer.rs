@@ -1570,22 +1570,37 @@ impl Layer for TtlLayer {
         // Try to append to current write segment
         loop {
             let segment_id = self.get_or_allocate_write_segment(ttl)?;
+            #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+            crate::segment::interpose::fire(crate::segment::interpose::WRITE_BEFORE_APPEND);
 
             if let Some(segment) = self.pool.get(segment_id) {
-                // Try to append
-                if let Some(offset) = segment.append_item(key, value, optional) {
-                    return Ok(ItemLocation::new(
-                        self.pool.layout(),
-                        self.pool.pool_id(),
-                        segment_id,
-                        segment.incarnation(),
-                        offset,
-                    ));
+                let bucket_index = self.buckets.get_bucket_index(ttl);
+                // Pinned, then re-checked: expiry can free the segment chosen
+                // above and give it to another bucket before this append
+                // runs, and a pinned segment is not freed until the pin is
+                // released.
+                if segment.try_pin_for_append() {
+                    let appended = (segment.bucket_id() == Some(bucket_index as u16)
+                        && Self::is_writable(segment, Self::now_secs()))
+                    .then(|| segment.append_item(key, value, optional))
+                    .flatten()
+                    .map(|offset| {
+                        ItemLocation::new(
+                            self.pool.layout(),
+                            self.pool.pool_id(),
+                            segment_id,
+                            segment.incarnation(),
+                            offset,
+                        )
+                    });
+                    segment.unpin_for_append();
+                    if let Some(location) = appended {
+                        return Ok(location);
+                    }
                 }
 
-                // Segment is full, need to allocate a new one
-                // Clear cached write segment
-                let bucket_index = self.buckets.get_bucket_index(ttl);
+                // Full, or no longer this bucket's writable segment: clear
+                // the cached write segment and allocate a new one.
                 if bucket_index < self.current_write_segments.len() {
                     self.current_write_segments[bucket_index]
                         .store(u32::MAX, std::sync::atomic::Ordering::Release);
@@ -2837,6 +2852,66 @@ mod tests {
         assert!(
             layer.get_item(fresh, b"fresh").is_some(),
             "a fresh, unexpired item was evicted by expiry"
+        );
+    }
+
+    /// A write whose chosen segment expires, is freed and is given to another
+    /// bucket before the append does not append into it.
+    #[test]
+    #[cfg(not(feature = "shuttle"))]
+    fn a_write_does_not_append_into_a_segment_reused_after_it_was_chosen() {
+        use crate::segment::interpose;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let clock = crate::clock::TestClock::start();
+        let layer = create_test_layer();
+        let hashtable = crate::hashtable_impl::MultiChoiceHashtable::new(10);
+        let segments = layer.free_segment_count();
+        // Long-lived buckets of one segment each, and one short-lived
+        // segment, fill the layer.
+        for i in 0..segments as u64 - 1 {
+            layer
+                .write_item(b"long", b"v", b"", Duration::from_secs(500 + 8 * i))
+                .expect("write");
+        }
+        let short = Duration::from_secs(4);
+        let first = layer.write_item(b"short", b"v", b"", short).expect("write");
+        let chosen = first.segment_id(layer.pool.layout());
+        assert_eq!(layer.free_segment_count(), 0);
+
+        // The write below chooses `chosen`, still unexpired, and stalls here.
+        let other = Rc::new(Cell::new(None));
+        {
+            let other = Rc::clone(&other);
+            let layer_ptr: *const TtlLayer = &layer;
+            let ht: *const crate::hashtable_impl::MultiChoiceHashtable = &hashtable;
+            let now = clock.now();
+            let _hook = interpose::install(Box::new(move |phase| {
+                if phase == interpose::WRITE_BEFORE_APPEND && other.get().is_none() {
+                    // SAFETY: both outlive the hook guard.
+                    let (layer, ht) = unsafe { (&*layer_ptr, &*ht) };
+                    crate::clock::set_virtual_now(now + 100);
+                    assert_eq!(layer.expire(ht), 1);
+                    let location = layer
+                        .write_item(b"other", b"v", b"", Duration::from_secs(3600))
+                        .expect("write");
+                    other.set(Some(location));
+                }
+            }));
+            let _ = layer.write_item(b"stalled", b"v", b"", short);
+        }
+
+        let other = other.get().expect("the hook ran");
+        assert_eq!(
+            other.segment_id(layer.pool.layout()),
+            chosen,
+            "the other bucket did not reuse the freed segment; the test is vacuous"
+        );
+        assert_eq!(
+            layer.pool.get(chosen).expect("segment").live_items(),
+            1,
+            "the stalled write appended into a segment another bucket owns"
         );
     }
 
