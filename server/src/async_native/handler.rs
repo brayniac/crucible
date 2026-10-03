@@ -219,7 +219,9 @@ async fn flush_worker<C: Cache>(
                         req.buffer_ptr,
                         req.buffer_len,
                     ) {
-                        Ok(fut) => fut.await,
+                        Ok(fut) => fut
+                            .await
+                            .and_then(|written| full_write(written, req.buffer_len)),
                         Err(e) => Err(e),
                     }
                 },
@@ -272,6 +274,19 @@ async fn flush_worker<C: Cache>(
                 }
             }
         }
+    }
+}
+
+/// A Direct I/O write's result as a flush outcome: an error unless it wrote
+/// all `len` bytes. A short write leaves the end of the segment unwritten on
+/// disk, so it is retried like a failed one.
+fn full_write(written: i32, len: u32) -> io::Result<i32> {
+    if written >= 0 && written as u32 == len {
+        Ok(written)
+    } else {
+        Err(io::Error::other(format!(
+            "short disk write: {written} of {len} bytes"
+        )))
     }
 }
 
@@ -955,4 +970,18 @@ fn yield_once() -> impl Future<Output = ()> {
             Poll::Pending
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_write;
+
+    /// A flush counts as done only when the write covered the whole buffer.
+    #[test]
+    fn a_short_flush_write_is_an_error() {
+        assert_eq!(full_write(8192, 8192).unwrap(), 8192);
+        assert!(full_write(4096, 8192).is_err(), "a short write passed");
+        assert!(full_write(0, 8192).is_err());
+        assert!(full_write(-5, 8192).is_err());
+    }
 }
