@@ -156,13 +156,47 @@ impl SlabCache {
         SlabCacheBuilder::new()
     }
 
+    /// Reset the cache to its freshly built state: an empty hashtable and
+    /// every slab back in the free pool.
+    ///
+    /// # Preconditions
+    ///
+    /// Only valid when no other operation is in flight on this cache: the
+    /// allocator reset frees slabs without waiting for readers. Under
+    /// traffic, use `Cache::flush`.
+    pub fn reset(&self) {
+        self.hashtable.clear();
+        self.allocator.reset_all();
+    }
+
     /// Pin the item at `location`, which a hashtable entry for `key` names,
     /// before the entry is replaced or removed. Never waits.
     fn pin_superseded(&self, key: &[u8], location: cache_core::Location) -> Superseded<'_> {
+        self.pin_superseded_inner(Some(key), location)
+    }
+
+    /// `pin_superseded` for an entry whose key is not known: the item is
+    /// pinned if its slot holds a live item, whatever its key.
+    fn pin_superseded_slot(&self, location: cache_core::Location) -> Superseded<'_> {
+        self.pin_superseded_inner(None, location)
+    }
+
+    fn pin_superseded_inner(
+        &self,
+        key: Option<&[u8]>,
+        location: cache_core::Location,
+    ) -> Superseded<'_> {
         let pool_id = SlabLocation::pool_id_from_location(location);
         if pool_id == self.ram_pool_id {
             let slab_loc = SlabLocation::from_location(location);
-            match self.allocator.pin_item(slab_loc, key) {
+            let pin = match key {
+                Some(key) => self.allocator.pin_item(slab_loc, key),
+                None => self
+                    .allocator
+                    .pin_slot(slab_loc)
+                    .filter(|pin| !pin.header().is_deleted()),
+            };
+            match pin {
                 Some(pin) => Superseded::Ram(slab_loc, pin),
                 None => Superseded::Unpinned,
             }
@@ -312,6 +346,15 @@ impl SlabCache {
                 item.slot_index,
             )
             .to_location();
+            // An item the hashtable no longer names (overwritten, or
+            // unlinked by a flush) is not worth a disk write.
+            if self
+                .hashtable
+                .get_item_frequency(item.key, location)
+                .is_none()
+            {
+                return false;
+            }
             self.demote_to_disk(item.key, item.value, ttl, location)
         }
     }
@@ -835,12 +878,16 @@ impl Cache for SlabCache {
         self.contains_key(key)
     }
 
+    /// Unlinks every hashtable entry and retires each unlinked item as
+    /// DELETE does: the item is pinned before its entry is removed, and only
+    /// the thread that removed the entry retires it. An item whose slab is
+    /// being evicted is left to that eviction. A write that runs concurrently
+    /// with the flush may survive it.
     fn flush(&self) {
-        // Clear the hashtable first - makes all items "invisible"
-        self.hashtable.clear();
-
-        // Reset the allocator (returns all slabs to free pool)
-        self.allocator.reset_all();
+        self.hashtable.drain_pinned(
+            |location| self.pin_superseded_slot(location),
+            |_, superseded| self.retire_superseded(superseded),
+        );
     }
 
     fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
@@ -1589,13 +1636,48 @@ mod tests {
         assert!(err.to_string().contains("slab classes"), "{err}");
     }
 
-    /// A flushed cache must still accept writes.
-    ///
-    /// The segment backends had this wrong (crucible#107): flush reset the
-    /// pool but left the layer's chain naming the segments it had just freed,
-    /// so every later write failed as `OutOfMemory`. `SlabAllocator::reset_all`
-    /// resets the per-class free lists and the global slab list together, so
-    /// there is no equivalent state left behind here -- this pins that.
+    /// A full cache accepts writes after a flush under every eviction
+    /// policy. Under `none`, where nothing is evicted, the flush itself must
+    /// free the slots, so the refill fits as much as the first fill did.
+    #[test]
+    fn every_slab_policy_refills_after_flush() {
+        for (name, strategy) in [
+            ("lra", EvictionStrategy::SLAB_LRA),
+            ("lrc", EvictionStrategy::SLAB_LRC),
+            ("random", EvictionStrategy::RANDOM),
+            ("none", EvictionStrategy::NONE),
+        ] {
+            let cache = SlabCacheBuilder::new()
+                .heap_size(1024 * 1024)
+                .slab_size(64 * 1024)
+                .hashtable_power(12)
+                .eviction_strategy(strategy)
+                .build()
+                .unwrap();
+            let ttl = Duration::from_secs(3600);
+            let value = vec![b'x'; 3000];
+            let fill = |prefix: &str| {
+                (0..1000)
+                    .filter(|i| {
+                        cache
+                            .set_item(format!("{prefix}{i}").as_bytes(), &value, ttl)
+                            .is_ok()
+                    })
+                    .count()
+            };
+            let before = fill("pre");
+            Cache::flush(&cache);
+            let after = fill("post");
+            assert!(
+                after >= before && after > 0,
+                "{name}: {after} writes fit after the flush, {before} before it"
+            );
+        }
+    }
+
+    /// After a flush no earlier item is readable, a full cache refills
+    /// through slab eviction, and a value read before the flush and still
+    /// held is not overwritten by the refill.
     #[test]
     fn test_cache_accepts_writes_after_flush() {
         let cache = create_test_cache();
@@ -1609,9 +1691,17 @@ mod tests {
                 .set_item(key.as_bytes(), &value, ttl)
                 .expect("pre-flush set");
         }
+        let held = Cache::get_value_ref(&cache, b"pre299").expect("pre299 is readable");
 
         Cache::flush(&cache);
 
+        for i in 0..300 {
+            let key = format!("pre{i}");
+            assert!(
+                cache.get_item(key.as_bytes()).is_none(),
+                "{key} survived the flush"
+            );
+        }
         for i in 0..300 {
             let key = format!("post{i}");
             cache
@@ -1620,6 +1710,11 @@ mod tests {
         }
 
         assert!(cache.contains_key(b"post299"));
+        assert_eq!(
+            held.as_ref(),
+            &value[..],
+            "a value held across the flush was overwritten"
+        );
     }
 
     /// Diagnostic for the intermittent `get` -> None failures tracked in #115.

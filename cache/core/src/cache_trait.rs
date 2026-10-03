@@ -453,9 +453,13 @@ pub trait Cache: Send + Sync + 'static {
     /// Check if a key exists in the cache.
     fn contains(&self, key: &[u8]) -> bool;
 
-    /// Flush all entries from the cache.
+    /// Remove every item: once this returns, no key written before the call
+    /// is readable. Safe under concurrent operations; a write concurrent
+    /// with the flush may survive it.
     ///
-    /// Note: This may be a no-op for some implementations.
+    /// Memory is not necessarily freed at once. The segment backend reclaims
+    /// flushed items through eviction and expiry, and until then its
+    /// residency stats keep counting them.
     fn flush(&self);
 
     /// Begin a two-phase SET for zero-copy receive into segment memory.

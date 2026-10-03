@@ -13,7 +13,9 @@
 use crate::config::{EvictionStrategy, LayerConfig};
 use crate::error::{CacheError, CacheResult};
 use crate::eviction::{ItemFate, determine_item_fate};
-use crate::hashtable::{Hashtable, KeyVerifier};
+use crate::hashtable::Hashtable;
+#[cfg(all(test, not(feature = "loom")))]
+use crate::hashtable::KeyVerifier;
 use crate::item::{BasicHeader, BasicItemGuard};
 use crate::item_location::ItemLocation;
 use crate::layer::Layer;
@@ -59,10 +61,12 @@ pub struct TtlLayer {
 }
 
 /// Helper struct for verifying keys in segments
+#[cfg(all(test, not(feature = "loom")))]
 struct SinglePoolVerifier<'a> {
     pool: &'a MemoryPool,
 }
 
+#[cfg(all(test, not(feature = "loom")))]
 impl KeyVerifier for SinglePoolVerifier<'_> {
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
         let item_loc = ItemLocation::from_location(location);
@@ -249,7 +253,7 @@ impl TtlLayer {
     /// Reset the layer to its freshly built state: empty TTL buckets, no
     /// cached write segments, and every segment free.
     ///
-    /// Backs [`crate::cache::TieredCache::flush`]. Resetting the pool alone is
+    /// Backs [`crate::cache::TieredCache::reset`]. Resetting the pool alone is
     /// not enough: the buckets and the per-bucket write-segment cache would
     /// keep naming segments the pool had just recycled, and the next append
     /// onto that stale tail fails -- reported as `OutOfMemory` even with every
@@ -436,7 +440,12 @@ impl TtlLayer {
                 )
                 .to_location();
 
-                let freq = hashtable.get_item_frequency(key, location).unwrap_or(0);
+                // An item the hashtable no longer names (overwritten, deleted, or
+                // unlinked by a flush) has nothing to ghost, demote or remove.
+                let Some(freq) = hashtable.get_item_frequency(key, location) else {
+                    offset += item_size;
+                    continue;
+                };
                 match determine_item_fate(freq, &self.config) {
                     ItemFate::Ghost => {
                         hashtable.convert_to_ghost(key, location);
@@ -1200,8 +1209,6 @@ impl TtlLayer {
         // commit sees this state change and writes the item again.
         crate::sync::fence(std::sync::atomic::Ordering::SeqCst);
 
-        let verifier = SinglePoolVerifier { pool: &self.pool };
-
         // ---- Phase A: scan the chain once, memoizing every live item.
         //
         // One `get_frequency` probe per item, here and nowhere else. The
@@ -1259,7 +1266,19 @@ impl TtlLayer {
                 // here, every budget, threshold and straddle decision is
                 // what it was when inserts started at 1, and CLOCK's floor
                 // of 1 still means "untouched since admission is pruned".
-                let reads = hashtable.get_frequency(key, &verifier);
+                //
+                // Looked up by location, not key: after a flush and a refill,
+                // the key's entry names its new copy, and scoring this copy
+                // by it would carry a copy nothing indexes.
+                let location = ItemLocation::new(
+                    self.pool.layout(),
+                    self.pool.pool_id(),
+                    cand_id,
+                    segment.incarnation(),
+                    offset,
+                )
+                .to_location();
+                let reads = hashtable.get_item_frequency(key, location);
                 let freq = reads.map_or(0, |f| f.saturating_add(1));
 
                 scanned.push(ScannedItem {
@@ -2289,6 +2308,33 @@ mod tests {
             );
         }
 
+        /// An item the hashtable does not name -- here because the table was
+        /// cleared, as a flush does -- is not handed to the demoter, even at a
+        /// demotion threshold of 0, where an unread indexed item is.
+        #[test]
+        fn demoting_eviction_skips_an_item_the_hashtable_does_not_name() {
+            let mut layer = TtlLayerBuilder::new()
+                .layer_id(1)
+                .pool_id(1)
+                .segment_size(64 * 1024)
+                .heap_size(640 * 1024)
+                .config(LayerConfig::new().with_demotion_threshold(0))
+                .spare_capacity(0)
+                .build()
+                .expect("Failed to create test layer");
+            layer.set_next_layer(2);
+            let staged = stage_one_item(&layer, 0);
+            staged.hashtable.clear();
+
+            let mut demoted = 0;
+            layer.process_evicted_segment_with_demoter(
+                staged.segment_id,
+                &staged.hashtable,
+                |_key, _value, _optional, _ttl, _location| demoted += 1,
+            );
+            assert_eq!(demoted, 0, "an item no entry names was demoted");
+        }
+
         /// An old copy of a key that has since been overwritten is not
         /// demoted, however hot the key is.
         ///
@@ -2608,7 +2654,7 @@ mod tests {
 
     /// A layer must accept writes again after `reset()`.
     ///
-    /// `reset()` backs FLUSHALL. Resetting the pool alone leaves the TTL
+    /// `reset()` backs `TieredCache::reset`. Resetting the pool alone leaves the TTL
     /// buckets -- and the per-bucket write-segment cache -- naming segments
     /// that are now `Free`, so `append_segment` cannot link onto that stale
     /// tail and the failure is reported as `OutOfMemory` even though every
@@ -4102,7 +4148,6 @@ mod merge_retention_budget {
     use crate::config::{EvictionStrategy, MergeConfig};
     use crate::hashtable_impl::MultiChoiceHashtable;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SEGMENT_SIZE: usize = 1024;
 
@@ -4395,6 +4440,38 @@ mod merge_retention_budget {
         );
     }
 
+    /// After the hashtable is cleared, as a flush does, and the same keys are
+    /// written again, a merge of the flushed copies carries none of them: they
+    /// are scored by their own location, which no entry names, not by the
+    /// key, whose entry names the new copy.
+    #[test]
+    fn merge_does_not_carry_flushed_copies_of_rewritten_keys() {
+        let layer = layer_with(
+            MergeConfig::new()
+                .with_min_segments(1)
+                .with_target_ratio(1.0),
+        );
+        let hashtable = MultiChoiceHashtable::new(12);
+        let n = 3 * (SEGMENT_SIZE / ITEM_BYTES);
+        let first = fill(&layer, &hashtable, n);
+        let first_chain = chain(&first);
+        hashtable.clear();
+        let second = fill(&layer, &hashtable, n);
+        let second_chain = chain(&second);
+        assert!(!second_chain.contains(&first_chain[0]));
+
+        assert!(layer.evict(&hashtable), "merge eviction did not run");
+
+        // A segment in neither chain that is in use is the spare.
+        let spare_bytes: usize = (0..layer.pool.segment_count() as u32)
+            .filter(|id| !first_chain.contains(id) && !second_chain.contains(id))
+            .filter_map(|id| layer.pool.get(id))
+            .filter(|segment| segment.state() != State::Free)
+            .map(|segment| segment.write_offset() as usize)
+            .sum();
+        assert_eq!(spare_bytes, 0, "flushed copies were carried into the spare");
+    }
+
     /// A segment with room to spare is compacted, not pruned.
     ///
     /// This asserted that a 0.5 target over sixteen live items leaves room
@@ -4471,25 +4548,30 @@ mod merge_retention_budget {
     /// budget is pinned by counting rather than by behaviour.
     struct ProbeCounting {
         inner: MultiChoiceHashtable,
-        freq_probes: AtomicUsize,
+        /// The key of every frequency probe, in order.
+        freq_probes: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     impl ProbeCounting {
         fn new(power: u8) -> Self {
             Self {
                 inner: MultiChoiceHashtable::new(power),
-                freq_probes: AtomicUsize::new(0),
+                freq_probes: std::sync::Mutex::new(Vec::new()),
             }
         }
 
-        fn take_probes(&self) -> usize {
-            self.freq_probes.swap(0, Ordering::Relaxed)
+        fn take_probes(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut *self.freq_probes.lock().unwrap())
+        }
+
+        fn probe(&self, key: &[u8]) {
+            self.freq_probes.lock().unwrap().push(key.to_vec());
         }
     }
 
     impl Hashtable for ProbeCounting {
         fn get_frequency(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<u8> {
-            self.freq_probes.fetch_add(1, Ordering::Relaxed);
+            self.probe(key);
             self.inner.get_frequency(key, verifier)
         }
 
@@ -4551,6 +4633,7 @@ mod merge_retention_budget {
         }
 
         fn get_item_frequency(&self, key: &[u8], location: Location) -> Option<u8> {
+            self.probe(key);
             self.inner.get_item_frequency(key, location)
         }
 
@@ -4563,7 +4646,7 @@ mod merge_retention_budget {
         }
     }
 
-    /// One probe per live item in the chain, and not one more.
+    /// The merge scan probes each live candidate item once and memoizes it.
     #[test]
     fn a_pass_probes_each_items_frequency_exactly_once() {
         let layer = layer_with(
@@ -4583,20 +4666,34 @@ mod merge_retention_budget {
         }
 
         // Every item in the candidates is live -- nothing here is overwritten
-        // or deleted -- so the pass has exactly this many frequencies to
-        // learn.
-        let live = written
-            .iter()
-            .filter(|w| candidates.contains(&w.segment))
-            .count();
-
+        // or deleted -- so the scan has one frequency to learn per item.
         hashtable.take_probes();
         assert!(layer.evict(&hashtable), "merge eviction did not run");
 
-        assert_eq!(
-            hashtable.take_probes(),
-            live,
-            "the pass did not probe each of its {live} live items exactly              once: the scan memoizes frequency precisely so the copy does not              have to ask again"
+        // The scan probes each candidate item once. This pass then falls
+        // back to whole-segment eviction, whose sweep probes the items of the
+        // one segment it evicts a second time; no item is probed more often,
+        // and no other segment's items twice.
+        let probes = hashtable.take_probes();
+        let mut doubled_segments = std::collections::HashSet::new();
+        for w in written.iter().filter(|w| candidates.contains(&w.segment)) {
+            let count = probes
+                .iter()
+                .filter(|p| p.as_slice() == w.key.as_bytes())
+                .count();
+            assert!(
+                (1..=2).contains(&count),
+                "{} was probed {count} times: the scan memoizes frequency",
+                w.key
+            );
+            if count == 2 {
+                doubled_segments.insert(w.segment);
+            }
+        }
+        assert!(
+            doubled_segments.len() <= 1,
+            "items of {doubled_segments:?} were probed twice: the scan probed \
+             an item more than once"
         );
     }
 

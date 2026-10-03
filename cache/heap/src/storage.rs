@@ -228,7 +228,7 @@ impl SlotStorage {
     /// Reset all slots and rebuild the free list.
     ///
     /// This clears all occupied slots (freeing their entries) and rebuilds
-    /// the free list to its initial state. Used during flush operations.
+    /// the free list to its initial state. Used by `HeapCache::reset`.
     ///
     /// # Safety
     ///

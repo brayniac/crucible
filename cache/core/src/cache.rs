@@ -391,7 +391,7 @@ impl CacheLayer {
 
     /// Reset this layer to its freshly built state.
     ///
-    /// Backs [`TieredCache::flush`]. This is the whole layer, not just its
+    /// Backs [`TieredCache::reset`]. This is the whole layer, not just its
     /// pool: chains and bucket lists are cleared, cached write segments are
     /// dropped, any pending disk flush is discarded, and only then is every
     /// segment returned to the free queue.
@@ -2068,12 +2068,30 @@ impl<H: Hashtable> TieredCache<H> {
         disk_layer.release_read(segment_id);
     }
 
-    /// Flush all items from the cache.
+    /// Remove every item from the cache.
     ///
-    /// This clears the hashtable and resets all segments to their initial state.
-    /// After calling flush, the cache will be empty.
+    /// Clears the hashtable, so no item is reachable once it returns.
+    /// Segments keep their bytes until eviction or expiry reclaims them,
+    /// through the same paths that reclaim any other segment, so nothing is
+    /// freed under a concurrent read or write. A write that runs concurrently
+    /// with the flush may survive it.
+    ///
+    /// Until eviction or expiry reclaims a flushed item's segment, the item
+    /// is still counted by the residency stats (`resident_items`,
+    /// `live_bytes`, `occupancy_deciles`).
     pub fn flush(&self) {
-        // Clear the hashtable first - this makes all items "invisible"
+        self.hashtable.clear();
+    }
+
+    /// Reset the cache to its freshly built state: an empty hashtable, and
+    /// every layer's segments free.
+    ///
+    /// # Preconditions
+    ///
+    /// Only valid when no other operation is in flight on this cache: the
+    /// layers' resets free segments without waiting for readers. Under
+    /// traffic, use [`Self::flush`].
+    pub fn reset(&self) {
         self.hashtable.clear();
 
         // Reset each layer completely -- organization state and pool both, or
@@ -2574,14 +2592,49 @@ mod tests {
             .build()
     }
 
-    /// Every layer type must still accept writes after `flush()`.
-    ///
-    /// `flush()` backs FLUSHALL. It used to reset the pools alone, leaving
-    /// each layer's organization state -- the FIFO chain, the TTL bucket
-    /// chains, the cached write segments -- naming segments the pool had just
-    /// recycled. The next write could not link onto that stale tail, and
-    /// `allocate_segment` reports the chain failure as `OutOfMemory`, so a
-    /// flushed server served misses forever with every segment free.
+    /// After `flush()`, no item written before it is readable, and a full
+    /// cache refills through ordinary eviction: the flushed items' segments
+    /// are reclaimed by the paths that reclaim any segment, so a value read
+    /// before the flush and still held is not overwritten by the refill.
+    #[test]
+    fn test_flush_hides_every_item_and_the_cache_refills() {
+        let cache = create_test_cache();
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+        // 1.2MB through 768KB of segments, so the cache is full.
+        for i in 0..300 {
+            cache
+                .set(format!("pre{i:03}").as_bytes(), &value, b"", ttl)
+                .unwrap_or_else(|e| panic!("pre set {i}: {e:?}"));
+        }
+        let held = cache.get_value_ref(b"pre299").expect("pre299 is readable");
+
+        cache.flush();
+
+        for i in 0..300 {
+            assert!(
+                cache.get(format!("pre{i:03}").as_bytes()).is_none(),
+                "pre{i:03} survived the flush"
+            );
+        }
+        for i in 0..300 {
+            cache
+                .set(format!("post{i:03}").as_bytes(), &value, b"", ttl)
+                .unwrap_or_else(|e| panic!("post set {i}: {e:?}"));
+        }
+        assert_eq!(cache.get(b"post299"), Some(value.clone()));
+        assert_eq!(
+            held.as_ref(),
+            &value[..],
+            "a value held across the flush was overwritten"
+        );
+    }
+
+    /// Every layer type accepts writes after `reset()`, which resets each
+    /// layer's organization state -- the FIFO chain, the TTL bucket chains,
+    /// the cached write segments -- along with its pool. A chain left naming
+    /// recycled segments makes the next write fail to link, which
+    /// `allocate_segment` reports as `OutOfMemory`.
     ///
     /// Written against the layers directly rather than through `set`, which
     /// only ever reaches layer 0: each `CacheLayer::reset` arm needs its own
@@ -2592,7 +2645,7 @@ mod tests {
     /// exclusion has to be stated here.
     #[test]
     #[cfg_attr(miri, ignore = "file-backed mmap is unsupported under Miri")]
-    fn test_flush_leaves_every_layer_type_writable() {
+    fn test_reset_leaves_every_layer_type_writable() {
         use crate::disk::{DiskLayerBuilder, IoUringDiskLayerBuilder};
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2679,7 +2732,7 @@ mod tests {
             );
         }
 
-        cache.flush();
+        cache.reset();
 
         for layer in &cache.layers {
             let chained = match layer {
@@ -2691,7 +2744,7 @@ mod tests {
             assert_eq!(
                 chained,
                 0,
-                "layer {} kept organization state naming segments flush freed",
+                "layer {} kept organization state naming segments reset freed",
                 layer.layer_id()
             );
         }

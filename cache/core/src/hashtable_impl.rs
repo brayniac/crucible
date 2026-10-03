@@ -1135,6 +1135,59 @@ impl MultiChoiceHashtable {
         false
     }
 
+    /// Unlink every entry, calling `unlinked` with the location of each live
+    /// one this call removed. Ghost entries are removed without a call.
+    ///
+    /// Each live entry is removed with a compare-exchange, so `unlinked` is
+    /// called once per entry and its caller owns the item as it would after
+    /// a successful [`Hashtable::remove`]. An entry published concurrently,
+    /// in a slot this call has already passed, survives it.
+    pub fn drain(&self, mut unlinked: impl FnMut(Location)) {
+        self.drain_pinned(|_| (), |location, ()| unlinked(location));
+    }
+
+    /// As [`Self::drain`], calling `pin` with each live entry's location
+    /// before removing it, as [`Hashtable::insert_pinned`] does. If the entry
+    /// changes before it is removed, the guard is dropped and the slot read
+    /// again. `unlinked` receives the guard for the entry it removed.
+    pub fn drain_pinned<G>(
+        &self,
+        mut pin: impl FnMut(Location) -> G,
+        mut unlinked: impl FnMut(Location, G),
+    ) {
+        for bucket in self.buckets.iter() {
+            for slot in bucket.items.iter() {
+                loop {
+                    let packed = slot.load(Ordering::Acquire);
+                    if packed == 0 {
+                        break;
+                    }
+                    if Hashbucket::is_ghost(packed) {
+                        if slot
+                            .compare_exchange(packed, 0, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            break;
+                        }
+                        spin_loop();
+                        continue;
+                    }
+                    let location = Hashbucket::location(packed);
+                    let guard = pin(location);
+                    if slot
+                        .compare_exchange(packed, 0, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        unlinked(location, guard);
+                        break;
+                    }
+                    drop(guard);
+                    spin_loop();
+                }
+            }
+        }
+    }
+
     fn try_unlink_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
 

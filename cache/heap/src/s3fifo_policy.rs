@@ -208,10 +208,12 @@ impl S3FifoPolicy {
 
     /// Drop all queued entries, returning the policy to its initial state.
     ///
-    /// For flush only, and only after the hashtable has been cleared. A queue
-    /// entry names a bucket; once flush clears those buckets, every entry is
-    /// stale, and `evict_from_small` abandons an eviction on the first stale
-    /// entry rather than skipping it.
+    /// Every popped entry stops being tracked, so call it only when the items
+    /// the entries name are about to be freed: `HeapCache::flush` calls it
+    /// before draining the hashtable, and `HeapCache::reset` with no operation
+    /// in flight. Left in place after the items are freed, every entry would
+    /// be stale, and `evict_from_small` abandons an eviction on the first
+    /// stale entry rather than skipping it.
     pub fn reset(&self) {
         self.small.clear();
         self.main.clear();
