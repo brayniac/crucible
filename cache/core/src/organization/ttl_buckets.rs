@@ -790,9 +790,13 @@ impl TtlBucket {
             return Err(TtlBucketError::InvalidState);
         }
 
-        // Spare must be in Reserved or Sealed state
+        // Spare must be in Reserved, Relinking (filled while readable) or
+        // Sealed state
         let spare_state = spare.state();
-        if spare_state != State::Reserved && spare_state != State::Sealed {
+        if !matches!(
+            spare_state,
+            State::Reserved | State::Relinking | State::Sealed
+        ) {
             return Err(TtlBucketError::InvalidState);
         }
 
@@ -927,9 +931,13 @@ impl TtlBucket {
 
         let spare = pool.get(spare_id).ok_or(TtlBucketError::InvalidSegmentId)?;
 
-        // Spare must be in Reserved or Sealed state
+        // Spare must be in Reserved, Relinking (filled while readable) or
+        // Sealed state
         let spare_state = spare.state();
-        if spare_state != State::Reserved && spare_state != State::Sealed {
+        if !matches!(
+            spare_state,
+            State::Reserved | State::Relinking | State::Sealed
+        ) {
             return Err(TtlBucketError::InvalidState);
         }
 
@@ -1386,8 +1394,8 @@ mod tests {
         chain_of(4)
     }
 
-    /// Put `ids` into Relinking and hand back a Reserved spare, which is the
-    /// state `replace_segments` expects a merge to have produced.
+    /// Put `ids` and a spare into Relinking, which is the state a merge
+    /// leaves them in before `replace_segments`.
     fn stage_merge(pool: &crate::memory_pool::MemoryPool, bucket: &TtlBucket, ids: &[u32]) -> u32 {
         for &id in ids {
             let seg = pool.get(id).expect("segment");
@@ -1397,9 +1405,9 @@ mod tests {
             );
         }
         let spare = pool.reserve().expect("spare");
-        pool.get(spare)
-            .expect("spare")
-            .set_bucket_id(bucket.index());
+        let spare_segment = pool.get(spare).expect("spare");
+        spare_segment.set_bucket_id(bucket.index());
+        assert!(spare_segment.cas_metadata(State::Reserved, State::Relinking, None, None));
         spare
     }
 

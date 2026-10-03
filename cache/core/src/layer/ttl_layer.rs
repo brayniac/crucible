@@ -694,9 +694,21 @@ impl TtlLayer {
             }
         };
 
+        // `Relinking` while it is filled, so a GET or SET of a relocated key
+        // resolves its entry in the spare (see `try_merge_eviction`).
+        if !spare.cas_metadata(State::Reserved, State::Relinking, None, None) {
+            src_a.cas_metadata(State::Relinking, State::Sealed, None, None);
+            src_b.cas_metadata(State::Relinking, State::Sealed, None, None);
+            self.pool.release(spare_id);
+            return false;
+        }
+
         // Copy items from src_a first (older), then src_b
         copy_items(src_a, src_a_id);
         copy_items(src_b, segment_id);
+
+        #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+        crate::segment::interpose::fire(crate::segment::interpose::RELOCATE_BEFORE_SPLICE);
 
         // Replace src_a and src_b with spare in the chain
         // This transitions src_a and src_b to AwaitingRelease
@@ -704,10 +716,10 @@ impl TtlLayer {
             .replace_adjacent_segments(src_a_id, segment_id, spare_id, &self.pool)
             .is_err()
         {
-            // Rollback: restore states and release spare
+            // Rollback: restore states and discard the spare
             src_a.cas_metadata(State::Relinking, State::Sealed, None, None);
             src_b.cas_metadata(State::Relinking, State::Sealed, None, None);
-            self.pool.release(spare_id);
+            self.discard_unspliced_spare(spare_id, hashtable);
             return false;
         }
 
@@ -715,6 +727,21 @@ impl TtlLayer {
         // src_a and src_b are now in AwaitingRelease state.
         // They will be returned to the free pool when their last reader drops.
         true
+    }
+
+    /// Discard a spare that items were relocated into but that could not be
+    /// spliced into its bucket.
+    ///
+    /// The relocated items' index entries point into the spare and readers
+    /// may hold it, so it cannot go straight back to the pool. It is evicted
+    /// like any detached segment: swept out of the index, then freed, or
+    /// condemned for the last reader to free.
+    fn discard_unspliced_spare<H: Hashtable>(&self, spare_id: u32, hashtable: &H) {
+        if let Some(spare) = self.pool.get(spare_id)
+            && spare.cas_metadata(State::Relinking, State::Draining, None, None)
+        {
+            self.process_evicted_segment(spare_id, hashtable);
+        }
     }
 
     /// Try to free a segment if it has no live items.
@@ -1317,6 +1344,21 @@ impl TtlLayer {
             return self.evict_selected_or_demote(hashtable, demoter);
         }
 
+        // The survivors' index entries move to the spare in phase C, so it has
+        // to be readable from then on: a GET resolves them there, and a SET
+        // of one of those keys finds and replaces the entry instead of
+        // inserting a second one. `Relinking` admits readers and is not
+        // picked by eviction; `replace_segments` seals it.
+        if !spare.cas_metadata(State::Reserved, State::Relinking, None, None) {
+            for &cand_id in &candidates {
+                if let Some(seg) = self.pool.get(cand_id) {
+                    seg.cas_metadata(State::Relinking, State::Sealed, None, None);
+                }
+            }
+            self.pool.release(spare_id);
+            return false;
+        }
+
         // ---- Phase C: copy the survivors, in the order they were scanned.
         let now = Self::now_secs();
         for item in &scanned {
@@ -1445,6 +1487,9 @@ impl TtlLayer {
             }
         }
 
+        #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+        crate::segment::interpose::fire(crate::segment::interpose::RELOCATE_BEFORE_SPLICE);
+
         // Only the prefix the pass actually consumed leaves the chain. The
         // rest go back to Sealed and stay linked behind the spare, to be
         // considered again by the next pass -- `replace_segments`
@@ -1468,7 +1513,7 @@ impl TtlLayer {
                     seg.cas_metadata(State::Relinking, State::Sealed, None, None);
                 }
             }
-            self.pool.release(spare_id);
+            self.discard_unspliced_spare(spare_id, hashtable);
             // Only a committed merge advances the cursor, so a pass that
             // rolled back would leave it on the position that just failed and
             // the next pass would start in the same place. Sending it back to
@@ -6003,6 +6048,156 @@ mod merge_demotion {
                 );
             }
         }
+    }
+
+    /// While merge relocates the items it keeps, they stay readable, and a
+    /// SET of one of those keys replaces its entry rather than adding a
+    /// second one. A spare left in `Reserved` refuses readers: the GET
+    /// misses, the SET inserts a duplicate, and after the merge one DELETE
+    /// leaves the key readable at its old value.
+    #[test]
+    fn a_key_relocated_by_merge_stays_readable_and_single() {
+        use crate::segment::interpose;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let clock = crate::clock::TestClock::start();
+        let layer = layer(0);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let value = vec![b'v'; ITEM_BYTES - 9 - 7];
+        for i in 0..4 * (SEGMENT_SIZE / ITEM_BYTES) {
+            let key = format!("k{i:06}");
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", TTL)
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+            for _ in 0..reads(i) {
+                assert!(hashtable.lookup(key.as_bytes(), &verifier).is_some());
+            }
+        }
+        // k000000 is hot, so merge keeps it. Its next value, written now and
+        // indexed inside the window.
+        let key = b"k000000";
+        let newer = layer.write_item(key, &value, b"", TTL).expect("write");
+
+        crate::clock::set_virtual_now(clock.now() + 100);
+        let seen = Rc::new(Cell::new(None));
+        {
+            let seen = Rc::clone(&seen);
+            let ht: *const MultiChoiceHashtable = &hashtable;
+            let pool: *const MemoryPool = &layer.pool;
+            let _hook = interpose::install(Box::new(move |phase| {
+                if phase == interpose::RELOCATE_BEFORE_SPLICE && seen.get().is_none() {
+                    // SAFETY: both outlive the hook guard.
+                    let (ht, pool) = unsafe { (&*ht, &*pool) };
+                    let verifier = SinglePoolVerifier { pool };
+                    let readable = ht.lookup(key, &verifier).is_some();
+                    let replaced = ht
+                        .insert(key, newer.to_location(), &verifier)
+                        .expect("insert")
+                        .is_some();
+                    seen.set(Some((readable, replaced)));
+                }
+            }));
+            assert!(layer.evict_with_demoter(&hashtable, |_, _, _, _, _| {}));
+        }
+        drop(clock);
+
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "(readable, replaced) inside the relocation window"
+        );
+        let (location, _) = hashtable.lookup(key, &verifier).expect("indexed");
+        assert_eq!(location, newer.to_location());
+        assert!(hashtable.remove(key, location));
+        assert!(
+            hashtable.lookup(key, &verifier).is_none(),
+            "a second entry for the key survived its delete"
+        );
+    }
+
+    /// The compaction twin of `a_key_relocated_by_merge_stays_readable_and_single`.
+    #[test]
+    fn a_key_relocated_by_compaction_stays_readable_and_single() {
+        use crate::segment::interpose;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let _clock = crate::clock::TestClock::start();
+        let layer = layer(0);
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = SinglePoolVerifier { pool: &layer.pool };
+        let value = vec![b'v'; ITEM_BYTES - 9 - 7];
+        let per = SEGMENT_SIZE / ITEM_BYTES;
+        let mut locations = Vec::new();
+        for i in 0..4 * per {
+            let key = format!("k{i:06}");
+            let loc = layer
+                .write_item(key.as_bytes(), &value, b"", TTL)
+                .expect("write");
+            hashtable
+                .insert(key.as_bytes(), loc.to_location(), &verifier)
+                .expect("insert");
+            locations.push(loc);
+        }
+        // Empty the first two segments but for their first items, so the two
+        // compact into one spare.
+        let layout = layer.pool.layout();
+        for (i, loc) in locations.iter().enumerate().take(2 * per) {
+            if i % per == 0 {
+                continue;
+            }
+            let key = format!("k{i:06}");
+            assert!(hashtable.remove(key.as_bytes(), loc.to_location()));
+            let segment = layer.pool.get(loc.segment_id(layout)).expect("segment");
+            segment
+                .mark_deleted(loc.offset(layout), key.as_bytes())
+                .expect("mark deleted");
+        }
+        let second = locations[per].segment_id(layout);
+        let key = b"k000000";
+        let newer = layer.write_item(key, &value, b"", TTL).expect("write");
+
+        let seen = Rc::new(Cell::new(None));
+        {
+            let seen = Rc::clone(&seen);
+            let ht: *const MultiChoiceHashtable = &hashtable;
+            let pool: *const MemoryPool = &layer.pool;
+            let _hook = interpose::install(Box::new(move |phase| {
+                if phase == interpose::RELOCATE_BEFORE_SPLICE && seen.get().is_none() {
+                    // SAFETY: both outlive the hook guard.
+                    let (ht, pool) = unsafe { (&*ht, &*pool) };
+                    let verifier = SinglePoolVerifier { pool };
+                    let readable = ht.lookup(key, &verifier).is_some();
+                    let replaced = ht
+                        .insert(key, newer.to_location(), &verifier)
+                        .expect("insert")
+                        .is_some();
+                    seen.set(Some((readable, replaced)));
+                }
+            }));
+            assert!(
+                layer.try_compact_segment(second, &hashtable),
+                "compaction ran"
+            );
+        }
+
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "(readable, replaced) inside the relocation window"
+        );
+        let (location, _) = hashtable.lookup(key, &verifier).expect("indexed");
+        assert_eq!(location, newer.to_location());
+        assert!(hashtable.remove(key, location));
+        assert!(
+            hashtable.lookup(key, &verifier).is_none(),
+            "a second entry for the key survived its delete"
+        );
     }
 
     /// At threshold 1 an item nobody read is pruned but not demoted.

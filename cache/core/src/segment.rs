@@ -263,6 +263,10 @@ pub(crate) mod interpose {
     /// a segment someone else may own. `IoUringDiskLayer`'s staging-buffer
     /// return is the cleanup that has to be inside `on_freed` for that reason.
     pub(crate) const FREE_AFTER_PUBLISH: u8 = 4;
+    /// The merge and compaction passes: after the survivors are copied into
+    /// the spare and their index entries moved to it, before the spare is
+    /// spliced into the chain.
+    pub(crate) const RELOCATE_BEFORE_SPLICE: u8 = 5;
 
     /// What a test installs: called with the phase.
     pub(crate) type Hook = Box<dyn FnMut(u8)>;
