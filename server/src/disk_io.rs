@@ -82,10 +82,12 @@ pub(crate) fn value_from_disk_read<'a>(
 /// returned. A deleted item, one with an invalid header, one that does not
 /// fit in `buf`, or one stored under a different key is a miss.
 ///
-/// The key check is the one the index could not make. A committed disk
-/// segment has no bytes in memory, so the hashtable matched this item on its
-/// 12-bit tag alone; about one lookup in 4,096 per occupied slot names some
-/// other key's item. Serving it would answer with another key's value.
+/// The key check compares the bytes the index could only compare by hash. A
+/// committed disk segment's keys are only on disk, so the hashtable matched
+/// this item by its tag and a 64-bit key hash recorded at flush
+/// (`DiskSegmentMeta::record_key_hashes`). Another key's item still reaches
+/// here on a hash collision, or when the disk bytes differ from the buffer
+/// that was hashed. Serving it would answer with another key's value.
 pub(crate) fn value_range_from_disk_read(
     buf: &[u8],
     item_offset: usize,
@@ -377,9 +379,9 @@ mod value_from_disk_read_tests {
         );
     }
 
-    /// The index matches a committed disk item on a 12-bit tag alone, so a
-    /// read can return a different key's item. Serving its value answers the
-    /// request with another key's data.
+    /// A disk read can return a different key's item (a key-hash collision,
+    /// or a flush that failed). Serving its value answers the request with
+    /// another key's data.
     #[test]
     fn another_keys_item_is_a_miss() {
         let buf = item(b"key-a", b"value-a");

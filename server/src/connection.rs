@@ -176,9 +176,9 @@ enum StreamingState {
 pub struct PendingDiskReadInfo {
     /// Disk read parameters from the cache layer.
     pub params: cache_core::DiskReadParams,
-    /// The key the read is for. The index matched it on a tag alone -- a
-    /// committed disk segment has no bytes in memory to compare against --
-    /// so the item the read returns must be checked against it.
+    /// The key the read is for. The index matched it by tag and recorded key
+    /// hash, not by the key bytes, which are only on disk, so the item the
+    /// read returns must be checked against it.
     pub key: Vec<u8>,
     /// Protocol context for building the response on completion.
     pub response_ctx: crate::disk_io::DiskReadResponseCtx,

@@ -386,6 +386,11 @@ pub trait SegmentKeyVerify {
     ///
     /// Used by hashtables to verify tag matches against actual keys.
     ///
+    /// The caller holds a reference from `try_acquire_read` for the
+    /// duration; prefer [`SegmentKeyVerify::verify_key_guarded`].
+    /// `DiskSegmentMeta` frees its recorded key hashes when the segment is
+    /// reserved again.
+    ///
     /// # Parameters
     /// - `offset`: Item offset within the segment
     /// - `key`: The key to compare against
