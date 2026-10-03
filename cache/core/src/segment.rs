@@ -271,6 +271,9 @@ pub(crate) mod interpose {
     /// expired, before the bucket re-checks it under its chain mutex and
     /// evicts it.
     pub(crate) const EXPIRE_BEFORE_EVICT: u8 = 6;
+    /// The disk and TTL layers' plain writes: after the write segment was
+    /// chosen, before it is pinned and appended to.
+    pub(crate) const WRITE_BEFORE_APPEND: u8 = 7;
 
     /// What a test installs: called with the phase.
     pub(crate) type Hook = Box<dyn FnMut(u8)>;
