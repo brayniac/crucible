@@ -16,8 +16,9 @@ pub const INVALID_SEGMENT_ID: u32 = 0xFF_FFFF;
 /// - **Linking**: Being added to a chain (next/prev being set)
 /// - **Live**: Active tail segment accepting writes and reads
 /// - **Sealed**: No more writes accepted, but data readable and chain stable
-/// - **Relinking**: Chain pointers being updated during neighbor removal.
-///   Data remains readable, only next/prev pointers are being modified.
+/// - **Relinking**: Readable, and held by a merge or compaction: either a
+///   source being replaced in its chain, or the spare being filled before it
+///   is spliced in, which is in no chain yet. Eviction never selects it.
 /// - **Draining**: Segment is being processed (merge eviction or removal).
 ///   Provides exclusive access - only one thread can hold a segment in Draining.
 ///   New reads are rejected; must wait for ref_count to drop before modifying data.
@@ -818,6 +819,8 @@ mod tests {
             // Ends append-pin admission (`try_pin_for_append` admits `Live`
             // only).
             (Live, Sealed),
+            // Discarding a spare whose splice failed.
+            (Relinking, Draining),
         ] {
             assert!(
                 transition_excludes_readers(from, to),
@@ -829,6 +832,8 @@ mod tests {
         // either leave admission unchanged, are already exclusive, or widen.
         for (from, to) in [
             (Sealed, Relinking),
+            (Reserved, Relinking), // a merge spare, readable while filled
+            (Relinking, Sealed),   // the spare spliced in
             (Live, Live),
             (Sealed, Sealed),
             (Locked, Locked),
