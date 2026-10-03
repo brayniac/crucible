@@ -226,10 +226,9 @@ async fn flush_worker<C: Cache>(
                 DiskBackend::Nvme { device, block_size } => {
                     let lba = req.disk_offset / *block_size as u64;
                     let num_blocks = (req.buffer_len / *block_size) as u16;
-                    // SAFETY: the flush buffer is owned by the cache's write
-                    // buffer for this segment and is only released by
-                    // `complete_flush` / the retry path below, both of which
-                    // run after the future resolves.
+                    // SAFETY: the flush buffer is the segment's write buffer,
+                    // held by a pin until `complete_flush`, which runs after
+                    // the future resolves.
                     match unsafe {
                         ringline::nvme_write(
                             *device,
@@ -248,7 +247,8 @@ async fn flush_worker<C: Cache>(
             DISK_FLUSHES.increment();
             match result {
                 Ok(_) => {
-                    // Success: detach write buffer and return it to the pool.
+                    // Success: detach the write buffer; it returns to the pool
+                    // when the last reader unpins.
                     cache.complete_flush(req.segment_id);
                 }
                 Err(e) if attempt < MAX_FLUSH_RETRIES => {

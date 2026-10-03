@@ -1110,25 +1110,7 @@ impl<H: Hashtable> TieredCache<H> {
         match layer {
             CacheLayer::IoUringDisk(disk_layer) => {
                 // Try synchronous read from write buffer first
-                if let Some((
-                    ref_count_ptr,
-                    value_ptr,
-                    value_len,
-                    metadata_ptr,
-                    free_queue_ptr,
-                    segment_id,
-                )) = disk_layer.read_from_buffer(item_loc, key)
-                {
-                    let vr = unsafe {
-                        crate::cache_trait::ValueRef::new(
-                            ref_count_ptr,
-                            value_ptr,
-                            value_len,
-                            metadata_ptr,
-                            free_queue_ptr,
-                            segment_id,
-                        )
-                    };
+                if let Some(vr) = disk_layer.read_from_buffer(item_loc, key) {
                     return LookupResult::Hit(vr);
                 }
                 // Need async disk read

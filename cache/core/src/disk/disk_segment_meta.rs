@@ -81,16 +81,96 @@ pub struct DiskSegmentMeta {
 
     /// RAM write buffer: present while the segment is being written to
     /// or while a flush is in-flight. Once the flush completes, this is
-    /// detached (set to None) and reads go to disk via io_uring.
+    /// detached and reads go to disk via io_uring.
+    ///
+    /// Written only by `attach_write_buffer`, on a segment its caller has
+    /// just reserved, by `release_write_buffer`, which runs once per attach
+    /// after the last pin is gone, and by `take_write_buffer_for_reset`, under
+    /// `IoUringDiskLayer::reset`'s precondition. Readers never touch the cell; they
+    /// resolve the buffer through `buffer_data` under a pin.
     write_buffer: UnsafeCell<Option<AlignedBuffer>>,
+
+    /// The attached buffer's data pointer, or null.
+    buffer_data: std::sync::atomic::AtomicPtr<u8>,
+
+    /// Pins on the write buffer and its state; see [`buffer_pin`].
+    buffer_pins: AtomicU32,
+
+    /// Where a released write buffer goes. Set once by the layer that owns
+    /// the pool.
+    buffer_pool:
+        std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<crate::disk::AlignedBufferPool>>>,
 }
 
-// SAFETY: All mutable state is managed through atomics.
-// The write_buffer is only accessed by a single writer thread at a time
-// (the worker that owns this pool). UnsafeCell is needed for interior
-// mutability but access is serialized by the caller.
+/// The write-buffer pin word.
+///
+/// A segment's write buffer is read zero-copy (a `ValueRef` or item guard
+/// sends straight from it) and written to disk by an asynchronous flush, so
+/// the buffer must not return to the pool -- where the next segment writes
+/// over it -- while anyone still holds a pointer into it. Every such holder
+/// pins the buffer after taking a reference on the segment and unpins it
+/// before releasing that reference. The evictor's walks hold the segment's
+/// `Draining` or `Locked` claim instead. A pin held under neither would let
+/// the segment be freed and its next buffer attached while the pin is held.
+///
+/// ```text
+/// no buffer:  0                     pin fails
+/// attached:   ATTACHED              pin succeeds
+/// detaching:  ATTACHED | DETACHING  pin fails; released when the count is 0
+/// ```
+///
+/// Exactly one thread releases a detached buffer: the detacher if no pin is
+/// held, otherwise the last unpinner, each through a CAS from
+/// `ATTACHED | DETACHING` with a zero count.
+mod buffer_pin {
+    /// Pins held on the buffer.
+    pub const COUNT_MASK: u32 = (1 << 29) - 1;
+    /// A buffer is attached.
+    pub const ATTACHED: u32 = 1 << 29;
+    /// The buffer has been detached and goes back to the pool once unpinned.
+    pub const DETACHING: u32 = 1 << 30;
+}
+
+// SAFETY: All mutable state is managed through atomics, except
+// `write_buffer`, whose writes are ordered by `buffer_pins` as described on
+// the field.
 unsafe impl Send for DiskSegmentMeta {}
 unsafe impl Sync for DiskSegmentMeta {}
+
+/// A pin on a segment's write buffer, released on drop.
+pub struct WriteBufferPin<'a> {
+    segment: &'a DiskSegmentMeta,
+    data: *mut u8,
+}
+
+impl WriteBufferPin<'_> {
+    /// The buffer's data pointer, valid while this pin is held.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data
+    }
+
+    /// The buffer's data pointer, for appends into a `Live` segment.
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.data
+    }
+
+    /// Give up the RAII release and keep the pin; the caller must call
+    /// [`DiskSegmentMeta::unpin_write_buffer`] later.
+    #[inline]
+    pub fn into_raw(self) -> *mut u8 {
+        let data = self.data;
+        std::mem::forget(self);
+        data
+    }
+}
+
+impl Drop for WriteBufferPin<'_> {
+    fn drop(&mut self) {
+        self.segment.unpin_write_buffer();
+    }
+}
 
 impl DiskSegmentMeta {
     const INVALID_BUCKET_ID: u16 = 0xFFFF;
@@ -136,6 +216,9 @@ impl DiskSegmentMeta {
             disk_offset,
             free_queue,
             write_buffer: UnsafeCell::new(None),
+            buffer_data: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            buffer_pins: AtomicU32::new(0),
+            buffer_pool: std::sync::OnceLock::new(),
         }
     }
 
@@ -145,19 +228,29 @@ impl DiskSegmentMeta {
         self.disk_offset
     }
 
-    /// Check if a write buffer is currently attached.
-    #[inline]
-    pub fn has_write_buffer(&self) -> bool {
-        // SAFETY: Read-only check, caller serializes mutations.
-        unsafe { (*self.write_buffer.get()).is_some() }
+    /// Give this segment the pool its write buffers return to. Called once
+    /// by the layer that owns the segment's pool.
+    pub fn set_buffer_pool(
+        &self,
+        pool: std::sync::Arc<std::sync::Mutex<crate::disk::AlignedBufferPool>>,
+    ) {
+        let _ = self.buffer_pool.set(pool);
     }
 
-    /// Attach a write buffer to this segment.
-    ///
-    /// # Safety
-    ///
-    /// Must be called from the owning worker thread only.
+    /// Whether a write buffer is attached and not detached. Advisory: a
+    /// reader that needs the buffer pins it with [`Self::pin_write_buffer`].
+    #[inline]
+    pub fn has_write_buffer(&self) -> bool {
+        let state = self.buffer_pins.load(Ordering::Acquire);
+        state & buffer_pin::ATTACHED != 0 && state & buffer_pin::DETACHING == 0
+    }
+
+    /// Attach a write buffer to a segment the caller has just reserved.
     pub fn attach_write_buffer(&self, buf: AlignedBuffer) {
+        let data = buf.as_ptr() as *mut u8;
+        // SAFETY: the segment was just reserved, so no buffer is attached
+        // and no release can be running: every pin is taken under a segment
+        // reference or the evictor's claim, and the segment was free.
         unsafe {
             debug_assert!(
                 (*self.write_buffer.get()).is_none(),
@@ -166,42 +259,118 @@ impl DiskSegmentMeta {
             );
             *self.write_buffer.get() = Some(buf);
         }
+        self.buffer_data
+            .store(data, std::sync::atomic::Ordering::Release);
+        // Keep any count: a pin that failed against the empty state is about
+        // to back out, and its unpin must not underflow.
+        let mut cur = self.buffer_pins.load(Ordering::Relaxed);
+        loop {
+            let new = (cur & buffer_pin::COUNT_MASK) | buffer_pin::ATTACHED;
+            match self.buffer_pins.compare_exchange_weak(
+                cur,
+                new,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
-    /// Detach and return the write buffer.
+    /// Pin the write buffer. Returns `None` if no buffer is attached or it
+    /// has been detached.
     ///
-    /// # Safety
-    ///
-    /// Must be called from the owning worker thread only.
-    pub fn detach_write_buffer(&self) -> Option<AlignedBuffer> {
+    /// The caller holds a segment reference (or the evictor's claim) from
+    /// before this call until after the unpin; see the `buffer_pin` module.
+    pub fn pin_write_buffer(&self) -> Option<WriteBufferPin<'_>> {
+        let prev = self.buffer_pins.fetch_add(1, Ordering::Acquire);
+        debug_assert!(prev & buffer_pin::COUNT_MASK < buffer_pin::COUNT_MASK);
+        if prev & buffer_pin::ATTACHED == 0 || prev & buffer_pin::DETACHING != 0 {
+            self.unpin_write_buffer();
+            return None;
+        }
+        Some(WriteBufferPin {
+            segment: self,
+            data: self.buffer_data.load(std::sync::atomic::Ordering::Acquire),
+        })
+    }
+
+    /// Release a pin taken by [`Self::pin_write_buffer`] and kept with
+    /// [`WriteBufferPin::into_raw`]. Returns the buffer to the pool if it was
+    /// detached and this was the last pin.
+    pub fn unpin_write_buffer(&self) {
+        let prev = self.buffer_pins.fetch_sub(1, Ordering::Release);
+        if prev & buffer_pin::COUNT_MASK == 1
+            && prev & !buffer_pin::COUNT_MASK == buffer_pin::ATTACHED | buffer_pin::DETACHING
+        {
+            self.release_write_buffer();
+        }
+    }
+
+    /// Detach the write buffer: new pins fail, and the buffer returns to the
+    /// pool once no pin is held -- now, or when the last pin is released.
+    pub fn detach_write_buffer(&self) {
+        let prev = self
+            .buffer_pins
+            .fetch_or(buffer_pin::DETACHING, Ordering::AcqRel);
+        if prev & buffer_pin::ATTACHED != 0 && prev & buffer_pin::COUNT_MASK == 0 {
+            self.release_write_buffer();
+        }
+    }
+
+    /// Return a detached, unpinned buffer to the pool, unless another thread
+    /// already has or a pin has arrived since (its unpin releases it).
+    fn release_write_buffer(&self) {
+        if self
+            .buffer_pins
+            .compare_exchange(
+                buffer_pin::ATTACHED | buffer_pin::DETACHING,
+                0,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.buffer_data
+            .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        // SAFETY: the CAS above is the only way into this branch, and it
+        // succeeds once per attach, after every pin is gone.
+        let buf = unsafe { (*self.write_buffer.get()).take() };
+        if let (Some(buf), Some(pool)) = (buf, self.buffer_pool.get()) {
+            pool.lock().unwrap().release(buf);
+        }
+    }
+
+    /// Detach and return the write buffer regardless of pins, for a reset
+    /// that requires no operation to be in flight.
+    pub fn take_write_buffer_for_reset(&self) -> Option<AlignedBuffer> {
+        // Keep the count: a `ValueRef` still in flight unpins later, and must
+        // not underflow into the state bits.
+        self.buffer_pins
+            .fetch_and(buffer_pin::COUNT_MASK, Ordering::AcqRel);
+        self.buffer_data
+            .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        // SAFETY: the caller guarantees no operation is in flight.
         unsafe { (*self.write_buffer.get()).take() }
     }
 
-    /// Get a pointer to the write buffer data (if present).
-    ///
-    /// Returns `None` if no write buffer is attached.
+    /// The write buffer's data pointer, or `None`. The caller holds a pin for
+    /// as long as it dereferences the pointer. The key-verifier prefetch in
+    /// `cache.rs` calls this without one and never dereferences it.
+    #[inline]
     pub fn write_buffer_ptr(&self) -> Option<*const u8> {
-        unsafe { (*self.write_buffer.get()).as_ref().map(|buf| buf.as_ptr()) }
+        let data = self.buffer_data.load(std::sync::atomic::Ordering::Acquire);
+        (!data.is_null()).then_some(data as *const u8)
     }
 
-    /// Get a mutable pointer to the write buffer data (if present).
-    ///
-    /// Returns `None` if no write buffer is attached.
+    /// Mutable form of [`Self::write_buffer_ptr`], with the same contract.
+    #[inline]
     pub fn write_buffer_mut_ptr(&self) -> Option<*mut u8> {
-        unsafe {
-            (*self.write_buffer.get())
-                .as_mut()
-                .map(|buf| buf.as_mut_ptr())
-        }
-    }
-
-    /// Get the capacity of the attached write buffer (if present).
-    pub fn write_buffer_capacity(&self) -> Option<usize> {
-        unsafe {
-            (*self.write_buffer.get())
-                .as_ref()
-                .map(|buf| buf.capacity())
-        }
+        let data = self.buffer_data.load(std::sync::atomic::Ordering::Acquire);
+        (!data.is_null()).then_some(data)
     }
 
     /// Get the pointer to the metadata atomic for ValueRef construction.
@@ -223,11 +392,9 @@ impl DiskSegmentMeta {
     /// condemned segment (see #127), and the last one out has to release it or
     /// nobody will.
     ///
-    /// Note: unlike [`IoUringDiskLayer::release_read`] this cannot return a
-    /// staging buffer to the layer's buffer pool -- the segment does not know
-    /// about it. Reaching here with a write buffer still attached means the
-    /// segment was condemned before it was flushed, which the layer handles on
-    /// its own paths.
+    /// Eviction detaches the write buffer before it condemns the segment, so
+    /// the buffer returns to the pool on its last unpin; this path does not
+    /// touch it.
     pub(crate) fn release_ref(&self) {
         // SeqCst -- see `SliceSegment::release_ref`. The store half of this
         // decrement is the reader side of the release Dekker pair; `Release`
@@ -279,9 +446,10 @@ impl SegmentKeyVerify for DiskSegmentMeta {
         // When write buffer has been flushed to disk, we can't verify the key
         // in RAM. Trust the hashtable tag match: whoever completes the async
         // read must compare the actual key (see `LookupResult::DiskRead`).
-        let Some(data_ptr) = self.write_buffer_ptr() else {
+        let Some(pin) = self.pin_write_buffer() else {
             return self.state().is_readable();
         };
+        let data_ptr = pin.as_ptr();
 
         if offset as usize + BasicHeader::SIZE > self.capacity as usize {
             return false;
@@ -320,7 +488,8 @@ impl SegmentKeyVerify for DiskSegmentMeta {
         key: &[u8],
         allow_deleted: bool,
     ) -> Option<(u8, u8, u32)> {
-        let data_ptr = self.write_buffer_ptr()?;
+        let pin = self.pin_write_buffer()?;
+        let data_ptr = pin.as_ptr();
 
         if offset as usize + BasicHeader::SIZE > self.capacity as usize {
             return None;
@@ -610,6 +779,7 @@ impl Segment for DiskSegmentMeta {
             .store(Self::INVALID_BUCKET_ID, Ordering::Release);
     }
 
+    // The caller holds a write-buffer pin for as long as it uses the slice.
     fn data_slice(&self, offset: u32, len: usize) -> Option<&[u8]> {
         // Only available when write buffer is present
         let data_ptr = self.write_buffer_ptr()?;
@@ -621,6 +791,7 @@ impl Segment for DiskSegmentMeta {
         Some(unsafe { std::slice::from_raw_parts(data_ptr.add(offset as usize), len) })
     }
 
+    // The caller holds a write-buffer pin for as long as it uses the pointer.
     fn header_ptr(&self, offset: u32, len: usize) -> Option<*const u8> {
         // Only available when write buffer is present
         let data_ptr = self.write_buffer_ptr()?;
@@ -633,7 +804,8 @@ impl Segment for DiskSegmentMeta {
     }
 
     fn append_item(&self, key: &[u8], value: &[u8], optional: &[u8]) -> Option<u32> {
-        let data_ptr = self.write_buffer_mut_ptr()?;
+        let pin = self.pin_write_buffer()?;
+        let data_ptr = pin.as_mut_ptr();
 
         let header = BasicHeader::new(key.len() as u8, optional.len() as u8, value.len() as u32);
         let header_size = BasicHeader::SIZE;
@@ -745,10 +917,10 @@ impl Segment for DiskSegmentMeta {
     }
 
     fn finalize_append(&self, offset: u32, item_size: u32) {
-        if let Some(data_ptr) = self.write_buffer_mut_ptr()
+        if let Some(pin) = self.pin_write_buffer()
             && offset as usize + BasicHeader::SIZE <= self.capacity as usize
         {
-            let flags_ptr = unsafe { data_ptr.add(offset as usize + 1) };
+            let flags_ptr = unsafe { pin.as_mut_ptr().add(offset as usize + 1) };
             #[cfg(not(feature = "loom"))]
             {
                 // SAFETY: in bounds (checked above); every writer of this
@@ -770,7 +942,7 @@ impl Segment for DiskSegmentMeta {
     }
 
     fn mark_deleted_at_offset(&self, offset: u32) {
-        let Some(data_ptr) = self.write_buffer_mut_ptr() else {
+        let Some(pin) = self.pin_write_buffer() else {
             return;
         };
 
@@ -781,7 +953,7 @@ impl Segment for DiskSegmentMeta {
         // Set the deleted flag atomically. This byte is read concurrently by
         // every header decode (`item::read_flags`), so a plain
         // read-modify-write here is a data race with live readers.
-        let flags_ptr = unsafe { data_ptr.add(offset as usize + 1) };
+        let flags_ptr = unsafe { pin.as_mut_ptr().add(offset as usize + 1) };
 
         #[cfg(not(feature = "loom"))]
         {
@@ -807,9 +979,10 @@ impl Segment for DiskSegmentMeta {
     }
 
     fn mark_deleted(&self, offset: u32, key: &[u8]) -> Result<bool, CacheError> {
-        let Some(data_ptr) = self.write_buffer_mut_ptr() else {
+        let Some(pin) = self.pin_write_buffer() else {
             return Err(CacheError::SegmentNotAccessible);
         };
+        let data_ptr = pin.as_mut_ptr();
 
         if offset as usize + BasicHeader::SIZE > self.capacity as usize {
             return Err(CacheError::InvalidOffset);
