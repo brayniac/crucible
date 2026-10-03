@@ -55,6 +55,9 @@ pub struct DiskReadParams {
     pub segment_id: u32,
     /// Pool ID.
     pub pool_id: u8,
+    /// Byte offset on the device/file where the item's segment ends. An item
+    /// never extends past it, so no read for the item needs to either.
+    pub segment_end: u64,
 }
 
 /// A sealed segment that needs to be flushed to disk via io_uring.
@@ -372,6 +375,8 @@ impl IoUringDiskLayer {
             item_offset,
             segment_id,
             pool_id: self.pool.pool_id(),
+            segment_end: self.pool.segment_disk_offset(segment_id)
+                + self.pool.segment_size() as u64,
         })
     }
 

@@ -1714,13 +1714,25 @@ impl Connection {
             return;
         }
 
+        self.queue_value_bytes(value_ref.into_bytes(), trailer);
+    }
+
+    /// Queue a value held in `Bytes` after the header already in
+    /// `write_buf`, then `trailer`. A value of `ZERO_COPY_MIN_VALUE_SIZE` or
+    /// more is sent from its own memory; a smaller one is copied.
+    fn queue_value_bytes(&mut self, value: Bytes, trailer: &[u8]) {
+        if value.len() < ZERO_COPY_MIN_VALUE_SIZE {
+            self.write_buf.extend_from_slice(&value);
+            self.write_buf.extend_from_slice(trailer);
+            return;
+        }
+
         // Flush write_buf (including the header the caller just wrote) to the queue
         self.flush_write_buf_to_queue();
 
         // Push the value directly into the queue (zero-copy)
-        let value_bytes = value_ref.into_bytes();
-        self.send_queue_bytes += value_bytes.len();
-        self.send_queue.push_back(value_bytes);
+        self.send_queue_bytes += value.len();
+        self.send_queue.push_back(value);
 
         // Write the trailer into the fresh write_buf
         self.write_buf.extend_from_slice(trailer);
@@ -1916,11 +1928,13 @@ impl Connection {
         }
     }
 
-    /// Write a disk read response in the appropriate protocol format.
+    /// Write a disk read response in the appropriate protocol format. The
+    /// value is sent from `value`'s memory when it is large enough; see
+    /// `queue_value_bytes`.
     pub(crate) fn write_disk_read_response(
         &mut self,
         response_ctx: &crate::disk_io::DiskReadResponseCtx,
-        value: &[u8],
+        value: Bytes,
     ) {
         use crate::disk_io::DiskReadResponseCtx;
 
@@ -1932,8 +1946,7 @@ impl Connection {
                 self.write_buf
                     .extend_from_slice(len_buf.format(value.len()).as_bytes());
                 self.write_buf.extend_from_slice(b"\r\n");
-                self.write_buf.extend_from_slice(value);
-                self.write_buf.extend_from_slice(b"\r\n");
+                self.queue_value_bytes(value, b"\r\n");
             }
             DiskReadResponseCtx::MemcacheAscii { key } => {
                 // VALUE <key> 0 <len>\r\n<value>\r\nEND\r\n
@@ -1944,8 +1957,7 @@ impl Connection {
                 self.write_buf
                     .extend_from_slice(len_buf.format(value.len()).as_bytes());
                 self.write_buf.extend_from_slice(b"\r\n");
-                self.write_buf.extend_from_slice(value);
-                self.write_buf.extend_from_slice(b"\r\nEND\r\n");
+                self.queue_value_bytes(value, b"\r\nEND\r\n");
             }
             DiskReadResponseCtx::MemcacheBinary {
                 key,
@@ -1969,7 +1981,7 @@ impl Connection {
 
                 let header_total = HEADER_SIZE + extras_len + key_len;
                 let start = self.write_buf.len();
-                self.write_buf.reserve(header_total + value.len());
+                self.write_buf.reserve(header_total);
                 unsafe {
                     self.write_buf.set_len(start + header_total);
                 }
@@ -1988,7 +2000,7 @@ impl Connection {
                     let key_start = start + HEADER_SIZE + extras_len;
                     self.write_buf[key_start..key_start + key.len()].copy_from_slice(key);
                 }
-                self.write_buf.extend_from_slice(value);
+                self.queue_value_bytes(value, b"");
             }
         }
     }
