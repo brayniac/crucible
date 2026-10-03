@@ -263,7 +263,7 @@ impl TtlBuckets {
 
     /// Return every bucket to its freshly constructed state.
     ///
-    /// For flush only. The caller must have already made the segments
+    /// For a reset only. The caller must have already made the segments
     /// unreachable -- this drops the buckets' references to them without
     /// touching their state, so calling it while the chains are live would
     /// strand every segment they name.
@@ -494,7 +494,7 @@ impl TtlBucket {
 
     /// Return this bucket to its freshly constructed state.
     ///
-    /// For flush only. The caller must have already made the segments
+    /// For a reset only. The caller must have already made the segments
     /// unreachable -- this drops the chain's references to them without
     /// touching their state, so calling it while the chain is live would
     /// strand every segment it names.

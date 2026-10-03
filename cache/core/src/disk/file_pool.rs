@@ -245,7 +245,7 @@ impl FilePool {
 
     /// Reset all segments to Free state and rebuild the free queue.
     ///
-    /// This is used during flush operations to reset the entire pool.
+    /// Used by a layer reset (`TieredCache::reset`) to reset the entire pool.
     pub fn reset_all(&self) {
         // Drain the free queue first
         loop {

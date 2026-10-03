@@ -82,7 +82,7 @@ impl FifoLayer {
     /// Reset the layer to its freshly built state: an empty chain and every
     /// segment free.
     ///
-    /// Backs [`crate::cache::TieredCache::flush`]. Resetting the pool alone is
+    /// Backs [`crate::cache::TieredCache::reset`]. Resetting the pool alone is
     /// not enough: the chain would keep naming segments the pool had just
     /// recycled, and the next `push` onto that stale tail fails -- reported as
     /// `OutOfMemory` even with every segment free.
@@ -217,7 +217,12 @@ impl FifoLayer {
                     )
                     .to_location();
 
-                    let freq = hashtable.get_item_frequency(key, location).unwrap_or(0);
+                    // An item the hashtable no longer names (overwritten, deleted, or
+                    // unlinked by a flush) has nothing to ghost, demote or remove.
+                    let Some(freq) = hashtable.get_item_frequency(key, location) else {
+                        offset += item_size;
+                        continue;
+                    };
                     match determine_item_fate(freq, &self.config) {
                         ItemFate::Ghost => {
                             hashtable.convert_to_ghost(key, location);
@@ -1410,7 +1415,7 @@ mod tests {
 
     /// A layer must accept writes again after `reset()`.
     ///
-    /// `reset()` backs FLUSHALL. Resetting the pool alone leaves the FIFO
+    /// `reset()` backs `TieredCache::reset`. Resetting the pool alone leaves the FIFO
     /// chain naming segments that are now `Free`, so `FifoChain::push` cannot
     /// link onto that stale tail -- and `allocate_segment` reports the failure
     /// as `OutOfMemory` even though every segment is free.

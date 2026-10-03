@@ -288,10 +288,9 @@ impl SetStorage {
     /// Deallocate a slot.
     /// Free every slot and rebuild the free list, as if newly constructed.
     ///
-    /// For flush only, and only after the hashtable has been cleared. Clearing
-    /// the hashtable makes these entries unreachable but leaves their slots
-    /// occupied -- without this, FLUSHALL leaks every set for the life
-    /// of the process.
+    /// For `HeapCache::reset` only, after the hashtable has been cleared.
+    /// Clearing the hashtable makes these entries unreachable but leaves
+    /// their slots occupied, and this frees them.
     ///
     /// Generations are bumped rather than left alone: a `TypedLocation` names
     /// (slot, generation), so a stale one from before the flush must stop

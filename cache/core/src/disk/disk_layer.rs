@@ -108,7 +108,7 @@ impl DiskLayer {
     /// Reset the layer to its freshly built state: empty TTL buckets, no
     /// cached write segments, and every segment free.
     ///
-    /// Backs [`crate::cache::TieredCache::flush`]. Resetting the pool alone is
+    /// Backs [`crate::cache::TieredCache::reset`]. Resetting the pool alone is
     /// not enough: the buckets and the per-bucket write-segment cache would
     /// keep naming segments the pool had just recycled, and the next append
     /// onto that stale tail fails -- reported as `OutOfMemory` even with every
@@ -1080,7 +1080,7 @@ mod tests {
 
     /// A layer must accept writes again after `reset()`.
     ///
-    /// `reset()` backs FLUSHALL. Resetting the pool alone leaves the TTL
+    /// `reset()` backs `TieredCache::reset`. Resetting the pool alone leaves the TTL
     /// buckets -- and the per-bucket write-segment cache -- naming segments
     /// that are now `Free`, so `append_segment` cannot link onto that stale
     /// tail and the failure is reported as `OutOfMemory` even though every

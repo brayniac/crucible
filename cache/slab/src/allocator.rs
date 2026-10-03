@@ -864,7 +864,7 @@ impl SlabAllocator {
     /// Reset the entire allocator, returning all memory to the free pool.
     ///
     /// This resets all slab classes and returns their slabs to the global
-    /// free list. Used during flush operations.
+    /// free list. Used by `SlabCache::reset`.
     pub fn reset_all(&self) {
         // First, drain the existing free slab list
         loop {

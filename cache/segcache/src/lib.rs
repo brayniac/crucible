@@ -1702,12 +1702,8 @@ mod tests {
         assert!(!cache.contains(b"key"));
     }
 
-    /// A flushed cache must still accept writes.
-    ///
-    /// `flush()` resets the pools but historically left each layer's chain
-    /// naming the segments it had just freed, so the next chain link failed and
-    /// was reported as `OutOfMemory` with every segment free. `flush()` backs
-    /// FLUSHALL, so this left a running server serving misses forever.
+    /// A flushed cache accepts writes: the flushed items' segments are
+    /// reclaimed by eviction as the cache refills.
     #[test]
     fn test_cache_accepts_writes_after_flush() {
         let cache = create_test_cache();

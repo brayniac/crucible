@@ -383,7 +383,7 @@ impl IoUringDiskLayer {
     /// Reset the layer to its freshly built state: empty TTL buckets, no
     /// cached write segments, no pending flushes, and every segment free.
     ///
-    /// Backs [`crate::cache::TieredCache::flush`]. Resetting the pool alone is
+    /// Backs [`crate::cache::TieredCache::reset`]. Resetting the pool alone is
     /// not enough, for two reasons:
     ///
     /// - The buckets and the per-bucket write-segment cache would keep naming
@@ -1760,7 +1760,7 @@ mod tests {
     /// A layer must accept writes again after `reset()`, with nothing left
     /// pointing at the segments it just recycled.
     ///
-    /// `reset()` backs FLUSHALL. Three things go stale at once here:
+    /// `reset()` backs `TieredCache::reset`. Three things go stale at once here:
     ///
     /// - the TTL buckets and the per-bucket write-segment cache, which would
     ///   name `Free` segments and make the next append fail as `OutOfMemory`;

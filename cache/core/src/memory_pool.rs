@@ -300,7 +300,7 @@ impl RamPool for MemoryPool {
 impl MemoryPool {
     /// Reset all segments to Free state and rebuild the free queues.
     ///
-    /// This is used during flush operations to reset the entire pool.
+    /// Used by a layer reset (`TieredCache::reset`) to reset the entire pool.
     /// All segments are reset to their initial state and distributed
     /// between the free queue and spare queue.
     ///

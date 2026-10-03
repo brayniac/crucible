@@ -210,9 +210,10 @@ impl FifoQueue {
 
     /// Drop every entry, returning the queue to empty.
     ///
-    /// For flush only. The entries name hashtable buckets and storage slots, so
-    /// this is correct exactly when those have already been cleared -- calling
-    /// it on a live queue silently stops tracking everything it held.
+    /// Every entry it pops stops being tracked, so call it only when the
+    /// items the entries name are about to be freed: `HeapCache::flush`
+    /// calls it before draining the hashtable, and `HeapCache::reset` with no
+    /// operation in flight.
     pub fn clear(&self) {
         while self.pop().is_some() {}
     }

@@ -1576,7 +1576,7 @@ impl Segment for SliceSegment<'_> {
 impl SliceSegment<'_> {
     /// Force reset this segment to Free state.
     ///
-    /// This is used during flush operations to reset all segments regardless
+    /// Used by a pool reset (`TieredCache::reset`) to reset all segments regardless
     /// of their current state. It resets all data fields and sets the state
     /// to Free.
     ///
