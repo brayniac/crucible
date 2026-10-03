@@ -60,6 +60,15 @@ thread_local! {
     static VIRTUAL_NOW: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
+/// The deadline `ttl` after `now`, in seconds, saturating at `u32::MAX`.
+///
+/// A TTL is converted with this rather than `as u32`, which truncates: a
+/// TTL of 2^32 seconds or more would otherwise wrap to a small value and
+/// expire the item early.
+pub fn deadline(now: u32, ttl: std::time::Duration) -> u32 {
+    now.saturating_add(u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX))
+}
+
 /// Current time in unix seconds, as every expiry check sees it.
 #[inline]
 pub fn now_unix_secs() -> u32 {
@@ -151,5 +160,19 @@ impl TestClock {
 impl Drop for TestClock {
     fn drop(&mut self) {
         clear_virtual_now();
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod deadline_tests {
+    use super::deadline;
+    use std::time::Duration;
+
+    /// A TTL past `u32::MAX` seconds saturates instead of wrapping.
+    #[test]
+    fn a_deadline_saturates() {
+        assert_eq!(deadline(100, Duration::from_secs(10)), 110);
+        assert_eq!(deadline(100, Duration::from_secs(1 << 32)), u32::MAX);
+        assert_eq!(deadline(u32::MAX - 1, Duration::from_secs(10)), u32::MAX);
     }
 }

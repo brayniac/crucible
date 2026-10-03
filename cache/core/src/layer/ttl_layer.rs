@@ -280,7 +280,7 @@ impl TtlLayer {
         let segment = self.pool.get(segment_id).ok_or(CacheError::OutOfMemory)?;
 
         // Set segment expiration time
-        let expire_at = Self::now_secs().saturating_add(ttl.as_secs() as u32);
+        let expire_at = crate::clock::deadline(Self::now_secs(), ttl);
         segment.set_expire_at(expire_at);
 
         // Track which bucket this segment belongs to
@@ -2901,6 +2901,21 @@ mod tests {
             .write_item(b"after", b"v", b"", Duration::from_secs(4))
             .unwrap();
         assert!(layer.get_item(location, b"after").is_some());
+    }
+
+    /// An item with a TTL of 2^31 seconds is still readable later, rather
+    /// than placed in the shortest-lived bucket.
+    #[test]
+    fn a_very_long_ttl_does_not_expire_early() {
+        let clock = crate::clock::TestClock::start();
+        let layer = create_test_layer();
+        let location = layer
+            .write_item(b"k", b"v", b"", Duration::from_secs(1 << 31))
+            .unwrap();
+        for _ in 0..100 {
+            clock.tick();
+        }
+        assert!(layer.get_item(location, b"k").is_some());
     }
 
     #[test]

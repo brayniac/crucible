@@ -130,7 +130,7 @@ impl SlabItemHeader {
             let expire_at = if ttl.is_zero() {
                 0
             } else {
-                let expire = now_secs().saturating_add(ttl.as_secs() as u32);
+                let expire = cache_core::clock::deadline(now_secs(), ttl);
                 expire.min(MAX_EXPIRE)
             };
 

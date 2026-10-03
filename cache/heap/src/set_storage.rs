@@ -701,7 +701,7 @@ fn expire_timestamp(ttl: Duration) -> u32 {
     use clocksource::coarse::UnixInstant;
     let now = UnixInstant::now();
     let now_secs = now.duration_since(UnixInstant::EPOCH).as_secs();
-    now_secs.saturating_add(ttl.as_secs() as u32)
+    cache_core::clock::deadline(now_secs, ttl)
 }
 
 /// Check if an expiration timestamp has passed.
