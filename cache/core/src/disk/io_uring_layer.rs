@@ -1463,6 +1463,50 @@ mod tests {
         );
     }
 
+    /// The layer keeps accepting writes once it is full: each eviction frees a
+    /// segment and the next write lands in it. The layer seals a full
+    /// segment itself before it appends the next, so the bucket chain must
+    /// link a tail that is already sealed; without that link the first
+    /// eviction left the bucket with no head, and every later eviction failed
+    /// and every write after it was `OutOfMemory`.
+    #[test]
+    fn writes_continue_through_repeated_eviction() {
+        let layer = test_layer();
+        let hashtable = MultiChoiceHashtable::new(12);
+        let verifier = IoUringPoolVerifier { pool: &layer.pool };
+        let ttl = Duration::from_secs(3600);
+        let value = vec![b'v'; 4096];
+
+        let mut evictions = 0;
+        for i in 0..400 {
+            let key = format!("key_{i:04}");
+            let location = loop {
+                match layer.write_item_with_buffers(key.as_bytes(), &value, b"", ttl) {
+                    Ok(location) => break location,
+                    Err(CacheError::OutOfMemory) => {
+                        for request in layer.take_flush_queue() {
+                            layer.complete_flush(request.segment_id);
+                        }
+                        assert!(
+                            layer.evict(&hashtable),
+                            "write {i}: the layer is full and eviction found nothing \
+                             after {evictions} evictions"
+                        );
+                        evictions += 1;
+                    }
+                    Err(e) => panic!("write {i}: {e:?}"),
+                }
+            };
+            hashtable
+                .insert(key.as_bytes(), location.to_location(), &verifier)
+                .expect("insert");
+        }
+        assert!(
+            evictions > 4,
+            "the test must evict more than once: {evictions}"
+        );
+    }
+
     /// A reset cancels queued flushes, dropping the segment reference each
     /// holds. A reference left behind keeps the segment from ever reaching
     /// `ref_count == 0`, so its next eviction condemns it and nothing frees it.

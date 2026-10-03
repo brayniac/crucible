@@ -556,11 +556,23 @@ impl TtlBucket {
                 .get(current_tail)
                 .ok_or(TtlBucketError::InvalidSegmentId)?;
 
-            // Seal the old tail if it's Live
-            let old_tail_state = tail_segment.state();
-            if old_tail_state == State::Live
-                && !tail_segment.cas_metadata(State::Live, State::Sealed, Some(segment_id), None)
-            {
+            // Link the old tail to the new segment, sealing it if it is Live.
+            // A tail already sealed by its writer -- the io_uring disk layer
+            // seals a full segment before it allocates the next -- still
+            // needs the link, or the chain ends at it and eviction loses
+            // every segment after the head.
+            // The tail's state can change under the CAS (merge takes
+            // `Sealed -> Relinking` outside this mutex), so re-read and retry.
+            let linked = (0..8).any(|_| {
+                let old_tail_state = tail_segment.state();
+                let new_tail_state = if old_tail_state == State::Live {
+                    State::Sealed
+                } else {
+                    old_tail_state
+                };
+                tail_segment.cas_metadata(old_tail_state, new_tail_state, Some(segment_id), None)
+            });
+            if !linked {
                 return Err(TtlBucketError::StateTransitionFailed);
             }
 
@@ -1191,6 +1203,32 @@ mod tests {
         // Tail should be Live
         let segment3 = pool.get(seg3).unwrap();
         assert_eq!(segment3.state(), State::Live);
+    }
+
+    /// A tail its writer sealed before the next segment arrived is still
+    /// linked to it, so eviction walks past the head. Before the link, the
+    /// first eviction left the bucket with no head and every later one
+    /// reported it empty.
+    #[test]
+    fn test_append_links_an_already_sealed_tail() {
+        let pool = create_test_pool();
+        let bucket = TtlBucket::new(Duration::from_secs(100), 12);
+
+        let segs: Vec<u32> = (0..3).map(|_| pool.reserve().unwrap()).collect();
+        for &seg in &segs {
+            if let Some(tail) = bucket.tail() {
+                let tail = pool.get(tail).unwrap();
+                assert!(tail.cas_metadata(State::Live, State::Sealed, None, None));
+            }
+            bucket.append_segment(seg, &pool).unwrap();
+        }
+
+        assert_eq!(pool.get(segs[0]).unwrap().next(), Some(segs[1]));
+        assert_eq!(pool.get(segs[1]).unwrap().next(), Some(segs[2]));
+        assert_eq!(bucket.evict_head_segment(&pool), Ok(segs[0]));
+        assert_eq!(bucket.head(), Some(segs[1]));
+        assert_eq!(bucket.evict_head_segment(&pool), Ok(segs[1]));
+        assert_eq!(bucket.head(), Some(segs[2]));
     }
 
     #[test]
