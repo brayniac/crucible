@@ -267,6 +267,10 @@ pub(crate) mod interpose {
     /// the spare and their index entries moved to it, before the spare is
     /// spliced into the chain.
     pub(crate) const RELOCATE_BEFORE_SPLICE: u8 = 5;
+    /// `TtlLayer::try_expire_segments`: after a bucket's head was seen
+    /// expired, before the bucket re-checks it under its chain mutex and
+    /// evicts it.
+    pub(crate) const EXPIRE_BEFORE_EVICT: u8 = 6;
 
     /// What a test installs: called with the phase.
     pub(crate) type Hook = Box<dyn FnMut(u8)>;

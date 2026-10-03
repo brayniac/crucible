@@ -305,18 +305,33 @@ impl TtlLayer {
         }
     }
 
+    /// Whether new items can go in `segment`: it is `Live`, and its
+    /// segment-level expiry has not passed. An item written to an expired
+    /// segment is a miss on its first read.
+    fn is_writable(segment: &SliceSegment<'static>, now: u32) -> bool {
+        let expire_at = segment.expire_at();
+        segment.state() == State::Live && (expire_at == 0 || now < expire_at)
+    }
+
     /// Get or allocate the write segment for a TTL.
+    ///
+    /// An expired tail is not written to: a new segment is appended, which
+    /// seals the expired one so expiry can reclaim it.
     fn get_or_allocate_write_segment(&self, ttl: Duration) -> CacheResult<u32> {
         let bucket_index = self.buckets.get_bucket_index(ttl);
         let bucket = self.buckets.get_bucket_by_index(bucket_index);
+        let now = Self::now_secs();
 
         // Check cached write segment first
         if bucket_index < self.current_write_segments.len() {
             let cached_id = self.current_write_segments[bucket_index]
                 .load(std::sync::atomic::Ordering::Acquire);
+            // The cached segment can have been evicted, freed and given to
+            // another bucket since it was cached.
             if cached_id != u32::MAX
                 && let Some(segment) = self.pool.get(cached_id)
-                && segment.state() == State::Live
+                && segment.bucket_id() == Some(bucket_index as u16)
+                && Self::is_writable(segment, now)
             {
                 return Ok(cached_id);
             }
@@ -325,7 +340,7 @@ impl TtlLayer {
         // Check bucket tail
         if let Some(tail_id) = bucket.tail()
             && let Some(segment) = self.pool.get(tail_id)
-            && segment.state() == State::Live
+            && Self::is_writable(segment, now)
         {
             // Update cache
             if bucket_index < self.current_write_segments.len() {
@@ -787,7 +802,7 @@ impl TtlLayer {
 
         let bucket = self.buckets.get_bucket_by_index(bucket_id);
 
-        // Need at least 2 segments to remove one (keep the Live tail)
+        // A sole segment is left to expiry.
         if bucket.segment_count() < 2 {
             return false;
         }
@@ -852,19 +867,17 @@ impl TtlLayer {
 
         // Check each bucket for expired segments
         for bucket in self.buckets.iter() {
-            // Can only evict if bucket has 2+ segments (keep Live tail)
-            if bucket.segment_count() < 2 {
-                continue;
-            }
-
             // Check if head segment is expired
             if let Some(head_id) = bucket.head()
                 && let Some(segment) = self.pool.get(head_id)
             {
                 let expire_at = segment.expire_at();
                 if expire_at > 0 && now >= expire_at {
-                    // Segment is expired, try to evict it
-                    if let Ok(evicted_id) = bucket.evict_head_segment(&self.pool) {
+                    #[cfg(all(test, not(feature = "loom"), not(feature = "shuttle")))]
+                    crate::segment::interpose::fire(crate::segment::interpose::EXPIRE_BEFORE_EVICT);
+                    // Checked again under the bucket's chain mutex: the head
+                    // can have been freed and reused since it was read here.
+                    if let Ok(evicted_id) = bucket.evict_expired_head(&self.pool, now) {
                         self.process_evicted_segment(evicted_id, hashtable);
                         expired_count += 1;
                     }
@@ -905,8 +918,9 @@ impl TtlLayer {
     /// - `Sealed`, so the segment is neither the bucket's Live write target
     ///   nor mid-transition in someone else's merge;
     /// - still carrying a bucket id, so there is a chain to unlink it from;
-    /// - in a bucket holding at least two segments, because a bucket must
-    ///   keep a Live tail and `evict_head_segment` refuses otherwise.
+    /// - in a bucket holding at least two segments. A bucket's only segment
+    ///   is usually its Live tail, which the `Sealed` check already
+    ///   excludes; a sole segment that is `Sealed` is left to expiry.
     ///
     /// The scan is over the pool rather than the chains, because `Random`,
     /// `Fifo` and `Cte` all rank segments layer-wide and a chain walk would
@@ -2746,6 +2760,147 @@ mod tests {
         let guard = guard.unwrap();
         assert_eq!(guard.key(), key);
         assert_eq!(guard.value(), value);
+    }
+
+    /// A write to a bucket whose tail has expired goes to a new segment, and
+    /// is readable.
+    #[test]
+    fn a_write_after_the_tail_expires_is_readable() {
+        let clock = crate::clock::TestClock::start();
+        let layer = create_test_layer();
+        let ttl = Duration::from_secs(10);
+        let first = layer.write_item(b"a", b"v", b"", ttl).unwrap();
+        for _ in 0..120 {
+            clock.tick();
+        }
+        let second = layer.write_item(b"b", b"v", b"", ttl).unwrap();
+        assert!(
+            layer.get_item(second, b"b").is_some(),
+            "a fresh write is unreadable"
+        );
+        assert_ne!(
+            first.unpack(layer.pool.layout()).1,
+            second.unpack(layer.pool.layout()).1,
+            "the write went to the expired segment"
+        );
+    }
+
+    /// Expiry that saw a bucket's head expired, while another expire freed
+    /// it and a write to the same bucket reused it, leaves the reused
+    /// segment and its fresh item alone.
+    #[test]
+    #[cfg(not(feature = "shuttle"))]
+    fn expiry_does_not_evict_a_head_reused_since_it_was_seen_expired() {
+        use crate::segment::interpose;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let clock = crate::clock::TestClock::start();
+        let layer = create_test_layer();
+        let hashtable = crate::hashtable_impl::MultiChoiceHashtable::new(10);
+        // Nine long-lived buckets of one segment each, and one short-lived
+        // segment, fill the ten segments.
+        for i in 0..9u64 {
+            layer
+                .write_item(b"long", b"v", b"", Duration::from_secs(500 + 8 * i))
+                .unwrap();
+        }
+        let short = Duration::from_secs(4);
+        let first = layer.write_item(b"short", b"v", b"", short).unwrap();
+        assert_eq!(layer.free_segment_count(), 0);
+        for _ in 0..20 {
+            clock.tick();
+        }
+
+        let fresh = Rc::new(Cell::new(None));
+        {
+            let fresh = Rc::clone(&fresh);
+            let layer_ptr: *const TtlLayer = &layer;
+            let ht: *const crate::hashtable_impl::MultiChoiceHashtable = &hashtable;
+            let _hook = interpose::install(Box::new(move |phase| {
+                if phase == interpose::EXPIRE_BEFORE_EVICT && fresh.get().is_none() {
+                    // SAFETY: both outlive the hook guard.
+                    let (layer, ht) = unsafe { (&*layer_ptr, &*ht) };
+                    assert_eq!(layer.expire(ht), 1);
+                    fresh.set(Some(layer.write_item(b"fresh", b"v", b"", short).unwrap()));
+                }
+            }));
+            assert_eq!(layer.expire(&hashtable), 0);
+        }
+
+        let fresh = fresh.get().expect("the hook ran");
+        assert_eq!(
+            fresh.unpack(layer.pool.layout()).1,
+            first.unpack(layer.pool.layout()).1,
+            "the fresh write did not reuse the expired segment"
+        );
+        assert!(
+            layer.get_item(fresh, b"fresh").is_some(),
+            "a fresh, unexpired item was evicted by expiry"
+        );
+    }
+
+    /// A bucket's cached write segment, expired, freed and then given to
+    /// another bucket, is not written to by the first bucket.
+    #[test]
+    fn a_write_does_not_go_to_a_cached_segment_now_in_another_bucket() {
+        let clock = crate::clock::TestClock::start();
+        let layer = create_test_layer();
+        let hashtable = crate::hashtable_impl::MultiChoiceHashtable::new(10);
+        let segment_of = |location: ItemLocation| location.unpack(layer.pool.layout()).1;
+        let ttls: Vec<_> = (0..10u64).map(|i| Duration::from_secs(8 * i + 4)).collect();
+        let first: Vec<_> = ttls
+            .iter()
+            .map(|&ttl| segment_of(layer.write_item(b"k", b"v", b"", ttl).unwrap()))
+            .collect();
+        for _ in 0..200 {
+            clock.tick();
+        }
+        assert_eq!(layer.expire(&hashtable), 10);
+
+        let reused = segment_of(
+            layer
+                .write_item(b"k", b"v", b"", Duration::from_secs(3600))
+                .unwrap(),
+        );
+        let old_bucket = first.iter().position(|&id| id == reused).unwrap();
+        let location = layer.write_item(b"k", b"v", b"", ttls[old_bucket]).unwrap();
+        assert_ne!(
+            segment_of(location),
+            reused,
+            "the write went to a segment of another bucket"
+        );
+    }
+
+    /// Expiry reclaims a bucket's only segment once it has expired. With
+    /// every segment the expired tail of its own bucket, nothing else can
+    /// free memory.
+    #[test]
+    fn expiry_reclaims_a_bucket_whose_only_segment_has_expired() {
+        let clock = crate::clock::TestClock::start();
+        let layer = create_test_layer();
+        let hashtable = crate::hashtable_impl::MultiChoiceHashtable::new(10);
+        // Ten TTLs eight seconds apart, one per bucket, fill the ten segments.
+        for i in 0..10u64 {
+            layer
+                .write_item(
+                    format!("k{i}").as_bytes(),
+                    b"v",
+                    b"",
+                    Duration::from_secs(8 * i + 4),
+                )
+                .unwrap();
+        }
+        assert_eq!(layer.free_segment_count(), 0);
+        for _ in 0..200 {
+            clock.tick();
+        }
+        assert_eq!(layer.expire(&hashtable), 10);
+        assert_eq!(layer.free_segment_count(), 10);
+        let location = layer
+            .write_item(b"after", b"v", b"", Duration::from_secs(4))
+            .unwrap();
+        assert!(layer.get_item(location, b"after").is_some());
     }
 
     #[test]
