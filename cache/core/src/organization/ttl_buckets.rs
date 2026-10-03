@@ -29,8 +29,9 @@
 //!                +------------+     +------------+     +------------+
 //! ```
 //!
-//! - **Head**: Oldest segment (expires first, evicted first)
-//! - **Tail**: Newest segment (currently Live, accepting writes)
+//! - Head: oldest segment (expires first, evicted first)
+//! - Tail: newest segment; Live and accepting writes until it fills or its
+//!   segment-level expiry passes
 
 use crate::pool::RamPool;
 use crate::segment::Segment;
@@ -72,7 +73,7 @@ pub enum TtlBucketError {
     StateTransitionFailed,
     /// Bucket is empty.
     EmptyBucket,
-    /// Cannot evict the only segment (need to keep tail Live).
+    /// The head is the bucket's only segment, which only expiry evicts.
     CannotEvictLiveSegment,
     /// Cannot remove head segment directly (use evict_head instead).
     CannotRemoveHead,
@@ -599,6 +600,10 @@ impl TtlBucket {
 
     /// Evict and remove the head segment from this bucket.
     ///
+    /// The head must be `Sealed` and must not be the bucket's only segment:
+    /// a sole segment is the newest in the bucket, and only expiry takes it
+    /// ([`Self::evict_expired_head`]).
+    ///
     /// Returns the segment ID in Draining state (ready for clearing).
     /// The caller is responsible for waiting for readers, clearing items,
     /// and transitioning to Free state.
@@ -607,15 +612,60 @@ impl TtlBucket {
         P::Segment: Segment,
     {
         let _guard = self.chain_mutex.lock();
+        self.evict_head_locked(pool, false)
+    }
+
+    /// Evict the head segment if its segment-level expiry has passed at
+    /// `now`, sealing it first if it is the bucket's only segment.
+    ///
+    /// The expiry is read under the chain mutex. `append_segment` links a
+    /// segment under the same mutex after its `expire_at` is set, so a head
+    /// freed and reused by this bucket since the caller looked at it is seen
+    /// with its new expiry and left alone.
+    ///
+    /// Returns the segment ID in Draining state, as `evict_head_segment`.
+    pub fn evict_expired_head<P: RamPool>(&self, pool: &P, now: u32) -> Result<u32, TtlBucketError>
+    where
+        P::Segment: Segment,
+    {
+        let _guard = self.chain_mutex.lock();
 
         let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-
-        // Can't evict if empty or only one segment (need to keep Live tail)
         if head == INVALID_SEGMENT_ID {
             return Err(TtlBucketError::EmptyBucket);
         }
-        if head == tail {
+        let segment = pool.get(head).ok_or(TtlBucketError::InvalidSegmentId)?;
+        let expire_at = segment.expire_at();
+        if expire_at == 0 || now < expire_at {
+            return Err(TtlBucketError::InvalidState);
+        }
+        // The only segment is the bucket's write target. Writers stop
+        // choosing it once it has expired, so seal it here; otherwise a
+        // bucket that receives no further writes keeps it allocated.
+        if head == self.tail.load(Ordering::Acquire) {
+            segment.cas_metadata(State::Live, State::Sealed, None, None);
+        }
+        self.evict_head_locked(pool, true)
+    }
+
+    /// Evict the head with the chain mutex already held. A sole segment is
+    /// evicted only with `allow_sole`, which leaves the bucket empty.
+    fn evict_head_locked<P: RamPool>(
+        &self,
+        pool: &P,
+        allow_sole: bool,
+    ) -> Result<u32, TtlBucketError>
+    where
+        P::Segment: Segment,
+    {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+
+        if head == INVALID_SEGMENT_ID {
+            return Err(TtlBucketError::EmptyBucket);
+        }
+
+        if head == tail && !allow_sole {
             return Err(TtlBucketError::CannotEvictLiveSegment);
         }
 
@@ -648,6 +698,9 @@ impl TtlBucket {
         }
 
         self.head.store(next_id, Ordering::Release);
+        if head == tail {
+            self.tail.store(INVALID_SEGMENT_ID, Ordering::Release);
+        }
         self.segment_count.fetch_sub(1, Ordering::Relaxed);
 
         // Clear evicted segment's chain links
@@ -1280,6 +1333,41 @@ mod tests {
         // Cannot evict single segment (it's Live)
         let result = bucket.evict_head_segment(&pool);
         assert_eq!(result, Err(TtlBucketError::CannotEvictLiveSegment));
+    }
+
+    /// An expired sole segment is sealed and evicted by expiry, which
+    /// empties the bucket, and the next append starts a new chain. Eviction
+    /// that is not expiry leaves a sealed sole segment alone.
+    #[test]
+    fn test_evict_expired_single_segment() {
+        let pool = create_test_pool();
+        let buckets = TtlBuckets::new();
+        let bucket = buckets.get_bucket_by_index(0);
+
+        let id = pool.reserve().unwrap();
+        let segment = pool.get(id).unwrap();
+        segment.set_expire_at(100);
+        bucket.append_segment(id, &pool).unwrap();
+
+        assert!(bucket.evict_expired_head(&pool, 99).is_err());
+        assert_eq!(segment.state(), State::Live);
+        assert!(segment.cas_metadata(State::Live, State::Sealed, None, None));
+        assert_eq!(
+            bucket.evict_head_segment(&pool),
+            Err(TtlBucketError::CannotEvictLiveSegment)
+        );
+        assert!(segment.cas_metadata(State::Sealed, State::Live, None, None));
+
+        assert_eq!(bucket.evict_expired_head(&pool, 100), Ok(id));
+        assert!(bucket.is_empty());
+        assert_eq!(bucket.head(), None);
+        assert_eq!(bucket.tail(), None);
+        assert_eq!(bucket.segment_count(), 0);
+
+        let next = pool.reserve().unwrap();
+        bucket.append_segment(next, &pool).unwrap();
+        assert_eq!(bucket.head(), Some(next));
+        assert_eq!(bucket.tail(), Some(next));
     }
 
     #[test]
