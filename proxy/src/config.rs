@@ -79,9 +79,9 @@ impl Config {
                     "cache.segment_size must be > 0 when cache is enabled".into(),
                 ));
             }
-            if self.cache.segment_size > self.cache.heap_size {
+            if self.cache.heap_size / self.cache.segment_size < 3 {
                 return Err(ConfigError::Validation(
-                    "cache.segment_size must be <= cache.heap_size".into(),
+                    "cache.heap_size must hold at least 3 segments of cache.segment_size".into(),
                 ));
             }
             if self.cache.hashtable_power == 0 {

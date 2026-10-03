@@ -363,6 +363,11 @@ impl DiskTierConfig {
     }
 }
 
+/// The fewest segments layer 0 can work with. `TieredCache` evicts until
+/// layer 0 has more than its eviction threshold (1) free segments, besides
+/// the one being written; with fewer, every SET fails.
+const LAYER0_MIN_SEGMENTS: usize = 3;
+
 /// Builder for [`SegCache`].
 ///
 /// # Example
@@ -701,6 +706,16 @@ impl SegCacheBuilder {
         let eviction_seed = self.eviction_seed;
         let eviction_strategy = single_layer_strategy(&self.eviction_policy);
 
+        let segments = self.heap_size / self.segment_size;
+        if segments < LAYER0_MIN_SEGMENTS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "heap holds {segments} segments; at least {LAYER0_MIN_SEGMENTS} are needed"
+                ),
+            ));
+        }
+
         // If disk tier is enabled, configure demotion to disk layer (layer 1)
         let mut layer_config = seeded_layer_config(eviction_seed)
             .with_ghosts(self.enable_ghosts)
@@ -780,13 +795,17 @@ impl SegCacheBuilder {
         // Calculate segment counts
         let total_segments = self.heap_size / self.segment_size;
         let small_percent = small_queue_percent.clamp(1, 50) as usize;
-        let small_queue_segments = ((total_segments * small_percent) / 100).max(1);
+        let small_queue_segments =
+            ((total_segments * small_percent) / 100).max(LAYER0_MIN_SEGMENTS);
         let main_cache_segments = total_segments.saturating_sub(small_queue_segments);
 
         if main_cache_segments == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "Not enough segments for main cache",
+                format!(
+                    "heap holds {total_segments} segments; the small queue needs \
+                     {small_queue_segments} and the main cache at least one"
+                ),
             ));
         }
 
@@ -1041,6 +1060,60 @@ impl Cache for SegCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An S3-FIFO cache whose small-queue percentage gives fewer than three
+    /// segments still accepts writes: the small queue is raised to three.
+    #[test]
+    fn a_small_s3fifo_heap_accepts_writes() {
+        for segments in [10usize, 20] {
+            let cache = SegCacheBuilder::new()
+                .heap_size(segments * 64 * 1024)
+                .segment_size(64 * 1024)
+                .hashtable_power(14)
+                .eviction_policy(EvictionPolicy::S3Fifo {
+                    small_queue_percent: 10,
+                    demotion_threshold: 1,
+                })
+                .build()
+                .unwrap();
+            let value = vec![b'x'; 1000];
+            for i in 0..5000 {
+                cache
+                    .set(
+                        format!("k{i}").as_bytes(),
+                        &value,
+                        Duration::from_secs(3600),
+                    )
+                    .unwrap_or_else(|e| panic!("{segments} segments: set {i} failed: {e:?}"));
+            }
+            assert!(cache.get(b"k4999").is_some(), "{segments} segments");
+        }
+    }
+
+    /// A heap too small for layer 0 to work is rejected when the cache is
+    /// built, rather than building a cache whose every SET fails.
+    #[test]
+    fn a_heap_below_three_segments_is_rejected() {
+        let single = SegCacheBuilder::new()
+            .heap_size(2 * 64 * 1024)
+            .segment_size(64 * 1024)
+            .eviction_policy(EvictionPolicy::Fifo)
+            .build();
+        assert!(single.is_err(), "a two-segment single-layer heap was built");
+
+        let s3fifo = SegCacheBuilder::new()
+            .heap_size(3 * 64 * 1024)
+            .segment_size(64 * 1024)
+            .eviction_policy(EvictionPolicy::S3Fifo {
+                small_queue_percent: 10,
+                demotion_threshold: 1,
+            })
+            .build();
+        assert!(
+            s3fifo.is_err(),
+            "an S3-FIFO heap with no main cache was built"
+        );
+    }
 
     fn create_test_cache() -> SegCache {
         SegCacheBuilder::new()
