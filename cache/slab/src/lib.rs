@@ -1199,6 +1199,14 @@ impl SlabCacheBuilder {
 mod tests {
     use super::*;
 
+    /// An item with a TTL past `u32::MAX` seconds is readable.
+    #[test]
+    fn a_ttl_past_u32_max_does_not_expire_the_item() {
+        let cache = create_test_cache();
+        Cache::set(&cache, b"k", b"v", Some(Duration::from_secs(1 << 33))).unwrap();
+        assert!(Cache::get(&cache, b"k").is_some());
+    }
+
     fn create_test_cache() -> SlabCache {
         SlabCacheBuilder::new()
             .heap_size(4 * 1024 * 1024) // 4MB

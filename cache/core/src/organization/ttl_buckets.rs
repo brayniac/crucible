@@ -166,12 +166,12 @@ impl TtlBuckets {
 
     /// Get the bucket index for a given TTL duration.
     pub fn get_bucket_index(&self, ttl: Duration) -> usize {
-        // Clamped rather than cast: a TTL of 2^31 seconds or more would wrap
-        // negative and land in bucket 0, the shortest-lived.
+        // `as i32` alone wraps a TTL of 2^31 s or more negative; clamped,
+        // every TTL from 8,355,840 s up maps to the last bucket.
         let ttl_secs = ttl.as_secs().min(i32::MAX as u64) as i32;
 
         if ttl_secs <= 0 {
-            return 0; // Use first bucket for zero/negative TTLs
+            return 0; // A zero TTL uses the first bucket.
         }
 
         // Branchless bucket index calculation
@@ -1169,8 +1169,7 @@ mod tests {
         assert_eq!(bucket.index(), 16);
     }
 
-    /// A TTL of 2^31 seconds or more maps to the longest-lived bucket, not
-    /// to bucket 0.
+    /// A TTL of 2^31 seconds or more maps to the last bucket.
     #[test]
     fn a_ttl_past_i32_max_maps_to_the_last_bucket() {
         let buckets = TtlBuckets::new();

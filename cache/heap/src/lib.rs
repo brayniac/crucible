@@ -2308,8 +2308,7 @@ mod tests {
         );
     }
 
-    /// An item with a TTL past `u32::MAX` seconds is readable: its deadline
-    /// saturates rather than wrapping (or, in a debug build, overflowing).
+    /// An item with a TTL past `u32::MAX` seconds is readable.
     #[test]
     fn a_ttl_past_u32_max_does_not_expire_the_item() {
         let cache = create_test_cache();

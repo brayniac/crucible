@@ -2903,10 +2903,10 @@ mod tests {
         assert!(layer.get_item(location, b"after").is_some());
     }
 
-    /// An item with a TTL of 2^31 seconds is still readable later, rather
-    /// than placed in the shortest-lived bucket.
+    /// An item with a TTL of 2^31 seconds goes in the last bucket, whose
+    /// segments expire after 8,355,840 s, so it is still readable 100 s later.
     #[test]
-    fn a_very_long_ttl_does_not_expire_early() {
+    fn a_ttl_past_i32_max_is_readable_100s_later() {
         let clock = crate::clock::TestClock::start();
         let layer = create_test_layer();
         let location = layer

@@ -1,7 +1,8 @@
 //! The cache's notion of the current time.
 //!
 //! Every expiry check reads this. In production it is the coarse system
-//! clock and this module compiles away to exactly that call.
+//! clock and this module compiles away to exactly that call. [`deadline`]
+//! turns a TTL into the deadline those checks compare against.
 //!
 //! A trace replay needs it to follow the trace instead. A replay consumes
 //! hours of recorded time in seconds of wall clock, so a TTL shorter than
@@ -60,11 +61,14 @@ thread_local! {
     static VIRTUAL_NOW: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-/// The deadline `ttl` after `now`, in seconds, saturating at `u32::MAX`.
+/// `now + ttl` in whole seconds, saturating at `u32::MAX`.
 ///
-/// A TTL is converted with this rather than `as u32`, which truncates: a
-/// TTL of 2^32 seconds or more would otherwise wrap to a small value and
-/// expire the item early.
+/// `now` may be in any seconds count (unix seconds, or slab's 2024-based
+/// epoch); the result is in the same one. The fractional part of `ttl` is
+/// dropped, so a TTL under one second gives `now`, which every expiry check
+/// treats as already expired. `ttl.as_secs() as u32` truncates a TTL of
+/// 2^32 s or more to a small value; use this instead.
+#[inline]
 pub fn deadline(now: u32, ttl: std::time::Duration) -> u32 {
     now.saturating_add(u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX))
 }
@@ -168,7 +172,7 @@ mod deadline_tests {
     use super::deadline;
     use std::time::Duration;
 
-    /// A TTL past `u32::MAX` seconds saturates instead of wrapping.
+    /// `deadline` returns `u32::MAX` when `now + ttl` does not fit in a u32.
     #[test]
     fn a_deadline_saturates() {
         assert_eq!(deadline(100, Duration::from_secs(10)), 110);
