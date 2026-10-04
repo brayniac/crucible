@@ -1644,6 +1644,74 @@ mod tests {
         assert!(err.to_string().contains("slab classes"), "{err}");
     }
 
+    /// A full cache keeps accepting writes while items in the slabs its
+    /// eviction policy would take first are held: a slab with references
+    /// held ranks after every slab without, so eviction takes another.
+    #[test]
+    fn eviction_skips_slabs_with_held_items() {
+        for (name, strategy) in [
+            ("lra", EvictionStrategy::SLAB_LRA),
+            ("lrc", EvictionStrategy::SLAB_LRC),
+        ] {
+            let cache = SlabCacheBuilder::new()
+                .heap_size(1024 * 1024)
+                .slab_size(64 * 1024)
+                .hashtable_power(12)
+                .eviction_strategy(strategy)
+                .build()
+                .unwrap();
+            let ttl = Duration::from_secs(3600);
+            let value = vec![b'x'; 3000];
+            for i in 0..400 {
+                let _ = cache.set_item(format!("pre{i}").as_bytes(), &value, ttl);
+            }
+            let first_victims = match name {
+                "lra" => cache.allocator.lra_candidates(),
+                _ => cache.allocator.lrc_candidates(),
+            };
+
+            // Pin one item in each of the slabs the policy would take first.
+            // `pin_item` does not touch the slab, so its access time is
+            // unchanged.
+            let verifier = cache.allocator.verifier();
+            let mut held = Vec::new();
+            for i in 0..400 {
+                let key = format!("pre{i}");
+                let Some((location, _)) = cache.hashtable.lookup(key.as_bytes(), &verifier) else {
+                    continue;
+                };
+                let slab_loc = SlabLocation::from_location(location);
+                let (class_id, slab_id, _) = slab_loc.unpack();
+                if first_victims
+                    .iter()
+                    .any(|&(c, s, _)| (c, s) == (class_id, slab_id))
+                    && !held.iter().any(|&(c, s, _)| (c, s) == (class_id, slab_id))
+                {
+                    let pin = cache
+                        .allocator
+                        .pin_item(slab_loc, key.as_bytes())
+                        .expect("pin");
+                    held.push((class_id, slab_id, pin));
+                }
+            }
+            assert_eq!(
+                held.len(),
+                first_victims.len(),
+                "{name}: not every first victim was pinned"
+            );
+
+            for i in 0..50 {
+                cache
+                    .set_item(format!("post{i}").as_bytes(), &value, ttl)
+                    .unwrap_or_else(|e| panic!("{name}: set {i} failed: {e:?}"));
+            }
+            for (_, _, pin) in &held {
+                // SAFETY: the pin holds a live item.
+                assert_eq!(unsafe { pin.header().value() }, &value[..]);
+            }
+        }
+    }
+
     /// A full cache accepts writes after a flush under every eviction
     /// policy. Under `none`, where nothing is evicted, the flush itself must
     /// free the slots, so the refill fits as much as the first fill did.
