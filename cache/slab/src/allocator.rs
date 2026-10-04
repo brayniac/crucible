@@ -17,6 +17,9 @@ use crate::item::{SlabItemHeader, pack_slot_ref, unpack_slot_ref};
 use crate::location::{MAX_SLOT_INDEX, SlabLocation};
 use crate::verifier::SlabVerifier;
 
+/// A slab eviction may take, as `(class_id, slab_id, sequence)`.
+pub(crate) type EvictionCandidate = (u8, u32, u64);
+
 /// A slab reference and slot pin on one item, released on drop.
 pub struct ItemPin<'a> {
     class: &'a SlabClass,
@@ -389,48 +392,63 @@ impl SlabAllocator {
         None
     }
 
-    /// Find the least recently accessed slab across all classes.
+    /// The number of slabs `try_slab_eviction_with_demoter` tries, in order,
+    /// under LRC and LRA. A slab whose references are not released within
+    /// `SlabClass`'s drain wait is skipped for the next.
+    const EVICTION_CANDIDATES: usize = 4;
+
+    /// The `EVICTION_CANDIDATES` Live slabs, across all classes, with the
+    /// smallest `key`, in ascending order, as `(class_id, slab_id, sequence)`.
     ///
-    /// Returns `(class_id, slab_id, sequence)` of the LRA slab, or `None` if
-    /// no slabs exist.
-    pub fn find_lra_slab(&self) -> Option<(u8, u32, u64)> {
-        // Ordered by last access, then by age: access times have one-second
-        // resolution, so ties are common and the older slab goes first.
-        self.classes
-            .iter()
-            .enumerate()
-            .flat_map(|(class_id, class)| {
-                class.slab_timestamps().into_iter().map(
-                    move |(slab_id, last_accessed, sequence)| {
-                        (
-                            (last_accessed, sequence),
-                            (class_id as u8, slab_id, sequence),
-                        )
-                    },
-                )
-            })
-            .min_by_key(|(key, _)| *key)
-            .map(|(_, slab)| slab)
+    /// Slabs with references held (a reader copying or holding a value, a
+    /// writer filling a slot) rank after every slab without: draining one
+    /// would wait and probably abort, and an aborted drain is not free -- for
+    /// its duration `allocate` drops the slab's free-slot entries and
+    /// superseded items in it are not retired. The reference count is read
+    /// without synchronization; it only orders the candidates.
+    fn eviction_candidates<K: Ord + Copy>(
+        &self,
+        key: impl Fn(u32, u64) -> K,
+    ) -> Vec<EvictionCandidate> {
+        let mut best: Vec<((bool, K), EvictionCandidate)> =
+            Vec::with_capacity(Self::EVICTION_CANDIDATES + 1);
+        for (class_id, class) in self.classes.iter().enumerate() {
+            for (slab_id, last_accessed, sequence) in class.slab_timestamps() {
+                let referenced =
+                    crate::class::packed_state::ref_count(class.state_word(slab_id)) != 0;
+                let k = (referenced, key(last_accessed, sequence));
+                if best.len() == Self::EVICTION_CANDIDATES
+                    && best.last().is_some_and(|(worst, _)| k >= *worst)
+                {
+                    continue;
+                }
+                let at = best.partition_point(|(other, _)| *other <= k);
+                best.insert(at, (k, (class_id as u8, slab_id, sequence)));
+                best.truncate(Self::EVICTION_CANDIDATES);
+            }
+        }
+        best.into_iter().map(|(_, slab)| slab).collect()
+    }
+
+    /// Least recently accessed slabs first, the older first among equal
+    /// access times: access times have one-second resolution, so ties are
+    /// common.
+    pub(crate) fn lra_candidates(&self) -> Vec<EvictionCandidate> {
+        self.eviction_candidates(|last_accessed, sequence| (last_accessed, sequence))
+    }
+
+    /// Least recently created slabs first, by `Slab::sequence`.
+    pub(crate) fn lrc_candidates(&self) -> Vec<EvictionCandidate> {
+        self.eviction_candidates(|_, sequence| sequence)
     }
 
     /// Find the least recently created slab across all classes.
     ///
     /// Returns `(class_id, slab_id, sequence)` of the slab added first, by
     /// `Slab::sequence`, or `None` if no slabs exist.
+    #[cfg(test)]
     pub fn find_lrc_slab(&self) -> Option<(u8, u32, u64)> {
-        self.classes
-            .iter()
-            .enumerate()
-            .flat_map(|(class_id, class)| {
-                class
-                    .slab_timestamps()
-                    .into_iter()
-                    .map(move |(slab_id, _, sequence)| {
-                        (sequence, (class_id as u8, slab_id, sequence))
-                    })
-            })
-            .min_by_key(|(sequence, _)| *sequence)
-            .map(|(_, slab)| slab)
+        self.lrc_candidates().into_iter().next()
     }
 
     /// Find a random slab across all classes.
@@ -465,8 +483,9 @@ impl SlabAllocator {
     /// the global free pool. Returns `true` if the slab was evicted.
     ///
     /// With `sequence`, the slab is evicted only if the slab now using
-    /// `slab_id` has that `Slab::sequence`. A victim chosen by a
-    /// `find_*_slab` call passes its sequence, so if that slab has been
+    /// `slab_id` has that `Slab::sequence`. A victim chosen by
+    /// `lrc_candidates`, `lra_candidates` or `find_random_slab` passes its
+    /// sequence, so if that slab has been
     /// evicted and its id given to a newer slab in the meantime, the newer
     /// slab is left alone.
     ///
@@ -574,28 +593,36 @@ impl SlabAllocator {
         // Try strategies in order from highest to lowest bit
         // SLAB_LRC (8)
         if strategy.contains(EvictionStrategy::SLAB_LRC)
-            && let Some((class_id, slab_id, sequence)) = self.find_lrc_slab()
-            && self.evict_slab_with_demoter(
-                class_id,
-                slab_id,
-                Some(sequence),
-                hashtable,
-                &mut demote,
-            )
+            && self
+                .lrc_candidates()
+                .into_iter()
+                .any(|(class_id, slab_id, sequence)| {
+                    self.evict_slab_with_demoter(
+                        class_id,
+                        slab_id,
+                        Some(sequence),
+                        hashtable,
+                        &mut demote,
+                    )
+                })
         {
             return true;
         }
 
         // SLAB_LRA (4)
         if strategy.contains(EvictionStrategy::SLAB_LRA)
-            && let Some((class_id, slab_id, sequence)) = self.find_lra_slab()
-            && self.evict_slab_with_demoter(
-                class_id,
-                slab_id,
-                Some(sequence),
-                hashtable,
-                &mut demote,
-            )
+            && self
+                .lra_candidates()
+                .into_iter()
+                .any(|(class_id, slab_id, sequence)| {
+                    self.evict_slab_with_demoter(
+                        class_id,
+                        slab_id,
+                        Some(sequence),
+                        hashtable,
+                        &mut demote,
+                    )
+                })
         {
             return true;
         }

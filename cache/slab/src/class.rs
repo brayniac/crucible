@@ -965,9 +965,12 @@ impl SlabClass {
         self.item_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Maximum iterations to wait for readers to drain before aborting eviction.
-    /// At ~1µs per iteration, this is roughly 100ms max wait time.
-    const MAX_DRAIN_ITERATIONS: usize = 100_000;
+    /// How long a drain waits for the slab's references to be released
+    /// before it is aborted. References are held by readers copying or
+    /// holding a value (a zero-copy send to a slow client holds one for the
+    /// whole send) and by writers filling a slot, so eviction does not wait
+    /// for them; the caller tries another slab.
+    const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_micros(20);
 
     /// Evict all items from a specific slab.
     ///
@@ -980,7 +983,8 @@ impl SlabClass {
     /// - The slab is already being drained
     /// - `sequence` is given and the slab now using `slab_id` has a different
     ///   `Slab::sequence`
-    /// - The drain timed out waiting for readers (eviction aborted)
+    /// - A reference taken before the drain began was still held after
+    ///   `DRAIN_WAIT` (drain aborted)
     ///
     /// # Safety
     ///
@@ -1034,23 +1038,18 @@ impl SlabClass {
             }
         }
 
-        // Phase 2: Wait for all readers to finish (bounded wait)
-        // Readers should be fast (just copying data), but we don't want to
-        // spin forever if there's a livelock situation.
-        let mut iterations = 0;
+        // Phase 2: Wait up to `DRAIN_WAIT` for references taken before the
+        // drain began to be released. If one is still held, the drain is
+        // aborted and the slab returns to Live. Free-slot entries `allocate`
+        // popped meanwhile are lost, and items superseded meanwhile stay
+        // unretired, until the slab is evicted.
+        let deadline = std::time::Instant::now() + Self::DRAIN_WAIT;
+        let mut spins = 0u32;
         while !packed_state::is_drain_complete(state_atom) {
-            iterations += 1;
-
-            if iterations > Self::MAX_DRAIN_ITERATIONS {
-                // Timeout: abort eviction and reset to Live state.
-                // The caller can try a different slab.
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(64) && std::time::Instant::now() >= deadline {
                 packed_state::abort_drain(state_atom);
                 return None;
-            }
-
-            if iterations % 1000 == 0 {
-                // Yield periodically to avoid burning CPU
-                std::thread::yield_now();
             }
             std::hint::spin_loop();
         }
