@@ -188,6 +188,42 @@ pub struct HeapCache {
     data_structures_enabled: bool,
 }
 
+/// Random slots tried per eviction sample before the sample gives up.
+const SAMPLE_ATTEMPTS: u32 = 16;
+
+/// A pseudo-random slot index below `bound` for attempt `attempt` of
+/// sample `offset` in eviction `start`. Every attempt draws independently,
+/// so samples spread uniformly over every index below `bound`.
+fn sample_index(start: u32, offset: u32, attempt: u32, bound: u32) -> u32 {
+    // splitmix64 over the three inputs.
+    let mut x = (u64::from(start) << 32) ^ (u64::from(offset) << 16) ^ u64::from(attempt);
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    ((u128::from(x) * u128::from(bound)) >> 64) as u32
+}
+
+/// The first slot below `bound` that `try_slot` accepts: up to
+/// `SAMPLE_ATTEMPTS` random indices, then a forward scan from a random index.
+/// The scan runs only when every random index misses, which happens when the
+/// occupied slots are a small fraction of those below `bound` (the mark stays
+/// at its peak after a flush, or after items grow and fewer fit).
+fn sample_slot<T>(
+    start: u32,
+    offset: u32,
+    bound: u32,
+    try_slot: impl FnMut(u32) -> Option<T>,
+) -> Option<T> {
+    if bound == 0 {
+        return None;
+    }
+    let first = sample_index(start, offset, 0, bound);
+    let random = (0..SAMPLE_ATTEMPTS).map(|attempt| sample_index(start, offset, attempt, bound));
+    let scan = (0..bound).map(|j| ((u64::from(first) + u64::from(j)) % u64::from(bound)) as u32);
+    random.chain(scan).find_map(try_slot)
+}
+
 impl HeapCache {
     /// Reset the cache to its freshly built state: an empty hashtable, every
     /// storage slot free, and empty eviction queues.
@@ -633,7 +669,7 @@ impl HeapCache {
     /// Dispatches to the appropriate eviction strategy based on policy:
     /// - S3-FIFO: Uses two-queue eviction with admission filter
     /// - LFU: Approximate least-frequently-used via random sampling
-    /// - Random: Evicts the first occupied slot found from a random starting point
+    /// - Random: evicts an item at a randomly sampled occupied slot
     fn evict_one(&self) -> bool {
         match &self.eviction_state {
             EvictionState::S3Fifo(policy) => self.evict_s3fifo(policy),
@@ -685,10 +721,15 @@ impl HeapCache {
             // Determine which storage type this sample falls into
             let (key, value_type) = if sample_idx < string_occupied {
                 // Sample from string storage
-                if let Some((k, _)) = self.sample_string_slot(start, i) {
-                    (k, ValueType::String)
-                } else {
-                    continue;
+                match self.sample_string_slot(start, i) {
+                    // An expired item is the victim outright.
+                    Some((k, true)) => {
+                        victim_key = Some(k);
+                        victim_type = Some(ValueType::String);
+                        break;
+                    }
+                    Some((k, false)) => (k, ValueType::String),
+                    None => continue,
                 }
             } else if sample_idx < string_occupied + hash_occupied {
                 // Sample from hash storage
@@ -713,13 +754,10 @@ impl HeapCache {
                 }
             };
 
-            // Look up frequency in hashtable
+            // Read the frequency without counting an access: `lookup` would
+            // raise it, so being sampled would make an item look hotter.
             let verifier = self.multi_type_verifier();
-            let freq = self
-                .hashtable
-                .lookup(&key, &verifier)
-                .map(|(loc, _)| self.hashtable.get_item_frequency(&key, loc).unwrap_or(0))
-                .unwrap_or(0);
+            let freq = self.hashtable.get_frequency(&key, &verifier).unwrap_or(0);
 
             if victim_key.is_none() || freq < victim_freq {
                 victim_key = Some(key);
@@ -750,7 +788,7 @@ impl HeapCache {
 
     /// Evict using random selection.
     ///
-    /// Finds the first occupied slot from a pseudo-random starting point
+    /// Samples an occupied slot
     /// across all storage types and evicts it.
     fn evict_random(&self) -> bool {
         let start = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
@@ -772,7 +810,7 @@ impl HeapCache {
 
             // Determine which storage type this sample falls into
             let key = if sample_idx < string_occupied {
-                self.sample_string_slot(start, i).map(|(k, _)| k)
+                self.sample_string_slot(start, i).map(|(k, _expired)| k)
             } else if sample_idx < string_occupied + hash_occupied {
                 self.sample_hash_slot(start, i).map(|(k, _)| k)
             } else if sample_idx < string_occupied + hash_occupied + list_occupied {
@@ -797,90 +835,56 @@ impl HeapCache {
         false
     }
 
-    /// Sample a random occupied slot from string storage.
-    fn sample_string_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
-        let capacity = self.storage.capacity() as u32;
-        if capacity == 0 {
-            return None;
-        }
-
-        for j in 0..capacity {
-            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+    /// Sample a random occupied slot from string storage, returning its key
+    /// and whether the item has expired.
+    ///
+    /// Expired items are sampled too: no read path frees them, so without
+    /// this a cache whose items have all expired could not evict.
+    fn sample_string_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, bool)> {
+        sample_slot(start, offset, self.storage.high_water(), |idx| {
             if !self.storage.is_slot_occupied(idx) {
-                continue;
+                return None;
             }
-
             let slot = self.storage.get(idx)?;
-            let generation = slot.generation();
-            let entry = slot.get(generation, false)?;
-            let key = entry.key().to_vec();
+            // The slot can be freed or reused since the occupancy check.
+            let entry = slot.get(slot.generation(), true)?;
+            let sampled = (entry.key().to_vec(), entry.is_expired());
             slot.release_read();
-            return Some((key, generation));
-        }
-        None
+            Some(sampled)
+        })
     }
 
     /// Sample a random occupied slot from hash storage.
     fn sample_hash_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
-        let capacity = self.hash_storage.capacity() as u32;
-        if capacity == 0 {
-            return None;
-        }
-
-        for j in 0..capacity {
-            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+        sample_slot(start, offset, self.hash_storage.high_water(), |idx| {
             if !self.hash_storage.is_slot_occupied(idx) {
-                continue;
+                return None;
             }
-
-            let slot = self.hash_storage.get(idx)?;
-            let generation = slot.generation();
-            let key = self.hash_storage.get_key(idx, generation)?;
-            return Some((key, generation));
-        }
-        None
+            let generation = self.hash_storage.get(idx)?.generation();
+            Some((self.hash_storage.get_key(idx, generation)?, generation))
+        })
     }
 
     /// Sample a random occupied slot from list storage.
     fn sample_list_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
-        let capacity = self.list_storage.capacity() as u32;
-        if capacity == 0 {
-            return None;
-        }
-
-        for j in 0..capacity {
-            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+        sample_slot(start, offset, self.list_storage.high_water(), |idx| {
             if !self.list_storage.is_slot_occupied(idx) {
-                continue;
+                return None;
             }
-
-            let slot = self.list_storage.get(idx)?;
-            let generation = slot.generation();
-            let key = self.list_storage.get_key(idx, generation)?;
-            return Some((key, generation));
-        }
-        None
+            let generation = self.list_storage.get(idx)?.generation();
+            Some((self.list_storage.get_key(idx, generation)?, generation))
+        })
     }
 
     /// Sample a random occupied slot from set storage.
     fn sample_set_slot(&self, start: u32, offset: u32) -> Option<(Vec<u8>, u16)> {
-        let capacity = self.set_storage.capacity() as u32;
-        if capacity == 0 {
-            return None;
-        }
-
-        for j in 0..capacity {
-            let idx = (start.wrapping_mul(2654435761).wrapping_add(offset + j)) % capacity;
+        sample_slot(start, offset, self.set_storage.high_water(), |idx| {
             if !self.set_storage.is_slot_occupied(idx) {
-                continue;
+                return None;
             }
-
-            let slot = self.set_storage.get(idx)?;
-            let generation = slot.generation();
-            let key = self.set_storage.get_key(idx, generation)?;
-            return Some((key, generation));
-        }
-        None
+            let generation = self.set_storage.get(idx)?.generation();
+            Some((self.set_storage.get_key(idx, generation)?, generation))
+        })
     }
 
     /// Record an insert for S3-FIFO tracking.
@@ -2333,6 +2337,127 @@ mod tests {
             .set(b"k", b"v", Some(Duration::from_secs(1 << 33)))
             .unwrap();
         assert!(cache.get(b"k").is_some(), "the item expired at once");
+    }
+
+    /// LFU and Random eviction free expired items: a cache whose memory is
+    /// held entirely by expired items accepts new writes.
+    #[test]
+    fn lfu_and_random_evict_expired_items() {
+        let caches: Vec<_> = [EvictionPolicy::Lfu, EvictionPolicy::Random]
+            .into_iter()
+            .map(|policy| {
+                let cache = HeapCacheBuilder::new()
+                    .memory_limit(1024 * 1024)
+                    .hashtable_power(12)
+                    .initial_fragmentation_ratio(100)
+                    .eviction_policy(policy)
+                    .build()
+                    .unwrap();
+                for i in 0..400 {
+                    let _ = cache.set(
+                        format!("short{i}").as_bytes(),
+                        &[b'x'; 4000],
+                        Some(Duration::from_secs(1)),
+                    );
+                }
+                (policy, cache)
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(2100));
+        for (policy, cache) in &caches {
+            for i in 0..200 {
+                cache
+                    .set(
+                        format!("long{i}").as_bytes(),
+                        &[b'x'; 4000],
+                        Some(Duration::from_secs(3600)),
+                    )
+                    .unwrap_or_else(|e| panic!("{policy:?}: set {i} failed: {e:?}"));
+            }
+        }
+    }
+
+    /// With a slot array far larger than the items in memory, LFU and
+    /// Random evict across the cached items: after many inserts the recent
+    /// ones remain and the early ones are gone.
+    #[test]
+    fn lfu_and_random_sample_across_the_cached_items() {
+        for policy in [EvictionPolicy::Lfu, EvictionPolicy::Random] {
+            let cache = HeapCacheBuilder::new()
+                .memory_limit(1024 * 1024)
+                .hashtable_power(16)
+                .initial_fragmentation_ratio(100)
+                .eviction_policy(policy)
+                .build()
+                .unwrap();
+            let value = [b'x'; 400];
+            for i in 0..2000 {
+                let _ = cache.set(format!("old{i}").as_bytes(), &value, None);
+            }
+            for i in 0..10_000 {
+                let _ = cache.set(format!("new{i}").as_bytes(), &value, None);
+            }
+            let old = (0..2000)
+                .filter(|i| cache.contains(format!("old{i}").as_bytes()))
+                .count();
+            let recent = (9900..10_000)
+                .filter(|i| cache.contains(format!("new{i}").as_bytes()))
+                .count();
+            assert!(old < 500, "{policy:?}: {old} of 2000 early items survived");
+            assert!(
+                recent > 50,
+                "{policy:?}: only {recent} of the last 100 survived"
+            );
+        }
+    }
+
+    /// LFU sampling does not raise the frequency of the items it samples.
+    #[test]
+    fn lfu_sampling_does_not_count_as_an_access() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(1024 * 1024)
+            .hashtable_power(12)
+            .initial_fragmentation_ratio(100)
+            .eviction_policy(EvictionPolicy::Lfu)
+            .build()
+            .unwrap();
+        for i in 0..3000 {
+            let _ = cache.set(format!("k{i}").as_bytes(), &[b'x'; 400], None);
+        }
+        let verifier = cache.multi_type_verifier();
+        for i in 0..3000 {
+            let key = format!("k{i}");
+            if let Some(freq) = cache.hashtable.get_frequency(key.as_bytes(), &verifier) {
+                assert_eq!(freq, 0, "{key} was never read but has frequency {freq}");
+            }
+        }
+    }
+
+    /// After a flush, when only a few items fit below a high slot mark,
+    /// LFU and Random still find a victim and writes succeed.
+    #[test]
+    fn eviction_finds_a_victim_when_items_are_sparse_below_the_mark() {
+        for policy in [EvictionPolicy::Lfu, EvictionPolicy::Random] {
+            let cache = HeapCacheBuilder::new()
+                .memory_limit(1024 * 1024)
+                .hashtable_power(12)
+                .initial_fragmentation_ratio(100)
+                .eviction_policy(policy)
+                .build()
+                .unwrap();
+            for i in 0..30_000 {
+                let _ = cache.set(format!("small{i}").as_bytes(), &[b's'; 8], None);
+            }
+            Cache::flush(&cache);
+            // About 20 of these fit, far below the slot mark the small items
+            // left.
+            let value = vec![b'l'; 50_000];
+            for i in 0..2000 {
+                cache
+                    .set(format!("large{i}").as_bytes(), &value, None)
+                    .unwrap_or_else(|e| panic!("{policy:?}: set {i} failed: {e:?}"));
+            }
+        }
     }
 
     fn create_test_cache() -> HeapCache {

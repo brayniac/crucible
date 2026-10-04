@@ -29,6 +29,10 @@ pub struct ListStorage {
     free_head: AtomicU64,
     /// Number of currently occupied slots.
     occupied_count: AtomicU32,
+    /// One past the highest slot index allocated since construction or the
+    /// last `reset_all`. Every occupied slot is below it, so eviction samples
+    /// only this prefix of the array.
+    high_water: AtomicU32,
 }
 
 /// A single list slot with Mutex protection.
@@ -109,6 +113,7 @@ impl ListStorage {
             slots,
             free_head: AtomicU64::new(pack_head(0, 0)),
             occupied_count: AtomicU32::new(0),
+            high_water: AtomicU32::new(0),
         }
     }
 
@@ -135,6 +140,7 @@ impl ListStorage {
             ) {
                 Ok(_) => {
                     self.occupied_count.fetch_add(1, Ordering::Relaxed);
+                    self.high_water.fetch_max(head + 1, Ordering::Relaxed);
                     let generation = slot.generation();
                     return Some((head, generation));
                 }
@@ -186,6 +192,7 @@ impl ListStorage {
             .store(pack_head(0, version.wrapping_add(1)), Ordering::Release);
 
         self.occupied_count.store(0, Ordering::Release);
+        self.high_water.store(0, Ordering::Release);
     }
 
     pub fn deallocate(&self, idx: u32) {
@@ -236,6 +243,13 @@ impl ListStorage {
     #[inline]
     pub fn occupied(&self) -> u32 {
         self.occupied_count.load(Ordering::Relaxed)
+    }
+
+    /// One past the highest slot index allocated since construction or the
+    /// last `reset_all`; every occupied slot is below it.
+    #[inline]
+    pub fn high_water(&self) -> u32 {
+        self.high_water.load(Ordering::Relaxed)
     }
 
     /// Get the total capacity.
