@@ -530,13 +530,23 @@ impl HeapCache {
         }
     }
 
-    /// Ensure enough memory is available for an allocation of `needed` bytes.
+    /// Ensure enough memory is available for an item of `needed` bytes.
     ///
-    /// Evicts items until there's room or we can't evict anymore.
+    /// The item's size is scaled by the fragmentation ratio, as
+    /// `estimated_memory` scales the bytes already used. Returns
+    /// `ValueTooLong` without evicting if the scaled size exceeds the
+    /// memory limit. Otherwise evicts until the item fits, at most as many
+    /// items as were cached at the start; returns `OutOfMemory` if it still
+    /// does not fit.
     fn ensure_memory_available(&self, needed: usize) -> CacheResult<()> {
-        let mut attempts = 0;
-        const MAX_EVICTION_ATTEMPTS: usize = 100;
+        let ratio = self.fragmentation_ratio.load(Ordering::Relaxed) as usize;
+        let needed = needed.saturating_mul(ratio) / 100;
+        if needed > self.bytes_limit {
+            return Err(CacheError::ValueTooLong);
+        }
 
+        let max_evictions = self.len();
+        let mut evictions = 0;
         loop {
             let estimated = self.estimated_memory();
             if estimated + needed <= self.bytes_limit {
@@ -554,8 +564,8 @@ impl HeapCache {
                 return Err(CacheError::OutOfMemory);
             }
 
-            attempts += 1;
-            if attempts >= MAX_EVICTION_ATTEMPTS {
+            evictions += 1;
+            if evictions > max_evictions {
                 return Err(CacheError::OutOfMemory);
             }
         }
@@ -2506,6 +2516,64 @@ mod tests {
         assert_eq!(cache.fragmentation_ratio(), 110);
         assert!(cache.bytes_used() > 0);
         drop(std::hint::black_box(ballast));
+    }
+
+    /// A value larger than the memory limit is refused without evicting
+    /// anything.
+    #[test]
+    fn set_larger_than_the_memory_limit_evicts_nothing() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(64 * 1024)
+            .hashtable_power(10)
+            .build()
+            .unwrap();
+        for i in 0..100 {
+            cache
+                .set(format!("k{i}").as_bytes(), &[b'x'; 100], None)
+                .unwrap();
+        }
+        assert_eq!(
+            cache.set(b"big", &vec![b'y'; 1024 * 1024], None),
+            Err(CacheError::ValueTooLong)
+        );
+        assert_eq!(cache.len(), 100);
+
+        // At a 200% ratio, a 40 KiB value is estimated to need 80 KiB.
+        cache.set_fragmentation_ratio(200);
+        assert_eq!(
+            cache.set(b"big", &vec![b'y'; 40 * 1024], None),
+            Err(CacheError::ValueTooLong)
+        );
+        assert_eq!(cache.len(), 100);
+    }
+
+    /// A value that fits within the memory limit is stored, however many
+    /// small items must be evicted to make room for it.
+    #[test]
+    fn large_set_evicts_as_many_items_as_it_needs() {
+        for policy in [
+            EvictionPolicy::S3Fifo,
+            EvictionPolicy::Lfu,
+            EvictionPolicy::Random,
+        ] {
+            let cache = HeapCacheBuilder::new()
+                .memory_limit(1024 * 1024)
+                .hashtable_power(12)
+                .initial_fragmentation_ratio(100)
+                .eviction_policy(policy)
+                .build()
+                .unwrap();
+            for i in 0..2_000 {
+                cache
+                    .set(format!("k{i}").as_bytes(), &[b'x'; 300], None)
+                    .unwrap();
+            }
+            let value = vec![b'y'; 512 * 1024];
+            cache
+                .set(b"big", &value, None)
+                .unwrap_or_else(|e| panic!("{policy:?}: {e:?}"));
+            assert_eq!(cache.with_value(b"big", |v| v == &value[..]), Some(true));
+        }
     }
 
     /// Entries whose items were deleted are skipped at the head of either

@@ -54,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
+- A heap SET that needed more than 100 evictions to fit failed with
+  `OutOfMemory` after evicting 100 items; it now evicts up to as many items
+  as are cached. A value whose size, scaled by the fragmentation ratio,
+  exceeds `memory_limit` is refused with `ValueTooLong` before anything is
+  evicted; before, it evicted 100 items and then failed. Eviction now also
+  scales the new item by the fragmentation ratio, so a stored item no
+  longer takes the estimate past the limit
 - The heap cache's fragmentation ratio divided whole-process memory (jemalloc
   allocated bytes, or RSS on Linux without jemalloc) by the cache's tracked
   bytes, so the hashtable, slot arrays and every other allocation counted
