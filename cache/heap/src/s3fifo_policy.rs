@@ -1,24 +1,31 @@
 //! S3-FIFO eviction policy for HeapCache.
 //!
-//! S3-FIFO uses two FIFO queues:
-//! - Small queue: admission filter (~10% capacity). New items enter here.
-//! - Main queue: long-term storage (~90% capacity). Items read in the small
-//!   queue move here.
+//! The policy follows S3-FIFO (Yang et al., "FIFO queues are all you need for
+//! cache eviction", SOSP 2023) and uses two FIFO queues:
+//! - Small queue: admission filter, `small_percent` of the total capacity.
+//!   New items enter here.
+//! - Main queue: the rest of the capacity. Items read in the small queue
+//!   move here.
 //!
 //! The small queue's oldest entry is processed when an eviction needs a
-//! victim, and also when an insert finds the small queue full:
+//! victim, and also when an insert finds the small queue at its target size:
 //! - If frequency > threshold: move to the main queue, decay frequency
-//! - Otherwise: unlink the item (or convert it to a ghost) and free it
+//! - Otherwise: unlink the item (or convert it to a ghost) and return its
+//!   location for the caller to free
 //!
 //! So an item read no more than `demotion_threshold` times is evicted once
-//! the small queue's capacity of newer inserts follow it, whether or not
-//! memory is short.
+//! the small queue's target size of newer inserts follow it, whether or not
+//! memory is short. The small queue is allocated at twice its target size, so
+//! concurrent inserts can push past the target without failing.
 //!
 //! On eviction from the main queue:
 //! - If frequency > 0: decay and reinsert at tail (CLOCK-like behavior)
-//! - If frequency == 0: unlink the item (or convert it to a ghost) and free it
+//! - If frequency == 0: unlink the item (or convert it to a ghost) and return
+//!   its location for the caller to free
 //!
-//! Decayed frequencies are capped at 3, as in the reference S3-FIFO.
+//! Decayed frequencies are capped at 3, the maximum of the paper's 2-bit
+//! counter. The hashtable keeps counting reads past 3, and an overwrite
+//! carries the count over to the new item.
 
 use crate::fifo_queue::{FifoQueue, QueueEntry};
 use cache_core::{Hashtable, Location};
@@ -40,10 +47,19 @@ const MAX_FREQUENCY: u8 = 3;
 /// Attempts `record_insert` makes to queue a new entry.
 const MAX_PUSH_ATTEMPTS: usize = 8;
 
+/// Largest main-queue capacity; `FifoQueue` holds at most 2^30 entries.
+const MAX_MAIN_CAPACITY: u64 = 1 << 30;
+
+/// Largest small-queue target, half of `MAX_MAIN_CAPACITY` because the small
+/// queue is allocated at twice its target.
+const MAX_SMALL_TARGET: u64 = 1 << 29;
+
 /// S3-FIFO eviction policy.
 pub struct S3FifoPolicy {
-    /// Small FIFO queue (admission filter).
+    /// Small FIFO queue (admission filter), allocated at twice `small_target`.
     small: FifoQueue,
+    /// Inserts trim the small queue to below this length before pushing.
+    small_target: u32,
     /// Main FIFO queue (long-term storage).
     main: FifoQueue,
     /// Frequency threshold for promotion from small to main.
@@ -57,14 +73,20 @@ impl S3FifoPolicy {
     /// - `total_capacity`: Total number of items the cache can hold
     /// - `small_percent`: Percentage of capacity for small queue (1-50, typically 10)
     /// - `demotion_threshold`: Frequency threshold for promotion (typically 1)
-    pub fn new(total_capacity: u32, small_percent: u8, demotion_threshold: u8) -> Self {
+    ///
+    /// The main queue is capped at 2^30 entries and the small-queue target
+    /// at 2^29. Items past the cap in the main queue are evicted.
+    pub fn new(total_capacity: u64, small_percent: u8, demotion_threshold: u8) -> Self {
         let small_percent = small_percent.clamp(1, 50) as u64;
-        let small_capacity = (total_capacity as u64 * small_percent / 100).max(1) as u32;
-        let main_capacity = total_capacity.saturating_sub(small_capacity).max(1);
+        let small_target = (total_capacity * small_percent / 100).clamp(1, MAX_SMALL_TARGET);
+        let main_capacity = total_capacity
+            .saturating_sub(small_target)
+            .clamp(1, MAX_MAIN_CAPACITY);
 
         Self {
-            small: FifoQueue::new(small_capacity),
-            main: FifoQueue::new(main_capacity),
+            small: FifoQueue::new(2 * small_target as u32),
+            small_target: small_target as u32,
+            main: FifoQueue::new(main_capacity as u32),
             demotion_threshold,
         }
     }
@@ -72,11 +94,13 @@ impl S3FifoPolicy {
     /// Record an item insertion in the small queue.
     ///
     /// This should be called after a successful hashtable insert. If the
-    /// small queue is full, its oldest entries are processed as for an
-    /// eviction until the new entry fits. If it still does not fit after
-    /// `MAX_PUSH_ATTEMPTS`, the new item itself is unlinked: an item in no
-    /// queue would never be evicted. The locations of every item unlinked
-    /// are returned for the caller to free.
+    /// small queue holds `small_target` or more entries, its oldest entries
+    /// are processed as for an eviction, up to `MAX_PUSH_ATTEMPTS` of them,
+    /// until it holds fewer. If the queue is then full, the same processing
+    /// continues for up to `MAX_PUSH_ATTEMPTS` more entries; if the new entry
+    /// still does not fit, the new item is unlinked, because an item in no
+    /// queue would never be evicted. Returns the locations of every item
+    /// unlinked, for the caller to free.
     ///
     /// # Arguments
     /// - `hashtable`: The hashtable for looking up/modifying items
@@ -93,12 +117,19 @@ impl S3FifoPolicy {
         let entry = QueueEntry::new(bucket_index, item_info);
         let mut freed = Vec::new();
         for _ in 0..MAX_PUSH_ATTEMPTS {
+            if self.small.len() < self.small_target
+                || !self.take_small_head(hashtable, create_ghosts, &mut freed)
+            {
+                break;
+            }
+        }
+        for _ in 0..MAX_PUSH_ATTEMPTS {
             if self.small.push(entry) {
                 return freed;
             }
             self.take_small_head(hashtable, create_ghosts, &mut freed);
         }
-        // Other inserters took the room each step made.
+        // Other inserters filled each slot these steps freed.
         let location = item_info & LOCATION_MASK;
         if Self::unlink(hashtable, bucket_index, location, create_ghosts) {
             freed.push(Location::new(location));
@@ -169,8 +200,9 @@ impl S3FifoPolicy {
             if self.main.push(promoted_entry) {
                 return true;
             }
-            // Other promotions took the room; an item in no queue would
-            // never be evicted, so this one is evicted now.
+            // Other threads' pushes to the main queue took the free slot. An
+            // item in no queue would never be evicted, so this one is
+            // evicted now.
         }
 
         // Evict this item, if it is still ours to evict
@@ -208,7 +240,8 @@ impl S3FifoPolicy {
     ) {
         // An entry not read again is evicted on its `MAX_FREQUENCY + 1`th
         // visit; this bound gives each entry present at the start that many
-        // visits.
+        // visits. Reads by other threads between visits raise frequencies
+        // again, so the loop can end without unlinking anything.
         let passes = (MAX_FREQUENCY as usize + 1) * (self.main.len() as usize + 1);
 
         for _ in 0..passes {
@@ -263,16 +296,19 @@ impl S3FifoPolicy {
     }
 
     /// Get the number of items in the small queue.
+    #[cfg(test)]
     pub fn small_queue_len(&self) -> u32 {
         self.small.len()
     }
 
     /// Get the number of items in the main queue.
+    #[cfg(test)]
     pub fn main_queue_len(&self) -> u32 {
         self.main.len()
     }
 
     /// Get the total number of items tracked.
+    #[cfg(all(test, not(feature = "loom")))]
     pub fn total_tracked(&self) -> u32 {
         self.small.len() + self.main.len()
     }
@@ -311,6 +347,18 @@ mod tests {
 
         assert_eq!(policy.small_queue_len(), 2);
         assert_eq!(policy.main_queue_len(), 0);
+    }
+
+    #[test]
+    #[cfg(not(feature = "loom"))]
+    fn record_insert_trims_small_queue_to_target() {
+        let policy = S3FifoPolicy::new(100, 10, 1);
+        let hashtable = cache_core::MultiChoiceHashtable::new(4);
+
+        for i in 0..50 {
+            policy.record_insert(&hashtable, i, i, false);
+        }
+        assert_eq!(policy.small_queue_len(), 10);
     }
 
     #[test]

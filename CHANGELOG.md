@@ -12,11 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds, saturating at `u32::MAX`
 
 ### Changed
-- **Heap S3-FIFO evicts from a full small queue on insert.** An item read no
-  more than `demotion_threshold` times now leaves once the small queue's
-  capacity of newer inserts follow it, whether or not memory is short.
-  Before, the oldest small-queue entry was dropped from tracking and its
-  item could never be evicted
+- **Heap S3-FIFO evicts from the small queue on insert.** When the small
+  queue holds `small_queue_percent` of the hashtable's slots, an insert
+  processes its oldest entries as an eviction would. An item read no more
+  than `demotion_threshold` times now leaves once that many newer inserts
+  follow it, whether or not memory is short
+- `S3FifoPolicy` is no longer exported from `heap-cache`. Its constructor
+  takes the capacity as a `u64`, and `record_insert` returns the locations
+  of the items it unlinked
 - **`Hashtable` gains `insert_pinned` and `update_if_present_pinned`**,
   which call a closure with the location of the entry being replaced before
   replacing it. They are required methods; `insert` and `update_if_present`
@@ -51,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
+- Heap S3-FIFO tracked no more items than the small queue holds: an insert
+  into a full small queue dropped its oldest entry from tracking, and that
+  item could then never be evicted. With every item tracked, a cache where
+  every item is read again can evict
+- Heap S3-FIFO queue capacities wrapped for `hashtable_power` 28 and above;
+  the main queue is now capped at 2^30 entries
+- The heap cache's lock-free queue could report full or empty while another
+  thread was between claiming a slot and releasing it
 - **Merge eviction rewritten to SSD GC style** (cache-core): The previous implementation used
   in-place pruning (`segment.prune()`) which marked items as deleted but never freed segments,
   causing `ensure_space` to loop until OutOfMemory. The new implementation reserves a spare

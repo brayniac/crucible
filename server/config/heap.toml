@@ -4,7 +4,7 @@
 # Each item is individually heap-allocated, which:
 # - Avoids segment fragmentation
 # - Supports any item size (no segment_size limit)
-# - Uses approximate LFU eviction
+# - Uses S3-FIFO eviction by default, or approximate LFU
 # - Has per-item allocator overhead
 
 
@@ -22,6 +22,9 @@ heap_size = "1GB"
 
 # Hashtable power (2^power buckets)
 # Should be sized for expected item count (aim for <50% load factor)
+# With policy = "s3fifo", the small queue holds small_queue_percent
+# (default 10) of the 2^power * 8 slots; an item not read while in it is
+# evicted once that many newer inserts follow it.
 hashtable_power = 24
 
 # SET eviction retry timeout in microseconds (async server only).

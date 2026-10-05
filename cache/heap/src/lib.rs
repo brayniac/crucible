@@ -81,7 +81,7 @@ mod sync;
 mod verifier;
 
 pub use location::ValueType;
-pub use s3fifo_policy::S3FifoPolicy;
+pub(crate) use s3fifo_policy::S3FifoPolicy;
 
 // Re-export from cache-core for disk tier configuration
 pub use cache_core::SyncMode;
@@ -684,7 +684,7 @@ impl HeapCache {
 
     /// Evict using S3-FIFO policy.
     fn evict_s3fifo(&self, policy: &S3FifoPolicy) -> bool {
-        // S3FifoPolicy::evict returns the Location to free
+        // S3FifoPolicy::evict returns the locations of the items it unlinked.
         // We don't create ghosts for heap cache (would need more state)
         let freed = policy.evict(self.hashtable.as_ref(), false);
         for &location in &freed {
@@ -2186,8 +2186,9 @@ impl HeapCacheBuilder {
     /// Set S3-FIFO small queue percentage (1-50, default 10), of the
     /// hashtable's slots.
     ///
-    /// Only used when eviction policy is S3-FIFO. An item not read while in
-    /// the small queue is evicted once this many newer inserts follow it,
+    /// Only used when eviction policy is S3-FIFO. An item read no more than
+    /// `demotion_threshold` times while in the small queue is evicted once
+    /// this percentage of the hashtable's slots in newer inserts follow it,
     /// whether or not memory is short.
     pub fn small_queue_percent(mut self, percent: u8) -> Self {
         self.small_queue_percent = percent.clamp(1, 50);
@@ -2227,7 +2228,7 @@ impl HeapCacheBuilder {
 
         let eviction_state = match self.eviction_policy {
             EvictionPolicy::S3Fifo => EvictionState::S3Fifo(S3FifoPolicy::new(
-                slot_capacity as u32,
+                slot_capacity as u64,
                 self.small_queue_percent,
                 self.demotion_threshold,
             )),
@@ -2508,7 +2509,10 @@ mod tests {
             .initial_fragmentation_ratio(100)
             .build()
             .unwrap();
-        for i in 0..20_000 {
+        // Fewer sets than `CALIBRATION_INTERVAL`: on Linux without jemalloc,
+        // calibration reads the whole process's RSS, which in a test binary
+        // includes every other test's allocations.
+        for i in 0..9_000 {
             let key = format!("k{i}");
             cache
                 .set(key.as_bytes(), &[b'x'; 400], None)
