@@ -90,6 +90,18 @@ pub struct FifoQueue {
     mask: u32,
 }
 
+/// Wait for another thread to finish with a slot it has claimed: spin,
+/// then yield, so a thread preempted inside that window is let run.
+#[inline]
+fn wait(waits: &mut u32) {
+    *waits = waits.wrapping_add(1);
+    if waits.is_multiple_of(64) {
+        std::thread::yield_now();
+    } else {
+        std::hint::spin_loop();
+    }
+}
+
 impl FifoQueue {
     /// Create a new FIFO queue with the given capacity.
     ///
@@ -127,6 +139,7 @@ impl FifoQueue {
     #[inline]
     pub fn push(&self, entry: QueueEntry) -> bool {
         let mut tail = self.tail.load(Ordering::Relaxed);
+        let mut waits = 0u32;
         loop {
             let slot = &self.slots[(tail & self.mask) as usize];
             let seq = slot.sequence.load(Ordering::Acquire);
@@ -153,8 +166,16 @@ impl FifoQueue {
                     Err(new_tail) => tail = new_tail,
                 }
             } else if diff < 0 {
-                // Queue is full
-                return false;
+                // The slot still holds an entry from the previous lap. The
+                // queue is full only if `capacity` entries lie between head
+                // and tail; otherwise a consumer has claimed this slot and
+                // not yet released it, so wait for it.
+                let head = self.head.load(Ordering::Acquire);
+                tail = self.tail.load(Ordering::Relaxed);
+                if tail.wrapping_sub(head) as i32 >= self.capacity as i32 {
+                    return false;
+                }
+                wait(&mut waits);
             } else {
                 // Another producer is writing to this slot, reload tail
                 tail = self.tail.load(Ordering::Relaxed);
@@ -174,6 +195,7 @@ impl FifoQueue {
     #[inline]
     pub fn pop(&self) -> Option<QueueEntry> {
         let mut head = self.head.load(Ordering::Relaxed);
+        let mut waits = 0u32;
         loop {
             let slot = &self.slots[(head & self.mask) as usize];
             let seq = slot.sequence.load(Ordering::Acquire);
@@ -199,8 +221,15 @@ impl FifoQueue {
                     Err(new_head) => head = new_head,
                 }
             } else if diff < 0 {
-                // Queue is empty
-                return None;
+                // The slot has no entry for this lap yet. The queue is empty
+                // only if head has caught up with tail; otherwise a producer
+                // has claimed this slot and not yet written it, so wait.
+                let tail = self.tail.load(Ordering::Acquire);
+                head = self.head.load(Ordering::Relaxed);
+                if tail.wrapping_sub(head) as i32 <= 0 {
+                    return None;
+                }
+                wait(&mut waits);
             } else {
                 // Another consumer is reading from this slot, reload head
                 head = self.head.load(Ordering::Relaxed);

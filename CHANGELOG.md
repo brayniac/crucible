@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds, saturating at `u32::MAX`
 
 ### Changed
+- **Heap S3-FIFO evicts from a full small queue on insert.** An item read no
+  more than `demotion_threshold` times now leaves once the small queue's
+  capacity of newer inserts follow it, whether or not memory is short.
+  Before, the oldest small-queue entry was dropped from tracking and its
+  item could never be evicted
 - **`Hashtable` gains `insert_pinned` and `update_if_present_pinned`**,
   which call a closure with the location of the entry being replaced before
   replacing it. They are required methods; `insert` and `update_if_present`

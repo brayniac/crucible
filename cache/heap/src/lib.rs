@@ -32,13 +32,17 @@
 //! # Memory Management
 //!
 //! The cache tracks allocated bytes and evicts items when approaching the
-//! memory limit. A fragmentation ratio is periodically calibrated by querying
+//! memory limit. Under S3-FIFO, inserts also evict once the small queue is
+//! full (see below). A fragmentation ratio is periodically calibrated by querying
 //! the allocator (if available) to account for external fragmentation.
 //!
 //! # Eviction Policies
 //!
 //! - **S3-FIFO** (default): Uses a small admission filter queue and a main cache.
-//!   Items are promoted based on access frequency.
+//!   An item read more than `demotion_threshold` times while in the small
+//!   queue moves to the main queue; any other is evicted once the small
+//!   queue's capacity of newer inserts follow it, whether or not memory is
+//!   short.
 //! - **LFU**: Approximate least-frequently-used eviction via random sampling.
 //!
 //! # Example
@@ -682,13 +686,12 @@ impl HeapCache {
     fn evict_s3fifo(&self, policy: &S3FifoPolicy) -> bool {
         // S3FifoPolicy::evict returns the Location to free
         // We don't create ghosts for heap cache (would need more state)
-        if let Some(location) = policy.evict(self.hashtable.as_ref(), false) {
+        let freed = policy.evict(self.hashtable.as_ref(), false);
+        for &location in &freed {
             // Use TypedLocation to handle all value types
-            let typed_loc = TypedLocation::from_location(location);
-            self.deallocate_typed_slot(typed_loc);
-            return true;
+            self.deallocate_typed_slot(TypedLocation::from_location(location));
         }
-        false
+        !freed.is_empty()
     }
 
     /// Evict using approximate LFU via random sampling.
@@ -896,7 +899,14 @@ impl HeapCache {
             if let Some((bucket_index, item_info)) =
                 self.hashtable.lookup_for_tracking(key, &verifier)
             {
-                policy.record_insert(bucket_index, item_info);
+                // When the small queue is full, `record_insert` unlinks
+                // items to make room; this thread frees each location it
+                // returns.
+                for location in
+                    policy.record_insert(self.hashtable.as_ref(), bucket_index, item_info, false)
+                {
+                    self.deallocate_typed_slot(TypedLocation::from_location(location));
+                }
             }
         }
     }
@@ -1239,8 +1249,8 @@ impl Cache for HeapCache {
     fn flush(&self) {
         // Drop the eviction policy's queued entries first, while every item
         // they track is still indexed: the drain below frees each of those
-        // items, and a stale entry would abort an eviction rather than be
-        // skipped. An item inserted after this point is queued again by its
+        // items, and each stale entry costs a later eviction one extra pop.
+        // An item inserted after this point is queued again by its
         // writer, so emptying the queues after the drain would leave such an
         // item in no queue and never evictable. Lfu and Random hold no state.
         if let EvictionState::S3Fifo(policy) = &self.eviction_state {
@@ -2173,9 +2183,12 @@ impl HeapCacheBuilder {
         self
     }
 
-    /// Set S3-FIFO small queue percentage (1-50, default 10).
+    /// Set S3-FIFO small queue percentage (1-50, default 10), of the
+    /// hashtable's slots.
     ///
-    /// Only used when eviction policy is S3-FIFO.
+    /// Only used when eviction policy is S3-FIFO. An item not read while in
+    /// the small queue is evicted once this many newer inserts follow it,
+    /// whether or not memory is short.
     pub fn small_queue_percent(mut self, percent: u8) -> Self {
         self.small_queue_percent = percent.clamp(1, 50);
         self
@@ -2460,6 +2473,148 @@ mod tests {
         }
     }
 
+    /// Every item stays in an S3-FIFO queue when inserts outnumber the
+    /// small queue's capacity: evicting until both queues are empty empties
+    /// the cache.
+    #[test]
+    fn s3fifo_tracks_every_item_past_the_small_queue_capacity() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(4 * 1024 * 1024)
+            .hashtable_power(10)
+            .initial_fragmentation_ratio(100)
+            .build()
+            .unwrap();
+        for i in 0..50_000 {
+            let _ = cache.set(format!("k{i}").as_bytes(), &[b'x'; 200], None);
+        }
+        let EvictionState::S3Fifo(policy) = &cache.eviction_state else {
+            unreachable!("the default policy is S3-FIFO")
+        };
+        let mut calls = 0;
+        while policy.total_tracked() > 0 && calls < 1_000_000 {
+            cache.evict_one();
+            calls += 1;
+        }
+        assert_eq!(cache.len(), 0, "live items are tracked by no S3-FIFO queue");
+    }
+
+    /// With every key read many times, S3-FIFO still finds a victim: a SET
+    /// never fails for want of one.
+    #[test]
+    fn s3fifo_evicts_when_every_item_is_hot() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(1024 * 1024)
+            .hashtable_power(12)
+            .initial_fragmentation_ratio(100)
+            .build()
+            .unwrap();
+        for i in 0..20_000 {
+            let key = format!("k{i}");
+            cache
+                .set(key.as_bytes(), &[b'x'; 400], None)
+                .unwrap_or_else(|e| panic!("set {i} failed: {e:?}"));
+            for _ in 0..20 {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+    }
+
+    /// Entries whose items were deleted are skipped at the head of either
+    /// queue: eviction still reaches every live item behind them.
+    #[test]
+    fn s3fifo_evicts_past_stale_queue_heads() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(64 * 1024 * 1024)
+            .hashtable_power(6)
+            .build()
+            .unwrap();
+        let EvictionState::S3Fifo(policy) = &cache.eviction_state else {
+            unreachable!("the default policy is S3-FIFO")
+        };
+        for i in 0..10 {
+            let key = format!("h{i}");
+            cache.set(key.as_bytes(), b"v", None).unwrap();
+            for _ in 0..3 {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        for i in 0..40 {
+            cache.set(format!("k{i}").as_bytes(), b"v", None).unwrap();
+        }
+        for i in 0..20 {
+            assert!(cache.delete(format!("k{i}").as_bytes()));
+        }
+        // Promotes h0..h9, skips the deleted k0..k19, evicts k20.
+        assert!(cache.evict_one());
+        assert_eq!(policy.main_queue_len(), 10);
+        for i in 0..5 {
+            assert!(cache.delete(format!("h{i}").as_bytes()));
+        }
+        let live = cache.len();
+        let mut evicted = 0;
+        while cache.evict_one() {
+            evicted += 1;
+        }
+        assert_eq!((evicted, cache.len()), (live, 0));
+    }
+
+    /// Items evicted from the main queue to admit a promotion during an
+    /// insert are freed: every occupied slot holds a reachable key.
+    #[test]
+    fn s3fifo_insert_frees_what_promotion_evicts() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(64 * 1024 * 1024)
+            .hashtable_power(4)
+            .build()
+            .unwrap();
+        // Overwrites leave stale entries that fill the main queue, so an
+        // insert's promotion has to evict from main.
+        let n = 50;
+        for r in 0..20_000 {
+            let i = r % n;
+            let key = format!("k{i}");
+            let _ = cache.set(key.as_bytes(), b"v", None);
+            for _ in 0..3 {
+                let _ = cache.get(key.as_bytes());
+            }
+        }
+        let reachable = (0..n)
+            .filter(|i| cache.contains(format!("k{i}").as_bytes()))
+            .count();
+        assert_eq!(cache.len(), reachable);
+    }
+
+    /// Concurrent inserters leave every item in an S3-FIFO queue: evicting
+    /// until both queues are empty empties the cache.
+    #[test]
+    fn s3fifo_tracks_every_item_under_concurrent_inserts() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(64 * 1024 * 1024)
+            .hashtable_power(10)
+            .initial_fragmentation_ratio(100)
+            .build()
+            .unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8u32 {
+                let cache = &cache;
+                s.spawn(move || {
+                    for i in 0..20_000u32 {
+                        let _ = cache.set(format!("t{t}k{i}").as_bytes(), b"v", None);
+                    }
+                });
+            }
+        });
+        let EvictionState::S3Fifo(policy) = &cache.eviction_state else {
+            unreachable!("the default policy is S3-FIFO")
+        };
+        let mut calls = 0;
+        while policy.total_tracked() > 0 && calls < 1_000_000 {
+            cache.evict_one();
+            calls += 1;
+        }
+        assert_eq!(cache.len(), 0, "live items are tracked by no S3-FIFO queue");
+    }
+
     fn create_test_cache() -> HeapCache {
         HeapCacheBuilder::new()
             .memory_limit(1024 * 1024) // 1MB
@@ -2471,9 +2626,7 @@ mod tests {
     }
 
     /// After a flush no earlier item is readable, every slot and byte is
-    /// accounted free, and a full cache refills. The S3-FIFO queues are
-    /// emptied too: `evict_from_small` uses `?` on a stale lookup, which
-    /// abandons the eviction instead of skipping the entry.
+    /// accounted free, and a full cache refills.
     #[test]
     fn test_cache_accepts_writes_after_flush() {
         let cache = create_test_cache();

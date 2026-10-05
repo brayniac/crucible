@@ -1,16 +1,24 @@
 //! S3-FIFO eviction policy for HeapCache.
 //!
 //! S3-FIFO uses two FIFO queues:
-//! - **Small queue**: Admission filter (~10% capacity). New items enter here.
-//! - **Main queue**: Long-term storage (~90% capacity). Hot items promoted here.
+//! - Small queue: admission filter (~10% capacity). New items enter here.
+//! - Main queue: long-term storage (~90% capacity). Items read in the small
+//!   queue move here.
 //!
-//! On eviction from the small queue:
-//! - If frequency > threshold: promote to main queue, decay frequency
-//! - If frequency <= threshold: create ghost, free the slot
+//! The small queue's oldest entry is processed when an eviction needs a
+//! victim, and also when an insert finds the small queue full:
+//! - If frequency > threshold: move to the main queue, decay frequency
+//! - Otherwise: unlink the item (or convert it to a ghost) and free it
+//!
+//! So an item read no more than `demotion_threshold` times is evicted once
+//! the small queue's capacity of newer inserts follow it, whether or not
+//! memory is short.
 //!
 //! On eviction from the main queue:
 //! - If frequency > 0: decay and reinsert at tail (CLOCK-like behavior)
-//! - If frequency == 0: create ghost, free the slot
+//! - If frequency == 0: unlink the item (or convert it to a ghost) and free it
+//!
+//! Decayed frequencies are capped at 3, as in the reference S3-FIFO.
 
 use crate::fifo_queue::{FifoQueue, QueueEntry};
 use cache_core::{Hashtable, Location};
@@ -19,6 +27,18 @@ use cache_core::{Hashtable, Location};
 /// item_info layout: [TAG:12][FREQ:8][LOCATION:44]
 /// We want to match TAG and LOCATION, masking out FREQ (bits 44-51).
 const COMPARE_MASK: u64 = !((0xFF_u64) << 44);
+
+/// The location bits of an item_info.
+const LOCATION_MASK: u64 = 0xFFF_FFFF_FFFF;
+
+/// Decayed frequencies are capped at this value, as in the reference
+/// S3-FIFO; the hashtable counts up to 127. An item at the cap that is not
+/// read again is evicted on its `MAX_FREQUENCY + 1`th visit to the head of
+/// the main queue.
+const MAX_FREQUENCY: u8 = 3;
+
+/// Attempts `record_insert` makes to queue a new entry.
+const MAX_PUSH_ATTEMPTS: usize = 8;
 
 /// S3-FIFO eviction policy.
 pub struct S3FifoPolicy {
@@ -51,94 +71,113 @@ impl S3FifoPolicy {
 
     /// Record an item insertion in the small queue.
     ///
-    /// This should be called after a successful hashtable insert.
+    /// This should be called after a successful hashtable insert. If the
+    /// small queue is full, its oldest entries are processed as for an
+    /// eviction until the new entry fits. If it still does not fit after
+    /// `MAX_PUSH_ATTEMPTS`, the new item itself is unlinked: an item in no
+    /// queue would never be evicted. The locations of every item unlinked
+    /// are returned for the caller to free.
     ///
     /// # Arguments
+    /// - `hashtable`: The hashtable for looking up/modifying items
     /// - `bucket_index`: The hashtable bucket where the item was inserted
     /// - `item_info`: The packed item info (tag, freq, location)
-    pub fn record_insert(&self, bucket_index: u64, item_info: u64) {
+    /// - `create_ghosts`: Whether to create ghost entries for evicted items
+    pub fn record_insert<H: Hashtable>(
+        &self,
+        hashtable: &H,
+        bucket_index: u64,
+        item_info: u64,
+        create_ghosts: bool,
+    ) -> Vec<Location> {
         let entry = QueueEntry::new(bucket_index, item_info);
-
-        // Try to push to small queue
-        if !self.small.push(entry) {
-            // Small queue full - this shouldn't happen if we evict properly
-            // but we handle it gracefully by dropping the oldest entry
-            let _ = self.small.pop();
-            let _ = self.small.push(entry);
+        let mut freed = Vec::new();
+        for _ in 0..MAX_PUSH_ATTEMPTS {
+            if self.small.push(entry) {
+                return freed;
+            }
+            self.take_small_head(hashtable, create_ghosts, &mut freed);
         }
+        // Other inserters took the room each step made.
+        let location = item_info & LOCATION_MASK;
+        if Self::unlink(hashtable, bucket_index, location, create_ghosts) {
+            freed.push(Location::new(location));
+        }
+        freed
     }
 
-    /// Evict an item from the cache using S3-FIFO policy.
+    /// Evict items from the cache using S3-FIFO policy.
     ///
-    /// Returns the location of the evicted item to be freed, or None if no
-    /// eviction was possible.
+    /// Returns the locations of the items unlinked, for the caller to free;
+    /// empty if no eviction was possible. Usually one; a promotion that
+    /// cannot enter the main queue unlinks the promoted item too.
     ///
     /// # Arguments
     /// - `hashtable`: The hashtable for looking up/modifying items
     /// - `create_ghosts`: Whether to create ghost entries for evicted items
-    pub fn evict<H: Hashtable>(&self, hashtable: &H, create_ghosts: bool) -> Option<Location> {
-        // First try to evict from small queue
-        if let Some(result) = self.evict_from_small(hashtable, create_ghosts) {
-            return Some(result);
+    pub fn evict<H: Hashtable>(&self, hashtable: &H, create_ghosts: bool) -> Vec<Location> {
+        let mut freed = Vec::new();
+        // Small queue first: process entries in order until one item is
+        // unlinked, bounded by the queue's length at the start, plus one.
+        for _ in 0..=self.small.len() {
+            if !self.take_small_head(hashtable, create_ghosts, &mut freed) || !freed.is_empty() {
+                break;
+            }
         }
-
-        // Fall back to main queue
-        self.evict_from_main(hashtable, create_ghosts)
+        if freed.is_empty() {
+            self.evict_from_main(hashtable, create_ghosts, &mut freed);
+        }
+        freed
     }
 
-    /// Evict from the small queue.
-    ///
-    /// Items with freq > threshold are promoted to main queue.
-    /// Items with freq <= threshold are evicted (ghosted).
-    fn evict_from_small<H: Hashtable>(
+    /// Pop the small queue's oldest entry and apply S3-FIFO's small-queue
+    /// decision to it, adding the locations of items unlinked to `freed`.
+    /// Returns `false` if the queue was empty.
+    fn take_small_head<H: Hashtable>(
         &self,
         hashtable: &H,
         create_ghosts: bool,
-    ) -> Option<Location> {
-        // Process up to N entries looking for something to evict
-        const MAX_ITERATIONS: usize = 100;
+        freed: &mut Vec<Location>,
+    ) -> bool {
+        let Some(entry) = self.small.pop() else {
+            return false;
+        };
 
-        for _ in 0..MAX_ITERATIONS {
-            let entry = self.small.pop()?;
+        // The entry is stale if its item was overwritten, deleted or evicted
+        // since it was queued; it is dropped.
+        let Some(current_info) = hashtable.get_info_at_bucket(entry.bucket_index, |info| {
+            // Match tag and location (ignore frequency which may have changed)
+            (info & COMPARE_MASK) == (entry.item_info & COMPARE_MASK)
+        }) else {
+            return true;
+        };
 
-            // Verify the entry is still valid in the hashtable
-            let current_info = hashtable.get_info_at_bucket(entry.bucket_index, |info| {
-                // Match tag and location (ignore frequency which may have changed)
-                (info & COMPARE_MASK) == (entry.item_info & COMPARE_MASK)
-            })?;
+        let current_freq = ((current_info >> 44) & 0xFF) as u8;
+        let location = current_info & LOCATION_MASK;
 
-            let current_freq = ((current_info >> 44) & 0xFF) as u8;
-            let location = current_info & 0xFFF_FFFF_FFFF;
+        if current_freq > self.demotion_threshold {
+            let decayed_freq = current_freq.min(MAX_FREQUENCY).saturating_sub(1);
+            let new_info = (current_info & !((0xFF_u64) << 44)) | ((decayed_freq as u64) << 44);
+            hashtable.set_frequency_at_bucket(entry.bucket_index, location, decayed_freq);
 
-            if current_freq > self.demotion_threshold {
-                // Promote to main queue
-                let decayed_freq = current_freq.saturating_sub(1);
-                let new_info = (current_info & !((0xFF_u64) << 44)) | ((decayed_freq as u64) << 44);
-
-                // Decay frequency in hashtable
-                hashtable.set_frequency_at_bucket(entry.bucket_index, location, decayed_freq);
-
-                // Add to main queue
-                let promoted_entry = QueueEntry::new(entry.bucket_index, new_info);
-                if !self.main.push(promoted_entry) {
-                    // Main queue full, evict from main first
-                    if let Some(evicted) = self.evict_from_main(hashtable, create_ghosts) {
-                        // Now try to push again
-                        let _ = self.main.push(promoted_entry);
-                        return Some(evicted);
-                    }
-                }
-                // Continue processing small queue
-                continue;
+            let promoted_entry = QueueEntry::new(entry.bucket_index, new_info);
+            if self.main.push(promoted_entry) {
+                return true;
             }
-
-            // Evict this item, if it is still ours to evict
-            if Self::unlink(hashtable, entry.bucket_index, location, create_ghosts) {
-                return Some(Location::new(location));
+            // Main queue full: make room by evicting from it.
+            self.evict_from_main(hashtable, create_ghosts, freed);
+            if self.main.push(promoted_entry) {
+                return true;
             }
+            // Other promotions took the room; an item in no queue would
+            // never be evicted, so this one is evicted now.
         }
 
-        None
+        // Evict this item, if it is still ours to evict
+        if Self::unlink(hashtable, entry.bucket_index, location, create_ghosts) {
+            freed.push(Location::new(location));
+        }
+        true
     }
 
     /// Unlink an evicted item's entry. Returns `true` iff this call unlinked
@@ -158,52 +197,57 @@ impl S3FifoPolicy {
         }
     }
 
-    /// Evict from the main queue.
-    ///
-    /// Items with freq > 0 are decayed and reinserted (CLOCK-like).
-    /// Items with freq == 0 are evicted.
+    /// Evict from the main queue: items with freq > 0 are decayed and
+    /// reinserted (CLOCK-like); the first with freq == 0 is unlinked and its
+    /// location added to `freed`.
     fn evict_from_main<H: Hashtable>(
         &self,
         hashtable: &H,
         create_ghosts: bool,
-    ) -> Option<Location> {
-        const MAX_ITERATIONS: usize = 100;
+        freed: &mut Vec<Location>,
+    ) {
+        // An entry not read again is evicted on its `MAX_FREQUENCY + 1`th
+        // visit; this bound gives each entry present at the start that many
+        // visits.
+        let passes = (MAX_FREQUENCY as usize + 1) * (self.main.len() as usize + 1);
 
-        for _ in 0..MAX_ITERATIONS {
-            let entry = self.main.pop()?;
+        for _ in 0..passes {
+            let Some(entry) = self.main.pop() else {
+                return;
+            };
 
-            // Verify the entry is still valid
-            let current_info = hashtable.get_info_at_bucket(entry.bucket_index, |info| {
+            // A stale entry, whose item was overwritten, deleted or evicted
+            // since it was queued, is dropped.
+            let Some(current_info) = hashtable.get_info_at_bucket(entry.bucket_index, |info| {
                 (info & COMPARE_MASK) == (entry.item_info & COMPARE_MASK)
-            })?;
+            }) else {
+                continue;
+            };
 
             let current_freq = ((current_info >> 44) & 0xFF) as u8;
-            let location = current_info & 0xFFF_FFFF_FFFF;
+            let location = current_info & LOCATION_MASK;
 
             if current_freq > 0 {
                 // Decay and reinsert at tail (second chance)
-                let decayed_freq = current_freq.saturating_sub(1);
+                let decayed_freq = current_freq.min(MAX_FREQUENCY).saturating_sub(1);
                 hashtable.set_frequency_at_bucket(entry.bucket_index, location, decayed_freq);
 
                 let new_info = (current_info & !((0xFF_u64) << 44)) | ((decayed_freq as u64) << 44);
-                let reinsert_entry = QueueEntry::new(entry.bucket_index, new_info);
-
-                if !self.main.push(reinsert_entry)
-                    && Self::unlink(hashtable, entry.bucket_index, location, create_ghosts)
+                if self
+                    .main
+                    .push(QueueEntry::new(entry.bucket_index, new_info))
                 {
-                    // Queue full, evict this item
-                    return Some(Location::new(location));
+                    continue;
                 }
-                continue;
+                // Queue full: evict this item instead.
             }
 
-            // Evict this item (freq == 0), if it is still ours to evict
+            // Evict this item, if it is still ours to evict
             if Self::unlink(hashtable, entry.bucket_index, location, create_ghosts) {
-                return Some(Location::new(location));
+                freed.push(Location::new(location));
+                return;
             }
         }
-
-        None
     }
 
     /// Drop all queued entries, returning the policy to its initial state.
@@ -212,8 +256,7 @@ impl S3FifoPolicy {
     /// the entries name are about to be freed: `HeapCache::flush` calls it
     /// before draining the hashtable, and `HeapCache::reset` with no operation
     /// in flight. Left in place after the items are freed, every entry would
-    /// be stale, and `evict_from_small` abandons an eviction on the first
-    /// stale entry rather than skipping it.
+    /// be stale, and eviction would drop them one at a time.
     pub fn reset(&self) {
         self.small.clear();
         self.main.clear();
@@ -249,12 +292,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "loom"))]
     fn test_record_insert() {
         let policy = S3FifoPolicy::new(100, 10, 1);
+        let hashtable = cache_core::MultiChoiceHashtable::new(4);
 
-        // Record some insertions
-        policy.record_insert(0, 0x1234_5678_9ABC_DEF0);
-        policy.record_insert(1, 0xFEDC_BA98_7654_3210);
+        // Record some insertions; the small queue has room, so none evicts.
+        assert!(
+            policy
+                .record_insert(&hashtable, 0, 0x1234_5678_9ABC_DEF0, false)
+                .is_empty()
+        );
+        assert!(
+            policy
+                .record_insert(&hashtable, 1, 0xFEDC_BA98_7654_3210, false)
+                .is_empty()
+        );
 
         assert_eq!(policy.small_queue_len(), 2);
         assert_eq!(policy.main_queue_len(), 0);
