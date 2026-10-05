@@ -298,9 +298,7 @@ impl HeapCache {
             return Err(CacheError::KeyTooLong);
         }
 
-        // Check if key already exists
-        let verifier = HeapCacheVerifier::new(&self.storage);
-        if self.hashtable.contains(key, &verifier) {
+        if self.lookup_live(key).is_some() {
             return Err(CacheError::KeyExists);
         }
 
@@ -377,9 +375,7 @@ impl HeapCache {
             return Err(CacheError::KeyTooLong);
         }
 
-        // Check if key exists
-        let verifier = HeapCacheVerifier::new(&self.storage);
-        if !self.hashtable.contains(key, &verifier) {
+        if self.lookup_live(key).is_none() {
             return Err(CacheError::KeyNotFound);
         }
 
@@ -618,6 +614,9 @@ impl HeapCache {
     }
 
     /// Delete an item from the cache.
+    ///
+    /// Returns `true` if this call removed a live item. An expired item is
+    /// removed and freed too, but the call returns `false`.
     fn delete_item(&self, key: &[u8]) -> bool {
         let verifier = HeapCacheVerifier::new(&self.storage);
 
@@ -625,21 +624,56 @@ impl HeapCache {
             Some(result) => result,
             None => return false,
         };
+        let slot_loc = SlotLocation::from_location(location);
+        let live = self.is_live(slot_loc);
 
         if !self.hashtable.remove(key, location) {
             return false;
         }
 
-        let slot_loc = SlotLocation::from_location(location);
         self.deallocate_and_track(slot_loc);
 
-        true
+        live
     }
 
-    /// Check if a key exists.
+    /// Check if a key exists. An expired item is removed and reported absent.
     fn contains_key(&self, key: &[u8]) -> bool {
+        self.lookup_live(key).is_some()
+    }
+
+    /// Look up `key`'s string item, treating an expired item as absent.
+    ///
+    /// The hashtable indexes an expired item until it is evicted, deleted or
+    /// overwritten. This removes its entry, matched on its exact location so
+    /// a concurrent overwrite is not lost, and frees it. Returns `None` if the
+    /// key is not indexed, its item has expired, or its slot was reused since
+    /// the lookup.
+    fn lookup_live(&self, key: &[u8]) -> Option<cache_core::Location> {
         let verifier = HeapCacheVerifier::new(&self.storage);
-        self.hashtable.contains(key, &verifier)
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let slot_loc = SlotLocation::from_location(location);
+        if self.is_live(slot_loc) {
+            return Some(location);
+        }
+        if self.hashtable.remove(key, location) {
+            self.deallocate_and_track(slot_loc);
+        }
+        None
+    }
+
+    /// Whether `slot_loc` holds an item that has not expired or been deleted.
+    fn is_live(&self, slot_loc: SlotLocation) -> bool {
+        let Some(slot) = self.storage.get(slot_loc.slot_index()) else {
+            return false;
+        };
+        if slot
+            .get_with_flags(slot_loc.generation(), false, false)
+            .is_none()
+        {
+            return false;
+        }
+        slot.release_read();
+        true
     }
 
     /// Try to evict one entry to make room for a new one.
@@ -2574,6 +2608,39 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{policy:?}: {e:?}"));
             assert_eq!(cache.with_value(b"big", |v| v == &value[..]), Some(true));
         }
+    }
+
+    /// An expired key is absent to ADD, REPLACE, `contains` and DELETE, and
+    /// each frees the expired item.
+    #[test]
+    fn expired_keys_are_absent() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(1024 * 1024)
+            .hashtable_power(10)
+            .build()
+            .unwrap();
+        let ttl = Some(Duration::from_secs(1));
+        for key in [&b"add"[..], b"replace", b"contains", b"delete"] {
+            cache.set(key, b"old", ttl).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(2100));
+
+        assert_eq!(cache.add(b"add", b"new", None), Ok(()));
+        assert_eq!(
+            cache.with_value(b"add", |v| v.to_vec()),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            cache.replace(b"replace", b"new", None),
+            Err(CacheError::KeyNotFound)
+        );
+        assert!(cache.get(b"replace").is_none());
+        assert!(!cache.contains(b"contains"));
+        assert!(!cache.delete(b"delete"));
+
+        // The three expired items were freed; only the ADD's item remains.
+        assert_eq!(cache.bytes_used(), entry::item_size(3, 3));
+        assert_eq!(cache.len(), 1);
     }
 
     /// Entries whose items were deleted are skipped at the head of either

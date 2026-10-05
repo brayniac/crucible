@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
+- Heap ADD refused, and REPLACE overwrote, a key whose item had expired but
+  was still indexed; `contains` reported it present and DELETE reported it
+  deleted. All four now treat an expired item as absent and free it
 - A heap SET that needed more than 100 evictions to fit failed with
   `OutOfMemory` after evicting 100 items; it now evicts up to as many items
   as are cached. A value whose size, scaled by the fragmentation ratio,
