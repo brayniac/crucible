@@ -94,6 +94,9 @@ pub struct CacheConfig {
 
     /// S3-FIFO small queue percentage (1-50, default: 10).
     /// Controls what fraction of cache capacity is used as the admission filter.
+    /// For the heap backend, capacity is the hashtable's slot count
+    /// (2^hashtable_power * 8), and an item not read while in the small queue
+    /// is evicted once that many newer inserts follow it.
     /// Only applies when policy is "s3fifo".
     #[serde(default = "default_small_queue_percent")]
     pub small_queue_percent: u8,

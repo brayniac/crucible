@@ -90,6 +90,18 @@ pub struct FifoQueue {
     mask: u32,
 }
 
+/// Back off while another thread finishes with a slot it has claimed: spin,
+/// and yield the CPU every 64th call.
+#[inline]
+fn wait(waits: &mut u32) {
+    *waits = waits.wrapping_add(1);
+    if waits.is_multiple_of(64) {
+        std::thread::yield_now();
+    } else {
+        std::hint::spin_loop();
+    }
+}
+
 impl FifoQueue {
     /// Create a new FIFO queue with the given capacity.
     ///
@@ -97,6 +109,11 @@ impl FifoQueue {
     pub fn new(capacity: u32) -> Self {
         // Round up to power of 2
         let capacity = capacity.next_power_of_two();
+        // The full and empty checks compare `tail - head` as an i32.
+        assert!(
+            capacity <= 1 << 30,
+            "queue capacity {capacity} exceeds 2^30"
+        );
         let mask = capacity - 1;
 
         let slots: Vec<Slot> = (0..capacity)
@@ -117,7 +134,9 @@ impl FifoQueue {
 
     /// Push an entry to the tail of the queue.
     ///
-    /// Returns `true` if successful, `false` if the queue is full.
+    /// Returns `true` if successful, `false` if the queue holds `capacity`
+    /// entries. If a consumer has claimed the tail slot and not released it,
+    /// waits for it.
     ///
     /// # Thread Safety
     ///
@@ -127,6 +146,7 @@ impl FifoQueue {
     #[inline]
     pub fn push(&self, entry: QueueEntry) -> bool {
         let mut tail = self.tail.load(Ordering::Relaxed);
+        let mut waits = 0u32;
         loop {
             let slot = &self.slots[(tail & self.mask) as usize];
             let seq = slot.sequence.load(Ordering::Acquire);
@@ -153,8 +173,18 @@ impl FifoQueue {
                     Err(new_tail) => tail = new_tail,
                 }
             } else if diff < 0 {
-                // Queue is full
-                return false;
+                // The slot still holds an entry from the previous lap. The
+                // queue is full only if `capacity` entries lie between head
+                // and tail; otherwise a consumer has claimed this slot and
+                // not yet released it, so wait for it.
+                // Tail before head: head only grows, so a later head can
+                // only lower the count, never report full when it is not.
+                tail = self.tail.load(Ordering::Acquire);
+                let head = self.head.load(Ordering::Acquire);
+                if tail.wrapping_sub(head) as i32 >= self.capacity as i32 {
+                    return false;
+                }
+                wait(&mut waits);
             } else {
                 // Another producer is writing to this slot, reload tail
                 tail = self.tail.load(Ordering::Relaxed);
@@ -164,7 +194,8 @@ impl FifoQueue {
 
     /// Pop an entry from the head of the queue.
     ///
-    /// Returns `None` if the queue is empty.
+    /// Returns `None` if head has reached tail. If a producer has claimed the
+    /// head slot and not finished writing it, waits for the write.
     ///
     /// # Thread Safety
     ///
@@ -174,6 +205,7 @@ impl FifoQueue {
     #[inline]
     pub fn pop(&self) -> Option<QueueEntry> {
         let mut head = self.head.load(Ordering::Relaxed);
+        let mut waits = 0u32;
         loop {
             let slot = &self.slots[(head & self.mask) as usize];
             let seq = slot.sequence.load(Ordering::Acquire);
@@ -199,8 +231,17 @@ impl FifoQueue {
                     Err(new_head) => head = new_head,
                 }
             } else if diff < 0 {
-                // Queue is empty
-                return None;
+                // The slot has no entry for this lap yet. The queue is empty
+                // only if head has caught up with tail; otherwise a producer
+                // has claimed this slot and not yet written it, so wait.
+                // Head before tail: tail only grows, so a later tail can
+                // only raise the count, never report empty when it is not.
+                head = self.head.load(Ordering::Acquire);
+                let tail = self.tail.load(Ordering::Acquire);
+                if tail.wrapping_sub(head) as i32 <= 0 {
+                    return None;
+                }
+                wait(&mut waits);
             } else {
                 // Another consumer is reading from this slot, reload head
                 head = self.head.load(Ordering::Relaxed);
@@ -439,5 +480,52 @@ mod tests {
 
         assert_eq!(consumed.load(Ordering::Relaxed), total_items);
         assert!(queue.is_empty());
+    }
+
+    /// Entries circulate between threads, each holding at most one, so the
+    /// queue always holds between `tokens - threads` and `tokens` entries.
+    /// `pop` never reports empty while entries remain, and `push` never
+    /// reports full while there is room, however the threads interleave.
+    fn circulate(capacity: u32, threads: u64, tokens: u64, iterations: u64) -> (u64, u64) {
+        use std::sync::atomic::AtomicU64;
+        let queue = FifoQueue::new(capacity);
+        for i in 0..tokens {
+            assert!(queue.push(QueueEntry::new(i, i)));
+        }
+        let false_empty = AtomicU64::new(0);
+        let false_full = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    for _ in 0..iterations {
+                        let entry = loop {
+                            if let Some(entry) = queue.pop() {
+                                break entry;
+                            }
+                            if tokens > threads {
+                                false_empty.fetch_add(1, Ordering::Relaxed);
+                            }
+                        };
+                        while !queue.push(entry) {
+                            if tokens < u64::from(queue.capacity()) {
+                                false_full.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(u64::from(queue.len()), tokens);
+        (false_empty.into_inner(), false_full.into_inner())
+    }
+
+    #[test]
+    fn pop_never_reports_empty_while_entries_remain() {
+        assert_eq!(circulate(1024, 8, 9, 200_000), (0, 0));
+    }
+
+    #[test]
+    fn push_never_reports_full_while_there_is_room() {
+        assert_eq!(circulate(16, 8, 15, 200_000), (0, 0));
     }
 }
