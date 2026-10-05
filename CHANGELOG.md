@@ -54,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
+- The heap cache's fragmentation ratio divided whole-process memory (jemalloc
+  allocated bytes, or RSS on Linux without jemalloc) by the cache's tracked
+  bytes, so the hashtable, slot arrays and every other allocation counted
+  as fragmentation. The ratio reached its 300% clamp and the cache held a
+  third of `memory_limit`; with a 256 MiB limit and 1 KB values, 85 MiB.
+  With the `jemalloc` feature the ratio is now jemalloc's resident bytes
+  divided by its allocated bytes; without it, the configured ratio is kept
 - Heap S3-FIFO tracked no more items than the small queue holds: an insert
   into a full small queue dropped its oldest entry from tracking, and that
   item could then never be evicted. With every item tracked, a cache where

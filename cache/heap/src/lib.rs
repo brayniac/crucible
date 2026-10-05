@@ -33,8 +33,12 @@
 //!
 //! The cache tracks allocated bytes and evicts items when approaching the
 //! memory limit. Under S3-FIFO, inserts also evict once the small queue is
-//! full (see below). A fragmentation ratio is periodically calibrated by querying
-//! the allocator (if available) to account for external fragmentation.
+//! full (see below). Tracked bytes are multiplied by a fragmentation ratio
+//! before comparing with the limit. With the `jemalloc` feature, the ratio is
+//! recalibrated every 10,000 operations to jemalloc's resident bytes divided
+//! by its allocated bytes; without it, the ratio stays at its configured
+//! value. The hashtable, slot arrays and eviction queues are allocated when
+//! the cache is built and are not counted against the limit.
 //!
 //! # Eviction Policies
 //!
@@ -272,59 +276,19 @@ impl HeapCache {
         }
     }
 
-    /// Calibrate the fragmentation ratio by querying the allocator.
+    /// Set the fragmentation ratio to jemalloc's resident bytes divided by
+    /// its allocated bytes, clamped to 100-300%.
     ///
-    /// This is called periodically to adjust for actual heap fragmentation.
-    /// If allocator stats aren't available, keeps the current ratio.
+    /// Both are process-wide, but their quotient measures fragmentation
+    /// rather than how much else the process allocates. Without the
+    /// `jemalloc` feature, or if jemalloc's statistics cannot be read, the
+    /// ratio is unchanged.
     pub fn calibrate_fragmentation(&self) {
-        let tracked = self.bytes_used.load(Ordering::Relaxed);
-        if tracked == 0 {
-            return;
+        #[cfg(feature = "jemalloc")]
+        if let Some(ratio) = jemalloc_fragmentation_ratio() {
+            self.fragmentation_ratio
+                .store(ratio.clamp(100, 300), Ordering::Relaxed);
         }
-
-        // Try to get actual memory usage from allocator
-        if let Some(actual) = Self::query_allocator_memory() {
-            // Calculate ratio as percentage (with bounds)
-            let ratio = ((actual as u128 * 100) / tracked as u128) as u32;
-            // Clamp to reasonable range (100-300%)
-            let ratio = ratio.clamp(100, 300);
-            self.fragmentation_ratio.store(ratio, Ordering::Relaxed);
-        }
-    }
-
-    /// Query the allocator for actual memory usage.
-    ///
-    /// Returns None if allocator stats aren't available.
-    #[cfg(feature = "jemalloc")]
-    fn query_allocator_memory() -> Option<usize> {
-        use tikv_jemalloc_ctl::{epoch, stats};
-        // Advance epoch to refresh cached stats
-        epoch::advance().ok()?;
-        stats::allocated::read().ok()
-    }
-
-    #[cfg(not(feature = "jemalloc"))]
-    fn query_allocator_memory() -> Option<usize> {
-        // Without jemalloc, try reading from /proc on Linux
-        #[cfg(target_os = "linux")]
-        {
-            Self::read_proc_statm_rss()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
-    }
-
-    /// Read RSS from /proc/self/statm on Linux.
-    /// Only used when jemalloc is not available.
-    #[cfg(all(target_os = "linux", not(feature = "jemalloc")))]
-    #[allow(dead_code)]
-    fn read_proc_statm_rss() -> Option<usize> {
-        use std::fs;
-        let statm = fs::read_to_string("/proc/self/statm").ok()?;
-        let rss_pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(rss_pages * 4096)
     }
 
     /// Store an item only if the key doesn't exist (ADD semantics).
@@ -2153,7 +2117,7 @@ impl HeapCacheBuilder {
     /// Set the hashtable power (2^power buckets).
     ///
     /// This determines both the hashtable size and the maximum number of
-    /// items the cache can hold (slot capacity = 2^power).
+    /// items the cache can hold (slot capacity = 2^power * 8).
     pub fn hashtable_power(mut self, power: u8) -> Self {
         self.hashtable_power = power;
         self
@@ -2167,8 +2131,9 @@ impl HeapCacheBuilder {
 
     /// Set the initial fragmentation ratio as a percentage.
     ///
-    /// 100 = no overhead (1.0x), 120 = 20% overhead (1.2x).
-    /// Will be calibrated automatically over time.
+    /// 100 = no overhead (1.0x), 120 = 20% overhead (1.2x). With the
+    /// `jemalloc` feature, it is recalibrated every 10,000 operations (see
+    /// [`HeapCache::calibrate_fragmentation`]); without it, it is not changed.
     pub fn initial_fragmentation_ratio(mut self, ratio: u32) -> Self {
         self.initial_fragmentation_ratio = ratio.clamp(100, 300);
         self
@@ -2509,10 +2474,7 @@ mod tests {
             .initial_fragmentation_ratio(100)
             .build()
             .unwrap();
-        // Fewer sets than `CALIBRATION_INTERVAL`: on Linux without jemalloc,
-        // calibration reads the whole process's RSS, which in a test binary
-        // includes every other test's allocations.
-        for i in 0..9_000 {
+        for i in 0..20_000 {
             let key = format!("k{i}");
             cache
                 .set(key.as_bytes(), &[b'x'; 400], None)
@@ -2521,6 +2483,29 @@ mod tests {
                 let _ = cache.get(key.as_bytes());
             }
         }
+    }
+
+    /// Without jemalloc, the fragmentation ratio keeps its configured value
+    /// past calibration points, so a cache with a small memory limit in a
+    /// process with a large footprint keeps its full capacity.
+    #[test]
+    #[cfg(not(feature = "jemalloc"))]
+    fn fragmentation_ratio_is_not_recalibrated_without_jemalloc() {
+        let cache = HeapCacheBuilder::new()
+            .memory_limit(1024 * 1024)
+            .hashtable_power(12)
+            .initial_fragmentation_ratio(110)
+            .build()
+            .unwrap();
+        // Resident memory the cache does not account for.
+        let ballast = vec![1u8; 64 * 1024 * 1024];
+        for i in 0..2 * CALIBRATION_INTERVAL {
+            let key = format!("k{}", i % 100);
+            cache.set(key.as_bytes(), &[b'x'; 100], None).unwrap();
+        }
+        assert_eq!(cache.fragmentation_ratio(), 110);
+        assert!(cache.bytes_used() > 0);
+        drop(std::hint::black_box(ballast));
     }
 
     /// Entries whose items were deleted are skipped at the head of either
