@@ -8,6 +8,55 @@
 use crate::error::CacheResult;
 use crate::location::Location;
 
+/// The entries an insert unlinked, each with the guard its `pin` returned.
+///
+/// Holds one entry without allocating. More than one only when concurrent
+/// inserts of the same absent key each published an entry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Displaced<G>(smallvec::SmallVec<[(Location, G); 1]>);
+
+impl<G> Displaced<G> {
+    /// No entries.
+    pub fn new() -> Self {
+        Self(smallvec::SmallVec::new())
+    }
+
+    /// Add an unlinked entry.
+    pub fn push(&mut self, location: Location, guard: G) {
+        self.0.push((location, guard));
+    }
+
+    /// Whether no entry was unlinked.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The number of entries unlinked.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The unlinked entries' locations.
+    pub fn locations(&self) -> impl Iterator<Item = Location> + '_ {
+        self.0.iter().map(|(location, _)| *location)
+    }
+}
+
+impl<G> Default for Displaced<G> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<G> IntoIterator for Displaced<G> {
+    type Item = (Location, G);
+    type IntoIter = smallvec::IntoIter<[(Location, G); 1]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// Trait for verifying that a key exists at a location.
 ///
 /// The hashtable calls this during lookup/insert to confirm that a tag match
@@ -104,17 +153,16 @@ pub trait Hashtable: Send + Sync {
     /// preserves the frequency. For ghosts, this "resurrects" the entry.
     ///
     /// # Returns
-    /// - `Ok(Some(old_location))` if an existing entry was replaced
-    /// - `Ok(None)` if this was a new entry or ghost resurrection
+    /// - `Ok(displaced)`: the entries this call unlinked, as described for
+    ///   [`Hashtable::insert_pinned`]. The caller retires each one.
     /// - `Err(CacheError::HashTableFull)` if no space available
     fn insert(
         &self,
         key: &[u8],
         location: Location,
         verifier: &impl KeyVerifier,
-    ) -> CacheResult<Option<Location>> {
+    ) -> CacheResult<Displaced<()>> {
         self.insert_pinned(key, location, verifier, |_| ())
-            .map(|replaced| replaced.map(|(old, ())| old))
     }
 
     /// As [`Hashtable::insert`], calling `pin` with the location of the
@@ -124,13 +172,21 @@ pub trait Hashtable: Send + Sync {
     /// storage from being reused. It runs inside the loop that replaces the
     /// entry, so it can be called several times and must not wait: if the
     /// entry changes before it is replaced, the guard is dropped, and `pin`
-    /// is called again if the entry still belongs to `key`. The guard for the
-    /// replaced entry is returned with its location, so the caller can retire
-    /// the old item while the guard is held.
+    /// is called again if the entry still belongs to `key`. The guard for
+    /// each unlinked entry is returned with its location, so the caller can
+    /// retire the old item while the guard is held.
+    ///
+    /// A key has at most one entry once every insert of it has returned.
+    /// Concurrent inserts of a key that is absent can each publish an entry;
+    /// each then unlinks every entry for the key except the one at the
+    /// highest slot position, possibly its own. So `location` may be among
+    /// the displaced entries, and an entry published by another insert may be
+    /// too.
     ///
     /// # Returns
-    /// - `Ok(Some((old_location, guard)))` if an existing entry was replaced
-    /// - `Ok(None)` if this was a new entry or ghost resurrection
+    /// - `Ok(displaced)`: the entries this call unlinked, each with its
+    ///   guard. Empty for a new key or a resurrected ghost; one entry for a
+    ///   replaced entry.
     /// - `Err(CacheError::HashTableFull)` if no space available
     fn insert_pinned<G>(
         &self,
@@ -138,7 +194,7 @@ pub trait Hashtable: Send + Sync {
         location: Location,
         verifier: &impl KeyVerifier,
         pin: impl FnMut(Location) -> G,
-    ) -> CacheResult<Option<(Location, G)>>;
+    ) -> CacheResult<Displaced<G>>;
 
     /// Insert a key only if it does NOT already exist (ADD semantics).
     ///

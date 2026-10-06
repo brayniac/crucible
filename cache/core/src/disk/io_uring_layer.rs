@@ -1497,7 +1497,7 @@ mod tests {
             hashtable
                 .insert(&other, other_location.to_location(), &verifier)
                 .expect("insert"),
-            None,
+            crate::Displaced::new(),
             "the insert replaced another key's flushed entry"
         );
         assert_eq!(

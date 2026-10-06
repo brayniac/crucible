@@ -107,7 +107,7 @@ mod hashtable_impl;
 mod loom_oracle;
 
 // Phase 3 re-exports
-pub use hashtable::{Hashtable, KeyVerifier};
+pub use hashtable::{Displaced, Hashtable, KeyVerifier};
 pub use hashtable_impl::{Hashbucket, MultiChoiceHashtable};
 
 // Phase 4 - Pools

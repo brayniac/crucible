@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds, saturating at `u32::MAX`
 
 ### Changed
+- **`Hashtable::insert` and `insert_pinned` return `Displaced<G>`**, the
+  entries the call unlinked, each with its `pin` guard, instead of an
+  `Option` of one. Usually empty or one entry; more when concurrent inserts
+  of an absent key each published an entry. The caller retires every one
 - **Heap S3-FIFO evicts from the small queue on insert.** When the small
   queue holds `small_queue_percent` of the hashtable's slots, an insert
   processes its oldest entries as an eviction would. An item read no more
@@ -54,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
+- Two concurrent inserts of a key that was absent could both publish an
+  entry, leaving the key with two live entries; a later DELETE removed one
+  and the other value came back. Each insert now unlinks every entry for
+  the key except the one at the highest slot position
 - Heap ADD refused, and REPLACE overwrote, a key whose item had expired but
   was still indexed; `contains` reported it present and DELETE reported it
   deleted. All four now treat an expired item as absent and free it

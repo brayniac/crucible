@@ -778,12 +778,12 @@ impl<H: Hashtable> TieredCache<H> {
             .hashtable
             .insert(key, location.to_location(), &verifier)
         {
-            Ok(Some(old_location)) => {
-                // Key existed, mark old location as deleted
-                self.supersede_at(old_location);
-            }
-            Ok(None) => {
-                // New key or ghost resurrection
+            Ok(displaced) => {
+                // Mark each unlinked entry's item deleted: the entry this
+                // replaced, or a duplicate from a concurrent insert.
+                for old_location in displaced.locations() {
+                    self.supersede_at(old_location);
+                }
             }
             Err(e) => {
                 // Hashtable full - mark item as deleted
@@ -874,12 +874,12 @@ impl<H: Hashtable> TieredCache<H> {
             .hashtable
             .insert(reservation.key(), location.to_location(), &verifier)
         {
-            Ok(Some(old_location)) => {
-                // Key existed, mark old location as deleted
-                self.supersede_at(old_location);
-            }
-            Ok(None) => {
-                // New key or ghost resurrection
+            Ok(displaced) => {
+                // Mark each unlinked entry's item deleted: the entry this
+                // replaced, or a duplicate from a concurrent insert.
+                for old_location in displaced.locations() {
+                    self.supersede_at(old_location);
+                }
             }
             Err(e) => {
                 // Hashtable full - mark item as deleted
