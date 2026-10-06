@@ -58,6 +58,10 @@ pub enum CacheError {
     /// Operation not supported by this cache implementation.
     Unsupported,
 
+    /// The key at this location must be read from disk before the operation
+    /// can compare it. No entry was changed; read the key and retry.
+    KeyUnresolved(crate::location::Location),
+
     /// Value is not a valid numeric string.
     NotNumeric,
 
@@ -72,6 +76,9 @@ pub enum CacheError {
 impl fmt::Display for CacheError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::KeyUnresolved(location) => {
+                write!(f, "key at {location:?} must be read from disk")
+            }
             Self::OutOfMemory => write!(f, "out of memory"),
             Self::HashTableFull => write!(f, "hashtable full"),
             Self::KeyExists => write!(f, "key already exists"),

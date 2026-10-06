@@ -12,33 +12,54 @@ use crate::location::Location;
 ///
 /// Holds one entry without allocating. More than one only when concurrent
 /// inserts of the same absent key each published an entry.
+///
+/// An insert or [`Hashtable::resolve`] that met an entry whose key must be
+/// read from disk also reports it in [`Self::unresolved`].
 #[derive(Debug, PartialEq, Eq)]
-pub struct Displaced<G>(smallvec::SmallVec<[(Location, G); 1]>);
+pub struct Displaced<G> {
+    entries: smallvec::SmallVec<[(Location, G); 1]>,
+    unresolved: Option<Location>,
+}
 
 impl<G> Displaced<G> {
     /// No entries.
     pub fn new() -> Self {
-        Self(smallvec::SmallVec::new())
+        Self {
+            entries: smallvec::SmallVec::new(),
+            unresolved: None,
+        }
     }
 
     /// Add an unlinked entry.
     pub fn push(&mut self, location: Location, guard: G) {
-        self.0.push((location, guard));
+        self.entries.push((location, guard));
+    }
+
+    /// An entry for the key's tag whose key must be read from disk before
+    /// the key can be known to have one entry. Read it and call
+    /// [`Hashtable::resolve`].
+    pub fn unresolved(&self) -> Option<Location> {
+        self.unresolved
+    }
+
+    /// Record an entry whose key must be read; see [`Self::unresolved`].
+    pub fn set_unresolved(&mut self, location: Location) {
+        self.unresolved = Some(location);
     }
 
     /// Whether no entry was unlinked.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
     }
 
     /// The number of entries unlinked.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     /// The unlinked entries' locations.
     pub fn locations(&self) -> impl Iterator<Item = Location> + '_ {
-        self.0.iter().map(|(location, _)| *location)
+        self.entries.iter().map(|(location, _)| *location)
     }
 }
 
@@ -53,8 +74,19 @@ impl<G> IntoIterator for Displaced<G> {
     type IntoIter = smallvec::IntoIter<[(Location, G); 1]>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        self.entries.into_iter()
     }
+}
+
+/// The answer to whether an entry holds a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The entry holds the key.
+    Match,
+    /// The entry holds another key, or no live item.
+    Mismatch,
+    /// The key cannot be compared without reading it from disk.
+    Unknown,
 }
 
 /// Trait for verifying that a key exists at a location.
@@ -100,6 +132,35 @@ pub trait KeyVerifier: Send + Sync {
     /// word to separate the two cases. Implementations only owe an honest
     /// answer about the location they were given.
     fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool;
+
+    /// Check `key` at `location` as [`Self::verify`] does, with a third
+    /// answer: [`Verdict::Unknown`] when the key cannot be compared without
+    /// reading it from disk.
+    ///
+    /// On `Unknown` the hashtable calls [`Self::unresolved`] with the
+    /// location and stops the operation before changing any entry: reads
+    /// answer absent, and writes return [`CacheError::KeyUnresolved`]. The
+    /// exception is an insert that has already published its entry: it
+    /// keeps the entry and reports the location in
+    /// [`Displaced::unresolved`]; see [`Hashtable::resolve`].
+    ///
+    /// The default answers from `verify` and never returns `Unknown`.
+    ///
+    /// [`CacheError::KeyUnresolved`]: crate::CacheError::KeyUnresolved
+    #[inline]
+    fn check(&self, key: &[u8], location: Location, allow_deleted: bool) -> Verdict {
+        if self.verify(key, location, allow_deleted) {
+            Verdict::Match
+        } else {
+            Verdict::Mismatch
+        }
+    }
+
+    /// Called with the location each time [`Self::check`] answers
+    /// [`Verdict::Unknown`]. The caller reads the key there and retries. The
+    /// default does nothing.
+    #[inline]
+    fn unresolved(&self, _location: Location) {}
 
     /// Prefetch memory at the given location.
     ///
@@ -195,6 +256,21 @@ pub trait Hashtable: Send + Sync {
         verifier: &impl KeyVerifier,
         pin: impl FnMut(Location) -> G,
     ) -> CacheResult<Displaced<G>>;
+
+    /// Unlink every live entry for `key` except the one at the highest slot
+    /// position, as an insert does after publishing its entry, and return
+    /// each with the guard `pin` returned for it. The caller retires each.
+    ///
+    /// An entry whose check answers [`Verdict::Unknown`] is left in place
+    /// and reported in [`Displaced::unresolved`]; the others are resolved
+    /// without it. The caller reads that entry's key and calls this again.
+    /// Repeating is safe: every call keeps the same entry.
+    fn resolve<G>(
+        &self,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+        pin: impl FnMut(Location) -> G,
+    ) -> Displaced<G>;
 
     /// Insert a key only if it does NOT already exist (ADD semantics).
     ///
