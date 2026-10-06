@@ -8,7 +8,7 @@
 //! - SIMD-accelerated bucket scanning on supported platforms
 
 use crate::error::{CacheError, CacheResult};
-use crate::hashtable::{Displaced, Hashtable, KeyVerifier};
+use crate::hashtable::{Displaced, Hashtable, KeyVerifier, Verdict};
 use crate::location::Location;
 use crate::sync::{AtomicU64, Ordering, fence, spin_loop};
 use ahash::RandomState;
@@ -546,6 +546,9 @@ impl MultiChoiceHashtable {
     /// not arise from the publish path this guards.
     ///
     /// Returns the (possibly refreshed) slot word and location on a match.
+    /// Returns `Err(location)` if the verifier answered
+    /// [`Verdict::Unknown`], after calling [`KeyVerifier::unresolved`]; the
+    /// caller stops before changing any entry.
     #[inline]
     fn verify_slot(
         &self,
@@ -555,7 +558,7 @@ impl MultiChoiceHashtable {
         verifier: &impl KeyVerifier,
         allow_deleted: bool,
         mut packed: u64,
-    ) -> Option<(u64, Location)> {
+    ) -> Result<Option<(u64, Location)>, Location> {
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
         const GHOST_LOCATION: u64 = 0x0000_0FFF_FFFF_FFFF;
         // Bound only the in-flight-publish case: a slot that keeps publishing
@@ -573,13 +576,26 @@ impl MultiChoiceHashtable {
             let location = Hashbucket::location(packed);
             verifier.prefetch(location);
 
-            if verifier.verify(key, location, allow_deleted) {
-                return Some((packed, location));
+            match verifier.check(key, location, allow_deleted) {
+                Verdict::Match => return Ok(Some((packed, location))),
+                Verdict::Mismatch => {}
+                Verdict::Unknown => {
+                    verifier.unresolved(location);
+                    return Err(location);
+                }
             }
 
             // Is this our key wearing a tombstone, rather than a different
             // key? Only asked on the mismatch path, which is rare.
-            let tombstoned_self = !allow_deleted && verifier.verify(key, location, true);
+            let tombstoned_self = !allow_deleted
+                && match verifier.check(key, location, true) {
+                    Verdict::Match => true,
+                    Verdict::Mismatch => false,
+                    Verdict::Unknown => {
+                        verifier.unresolved(location);
+                        return Err(location);
+                    }
+                };
 
             // Order the item reads above *before* the slot re-read below. A
             // load-acquire orders what follows it, not what precedes it, so
@@ -593,13 +609,13 @@ impl MultiChoiceHashtable {
                 if !tombstoned_self {
                     // The slot still publishes what we compared against, so
                     // the mismatch is this slot's real answer.
-                    return None;
+                    return Ok(None);
                 }
                 // A publish is in flight, or the key is deleted. Give the
                 // publisher a bounded window to land its slot swap.
                 tombstone_polls += 1;
                 if tombstone_polls >= MAX_TOMBSTONE_POLLS {
-                    return None;
+                    return Ok(None);
                 }
                 spin_loop();
                 continue;
@@ -611,7 +627,7 @@ impl MultiChoiceHashtable {
                 || (current & GHOST_LOCATION) == GHOST_LOCATION
                 || (current & TAG_MASK) != tag_shifted
             {
-                return None;
+                return Ok(None);
             }
 
             // The slot moved, so the budget above was not spent on a stable
@@ -632,7 +648,7 @@ impl MultiChoiceHashtable {
         tag: u16,
         key: &[u8],
         verifier: &impl KeyVerifier,
-    ) -> Option<(Location, u8)> {
+    ) -> Result<Option<(Location, u8)>, Location> {
         let bucket = self.bucket(bucket_index);
 
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
@@ -662,7 +678,7 @@ impl MultiChoiceHashtable {
             // Verify against what the slot publishes, retrying if a publish
             // moves it under us (see `verify_slot`).
             if let Some((packed, location)) =
-                self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+                self.verify_slot(bucket, slot_index, key, verifier, false, packed)?
             {
                 // Update frequency (best effort)
                 let freq = Hashbucket::freq(packed);
@@ -678,11 +694,11 @@ impl MultiChoiceHashtable {
                     );
                 }
 
-                return Some((location, freq));
+                return Ok(Some((location, freq)));
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Search a bucket for existence (no frequency update).
@@ -692,7 +708,7 @@ impl MultiChoiceHashtable {
         tag: u16,
         key: &[u8],
         verifier: &impl KeyVerifier,
-    ) -> bool {
+    ) -> Result<bool, Location> {
         let bucket = self.bucket(bucket_index);
 
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
@@ -719,14 +735,14 @@ impl MultiChoiceHashtable {
             }
 
             if self
-                .verify_slot(bucket, slot_index, key, verifier, false, packed)
+                .verify_slot(bucket, slot_index, key, verifier, false, packed)?
                 .is_some()
             {
-                return true;
+                return Ok(true);
             }
         }
 
-        false
+        Ok(false)
     }
 
     /// Search a bucket for S3-FIFO tracking (returns packed item_info, no frequency update).
@@ -736,7 +752,7 @@ impl MultiChoiceHashtable {
         tag: u16,
         key: &[u8],
         verifier: &impl KeyVerifier,
-    ) -> Option<u64> {
+    ) -> Result<Option<u64>, Location> {
         let bucket = self.bucket(bucket_index);
 
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
@@ -763,13 +779,13 @@ impl MultiChoiceHashtable {
             }
 
             if let Some((packed, _location)) =
-                self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+                self.verify_slot(bucket, slot_index, key, verifier, false, packed)?
             {
-                return Some(packed);
+                return Ok(Some(packed));
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Search for a ghost entry's frequency.
@@ -831,7 +847,7 @@ impl MultiChoiceHashtable {
         tag: u16,
         key: &[u8],
         verifier: &impl KeyVerifier,
-    ) -> Option<u8> {
+    ) -> Result<Option<u8>, Location> {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
@@ -865,14 +881,14 @@ impl MultiChoiceHashtable {
                 // `get_item_frequency`, which is location-scoped and does not
                 // come through here.)
                 if let Some((packed, _location)) =
-                    self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+                    self.verify_slot(bucket, slot_index, key, verifier, false, packed)?
                 {
-                    return Some(Hashbucket::freq(packed));
+                    return Ok(Some(Hashbucket::freq(packed)));
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Search for frequency by exact location.
@@ -964,11 +980,14 @@ impl MultiChoiceHashtable {
                 // me" — a bare `verify` cannot tell those apart, and reading a
                 // relocation as a mismatch is what makes this pass miss a live
                 // entry and fall through to claiming a second slot.
-                let Some((packed, location)) =
-                    self.verify_slot(bucket, slot_index, key, verifier, true, packed)
-                else {
-                    break;
-                };
+                let (packed, location) =
+                    match self.verify_slot(bucket, slot_index, key, verifier, true, packed) {
+                        Ok(Some(found)) => found,
+                        Ok(None) => break,
+                        Err(location) => {
+                            return Some(Err(CacheError::KeyUnresolved(location)));
+                        }
+                    };
                 let guard = pin(location);
 
                 let new_with_freq = Hashbucket::with_freq(new_packed, Hashbucket::freq(packed));
@@ -1359,7 +1378,7 @@ impl MultiChoiceHashtable {
         tag: u16,
         key: &[u8],
         verifier: &impl KeyVerifier,
-    ) -> bool {
+    ) -> Result<bool, Location> {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
@@ -1391,15 +1410,15 @@ impl MultiChoiceHashtable {
                 // live key absent — which lets the ADD path publish a
                 // second entry for it.
                 if self
-                    .verify_slot(bucket, slot_index, key, verifier, false, packed)
+                    .verify_slot(bucket, slot_index, key, verifier, false, packed)?
                     .is_some()
                 {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
 
-        false
+        Ok(false)
     }
 
     /// Try to replace a matching ghost for ADD (inherit frequency).
@@ -1485,11 +1504,21 @@ impl MultiChoiceHashtable {
                         if new_current != 0
                             && !Hashbucket::is_ghost(new_current)
                             && Hashbucket::tag(new_current) == tag
-                            && self
-                                .verify_slot(bucket, slot_index, key, verifier, false, new_current)
-                                .is_some()
                         {
-                            return Some(Err(CacheError::KeyExists));
+                            match self.verify_slot(
+                                bucket,
+                                slot_index,
+                                key,
+                                verifier,
+                                false,
+                                new_current,
+                            ) {
+                                Ok(Some(_)) => return Some(Err(CacheError::KeyExists)),
+                                Ok(None) => {}
+                                Err(location) => {
+                                    return Some(Err(CacheError::KeyUnresolved(location)));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -1549,10 +1578,12 @@ impl MultiChoiceHashtable {
                     {
                         continue;
                     }
-                    if let Some((packed, _)) =
-                        self.verify_slot(bucket, slot_index, key, verifier, false, packed)
-                    {
-                        found.push((bucket_index, slot_index, packed));
+                    match self.verify_slot(bucket, slot_index, key, verifier, false, packed) {
+                        Ok(Some((packed, _))) => found.push((bucket_index, slot_index, packed)),
+                        Ok(None) => {}
+                        // Left in place; the caller reads its key and
+                        // resolves again.
+                        Err(location) => displaced.set_unresolved(location),
                     }
                 }
             }
@@ -1628,9 +1659,11 @@ impl MultiChoiceHashtable {
                     // and reading that as "another key" makes this report a
                     // live key absent — which lets the ADD path publish a
                     // second entry for it.
-                    if self
-                        .verify_slot(bucket, slot_index, key, verifier, false, packed)
-                        .is_some()
+                    // An `Unknown` entry is left alone: this ADD has
+                    // published, and `verify_slot` has reported the entry
+                    // through `KeyVerifier::unresolved`.
+                    if let Ok(Some(_)) =
+                        self.verify_slot(bucket, slot_index, key, verifier, false, packed)
                     {
                         return true;
                     }
@@ -1716,11 +1749,14 @@ impl MultiChoiceHashtable {
                 // "the location I read was recycled underneath me"; a bare
                 // `verify` reads a relocation as a mismatch and reports the
                 // live key absent.
-                let Some((packed, old_location)) =
-                    self.verify_slot(bucket, slot_index, key, verifier, false, packed)
-                else {
-                    break;
-                };
+                let (packed, old_location) =
+                    match self.verify_slot(bucket, slot_index, key, verifier, false, packed) {
+                        Ok(Some(found)) => found,
+                        Ok(None) => break,
+                        Err(location) => {
+                            return Some(Err(CacheError::KeyUnresolved(location)));
+                        }
+                    };
                 let guard = pin(old_location);
 
                 let freq = Hashbucket::freq(packed);
@@ -1753,8 +1789,11 @@ impl Hashtable for MultiChoiceHashtable {
         }
 
         for &bucket_index in &buckets[..num_choices] {
-            if let Some(result) = self.search_bucket_for_get(bucket_index, tag, key, verifier) {
-                return Some(result);
+            match self.search_bucket_for_get(bucket_index, tag, key, verifier) {
+                Ok(Some(result)) => return Some(result),
+                Ok(None) => {}
+                // Reported through `KeyVerifier::unresolved`.
+                Err(_) => return None,
             }
         }
 
@@ -1779,8 +1818,11 @@ impl Hashtable for MultiChoiceHashtable {
         }
 
         for &bucket_index in &buckets[..num_choices] {
-            if self.search_bucket_exists(bucket_index, tag, key, verifier) {
-                return true;
+            match self.search_bucket_exists(bucket_index, tag, key, verifier) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                // Reported through `KeyVerifier::unresolved`.
+                Err(_) => return false,
             }
         }
 
@@ -1881,8 +1923,10 @@ impl Hashtable for MultiChoiceHashtable {
 
         // Phase 1: Check if key already exists in any bucket
         for &bucket_index in choices {
-            if self.check_key_exists(bucket_index, tag, key, verifier) {
-                return Err(CacheError::KeyExists);
+            match self.check_key_exists(bucket_index, tag, key, verifier) {
+                Ok(true) => return Err(CacheError::KeyExists),
+                Ok(false) => {}
+                Err(location) => return Err(CacheError::KeyUnresolved(location)),
             }
         }
 
@@ -1934,12 +1978,32 @@ impl Hashtable for MultiChoiceHashtable {
         //
         // Off the hot path: this only runs when the insert has already failed.
         for &bucket_index in choices {
-            if self.check_key_exists(bucket_index, tag, key, verifier) {
-                return Err(CacheError::KeyExists);
+            match self.check_key_exists(bucket_index, tag, key, verifier) {
+                Ok(true) => return Err(CacheError::KeyExists),
+                Ok(false) => {}
+                Err(location) => return Err(CacheError::KeyUnresolved(location)),
             }
         }
 
         Err(CacheError::HashTableFull)
+    }
+
+    fn resolve<G>(
+        &self,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+        mut pin: impl FnMut(Location) -> G,
+    ) -> Displaced<G> {
+        let hash = self.hash_key(key);
+        let tag = Self::tag_from_hash(hash);
+        let buckets = self.bucket_indices(hash);
+        self.resolve_duplicates(
+            key,
+            tag,
+            &buckets[..self.num_choices as usize],
+            verifier,
+            &mut pin,
+        )
     }
 
     fn update_if_present_pinned<G>(
@@ -2024,8 +2088,11 @@ impl Hashtable for MultiChoiceHashtable {
         let buckets = self.bucket_indices(hash);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
-            if let Some(freq) = self.search_bucket_for_freq(bucket_index, tag, key, verifier) {
-                return Some(freq);
+            match self.search_bucket_for_freq(bucket_index, tag, key, verifier) {
+                Ok(Some(freq)) => return Some(freq),
+                Ok(None) => {}
+                // Reported through `KeyVerifier::unresolved`.
+                Err(_) => return None,
             }
         }
 
@@ -2071,10 +2138,11 @@ impl Hashtable for MultiChoiceHashtable {
         let num_choices = self.num_choices as usize;
 
         for &bucket_index in &buckets[..num_choices] {
-            if let Some(item_info) =
-                self.search_bucket_for_tracking(bucket_index, tag, key, verifier)
-            {
-                return Some((bucket_index as u64, item_info));
+            match self.search_bucket_for_tracking(bucket_index, tag, key, verifier) {
+                Ok(Some(item_info)) => return Some((bucket_index as u64, item_info)),
+                Ok(None) => {}
+                // Reported through `KeyVerifier::unresolved`.
+                Err(_) => return None,
             }
         }
 
@@ -3401,6 +3469,147 @@ mod tests {
         assert!(ht.lookup(b"test", &verifier).is_none());
         assert!(!ht.contains(b"test", &verifier));
     }
+    /// A verifier that answers from a table of (location, verdict) and
+    /// records every location passed to `unresolved`.
+    struct VerdictTable {
+        verdicts: std::sync::Mutex<std::collections::HashMap<u64, Verdict>>,
+        unresolved: std::sync::Mutex<Vec<Location>>,
+    }
+
+    impl VerdictTable {
+        fn new(entries: &[(Location, Verdict)]) -> Self {
+            Self {
+                verdicts: std::sync::Mutex::new(
+                    entries.iter().map(|(l, v)| (l.as_raw(), *v)).collect(),
+                ),
+                unresolved: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn set(&self, location: Location, verdict: Verdict) {
+            self.verdicts
+                .lock()
+                .unwrap()
+                .insert(location.as_raw(), verdict);
+        }
+
+        fn take_unresolved(&self) -> Vec<Location> {
+            std::mem::take(&mut *self.unresolved.lock().unwrap())
+        }
+    }
+
+    impl KeyVerifier for VerdictTable {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            self.check(key, location, allow_deleted) == Verdict::Match
+        }
+
+        fn check(&self, _key: &[u8], location: Location, _allow_deleted: bool) -> Verdict {
+            *self
+                .verdicts
+                .lock()
+                .unwrap()
+                .get(&location.as_raw())
+                .unwrap_or(&Verdict::Mismatch)
+        }
+
+        fn unresolved(&self, location: Location) {
+            self.unresolved.lock().unwrap().push(location);
+        }
+    }
+
+    /// The live locations for `key`, found by trying to remove each of
+    /// `candidates` and putting nothing back. Consumes the table's entries.
+    fn live(ht: &MultiChoiceHashtable, key: &[u8], candidates: &[Location]) -> Vec<Location> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|&location| ht.remove(key, location))
+            .collect()
+    }
+
+    /// An entry whose key is `Unknown` stops every keyed operation before
+    /// it changes anything: reads answer absent, writes return
+    /// `KeyUnresolved`, and each reports the location.
+    #[test]
+    fn an_unknown_entry_stops_operations_without_changing_the_table() {
+        let ht = MultiChoiceHashtable::new(4);
+        let (old, new) = (Location::new(1), Location::new(2));
+        let verifier = VerdictTable::new(&[(old, Verdict::Match), (new, Verdict::Match)]);
+        ht.insert(b"k", old, &verifier).unwrap();
+        verifier.set(old, Verdict::Unknown);
+
+        assert_eq!(ht.lookup(b"k", &verifier), None);
+        assert!(!ht.contains(b"k", &verifier));
+        assert_eq!(ht.get_frequency(b"k", &verifier), None);
+        assert_eq!(ht.lookup_for_tracking(b"k", &verifier), None);
+        assert_eq!(
+            ht.insert(b"k", new, &verifier),
+            Err(CacheError::KeyUnresolved(old))
+        );
+        assert_eq!(
+            ht.insert_if_absent(b"k", new, &verifier),
+            Err(CacheError::KeyUnresolved(old))
+        );
+        assert_eq!(
+            ht.update_if_present(b"k", new, &verifier),
+            Err(CacheError::KeyUnresolved(old))
+        );
+        assert_eq!(verifier.take_unresolved(), vec![old; 7]);
+
+        // Nothing changed: once the key is known, the old entry is there.
+        verifier.set(old, Verdict::Match);
+        assert_eq!(ht.lookup(b"k", &verifier).map(|(l, _)| l), Some(old));
+        assert_eq!(live(&ht, b"k", &[old, new]), vec![old]);
+    }
+
+    /// Once the caller answers the unknown entry, the retried write
+    /// replaces it.
+    #[test]
+    fn a_write_retried_after_resolution_replaces_the_entry() {
+        let ht = MultiChoiceHashtable::new(4);
+        let (old, new) = (Location::new(1), Location::new(2));
+        let verifier = VerdictTable::new(&[(old, Verdict::Match), (new, Verdict::Match)]);
+        ht.insert(b"k", old, &verifier).unwrap();
+        verifier.set(old, Verdict::Unknown);
+        assert_eq!(
+            ht.insert(b"k", new, &verifier),
+            Err(CacheError::KeyUnresolved(old))
+        );
+
+        verifier.set(old, Verdict::Match);
+        let displaced = ht.insert(b"k", new, &verifier).unwrap();
+        assert_eq!(displaced.locations().collect::<Vec<_>>(), vec![old]);
+        assert_eq!(live(&ht, b"k", &[old, new]), vec![new]);
+    }
+
+    /// `resolve` leaves an unknown entry in place and reports it, then
+    /// unlinks it once it is known to be a duplicate.
+    #[test]
+    fn resolve_reports_an_unknown_entry_and_resolves_it_when_known() {
+        let ht = MultiChoiceHashtable::new(4);
+        let (a, b) = (Location::new(1), Location::new(2));
+        // Two entries for the key: each insert saw the other as a mismatch.
+        let blind = VerdictTable::new(&[]);
+        ht.insert(b"k", a, &blind).unwrap();
+        ht.insert(b"k", b, &blind).unwrap();
+
+        // Both unknown: nothing is unlinked, and one is reported.
+        let verifier = VerdictTable::new(&[(a, Verdict::Unknown), (b, Verdict::Unknown)]);
+        let displaced = ht.resolve(b"k", &verifier, |_| ());
+        assert!(displaced.is_empty());
+        assert!(displaced.unresolved().is_some());
+
+        // Both known: exactly one is unlinked, the other kept.
+        verifier.set(a, Verdict::Match);
+        verifier.set(b, Verdict::Match);
+        let displaced = ht.resolve(b"k", &verifier, |_| ());
+        assert_eq!(displaced.len(), 1);
+        assert_eq!(displaced.unresolved(), None);
+        let unlinked = displaced.locations().next().unwrap();
+        let kept: Vec<_> = live(&ht, b"k", &[a, b]);
+        assert_eq!(kept.len(), 1);
+        assert_ne!(kept[0], unlinked);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -4440,6 +4649,74 @@ mod loom_tests {
                 1,
                 "concurrent ADDs must leave exactly one live entry"
             );
+        });
+    }
+
+    /// Answers a fixed verdict per location, `Mismatch` for any other.
+    struct Fixed(Vec<(Location, Verdict)>);
+
+    impl KeyVerifier for Fixed {
+        fn verify(&self, key: &[u8], location: Location, allow_deleted: bool) -> bool {
+            self.check(key, location, allow_deleted) == Verdict::Match
+        }
+
+        fn check(&self, _key: &[u8], location: Location, _allow_deleted: bool) -> Verdict {
+            self.0
+                .iter()
+                .find(|(l, _)| *l == location)
+                .map_or(Verdict::Mismatch, |(_, v)| *v)
+        }
+    }
+
+    /// An insert that meets an `Unknown` entry returns `KeyUnresolved` and
+    /// publishes nothing, while another insert of the key, which can read
+    /// that entry, races it.
+    #[test]
+    fn loom_an_unresolved_insert_publishes_nothing() {
+        loom::model(|| {
+            let (seed, blocked, racing) = (
+                KeyOracle::location(SRC),
+                KeyOracle::location(NEW),
+                KeyOracle::location(DST),
+            );
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let known = Fixed(vec![
+                (seed, Verdict::Match),
+                (blocked, Verdict::Match),
+                (racing, Verdict::Match),
+            ]);
+            <MultiChoiceHashtable as Hashtable>::insert(&ht, KEY, seed, &known).unwrap();
+
+            let ht1 = ht.clone();
+            let racer = thread::spawn(move || {
+                let known = Fixed(vec![
+                    (seed, Verdict::Match),
+                    (blocked, Verdict::Match),
+                    (racing, Verdict::Match),
+                ]);
+                <MultiChoiceHashtable as Hashtable>::insert(&ht1, KEY, racing, &known).unwrap()
+            });
+
+            // This insert cannot read the seed's key or the racer's.
+            let unknown = Fixed(vec![
+                (seed, Verdict::Unknown),
+                (racing, Verdict::Unknown),
+                (blocked, Verdict::Match),
+            ]);
+            let result = <MultiChoiceHashtable as Hashtable>::insert(&ht, KEY, blocked, &unknown);
+            let displaced = racer.join().unwrap();
+
+            assert!(
+                matches!(result, Err(CacheError::KeyUnresolved(_))),
+                "an insert that met an unknown entry returned {result:?}"
+            );
+            assert_eq!(displaced.locations().collect::<Vec<_>>(), vec![seed]);
+            assert!(
+                !ht.remove(KEY, blocked),
+                "an unresolved insert published its entry"
+            );
+            assert!(ht.remove(KEY, racing), "the racing insert's entry is live");
+            assert!(!ht.remove(KEY, seed));
         });
     }
 

@@ -4683,6 +4683,15 @@ mod merge_retention_budget {
             self.inner.insert_pinned(key, location, verifier, pin)
         }
 
+        fn resolve<G>(
+            &self,
+            key: &[u8],
+            verifier: &impl KeyVerifier,
+            pin: impl FnMut(Location) -> G,
+        ) -> crate::Displaced<G> {
+            self.inner.resolve(key, verifier, pin)
+        }
+
         fn insert_if_absent(
             &self,
             key: &[u8],

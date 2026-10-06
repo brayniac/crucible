@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `KeyVerifier::check`, returning `Verdict::{Match, Mismatch, Unknown}`,
+  and `KeyVerifier::unresolved`. On `Unknown`, which a verifier returns
+  when an entry's key must be read from disk, the hashtable stops the
+  operation before changing any entry: reads answer absent, writes return
+  the new `CacheError::KeyUnresolved(location)`, and the location goes to
+  `unresolved`. An insert that has already published keeps its entry and
+  reports the location in `Displaced::unresolved`; `Hashtable::resolve`
+  finishes its duplicate resolution once the key is known. The default
+  `check` answers from `verify`, so existing verifiers are unchanged
 - `cache_core::clock::deadline(now, ttl)`: a TTL converted to a deadline in
   seconds, saturating at `u32::MAX`
 
