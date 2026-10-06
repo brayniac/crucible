@@ -541,15 +541,13 @@ impl SlabCache {
             .insert_pinned(key, location, &verifier, |old| {
                 self.pin_superseded(key, old)
             }) {
-            Ok(Some((_, superseded))) => {
+            Ok(displaced) => {
                 // Release write ref - write is complete and item is visible in hashtable
                 self.allocator.release_write_ref(class_id, slab_id);
 
-                self.retire_superseded(superseded);
-            }
-            Ok(None) => {
-                // Release write ref - write is complete and item is visible in hashtable
-                self.allocator.release_write_ref(class_id, slab_id);
+                for (_, superseded) in displaced {
+                    self.retire_superseded(superseded);
+                }
             }
             Err(e) => {
                 // The write ref keeps the slab in this class while the slot is freed.
@@ -800,12 +798,11 @@ impl SlabCache {
             .hashtable
             .insert_pinned(key, loc, &verifier, |old| self.pin_superseded(key, old))
         {
-            Ok(Some((_, superseded))) => {
+            Ok(displaced) => {
                 self.allocator.release_write_ref(class_id, slab_id);
-                self.retire_superseded(superseded);
-            }
-            Ok(None) => {
-                self.allocator.release_write_ref(class_id, slab_id);
+                for (_, superseded) in displaced {
+                    self.retire_superseded(superseded);
+                }
             }
             Err(e) => {
                 // The item is counted and published but not indexed.

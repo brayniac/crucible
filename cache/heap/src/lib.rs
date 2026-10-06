@@ -507,11 +507,11 @@ impl HeapCache {
             .hashtable
             .insert(key, slot_loc.to_location(), &verifier)
         {
-            Ok(old_location) => {
-                // If there was a previous entry, deallocate its slot
-                if let Some(old_loc) = old_location {
-                    let old_slot_loc = SlotLocation::from_location(old_loc);
-                    self.deallocate_and_track(old_slot_loc);
+            Ok(displaced) => {
+                // Free each unlinked entry's slot: the entry this replaced,
+                // or a duplicate from a concurrent insert, possibly this one.
+                for old_loc in displaced.locations() {
+                    self.deallocate_and_track(SlotLocation::from_location(old_loc));
                 }
                 // Record for S3-FIFO tracking
                 self.maybe_record_insert(key);
@@ -1094,11 +1094,17 @@ impl HeapCache {
             .hashtable
             .insert(key, typed_loc.to_location(), &verifier)
         {
-            Ok(old_location) => {
-                // Clean up any old entry if we replaced something
-                if let Some(old_loc) = old_location {
-                    let old_typed = TypedLocation::from_location(old_loc);
-                    self.deallocate_typed_slot(old_typed);
+            Ok(displaced) => {
+                // Free each unlinked entry's slot: the entry this replaced,
+                // or a duplicate from a concurrent create of the same key.
+                let mut lost = false;
+                for old_loc in displaced.locations() {
+                    lost |= old_loc == typed_loc.to_location();
+                    self.deallocate_typed_slot(TypedLocation::from_location(old_loc));
+                }
+                if lost {
+                    // A concurrent create of this key kept its entry; use it.
+                    return self.get_or_create_typed(key, value_type, ttl);
                 }
                 Ok((idx, generation, true))
             }

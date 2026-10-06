@@ -8,7 +8,7 @@
 //! - SIMD-accelerated bucket scanning on supported platforms
 
 use crate::error::{CacheError, CacheResult};
-use crate::hashtable::{Hashtable, KeyVerifier};
+use crate::hashtable::{Displaced, Hashtable, KeyVerifier};
 use crate::location::Location;
 use crate::sync::{AtomicU64, Ordering, fence, spin_loop};
 use ahash::RandomState;
@@ -1500,6 +1500,87 @@ impl MultiChoiceHashtable {
         None
     }
 
+    /// Unlink every live entry for `key` in its `choices` buckets except the
+    /// one at the highest (bucket, slot) position, returning each unlinked
+    /// entry's location with the guard `pin` returned for it.
+    ///
+    /// `insert_pinned` calls this after it publishes a new slot. Two inserts
+    /// of an absent key can both pass the presence checks and each publish
+    /// an entry. Each publishes, fences, then scans. With a `SeqCst` fence
+    /// between every publish and the scan that follows it, at least one of
+    /// the two scans sees both entries. Every scan keeps the same entry, the
+    /// highest, so the inserts never unlink each other's survivor.
+    ///
+    /// An entry is unlinked by compare-exchange on the word that was
+    /// verified, so one that changed after the scan is left alone and the
+    /// scan repeats.
+    fn resolve_duplicates<G>(
+        &self,
+        key: &[u8],
+        tag: u16,
+        choices: &[usize],
+        verifier: &impl KeyVerifier,
+        pin: &mut impl FnMut(Location) -> G,
+    ) -> Displaced<G> {
+        // The choice buckets in ascending order, each once: two choices can
+        // name the same bucket.
+        let mut buckets = [0usize; MAX_CHOICES as usize];
+        let mut count = 0;
+        for &bucket_index in choices {
+            if !buckets[..count].contains(&bucket_index) {
+                buckets[count] = bucket_index;
+                count += 1;
+            }
+        }
+        let buckets = &mut buckets[..count];
+        buckets.sort_unstable();
+
+        let mut displaced = Displaced::new();
+        loop {
+            fence(Ordering::SeqCst);
+
+            // The key's live entries, in ascending position order.
+            let mut found: smallvec::SmallVec<[(usize, usize, u64); 2]> = smallvec::SmallVec::new();
+            for &bucket_index in buckets.iter() {
+                let bucket = self.bucket(bucket_index);
+                for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+                    let packed = bucket.items[slot_index].load(Ordering::Acquire);
+                    if packed == 0 || Hashbucket::is_ghost(packed) || Hashbucket::tag(packed) != tag
+                    {
+                        continue;
+                    }
+                    if let Some((packed, _)) =
+                        self.verify_slot(bucket, slot_index, key, verifier, false, packed)
+                    {
+                        found.push((bucket_index, slot_index, packed));
+                    }
+                }
+            }
+
+            // Keep the highest; unlink the rest.
+            found.pop();
+            if found.is_empty() {
+                return displaced;
+            }
+            let mut changed = false;
+            for (bucket_index, slot_index, packed) in found {
+                let location = Hashbucket::location(packed);
+                let guard = pin(location);
+                if self.bucket(bucket_index).items[slot_index]
+                    .compare_exchange(packed, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    displaced.push(location, guard);
+                } else {
+                    changed = true;
+                }
+            }
+            if !changed {
+                return displaced;
+            }
+        }
+    }
+
     /// Check for duplicate after inserting (race detection).
     fn check_for_duplicate_after_insert(
         &self,
@@ -1712,7 +1793,7 @@ impl Hashtable for MultiChoiceHashtable {
         location: Location,
         verifier: &impl KeyVerifier,
         mut pin: impl FnMut(Location) -> G,
-    ) -> CacheResult<Option<(Location, G)>> {
+    ) -> CacheResult<Displaced<G>> {
         let hash = self.hash_key(key);
         let tag = Self::tag_from_hash(hash);
         let buckets = self.bucket_indices(hash);
@@ -1740,16 +1821,27 @@ impl Hashtable for MultiChoiceHashtable {
                 verifier,
                 &mut pin,
             ) {
-                return result;
+                return result.map(|replaced| {
+                    let mut displaced = Displaced::new();
+                    if let Some((old, guard)) = replaced {
+                        displaced.push(old, guard);
+                    }
+                    displaced
+                });
             }
         }
+
+        // Passes 2-4 publish a new slot. Another insert of this key can have
+        // found it absent too and published its own; each resolves that
+        // after publishing.
+        let resolve = |pin: &mut _| self.resolve_duplicates(key, tag, choices, verifier, pin);
 
         // Pass 2: take over a ghost this key left behind.
         for &bucket_index in choices {
             if let Some(result) =
                 self.try_replace_matching_ghost_in_bucket(bucket_index, tag, new_packed)
             {
-                return result.map(|_| None);
+                return result.map(|_| resolve(&mut pin));
             }
         }
 
@@ -1762,14 +1854,14 @@ impl Hashtable for MultiChoiceHashtable {
         // Pass 3: claim an empty slot.
         for &bucket_index in ordered.iter() {
             if let Some(result) = self.try_claim_empty_in_bucket(bucket_index, new_packed) {
-                return result.map(|_| None);
+                return result.map(|_| resolve(&mut pin));
             }
         }
 
         // Pass 4: evict any ghost to make room.
         for &bucket_index in ordered.iter() {
             if let Some(result) = self.try_evict_any_ghost_in_bucket(bucket_index, new_packed) {
-                return result.map(|_| None);
+                return result.map(|_| resolve(&mut pin));
             }
         }
 
@@ -2849,7 +2941,7 @@ mod tests {
 
         let result = ht.insert(b"test", location, &verifier);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(result.unwrap().is_empty());
 
         let lookup = ht.lookup(b"test", &verifier);
         assert!(lookup.is_some());
@@ -2876,6 +2968,8 @@ mod tests {
                 ht.get_item_frequency(b"k", old).is_some()
             })
             .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
         assert_eq!(old, a);
         assert!(published, "insert_pinned pinned after replacing the entry");
@@ -3128,14 +3222,13 @@ mod tests {
         // First insert
         let result = ht.insert(b"test", location1, &verifier);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(result.unwrap().is_empty());
 
         // Second insert overwrites
         let result = ht.insert(b"test", location2, &verifier);
         assert!(result.is_ok());
         let old = result.unwrap();
-        assert!(old.is_some());
-        assert_eq!(old.unwrap(), location1);
+        assert_eq!(old.locations().collect::<Vec<_>>(), vec![location1]);
     }
 
     #[test]
@@ -3264,7 +3357,7 @@ mod tests {
         // Insert over the ghost - frequency should be preserved
         let result = ht.insert(b"test", location2, &verifier);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none()); // Ghost resurrection returns None
+        assert!(result.unwrap().is_empty()); // Ghost resurrection returns None
 
         // Verify the frequency was preserved
         let freq_after = ht.get_frequency(b"test", &verifier).unwrap();
@@ -4346,6 +4439,52 @@ mod loom_tests {
                 KeyOracle::drain_live_entries(&ht),
                 1,
                 "concurrent ADDs must leave exactly one live entry"
+            );
+        });
+    }
+
+    /// Two `insert`s of an absent key leave exactly one live entry, and every
+    /// other location either insert published is returned as displaced by
+    /// exactly one of them, so its item is retired once.
+    #[test]
+    fn loom_concurrent_inserts_of_an_absent_key_leave_one_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let oracle = Arc::new(KeyOracle::new());
+            oracle.place(SRC, KEY);
+            oracle.place(DST, KEY);
+
+            let ht1 = ht.clone();
+            let o1 = oracle.clone();
+            let first = thread::spawn(move || {
+                <MultiChoiceHashtable as Hashtable>::insert(
+                    &ht1,
+                    KEY,
+                    KeyOracle::location(SRC),
+                    &*o1,
+                )
+            });
+            let second = <MultiChoiceHashtable as Hashtable>::insert(
+                &ht,
+                KEY,
+                KeyOracle::location(DST),
+                &*oracle,
+            )
+            .expect("insert must find a slot");
+            let first = first.join().unwrap().expect("insert must find a slot");
+
+            let mut displaced: Vec<Location> =
+                first.locations().chain(second.locations()).collect();
+            displaced.sort_by_key(|location| location.as_raw());
+            assert_eq!(
+                KeyOracle::drain_live_entries(&ht),
+                1,
+                "concurrent inserts of an absent key left a duplicate entry"
+            );
+            assert_eq!(
+                displaced.len(),
+                1,
+                "exactly one of the two published locations is displaced, once: {displaced:?}"
             );
         });
     }

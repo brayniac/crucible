@@ -43,6 +43,7 @@ shuttle = ["dep:shuttle"]
 validation = []
 
 [dependencies]
+smallvec = { workspace = true }
 ahash = { workspace = true }
 bytes = { workspace = true }
 clocksource = { workspace = true }

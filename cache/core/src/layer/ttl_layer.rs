@@ -4679,7 +4679,7 @@ mod merge_retention_budget {
             location: Location,
             verifier: &impl KeyVerifier,
             pin: impl FnMut(Location) -> G,
-        ) -> CacheResult<Option<(Location, G)>> {
+        ) -> CacheResult<crate::Displaced<G>> {
             self.inner.insert_pinned(key, location, verifier, pin)
         }
 
@@ -6443,7 +6443,8 @@ mod merge_demotion {
                     let replaced = ht
                         .insert(key, newer.to_location(), &verifier)
                         .expect("insert")
-                        .is_some();
+                        .len()
+                        == 1;
                     seen.set(Some((readable, replaced)));
                 }
             }));
@@ -6521,7 +6522,8 @@ mod merge_demotion {
                     let replaced = ht
                         .insert(key, newer.to_location(), &verifier)
                         .expect("insert")
-                        .is_some();
+                        .len()
+                        == 1;
                     seen.set(Some((readable, replaced)));
                 }
             }));
