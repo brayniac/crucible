@@ -465,25 +465,12 @@ impl IoUringDiskLayer {
     /// Complete a flush operation.
     ///
     /// Called once per [`FlushRequest`], when its io_uring write completes.
-    /// Records the hash of every item's key, which key checks use once the
-    /// keys are only on disk. Then detaches the write buffer, so reads go to
-    /// disk from now on; the buffer returns to the pool when the last reader
-    /// still holding it unpins. Then drops the buffer pin and segment
-    /// reference the request held.
+    /// Detaches the write buffer, so reads go to disk from now on and key
+    /// checks on the segment's items answer [`crate::Verdict::Unknown`] until
+    /// the key is read (see [`crate::KeyMemo`]); the buffer returns to the
+    /// pool when the last reader still holding it unpins. Then drops the
+    /// buffer pin and segment reference the request held.
     pub fn complete_flush(&self, segment_id: u32) {
-        if let Some(segment) = self.pool.get(segment_id) {
-            segment.record_key_hashes();
-            segment.detach_write_buffer();
-            segment.unpin_write_buffer();
-            self.release_segment_ref(segment);
-        }
-    }
-
-    /// As [`Self::complete_flush`], without recording key hashes, so a key
-    /// check on the segment's items answers [`crate::Verdict::Unknown`]
-    /// until the key is read from disk. For tests of that path.
-    #[doc(hidden)]
-    pub fn complete_flush_without_key_hashes(&self, segment_id: u32) {
         if let Some(segment) = self.pool.get(segment_id) {
             segment.detach_write_buffer();
             segment.unpin_write_buffer();
@@ -1363,6 +1350,17 @@ mod tests {
                 false
             }
         }
+
+        fn check(&self, key: &[u8], location: Location, allow_deleted: bool) -> crate::Verdict {
+            let item_loc = ItemLocation::from_location(location);
+            let (_, segment_id, incarnation, offset) = item_loc.unpack(self.pool.layout());
+            match self.pool.get(segment_id) {
+                Some(segment) => {
+                    segment.check_key_guarded(location, offset, key, allow_deleted, incarnation)
+                }
+                None => crate::Verdict::Mismatch,
+            }
+        }
     }
 
     /// Fill one segment with items and index them, returning keys, their
@@ -1464,9 +1462,12 @@ mod tests {
         (first, second)
     }
 
-    /// Once a segment is flushed, another key with the same tag in the same
-    /// bucket does not resolve to its entry: a lookup misses, and an insert
-    /// adds a second entry instead of replacing the first.
+    /// Once a segment is flushed, a key with the same tag in the same bucket
+    /// cannot be told from the stored one until the stored key is read: a
+    /// write of it returns `KeyUnresolved` and changes nothing. With the
+    /// stored key recorded, the other key does not resolve to its entry: a
+    /// lookup misses, and an insert adds a second entry instead of replacing
+    /// the first.
     #[test]
     fn a_flushed_entry_does_not_match_a_key_that_shares_its_tag() {
         let seeds = [1, 2, 3, 4];
@@ -1502,30 +1503,39 @@ mod tests {
         layer.complete_flush(segment_id);
         assert!(!layer.pool.get(segment_id).unwrap().has_write_buffer());
 
-        assert_eq!(
-            hashtable.lookup(&stored, &verifier).map(|(l, _)| l),
-            Some(location.to_location())
-        );
-        assert!(
-            hashtable.lookup(&other, &verifier).is_none(),
-            "a key resolved to another key's flushed entry"
-        );
-
         let other_location = layer
             .write_item_with_buffers(&other, b"other", b"", ttl)
             .expect("write");
         assert_eq!(
-            hashtable
-                .insert(&other, other_location.to_location(), &verifier)
-                .expect("insert"),
-            crate::Displaced::new(),
-            "the insert replaced another key's flushed entry"
+            hashtable.insert(&other, other_location.to_location(), &verifier),
+            Err(CacheError::KeyUnresolved(location.to_location())),
+            "an insert decided without reading the flushed entry's key"
         );
-        assert_eq!(
-            hashtable.lookup(&stored, &verifier).map(|(l, _)| l),
-            Some(location.to_location()),
-            "the flushed key lost its entry"
-        );
+
+        let memo = crate::KeyMemo::new();
+        memo.record(location.to_location(), Some(stored.clone()));
+        crate::with_key_memo(&memo, || {
+            assert_eq!(
+                hashtable.lookup(&stored, &verifier).map(|(l, _)| l),
+                Some(location.to_location())
+            );
+            assert!(
+                hashtable.lookup(&other, &verifier).is_none(),
+                "a key resolved to another key's flushed entry"
+            );
+            assert_eq!(
+                hashtable
+                    .insert(&other, other_location.to_location(), &verifier)
+                    .expect("insert"),
+                crate::Displaced::new(),
+                "the insert replaced another key's flushed entry"
+            );
+            assert_eq!(
+                hashtable.lookup(&stored, &verifier).map(|(l, _)| l),
+                Some(location.to_location()),
+                "the flushed key lost its entry"
+            );
+        });
     }
 
     fn test_layer() -> IoUringDiskLayer {

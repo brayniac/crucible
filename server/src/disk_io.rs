@@ -82,12 +82,10 @@ pub(crate) fn value_from_disk_read<'a>(
 /// returned. A deleted item, one with an invalid header, one that does not
 /// fit in `buf`, or one stored under a different key is a miss.
 ///
-/// The key check compares the bytes the index could only compare by hash. A
-/// committed disk segment's keys are only on disk, so the hashtable matched
-/// this item by its tag and a 64-bit key hash recorded at flush
-/// (`DiskSegmentMeta::record_key_hashes`). Another key's item still reaches
-/// here on a hash collision, or when the disk bytes differ from the buffer
-/// that was hashed. Serving it would answer with another key's value.
+/// The key check is the only comparison of the key. A committed disk
+/// segment's keys are only on disk, so the hashtable matched this item by
+/// its 12-bit tag alone; another key's item reaches here whenever tags
+/// collide. Serving it would answer with another key's value.
 pub(crate) fn value_range_from_disk_read(
     buf: &[u8],
     item_offset: usize,
@@ -101,6 +99,29 @@ pub(crate) fn value_range_from_disk_read(
         return None;
     }
     Some(value_start..value_end)
+}
+
+/// The key of the live item at `item_offset` in `buf`, or `None` if its
+/// header or key is not in `buf`, is invalid, or marks the item deleted.
+pub(crate) fn key_from_disk_read(buf: &[u8], item_offset: usize) -> Option<&[u8]> {
+    let header = header_from_disk_read(buf, item_offset)?;
+    let key_start = item_offset + cache_core::BasicHeader::SIZE + header.optional_len() as usize;
+    buf.get(key_start..key_start + header.key_len() as usize)
+}
+
+/// The key stored at `item_offset` in `buf`, deleted or not, or `None` if
+/// its header or key is not in `buf` or the header is invalid. A key check
+/// needs the stored key whatever its flags: a write that matches a deleted
+/// item's key replaces its entry rather than adding one beside it.
+pub(crate) fn stored_key_from_disk_read(buf: &[u8], item_offset: usize) -> Option<&[u8]> {
+    let header_size = cache_core::BasicHeader::SIZE;
+    let header_bytes = buf.get(item_offset..item_offset + header_size)?;
+    let mut copy = [0u8; cache_core::BasicHeader::SIZE];
+    copy.copy_from_slice(header_bytes);
+    // SAFETY: `copy` is `SIZE` writable bytes; see `header_from_disk_read`.
+    let header = unsafe { cache_core::BasicHeader::try_from_ptr(copy.as_mut_ptr()) }?;
+    let key_start = item_offset + header_size + header.optional_len() as usize;
+    buf.get(key_start..key_start + header.key_len() as usize)
 }
 
 /// Whether the item at `item_offset` in `buf` is live and stored under

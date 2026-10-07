@@ -33,6 +33,7 @@ pub mod cache {
     pub const DISK_READ_ERRORS: usize = 5;
     pub const DISK_FLUSHES: usize = 6;
     pub const DISK_FLUSH_ERRORS: usize = 7;
+    pub const DISK_KEY_READS: usize = 8;
 }
 
 /// Counter slot indices for error metrics.
@@ -111,6 +112,12 @@ pub static DISK_FLUSHES: Counter = Counter::new(&CACHE, cache::DISK_FLUSHES);
     description = "Segment flushes that failed"
 )]
 pub static DISK_FLUSH_ERRORS: Counter = Counter::new(&CACHE, cache::DISK_FLUSH_ERRORS);
+
+#[metric(
+    name = "disk_key_reads",
+    description = "Disk reads of an item's key, for a command that met an entry whose key is only on disk"
+)]
+pub static DISK_KEY_READS: Counter = Counter::new(&CACHE, cache::DISK_KEY_READS);
 
 // Errors
 #[metric(

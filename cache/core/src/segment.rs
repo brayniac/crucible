@@ -391,8 +391,6 @@ pub trait SegmentKeyVerify {
     ///
     /// The caller holds a reference from `try_acquire_read` for the
     /// duration; prefer [`SegmentKeyVerify::verify_key_guarded`].
-    /// `DiskSegmentMeta` frees its recorded key hashes when the segment is
-    /// reserved again.
     ///
     /// # Parameters
     /// - `offset`: Item offset within the segment

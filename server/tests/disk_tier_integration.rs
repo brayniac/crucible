@@ -168,6 +168,17 @@ fn start_disk_test_server_callback(
 
 /// Start an async server with a small RAM heap + Direct I/O disk tier.
 fn start_disk_test_server_async(port: u16, disk_path: &std::path::Path) -> thread::JoinHandle<()> {
+    start_disk_test_server_with(port, disk_path, "resp", "64KB")
+}
+
+/// As `start_disk_test_server_async`, speaking `protocol` and accepting
+/// values up to `max_value_size`.
+fn start_disk_test_server_with(
+    port: u16,
+    disk_path: &std::path::Path,
+    protocol: &'static str,
+    max_value_size: &'static str,
+) -> thread::JoinHandle<()> {
     let disk_path = disk_path.to_path_buf();
     thread::spawn(move || {
         let config_str = format!(
@@ -179,7 +190,7 @@ fn start_disk_test_server_async(port: u16, disk_path: &std::path::Path) -> threa
             backend = "segment"
             heap_size = "4MB"
             segment_size = "1MB"
-            max_value_size = "64KB"
+            max_value_size = "{max_value_size}"
             hashtable_power = 14
 
             [cache.disk]
@@ -190,7 +201,7 @@ fn start_disk_test_server_async(port: u16, disk_path: &std::path::Path) -> threa
             promotion_threshold = 2
 
             [[listener]]
-            protocol = "resp"
+            protocol = "{protocol}"
             address = "127.0.0.1:{port}"
 
             [metrics]
@@ -418,4 +429,281 @@ fn test_disk_tier_serves_values_larger_than_a_block() {
 #[serial]
 fn test_disk_tier_serves_values_within_a_block() {
     serves_values_from_disk("block", 2 * 1024, 3000);
+}
+
+fn send_del(stream: &mut TcpStream, key: &str) -> Option<i64> {
+    let cmd = format!("*2\r\n$3\r\nDEL\r\n${}\r\n{}\r\n", key.len(), key);
+    stream.write_all(cmd.as_bytes()).ok()?;
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).ok()?;
+    let response = std::str::from_utf8(&buf[..n]).ok()?;
+    response.strip_prefix(':')?.trim_end().parse().ok()
+}
+
+/// A connected client for one of the disk-tier servers.
+fn connect(addr: SocketAddr) -> TcpStream {
+    assert!(
+        wait_for_server(addr, Duration::from_secs(10)),
+        "Async server with disk tier failed to start"
+    );
+    let stream = TcpStream::connect(addr).expect("Failed to connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+}
+
+/// Read until the bytes read end with `suffix`, or fail after 10 seconds.
+fn read_until(stream: &mut TcpStream, suffix: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    let start = Instant::now();
+    while !buf.ends_with(suffix) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no complete reply"
+        );
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("connection closed"),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+    buf
+}
+
+/// Write `num_keys` values of `value_size` bytes over RESP, then wait for the
+/// disk tier's flushes, so the items demoted to disk are only on disk.
+fn fill_to_disk(stream: &mut TcpStream, name: &str, value_size: usize, num_keys: usize) {
+    for i in 0..num_keys {
+        assert!(send_set(
+            stream,
+            &format!("{name}:{i}"),
+            &make_value(i, value_size)
+        ));
+    }
+    thread::sleep(Duration::from_millis(500));
+}
+
+/// Overwrites and deletes of keys whose items are only on disk read each
+/// key from disk first. An overwrite that is served afterwards is never the
+/// older value, most overwrites are served, a discarded attempt is not
+/// counted as a SET error, and a deleted key stays deleted.
+#[test]
+#[serial]
+fn test_disk_tier_overwrites_and_deletes_keys_only_on_disk() {
+    let name = "rewrite";
+    let (value_size, num_keys) = (2 * 1024, 3000);
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let disk_file = TempDiskFile::new(name);
+    let _server_handle = start_disk_test_server_async(port, &disk_file.path);
+    let mut stream = connect(addr);
+
+    let key = |i: usize| format!("{name}:{i}");
+    fill_to_disk(&mut stream, name, value_size, num_keys);
+
+    let key_reads_before = server::metrics::DISK_KEY_READS.value();
+    let set_errors_before = server::metrics::SET_ERRORS.value();
+    let newer = |i: usize| make_value(i + num_keys, value_size);
+    for i in 0..num_keys {
+        assert!(send_set(&mut stream, &key(i), &newer(i)), "SET {i} failed");
+    }
+    let key_reads = server::metrics::DISK_KEY_READS.value() - key_reads_before;
+    eprintln!("{name}: {key_reads} keys read from disk for overwrites");
+    assert!(key_reads > 0, "no overwrite read a key from disk");
+    assert_eq!(
+        server::metrics::SET_ERRORS.value(),
+        set_errors_before,
+        "an overwrite that waited on a key read counted as a SET error"
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    let mut served = Vec::new();
+    for i in 0..num_keys {
+        if let Some(got) = send_get(&mut stream, &key(i)) {
+            assert_eq!(
+                got,
+                newer(i),
+                "key {i} served a value older than its overwrite"
+            );
+            served.push(i);
+        }
+    }
+    assert!(
+        served.len() > num_keys / 2,
+        "only {} of {num_keys} overwrites were served",
+        served.len()
+    );
+    for &i in served.iter().step_by(2) {
+        assert_eq!(send_del(&mut stream, &key(i)), Some(1), "DEL {i}");
+        assert_eq!(
+            send_get(&mut stream, &key(i)),
+            None,
+            "deleted key {i} came back"
+        );
+    }
+}
+
+/// The same over memcache ASCII: overwrites of keys only on disk read the
+/// key first, and a served value is never the older one.
+#[test]
+#[serial]
+fn test_disk_tier_memcache_overwrites_keys_only_on_disk() {
+    let name = "mcrewrite";
+    let (value_size, num_keys) = (2 * 1024, 3000);
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let disk_file = TempDiskFile::new(name);
+    let _server_handle = start_disk_test_server_with(port, &disk_file.path, "memcache", "64KB");
+    let mut stream = connect(addr);
+
+    let key = |i: usize| format!("{name}:{i}");
+    let set = |stream: &mut TcpStream, key: &str, value: &str| {
+        let cmd = format!("set {key} 0 0 {}\r\n{value}\r\n", value.len());
+        stream.write_all(cmd.as_bytes()).unwrap();
+        assert_eq!(read_until(stream, b"\r\n"), b"STORED\r\n", "set {key}");
+    };
+    for i in 0..num_keys {
+        set(&mut stream, &key(i), &make_value(i, value_size));
+    }
+    thread::sleep(Duration::from_millis(500));
+
+    let key_reads_before = server::metrics::DISK_KEY_READS.value();
+    let newer = |i: usize| make_value(i + num_keys, value_size);
+    for i in 0..num_keys {
+        set(&mut stream, &key(i), &newer(i));
+    }
+    assert!(
+        server::metrics::DISK_KEY_READS.value() > key_reads_before,
+        "no overwrite read a key from disk"
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    let mut served = 0;
+    for i in 0..num_keys {
+        stream
+            .write_all(format!("get {}\r\n", key(i)).as_bytes())
+            .unwrap();
+        let reply = read_until(&mut stream, b"END\r\n");
+        if reply != b"END\r\n" {
+            let expected = format!(
+                "VALUE {} 0 {}\r\n{}\r\nEND\r\n",
+                key(i),
+                value_size,
+                newer(i)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&reply),
+                expected,
+                "key {i} served a value older than its overwrite"
+            );
+            served += 1;
+        }
+    }
+    assert!(
+        served > num_keys / 2,
+        "only {served} of {num_keys} overwrites were served"
+    );
+}
+
+/// A streamed SET (a value large enough to be received into its segment
+/// directly) over a key whose item is only on disk waits on the key read at
+/// its commit, then stores: the served value is the streamed one.
+#[test]
+#[serial]
+fn test_disk_tier_streamed_overwrites_of_keys_only_on_disk() {
+    let name = "streamed";
+    let (value_size, num_keys) = (2 * 1024, 3000);
+    let large = 70 * 1024;
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let disk_file = TempDiskFile::new(name);
+    let _server_handle = start_disk_test_server_with(port, &disk_file.path, "resp", "256KB");
+    let mut stream = connect(addr);
+
+    let key = |i: usize| format!("{name}:{i}");
+    fill_to_disk(&mut stream, name, value_size, num_keys);
+
+    let key_reads_before = server::metrics::DISK_KEY_READS.value();
+    let overwritten: Vec<usize> = (0..num_keys).step_by(50).collect();
+    for &i in &overwritten {
+        assert!(
+            send_set(&mut stream, &key(i), &make_value(i, large)),
+            "SET {i}"
+        );
+    }
+    assert!(
+        server::metrics::DISK_KEY_READS.value() > key_reads_before,
+        "no streamed overwrite read a key from disk"
+    );
+
+    let mut served = 0;
+    for &i in &overwritten {
+        if let Some(got) = send_get(&mut stream, &key(i)) {
+            assert_eq!(
+                got.len(),
+                large,
+                "key {i} served a value older than its overwrite"
+            );
+            assert_eq!(got, make_value(i, large));
+            served += 1;
+        }
+    }
+    assert!(
+        served > overwritten.len() / 2,
+        "only {served} of {} streamed overwrites were served",
+        overwritten.len()
+    );
+}
+
+/// Pipelined SET and GET pairs over keys only on disk come back in order:
+/// each GET answers with the value its own SET just stored.
+#[test]
+#[serial]
+fn test_disk_tier_pipelined_overwrites_stay_in_order() {
+    let name = "pipeline";
+    let (value_size, num_keys) = (2 * 1024, 3000);
+    let port = get_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let disk_file = TempDiskFile::new(name);
+    let _server_handle = start_disk_test_server_async(port, &disk_file.path);
+    let mut stream = connect(addr);
+    fill_to_disk(&mut stream, name, value_size, num_keys);
+
+    let key_reads_before = server::metrics::DISK_KEY_READS.value();
+    let batch = 8;
+    for start in (0..num_keys).step_by(batch) {
+        let mut request = Vec::new();
+        let mut expected = Vec::new();
+        for i in start..(start + batch).min(num_keys) {
+            let (key, value) = (format!("{name}:{i}"), format!("new{i}"));
+            request.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n{value}\r\n",
+                    key.len(),
+                    value.len()
+                )
+                .as_bytes(),
+            );
+            request.extend_from_slice(
+                format!("*2\r\n$3\r\nGET\r\n${}\r\n{key}\r\n", key.len()).as_bytes(),
+            );
+            expected.extend_from_slice(b"+OK\r\n");
+            expected.extend_from_slice(format!("${}\r\n{value}\r\n", value.len()).as_bytes());
+        }
+        stream.write_all(&request).unwrap();
+        let reply = read_until(&mut stream, &expected[expected.len() - 8..]);
+        assert_eq!(
+            String::from_utf8_lossy(&reply),
+            String::from_utf8_lossy(&expected),
+            "batch at {start}"
+        );
+    }
+    assert!(
+        server::metrics::DISK_KEY_READS.value() > key_reads_before,
+        "no pipelined overwrite read a key from disk"
+    );
 }

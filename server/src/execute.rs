@@ -85,6 +85,14 @@ unsafe fn write_bulk_string(buf: &mut [u8], value: &[u8]) -> usize {
 /// returns `Some(PendingSetRetry)` instead of writing a response, allowing the async
 /// handler to sleep and retry.
 #[inline]
+/// Count a failed write, unless the command is waiting on a disk key read:
+/// that attempt's result is discarded and the command runs again.
+fn count_set_error() {
+    if !cache_core::key_memo::waiting() {
+        SET_ERRORS.increment();
+    }
+}
+
 pub fn execute_resp<C: Cache>(
     cmd: &RespCommand<'_>,
     cache: &C,
@@ -176,7 +184,7 @@ pub fn execute_resp<C: Cache>(
                             quiet: false,
                         });
                     }
-                    SET_ERRORS.increment();
+                    count_set_error();
                     if e.is_client_error() {
                         // Client validation errors should be reported so the
                         // caller can fix the request.
@@ -1327,7 +1335,7 @@ pub fn execute_memcache<C: Cache>(
                             }),
                         );
                     }
-                    SET_ERRORS.increment();
+                    count_set_error();
                     if e.is_client_error() {
                         write_buf.extend_from_slice(b"CLIENT_ERROR ");
                         write_buf.extend_from_slice(e.to_string().as_bytes());
@@ -1357,7 +1365,7 @@ pub fn execute_memcache<C: Cache>(
                     write_buf.extend_from_slice(b"NOT_STORED\r\n");
                 }
                 Err(_) => {
-                    SET_ERRORS.increment();
+                    count_set_error();
                     write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
@@ -1381,7 +1389,7 @@ pub fn execute_memcache<C: Cache>(
                     write_buf.extend_from_slice(b"NOT_STORED\r\n");
                 }
                 Err(_) => {
-                    SET_ERRORS.increment();
+                    count_set_error();
                     write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
@@ -1416,7 +1424,7 @@ pub fn execute_memcache<C: Cache>(
                 }
                 Err(_) => {
                     // Other error (e.g., out of memory)
-                    SET_ERRORS.increment();
+                    count_set_error();
                     write_buf.extend_from_slice(MC_SERVER_ERROR_OOM);
                 }
             }
@@ -1651,7 +1659,7 @@ pub fn execute_memcache_binary<C: Cache>(
                             }),
                         );
                     }
-                    SET_ERRORS.increment();
+                    count_set_error();
                     let len = if e.is_client_error() {
                         BinaryResponse::encode_invalid_arguments(buf, Opcode::Set, *opaque)
                     } else {
@@ -1697,7 +1705,7 @@ pub fn execute_memcache_binary<C: Cache>(
                             }),
                         );
                     }
-                    SET_ERRORS.increment();
+                    count_set_error();
                     if e.is_client_error() {
                         let len =
                             BinaryResponse::encode_invalid_arguments(buf, Opcode::Set, *opaque);
@@ -1727,7 +1735,7 @@ pub fn execute_memcache_binary<C: Cache>(
                     BinaryResponse::encode_exists(buf, Opcode::Add, *opaque)
                 }
                 Err(_) => {
-                    SET_ERRORS.increment();
+                    count_set_error();
                     BinaryResponse::encode_out_of_memory(buf, Opcode::Add, *opaque)
                 }
             }
@@ -1752,7 +1760,7 @@ pub fn execute_memcache_binary<C: Cache>(
                     BinaryResponse::encode_not_found(buf, Opcode::Replace, *opaque)
                 }
                 Err(_) => {
-                    SET_ERRORS.increment();
+                    count_set_error();
                     BinaryResponse::encode_out_of_memory(buf, Opcode::Replace, *opaque)
                 }
             }

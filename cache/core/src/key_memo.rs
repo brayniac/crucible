@@ -166,6 +166,13 @@ pub(crate) fn unresolved_location() -> Option<Location> {
     active(|memo| memo.unresolved.get()).flatten()
 }
 
+/// Whether the installed memo has an unresolved location: the command in
+/// progress is waiting on a key read, and its result so far will be
+/// discarded and the command run again.
+pub fn waiting() -> bool {
+    unresolved_location().is_some()
+}
+
 /// `KeyUnresolved` for the installed memo's unresolved location, if any; see
 /// [`unresolved_location`].
 pub(crate) fn refusal() -> Option<crate::CacheError> {

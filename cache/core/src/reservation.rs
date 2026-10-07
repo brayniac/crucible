@@ -157,6 +157,9 @@ pub struct SegmentReservation {
     /// Whether a commit published and counted the item. A commit that
     /// returned `KeyUnresolved` leaves it published but not indexed.
     finalized: bool,
+    /// Whether a commit found the segment evicted and stores the value with
+    /// a plain `set` instead. A retried commit then retries the `set`.
+    set_fallback: bool,
     /// Holds a reference on the segment until the reservation is dropped,
     /// so the segment is not freed and reused while the value is received.
     _pin: crate::cache_trait::ValueRef,
@@ -172,6 +175,7 @@ impl std::fmt::Debug for SegmentReservation {
             .field("item_size", &self.item_size)
             .field("committed", &self.committed)
             .field("finalized", &self.finalized)
+            .field("set_fallback", &self.set_fallback)
             .finish_non_exhaustive()
     }
 }
@@ -207,6 +211,7 @@ impl SegmentReservation {
             item_size,
             committed: false,
             finalized: false,
+            set_fallback: false,
             _pin: pin,
         }
     }
@@ -277,6 +282,16 @@ impl SegmentReservation {
 
     pub(crate) fn mark_finalized(&mut self) {
         self.finalized = true;
+    }
+
+    /// Whether a commit stores the value with a plain `set`; see
+    /// [`Self::set_fallback`].
+    pub(crate) fn is_set_fallback(&self) -> bool {
+        self.set_fallback
+    }
+
+    pub(crate) fn mark_set_fallback(&mut self) {
+        self.set_fallback = true;
     }
 }
 

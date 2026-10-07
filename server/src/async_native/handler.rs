@@ -5,12 +5,12 @@
 //! and command execution, then drains pending writes via copy sends (small
 //! protocol framing) and zero-copy guard sends (large values).
 
-use crate::connection::{Connection, PendingDiskReadInfo, SliceRecvBuf};
+use crate::connection::{Connection, PendingDiskReadInfo, SliceRecvBuf, Suspended};
 use crate::disk_io::DiskBackend;
 use crate::disk_io::DiskIoWorkerConfig;
 use crate::metrics::{
-    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_FLUSH_ERRORS, DISK_FLUSHES, DISK_READ_ERRORS,
-    DISK_READ_HITS, DISK_READ_MISSES, DISK_READS, HITS, MISSES,
+    CONNECTIONS_ACCEPTED, CONNECTIONS_ACTIVE, DISK_FLUSH_ERRORS, DISK_FLUSHES, DISK_KEY_READS,
+    DISK_READ_ERRORS, DISK_READ_HITS, DISK_READ_MISSES, DISK_READS, HITS, MISSES,
 };
 use bytes::Bytes;
 use cache_core::Cache;
@@ -350,6 +350,9 @@ async fn handle_connection<C: Cache>(
     } else {
         Connection::with_options(cfg.max_value_size, cfg.allow_flush)
     };
+    // Segment pins for the keys the current command has read; see
+    // `resume_suspended`.
+    let mut key_pins: Vec<DiskReadRef<'_, C>> = Vec::new();
 
     loop {
         // Backpressure: if write queue is full, drain pending writes first.
@@ -370,6 +373,7 @@ async fn handle_connection<C: Cache>(
             continue;
         }
 
+        let key_memo = connection.key_memo.clone();
         let consumed = conn
             .with_data(|data| {
                 if data.is_empty() {
@@ -377,7 +381,7 @@ async fn handle_connection<C: Cache>(
                 }
 
                 let mut buf = SliceRecvBuf::new(data);
-                connection.process_from(&mut buf, &*cache);
+                cache_core::with_key_memo(&key_memo, || connection.process_from(&mut buf, &*cache));
                 ringline::ParseResult::Consumed(buf.consumed())
             })
             .await;
@@ -399,7 +403,7 @@ async fn handle_connection<C: Cache>(
             // Process any overflow data in the accumulator (trailing CRLF, next commands).
             let processed = conn.try_with_data(|data| {
                 let mut buf = SliceRecvBuf::new(data);
-                connection.process_from(&mut buf, &*cache);
+                cache_core::with_key_memo(&key_memo, || connection.process_from(&mut buf, &*cache));
                 ringline::ParseResult::Consumed(buf.consumed())
             });
             if sink_bytes == 0
@@ -409,34 +413,49 @@ async fn handle_connection<C: Cache>(
             }
         }
 
-        // Handle pending disk read (disk-tier GET).
-        if connection.pending_disk_read.is_some() {
-            let has_disk_io = disk_io.lock().is_some();
-            if has_disk_io {
-                let pending_info = connection
-                    .pending_disk_read
-                    .take()
-                    .expect("pending_disk_read must be Some (guarded by is_some check)");
-                match submit_and_await_disk_read(
+        // Commands waiting on disk reads: a key read for a suspended
+        // command, or a disk-tier GET's item read. Either can lead to the
+        // other: a retried command can be a GET that needs its item read,
+        // and a GET whose read finds another key runs again.
+        let mut closed = false;
+        loop {
+            if connection.suspended.is_some() {
+                resume_suspended(&disk_io, &*cache, &mut connection, &mut key_pins).await;
+            }
+            let Some(pending_info) = connection.pending_disk_read.take() else {
+                break;
+            };
+            if disk_io.lock().is_some() {
+                if submit_and_await_disk_read(
                     &disk_io,
                     &*cache,
                     &conn,
                     &mut connection,
                     pending_info,
                     cfg.slot_size,
+                    &mut key_pins,
                 )
                 .await
+                .is_err()
                 {
-                    Ok(()) => {}
-                    Err(()) => break,
+                    closed = true;
+                    break;
                 }
             } else {
                 // No disk I/O configured — treat as miss.
-                connection.pending_disk_read.take();
+                cache
+                    .release_disk_read(pending_info.params.segment_id, pending_info.params.pool_id);
+                connection.key_memo.clear();
                 DISK_READ_ERRORS.increment();
                 MISSES.increment();
                 connection.write_miss_response();
             }
+        }
+        if connection.key_memo.is_empty() {
+            key_pins.clear();
+        }
+        if closed {
+            break;
         }
 
         // Drain pending responses.
@@ -457,14 +476,35 @@ async fn handle_connection<C: Cache>(
             let deadline =
                 ringline::Deadline::after(Duration::from_micros(cfg.set_retry_timeout_us));
             loop {
-                ringline::sleep(Duration::from_micros(50)).await;
-                if connection.retry_set(&*cache) {
+                // A key read is progress, not waiting on eviction: it does
+                // not count against the deadline, and the SET is retried at
+                // once.
+                if let Some(location) = connection.key_memo.unresolved() {
+                    if !record_key(&disk_io, &*cache, &mut connection, location, &mut key_pins)
+                        .await
+                    {
+                        connection
+                            .abandon_retry_with_error(cache_core::CacheError::SegmentNotAccessible);
+                        break;
+                    }
+                } else {
+                    ringline::sleep(Duration::from_micros(50)).await;
+                }
+                let key_memo = connection.key_memo.clone();
+                if cache_core::with_key_memo(&key_memo, || connection.retry_set(&*cache)) {
                     break; // succeeded or gave up on non-retryable error
                 }
-                if deadline.remaining().is_zero() {
+                if connection.key_memo.unresolved().is_none() && deadline.remaining().is_zero() {
                     connection.abandon_retry(); // silent drop + SET_ERRORS
                     break;
                 }
+            }
+            // A retried SET that left its duplicate resolution pending.
+            if connection.suspended.is_some() {
+                resume_suspended(&disk_io, &*cache, &mut connection, &mut key_pins).await;
+            }
+            if connection.key_memo.is_empty() {
+                key_pins.clear();
             }
             // Drain the retry's response.
             if connection.has_pending_write()
@@ -486,7 +526,176 @@ async fn handle_connection<C: Cache>(
         }
     }
 
+    connection.abandon_suspended(&*cache);
+    drop(key_pins);
     CONNECTIONS_ACTIVE.decrement();
+}
+
+/// Run the connection's suspended command again, reading the key it waits on
+/// first, until nothing is suspended or a retried GET needs its item read.
+/// If the key cannot be read, the command fails with an error.
+///
+/// A key read's segment pin is kept in `key_pins` until the key memo is
+/// empty, so the segment is not reused while the memo holds its key.
+async fn resume_suspended<'c, C: Cache>(
+    disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
+    cache: &'c C,
+    connection: &mut Connection,
+    key_pins: &mut Vec<DiskReadRef<'c, C>>,
+) {
+    // Whether the last round read no key: running a command again twice in
+    // a row with nothing new recorded would not make progress.
+    let mut nothing_new = false;
+    while connection.suspended.is_some() && connection.pending_disk_read.is_none() {
+        // A suspended command waits on `unresolved`; a pending resolve on the
+        // location its resolution met.
+        let location = connection.key_memo.unresolved().or_else(|| {
+            matches!(connection.suspended, Some(Suspended::Resolve))
+                .then(|| {
+                    connection
+                        .key_memo
+                        .pending_resolve()
+                        .map(|(_, location)| location)
+                })
+                .flatten()
+        });
+        match location {
+            Some(location) => {
+                if !record_key(disk_io, cache, connection, location, key_pins).await {
+                    connection.fail_suspended(cache);
+                    return;
+                }
+                nothing_new = false;
+            }
+            // A GET whose item read found another key has recorded it and
+            // runs once more with nothing to read. A command that suspends
+            // again without naming a key would not make progress.
+            None if nothing_new && !matches!(connection.suspended, Some(Suspended::Resolve)) => {
+                debug_assert!(false, "a command suspended again without an unresolved key");
+                connection.fail_suspended(cache);
+                return;
+            }
+            None => nothing_new = true,
+        }
+        let key_memo = connection.key_memo.clone();
+        cache_core::with_key_memo(&key_memo, || connection.resume(cache));
+    }
+}
+
+/// Attempts at reading a key before the command that needs it fails.
+const KEY_READ_ATTEMPTS: usize = 3;
+
+/// Read the key at `location` and record it in the connection's key memo,
+/// trying up to [`KEY_READ_ATTEMPTS`] times. Returns `false` if every read
+/// failed; nothing is recorded then, as recording no key would let a write
+/// add an entry beside a live one.
+async fn record_key<'c, C: Cache>(
+    disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
+    cache: &'c C,
+    connection: &mut Connection,
+    location: cache_core::Location,
+    key_pins: &mut Vec<DiskReadRef<'c, C>>,
+) -> bool {
+    for _ in 0..KEY_READ_ATTEMPTS {
+        match read_key(disk_io, cache, location, key_pins).await {
+            KeyRead::Key(key) => {
+                connection.key_memo.record(location, Some(key));
+                return true;
+            }
+            KeyRead::Unpinnable => {
+                connection.key_memo.record(location, None);
+                return true;
+            }
+            KeyRead::Failed => DISK_READ_ERRORS.increment(),
+        }
+    }
+    false
+}
+
+/// The outcome of reading an entry's key from disk.
+enum KeyRead {
+    /// The key stored at the entry's location.
+    Key(Vec<u8>),
+    /// `Cache::key_read` could not pin the entry's segment: it is freed,
+    /// condemned, expired or reused, so the entry holds no key.
+    Unpinnable,
+    /// The read failed, returned too few bytes, or its header did not parse.
+    Failed,
+}
+
+/// How long `read_key` waits between attempts to take a pooled read buffer.
+const BUFFER_WAIT: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// Attempts `read_key` makes at taking a pooled read buffer (about one
+/// second) before the read fails.
+const BUFFER_ATTEMPTS: usize = 20_000;
+
+/// Read the key stored at `location`, keeping its segment pin in `key_pins`.
+async fn read_key<'c, C: Cache>(
+    disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
+    cache: &'c C,
+    location: cache_core::Location,
+    key_pins: &mut Vec<DiskReadRef<'c, C>>,
+) -> KeyRead {
+    let Some(params) = cache.key_read(location) else {
+        return KeyRead::Unpinnable;
+    };
+    let pin = DiskReadRef {
+        cache,
+        segment_id: params.segment_id,
+        pool_id: params.pool_id,
+    };
+    let mut buffer = None;
+    for _ in 0..BUFFER_ATTEMPTS {
+        let allocated = match disk_io.lock().as_mut() {
+            Some(dio) => dio.read_buffer_pool.allocate(),
+            None => return KeyRead::Failed,
+        };
+        if allocated.is_some() {
+            buffer = allocated;
+            break;
+        }
+        ringline::sleep(BUFFER_WAIT).await;
+    }
+    let Some(mut buffer) = buffer else {
+        return KeyRead::Failed;
+    };
+    let release_buffer = |buffer| {
+        if let Some(dio) = disk_io.lock().as_mut() {
+            dio.read_buffer_pool.release(buffer);
+        }
+    };
+    if params.read_len as usize > buffer.capacity() {
+        release_buffer(buffer);
+        return KeyRead::Failed;
+    }
+    DISK_KEY_READS.increment();
+    // SAFETY: `buffer` is a pooled read buffer of at least `read_len` bytes.
+    // If this future is dropped mid-read, `buffer` is never returned to the
+    // pool, so the kernel's write lands in memory nothing else uses.
+    let read = unsafe {
+        read_disk(
+            disk_io,
+            params.disk_offset,
+            buffer.as_mut_ptr(),
+            params.read_len as usize,
+        )
+    }
+    .await;
+    let key = read.ok().and_then(|valid_len| {
+        // SAFETY: the read returned `valid_len` bytes into `buffer`.
+        let data = unsafe { buffer.as_slice(valid_len) };
+        crate::disk_io::stored_key_from_disk_read(data, params.item_offset as usize)
+            .map(<[u8]>::to_vec)
+    });
+    release_buffer(buffer);
+    match key {
+        Some(key) => {
+            key_pins.push(pin);
+            KeyRead::Key(key)
+        }
+        None => KeyRead::Failed,
+    }
 }
 
 /// Releases a disk segment's read reference when dropped, including when
@@ -509,13 +718,14 @@ impl<C: Cache> Drop for DiskReadRef<'_, C> {
 /// The first read fills a pooled buffer; an item that runs past it is read
 /// again in full into a buffer of its own, whose value is sent without a
 /// copy. The segment's read reference is released once the reads complete.
-async fn submit_and_await_disk_read<C: Cache>(
+async fn submit_and_await_disk_read<'c, C: Cache>(
     disk_io: &Arc<Mutex<Option<AsyncDiskIo>>>,
-    cache: &C,
+    cache: &'c C,
     conn: &ConnCtx,
     connection: &mut Connection,
     pending_info: PendingDiskReadInfo,
     slot_size: usize,
+    key_pins: &mut Vec<DiskReadRef<'c, C>>,
 ) -> Result<(), ()> {
     let segment_id = pending_info.params.segment_id;
     let pool_id = pending_info.params.pool_id;
@@ -531,6 +741,7 @@ async fn submit_and_await_disk_read<C: Cache>(
         }
     };
     let miss_on_error = |connection: &mut Connection, e: &dyn std::fmt::Display| {
+        connection.key_memo.clear();
         DISK_READ_ERRORS.increment();
         MISSES.increment();
         tracing::warn!(segment_id, pool_id, "Disk read failed: {e}");
@@ -548,6 +759,7 @@ async fn submit_and_await_disk_read<C: Cache>(
             None => {
                 DISK_READ_ERRORS.increment();
                 MISSES.increment();
+                connection.key_memo.clear();
                 connection.write_miss_response();
                 return Ok(());
             }
@@ -566,6 +778,7 @@ async fn submit_and_await_disk_read<C: Cache>(
             capacity = buffer.capacity(),
             "disk read longer than its buffer"
         );
+        connection.key_memo.clear();
         connection.write_miss_response();
         release_buffer(buffer);
         return Ok(());
@@ -599,6 +812,21 @@ async fn submit_and_await_disk_read<C: Cache>(
     // SAFETY: the read returned `valid_len` bytes into `buffer`.
     let first = unsafe { buffer.as_slice(valid_len) };
     let key = &pending_info.key;
+
+    // The entry was matched without its key, which is only on disk. If the
+    // item holds another key, record it and run the GET again: its lookup
+    // then answers this entry from the key read and moves on.
+    let read_key = crate::disk_io::key_from_disk_read(first, item_offset);
+    if read_key != Some(key.as_slice()) {
+        connection
+            .key_memo
+            .record(pending_info.params.location, read_key.map(<[u8]>::to_vec));
+        release_buffer(buffer);
+        key_pins.push(segment_ref);
+        connection.suspended = Some(Suspended::Command(pending_info.command));
+        return Ok(());
+    }
+
     let value = match crate::disk_io::item_len_from_disk_read(first, item_offset) {
         Some(item_len) if item_offset + item_len <= valid_len => {
             let value = crate::disk_io::value_range_from_disk_read(first, item_offset, key)
@@ -623,6 +851,7 @@ async fn submit_and_await_disk_read<C: Cache>(
     // Both reads have completed and the value, if any, is in a buffer of
     // this request's, not in the segment.
     drop(segment_ref);
+    connection.key_memo.clear();
 
     match value {
         Ok(Some(value)) => {
