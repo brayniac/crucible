@@ -2686,6 +2686,73 @@ mod tests {
         fn flush(&self) {}
     }
 
+    /// A cache whose only key cannot be read by `append`, as for an item
+    /// only on a committed disk segment. Records every `set`.
+    struct UnreadableAppendCache {
+        sets: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl Cache for UnreadableAppendCache {
+        fn get(&self, _key: &[u8]) -> Option<cache_core::OwnedGuard> {
+            None
+        }
+
+        fn with_value<F, R>(&self, _key: &[u8], _f: F) -> Option<R>
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            None
+        }
+
+        fn get_value_ref(&self, _key: &[u8]) -> Option<cache_core::ValueRef> {
+            None
+        }
+
+        fn set(
+            &self,
+            _key: &[u8],
+            value: &[u8],
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), cache_core::CacheError> {
+            self.sets.lock().unwrap().push(value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn contains(&self, _key: &[u8]) -> bool {
+            true
+        }
+
+        fn flush(&self) {}
+
+        fn append(&self, _key: &[u8], _data: &[u8]) -> Result<usize, cache_core::CacheError> {
+            Err(cache_core::CacheError::SegmentNotAccessible)
+        }
+    }
+
+    /// RESP APPEND on a key `append` cannot read answers an error and does
+    /// not store the appended bytes as the whole value.
+    #[test]
+    fn resp_append_on_an_unreadable_key_does_not_overwrite_it() {
+        let cache = UnreadableAppendCache {
+            sets: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut conn = Connection::default();
+
+        let mut buf = TestRecvBuf::new(b"*3\r\n$6\r\nAPPEND\r\n$1\r\nk\r\n$4\r\ntail\r\n");
+        conn.process_from(&mut buf, &cache);
+
+        assert!(
+            conn.pending_write_data().starts_with(b"-ERR"),
+            "got {:?}",
+            String::from_utf8_lossy(conn.pending_write_data())
+        );
+        assert!(cache.sets.lock().unwrap().is_empty(), "APPEND called set");
+    }
+
     #[test]
     fn test_resp_set_key_too_long_returns_error() {
         let cache = FailingSetCache {
