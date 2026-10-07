@@ -11,7 +11,7 @@ use crate::cas::CasToken;
 use crate::config::LayerConfig;
 use crate::disk::{DiskLayer, FilePool, IoUringDiskLayer, IoUringPool};
 use crate::error::{CacheError, CacheResult};
-use crate::hashtable::{Hashtable, KeyVerifier};
+use crate::hashtable::{Hashtable, KeyVerifier, Verdict};
 use crate::item::ItemGuard;
 use crate::item_location::ItemLocation;
 use crate::layer::{EvictResult, FifoLayer, Layer, TtlLayer};
@@ -763,6 +763,10 @@ impl<H: Hashtable> TieredCache<H> {
     /// when inserting. This implements "second chance" semantics where
     /// recently-evicted items get a higher initial frequency.
     pub fn set(&self, key: &[u8], value: &[u8], optional: &[u8], ttl: Duration) -> CacheResult<()> {
+        if let Some(e) = crate::key_memo::refusal() {
+            return Err(e);
+        }
+
         // Ensure we have space in Layer 0
         self.ensure_space()?;
 
@@ -783,6 +787,10 @@ impl<H: Hashtable> TieredCache<H> {
                 // replaced, or a duplicate from a concurrent insert.
                 for old_location in displaced.locations() {
                     self.supersede_at(old_location);
+                }
+                crate::key_memo::clear_unresolved_after_publish();
+                if let Some(unresolved) = displaced.unresolved() {
+                    crate::key_memo::need_resolve(key, unresolved);
                 }
             }
             Err(e) => {
@@ -811,15 +819,18 @@ impl<H: Hashtable> TieredCache<H> {
     /// socket.recv_exact(reservation.value_mut())?;
     ///
     /// // 3. Commit to finalize and update hashtable
-    /// cache.commit_segment_set(reservation)?;
+    /// cache.commit_segment_set(&mut reservation)?;
     /// ```
     ///
     /// # Cancellation
     ///
     /// The reserved item is written deleted and stays deleted unless the
     /// reservation is committed, so dropping it (e.g., connection closed
-    /// during receive) leaves nothing to clean up. The reservation holds a
-    /// reference on its segment until it is dropped.
+    /// during receive) leaves nothing to clean up, unless a commit returned
+    /// `KeyUnresolved`: that commit published the item, so cancel the
+    /// reservation with [`Self::cancel_segment_set`] rather than dropping
+    /// it. The reservation holds a reference on its segment until it is
+    /// dropped.
     pub fn begin_segment_set(
         &self,
         key: &[u8],
@@ -853,18 +864,29 @@ impl<H: Hashtable> TieredCache<H> {
     /// Commit a two-phase SET operation.
     ///
     /// Finalizes the segment write and inserts the item into the hashtable.
-    /// The reservation is consumed.
+    ///
+    /// Returns `KeyUnresolved(location)` with nothing indexed when an
+    /// existing entry's key must be read from disk first; record it in the
+    /// installed [`crate::KeyMemo`] and call this again with the same
+    /// reservation, or cancel it with [`Self::cancel_segment_set`].
     pub fn commit_segment_set(
         &self,
-        mut reservation: crate::SegmentReservation,
+        reservation: &mut crate::SegmentReservation,
     ) -> CacheResult<()> {
+        if let Some(e) = crate::key_memo::refusal() {
+            return Err(e);
+        }
         let location = reservation.location();
         let item_size = reservation.item_size();
 
         // Publish the item (clear the deleted flag it was written with) and
-        // count it.
+        // count it, once: a commit that returned `KeyUnresolved` is retried
+        // with the item already published.
         let layer = self.layers.first().ok_or(CacheError::OutOfMemory)?;
-        layer.finalize_write_item(location, item_size);
+        if !reservation.is_finalized() {
+            layer.finalize_write_item(location, item_size);
+            reservation.mark_finalized();
+        }
 
         // Create key verifier for hashtable operations
         let verifier = self.create_key_verifier();
@@ -880,7 +902,14 @@ impl<H: Hashtable> TieredCache<H> {
                 for old_location in displaced.locations() {
                     self.supersede_at(old_location);
                 }
+                crate::key_memo::clear_unresolved_after_publish();
+                if let Some(unresolved) = displaced.unresolved() {
+                    crate::key_memo::need_resolve(reservation.key(), unresolved);
+                }
             }
+            // Nothing was indexed; the caller retries with the reservation
+            // once the key is read, or cancels it.
+            Err(e @ CacheError::KeyUnresolved(_)) => return Err(e),
             Err(e) => {
                 // Hashtable full - mark item as deleted
                 layer.mark_deleted(location);
@@ -918,14 +947,23 @@ impl<H: Hashtable> TieredCache<H> {
     /// Cancel a two-phase SET operation.
     ///
     /// Sets the deleted flag on the reserved item, which it was written with
-    /// already, and drops the reservation. Called when a receive operation
-    /// fails (e.g., connection closed during value receive).
+    /// already, and drops the reservation. If a commit returned
+    /// `KeyUnresolved`, the item was published and counted, and is uncounted
+    /// here too. Called when a receive operation fails (e.g., connection
+    /// closed during value receive), or instead of retrying such a commit.
     pub fn cancel_segment_set(&self, reservation: crate::SegmentReservation) {
         if reservation.is_committed() {
             return;
         }
 
         if let Some(layer) = self.layers.first() {
+            if reservation.is_finalized() {
+                // Published and counted by a commit that returned
+                // `KeyUnresolved`. `mark_deleted` uncounts it, but refuses a
+                // segment that is draining or being cleared; there the
+                // flag is set below and the clear resets the counts.
+                layer.mark_deleted(reservation.location());
+            }
             layer.cancel_write_item(reservation.location());
         }
     }
@@ -934,11 +972,22 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// Returns error if key already exists.
     pub fn add(&self, key: &[u8], value: &[u8], optional: &[u8], ttl: Duration) -> CacheResult<()> {
+        if let Some(e) = crate::key_memo::refusal() {
+            return Err(e);
+        }
+
         // Check if key exists first. An expired entry is still indexed, so it
         // is retired here rather than counted as the key existing.
         let verifier = self.create_key_verifier();
-        if self.hashtable.contains(key, &verifier) && !self.remove_if_expired(key) {
+        let present = self.hashtable.contains(key, &verifier);
+        if let Some(e) = self.unresolved(&verifier) {
+            return Err(e);
+        }
+        if present && !self.remove_if_expired(key) {
             return Err(CacheError::KeyExists);
+        }
+        if let Some(e) = crate::key_memo::refusal() {
+            return Err(e);
         }
 
         // Ensure we have space in Layer 0
@@ -953,7 +1002,12 @@ impl<H: Hashtable> TieredCache<H> {
             .hashtable
             .insert_if_absent(key, location.to_location(), &verifier)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // A check after the publish can have met an unknown entry;
+                // it is left in place, as the hashtable documents.
+                crate::key_memo::clear_unresolved_after_publish();
+                Ok(())
+            }
             Err(e) => {
                 // Failed to insert, mark item as deleted
                 layer.mark_deleted(location);
@@ -972,12 +1026,22 @@ impl<H: Hashtable> TieredCache<H> {
         optional: &[u8],
         ttl: Duration,
     ) -> CacheResult<()> {
+        if let Some(e) = crate::key_memo::refusal() {
+            return Err(e);
+        }
         let verifier = self.create_key_verifier();
 
         // Check if key exists. An expired entry is still indexed, and storing
         // over it would bring the key back.
-        if !self.hashtable.contains(key, &verifier) || self.remove_if_expired(key) {
+        let present = self.hashtable.contains(key, &verifier);
+        if let Some(e) = self.unresolved(&verifier) {
+            return Err(e);
+        }
+        if !present || self.remove_if_expired(key) {
             return Err(CacheError::KeyNotFound);
+        }
+        if let Some(e) = crate::key_memo::refusal() {
+            return Err(e);
         }
 
         // Ensure we have space in Layer 0
@@ -1008,6 +1072,9 @@ impl<H: Hashtable> TieredCache<H> {
     /// Returns the value as a `Vec<u8>`, or None if not found.
     /// This increments the item's frequency counter.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if crate::key_memo::unresolved_location().is_some() {
+            return None;
+        }
         let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
@@ -1030,6 +1097,9 @@ impl<H: Hashtable> TieredCache<H> {
     where
         F: FnOnce(&dyn ItemGuard<'_>) -> R,
     {
+        if crate::key_memo::unresolved_location().is_some() {
+            return None;
+        }
         let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
@@ -1052,6 +1122,9 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// This is the most efficient way to read values for scatter-gather I/O.
     pub fn get_value_ref(&self, key: &[u8]) -> Option<crate::cache_trait::ValueRef> {
+        if crate::key_memo::unresolved_location().is_some() {
+            return None;
+        }
         let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
@@ -1091,10 +1164,32 @@ impl<H: Hashtable> TieredCache<H> {
     pub fn lookup(&self, key: &[u8]) -> crate::cache_trait::LookupResult {
         use crate::cache_trait::LookupResult;
 
+        if crate::key_memo::unresolved_location().is_some() {
+            return LookupResult::Miss;
+        }
         let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
         let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) else {
+            // An entry whose key is only on disk: read the whole item, whose
+            // key the reader compares (see `LookupResult::DiskRead`).
+            let Some(unresolved) = verifier.unresolved_location() else {
+                return LookupResult::Miss;
+            };
+            let item_loc = ItemLocation::from_location(unresolved);
+            if let Some(CacheLayer::IoUringDisk(disk_layer)) = self
+                .layer_for_pool(item_loc.pool_id())
+                .and_then(|idx| self.layers.get(idx))
+                && let Some(params) =
+                    disk_layer.prepare_read(item_loc, disk_layer.pool().block_size())
+            {
+                return LookupResult::DiskRead(params);
+            }
+            // The segment cannot be pinned for a read. Answer the entry as
+            // another key's for this command and look again.
+            if crate::key_memo::unreadable(unresolved) {
+                return self.lookup(key);
+            }
             return LookupResult::Miss;
         };
         let item_loc = ItemLocation::from_location(location);
@@ -1156,6 +1251,9 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// This is used for memcached GETS command.
     pub fn get_with_cas(&self, key: &[u8]) -> Option<(Vec<u8>, CasToken)> {
+        if crate::key_memo::unresolved_location().is_some() {
+            return None;
+        }
         let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
@@ -1190,6 +1288,9 @@ impl<H: Hashtable> TieredCache<H> {
     where
         F: FnOnce(&[u8]) -> R,
     {
+        if crate::key_memo::unresolved_location().is_some() {
+            return None;
+        }
         let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
@@ -1234,6 +1335,10 @@ impl<H: Hashtable> TieredCache<H> {
         ttl: Duration,
         cas_token: CasToken,
     ) -> CacheResult<bool> {
+        if let Some(e) = crate::key_memo::refusal() {
+            return Err(e);
+        }
+
         // A token taken while the item was live still matches after it
         // expires, and CAS never reads the item; storing would bring it back.
         if self.remove_if_expired(key) {
@@ -1244,7 +1349,9 @@ impl<H: Hashtable> TieredCache<H> {
 
         // Lookup current item
         let Some((current_location, _freq)) = self.hashtable.lookup(key, &verifier) else {
-            return Err(CacheError::KeyNotFound);
+            return Err(self
+                .unresolved(&verifier)
+                .unwrap_or(CacheError::KeyNotFound));
         };
 
         let item_loc = ItemLocation::from_location(current_location);
@@ -1302,6 +1409,9 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// Returns true if the item was found and deleted.
     pub fn delete(&self, key: &[u8]) -> bool {
+        if crate::key_memo::unresolved_location().is_some() {
+            return false;
+        }
         let verifier = self.create_key_verifier();
 
         // Lookup in hashtable
@@ -1324,12 +1434,18 @@ impl<H: Hashtable> TieredCache<H> {
     ///
     /// Does not increment frequency counter.
     pub fn contains(&self, key: &[u8]) -> bool {
+        if crate::key_memo::unresolved_location().is_some() {
+            return false;
+        }
         let verifier = self.create_key_verifier();
         self.hashtable.contains(key, &verifier)
     }
 
     /// Get the remaining TTL for an item.
     pub fn ttl(&self, key: &[u8]) -> Option<Duration> {
+        if crate::key_memo::unresolved_location().is_some() {
+            return None;
+        }
         let verifier = self.create_key_verifier();
 
         let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
@@ -1342,6 +1458,9 @@ impl<H: Hashtable> TieredCache<H> {
 
     /// Get the frequency counter for an item.
     pub fn frequency(&self, key: &[u8]) -> Option<u8> {
+        if crate::key_memo::unresolved_location().is_some() {
+            return None;
+        }
         let verifier = self.create_key_verifier();
         self.hashtable.get_frequency(key, &verifier)
     }
@@ -1417,6 +1536,9 @@ impl<H: Hashtable> TieredCache<H> {
                 }
                 Some((None, _)) => return Err(CacheError::NotNumeric),
                 None => {
+                    if let Some(e) = crate::key_memo::refusal() {
+                        return Err(e);
+                    }
                     // with_value_cas returns None when the key is absent, and
                     // also for three states of a key the hashtable still
                     // indexes. Only a transient one is worth a retry.
@@ -1481,11 +1603,15 @@ impl<H: Hashtable> TieredCache<H> {
     /// as absent would overwrite the item.
     fn read_for_update(&self, key: &[u8]) -> CacheResult<(Vec<u8>, Duration)> {
         loop {
+            if let Some(e) = crate::key_memo::refusal() {
+                return Err(e);
+            }
             let verifier = self.create_key_verifier();
-            let (location, _freq) = self
-                .hashtable
-                .lookup(key, &verifier)
-                .ok_or(CacheError::KeyNotFound)?;
+            let Some((location, _freq)) = self.hashtable.lookup(key, &verifier) else {
+                return Err(self
+                    .unresolved(&verifier)
+                    .unwrap_or(CacheError::KeyNotFound));
+            };
             let item_loc = ItemLocation::from_location(location);
             let layer = self
                 .layer_for_pool(item_loc.pool_id())
@@ -1532,7 +1658,10 @@ impl<H: Hashtable> TieredCache<H> {
         }
         let verifier = self.create_key_verifier();
         let Some((location, _)) = self.hashtable.lookup(key, &verifier) else {
-            return Ok(false);
+            return match self.unresolved(&verifier) {
+                Some(e) => Err(e),
+                None => Ok(false),
+            };
         };
         let item_loc = ItemLocation::from_location(location);
         let Some(layer) = self
@@ -1602,6 +1731,9 @@ impl<H: Hashtable> TieredCache<H> {
                 }
                 Some((None, _)) => return Err(CacheError::NotNumeric),
                 None => {
+                    if let Some(e) = crate::key_memo::refusal() {
+                        return Err(e);
+                    }
                     // with_value_cas returns None when the key is absent, and
                     // also for three states of a key the hashtable still
                     // indexes. Only a transient one is worth a retry.
@@ -1987,6 +2119,16 @@ impl<H: Hashtable> TieredCache<H> {
         }
     }
 
+    /// `KeyUnresolved` for an entry whose key must be read from disk before
+    /// the operation can decide: one `verifier` met, or one an earlier
+    /// operation in the same command met (see [`crate::key_memo`]).
+    fn unresolved(&self, verifier: &CacheKeyVerifier<'_>) -> Option<CacheError> {
+        verifier
+            .unresolved_location()
+            .or_else(crate::key_memo::unresolved_location)
+            .map(CacheError::KeyUnresolved)
+    }
+
     /// Create a key verifier for hashtable operations.
     fn create_key_verifier(&self) -> CacheKeyVerifier<'_> {
         // Pre-compute direct pool references indexed by pool_id
@@ -2020,7 +2162,53 @@ impl<H: Hashtable> TieredCache<H> {
             }
         }
 
-        CacheKeyVerifier { pools }
+        CacheKeyVerifier {
+            pools,
+            unresolved: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Where to read the key of the entry at `location`, with its segment
+    /// pinned for the read. Hold the pin until the command that needed the
+    /// key finishes and [`crate::KeyMemo::clear`] drops the key, then release
+    /// it with [`Self::release_disk_read`]: while it is held the segment
+    /// cannot be reused, so the recorded key stays the key at `location`.
+    ///
+    /// `None` if the location is not on an io_uring disk segment that can be
+    /// pinned for a read: freed, condemned, expired, of another incarnation,
+    /// or with its write buffer still attached. The caller then records the
+    /// entry as not holding the key, with [`crate::KeyMemo::record`].
+    pub fn key_read(&self, location: Location) -> Option<crate::disk::DiskReadParams> {
+        let item_loc = ItemLocation::from_location(location);
+        let Some(CacheLayer::IoUringDisk(disk_layer)) = self
+            .layer_for_pool(item_loc.pool_id())
+            .and_then(|idx| self.layers.get(idx))
+        else {
+            return None;
+        };
+        // The header, then optional data and key of at most 255 bytes each.
+        let read_size = (crate::BasicHeader::SIZE + 2 * 255) as u32;
+        disk_layer.prepare_read(item_loc, read_size)
+    }
+
+    /// Finish the duplicate resolution a write left pending in the installed
+    /// [`crate::KeyMemo`] (see [`crate::KeyMemo::pending_resolve`]): unlink
+    /// every entry for `key` except the one at the highest slot position and
+    /// retire each. If an entry's key still has to be read, the memo records
+    /// it as unresolved and the resolve stays pending.
+    pub fn resolve_key(&self, key: &[u8]) {
+        let verifier = self.create_key_verifier();
+        let displaced = self.hashtable.resolve(key, &verifier, |_| ());
+        crate::key_memo::clear_unresolved_after_publish();
+        for old_location in displaced.locations() {
+            self.supersede_at(old_location);
+        }
+        match displaced.unresolved() {
+            Some(unresolved) => {
+                crate::key_memo::need_resolve(key, unresolved);
+            }
+            None => crate::key_memo::resolve_done(),
+        }
     }
 
     /// Drain the io_uring disk tier's flush queue.
@@ -2110,6 +2298,19 @@ enum PoolRef<'a> {
 struct CacheKeyVerifier<'a> {
     /// Direct pool references with is_per_item_ttl flag, indexed by pool_id.
     pools: [Option<(PoolRef<'a>, bool)>; 4],
+    /// The raw location plus one of the first entry a check answered
+    /// [`Verdict::Unknown`] for, or 0.
+    unresolved: std::sync::atomic::AtomicU64,
+}
+
+impl CacheKeyVerifier<'_> {
+    /// The first location a check answered [`Verdict::Unknown`] for.
+    fn unresolved_location(&self) -> Option<Location> {
+        match self.unresolved.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            raw => Some(Location::new(raw - 1)),
+        }
+    }
 }
 
 impl KeyVerifier for CacheKeyVerifier<'_> {
@@ -2202,6 +2403,36 @@ impl KeyVerifier for CacheKeyVerifier<'_> {
             ))
         ))]
         let _ = ptr;
+    }
+
+    fn check(&self, key: &[u8], location: Location, allow_deleted: bool) -> Verdict {
+        let item_loc = ItemLocation::from_location(location);
+        let pool_id = item_loc.pool_id();
+        // SAFETY: as in `verify`.
+        if let Some((PoolRef::IoUring(pool), _)) =
+            unsafe { *self.pools.get_unchecked(pool_id as usize) }
+        {
+            let (_, segment_id, incarnation, offset) = item_loc.unpack(pool.layout());
+            let Some(meta) = pool.get_meta(segment_id) else {
+                return Verdict::Mismatch;
+            };
+            return meta.check_key_guarded(location, offset, key, allow_deleted, incarnation);
+        }
+        if self.verify(key, location, allow_deleted) {
+            Verdict::Match
+        } else {
+            Verdict::Mismatch
+        }
+    }
+
+    fn unresolved(&self, location: Location) {
+        let _ = self.unresolved.compare_exchange(
+            0,
+            location.as_raw() + 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        crate::key_memo::need(location);
     }
 
     #[inline(always)]
@@ -2513,7 +2744,7 @@ mod tests {
                 let _ = cache.set(format!("f{i}").as_bytes(), &filler, b"", ttl);
             }
             reservation.value_mut().fill(0xEE);
-            cache.commit_segment_set(reservation).expect("commit");
+            cache.commit_segment_set(&mut reservation).expect("commit");
 
             assert_eq!(
                 cache.get(b"big"),

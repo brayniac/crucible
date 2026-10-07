@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cache_core::KeyMemo` and `with_key_memo`: keys read from the io_uring
+  disk tier for the command in progress. Installed by the caller around a
+  synchronous attempt, it lets a `TieredCache` key operation that meets an
+  entry whose key is only on disk stop before changing anything (reads
+  answer absent, writes return `KeyUnresolved`), record the location as
+  `KeyMemo::unresolved`, and refuse every later operation in the command.
+  The caller reads the key (`Cache::key_read` gives the read and pins the
+  segment), records it with `KeyMemo::record`, and runs the command again.
+  A write stored before such an entry was met leaves
+  `KeyMemo::pending_resolve`, finished with `Cache::resolve_key`. With hashes
+  recorded at flush, as in every flush today, no check answers `Unknown`
 - `KeyVerifier::check`, returning `Verdict::{Match, Mismatch, Unknown}`,
   and `KeyVerifier::unresolved`. On `Unknown`, which a verifier returns
   when an entry's key must be read from disk, the hashtable stops the
@@ -21,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds, saturating at `u32::MAX`
 
 ### Changed
+- `Cache::commit_segment_set` and `TieredCache::commit_segment_set` take
+  `&mut SegmentReservation`. On `KeyUnresolved` nothing was indexed; commit
+  again with the same reservation, or cancel it with `cancel_segment_set`,
+  which then uncounts the item the commit published
+- `DiskReadParams` carries the entry's `location`
 - **`Hashtable::insert` and `insert_pinned` return `Displaced<G>`**, the
   entries the call unlinked, each with its `pin` guard, instead of an
   `Option` of one. Usually empty or one entry; more when concurrent inserts
@@ -67,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
+- `IoUringDiskLayer::prepare_read` pinned a segment without checking the
+  location's incarnation, so a stale location could read a later item's
+  bytes. It now checks under the pin and refuses
 - RESP APPEND on a key whose item was only on a committed io_uring disk
   segment replaced the value with the appended bytes. `TieredCache::append`
   and `prepend` reported the unreadable item as `KeyNotFound`, and APPEND

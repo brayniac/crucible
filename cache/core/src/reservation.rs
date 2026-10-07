@@ -128,15 +128,17 @@ impl SetReservation {
 /// socket.recv_exact(reservation.value_mut())?;
 ///
 /// // 4. Commit to finalize segment write and update hashtable
-/// cache.commit_segment_set(reservation)?;
+/// cache.commit_segment_set(&mut reservation)?;
 /// ```
 ///
 /// # Cancellation
 ///
 /// The reserved item is written deleted and stays deleted unless the
 /// reservation is committed, so dropping it (e.g., connection closed during
-/// receive) leaves nothing to clean up. Dropping it also releases its
-/// reference on the segment.
+/// receive) leaves nothing to clean up, unless a commit returned
+/// `KeyUnresolved`: that commit published the item, so cancel the
+/// reservation with `cancel_segment_set` rather than dropping it. Dropping
+/// it also releases its reference on the segment.
 pub struct SegmentReservation {
     /// Item location in the segment (pool_id, segment_id, offset).
     location: crate::ItemLocation,
@@ -152,6 +154,9 @@ pub struct SegmentReservation {
     item_size: u32,
     /// Whether this reservation has been committed.
     committed: bool,
+    /// Whether a commit published and counted the item. A commit that
+    /// returned `KeyUnresolved` leaves it published but not indexed.
+    finalized: bool,
     /// Holds a reference on the segment until the reservation is dropped,
     /// so the segment is not freed and reused while the value is received.
     _pin: crate::cache_trait::ValueRef,
@@ -166,6 +171,7 @@ impl std::fmt::Debug for SegmentReservation {
             .field("ttl", &self.ttl)
             .field("item_size", &self.item_size)
             .field("committed", &self.committed)
+            .field("finalized", &self.finalized)
             .finish_non_exhaustive()
     }
 }
@@ -200,6 +206,7 @@ impl SegmentReservation {
             ttl,
             item_size,
             committed: false,
+            finalized: false,
             _pin: pin,
         }
     }
@@ -261,6 +268,15 @@ impl SegmentReservation {
     #[inline]
     pub(crate) fn mark_committed(&mut self) {
         self.committed = true;
+    }
+
+    /// Whether a commit has published and counted the item.
+    pub fn is_finalized(&self) -> bool {
+        self.finalized
+    }
+
+    pub(crate) fn mark_finalized(&mut self) {
+        self.finalized = true;
     }
 }
 

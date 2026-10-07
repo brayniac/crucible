@@ -108,7 +108,10 @@ mod loom_oracle;
 
 // Phase 3 re-exports
 pub use hashtable::{Displaced, Hashtable, KeyVerifier, Verdict};
+
+pub mod key_memo;
 pub use hashtable_impl::{Hashbucket, MultiChoiceHashtable};
+pub use key_memo::{KeyMemo, with_key_memo};
 
 // Phase 4 - Pools
 mod hugepage;

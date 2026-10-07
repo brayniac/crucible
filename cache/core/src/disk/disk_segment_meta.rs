@@ -267,6 +267,118 @@ impl DiskSegmentMeta {
         }
     }
 
+    /// Check `key` at `offset` under a read guard, checking `incarnation`
+    /// first, as [`SegmentKeyVerify::verify_key_guarded`] does, with a third
+    /// answer: [`crate::Verdict::Unknown`] for an item whose key is only on
+    /// disk and is neither recorded nor in the installed
+    /// [`crate::key_memo::KeyMemo`]. `location` is the entry's location, the
+    /// memo's key.
+    pub fn check_key_guarded(
+        &self,
+        location: crate::Location,
+        offset: u32,
+        key: &[u8],
+        allow_deleted: bool,
+        incarnation: u8,
+    ) -> crate::Verdict {
+        if !self.try_acquire_read() {
+            return crate::Verdict::Mismatch;
+        }
+        let verdict = if self.incarnation() == incarnation {
+            self.check_key_at_offset(Some(location), offset, key, allow_deleted)
+        } else {
+            crate::Verdict::Mismatch
+        };
+        self.release_read();
+        verdict
+    }
+
+    /// Compare `key` with the item at `offset`.
+    ///
+    /// With the write buffer attached, the stored key is compared. After the
+    /// flush detached it, the key is only on disk:
+    /// - a key the installed key memo holds for `location` is compared;
+    /// - otherwise, with key hashes recorded, the hash is compared;
+    /// - otherwise, for an item the flush wrote, in a segment a key read can
+    ///   pin (readable, not condemned, not expired), the result is
+    ///   `Unknown`;
+    /// - anything else is `Mismatch`.
+    fn check_key_at_offset(
+        &self,
+        location: Option<crate::Location>,
+        offset: u32,
+        key: &[u8],
+        allow_deleted: bool,
+    ) -> crate::Verdict {
+        use crate::Verdict;
+
+        let Some(pin) = self.pin_write_buffer() else {
+            let state = self.state();
+            if !state.is_readable() {
+                return Verdict::Mismatch;
+            }
+            // A key read for this command is the answer, ahead of a hash: a
+            // GET whose read found another key under a matching hash runs
+            // again and must not match the same entry.
+            if let Some(answer) =
+                location.and_then(|location| crate::key_memo::answer(location, key))
+            {
+                return answer;
+            }
+            return match self.key_hash_matches(offset, key) {
+                Some(true) => Verdict::Match,
+                Some(false) => Verdict::Mismatch,
+                None => {
+                    let expire_at = self.expire_at();
+                    let expired = expire_at > 0 && crate::clock::now_unix_secs() >= expire_at;
+                    if state.is_condemned()
+                        || expired
+                        || offset >= self.flushed_len.load(Ordering::Acquire)
+                    {
+                        Verdict::Mismatch
+                    } else {
+                        Verdict::Unknown
+                    }
+                }
+            };
+        };
+        let data_ptr = pin.as_ptr();
+
+        if offset as usize + BasicHeader::SIZE > self.capacity as usize {
+            return Verdict::Mismatch;
+        }
+
+        let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
+
+        if !allow_deleted && header.is_deleted() {
+            return Verdict::Mismatch;
+        }
+
+        // The stored key must be the same LENGTH before its bytes are worth
+        // comparing. The bounds check below is computed from
+        // `header.key_len()` but the slice is built with the caller's
+        // `key.len()`, so without this the two can disagree: a longer caller
+        // key reads past the bound that was checked, and a shorter one
+        // compares against a prefix and reports a match for a key this
+        // segment does not hold. `SliceSegment` has always had this guard.
+        if header.key_len() as usize != key.len() {
+            return Verdict::Mismatch;
+        }
+
+        let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
+        let key_end = key_start + header.key_len() as usize;
+        if key_end > self.capacity as usize {
+            return Verdict::Mismatch;
+        }
+
+        let stored_key = unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key.len()) };
+        if stored_key == key {
+            Verdict::Match
+        } else {
+            Verdict::Mismatch
+        }
+    }
+
     /// Set the number of bytes the queued flush writes.
     pub fn set_flushed_len(&self, len: u32) {
         self.flushed_len.store(len, Ordering::Release);
@@ -582,44 +694,7 @@ impl SegmentKeyVerify for DiskSegmentMeta {
     }
 
     fn verify_key_at_offset(&self, offset: u32, key: &[u8], allow_deleted: bool) -> bool {
-        // Once the write buffer has been flushed and detached, the key is on
-        // disk; compare its hash, recorded before the detach. Without
-        // recorded hashes nothing matches. Whoever completes the async read
-        // still compares the actual key (see `LookupResult::DiskRead`).
-        let Some(pin) = self.pin_write_buffer() else {
-            return self.state().is_readable() && self.key_hash_matches(offset, key) == Some(true);
-        };
-        let data_ptr = pin.as_ptr();
-
-        if offset as usize + BasicHeader::SIZE > self.capacity as usize {
-            return false;
-        }
-
-        let header = unsafe { BasicHeader::from_ptr(data_ptr.add(offset as usize)) };
-
-        if !allow_deleted && header.is_deleted() {
-            return false;
-        }
-
-        // The stored key must be the same LENGTH before its bytes are worth
-        // comparing. The bounds check below is computed from
-        // `header.key_len()` but the slice is built with the caller's
-        // `key.len()`, so without this the two can disagree: a longer caller
-        // key reads past the bound that was checked, and a shorter one
-        // compares against a prefix and reports a match for a key this
-        // segment does not hold. `SliceSegment` has always had this guard.
-        if header.key_len() as usize != key.len() {
-            return false;
-        }
-
-        let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
-        let key_end = key_start + header.key_len() as usize;
-        if key_end > self.capacity as usize {
-            return false;
-        }
-
-        let stored_key = unsafe { std::slice::from_raw_parts(data_ptr.add(key_start), key.len()) };
-        stored_key == key
+        self.check_key_at_offset(None, offset, key, allow_deleted) == crate::Verdict::Match
     }
 
     fn verify_key_with_header(
