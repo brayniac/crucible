@@ -876,6 +876,12 @@ impl<H: Hashtable> TieredCache<H> {
         if let Some(e) = crate::key_memo::refusal() {
             return Err(e);
         }
+        if reservation.is_set_fallback() {
+            // A commit that found the segment evicted, and whose `set`
+            // returned `KeyUnresolved`: retry the `set`.
+            let value = reservation.value().to_vec();
+            return self.set(reservation.key(), &value, &[], reservation.ttl());
+        }
         let location = reservation.location();
         let item_size = reservation.item_size();
 
@@ -937,6 +943,7 @@ impl<H: Hashtable> TieredCache<H> {
             // `cancel_write_item` sets the deleted flag in any state;
             // `mark_deleted` refuses the states that lead here.
             layer.cancel_write_item(location);
+            reservation.mark_set_fallback();
             let value = reservation.value().to_vec();
             return self.set(reservation.key(), &value, &[], reservation.ttl());
         }

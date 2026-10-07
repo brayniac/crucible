@@ -182,6 +182,55 @@ pub struct PendingDiskReadInfo {
     pub key: Vec<u8>,
     /// Protocol context for building the response on completion.
     pub response_ctx: crate::disk_io::DiskReadResponseCtx,
+    /// The GET's request bytes. If the item read holds another key, the GET
+    /// runs again with that key recorded, and its lookup skips the entry.
+    pub command: Vec<u8>,
+}
+
+/// A command waiting on a disk read before it can finish.
+pub(crate) enum Suspended {
+    /// A complete command's request bytes. It met an entry whose key is only
+    /// on disk (`KeyMemo::unresolved`); its response was discarded, and it
+    /// runs again once that key is read.
+    Command(Vec<u8>),
+    /// A streamed SET whose commit returned `KeyUnresolved`. The reservation
+    /// is committed again once the key is read.
+    Commit {
+        reservation: SegmentReservation,
+        reply: CommitReply,
+    },
+    /// A stored write whose duplicate resolution is pending
+    /// (`KeyMemo::pending_resolve`). Its response is written; no further
+    /// command runs until `Cache::resolve_key` leaves nothing pending.
+    Resolve,
+}
+
+/// The response a streamed SET's commit writes.
+pub(crate) enum CommitReply {
+    Resp,
+    MemcacheAscii {
+        noreply: bool,
+    },
+    MemcacheBinary {
+        opcode: memcache_proto::binary::Opcode,
+        opaque: u32,
+    },
+}
+
+/// What [`Connection::finish_command`] did with a command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Finished {
+    Done,
+    Discarded,
+    Resolve,
+}
+
+/// Response lengths at the start of a command, so its response can be
+/// discarded if it suspends.
+#[derive(Clone, Copy)]
+struct Checkpoint {
+    write_len: usize,
+    queue_len: usize,
 }
 
 /// Per-connection state for the cache server.
@@ -214,6 +263,12 @@ pub struct Connection {
     /// The handler must submit an io_uring read and resume processing
     /// when it completes.
     pub(crate) pending_disk_read: Option<PendingDiskReadInfo>,
+    /// Keys read from disk for the command in progress. The handler installs
+    /// it with `cache_core::with_key_memo` around every call into
+    /// `process_from` and [`Connection::resume`].
+    pub(crate) key_memo: std::rc::Rc<cache_core::KeyMemo>,
+    /// A command waiting on a disk read; see [`Suspended`].
+    pub(crate) suspended: Option<Suspended>,
     /// Saved SET parameters awaiting eviction retry (async handler only).
     pub(crate) pending_retry: Option<PendingSetRetry>,
     /// Whether this connection should signal SET eviction failures for retry
@@ -243,6 +298,8 @@ impl Connection {
             streaming_state: StreamingState::None,
             allow_flush,
             pending_disk_read: None,
+            key_memo: std::rc::Rc::new(cache_core::KeyMemo::new()),
+            suspended: None,
             pending_retry: None,
             retry_on_eviction: false,
         }
@@ -264,7 +321,9 @@ impl Connection {
     /// or when a disk read is pending (pipeline stalling).
     #[inline]
     pub fn should_read(&self) -> bool {
-        self.pending_disk_read.is_none() && self.pending_write_len() <= Self::MAX_PENDING_WRITE
+        self.pending_disk_read.is_none()
+            && self.suspended.is_none()
+            && self.pending_write_len() <= Self::MAX_PENDING_WRITE
     }
 
     /// Get the amount of pending write data (send queue + write buffer).
@@ -289,11 +348,19 @@ impl Connection {
             Ok(()) => {
                 self.write_set_success_response();
                 self.pending_retry = None;
+                if self.key_memo.pending_resolve().is_some() {
+                    self.suspended = Some(Suspended::Resolve);
+                } else {
+                    self.key_memo.clear();
+                }
                 true
             }
-            Err(cache_core::CacheError::OutOfMemory | cache_core::CacheError::HashTableFull) => {
-                false
-            }
+            // The handler reads the key the memo names before retrying.
+            Err(
+                cache_core::CacheError::OutOfMemory
+                | cache_core::CacheError::HashTableFull
+                | cache_core::CacheError::KeyUnresolved(_),
+            ) => false,
             Err(e) => {
                 // Non-retryable error, give up
                 self.abandon_retry_with_error(e);
@@ -310,13 +377,15 @@ impl Connection {
         SET_ERRORS.increment();
         self.write_set_success_response();
         self.pending_retry = None;
+        self.key_memo.clear();
     }
 
     /// Abandon a pending SET retry due to a non-retryable error.
     /// Reports client errors back to the caller; silently drops for
     /// cache-internal errors.
-    fn abandon_retry_with_error(&mut self, error: cache_core::CacheError) {
+    pub(crate) fn abandon_retry_with_error(&mut self, error: cache_core::CacheError) {
         use crate::metrics::SET_ERRORS;
+        self.key_memo.clear();
         SET_ERRORS.increment();
         if error.is_client_error() {
             self.write_set_error_response(&error);
@@ -411,12 +480,235 @@ impl Connection {
         }
     }
 
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            write_len: self.write_buf.len(),
+            queue_len: self.send_queue.len(),
+        }
+    }
+
+    /// Finish a complete command, the first `consumed` bytes of `buf`, after
+    /// it ran, and consume its bytes:
+    ///
+    /// - [`Finished::Resolve`]: it stored a write whose duplicate resolution
+    ///   is pending. Its response and effects stay; the caller applies them
+    ///   and stops, and nothing else runs until the resolution ends.
+    /// - [`Finished::Discarded`]: it met an entry whose key is only on disk.
+    ///   Its response is discarded and its bytes kept, to run again once the
+    ///   key is read. No cache operation changed anything after that entry
+    ///   was met, and the operations before it change nothing either: every
+    ///   command makes at most one cache change, as its last operation. The
+    ///   caller discards its effects and stops.
+    /// - [`Finished::Done`]: the key memo is cleared for the next command.
+    fn finish_command(
+        &mut self,
+        buf: &mut dyn RecvBuf,
+        consumed: usize,
+        checkpoint: Checkpoint,
+    ) -> Finished {
+        if self.key_memo.pending_resolve().is_some() {
+            buf.consume(consumed);
+            self.suspended = Some(Suspended::Resolve);
+            return Finished::Resolve;
+        }
+        if self.key_memo.unresolved().is_some() {
+            // `execute_*` write only to `write_buf`, so the truncation below
+            // discards the whole response.
+            assert_eq!(
+                self.send_queue.len(),
+                checkpoint.queue_len,
+                "a command that suspends queued a send buffer"
+            );
+            self.write_buf.truncate(checkpoint.write_len);
+            let command = buf.as_slice()[..consumed].to_vec();
+            buf.consume(consumed);
+            self.suspended = Some(Suspended::Command(command));
+            return Finished::Discarded;
+        }
+        buf.consume(consumed);
+        self.key_memo.clear();
+        Finished::Done
+    }
+
+    /// Commit a streamed SET and write its response, or suspend it if the
+    /// commit must wait on a key read.
+    fn commit_streamed<C: Cache>(
+        &mut self,
+        cache: &C,
+        mut reservation: SegmentReservation,
+        reply: CommitReply,
+    ) {
+        match cache.commit_segment_set(&mut reservation) {
+            Err(CacheError::KeyUnresolved(_)) => {
+                self.suspended = Some(Suspended::Commit { reservation, reply });
+            }
+            result => {
+                drop(reservation);
+                self.write_commit_reply(&reply, result);
+                if self.key_memo.pending_resolve().is_some() {
+                    self.suspended = Some(Suspended::Resolve);
+                } else {
+                    self.key_memo.clear();
+                }
+            }
+        }
+    }
+
+    /// Run a suspended command once the key it waited on has been read.
+    /// The handler calls this with the key memo installed. It may suspend
+    /// again.
+    pub(crate) fn resume<C: Cache>(&mut self, cache: &C) {
+        match self.suspended.take() {
+            None => {}
+            Some(Suspended::Command(command)) => {
+                let mut buf = SliceRecvBuf::new(&command);
+                self.process_from(&mut buf, cache);
+            }
+            Some(Suspended::Commit { reservation, reply }) => {
+                self.commit_streamed(cache, reservation, reply);
+            }
+            Some(Suspended::Resolve) => {
+                if let Some((key, _)) = self.key_memo.pending_resolve() {
+                    cache.resolve_key(&key);
+                }
+                if self.key_memo.pending_resolve().is_some() {
+                    self.suspended = Some(Suspended::Resolve);
+                } else {
+                    self.key_memo.clear();
+                }
+            }
+        }
+    }
+
+    /// Fail the suspended command because the key it waits on could not be
+    /// read: answer it with an error, cancelling a pending commit's
+    /// reservation, and record nothing. A pending resolve already answered;
+    /// the duplicate it would have removed stays until a later write of the
+    /// key resolves it.
+    pub(crate) fn fail_suspended<C: Cache>(&mut self, cache: &C) {
+        match self.suspended.take() {
+            None | Some(Suspended::Resolve) => {}
+            Some(Suspended::Command(command)) => self.write_disk_read_error(&command),
+            Some(Suspended::Commit { reservation, reply }) => {
+                cache.cancel_segment_set(reservation);
+                self.write_commit_reply(&reply, Err(CacheError::SegmentNotAccessible));
+            }
+        }
+        self.key_memo.clear();
+    }
+
+    /// The error response for `command`, a request whose key read failed.
+    fn write_disk_read_error(&mut self, command: &[u8]) {
+        match self.protocol {
+            DetectedProtocol::Unknown => {}
+            DetectedProtocol::Resp => {
+                self.write_buf
+                    .extend_from_slice(b"-ERR disk read failed\r\n");
+            }
+            DetectedProtocol::MemcacheAscii => {
+                self.write_buf
+                    .extend_from_slice(b"SERVER_ERROR disk read failed\r\n");
+            }
+            DetectedProtocol::MemcacheBinary => {
+                use memcache_proto::binary::{BinaryResponse, Opcode, Status};
+                // The request header: opcode at byte 1, opaque at 12..16.
+                let Some(opcode) = command.get(1).copied().and_then(Opcode::from_u8) else {
+                    return;
+                };
+                let Some(opaque) = command.get(12..16) else {
+                    return;
+                };
+                let opaque = u32::from_be_bytes(opaque.try_into().unwrap());
+                let mut scratch = [0u8; 128];
+                let len =
+                    BinaryResponse::encode_error(&mut scratch, opcode, opaque, Status::TempFailure);
+                self.write_buf.extend_from_slice(&scratch[..len]);
+            }
+        }
+    }
+
+    /// Drop a suspended command when the connection closes, cancelling a
+    /// pending commit's reservation.
+    pub(crate) fn abandon_suspended<C: Cache>(&mut self, cache: &C) {
+        if let Some(Suspended::Commit { reservation, .. }) = self.suspended.take() {
+            cache.cancel_segment_set(reservation);
+        }
+        self.key_memo.clear();
+    }
+
+    /// The response for a streamed SET's commit.
+    fn write_commit_reply(&mut self, reply: &CommitReply, result: Result<(), CacheError>) {
+        // Counts SETS or SET_ERRORS for the streamed SET.
+        use crate::metrics::{SET_ERRORS, SETS};
+        if let Err(e) = &result {
+            SET_ERRORS.increment();
+            tracing::warn!(error = %e, "commit_segment_set failed");
+        } else {
+            SETS.increment();
+        }
+        match reply {
+            CommitReply::Resp => {
+                self.write_buf.extend_from_slice(if result.is_ok() {
+                    b"+OK\r\n".as_slice()
+                } else {
+                    b"-ERR Failed to store value\r\n".as_slice()
+                });
+            }
+            CommitReply::MemcacheAscii { noreply } => {
+                if !noreply {
+                    self.write_buf.extend_from_slice(if result.is_ok() {
+                        b"STORED\r\n".as_slice()
+                    } else {
+                        b"NOT_STORED\r\n".as_slice()
+                    });
+                }
+            }
+            CommitReply::MemcacheBinary { opcode, opaque } => {
+                use memcache_proto::binary::{BinaryResponse, Status};
+                if opcode.is_quiet() {
+                    return;
+                }
+                let response_len = if result.is_ok() {
+                    BinaryResponse::encode_stored(&mut [0u8; 32], *opcode, *opaque, 0)
+                } else {
+                    BinaryResponse::encode_error(
+                        &mut [0u8; 32],
+                        *opcode,
+                        *opaque,
+                        Status::ItemNotStored,
+                    )
+                };
+                let start = self.write_buf.len();
+                self.write_buf.resize(start + response_len, 0);
+                if result.is_ok() {
+                    BinaryResponse::encode_stored(
+                        &mut self.write_buf[start..],
+                        *opcode,
+                        *opaque,
+                        0,
+                    );
+                } else {
+                    BinaryResponse::encode_error(
+                        &mut self.write_buf[start..],
+                        *opcode,
+                        *opaque,
+                        Status::ItemNotStored,
+                    );
+                }
+            }
+        }
+    }
+
     /// Process all complete commands from the receive buffer.
     ///
     /// This is the zero-copy path - data is read directly from the driver's
     /// buffer without copying into a connection-owned buffer.
     #[inline]
     pub fn process_from<C: Cache>(&mut self, buf: &mut dyn RecvBuf, cache: &C) {
+        if self.suspended.is_some() || self.pending_disk_read.is_some() {
+            return;
+        }
+
         // Clear write buffer if all data has been sent and queue is empty
         if self.send_queue.is_empty() && self.write_pos >= self.write_buf.len() {
             self.write_buf.clear();
@@ -454,6 +746,10 @@ impl Connection {
             // This must be checked before we borrow data for parsing
             let len_before = buf.len();
             if self.continue_streaming_recv(buf, cache) {
+                // A commit waiting on a key read: nothing after it runs yet.
+                if self.suspended.is_some() {
+                    break;
+                }
                 if buf.len() == len_before {
                     // Streaming needs more data (e.g. trailing CRLF split across
                     // recv buffers). Break to return to the event loop.
@@ -476,6 +772,7 @@ impl Connection {
                         match cache.lookup(key) {
                             LookupResult::Hit(value_ref) => {
                                 HITS.increment();
+                                self.key_memo.clear();
                                 buf.consume(consumed);
                                 // Write RESP header: $<len>\r\n
                                 self.write_buf.extend_from_slice(b"$");
@@ -488,19 +785,22 @@ impl Connection {
                                 continue;
                             }
                             LookupResult::DiskRead(params) => {
-                                // Copied before `consume` releases the bytes it borrows.
+                                // Copied before `consume` releases the bytes they borrow.
                                 let key = key.to_vec();
+                                let command = data[..consumed].to_vec();
                                 buf.consume(consumed);
                                 // Stall pipeline: save params for handler to submit io_uring read
                                 self.pending_disk_read = Some(PendingDiskReadInfo {
                                     key,
                                     params,
                                     response_ctx: crate::disk_io::DiskReadResponseCtx::Resp,
+                                    command,
                                 });
                                 break;
                             }
                             LookupResult::Miss => {
                                 MISSES.increment();
+                                self.key_memo.clear();
                                 if self.resp_version == RespVersion::Resp3 {
                                     self.write_buf.extend_from_slice(b"_\r\n");
                                 } else {
@@ -512,19 +812,26 @@ impl Connection {
                         }
                     }
 
-                    if let Some(retry) = execute_resp(
+                    let checkpoint = self.checkpoint();
+                    let retry = execute_resp(
                         &cmd,
                         cache,
                         &mut self.write_buf,
                         &mut self.resp_version,
                         self.allow_flush,
                         self.retry_on_eviction,
-                    ) {
-                        buf.consume(consumed);
+                    );
+                    let finished = self.finish_command(buf, consumed, checkpoint);
+                    if finished == Finished::Discarded {
+                        break;
+                    }
+                    if let Some(retry) = retry {
                         self.pending_retry = Some(retry);
                         break;
                     }
-                    buf.consume(consumed);
+                    if finished == Finished::Resolve {
+                        break;
+                    }
                 }
                 Ok(ParseProgress::NeedValue {
                     header,
@@ -722,21 +1029,7 @@ impl Connection {
                 // Extract reservation and commit
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::ReceivingSegment { reservation, .. } = state {
-                    // The streaming path is where every large SET lands, and it
-                    // was counting neither outcome: `SETS` was incremented only
-                    // in `execute.rs`, which these never reach, and the commit
-                    // failure below only logged. See #145.
-                    use crate::metrics::{SET_ERRORS, SETS};
-                    let mut reservation = reservation;
-                    if let Err(e) = cache.commit_segment_set(&mut reservation) {
-                        SET_ERRORS.increment();
-                        tracing::warn!(error = %e, "commit_segment_set failed");
-                        self.write_buf
-                            .extend_from_slice(b"-ERR Failed to store value\r\n");
-                    } else {
-                        SETS.increment();
-                        self.write_buf.extend_from_slice(b"+OK\r\n");
-                    }
+                    self.commit_streamed(cache, reservation, CommitReply::Resp);
                 }
 
                 true
@@ -824,6 +1117,10 @@ impl Connection {
             // Check if we're in the middle of receiving a large value
             let len_before = buf.len();
             if self.continue_memcache_ascii_streaming_recv(buf, cache) {
+                // A commit waiting on a key read: nothing after it runs yet.
+                if self.suspended.is_some() {
+                    break;
+                }
                 if buf.len() == len_before {
                     break; // Streaming needs more data
                 }
@@ -865,6 +1162,7 @@ impl Connection {
                                         crate::disk_io::DiskReadResponseCtx::MemcacheAscii {
                                             key: key.to_vec(),
                                         },
+                                    command: data[..consumed].to_vec(),
                                 });
                                 buf.consume(consumed);
                                 break;
@@ -874,10 +1172,12 @@ impl Connection {
                                 self.write_buf.extend_from_slice(b"END\r\n");
                             }
                         }
+                        self.key_memo.clear();
                         buf.consume(consumed);
                         continue;
                     }
 
+                    let checkpoint = self.checkpoint();
                     let (close, retry) = execute_memcache(
                         &cmd,
                         cache,
@@ -885,12 +1185,18 @@ impl Connection {
                         self.allow_flush,
                         self.retry_on_eviction,
                     );
+                    let finished = self.finish_command(buf, consumed, checkpoint);
+                    if finished == Finished::Discarded {
+                        break;
+                    }
                     if close {
                         self.should_close = true;
                     }
-                    buf.consume(consumed);
                     if let Some(r) = retry {
                         self.pending_retry = Some(r);
+                        break;
+                    }
+                    if finished == Finished::Resolve {
                         break;
                     }
                 }
@@ -1059,24 +1365,13 @@ impl Connection {
                 let noreply_val = *noreply;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheAsciiSegment { reservation, .. } = state {
-                    // #145: the streaming commit counted neither outcome.
-                    use crate::metrics::{SET_ERRORS, SETS};
-                    let mut reservation = reservation;
-                    match cache.commit_segment_set(&mut reservation) {
-                        Ok(()) => {
-                            SETS.increment();
-                            if !noreply_val {
-                                self.write_buf.extend_from_slice(b"STORED\r\n");
-                            }
-                        }
-                        Err(e) => {
-                            SET_ERRORS.increment();
-                            tracing::warn!(error = %e, "commit_segment_set failed");
-                            if !noreply_val {
-                                self.write_buf.extend_from_slice(b"NOT_STORED\r\n");
-                            }
-                        }
-                    }
+                    self.commit_streamed(
+                        cache,
+                        reservation,
+                        CommitReply::MemcacheAscii {
+                            noreply: noreply_val,
+                        },
+                    );
                 }
 
                 true
@@ -1161,6 +1456,10 @@ impl Connection {
             // Check if we're in the middle of receiving a large value
             let len_before = buf.len();
             if self.continue_memcache_binary_streaming_recv(buf, cache) {
+                // A commit waiting on a key read: nothing after it runs yet.
+                if self.suspended.is_some() {
+                    break;
+                }
                 if buf.len() == len_before {
                     break; // Streaming needs more data
                 }
@@ -1252,6 +1551,7 @@ impl Connection {
                                                 opaque,
                                                 quiet: is_quiet,
                                             },
+                                        command: data[..consumed].to_vec(),
                                     });
                                     buf.consume(consumed);
                                     break;
@@ -1273,12 +1573,14 @@ impl Connection {
                                     }
                                 }
                             }
+                            self.key_memo.clear();
                             buf.consume(consumed);
                             continue;
                         }
                         _ => {}
                     }
 
+                    let checkpoint = self.checkpoint();
                     let (close, retry) = execute_memcache_binary(
                         &cmd,
                         cache,
@@ -1286,12 +1588,18 @@ impl Connection {
                         self.allow_flush,
                         self.retry_on_eviction,
                     );
+                    let finished = self.finish_command(buf, consumed, checkpoint);
+                    if finished == Finished::Discarded {
+                        break;
+                    }
                     if close {
                         self.should_close = true;
                     }
-                    buf.consume(consumed);
                     if let Some(r) = retry {
                         self.pending_retry = Some(r);
+                        break;
+                    }
+                    if finished == Finished::Resolve {
                         break;
                     }
                 }
@@ -1455,58 +1763,14 @@ impl Connection {
                 let opaque_val = *opaque;
                 let state = std::mem::replace(&mut self.streaming_state, StreamingState::None);
                 if let StreamingState::MemcacheBinarySegment { reservation, .. } = state {
-                    use memcache_proto::binary::BinaryResponse;
-                    // #145: the streaming commit counted neither outcome.
-                    use crate::metrics::{SET_ERRORS, SETS};
-                    let mut reservation = reservation;
-                    match cache.commit_segment_set(&mut reservation) {
-                        Ok(()) => {
-                            SETS.increment();
-                            if !opcode_val.is_quiet() {
-                                let response_len = BinaryResponse::encode_stored(
-                                    &mut [0u8; 32],
-                                    opcode_val,
-                                    opaque_val,
-                                    0,
-                                );
-                                let start = self.write_buf.len();
-                                self.write_buf.reserve(response_len);
-                                unsafe {
-                                    self.write_buf.set_len(start + response_len);
-                                }
-                                BinaryResponse::encode_stored(
-                                    &mut self.write_buf[start..],
-                                    opcode_val,
-                                    opaque_val,
-                                    0,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            SET_ERRORS.increment();
-                            tracing::warn!(error = %e, "commit_segment_set failed");
-                            if !opcode_val.is_quiet() {
-                                use memcache_proto::binary::Status;
-                                let response_len = BinaryResponse::encode_error(
-                                    &mut [0u8; 32],
-                                    opcode_val,
-                                    opaque_val,
-                                    Status::ItemNotStored,
-                                );
-                                let start = self.write_buf.len();
-                                self.write_buf.reserve(response_len);
-                                unsafe {
-                                    self.write_buf.set_len(start + response_len);
-                                }
-                                BinaryResponse::encode_error(
-                                    &mut self.write_buf[start..],
-                                    opcode_val,
-                                    opaque_val,
-                                    Status::ItemNotStored,
-                                );
-                            }
-                        }
-                    }
+                    self.commit_streamed(
+                        cache,
+                        reservation,
+                        CommitReply::MemcacheBinary {
+                            opcode: opcode_val,
+                            opaque: opaque_val,
+                        },
+                    );
                 }
 
                 true
@@ -2687,6 +2951,121 @@ mod tests {
         }
 
         fn flush(&self) {}
+    }
+
+    /// A cache whose `set` first reports the key at `unknown()` as only on
+    /// disk, as `TieredCache` does through its verifier, then stores.
+    struct UnknownOnceCache {
+        sets: std::sync::atomic::AtomicUsize,
+    }
+
+    fn unknown() -> cache_core::Location {
+        cache_core::Location::new(42)
+    }
+
+    impl Cache for UnknownOnceCache {
+        fn get(&self, _key: &[u8]) -> Option<cache_core::OwnedGuard> {
+            None
+        }
+
+        fn with_value<F, R>(&self, _key: &[u8], _f: F) -> Option<R>
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            None
+        }
+
+        fn get_value_ref(&self, _key: &[u8]) -> Option<cache_core::ValueRef> {
+            None
+        }
+
+        fn set(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), cache_core::CacheError> {
+            use std::sync::atomic::Ordering;
+            if self.sets.fetch_add(1, Ordering::Relaxed) == 0 {
+                cache_core::key_memo::need(unknown());
+                return Err(cache_core::CacheError::KeyUnresolved(unknown()));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn contains(&self, _key: &[u8]) -> bool {
+            false
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Run `process_from` with the connection's key memo installed, as the
+    /// handler does.
+    fn process_with_memo<C: Cache>(conn: &mut Connection, buf: &mut TestRecvBuf, cache: &C) {
+        let memo = conn.key_memo.clone();
+        cache_core::with_key_memo(&memo, || conn.process_from(buf, cache));
+    }
+
+    /// A command that meets a key only on disk suspends with nothing written
+    /// and its bytes consumed. After the key is read it runs again, and the
+    /// pipelined command after it runs only then, so responses stay in order.
+    fn assert_suspends_and_resumes_in_order(request: &[u8], expected: &[u8]) {
+        let cache = UnknownOnceCache {
+            sets: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut conn = Connection::default();
+        let mut buf = TestRecvBuf::new(request);
+
+        process_with_memo(&mut conn, &mut buf, &cache);
+        assert!(
+            matches!(conn.suspended, Some(Suspended::Command(_))),
+            "the command did not suspend"
+        );
+        assert!(
+            conn.pending_write_data().is_empty(),
+            "a suspended command left a response: {:?}",
+            String::from_utf8_lossy(conn.pending_write_data())
+        );
+        assert!(
+            !buf.is_empty(),
+            "the next command ran before the suspended one"
+        );
+        assert!(!conn.should_read());
+
+        conn.key_memo.record(unknown(), Some(b"another".to_vec()));
+        let memo = conn.key_memo.clone();
+        cache_core::with_key_memo(&memo, || conn.resume(&cache));
+        assert!(conn.suspended.is_none());
+        process_with_memo(&mut conn, &mut buf, &cache);
+
+        assert_eq!(
+            String::from_utf8_lossy(conn.pending_write_data()),
+            String::from_utf8_lossy(expected)
+        );
+        assert!(
+            conn.key_memo.is_empty(),
+            "the key memo outlived its command"
+        );
+    }
+
+    #[test]
+    fn resp_command_waiting_on_a_disk_key_suspends_and_resumes_in_order() {
+        let mut request = build_resp_set(b"a", b"1");
+        request.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
+        assert_suspends_and_resumes_in_order(&request, b"+OK\r\n$-1\r\n");
+    }
+
+    #[test]
+    fn memcache_command_waiting_on_a_disk_key_suspends_and_resumes_in_order() {
+        assert_suspends_and_resumes_in_order(
+            b"set a 0 0 1\r\n1\r\nget b\r\n",
+            b"STORED\r\nEND\r\n",
+        );
     }
 
     /// A cache whose only key cannot be read by `append`, as for an item
