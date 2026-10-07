@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds, saturating at `u32::MAX`
 
 ### Changed
+- **Key checks on flushed io_uring disk segments compare the real key, not
+  a RAM hash.** The per-segment table of key hashes recorded at flush
+  (12 bytes per item in RAM) is gone. A check on a flushed item answers
+  from the installed `KeyMemo`, or `Verdict::Unknown`: reads answer absent
+  (`lookup` answers `DiskRead` for that entry), writes return
+  `KeyUnresolved`, until the caller reads the key and records it. A caller
+  that installs no memo and does not read keys gets `KeyUnresolved` for
+  every write that meets a disk-resident entry with its key's tag. The
+  test hook `complete_flush_without_key_hashes` is removed;
+  `complete_flush` now does what it did
 - `Cache::commit_segment_set` and `TieredCache::commit_segment_set` take
   `&mut SegmentReservation`. On `KeyUnresolved` nothing was indexed; commit
   again with the same reservation, or cancel it with `cancel_segment_set`,

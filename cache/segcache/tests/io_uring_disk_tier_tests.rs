@@ -500,7 +500,7 @@ fn a_counter_on_committed_disk() -> (std::sync::Arc<SegCache>, String) {
 
     let key = (0..8000)
         .map(|i| format!("k:{i}"))
-        .find(|k| matches!(cache.lookup(k.as_bytes()), LookupResult::DiskRead(_)))
+        .find(|k| is_disk_read(&cache, k.as_bytes()))
         .expect("precondition: some item is on a committed disk segment");
     (cache, key)
 }
@@ -508,11 +508,10 @@ fn a_counter_on_committed_disk() -> (std::sync::Arc<SegCache>, String) {
 /// `increment` and `decrement` must return for an item on a committed disk
 /// segment, with an error rather than an answer from the wrong value.
 ///
-/// They read through the synchronous item path, which returns `None` for a
-/// committed io_uring segment -- that read has to go through the ring. Both
-/// treat `None` with the key still indexed as "transiently unreadable" and
-/// retry, and nothing changes between retries, so they spin forever. On a
-/// server that is a worker thread lost to one incr of a cold counter.
+/// The item's key is only on disk, so without a key read the operation
+/// cannot know whether the entry is this key's: it returns `KeyUnresolved`.
+/// A retry loop that read that as "transiently unreadable" would spin
+/// forever, since nothing changes between retries.
 ///
 /// `initial` is set, so a fix that read the item as absent would return 1 (a
 /// fresh counter) and fail too.
@@ -521,14 +520,17 @@ fn a_counter_on_committed_disk_does_not_hang() {
     for (name, op, want) in [("increment", true, 11u64), ("decrement", false, 9u64)] {
         let (cache, key) = a_counter_on_committed_disk();
 
-        // The state the retry loop cannot leave: the synchronous read finds
+        // The state a retry loop cannot leave: the synchronous read finds
         // nothing, and the hashtable still indexes the key. Checked directly,
         // so a timeout below is this and not some other stall.
         assert!(
             cache.get(key.as_bytes()).is_none(),
             "{key} is readable synchronously"
         );
-        assert!(cache.contains(key.as_bytes()), "{key} is no longer indexed");
+        assert!(
+            is_disk_read(&cache, key.as_bytes()),
+            "{key} is no longer indexed"
+        );
 
         let (tx, rx) = std::sync::mpsc::channel();
         {
@@ -544,15 +546,13 @@ fn a_counter_on_committed_disk_does_not_hang() {
             });
         }
 
-        // An error, not a guess: the read has to go through the ring, which a
-        // synchronous incr cannot drive. Promoting the counter back into RAM
-        // (the async path GET already takes) would make this `Ok(want)`.
+        // An error, not a guess: the key has to be read through the ring,
+        // which a synchronous incr cannot drive.
         match rx.recv_timeout(Duration::from_secs(5)) {
             Err(_) => panic!("{name} on {key} did not return within 5s"),
-            Ok(got) => assert_eq!(
-                got,
-                Err(cache_core::CacheError::SegmentNotAccessible),
-                "{name} on {key} (the value is 10, so success would be {want})"
+            Ok(got) => assert!(
+                matches!(got, Err(cache_core::CacheError::KeyUnresolved(_))),
+                "{name} on {key} returned {got:?} (the value is 10, so success would be {want})"
             ),
         }
     }
@@ -561,9 +561,9 @@ fn a_counter_on_committed_disk_does_not_hang() {
 /// `append` and `prepend` on an item that is only on a committed disk
 /// segment return an error and leave the item alone.
 ///
-/// The synchronous read returns nothing for such an item. Reported as
-/// `KeyNotFound`, RESP APPEND treated the key as deleted and stored the
-/// appended bytes as the whole value.
+/// The item's key is only on disk, so they return `KeyUnresolved` until it
+/// is read. Reported as `KeyNotFound`, RESP APPEND treated the key as
+/// deleted and stored the appended bytes as the whole value.
 #[test]
 fn append_on_committed_disk_does_not_replace_the_value() {
     for (name, op) in [("append", true), ("prepend", false)] {
@@ -573,22 +573,21 @@ fn append_on_committed_disk_does_not_replace_the_value() {
         } else {
             cache.prepend(key.as_bytes(), b"head")
         };
-        assert_eq!(
-            r,
-            Err(cache_core::CacheError::SegmentNotAccessible),
-            "{name} on {key}"
+        assert!(
+            matches!(r, Err(cache_core::CacheError::KeyUnresolved(_))),
+            "{name} on {key} returned {r:?}"
         );
         assert!(
-            matches!(cache.lookup(key.as_bytes()), LookupResult::DiskRead(_)),
+            is_disk_read(&cache, key.as_bytes()),
             "{name} on {key} replaced the item on disk"
         );
     }
 }
 
-/// A cache whose demoted items sit on committed disk segments without
-/// recorded key hashes, so every key check on them must read the key, and
-/// the bytes each flush would have written to disk.
-fn committed_unhashed() -> (SegCache, Vec<u8>) {
+/// A cache whose demoted items sit on committed disk segments, so every key
+/// check on them must read the key, and the bytes each flush would have
+/// written to disk.
+fn committed_to_disk() -> (SegCache, Vec<u8>) {
     use segcache::CacheLayer;
 
     let segment_size = 1024 * 1024; // as `create_small_disk_cache`
@@ -611,7 +610,7 @@ fn committed_unhashed() -> (SegCache, Vec<u8>) {
         let src = unsafe { std::slice::from_raw_parts(req.buffer_ptr, req.data_len as usize) };
         let offset = req.disk_offset as usize;
         disk_data[offset..offset + src.len()].copy_from_slice(src);
-        disk.complete_flush_without_key_hashes(req.segment_id);
+        disk.complete_flush(req.segment_id);
     }
     (cache, disk_data)
 }
@@ -710,7 +709,7 @@ fn a_key_only_on_disk(cache: &SegCache, disk_data: &[u8]) -> String {
 /// the disk entry: the key has one entry, so a DELETE removes it for good.
 #[test]
 fn set_over_a_disk_only_key_reads_it_and_replaces_its_entry() {
-    let (cache, disk_data) = committed_unhashed();
+    let (cache, disk_data) = committed_to_disk();
     let key = a_key_only_on_disk(&cache, &disk_data);
     let memo = cache_core::KeyMemo::new();
 
@@ -739,7 +738,7 @@ fn set_over_a_disk_only_key_reads_it_and_replaces_its_entry() {
 /// read the key and answer as for a key in RAM.
 #[test]
 fn keyed_operations_on_a_disk_only_key_read_it() {
-    let (cache, disk_data) = committed_unhashed();
+    let (cache, disk_data) = committed_to_disk();
     let memo = cache_core::KeyMemo::new();
     let ttl = Duration::from_secs(60);
 
@@ -776,7 +775,7 @@ fn keyed_operations_on_a_disk_only_key_read_it() {
 /// reservation, and the item is counted once.
 #[test]
 fn a_streamed_commit_retried_after_a_key_read_counts_its_item_once() {
-    let (cache, disk_data) = committed_unhashed();
+    let (cache, disk_data) = committed_to_disk();
     let key = a_key_only_on_disk(&cache, &disk_data);
     let memo = cache_core::KeyMemo::new();
     let before = cache.internal_stats().unwrap();
@@ -808,7 +807,7 @@ fn a_streamed_commit_retried_after_a_key_read_counts_its_item_once() {
 /// `contains` then `set` would.
 #[test]
 fn a_write_after_an_unknown_key_in_the_same_command_refuses() {
-    let (cache, disk_data) = committed_unhashed();
+    let (cache, disk_data) = committed_to_disk();
     let key = a_key_only_on_disk(&cache, &disk_data);
     let memo = cache_core::KeyMemo::new();
 
@@ -833,10 +832,10 @@ fn a_write_after_an_unknown_key_in_the_same_command_refuses() {
     );
 }
 
-/// A key recorded in the memo is the answer for its location, ahead of a
-/// recorded key hash.
+/// A key recorded in the memo is the answer for its location: an entry
+/// recorded as holding another key is not read again.
 #[test]
-fn a_recorded_key_overrides_the_recorded_hash() {
+fn a_recorded_key_answers_its_location() {
     let (cache, key) = a_counter_on_committed_disk();
     let memo = cache_core::KeyMemo::new();
     let location = cache_core::with_key_memo(&memo, || match cache.lookup(key.as_bytes()) {
@@ -850,7 +849,7 @@ fn a_recorded_key_overrides_the_recorded_hash() {
     let lookup = cache_core::with_key_memo(&memo, || is_disk_read(&cache, key.as_bytes()));
     assert!(
         !lookup,
-        "the hash matched an entry the memo says holds another key"
+        "the lookup read an entry the memo says holds another key"
     );
 }
 
@@ -858,7 +857,7 @@ fn a_recorded_key_overrides_the_recorded_hash() {
 /// the item that commit published.
 #[test]
 fn cancelling_an_unresolved_commit_uncounts_its_item() {
-    let (cache, disk_data) = committed_unhashed();
+    let (cache, disk_data) = committed_to_disk();
     let key = a_key_only_on_disk(&cache, &disk_data);
     let memo = cache_core::KeyMemo::new();
     let before = cache.internal_stats().unwrap().resident_items;

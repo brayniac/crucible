@@ -101,48 +101,9 @@ pub struct DiskSegmentMeta {
     buffer_pool:
         std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<crate::disk::AlignedBufferPool>>>,
 
-    /// The key hash of every item in the segment, recorded by
-    /// [`Self::record_key_hashes`] before the write buffer is detached, or
-    /// null. Once the buffer is gone, keys are compared by these hashes.
-    ///
-    /// Published with `Release` before the detach and read with `Acquire`
-    /// under a segment reference. Set only by `record_key_hashes` and freed
-    /// by `attach_write_buffer`, on a segment its caller has just reserved,
-    /// which no reader holds. That free does not wait for readers, so
-    /// `IoUringDiskLayer::reset`'s precondition (no operation in flight)
-    /// covers these hashes too.
-    key_hashes: std::sync::atomic::AtomicPtr<KeyHashes>,
-
     /// The number of bytes the flush writes, set when the segment is sealed
-    /// for flushing. `record_key_hashes` records only the items within it.
+    /// for flushing. An item at or past it is not on disk.
     flushed_len: AtomicU32,
-}
-
-impl Drop for DiskSegmentMeta {
-    fn drop(&mut self) {
-        self.clear_key_hashes();
-    }
-}
-
-/// The items of a flushed segment, as parallel arrays sorted by offset.
-struct KeyHashes {
-    offsets: Box<[u32]>,
-    hashes: Box<[u64]>,
-}
-
-impl KeyHashes {
-    /// The recorded hash of the item at `offset`, if one starts there.
-    fn hash_at(&self, offset: u32) -> Option<u64> {
-        let index = self.offsets.binary_search(&offset).ok()?;
-        Some(self.hashes[index])
-    }
-}
-
-/// The hash a flushed segment's keys are compared by: 64 bits, so two keys
-/// sharing a hashtable tag are told apart except with probability 2^-64.
-fn key_hash(key: &[u8]) -> u64 {
-    static STATE: std::sync::OnceLock<ahash::RandomState> = std::sync::OnceLock::new();
-    STATE.get_or_init(ahash::RandomState::new).hash_one(key)
 }
 
 /// The write-buffer pin word.
@@ -262,7 +223,6 @@ impl DiskSegmentMeta {
             buffer_data: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             buffer_pins: AtomicU32::new(0),
             buffer_pool: std::sync::OnceLock::new(),
-            key_hashes: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             flushed_len: AtomicU32::new(0),
         }
     }
@@ -297,11 +257,10 @@ impl DiskSegmentMeta {
     ///
     /// With the write buffer attached, the stored key is compared. After the
     /// flush detached it, the key is only on disk:
-    /// - a key the installed key memo holds for `location` is compared;
-    /// - otherwise, with key hashes recorded, the hash is compared;
-    /// - otherwise, for an item the flush wrote, in a segment a key read can
-    ///   pin (readable, not condemned, not expired), the result is
-    ///   `Unknown`;
+    /// - for an item the flush wrote, in a segment a key read can pin
+    ///   (readable, not condemned, not expired), the key the installed key
+    ///   memo holds for `location` is compared, and without one the result
+    ///   is `Unknown`;
     /// - anything else is `Mismatch`.
     fn check_key_at_offset(
         &self,
@@ -313,34 +272,22 @@ impl DiskSegmentMeta {
         use crate::Verdict;
 
         let Some(pin) = self.pin_write_buffer() else {
+            // The key is only on disk. An item a key read could not reach --
+            // in a segment that is not readable, condemned or expired, or
+            // past what the flush wrote -- holds no key a lookup may use.
             let state = self.state();
-            if !state.is_readable() {
+            let expire_at = self.expire_at();
+            let expired = expire_at > 0 && crate::clock::now_unix_secs() >= expire_at;
+            if !state.is_readable()
+                || state.is_condemned()
+                || expired
+                || offset >= self.flushed_len.load(Ordering::Acquire)
+            {
                 return Verdict::Mismatch;
             }
-            // A key read for this command is the answer, ahead of a hash: a
-            // GET whose read found another key under a matching hash runs
-            // again and must not match the same entry.
-            if let Some(answer) =
-                location.and_then(|location| crate::key_memo::answer(location, key))
-            {
-                return answer;
-            }
-            return match self.key_hash_matches(offset, key) {
-                Some(true) => Verdict::Match,
-                Some(false) => Verdict::Mismatch,
-                None => {
-                    let expire_at = self.expire_at();
-                    let expired = expire_at > 0 && crate::clock::now_unix_secs() >= expire_at;
-                    if state.is_condemned()
-                        || expired
-                        || offset >= self.flushed_len.load(Ordering::Acquire)
-                    {
-                        Verdict::Mismatch
-                    } else {
-                        Verdict::Unknown
-                    }
-                }
-            };
+            return location
+                .and_then(|location| crate::key_memo::answer(location, key))
+                .unwrap_or(Verdict::Unknown);
         };
         let data_ptr = pin.as_ptr();
 
@@ -384,90 +331,6 @@ impl DiskSegmentMeta {
         self.flushed_len.store(len, Ordering::Release);
     }
 
-    /// Record the hash of every flushed item's key, for key checks once the
-    /// write buffer is detached. Called with the flush's buffer pin held,
-    /// after the flush completes and before the buffer is detached.
-    ///
-    /// Only items within the flushed length are recorded: an item appended
-    /// after the segment was sealed is not on disk.
-    pub fn record_key_hashes(&self) {
-        let Some(pin) = self.pin_write_buffer() else {
-            return;
-        };
-        let data = pin.as_ptr();
-        let end = self
-            .flushed_len
-            .load(Ordering::Acquire)
-            .min(self.write_offset());
-        let mut offsets = Vec::new();
-        let mut hashes = Vec::new();
-        let mut offset = 0u32;
-        while offset < end && offset as usize + BasicHeader::SIZE <= self.capacity as usize {
-            // SAFETY: the pin keeps the buffer attached, and `offset` is in
-            // bounds. An append can still be in progress past `end`, by a
-            // writer that took the segment while it was Live; the items
-            // within `end` were complete when the flush was queued.
-            let Some(header) = (unsafe { BasicHeader::try_from_ptr(data.add(offset as usize)) })
-            else {
-                break;
-            };
-            let key_start = offset as usize + BasicHeader::SIZE + header.optional_len() as usize;
-            let key_end = key_start + header.key_len() as usize;
-            if key_end > self.capacity as usize {
-                break;
-            }
-            // SAFETY: `key_start..key_end` is in bounds of the buffer.
-            let key =
-                unsafe { std::slice::from_raw_parts(data.add(key_start), key_end - key_start) };
-            offsets.push(offset);
-            hashes.push(key_hash(key));
-            let stride = self.item_stride(header.padded_size());
-            let Some(next) = offset.checked_add(stride).filter(|&next| next > offset) else {
-                break;
-            };
-            offset = next;
-        }
-        let recorded = Box::into_raw(Box::new(KeyHashes {
-            offsets: offsets.into_boxed_slice(),
-            hashes: hashes.into_boxed_slice(),
-        }));
-        let old = self
-            .key_hashes
-            .swap(recorded, std::sync::atomic::Ordering::AcqRel);
-        // `attach_write_buffer` cleared the previous incarnation's hashes, and
-        // a detached buffer cannot be pinned, so this runs once per attach.
-        debug_assert!(
-            old.is_null(),
-            "segment {} recorded key hashes twice in one incarnation",
-            self.id
-        );
-    }
-
-    /// Whether the item at `offset` was recorded with `key`'s hash. `None`
-    /// if no hashes were recorded.
-    fn key_hash_matches(&self, offset: u32, key: &[u8]) -> Option<bool> {
-        let recorded = self.key_hashes.load(std::sync::atomic::Ordering::Acquire);
-        if recorded.is_null() {
-            return None;
-        }
-        // SAFETY: the caller holds a segment reference, so the segment is not
-        // reserved again and `attach_write_buffer` cannot free this value.
-        let recorded = unsafe { &*recorded };
-        Some(recorded.hash_at(offset) == Some(key_hash(key)))
-    }
-
-    /// Free the recorded hashes. The caller guarantees no reader holds them.
-    fn clear_key_hashes(&self) {
-        let old = self
-            .key_hashes
-            .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
-        if !old.is_null() {
-            // SAFETY: allocated by `record_key_hashes`; the caller guarantees
-            // no reader holds it.
-            drop(unsafe { Box::from_raw(old) });
-        }
-    }
-
     /// Get the byte offset of this segment on the disk device/file.
     #[inline]
     pub fn disk_offset(&self) -> u64 {
@@ -493,10 +356,6 @@ impl DiskSegmentMeta {
 
     /// Attach a write buffer to a segment the caller has just reserved.
     pub fn attach_write_buffer(&self, buf: AlignedBuffer) {
-        // Free the previous incarnation's hashes. No reader holds a reference
-        // on a segment that was free (see `IoUringDiskLayer::reset`'s
-        // precondition).
-        self.clear_key_hashes();
         self.flushed_len.store(0, Ordering::Relaxed);
         let data = buf.as_ptr() as *mut u8;
         // SAFETY: the segment was just reserved, so no buffer is attached
@@ -1458,11 +1317,13 @@ mod tests {
     }
 
     /// After the write buffer is detached, a key check at a flushed item's
-    /// offset matches that item's key and no other, by the hashes recorded
-    /// before the detach. An item appended after the flush was queued
-    /// matches nothing.
+    /// offset is `Unknown` until the key read there is in the installed key
+    /// memo, and then matches that key and no other. An item appended after
+    /// the flush was queued matches nothing.
     #[test]
-    fn a_flushed_segment_matches_only_the_recorded_key() {
+    fn a_flushed_segment_answers_keys_from_the_key_memo() {
+        use crate::{KeyMemo, Location, Verdict, with_key_memo};
+
         let (meta, _pool, _injector) = segment_with_alignment(4096, 8);
         assert!(meta.try_reserve());
         assert!(meta.cas_metadata(State::Reserved, State::Live, None, None));
@@ -1472,24 +1333,27 @@ mod tests {
         // Appended after the flush was queued, so not on disk.
         let late = meta.append_item(b"late", b"3", &[]).expect("append");
 
-        meta.record_key_hashes();
         meta.detach_write_buffer();
         assert!(!meta.has_write_buffer());
 
-        assert!(meta.verify_key_at_offset(alpha, b"alpha", false));
-        assert!(meta.verify_key_at_offset(beta, b"beta", false));
+        let (at_alpha, at_beta, at_late) = (Location::new(1), Location::new(2), Location::new(3));
+        let check = |location, offset, key: &[u8]| {
+            meta.check_key_at_offset(Some(location), offset, key, false)
+        };
+        assert_eq!(check(at_alpha, alpha, b"alpha"), Verdict::Unknown);
         assert!(
-            !meta.verify_key_at_offset(alpha, b"beta", false),
-            "another key matched a flushed item"
+            !meta.verify_key_at_offset(alpha, b"alpha", false),
+            "a key matched without being read"
         );
-        assert!(
-            !meta.verify_key_at_offset(alpha + 8, b"alpha", false),
-            "a key matched at an offset where no item starts"
-        );
-        assert!(
-            !meta.verify_key_at_offset(late, b"late", false),
-            "an item past the flushed length matched"
-        );
+        assert_eq!(check(at_late, late, b"late"), Verdict::Mismatch);
+
+        let memo = KeyMemo::new();
+        memo.record(at_alpha, Some(b"alpha".to_vec()));
+        with_key_memo(&memo, || {
+            assert_eq!(check(at_alpha, alpha, b"alpha"), Verdict::Match);
+            assert_eq!(check(at_alpha, alpha, b"beta"), Verdict::Mismatch);
+            assert_eq!(check(at_beta, beta, b"beta"), Verdict::Unknown);
+        });
     }
 
     /// Memory-style 8-byte alignment must be unaffected.

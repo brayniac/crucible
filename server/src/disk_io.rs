@@ -82,12 +82,10 @@ pub(crate) fn value_from_disk_read<'a>(
 /// returned. A deleted item, one with an invalid header, one that does not
 /// fit in `buf`, or one stored under a different key is a miss.
 ///
-/// The key check compares the bytes the index could only compare by hash. A
-/// committed disk segment's keys are only on disk, so the hashtable matched
-/// this item by its tag and a 64-bit key hash recorded at flush
-/// (`DiskSegmentMeta::record_key_hashes`). Another key's item still reaches
-/// here on a hash collision, or when the disk bytes differ from the buffer
-/// that was hashed. Serving it would answer with another key's value.
+/// The key check is the only comparison of the key. A committed disk
+/// segment's keys are only on disk, so the hashtable matched this item by
+/// its 12-bit tag alone; another key's item reaches here whenever tags
+/// collide. Serving it would answer with another key's value.
 pub(crate) fn value_range_from_disk_read(
     buf: &[u8],
     item_offset: usize,

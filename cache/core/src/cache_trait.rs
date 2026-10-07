@@ -918,8 +918,8 @@ pub enum LookupResult {
     /// 4. Call [`Cache::release_disk_read`] when done with the bytes
     ///
     /// The key check in step 3 is required. A committed segment's keys are
-    /// only on disk, so the hashtable matched this entry by its tag, and a
-    /// key hash if one was recorded at flush; the item can hold another key.
+    /// only on disk, so the hashtable matched this entry by its tag alone;
+    /// the item can hold another key.
     /// If it does, the requested key can still be in another entry. With a
     /// [`crate::KeyMemo`] installed, record the key read at
     /// [`crate::disk::DiskReadParams::location`] and look up again: the
