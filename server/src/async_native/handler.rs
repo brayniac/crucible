@@ -543,6 +543,9 @@ async fn resume_suspended<'c, C: Cache>(
     connection: &mut Connection,
     key_pins: &mut Vec<DiskReadRef<'c, C>>,
 ) {
+    // Whether the last round read no key: running a command again twice in
+    // a row with nothing new recorded would not make progress.
+    let mut nothing_new = false;
     while connection.suspended.is_some() && connection.pending_disk_read.is_none() {
         // A suspended command waits on `unresolved`; a pending resolve on the
         // location its resolution met.
@@ -562,15 +565,17 @@ async fn resume_suspended<'c, C: Cache>(
                     connection.fail_suspended(cache);
                     return;
                 }
+                nothing_new = false;
             }
-            // A suspended command always names the key it waits on; running
-            // it again with nothing new to read would not make progress.
-            None if !matches!(connection.suspended, Some(Suspended::Resolve)) => {
-                debug_assert!(false, "a command suspended without an unresolved key");
+            // A GET whose item read found another key has recorded it and
+            // runs once more with nothing to read. A command that suspends
+            // again without naming a key would not make progress.
+            None if nothing_new && !matches!(connection.suspended, Some(Suspended::Resolve)) => {
+                debug_assert!(false, "a command suspended again without an unresolved key");
                 connection.fail_suspended(cache);
                 return;
             }
-            None => {}
+            None => nothing_new = true,
         }
         let key_memo = connection.key_memo.clone();
         cache_core::with_key_memo(&key_memo, || connection.resume(cache));
