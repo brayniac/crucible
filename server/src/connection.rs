@@ -727,7 +727,8 @@ impl Connection {
                     // in `execute.rs`, which these never reach, and the commit
                     // failure below only logged. See #145.
                     use crate::metrics::{SET_ERRORS, SETS};
-                    if let Err(e) = cache.commit_segment_set(reservation) {
+                    let mut reservation = reservation;
+                    if let Err(e) = cache.commit_segment_set(&mut reservation) {
                         SET_ERRORS.increment();
                         tracing::warn!(error = %e, "commit_segment_set failed");
                         self.write_buf
@@ -1060,7 +1061,8 @@ impl Connection {
                 if let StreamingState::MemcacheAsciiSegment { reservation, .. } = state {
                     // #145: the streaming commit counted neither outcome.
                     use crate::metrics::{SET_ERRORS, SETS};
-                    match cache.commit_segment_set(reservation) {
+                    let mut reservation = reservation;
+                    match cache.commit_segment_set(&mut reservation) {
                         Ok(()) => {
                             SETS.increment();
                             if !noreply_val {
@@ -1456,7 +1458,8 @@ impl Connection {
                     use memcache_proto::binary::BinaryResponse;
                     // #145: the streaming commit counted neither outcome.
                     use crate::metrics::{SET_ERRORS, SETS};
-                    match cache.commit_segment_set(reservation) {
+                    let mut reservation = reservation;
+                    match cache.commit_segment_set(&mut reservation) {
                         Ok(()) => {
                             SETS.increment();
                             if !opcode_val.is_quiet() {

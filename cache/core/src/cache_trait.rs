@@ -477,7 +477,7 @@ pub trait Cache: Send + Sync + 'static {
     /// ```ignore
     /// let mut reservation = cache.begin_segment_set(key, value_len, ttl)?;
     /// socket.recv_exact(reservation.value_mut())?;
-    /// cache.commit_segment_set(reservation)?;
+    /// cache.commit_segment_set(&mut reservation)?;
     /// ```
     fn begin_segment_set(
         &self,
@@ -492,12 +492,17 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// Finalizes the segment write and updates the hashtable.
     ///
+    /// On `Err(CacheError::KeyUnresolved(location))` nothing was indexed:
+    /// read the key at `location` (see [`Cache::key_read`]) and call this
+    /// again with the same reservation, or cancel it with
+    /// [`Cache::cancel_segment_set`]. On any other result, drop it.
+    ///
     /// # Default Implementation
     ///
     /// Returns `CacheError::Unsupported` - only TieredCache supports this.
     fn commit_segment_set(
         &self,
-        _reservation: crate::SegmentReservation,
+        _reservation: &mut crate::SegmentReservation,
     ) -> Result<(), CacheError> {
         Err(CacheError::Unsupported)
     }
@@ -742,6 +747,33 @@ pub trait Cache: Send + Sync + 'static {
     /// No-op — only caches with an io_uring disk tier need this.
     fn release_disk_read(&self, _segment_id: u32, _pool_id: u8) {}
 
+    /// Where to read the key of the entry at `location`, which an operation
+    /// reported with `CacheError::KeyUnresolved` or through
+    /// [`crate::KeyMemo::unresolved`], with its segment pinned for the read.
+    /// Hold the pin until the command that needed the key finishes and
+    /// [`crate::KeyMemo::clear`] drops the key, then release it with
+    /// [`Cache::release_disk_read`]: while it is held the segment cannot be
+    /// reused, so the recorded key stays the key at `location`.
+    ///
+    /// `None` if the segment cannot be pinned for a read; record the entry
+    /// as not holding the key with [`crate::KeyMemo::record`].
+    ///
+    /// # Default Implementation
+    ///
+    /// `None` — only caches with an io_uring disk tier report unresolved keys.
+    fn key_read(&self, _location: crate::Location) -> Option<crate::disk::DiskReadParams> {
+        None
+    }
+
+    /// Finish the duplicate resolution that a write left pending in the
+    /// installed [`crate::KeyMemo`] for `key`; see
+    /// [`crate::KeyMemo::pending_resolve`].
+    ///
+    /// # Default Implementation
+    ///
+    /// No-op — only caches with an io_uring disk tier leave one pending.
+    fn resolve_key(&self, _key: &[u8]) {}
+
     /// Look up a key, returning either an immediate hit or disk read params.
     ///
     /// For items in RAM (or in a disk segment's write buffer), returns
@@ -879,16 +911,20 @@ pub enum LookupResult {
     ///
     /// The caller should:
     /// 1. Allocate a read buffer
-    /// 2. Submit an io_uring read using the provided parameters
-    /// 3. Parse the item from the read buffer on completion, and **compare
-    ///    its key with the requested one**, answering a miss if they differ
-    /// 4. Call `release_read()` on the disk layer when done
+    /// 2. Submit an io_uring read using the provided parameters; the read
+    ///    covers the item's header and key
+    /// 3. Parse the item from the read buffer on completion and compare its
+    ///    key with the requested one
+    /// 4. Call [`Cache::release_disk_read`] when done with the bytes
     ///
-    /// Step 3's key check is required. A committed segment's keys are only
-    /// on disk, so the hashtable matched this item by its tag and a 64-bit
-    /// key hash recorded at flush. The item can still belong to a different
-    /// key on a hash collision, or if the disk bytes differ from the buffer
-    /// that was hashed (a flush that failed after its retries).
+    /// The key check in step 3 is required. A committed segment's keys are
+    /// only on disk, so the hashtable matched this entry by its tag, and a
+    /// key hash if one was recorded at flush; the item can hold another key.
+    /// If it does, the requested key can still be in another entry. With a
+    /// [`crate::KeyMemo`] installed, record the key read at
+    /// [`crate::disk::DiskReadParams::location`] and look up again: the
+    /// lookup then answers that entry from the memo and moves on. Without
+    /// one, answer a miss.
     DiskRead(crate::disk::DiskReadParams),
     /// Item not found in any layer.
     Miss,

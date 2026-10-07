@@ -968,6 +968,14 @@ impl Cache for SegCache {
         self.inner.release_disk_read(segment_id, pool_id);
     }
 
+    fn key_read(&self, location: cache_core::Location) -> Option<cache_core::DiskReadParams> {
+        self.inner.key_read(location)
+    }
+
+    fn resolve_key(&self, key: &[u8]) {
+        self.inner.resolve_key(key);
+    }
+
     fn add(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError> {
         let ttl = ttl.unwrap_or(DEFAULT_TTL);
         self.inner.add(key, value, b"", ttl)
@@ -990,7 +998,7 @@ impl Cache for SegCache {
 
     fn commit_segment_set(
         &self,
-        reservation: cache_core::SegmentReservation,
+        reservation: &mut cache_core::SegmentReservation,
     ) -> Result<(), CacheError> {
         self.inner.commit_segment_set(reservation)
     }

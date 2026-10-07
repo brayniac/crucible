@@ -58,6 +58,8 @@ pub struct DiskReadParams {
     /// Byte offset on the device/file where the item's segment ends. An item
     /// never extends past it, so no read for the item needs to either.
     pub segment_end: u64,
+    /// The hashtable location of the item being read.
+    pub location: crate::Location,
 }
 
 /// A sealed segment that needs to be flushed to disk via io_uring.
@@ -348,7 +350,7 @@ impl IoUringDiskLayer {
             return None;
         }
 
-        let (_, segment_id, _, offset) = location.unpack(self.pool.layout());
+        let (_, segment_id, incarnation, offset) = location.unpack(self.pool.layout());
         let segment = self.pool.get(segment_id)?;
 
         let state = segment.state();
@@ -375,6 +377,12 @@ impl IoUringDiskLayer {
         if !self.pin_for_read(segment) {
             return None;
         }
+        // Checked under the pin, which stops the segment being reused: a
+        // location of an earlier incarnation names another item's bytes.
+        if segment.incarnation() != incarnation {
+            self.release_read(segment_id);
+            return None;
+        }
 
         // Compute block-aligned read range
         let (disk_offset, read_len, item_offset) =
@@ -388,6 +396,7 @@ impl IoUringDiskLayer {
             pool_id: self.pool.pool_id(),
             segment_end: self.pool.segment_disk_offset(segment_id)
                 + self.pool.segment_size() as u64,
+            location: location.to_location(),
         })
     }
 
@@ -464,6 +473,18 @@ impl IoUringDiskLayer {
     pub fn complete_flush(&self, segment_id: u32) {
         if let Some(segment) = self.pool.get(segment_id) {
             segment.record_key_hashes();
+            segment.detach_write_buffer();
+            segment.unpin_write_buffer();
+            self.release_segment_ref(segment);
+        }
+    }
+
+    /// As [`Self::complete_flush`], without recording key hashes, so a key
+    /// check on the segment's items answers [`crate::Verdict::Unknown`]
+    /// until the key is read from disk. For tests of that path.
+    #[doc(hidden)]
+    pub fn complete_flush_without_key_hashes(&self, segment_id: u32) {
+        if let Some(segment) = self.pool.get(segment_id) {
             segment.detach_write_buffer();
             segment.unpin_write_buffer();
             self.release_segment_ref(segment);
