@@ -557,3 +557,30 @@ fn a_counter_on_committed_disk_does_not_hang() {
         }
     }
 }
+
+/// `append` and `prepend` on an item that is only on a committed disk
+/// segment return an error and leave the item alone.
+///
+/// The synchronous read returns nothing for such an item. Reported as
+/// `KeyNotFound`, RESP APPEND treated the key as deleted and stored the
+/// appended bytes as the whole value.
+#[test]
+fn append_on_committed_disk_does_not_replace_the_value() {
+    for (name, op) in [("append", true), ("prepend", false)] {
+        let (cache, key) = a_counter_on_committed_disk();
+        let r = if op {
+            cache.append(key.as_bytes(), b"tail")
+        } else {
+            cache.prepend(key.as_bytes(), b"head")
+        };
+        assert_eq!(
+            r,
+            Err(cache_core::CacheError::SegmentNotAccessible),
+            "{name} on {key}"
+        );
+        assert!(
+            matches!(cache.lookup(key.as_bytes()), LookupResult::DiskRead(_)),
+            "{name} on {key} replaced the item on disk"
+        );
+    }
+}

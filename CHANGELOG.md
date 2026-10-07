@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
+- RESP APPEND on a key whose item was only on a committed io_uring disk
+  segment replaced the value with the appended bytes. `TieredCache::append`
+  and `prepend` reported the unreadable item as `KeyNotFound`, and APPEND
+  then stored its argument as a new value. They now return
+  `SegmentNotAccessible`, which APPEND answers with an error
 - Two concurrent inserts of a key that was absent could both publish an
   entry, leaving the key with two live entries; a later DELETE removed one
   and the other value came back. Each insert now unlinks every entry for

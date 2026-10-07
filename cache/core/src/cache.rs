@@ -1473,6 +1473,41 @@ impl<H: Hashtable> TieredCache<H> {
         true
     }
 
+    /// The value and remaining TTL of `key`'s item, for a read-modify-write.
+    ///
+    /// Returns `KeyNotFound` if the key is absent, and `SegmentNotAccessible`
+    /// if the item is only on a committed io_uring disk segment, which this
+    /// synchronous read cannot reach. A caller that treated the second case
+    /// as absent would overwrite the item.
+    fn read_for_update(&self, key: &[u8]) -> CacheResult<(Vec<u8>, Duration)> {
+        loop {
+            let verifier = self.create_key_verifier();
+            let (location, _freq) = self
+                .hashtable
+                .lookup(key, &verifier)
+                .ok_or(CacheError::KeyNotFound)?;
+            let item_loc = ItemLocation::from_location(location);
+            let layer = self
+                .layer_for_pool(item_loc.pool_id())
+                .and_then(|idx| self.layers.get(idx))
+                .ok_or(CacheError::KeyNotFound)?;
+
+            let read = layer.with_item(item_loc, key, |guard| {
+                let value = guard.value().to_vec();
+                let remaining_ttl = layer
+                    .item_ttl(item_loc)
+                    .unwrap_or(Duration::from_secs(3600));
+                (value, remaining_ttl)
+            });
+            if let Some(read) = read {
+                return Ok(read);
+            }
+            if !self.retry_unreadable(key)? {
+                return Err(CacheError::KeyNotFound);
+            }
+        }
+    }
+
     /// Decide what a read-modify-write loop does about a key it could not
     /// read: `Ok(true)` to retry, `Ok(false)` to treat the key as absent, or
     /// an error.
@@ -1598,32 +1633,10 @@ impl<H: Hashtable> TieredCache<H> {
     /// # Returns
     /// * `Ok(new_length)` - The length of the value after appending
     /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    /// * `Err(CacheError::SegmentNotAccessible)` - The item is only on a
+    ///   committed io_uring disk segment, which this call cannot read
     pub fn append(&self, key: &[u8], data: &[u8]) -> CacheResult<usize> {
-        // Get the current value and TTL
-        let verifier = self.create_key_verifier();
-
-        let (location, _freq) = self
-            .hashtable
-            .lookup(key, &verifier)
-            .ok_or(CacheError::KeyNotFound)?;
-        let item_loc = ItemLocation::from_location(location);
-
-        // Find the layer containing this item
-        let layer_idx = self
-            .layer_for_pool(item_loc.pool_id())
-            .ok_or(CacheError::KeyNotFound)?;
-        let layer = self.layers.get(layer_idx).ok_or(CacheError::KeyNotFound)?;
-
-        // Get current value and remaining TTL
-        let (current_value, ttl) = layer
-            .with_item(item_loc, key, |guard| {
-                let value = guard.value().to_vec();
-                let remaining_ttl = layer
-                    .item_ttl(item_loc)
-                    .unwrap_or(Duration::from_secs(3600));
-                (value, remaining_ttl)
-            })
-            .ok_or(CacheError::KeyNotFound)?;
+        let (current_value, ttl) = self.read_for_update(key)?;
 
         // Create new value with appended data
         let mut new_value = current_value;
@@ -1644,32 +1657,10 @@ impl<H: Hashtable> TieredCache<H> {
     /// # Returns
     /// * `Ok(new_length)` - The length of the value after prepending
     /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    /// * `Err(CacheError::SegmentNotAccessible)` - The item is only on a
+    ///   committed io_uring disk segment, which this call cannot read
     pub fn prepend(&self, key: &[u8], data: &[u8]) -> CacheResult<usize> {
-        // Get the current value and TTL
-        let verifier = self.create_key_verifier();
-
-        let (location, _freq) = self
-            .hashtable
-            .lookup(key, &verifier)
-            .ok_or(CacheError::KeyNotFound)?;
-        let item_loc = ItemLocation::from_location(location);
-
-        // Find the layer containing this item
-        let layer_idx = self
-            .layer_for_pool(item_loc.pool_id())
-            .ok_or(CacheError::KeyNotFound)?;
-        let layer = self.layers.get(layer_idx).ok_or(CacheError::KeyNotFound)?;
-
-        // Get current value and remaining TTL
-        let (current_value, ttl) = layer
-            .with_item(item_loc, key, |guard| {
-                let value = guard.value().to_vec();
-                let remaining_ttl = layer
-                    .item_ttl(item_loc)
-                    .unwrap_or(Duration::from_secs(3600));
-                (value, remaining_ttl)
-            })
-            .ok_or(CacheError::KeyNotFound)?;
+        let (current_value, ttl) = self.read_for_update(key)?;
 
         // Create new value with prepended data
         let mut new_value = data.to_vec();
