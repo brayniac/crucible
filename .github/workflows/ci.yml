@@ -263,20 +263,30 @@ jobs:
     needs: changes
     if: needs.changes.outputs.cache-core == 'true'
     runs-on: ubuntu-latest
-    # Sharded because one job no longer fits: about 77 minutes serially,
-    # of which `cache::tests` is ~48 and the rest ~31. The two filters are
-    # exact complements -- the same substring selected in one shard and
-    # skipped in the other -- so every test runs exactly once whatever it
-    # is named; a name that happens to contain `cache::tests::` elsewhere
-    # only moves it between shards. Rebalance if either approaches the
-    # timeout, which has headroom over the larger shard, not slack for
-    # doubling it.
+    # Sharded because one job does not fit. On a passing run in October 2026
+    # `cache::tests` took 60 minutes and the rest ~31; runners have been up
+    # to 45% slower than that, so `cache::tests` is split again: the four
+    # `every_` tests and the streamed-set eviction test (~31 minutes of the
+    # 60) run in `cache-slow`. The filters
+    # are exact complements -- each substring selected in one shard is
+    # skipped in the others -- so every test runs exactly once whatever it
+    # is named; a name that happens to match a filter elsewhere only moves
+    # it between shards. Rebalance if any shard approaches the timeout,
+    # which has headroom over the largest shard, not slack for doubling it.
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         shard:
-          - { name: cache, filter: "cache::tests::" }
+          - name: cache-slow
+            filter: >-
+              cache::tests::every_
+              cache::tests::a_streamed_set_survives_its_segment_being_evicted
+          - name: cache
+            filter: >-
+              cache::tests::
+              --skip cache::tests::every_
+              --skip cache::tests::a_streamed_set_survives_its_segment_being_evicted
           - { name: rest, filter: "--skip cache::tests::" }
     # Miri under Stacked Borrows, over nearly all of cache-core.
     #
